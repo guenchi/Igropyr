@@ -1,8 +1,8 @@
-# IgroPyr
+# Igropyr
 a async Scheme http server base on libuv
 
 
-IgroPyr is
+Igropyr is
 
 .a async Scheme Webserver
 
@@ -20,4 +20,4 @@ IgroPyr is
 
 Node = Javascript + V8 + libuv
 
-IgroPyr = Scheme + ChezScheme + libuv
+Igropyr = Scheme + ChezScheme + libuv
