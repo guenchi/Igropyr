@@ -5,3 +5,5 @@
 *.scm~
 *.scm#*
 .#*.scm
+
+/lib

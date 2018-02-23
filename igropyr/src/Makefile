@@ -1,4 +1,4 @@
-TARGET = igropyr.so
+TARGET = libigropyr.so
 OBJS = igropyr.o
 
 CFLAGS= -Wall -Wformat -fPIC
