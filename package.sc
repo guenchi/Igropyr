@@ -6,7 +6,7 @@
     ("guenchi" "chclock"))
 ("private" . #f)
 ("scripts" 
-    ("build" . "cd igropyr/src && make && make clean")
+    ("build" . "cd igropyr/src && cc -fPIC -shared httpc.c membuf.c -luv -o httpc.so")
     ("run" . "scheme --script"))
 ("dependencies")
 ("devDependencies"))
