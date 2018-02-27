@@ -7,6 +7,7 @@
 ("private" . #f)
 ("scripts" 
     ("build" . "cd igropyr/src && cc -fPIC -shared httpc.c membuf.c -luv -o httpc.so")
-    ("run" . "scheme --script"))
+    ("run" . "scheme --script")
+    ("test" . "scheme --script server.sc"))
 ("dependencies")
 ("devDependencies"))
