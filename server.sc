@@ -12,10 +12,10 @@
 ;; to use 
 ;;
 ;;(get
-;;  ('/         index)
-;;  ('/index    index)
-;;  ('/user     user)
-;;  ('/data     auth    data))
+;;  ("/"         index)
+;;  ("/index"    index)
+;;  ("/user"     user)
+;;  ("/data"     auth    data))
 ;;
 ;;
 ;;
