@@ -1,5 +1,5 @@
-TARGET = libigropyr.so
-OBJS = igropyr.o
+TARGET = httpc.so
+OBJS = httpc.o
 
 CFLAGS= -Wall -Wformat -fPIC
 PREFIX?=/usr/local
