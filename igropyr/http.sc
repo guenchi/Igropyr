@@ -4,7 +4,7 @@
     listen
     set
     ref
-    respone
+    response
     callback
   )
   (import
@@ -23,8 +23,8 @@
   (define igropyr_res_init
     (foreign-procedure "igropyr_res_init" (iptr) int))
 
-  (define respone
-    (foreign-procedure "igropyr_respone" (int string string) string))
+  (define response
+    (foreign-procedure "igropyr_response" (int string string) string))
 
 
   (define callback
