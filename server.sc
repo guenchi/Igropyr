@@ -4,8 +4,8 @@
 
 (server 
     (set 
-        ('path "/users/iter/igropyr/www/"))
-    (listen 8080))
+        ('staticpath "/users/iter/igropyr/www/"))
+    (listen 8081))
 
 
 
