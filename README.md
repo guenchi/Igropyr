@@ -43,8 +43,8 @@ use the default value to start server:
 
 ```
 (listen 
-    ('ip    "127.0.0.1")                 ;to define the ip that server listen on, default is "0.0.0.0"
-    ('port  8080))                       ;to define the port that server listen on, defualt is 80
+    ('ip    "127.0.0.1")                ;to define the ip that server listen on, default is "0.0.0.0"
+    ('port  8080))                      ;to define the port that server listen on, defualt is 80
 ```
 
 or simply like this:
