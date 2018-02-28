@@ -27,7 +27,15 @@ Igropyr = Scheme + ChezScheme + libuv
 
 use the default value to start server:
 
-`(server (set) (listen))`
+```
+(define request
+    (callback
+        (lambda (request_header pathinfo query_string)
+            (respone "200 OK" "text/html"
+                (string-append "<p>path is:" pathinfo "</br>query is:" (if query_string query_string "nothing"))))))
+
+(server request (set) (listen))
+```
 
 
 (set) may define like:
