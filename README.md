@@ -2,8 +2,9 @@
 a async Scheme http server base on libuv
 
 
-Igropyr is
+***Igropyr*** is
 
+```
 .a async Scheme Webserver
 
 .a async Scheme Httpserver
@@ -21,14 +22,16 @@ Igropyr is
 Node = Javascript + V8 + libuv
 
 Igropyr = Scheme + ChezScheme + libuv
-
+```
 
 
 use the default value to start server:
+
 `(server (set) (listen))`
 
 
 (set) may define like:
+
 ```
 (set 
     ('staticpath    "/usr/local/www")   ;to define the static path    
