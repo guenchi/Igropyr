@@ -35,26 +35,24 @@ use the default value to start server:
 ```
 (set 
     ('staticpath    "/usr/local/www")   ;to define the static path    
-    ('connections   1024)               ;to define the max connections, default 3600
-    ('keepalive     36000))             ;to define the keepalive timeout, 0 for short connection, default 36000 (s)
+    ('connections   1024)               ;to define the max connections, default is 3600
+    ('keepalive     36000))             ;to define the keepalive timeout, 0 for short connection, default is 36000 (s)
 ```
 
-;;  (listen) 
-;;may define the specific port as
-;;  (listen 8080) 
-;;or writen like this
-;;  (listen 
-;;      ('port 8080))
-;;or define the specific ip as
-;;  (listen "127.0.0.1")
-;;or writen like this
-;;  (listen 
-;;      ('ip "127.0.0.1"))
-;;or define the two
-;;  (listen "127.0.0.1" 8080)
-;;or writen like this 
-;;  (listen 
-;;      ('ip "127.0.0.1")
-;;      ('port 8080))
-;;if you don't define
-;;server will listen on 0.0.0.0:80
+(listen) may define like:
+
+```
+(listen 
+    ('ip    "127.0.0.1")                 ;to define the ip that server listen on, default is "0.0.0.0"
+    ('port  8080))                       ;to define the port that server listen on, defualt is 80
+```
+
+or simply like this:
+
+```
+(listen "127.0.0.1" 8080)               ;define the ip and port that server listen on
+(listen "127.0.0.1")                    ;if only define the ip
+(listen 8080)                           ;if only define the port
+
+```
+
