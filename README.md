@@ -36,7 +36,7 @@ use the default value to start server:
 (set 
     ('staticpath    "/usr/local/www")   ;to define the static path    
     ('connections   1024)               ;to define the max connections, default is 3600
-    ('keepalive     36000))             ;to define the keepalive timeout, 0 for short connection, default is 36000 (s)
+    ('keepalive     36000))             ;keepalive timeout, 0 for short connection, default is 36000 (s)
 ```
 
 (listen) may define like:
