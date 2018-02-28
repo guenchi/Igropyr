@@ -25,7 +25,7 @@ Igropyr = Scheme + ChezScheme + libuv
 ```
 
 
-use the default value to start server:
+***start server:***
 
 ```
 (define request
