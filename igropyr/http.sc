@@ -37,25 +37,33 @@
         ((_ (e1 e2)) #'(list (cons e1 e2))))))
 
 
-  (define igropyr_start
-    (foreign-procedure "igropyr_start" (string int string) int)
+(define igropyr_init
+    (foreign-procedure "igropyr_init" (string string int) int)
   )
 
   (define server 
     (lambda (set listen)
-      (let ((ip (index listen 'ip))
-            (port (index listen 'port))
-            (path (index set 'path)))
-        (igropyr_start
+      (let ((staticpath (index set 'staticpath))
+            ;(connections (index set 'connections))
+            ;(keepalive (index set 'keepalive))
+            (ip (index listen 'ip))
+            (port (index listen 'port)))
+        (igropyr_init
+          (if (null? staticpath)
+            ""
+            staticpath)
+        ;(if (null? connections)
+        ;   3600
+        ;   connections)
+        ;(if (null? keepalive)
+        ;   36000
+        ;   keepalive)
           (if (null? ip)
             "0.0.0.0"
             ip)
           (if (null? port)
             80
-            port)
-          (if (null? path)
-            ""
-            path)))))
+            port)))))
   
 )
 
