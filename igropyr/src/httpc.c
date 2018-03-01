@@ -6,7 +6,7 @@
 #include <string.h>
 #include <memory.h>
 
-#define IGROPYR_VERSION 0.1.0
+#define IGROPYR_VERSION "0.1.0"
 
 
 uv_tcp_t    _server;
@@ -180,7 +180,7 @@ static void handle_404(uv_stream_t* client, const char* path_info)
 {
 	char* respone;
 	char buffer[1024];
-	snprintf(buffer, sizeof(buffer), "</br><h1>Igropyr</h1><h3>404 Not Found</h3><p>%s</p>", path_info);
+	snprintf(buffer, sizeof(buffer), "<html><head><title>404 Not Found</title></head><body bgcolor='white'><center><h1>404 Not Found</h1></center><hr><center>Igropyr/%s</center><p>%s</p></body></html>", IGROPYR_VERSION, path_info);
 	respone = format_http_response("404 Not Found", "text/html", buffer, -1, NULL);
 	write_uv_data(client, respone, -1, 0, 1);
 }
