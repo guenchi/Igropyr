@@ -1,5 +1,7 @@
 (import (igropyr http))
 
+(printf "server is start, listen on port..~a\n" 8080)
+
 (define get
     (callback
         (lambda (request_header pathinfo query_string)
@@ -13,5 +15,5 @@
 
 (server get post (set) (listen))
 
-(printf "server is start, listen on port..~a\n" 8080)
+
 
