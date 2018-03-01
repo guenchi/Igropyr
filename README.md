@@ -31,7 +31,7 @@ Igropyr = Scheme + ChezScheme + libuv
 (define request
     (callback
         (lambda (request_header pathinfo query_string)
-            (respone "200 OK" "text/html"
+            (response "200 OK" "text/html"
                 (string-append "<p>path is:" pathinfo "</br>query is:" (if query_string query_string "nothing"))))))
 
 (server request (set) (listen))
