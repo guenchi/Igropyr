@@ -5,6 +5,7 @@
     set
     response
     callback
+    par
   )
   (import
     (scheme)
@@ -24,6 +25,9 @@
 
   (define response
     (foreign-procedure "igropyr_response" (int string string) string))
+ 
+   (define par
+    (foreign-procedure "par" (string string) boolean))
 
 
   (define callback
