@@ -26,7 +26,13 @@ Igropyr = Scheme + ChezScheme + libuv
 
 ***install Igropyr***
 
-You can use Raven to install Igropyr easily:
+Igropyr dependence libuv, make sure you have installed it.
+
+then 
+
+`$ cd igropyr/src && cc -fPIC -shared httpc.c membuf.c -luv -o httpc.so`
+
+or simply use Raven to install Igropyr:
 
 `$ raven install igropyr`
 
