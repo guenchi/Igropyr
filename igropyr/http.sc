@@ -20,14 +20,14 @@
     (foreign-procedure "igropyr_init" (string string int) int)
   )
 
-  (define igropyr_res_init
-    (foreign-procedure "igropyr_res_init" (iptr) int))
+  (define handle_request
+    (foreign-procedure "handle_request" (iptr iptr) int))
 
   (define response
     (foreign-procedure "igropyr_response" (int string string) string))
- 
-   (define par
-    (foreign-procedure "par" (string string) boolean))
+
+  (define par
+    (foreign-procedure "igropyr_par" (string string) boolean))
 
 
   (define callback
@@ -63,14 +63,14 @@
         ((_ e1 e2) #'(list (cons 'ip e1)(cons 'port e2))))))
 
   (define server 
-    (lambda (request set listen)
+    (lambda (req_get req_post set listen)
       (let ((staticpath (ref set 'staticpath))
             ;(connections (ref set 'connections))
             ;(keepalive (ref set 'keepalive))
             (ip (ref listen 'ip))
             (port (ref listen 'port)))
         (begin 
-          (igropyr_res_init request)
+          (handle_request req_get req_post)
           (igropyr_init
             (if (null? staticpath)
             ""
