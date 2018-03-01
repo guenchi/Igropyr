@@ -5,11 +5,11 @@ a async Scheme http server base on libuv
 ***Igropyr*** is
 
 ```
-.a async Scheme Webserver
+.a async Scheme web-server
 
-.a async Scheme Httpserver
+.a async Scheme http-server
 
-.a async Scheme Socketserver
+.a async Scheme socket-server
 
 .a async files reader/writer
 
