@@ -24,6 +24,12 @@ Node = Javascript + V8 + libuv
 Igropyr = Scheme + ChezScheme + libuv
 ```
 
+***install Igropyr***
+
+You can use Raven to install Igropyr easily:
+
+`$ raven install igropyr`
+
 
 ***start server:***
 
