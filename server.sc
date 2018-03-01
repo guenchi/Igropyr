@@ -9,7 +9,7 @@
 (define post
     (callback
         (lambda (request_header pathinfo payload)
-            (response 200 "text/html" "{\"hello\":\"world\"}"))))
+            (response 200 "application/json" "{\"hello\":\"world\"}"))))
 
 (server get post (set) (listen))
 
