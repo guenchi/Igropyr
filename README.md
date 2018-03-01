@@ -71,6 +71,6 @@ or simply like this:
 ```
 
 
-recommand use ***Catapult*** as Webframework
+We recommand use ***Catapult*** as Webframework
 
 https://github.com/guenchi/Catapult
