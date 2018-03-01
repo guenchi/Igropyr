@@ -14,7 +14,7 @@
 
 
 
-  (define lib (load-shared-object "./igropyr/httpc.so"))
+  (define lib (load-shared-object "./lib/igropyr/httpc.so"))
 
   (define igropyr_init
     (foreign-procedure "igropyr_init" (string string int) int)
