@@ -3,8 +3,8 @@
     server
     listen
     set
+    request
     response
-    callback
     par
   )
   (import
@@ -30,9 +30,9 @@
     (foreign-procedure "igropyr_par" (string string) boolean))
 
 
-  (define callback
-    (lambda (p)
-        (let ((code (foreign-callable p (string string string) string)))
+  (define request
+    (lambda (info)
+        (let ((code (foreign-callable info (string string string) string)))
             (lock-object code)
             (foreign-callable-entry-point code))))
 
