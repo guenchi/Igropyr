@@ -328,3 +328,56 @@ static void igropyr_on_connection(uv_stream_t* server, int status)
 	}
 }
 
+
+int par(char* router_info, char* path_info)
+{
+	char* p1 = router_info + 1;
+	char* p2 = path_info + 1;
+
+	for(;;)
+	{
+		if(*p1 != '*')
+		{
+			if(*p1 != *p2)
+			{
+				p1 = NULL;
+				p2 = NULL;
+				return 0;
+				break;
+			}
+			else
+			{
+				if(*p1 == '\0')
+				{
+				p1 = NULL;
+				p2 = NULL;
+				return 1;
+				break;
+				}
+				else
+				{
+				p1++;
+				p2++;
+				}
+			}
+		}
+		else
+		{
+			p1++;
+			if(*p1 == '\0')
+			{
+				p1 = NULL;
+				p2 = NULL;
+				return 1;
+				break;
+			}
+			else
+			{
+				for(;*p2 != '/'; p2++)
+	 			{
+	 			}
+			}
+		}
+	}
+
+}
