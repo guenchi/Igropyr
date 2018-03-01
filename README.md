@@ -76,6 +76,10 @@ or simply like this:
 
 ```
 
+then
+
+`$ raven run server.sc`
+
 
 We recommand use ***Catapult*** as Webframework
 
