@@ -14,9 +14,7 @@ uv_tcp_t    _client;
 const char* _doc_root_path = NULL;
 
 
-
-
-static void igropyr_on_connection(uv_stream_t* server, int status);
+static void on_connection(uv_stream_t* server, int status);
 
 
 int igropyr_init(const char* doc_root_path, const char* ip, int port)
@@ -27,7 +25,7 @@ int igropyr_init(const char* doc_root_path, const char* ip, int port)
 
 	uv_tcp_init(uv_default_loop(), &_server);
 	uv_tcp_bind(&_server, (const struct sockaddr*) &addr, 0);
-	uv_listen((uv_stream_t*)&_server, 8, igropyr_on_connection);
+	uv_listen((uv_stream_t*)&_server, 8, on_connection);
 
 	return uv_run(uv_default_loop(), UV_RUN_DEFAULT);
 }
@@ -186,6 +184,7 @@ static void handle_404(uv_stream_t* client, const char* path_info)
 }
 
 
+
 static void send_file(uv_stream_t* client, const char* content_type, const char* file, const char* path_info) 
 {
 	int file_size, read_bytes, respone_size;
@@ -234,17 +233,20 @@ static const char* handle_content_type(const char* postfix)
 }
 
 
-typedef char* (*igropyr_res)(char* request_header, char* path_info, char* query_stirng); 
+typedef char* (*igropyr_res)(char* request_header, char* path_info, char* payload); 
 
-igropyr_res _res;
 
-int igropyr_res_init(igropyr_res _response)
+igropyr_res res_get;
+igropyr_res res_post;
+
+int handle_request(igropyr_res response_get, igropyr_res response_post)
 {
-	_res = _response;
+		res_get = response_get;
+		res_post = response_post;
 }
 
 
-static void igropyr_on_request_get(const char* request_header, uv_stream_t* client, const char* path_info, const char* query_stirng) 
+static void handle_get(uv_stream_t* client, const char* request_header, const char* path_info, const char* query_stirng) 
 {
 	char* postfix = strrchr(path_info, '.');
 
@@ -266,38 +268,72 @@ static void igropyr_on_request_get(const char* request_header, uv_stream_t* clie
 	}
 	else
 	{
-		char* respone = _res(request_header, path_info, query_stirng);
+		char* respone = res_get(request_header, path_info, query_stirng);
 		write_uv_data(client, respone, -1, 0, 1);
 	}
+}
+
+static void handle_post(uv_stream_t* client, const char* request_header, const char* path_info, const char* payload) 
+{
+		printf("%s",path_info);
+		char* respone = res_post(request_header, path_info, payload);
+		write_uv_data(client, respone, -1, 0, 1);
+
 }
 
 static void on_uv_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
 	*buf = uv_buf_init(malloc(suggested_size), suggested_size);
 }
 
+//缺少 cookie 
+
 static void on_uv_read(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
-	if(nread > 0) {
+	if(nread > 0) 
+	{
 		char* crln2;
-		membuf_t* membuf = (membuf_t*) client->data; //see igropyr_on_connection()
+		membuf_t* membuf = (membuf_t*) client->data; 
 		assert(membuf);
 		membuf_append_data(membuf, buf->base, nread);
-		if((crln2 = strstr((const char*)membuf->data, "\r\n\r\n")) != NULL) {
+
+		if((crln2 = strstr((const char*)membuf->data, "\r\n\r\n")) != NULL) 
+		{
 			const char* request_header = membuf->data;
 			*crln2 = '\0';
-			if(request_header[0]=='G' && request_header[1]=='E' && request_header[2]=='T') {
-				char *query_stirng, *end;
+
+			if(request_header[0]=='G' && request_header[1]=='E' && request_header[2]=='T') 
+			{
+				char* query_stirng; 
+				char* end;
 				const char* path_info = request_header + 3;
+
 				while(isspace(*path_info)) path_info++;
 				end = strchr(path_info, ' ');
 				if(end) *end = '\0';
+
 				query_stirng = strchr(path_info, '?'); 
+
 				if(query_stirng) {
 					*query_stirng = '\0';
 					query_stirng++;
 				}
-				igropyr_on_request_get(request_header, client, path_info, query_stirng);
 
-			} else {
+				handle_get(client, request_header, path_info, query_stirng);
+			}
+			else if(request_header[0]=='P' && request_header[1]=='O' && request_header[2]=='S' && request_header[3]=='T')
+			{
+				char* payload;
+				char* end;
+				const char* path_info = request_header + 4;
+
+				while(isspace(*path_info)) path_info++;
+				end = strchr(path_info, ' ');
+				if(end) *end = '\0';
+
+				handle_post(client, request_header, path_info, payload);
+
+			} 
+			else 
+			{
 				igropyr_close_client(client);
 			}
 		}
@@ -314,7 +350,7 @@ static void on_uv_read(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) 
 		
 }
 
-static void igropyr_on_connection(uv_stream_t* server, int status) 
+static void on_connection(uv_stream_t* server, int status) 
 {
 	assert(server == (uv_stream_t*)&_server);
 	if(status == 0) 
@@ -328,53 +364,54 @@ static void igropyr_on_connection(uv_stream_t* server, int status)
 	}
 }
 
-int par(char* router_info, char* path_info)
+int igropyr_par(char* router_info, char* path_info)
 {
 	char* p1 = router_info + 1;
 	char* p2 = path_info + 1;
 
-	for(;;)
+	if(*p1 != '*')
 	{
-		if(*p1 != '*')
+		if(*p1 != *p2)
 		{
-			if(*p1 != *p2)
-			{
-				p1 = NULL;
-				p2 = NULL;
-				return 0;
-				break;
-			}
-			else
-			{
-				if(*p1 == '\0')
-				{
-				p1 = NULL;
-				p2 = NULL;
-				return 1;
-				break;
-				}
-				else
-				{
-				p1++;
-				p2++;
-				}
-			}
+			p1 = NULL;
+			p2 = NULL;
+			return 0;
 		}
 		else
 		{
-			p1++;
 			if(*p1 == '\0')
 			{
 				p1 = NULL;
 				p2 = NULL;
 				return 1;
-				break;
 			}
 			else
 			{
-				for(;*p2 != '/'; p2++)
-	 			{
-	 			}
+				p1++;
+				p2++;
+			}
+		}
+	}
+	else
+	{
+		p1++;
+			
+		if(*p1 == '\0')
+		{
+			p1 = NULL;
+			p2 = NULL;
+			return 1;
+		}
+		else
+		{
+			if(*p2 == '/')
+			{
+				p1++;
+				p2++;
+			}
+			else
+			{
+				p2++;
 			}
 		}
 	}
