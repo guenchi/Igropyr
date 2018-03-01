@@ -113,7 +113,7 @@ char* format_http_response(const char* status, const char* content_type, const v
 	return respone;
 }
 
-static char* status_code(int code)
+static char* handle_status_code(int code)
 {
 	switch(code)
 	{
@@ -166,7 +166,7 @@ static char* status_code(int code)
 
 char* igropyr_response(const int code, const char* content_type, const char* content) 
 {
-	char* status = status_code(code);
+	char* status = handle_status_code(code);
 	return format_http_response(status, content_type, content, -1, NULL);
 }
 
@@ -176,17 +176,17 @@ char* igropyr_response(const int code, const char* content_type, const char* con
 	#define snprintf _snprintf
 #endif
 
-static void handle_404(uv_stream_t* client, const char* pathinfo) 
+static void handle_404(uv_stream_t* client, const char* path_info) 
 {
 	char* respone;
 	char buffer[1024];
-	snprintf(buffer, sizeof(buffer), "</br><h1>IgroPyr</h1><h3>404 Not Found</h3><p>%s</p>", pathinfo);
+	snprintf(buffer, sizeof(buffer), "</br><h1>Igropyr</h1><h3>404 Not Found</h3><p>%s</p>", path_info);
 	respone = format_http_response("404 Not Found", "text/html", buffer, -1, NULL);
 	write_uv_data(client, respone, -1, 0, 1);
 }
 
 
-static void _on_send_file(uv_stream_t* client, const char* content_type, const char* file, const char* pathinfo) 
+static void send_file(uv_stream_t* client, const char* content_type, const char* file, const char* path_info) 
 {
 	int file_size, read_bytes, respone_size;
 	unsigned char *file_data, *respone;
@@ -208,12 +208,12 @@ static void _on_send_file(uv_stream_t* client, const char* content_type, const c
 	} 
 	else 
 	{
-		handle_404(client, pathinfo);
+		handle_404(client, path_info);
 	}
 }
 
 
-static const char* _get_content_type(const char* postfix) 
+static const char* handle_content_type(const char* postfix) 
 {
 	if(strcmp(postfix, "html") == 0 || strcmp(postfix, "htm") == 0)
 		return "text/html";
@@ -234,7 +234,7 @@ static const char* _get_content_type(const char* postfix)
 }
 
 
-typedef char* (*igropyr_res)(char* request_header, char* pathinfo, char* query_stirng); 
+typedef char* (*igropyr_res)(char* request_header, char* path_info, char* query_stirng); 
 
 igropyr_res _res;
 
@@ -244,9 +244,9 @@ int igropyr_res_init(igropyr_res _response)
 }
 
 
-static void igropyr_on_request_get(const char* request_header, uv_stream_t* client, const char* pathinfo, const char* query_stirng) 
+static void igropyr_on_request_get(const char* request_header, uv_stream_t* client, const char* path_info, const char* query_stirng) 
 {
-	char* postfix = strrchr(pathinfo, '.');
+	char* postfix = strrchr(path_info, '.');
 
 	if(postfix) 
 	{
@@ -254,19 +254,19 @@ static void igropyr_on_request_get(const char* request_header, uv_stream_t* clie
 		if(_doc_root_path) 
 		{
 			char file[1024];
-			snprintf(file, sizeof(file), "%s%s", _doc_root_path, pathinfo);
-			_on_send_file(client, _get_content_type(postfix), file, pathinfo);
+			snprintf(file, sizeof(file), "%s%s", _doc_root_path, path_info);
+			send_file(client, handle_content_type(postfix), file, path_info);
 			return;
 		}
 		else
 		{
-			handle_404(client, pathinfo);
+			handle_404(client, path_info);
 			return;
 		}
 	}
 	else
 	{
-		char* respone = _res(request_header, pathinfo, query_stirng);
+		char* respone = _res(request_header, path_info, query_stirng);
 		write_uv_data(client, respone, -1, 0, 1);
 	}
 }
@@ -286,16 +286,16 @@ static void on_uv_read(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) 
 			*crln2 = '\0';
 			if(request_header[0]=='G' && request_header[1]=='E' && request_header[2]=='T') {
 				char *query_stirng, *end;
-				const char* pathinfo = request_header + 3;
-				while(isspace(*pathinfo)) pathinfo++;
-				end = strchr(pathinfo, ' ');
+				const char* path_info = request_header + 3;
+				while(isspace(*path_info)) path_info++;
+				end = strchr(path_info, ' ');
 				if(end) *end = '\0';
-				query_stirng = strchr(pathinfo, '?'); 
+				query_stirng = strchr(path_info, '?'); 
 				if(query_stirng) {
 					*query_stirng = '\0';
 					query_stirng++;
 				}
-				igropyr_on_request_get(request_header, client, pathinfo, query_stirng);
+				igropyr_on_request_get(request_header, client, path_info, query_stirng);
 
 			} else {
 				igropyr_close_client(client);
@@ -327,7 +327,6 @@ static void igropyr_on_connection(uv_stream_t* server, int status)
 		uv_read_start((uv_stream_t*)client, on_uv_alloc, on_uv_read);
 	}
 }
-
 
 int par(char* router_info, char* path_info)
 {
@@ -381,3 +380,7 @@ int par(char* router_info, char* path_info)
 	}
 
 }
+
+
+
+
