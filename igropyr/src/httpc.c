@@ -369,55 +369,52 @@ int igropyr_par(char* router_info, char* path_info)
 	char* p1 = router_info + 1;
 	char* p2 = path_info + 1;
 
-	if(*p1 != '*')
+	for(;;)
 	{
-		if(*p1 != *p2)
+		if(*p1 != '*')
 		{
-			p1 = NULL;
-			p2 = NULL;
-			return 0;
+			if(*p1 != *p2)
+			{
+				p1 = NULL;
+				p2 = NULL;
+				return 0;
+				break;
+			}
+			else
+			{
+				if(*p1 == '\0')
+				{
+					p1 = NULL;
+					p2 = NULL;
+					return 1;
+					break;
+				}
+				else
+				{
+					p1++;
+					p2++;
+				}
+			}
 		}
 		else
 		{
+			p1++;
+
 			if(*p1 == '\0')
 			{
 				p1 = NULL;
 				p2 = NULL;
 				return 1;
+				break;
 			}
 			else
 			{
-				p1++;
-				p2++;
-			}
-		}
-	}
-	else
-	{
-		p1++;
-			
-		if(*p1 == '\0')
-		{
-			p1 = NULL;
-			p2 = NULL;
-			return 1;
-		}
-		else
-		{
-			if(*p2 == '/')
-			{
-				p1++;
-				p2++;
-			}
-			else
-			{
-				p2++;
+				for(;*p2 != '/'; p2++)
+	 			{
+	 			}
 			}
 		}
 	}
 
 }
-
-
-
 
