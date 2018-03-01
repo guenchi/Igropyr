@@ -3,7 +3,6 @@
     server
     listen
     set
-    ref
     response
     callback
   )
