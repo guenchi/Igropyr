@@ -83,7 +83,7 @@ or simply like this:
 
 then
 
-`$ raven run server.sc`
+`$ raven run test.sc`
 
 
 We recommand use ***Catapult*** as Webframework
