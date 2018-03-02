@@ -6,7 +6,7 @@
 #include <string.h>
 #include <memory.h>
 
-#define IGROPYR_VERSION "0.1.1"
+#define IGROPYR_VERSION "0.2.1"
 
 
 uv_tcp_t    _server;
@@ -281,54 +281,69 @@ static void handle_post(uv_stream_t* client, const char* request_header, const c
 
 }
 
-static void on_uv_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+static void on_uv_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) 
+{
 	*buf = uv_buf_init(malloc(suggested_size), suggested_size);
 }
 
-//缺少 cookie 
-
-static void on_uv_read(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
+static void on_uv_read(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) 
+{
 	if(nread > 0) 
 	{
-		char* crln2;
+		char* separator;
+		char* payload;
+		char* query_stirng; 
+		char* end;
+
 		membuf_t* membuf = (membuf_t*) client->data; 
 		assert(membuf);
 		membuf_append_data(membuf, buf->base, nread);
+		separator = strstr((const char*)membuf->data, "\r\n\r\n");
 
-		if((crln2 = strstr((const char*)membuf->data, "\r\n\r\n")) != NULL) 
+		if(separator != NULL) 
 		{
 			const char* request_header = membuf->data;
-			*crln2 = '\0';
+			*separator = '\0';
+			payload = separator + 4;
 
 			if(request_header[0]=='G' && request_header[1]=='E' && request_header[2]=='T') 
 			{
-				char* query_stirng; 
-				char* end;
 				const char* path_info = request_header + 3;
+				
+				while(isspace(*path_info))
+					path_info++;
 
-				while(isspace(*path_info)) path_info++;
 				end = strchr(path_info, ' ');
-				if(end) *end = '\0';
+
+				if(end)
+				{
+					*end = '\0';
+					request_header = end +1;
+				}
 
 				query_stirng = strchr(path_info, '?'); 
 
-				if(query_stirng) {
+				if(query_stirng) 
+				{
 					*query_stirng = '\0';
 					query_stirng++;
 				}
-
+				
 				handle_get(client, request_header, path_info, query_stirng);
 			}
 			else if(request_header[0]=='P' && request_header[1]=='O' && request_header[2]=='S' && request_header[3]=='T')
 			{
-				char* payload;
-				char* end;
 				const char* path_info = request_header + 4;
-
+				
 				while(isspace(*path_info)) path_info++;
 				end = strchr(path_info, ' ');
-				if(end) *end = '\0';
 
+				if(end)
+				{
+					*end = '\0';
+					request_header = end +1;
+				}
+				
 				handle_post(client, request_header, path_info, payload);
 
 			} 
@@ -353,6 +368,7 @@ static void on_uv_read(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) 
 static void on_connection(uv_stream_t* server, int status) 
 {
 	assert(server == (uv_stream_t*)&_server);
+	
 	if(status == 0) 
 	{
 		uv_tcp_t* client = (uv_tcp_t*)malloc(sizeof(uv_tcp_t));
