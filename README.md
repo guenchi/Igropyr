@@ -51,7 +51,11 @@ or simply use Raven to install Igropyr:
         (lambda (request_header pathinfo payload)
             (response 200 "application/json" "{\"hello\":\"world\"}"))))
 
-(server get post (set) (listen))
+(server 
+    get 
+    post 
+    (set) 
+    (listen))
 ```
 
 
