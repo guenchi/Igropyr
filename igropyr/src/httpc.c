@@ -275,10 +275,8 @@ static void handle_get(uv_stream_t* client, const char* request_header, const ch
 
 static void handle_post(uv_stream_t* client, const char* request_header, const char* path_info, const char* payload) 
 {
-		printf("%s",path_info);
 		char* respone = res_post(request_header, path_info, payload);
 		write_uv_data(client, respone, -1, 0, 1);
-
 }
 
 static void on_uv_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) 
