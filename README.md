@@ -41,7 +41,7 @@ or simply use Raven to install Igropyr:
 
 ```
 
-（define hello
+(define hello
     (lambda ()
         (response 200 "text/plain" "Hello World")))
 
