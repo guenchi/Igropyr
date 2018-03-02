@@ -23,8 +23,8 @@
   (define handle_request
     (foreign-procedure "handle_request" (iptr iptr) int))
 
-  (define response
-    (foreign-procedure "igropyr_response" (int string string) string))
+  (define igropyr_response
+    (foreign-procedure "igropyr_response" (int string string string) string))
 
   (define par
     (foreign-procedure "igropyr_par" (string string) boolean))
@@ -35,6 +35,12 @@
         (let ((code (foreign-callable info (string string string) string)))
             (lock-object code)
             (foreign-callable-entry-point code))))
+
+  (define response
+    (lambda (status type content)
+      (if (list? content)
+        (igropyr_response status type (car content) (cadr content))
+        (igropyr_response status type "" content))))
 
   (define ref
     (lambda (str x)
