@@ -54,8 +54,6 @@
     (lambda (x)
       (syntax-case x ()
         ((_) #''())
-        ((_ (e1 e2)) #'(list (cons e1 e2)))
-        ((_ (e1 e2)(e3 e4)) #'(list (cons e1 e2)(cons e3 e4)))
         ((_ e) #'(cond 
                   ((string? e) (list (cons 'ip e)))
                   ((integer? e) (list (cons 'port e)))
@@ -76,10 +74,10 @@
             ""
             staticpath)
         ;(if (null? connections)
-        ;   3600
+        ;   1024
         ;   connections)
         ;(if (null? keepalive)
-        ;   36000
+        ;   5000
         ;   keepalive)
           (if (null? ip)
             "0.0.0.0"
