@@ -1,6 +1,7 @@
 # Igropyr
 a async Scheme http server base on libuv
 
+api: https://guenchi.gitbooks.io/igropyr/
 
 ***Igropyr*** is
 
@@ -83,9 +84,12 @@ or simply use Raven to install Igropyr:
 
 then
 
+```
 `$ raven run test.sc`
-
+```
 
 We recommand use ***Catapult*** as Webframework
 
 https://github.com/guenchi/Catapult
+
+中文api手册：https://guenchi.gitbooks.io/igropyr-zhcn/
