@@ -162,7 +162,7 @@ static char* handle_status_code(int code)
    	
 
 
-char* igropyr_response(const int code, const char* content_type, const char* content) 
+char* igropyr_response(const int code, const char* content_type, const char* cookie, const char* content) 
 {
 	char* status = handle_status_code(code);
 	return format_http_response(status, content_type, content, -1, NULL);
