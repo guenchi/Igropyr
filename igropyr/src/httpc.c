@@ -185,12 +185,12 @@ static char* handle_content_type(const char* postfix)
 	#define snprintf _snprintf
 #endif
 
-char* igropyr_errorpage(int error_code, const char* path_info) 
+char* igropyr_errorpage(int error_code, const char* error_info) 
 {
 	char* respone;
 	const char* error = handle_status_code(error_code);
 	char buffer[1024];
-	snprintf(buffer, sizeof(buffer), "<html><head><title>%s</title></head><body bgcolor='white'><center><h1>%s</h1></center><hr><center>Igropyr/%s</center><p>%s</p></body></html>", error, error, IGROPYR_VERSION, path_info);
+	snprintf(buffer, sizeof(buffer), "<html><head><title>%s</title></head><body bgcolor='white'><center><h1>%s</h1></center><hr><center>Igropyr/%s</center><p>%s</p></body></html>", error, error, IGROPYR_VERSION, error_info);
 	return format_http_response(error, "text/html", buffer, -1, NULL);
 }
 
