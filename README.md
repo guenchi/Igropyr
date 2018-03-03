@@ -1,7 +1,11 @@
 # Igropyr
 a async Scheme http server base on libuv
 
-api: https://guenchi.gitbooks.io/igropyr/
+How fast？
+![image](https://github.com/guenchi/Igropyr/blob/master/benchmark.png)
+To be honest, I'm scared myself...
+I think the reason is more likely that the Chez Scheme is very very very fast!!! 
+I test with the --script option and don't compile the scheme file...
 
 ***Igropyr*** is
 
@@ -24,6 +28,7 @@ Node = Javascript + V8 + libuv
 
 Igropyr = Scheme + ChezScheme + libuv
 ```
+
 
 ***install Igropyr***
 
@@ -87,6 +92,8 @@ then
 ```
 `$ raven run test.sc`
 ```
+
+api: https://guenchi.gitbooks.io/igropyr/
 
 We recommand use ***Catapult*** as Webframework
 
