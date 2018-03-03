@@ -6,22 +6,22 @@
 #include <string.h>
 #include <memory.h>
 
-#define IGROPYR_VERSION "0.2.1"
+#define IGROPYR_VERSION "0.2.2"
 
 
 uv_tcp_t    _server;
 uv_tcp_t    _client;
-const char* _doc_root_path = NULL;
+const char* STATIC_PATH = NULL;
 
 
 static void on_connection(uv_stream_t* server, int status);
 
 
-int igropyr_init(const char* doc_root_path, const char* ip, int port)
+int igropyr_init(const char* static_path, const char* ip, int port)
 {
 	struct sockaddr_in addr;
 	uv_ip4_addr((ip && ip[0]) ? ip : "0.0.0.0", port, &addr);
-	_doc_root_path = doc_root_path;
+	STATIC_PATH = static_path;
 
 	uv_tcp_init(uv_default_loop(), &_server);
 	uv_tcp_bind(&_server, (const struct sockaddr*) &addr, 0);
@@ -50,7 +50,7 @@ static void after_uv_write(uv_write_t* w, int status)
 	free(w);
 }
 
-static void igropyr_close_client(uv_stream_t* client) 
+static void close_client(uv_stream_t* client) 
 {
 	uv_close((uv_handle_t*)client, after_uv_close_client);
 }
@@ -118,6 +118,7 @@ static char* handle_status_code(int code)
 		case 200: return("200 OK");break;
 		case 301: return("301 Moved Permanently");break;
 		case 302: return("302 Found");break;
+		case 403: return("403 Forbidden");break;
 		case 404: return("404 Not Found");break;
 		case 500: return("500 Internal Server Error");break;
 		case 502: return("502 Bad Gateway");break;
@@ -138,8 +139,7 @@ static char* handle_status_code(int code)
    		case 307: return("307 Temporary Redirect");break;
    		case 400: return("400 Bad Request");break;
    		case 401: return("401 Unauthorized");break;
-   		case 402: return("402 Payment Required");break;
-   		case 403: return("403 Forbidden");break;   		
+   		case 402: return("402 Payment Required");break;   		
    		case 405: return("405 Method Not Allowed");break;
    		case 406: return("406 Not Acceptable");break;
    		case 407: return("407 Proxy Authentication Required");break;
@@ -159,60 +159,8 @@ static char* handle_status_code(int code)
 		default: return("200 OK");break;
 	}
 }
-   	
 
-
-char* igropyr_response(const int code, const char* content_type, const char* cookie, const char* content) 
-{
-	char* status = handle_status_code(code);
-	return format_http_response(status, content_type, content, -1, NULL);
-}
-
-
-
-#if defined(WIN32)
-	#define snprintf _snprintf
-#endif
-
-static void handle_404(uv_stream_t* client, const char* path_info) 
-{
-	char* respone;
-	char buffer[1024];
-	snprintf(buffer, sizeof(buffer), "<html><head><title>404 Not Found</title></head><body bgcolor='white'><center><h1>404 Not Found</h1></center><hr><center>Igropyr/%s</center><p>%s</p></body></html>", IGROPYR_VERSION, path_info);
-	respone = format_http_response("404 Not Found", "text/html", buffer, -1, NULL);
-	write_uv_data(client, respone, -1, 0, 1);
-}
-
-
-
-static void send_file(uv_stream_t* client, const char* content_type, const char* file, const char* path_info) 
-{
-	int file_size, read_bytes, respone_size;
-	unsigned char *file_data, *respone;
-	FILE* fp = fopen(file, "rb");
-	if(fp) 
-	{
-		fseek(fp, 0, SEEK_END);
-		file_size = ftell(fp);
-		fseek(fp, 0, SEEK_SET);
-		file_data = (unsigned char*) malloc(file_size);
-		read_bytes = fread(file_data, 1, file_size, fp);
-		assert(read_bytes == file_size);
-		fclose(fp);
-
-		respone_size = 0;
-		respone = format_http_response("200 OK", content_type, file_data, file_size, &respone_size);
-		free(file_data);
-		write_uv_data(client, respone, respone_size, 0, 1);
-	} 
-	else 
-	{
-		handle_404(client, path_info);
-	}
-}
-
-
-static const char* handle_content_type(const char* postfix) 
+static char* handle_content_type(const char* postfix) 
 {
 	if(strcmp(postfix, "html") == 0 || strcmp(postfix, "htm") == 0)
 		return "text/html";
@@ -231,6 +179,113 @@ static const char* handle_content_type(const char* postfix)
 	else
 		return "application/octet-stream";
 }
+   	
+#if defined(WIN32)
+	#define snprintf _snprintf
+#endif
+
+char* igropyr_errorpage(int error_code, const char* path_info) 
+{
+	char* respone;
+	const char* error = handle_status_code(error_code);
+	char buffer[1024];
+	snprintf(buffer, sizeof(buffer), "<html><head><title>%s</title></head><body bgcolor='white'><center><h1>%s</h1></center><hr><center>Igropyr/%s</center><p>%s</p></body></html>", error, error, IGROPYR_VERSION, path_info);
+	return format_http_response(error, "text/html", buffer, -1, NULL);
+}
+
+char* igropyr_response(const int code, const char* content_type, const char* cookie, const char* content) 
+{
+	char* status = handle_status_code(code);
+	return format_http_response(status, content_type, content, -1, NULL);
+}
+
+
+char* igropyr_sendfile(const int code, const char* content_type, const char* cookie, const char* file_path)
+{
+	char* status = handle_status_code(code);
+	
+	if(content_type == '\0')
+	{
+		char* postfix = strrchr(file_path, '.');
+		postfix++;
+		content_type = handle_content_type(postfix);
+	}
+	
+	if(STATIC_PATH) 
+	{
+		char file[1024];
+		int file_size;
+		int read_bytes;
+		int respone_size;
+		unsigned char* file_data;
+		unsigned char* respone;
+	
+		snprintf(file, sizeof(file), "%s%s", STATIC_PATH, file_path);
+		
+		FILE* fp = fopen(file, "rb");
+
+		if(fp) 
+		{
+			fseek(fp, 0, SEEK_END);
+			file_size = ftell(fp);
+			fseek(fp, 0, SEEK_SET);
+			file_data = (unsigned char*) malloc(file_size);
+			read_bytes = fread(file_data, 1, file_size, fp);
+			assert(read_bytes == file_size);
+			fclose(fp);
+
+			respone_size = 0;
+			respone = format_http_response(status, content_type, file_data, file_size, &respone_size);
+			free(file_data);
+			return respone;
+		}
+		else
+		{
+		return igropyr_errorpage(404, file_path);
+		}
+	}
+	else
+	{
+		return igropyr_errorpage(403, file_path);
+	}
+
+	
+}
+
+
+
+
+static void send_file(uv_stream_t* client, const char* content_type, const char* file, const char* file_path) 
+{
+	int file_size;
+	int read_bytes;
+	int respone_size;
+	unsigned char* file_data;
+	unsigned char* respone;
+
+	FILE* fp = fopen(file, "rb");
+	if(fp) 
+	{
+		fseek(fp, 0, SEEK_END);
+		file_size = ftell(fp);
+		fseek(fp, 0, SEEK_SET);
+		file_data = (unsigned char*) malloc(file_size);
+		read_bytes = fread(file_data, 1, file_size, fp);
+		assert(read_bytes == file_size);
+		fclose(fp);
+
+		respone_size = 0;
+		respone = format_http_response("200 OK", content_type, file_data, file_size, &respone_size);
+		free(file_data);
+		write_uv_data(client, respone, respone_size, 0, 1);
+	} 
+	else 
+	{
+		respone = igropyr_errorpage(404, file_path);
+		write_uv_data(client, respone, -1, 0, 1);
+	}
+}
+
 
 
 typedef char* (*igropyr_res)(char* request_header, char* path_info, char* payload); 
@@ -253,16 +308,17 @@ static void handle_get(uv_stream_t* client, const char* request_header, const ch
 	if(postfix) 
 	{
 		postfix++;
-		if(_doc_root_path) 
+		if(STATIC_PATH) 
 		{
 			char file[1024];
-			snprintf(file, sizeof(file), "%s%s", _doc_root_path, path_info);
+			snprintf(file, sizeof(file), "%s%s", STATIC_PATH, path_info);
 			send_file(client, handle_content_type(postfix), file, path_info);
 			return;
 		}
 		else
 		{
-			handle_404(client, path_info);
+			char* respone = igropyr_errorpage(403, path_info);
+			write_uv_data(client, respone, -1, 0, 1);
 			return;
 		}
 	}
@@ -283,6 +339,7 @@ static void on_uv_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* bu
 {
 	*buf = uv_buf_init(malloc(suggested_size), suggested_size);
 }
+
 
 static void on_uv_read(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) 
 {
@@ -347,13 +404,13 @@ static void on_uv_read(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf)
 			} 
 			else 
 			{
-				igropyr_close_client(client);
+				close_client(client);
 			}
 		}
 	}
 	else if(nread == -1) 
 	{
-		igropyr_close_client(client);
+		close_client(client);
 	}
 
 	if(buf->base)
@@ -366,7 +423,6 @@ static void on_uv_read(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf)
 static void on_connection(uv_stream_t* server, int status) 
 {
 	assert(server == (uv_stream_t*)&_server);
-	
 	if(status == 0) 
 	{
 		uv_tcp_t* client = (uv_tcp_t*)malloc(sizeof(uv_tcp_t));
@@ -424,11 +480,14 @@ int igropyr_par(char* router_info, char* path_info)
 			else
 			{
 				for(;*p2 != '/'; p2++)
-	 			{
-	 			}
+	 			{}
 			}
 		}
 	}
 
 }
+
+
+
+
 
