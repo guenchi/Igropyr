@@ -5,6 +5,8 @@
     set
     request
     response
+    sendfile
+    errorpage
     par
   )
   (import
@@ -26,6 +28,12 @@
   (define igropyr_response
     (foreign-procedure "igropyr_response" (int string string string) string))
 
+  (define igropyr_sendfile
+    (foreign-procedure "igropyr_sendfile" (int string string string) string))
+
+  (define errorpage
+    (foreign-procedure "igropyr_errorpage" (int string) string))
+
   (define par
     (foreign-procedure "igropyr_par" (string string) boolean))
 
@@ -41,6 +49,12 @@
       (if (list? content)
         (igropyr_response status type (car content) (cadr content))
         (igropyr_response status type "" content))))
+
+    (define sendfile
+    (lambda (status type content)
+      (if (list? content)
+        (igropyr_sendfile status type (car content) (cadr content))
+        (igropyr_sendfile status type "" content))))
 
   (define ref
     (lambda (str x)
