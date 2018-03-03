@@ -92,4 +92,3 @@ We recommand use ***Catapult*** as Webframework
 
 https://github.com/guenchi/Catapult
 
-中文api手册：https://guenchi.gitbooks.io/igropyr-zhcn/
