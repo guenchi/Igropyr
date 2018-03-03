@@ -95,9 +95,10 @@ char* format_http_response(const char* status, const char* content_type, const v
 	totalsize = strlen(status) + strlen(content_type) + content_length + 128;
 	respone = (char*) malloc(totalsize);
 	header_size = sprintf(respone,  "HTTP/1.1 %s\r\n"
-									"Content-Type:%s;charset=utf-8\r\n"
-									"Content-Length:%d\r\n\r\n",
-						status, content_type, content_length);
+					"Server: Igropyr/%s\r\n"
+					"Content-Type: %s;charset=utf-8\r\n"
+					"Content-Length: %d\r\n\r\n",
+						status, IGROPYR_VERSION, content_type, content_length);
 	assert(header_size > 0);
 	if(content) 
 	{
