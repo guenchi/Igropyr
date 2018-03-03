@@ -1,8 +1,10 @@
 # Igropyr
 a async Scheme http server base on libuv
 
-How fast？
+How fast？ 
 ![image](https://github.com/guenchi/Igropyr/blob/master/benchmark.png)
+(MacBook Pro Retina, High Sierra 10.13.3, Mid 2014 2.2 GHz Intel Core i7, 16 GB 1600 MHz DDR3)
+
 To be honest, I'm scared myself...
 I think the reason is more likely that the Chez Scheme is very very very fast!!! 
 I test with the --script option and don't compile the scheme file...
