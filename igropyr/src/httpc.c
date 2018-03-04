@@ -7,7 +7,7 @@
 #include <memory.h>
 #include <ctype.h>
 
-#define IGROPYR_VERSION "0.2.2"
+#define IGROPYR_VERSION "0.2.3"
 
 
 uv_tcp_t    _server;
@@ -202,60 +202,6 @@ char* igropyr_response(const int code, const char* content_type, const char* coo
 }
 
 
-char* igropyr_sendfile(const int code, const char* content_type, const char* cookie, const char* file_path)
-{
-	char* status = handle_status_code(code);
-	
-	if(*content_type == '\0')
-	{
-		char* postfix = strrchr(file_path, '.');
-		postfix++;
-		content_type = handle_content_type(postfix);
-	}
-	
-	if(STATIC_PATH) 
-	{
-		char file[1024];
-		int file_size;
-		int read_bytes;
-		int respone_size;
-		unsigned char* file_data;
-		unsigned char* respone;
-	
-		snprintf(file, sizeof(file), "%s%s", STATIC_PATH, file_path);
-		
-		FILE* fp = fopen(file, "rb");
-
-		if(fp) 
-		{
-			fseek(fp, 0, SEEK_END);
-			file_size = ftell(fp);
-			fseek(fp, 0, SEEK_SET);
-			file_data = (unsigned char*) malloc(file_size);
-			read_bytes = fread(file_data, 1, file_size, fp);
-			assert(read_bytes == file_size);
-			fclose(fp);
-
-			respone_size = 0;
-			respone = format_http_response(status, content_type, file_data, file_size, &respone_size);
-			free(file_data);
-			return respone;
-		}
-		else
-		{
-		return igropyr_errorpage(404, file_path);
-		}
-	}
-	else
-	{
-		return igropyr_errorpage(403, file_path);
-	}
-
-	
-}
-
-
-
 
 static void send_file(uv_stream_t* client, const char* content_type, const char* file, const char* file_path) 
 {
@@ -303,6 +249,7 @@ int handle_request(igropyr_res response_get, igropyr_res response_post)
 }
 
 
+
 static void handle_get(uv_stream_t* client, const char* request_header, const char* path_info, const char* query_stirng) 
 {
 	char* postfix = strrchr(path_info, '.');
@@ -327,14 +274,63 @@ static void handle_get(uv_stream_t* client, const char* request_header, const ch
 	else
 	{
 		char* respone = res_get(request_header, path_info, query_stirng);
+		if(*respone == ' ')
+		{
+			if(STATIC_PATH) 
+			{				
+				char* file_path = respone;
+				file_path++;
+				postfix = strrchr(file_path, '.');
+				postfix++;
+				char file[1024];
+				snprintf(file, sizeof(file), "%s%s", STATIC_PATH, file_path);
+				send_file(client, handle_content_type(postfix), file, path_info);
+				return;
+			}
+			else
+			{
+				char* respone = igropyr_errorpage(403, path_info);
+				write_uv_data(client, respone, -1, 0, 1);
+				return;
+			}
+		}
+		else
+		{
 		write_uv_data(client, respone, -1, 0, 1);
+		return;
+		}
 	}
 }
 
 static void handle_post(uv_stream_t* client, const char* request_header, const char* path_info, const char* payload) 
 {
-		char* respone = res_post(request_header, path_info, payload);
-		write_uv_data(client, respone, -1, 0, 1);
+	char* respone = res_post(request_header, path_info, payload);
+		
+	if(*respone == ' ')
+	{
+		if(STATIC_PATH) 
+		{				
+			char* file_path = respone;
+			file_path++;
+			char* postfix = strrchr(file_path, '.');
+			postfix++;
+			char file[1024];
+			snprintf(file, sizeof(file), "%s%s", STATIC_PATH, file_path);
+			send_file(client, handle_content_type(postfix), file, path_info);
+			return;
+		}
+		else
+		{
+			char* respone = igropyr_errorpage(403, path_info);
+			write_uv_data(client, respone, -1, 0, 1);
+			return;
+		}
+	}
+	else
+	{
+	write_uv_data(client, respone, -1, 0, 1);
+	return;
+	}
 }
 
 static void on_uv_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) 
