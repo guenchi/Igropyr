@@ -28,9 +28,6 @@
   (define igropyr_response
     (foreign-procedure "igropyr_response" (int string string string) string))
 
-  (define igropyr_sendfile
-    (foreign-procedure "igropyr_sendfile" (int string string string) string))
-
   (define igropyr_errorpage
     (foreign-procedure "igropyr_errorpage" (int string) string))
 
@@ -51,10 +48,8 @@
         (igropyr_response status type "" content))))
 
     (define sendfile
-    (lambda (status type content)
-      (if (list? content)
-        (igropyr_sendfile status type (car content) (cadr content))
-        (igropyr_sendfile status type "" content))))
+      (lambda (type content)
+        (string-append " " content)))
 
   (define ref
     (lambda (str x)
@@ -79,12 +74,12 @@
                   ((integer? e) (list (cons 'port e)))
                   (else '())))
         ((_ e1 e2) #'(list (cons 'ip e1)(cons 'port e2))))))
- 
- (define-syntax errorpage
-   (lambda (x)
-     (syntax-case x ()
-       ((_ e) #'(igropyr_errorpage e ""))
-       ((_ e1 e2) #'(igropyr_errorpage e1 e2)))))
+
+  (define-syntax errorpage
+    (lambda (x)
+      (syntax-case x ()
+        ((_ e) #'(igropyr_errorpage e ""))
+        ((_ e1 e2) #'(igropyr_errorpage e1 e2)))))
 
   (define server 
     (lambda (req_get req_post set listen)
