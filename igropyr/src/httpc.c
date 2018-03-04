@@ -205,7 +205,7 @@ char* igropyr_sendfile(const int code, const char* content_type, const char* coo
 {
 	char* status = handle_status_code(code);
 	
-	if(content_type == '\0')
+	if(*content_type == '\0')
 	{
 		char* postfix = strrchr(file_path, '.');
 		postfix++;
