@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <string.h>
 #include <memory.h>
+#include <ctype.h>
 
 #define IGROPYR_VERSION "0.2.2"
 
