@@ -1,6 +1,4 @@
 # Igropyr
-a async Scheme http server base on libuv
-
 for Chez Scheme, support Unix, MacOS, Linux, Windows
 
 How fast？ 
