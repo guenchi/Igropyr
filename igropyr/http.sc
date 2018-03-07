@@ -16,14 +16,7 @@
 
 
 
-  (define lib-name
-    (case (machine-type)
-      ((a6nt i3nt ta6nt ti3nt) ".\\igropyr\\src\\httpc.dll")
-      ((a6le i3le ta6le ti3le) "./igropyr/src/httpc.so")
-      ((a6osx i3osx ta6osx ti3osx) "./igropyr/src/httpc.so")
-      (else "./igropyr/src/httpc.so")))
-
-  (define lib (load-shared-object lib-name))
+(define lib (load-shared-object "./lib/igropyr/httpc.so"))
 
   (define igropyr_init
     (foreign-procedure "igropyr_init" (string string int) int)
