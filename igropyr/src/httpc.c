@@ -7,7 +7,7 @@
 #include <memory.h>
 #include <ctype.h>
 
-#define IGROPYR_VERSION "0.2.3"
+#define IGROPYR_VERSION "0.2.4"
 
 
 uv_tcp_t    _server;
@@ -83,7 +83,7 @@ static void write_uv_data(uv_stream_t* client, const void* data, unsigned int le
 	uv_write(w, client, &buf, 1, after_uv_write); 
 }
 
-char* format_http_response(const char* status, const char* content_type, const void* content, int content_length, int* respone_size) 
+char* format_http_response(const char* status, const char* content_type, const char* cookie, const void* content, int content_length, int* respone_size) 
 {
 	int totalsize, header_size;
 	char* respone;
@@ -95,12 +95,25 @@ char* format_http_response(const char* status, const char* content_type, const v
 		
 	totalsize = strlen(status) + strlen(content_type) + content_length + 128;
 	respone = (char*) malloc(totalsize);
-	header_size = sprintf(respone,  "HTTP/1.1 %s\r\n"
+	if(cookie)
+	{
+		header_size = sprintf(respone,  "HTTP/1.1 %s\r\n"
+									"Server: Igropyr/%s\r\n"
+									"Content-Type: %s; charset=utf-8\r\n"
+									"Content-Length: %d\r\n"
+									"Set-Cookie: %s\r\n\r\n",
+									status, IGROPYR_VERSION, content_type, content_length, cookie);
+	}
+	else
+	{
+		header_size = sprintf(respone,  "HTTP/1.1 %s\r\n"
 									"Server: Igropyr/%s\r\n"
 									"Content-Type: %s; charset=utf-8\r\n"
 									"Content-Length: %d\r\n\r\n",
-						status, IGROPYR_VERSION, content_type, content_length);
+									status, IGROPYR_VERSION, content_type, content_length);
+	}
 	assert(header_size > 0);
+	
 	if(content) 
 	{
 		memcpy(respone + header_size, content, content_length);
@@ -192,13 +205,13 @@ char* igropyr_errorpage(int error_code, const char* error_info)
 	const char* error = handle_status_code(error_code);
 	char buffer[1024];
 	snprintf(buffer, sizeof(buffer), "<html><head><title>%s</title></head><body bgcolor='white'><center><h1>%s</h1></center><hr><center>Igropyr/%s</center><p>%s</p></body></html>", error, error, IGROPYR_VERSION, error_info);
-	return format_http_response(error, "text/html", buffer, -1, NULL);
+	return format_http_response(error, "text/html", NULL, buffer, -1, NULL);
 }
 
 char* igropyr_response(const int code, const char* content_type, const char* cookie, const char* content) 
 {
 	char* status = handle_status_code(code);
-	return format_http_response(status, content_type, content, -1, NULL);
+	return format_http_response(status, content_type, cookie, content, -1, NULL);
 }
 
 
@@ -223,7 +236,7 @@ static void send_file(uv_stream_t* client, const char* content_type, const char*
 		fclose(fp);
 
 		respone_size = 0;
-		respone = format_http_response("200 OK", content_type, file_data, file_size, &respone_size);
+		respone = format_http_response("200 OK", content_type, NULL, file_data, file_size, &respone_size);
 		free(file_data);
 		write_uv_data(client, respone, respone_size, 0, 1);
 	} 
