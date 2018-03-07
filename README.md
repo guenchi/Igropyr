@@ -88,7 +88,7 @@ or simply use Raven to install Igropyr:
 then
 
 ```
-`$ raven run test.sc`
+$ raven run test.sc
 ```
 
 api: https://guenchi.gitbooks.io/igropyr/
