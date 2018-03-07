@@ -82,7 +82,6 @@ or simply use Raven to install Igropyr:
 (listen "127.0.0.1" 8080)               ;define the ip and port that server listen on
 (listen "127.0.0.1")                    ;if only define the ip, port use default 80
 (listen 8080)                           ;if only define the port, ip use default "0.0.0.0"
-
 ```
 
 then
