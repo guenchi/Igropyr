@@ -12,6 +12,7 @@
   )
   (import
     (scheme)
+    (igropyr igropyr)
   )
 
 
