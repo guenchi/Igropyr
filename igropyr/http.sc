@@ -8,6 +8,7 @@
     sendfile
     errorpage
     par
+    ref
   )
   (import
     (scheme)
