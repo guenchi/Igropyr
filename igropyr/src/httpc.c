@@ -249,7 +249,7 @@ static void send_file(uv_stream_t* client, const char* content_type, const char*
 
 
 
-typedef char* (*igropyr_res)(char* request_header, char* path_info, char* payload); 
+typedef char* (*igropyr_res)(const char* request_header, const char* path_info, const char* payload); 
 
 
 igropyr_res res_get;
@@ -259,6 +259,7 @@ int handle_request(igropyr_res response_get, igropyr_res response_post)
 {
 		res_get = response_get;
 		res_post = response_post;
+		return 1;
 }
 
 
@@ -368,7 +369,7 @@ static void on_uv_read(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf)
 
 		if(separator != NULL) 
 		{
-			const char* request_header = membuf->data;
+			const char* request_header = (const char*)membuf->data;
 			*separator = '\0';
 			payload = separator + 4;
 
@@ -499,6 +500,7 @@ int igropyr_par(char* router_info, char* path_info)
 }
 
 
+
 char* igropyr_header_parser(char* http_header, char* key)
 {
 	char* begin = http_header;
@@ -543,4 +545,12 @@ loop: finder = key;
 	*end = '\0';
 	return begin;
 }
+
+
+
+
+
+
+
+
 
