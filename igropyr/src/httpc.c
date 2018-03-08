@@ -18,7 +18,7 @@ const char* STATIC_PATH = NULL;
 static void on_connection(uv_stream_t* server, int status);
 
 
-int igropyr_init(const char* static_path, const char* ip, int port)
+int igr_init(const char* static_path, const char* ip, int port)
 {
 	struct sockaddr_in addr;
 	uv_ip4_addr(ip, port, &addr);
@@ -199,7 +199,7 @@ static char* handle_content_type(const char* postfix)
 	#define snprintf _snprintf
 #endif
 
-char* igropyr_errorpage(int error_code, const char* error_info) 
+char* igr_errorpage(int error_code, const char* error_info) 
 {
 	char* respone;
 	const char* error = handle_status_code(error_code);
@@ -208,7 +208,7 @@ char* igropyr_errorpage(int error_code, const char* error_info)
 	return format_http_response(error, "text/html", NULL, buffer, -1, NULL);
 }
 
-char* igropyr_response(const int code, const char* content_type, const char* cookie, const char* content) 
+char* igr_response(const int code, const char* content_type, const char* cookie, const char* content) 
 {
 	char* status = handle_status_code(code);
 	return format_http_response(status, content_type, cookie, content, -1, NULL);
@@ -242,20 +242,20 @@ static void send_file(uv_stream_t* client, const char* content_type, const char*
 	} 
 	else 
 	{
-		respone = igropyr_errorpage(404, file_path);
+		respone = igr_errorpage(404, file_path);
 		write_uv_data(client, respone, -1, 0, 1);
 	}
 }
 
 
 
-typedef char* (*igropyr_res)(const char* request_header, const char* path_info, const char* payload); 
+typedef char* (*igr_res)(const char* request_header, const char* path_info, const char* payload); 
 
 
-igropyr_res res_get;
-igropyr_res res_post;
+igr_res res_get;
+igr_res res_post;
 
-int handle_request(igropyr_res response_get, igropyr_res response_post)
+int igr_handle_request(igr_res response_get, igr_res response_post)
 {
 		res_get = response_get;
 		res_post = response_post;
@@ -280,7 +280,7 @@ static void handle_get(uv_stream_t* client, const char* request_header, const ch
 		}
 		else
 		{
-			char* respone = igropyr_errorpage(403, path_info);
+			char* respone = igr_errorpage(403, path_info);
 			write_uv_data(client, respone, -1, 0, 1);
 			return;
 		}
@@ -303,7 +303,7 @@ static void handle_get(uv_stream_t* client, const char* request_header, const ch
 			}
 			else
 			{
-				char* respone = igropyr_errorpage(403, path_info);
+				char* respone = igr_errorpage(403, path_info);
 				write_uv_data(client, respone, -1, 0, 1);
 				return;
 			}
@@ -335,7 +335,7 @@ static void handle_post(uv_stream_t* client, const char* request_header, const c
 		}
 		else
 		{
-			char* respone = igropyr_errorpage(403, path_info);
+			char* respone = igr_errorpage(403, path_info);
 			write_uv_data(client, respone, -1, 0, 1);
 			return;
 		}
@@ -446,7 +446,7 @@ static void on_connection(uv_stream_t* server, int status)
 	}
 }
 
-int igropyr_par(char* router_info, char* path_info)
+int igr_par(char* router_info, char* path_info)
 {
 	char* p1 = router_info + 1;
 	char* p2 = path_info + 1;
@@ -501,7 +501,7 @@ int igropyr_par(char* router_info, char* path_info)
 
 
 
-char* igropyr_header_parser(char* http_header, char* key)
+char* igr_header_parser(char* http_header, char* key)
 {
 	char* begin = http_header;
 	char* end;
