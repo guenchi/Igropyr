@@ -505,36 +505,36 @@ char* igropyr_header_parser(char* http_header, char* key)
 	char* end;
 	char* finder;
 
-		loop: finder = key;
-		if(*begin == *finder)
+loop: finder = key;
+	if(*begin == *finder)
+	{
+		for(; *finder != '\0';)
 		{
-			for(; *finder != '\0';)
-			{
-				if(*begin != *finder)
-				{
-					for(;*begin != '\r'; begin++)
-					{}
-					begin = begin + 2;
-					goto loop;
-				}
-				begin++;
-				finder++;
-			}	
-		}
-		else
-		{
-			if(*begin == '\0')
-			{
-				return("");
-			}
-			else
+			if(*begin != *finder)
 			{
 				for(;*begin != '\r'; begin++)
 				{}
 				begin = begin + 2;
 				goto loop;
 			}
+			begin++;
+			finder++;
+		}	
+	}
+	else
+	{
+	if(*begin == '\0')
+	{
+		return("");
 		}
+		else
+		{
+			for(;*begin != '\r'; begin++)
+			{}
+			begin = begin + 2;
+			goto loop;
+		}
+	}
 	begin++;
 	while(isspace(*begin))
 		begin++;
