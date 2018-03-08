@@ -7,8 +7,8 @@
     response
     sendfile
     errorpage
-    header-parser
     par
+    header-parser
   )
   (import
     (scheme)
@@ -16,28 +16,26 @@
   )
 
 
+  (define lib (load-shared-object "./lib/igropyr/httpc.so"))
 
-
-(define lib (load-shared-object "./lib/igropyr/httpc.so"))
-
-  (define igropyr_init
-    (foreign-procedure "igropyr_init" (string string int) int)
+  (define igr_init
+    (foreign-procedure "igr_init" (string string int) int)
   )
 
-  (define handle_request
-    (foreign-procedure "handle_request" (iptr iptr) int))
+  (define igr_request
+    (foreign-procedure "igr_handle_request" (iptr iptr) int))
 
-  (define igropyr_response
-    (foreign-procedure "igropyr_response" (int string string string) string))
+  (define igr_response
+    (foreign-procedure "igr_response" (int string string string) string))
 
-  (define igropyr_errorpage
-    (foreign-procedure "igropyr_errorpage" (int string) string))
- 
+  (define igr_errorpage
+    (foreign-procedure "igr_errorpage" (int string) string))
+
   (define header-parser
-    (foreign-procedure "igropyr_header_parser" (string string) string))
+    (foreign-procedure "igr_header_parser" (string string) string))
 
   (define par
-    (foreign-procedure "igropyr_par" (string string) boolean))
+    (foreign-procedure "igr_par" (string string) boolean))
 
 
   (define request
@@ -49,20 +47,13 @@
   (define response
     (lambda (status type content)
       (if (list? content)
-        (igropyr_response status type (car content) (cadr content))
-        (igropyr_response status type "" content))))
+        (igr_response status type (car content) (cadr content))
+        (igr_response status type "" content))))
 
     (define sendfile
       (lambda (type content)
         (string-append " " content)))
 
-  (define ref
-    (lambda (str x)
-      (if (null? str)
-        '()
-        (if (equal? (caar str) x)
-          (cdar str)
-          (ref (cdr str) x)))))
 
   (define-syntax set
     (lambda (x)
@@ -83,19 +74,19 @@
   (define-syntax errorpage
     (lambda (x)
       (syntax-case x ()
-        ((_ e) #'(igropyr_errorpage e ""))
-        ((_ e1 e2) #'(igropyr_errorpage e1 e2)))))
+        ((_ e) #'(igr_errorpage e ""))
+        ((_ e1 e2) #'(igr_errorpage e1 e2)))))
 
   (define server 
-    (lambda (req_get req_post set listen)
+    (lambda (res_get res_post set listen)
       (let ((staticpath (ref set 'staticpath))
             ;(connections (ref set 'connections))
             ;(keepalive (ref set 'keepalive))
             (ip (ref listen 'ip))
             (port (ref listen 'port)))
         (begin 
-          (handle_request req_get req_post)
-          (igropyr_init
+          (igr_request res_get res_post)
+          (igr_init
             (if (null? staticpath)
             ""
             staticpath)
@@ -111,6 +102,10 @@
           (if (null? port)
             80
             port))))))
+
+
+
+
   
 )
 
