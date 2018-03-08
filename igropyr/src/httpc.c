@@ -499,6 +499,25 @@ int igropyr_par(char* router_info, char* path_info)
 }
 
 
-
+char* igropyr_header_parser(char* http_header, char* key)
+{
+	char* begin = strstr(http_header, key);
+	if(begin)
+	{
+	begin = begin + strlen(key);
+	begin ++;
+	while(isspace(*begin))
+		begin++;
+	char* end;
+	for(end = begin + 1; *end != '\r'; end++)
+	{}
+	*end = '\0';
+	return begin;
+	}
+	else
+	{
+		return("");
+	}
+}
 
 
