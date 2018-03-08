@@ -50,7 +50,6 @@ or simply use Raven to install Igropyr:
 ***start server:***
 
 ```
-
 (define get
     (lambda (request_header pathinfo query_string)
         (response 200 "text/plain" "Hello World")))
