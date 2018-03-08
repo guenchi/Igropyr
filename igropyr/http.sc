@@ -7,8 +7,8 @@
     response
     sendfile
     errorpage
+    header-parser
     par
-    ref
   )
   (import
     (scheme)
@@ -32,6 +32,9 @@
 
   (define igropyr_errorpage
     (foreign-procedure "igropyr_errorpage" (int string) string))
+ 
+  (define header-parser
+    (foreign-procedure "igropyr_header_parser" (string string) string))
 
   (define par
     (foreign-procedure "igropyr_par" (string string) boolean))
