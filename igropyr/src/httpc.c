@@ -242,7 +242,7 @@ static void send_file(uv_stream_t* client, const char* content_type, const char*
 	} 
 	else 
 	{
-		respone = igr_errorpage(404, file_path);
+		respone = (unsigned char*)igr_errorpage(404, file_path);
 		write_uv_data(client, respone, -1, 0, 1);
 	}
 }
@@ -503,49 +503,24 @@ int igr_par(char* router_info, char* path_info)
 
 char* igr_header_parser(char* http_header, char* key)
 {
-	char* begin = http_header;
-	char* end;
-	char* finder;
-
-loop: finder = key;
-	if(*begin == *finder)
+	char* begin = strstr(http_header, key);
+	if(begin)
 	{
-		for(; *finder != '\0';)
-		{
-			if(*begin != *finder)
-			{
-				for(;*begin != '\r'; begin++)
-				{}
-				begin = begin + 2;
-				goto loop;
-			}
-			begin++;
-			finder++;
-		}	
-	}
-	else
-	{
-	if(*begin == '\0')
-	{
-		return("");
-		}
-		else
-		{
-			for(;*begin != '\r'; begin++)
-			{}
-			begin = begin + 2;
-			goto loop;
-		}
-	}
-	begin++;
+	begin = begin + strlen(key);
+	begin ++;
 	while(isspace(*begin))
 		begin++;
+	char* end;
 	for(end = begin + 1; *end != '\r'; end++)
 	{}
 	*end = '\0';
 	return begin;
+	}
+	else
+	{
+		return("");
+	}
 }
-
 
 
 
