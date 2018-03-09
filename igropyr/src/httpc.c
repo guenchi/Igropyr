@@ -221,8 +221,9 @@ static void send_file(uv_stream_t* client, const char* content_type, const char*
 	int file_size;
 	int read_bytes;
 	int respone_size;
+	char* respone;
 	unsigned char* file_data;
-	unsigned char* respone;
+	
 
 	FILE* fp = fopen(file, "rb");
 	if(fp) 
@@ -242,7 +243,7 @@ static void send_file(uv_stream_t* client, const char* content_type, const char*
 	} 
 	else 
 	{
-		respone = (unsigned char*)igr_errorpage(404, file_path);
+		respone = igr_errorpage(404, file_path);
 		write_uv_data(client, respone, -1, 0, 1);
 	}
 }
