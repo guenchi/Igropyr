@@ -1,11 +1,11 @@
 # Igropyr
 for Chez Scheme, support Unix, MacOS, Linux, Windows
 
-How fast？ 
+How fast？ (test on single thread)
 ![image](https://github.com/guenchi/Igropyr/blob/master/benckmark.png?raw=true)
 (MacBook Pro Retina, High Sierra 10.13.3, Mid 2014 2.2 GHz Intel Core i7, 16 GB 1600 MHz DDR3)
 
-Chez Scheme run with the --script option and don't compile scheme code, Nginx run on single thread.
+Chez Scheme run with the --script option and don't compile scheme code
 
 ***Igropyr*** is
 
