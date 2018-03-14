@@ -20,14 +20,10 @@ Chez Scheme run with the --script option and don't compile scheme code
 
 .a Scheme version's Node.js
 
-
-.base on libuv
-
-
-Node = Javascript + V8 + libuv
-
-Igropyr = Scheme + ChezScheme + libuv
 ```
+***Node*** = Javascript + V8 + libuv
+
+***Igropyr*** = Scheme + ChezScheme + libuv
 
 
 ***install Igropyr***
