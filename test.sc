@@ -87,7 +87,25 @@
         "   ok"
         "   error\n"))
 (newline)
+
+
+(display "test procedure par...")
+(display
+    (if 
+        (and 
+            (par "/abc" "/abc")
+            (not (par "/abc" "/123"))
+            (par "/*" "/abc")
+            (par "/*/abc" "/efg/abc")
+            (not (par "/*/abc" "/abc/efg"))
+            (par "/abc/*/efg" "/abc/ace/efg")
+            (par "/a*/abc" "/alm/abc"))
+        "           ok"
+        "           error\n"))
 (newline)
+(newline)
+
+
 
 (display "Test complished!")
 (newline)
