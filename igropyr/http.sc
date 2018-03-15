@@ -55,11 +55,12 @@
         (string-append " " content)))
 
 
-  (define-syntax set
+(define-syntax set
     (lambda (x)
       (syntax-case x ()
         ((_) #''())
-        ((_ (e1 e2)) #'(list (cons e1 e2))))))
+        ((_ (e1 e2)) #'(list (cons e1 e2)))
+        ((_ (e1 e2) (e3 e4) ...) #'(list (cons e1 e2) (cons e3 e4) ...)))))
 
   (define-syntax listen
     (lambda (x)
