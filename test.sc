@@ -33,7 +33,8 @@
             (equal? (header-parser header "User-Agent") "Mozilla/5.0 (Macintosh, Intel Mac OS X 10_13_3) AppleWebKit/604.5.6 (KHTML, like Gecko) Version/11.0.3 Safari/604.5.6")
             (equal? (header-parser header "Accept-Language") "zh-cn")
             (equal? (header-parser header "Accept-Encoding") "gzip, deflate")
-            (equal? (header-parser header "Connection") "keep-alive"))
+            (equal? (header-parser header "Connection") "keep-alive")
+            (equal? (header-parser header "Cookie") ""))
         "     ...ok"
         "     ...error\n"))
 (newline)
