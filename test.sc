@@ -25,7 +25,7 @@
 
 
 
-(display "test procedure ref")
+(display "test procedure ref...")
 (display
     (if 
         (and 
@@ -33,11 +33,11 @@
             (equal? (ref testlist 'b) "b")
             (equal? (ref testlist "c") 'c)
             (equal? (ref testlist 'num) 123))
-        "     ...ok"
-        "     ...error\n"))
+        "           ok"
+        "           error\n"))
 (newline)
 
-(display "test procedure val")
+(display "test procedure val...")
 (display
     (if 
         (and 
@@ -45,26 +45,35 @@
             (equal? (val testlist "b") 'b)
             (equal? (val testlist 'c) "c")
             (equal? (val testlist 123) 'num))
-        "     ...ok"
-        "     ...error\n"))
+        "           ok"
+        "           error\n"))
 (newline)
 
-(display "test procedure set")
+(display "test procedure set...")
 (display
     (if 
         (and 
             (equal? (ref serverset 'staticpath) "/usr/local/www/")
             (equal? (ref serverset 'connections) 1024)
             (equal? (ref serverset 'keepalive) 5000))
-        "     ...ok"
-        "     ...error\n"))
+        "           ok"
+        "           error\n"))
 (newline)
 
 
-(display "test procedure listen")
+(display "test procedure listen...")
+(display
+    (if 
+        (and 
+            (equal? (ref (listen 80) 'port) 80)
+            (equal? (ref (listen "127.0.0.1") 'ip) "127.0.0.1")
+            (equal? (ref (listen "127.0.0.1" 80) 'ip) "127.0.0.1")
+            (equal? (ref (listen "127.0.0.1" 80) 'port) 80))
+        "        ok"
+        "        error\n"))
 (newline)
 
-(display "test procedure head-parser")
+(display "test procedure head-parser...")
 (display
     (if 
         (and 
@@ -75,8 +84,8 @@
             (equal? (header-parser header "Accept-Encoding") "gzip, deflate")
             (equal? (header-parser header "Connection") "keep-alive")
             (equal? (header-parser header "Cookie") ""))
-        "     ...ok"
-        "     ...error\n"))
+        "   ok"
+        "   error\n"))
 (newline)
 (newline)
 
