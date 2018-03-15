@@ -17,6 +17,8 @@
         ('connections 1024)
         ('keepalive 5000)))
 
+
+(newline)
 (display "Start test...")
 (newline)
 (newline)
@@ -35,6 +37,17 @@
         "     ...error\n"))
 (newline)
 
+(display "test procedure val")
+(display
+    (if 
+        (and 
+            (equal? (val testlist 'a) 'a)
+            (equal? (val testlist "b") 'b)
+            (equal? (val testlist 'c) "c")
+            (equal? (val testlist 123) 'num))
+        "     ...ok"
+        "     ...error\n"))
+(newline)
 
 (display "test procedure set")
 (display
@@ -67,6 +80,6 @@
 (newline)
 (newline)
 
-(display "Test complished")
+(display "Test complished!")
 (newline)
 (newline)
