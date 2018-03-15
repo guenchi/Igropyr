@@ -4,16 +4,39 @@
 
 (define header "HTTP/1.1\r\n Host: 127.0.0.1:8081\r\nUpgrade-Insecure-Requests: 1\r\nAccept: text/html,application/xhtml+xml,application/xml,q=0.9,*/*,q=0.8\r\nUser-Agent: Mozilla/5.0 (Macintosh, Intel Mac OS X 10_13_3) AppleWebKit/604.5.6 (KHTML, like Gecko) Version/11.0.3 Safari/604.5.6\r\nAccept-Language: zh-cn\r\nAccept-Encoding: gzip, deflate\r\nConnection: keep-alive\r\n")
 
-(display "Start test...")
-(newline)
-(newline)
+(define testlist
+    (list
+        (cons 'a 'a)
+        (cons 'b "b")
+        (cons "c" 'c)
+        (cons 'num 123)))
 
-(display "test procedure set")
 (define serverset 
     (set 
         ('staticpath "/usr/local/www/")
         ('connections 1024)
         ('keepalive 5000)))
+
+(display "Start test...")
+(newline)
+(newline)
+
+
+
+(display "test procedure ref")
+(display
+    (if 
+        (and 
+            (equal? (ref testlist 'a) 'a)
+            (equal? (ref testlist 'b) "b")
+            (equal? (ref testlist "c") 'c)
+            (equal? (ref testlist 'num) 123))
+        "     ...ok"
+        "     ...error\n"))
+(newline)
+
+
+(display "test procedure set")
 (display
     (if 
         (and 
@@ -22,6 +45,10 @@
             (equal? (ref serverset 'keepalive) 5000))
         "     ...ok"
         "     ...error\n"))
+(newline)
+
+
+(display "test procedure listen")
 (newline)
 
 (display "test procedure head-parser")
