@@ -8,6 +8,22 @@
 (newline)
 (newline)
 
+(display "test procedure set")
+(define serverset 
+    (set 
+        ('staticpath "/usr/local/www/")
+        ('connections 1024)
+        ('keepalive 5000)))
+(display
+    (if 
+        (and 
+            (equal? (ref serverset 'staticpath) "/usr/local/www/")
+            (equal? (ref serverset 'connections) 1024)
+            (equal? (ref serverset 'keepalive) 5000))
+        "     ...ok"
+        "     ...error\n"))
+(newline)
+
 (display "test procedure head-parser")
 (display
     (if 
