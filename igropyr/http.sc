@@ -7,8 +7,9 @@
     response
     sendfile
     errorpage
-    par
     header-parser
+    path-parser
+    par
   )
   (import
     (scheme)
@@ -33,6 +34,9 @@
 
   (define header-parser
     (foreign-procedure "igr_header_parser" (string string) string))
+ 
+  (define path-parser
+    (foreign-procedure "igr_path_parser" (string int) string))
 
   (define par
     (foreign-procedure "igr_par" (string string) boolean))
