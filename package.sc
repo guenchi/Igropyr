@@ -1,5 +1,5 @@
 (("name" . "igropyr")
-("version" . "0.2.6")
+("version" . "0.2.7")
 ("description" . "a async Scheme http server base on libuv")
 ("keywords"
     ("Scheme" "http-server" "async"))
