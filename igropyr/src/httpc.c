@@ -529,10 +529,9 @@ char* igr_path_parser(char* path, int i)
 {
 	char* begin = path;
 	char* end;
-	int n;
-	int m = i + 1;
+	int n = 0;
 
-	for(n = 0; n < m;)
+	for( ; ;)
 	{
 		if(*begin == '/')
 		{
@@ -554,11 +553,11 @@ char* igr_path_parser(char* path, int i)
 			if(*end == '/')
 			{
 				*end = '\0';
-				n++;
+				break;
 			}
 			else if(*end == '\0')
 			{
-				n++;
+				break;
 			}
 			else
 			{
@@ -581,7 +580,6 @@ char* igr_path_parser(char* path, int i)
 	
 	return begin;
 }
-
 
 
 
