@@ -7,7 +7,7 @@
 #include <memory.h>
 #include <ctype.h>
 
-#define IGROPYR_VERSION "0.2.6"
+#define IGROPYR_VERSION "0.2.7"
 
 
 uv_tcp_t    _server;
@@ -525,7 +525,62 @@ char* igr_header_parser(char* http_header, char* key)
 
 
 
+char* igr_path_parser(char* path, int i)
+{
+	char* begin = path;
+	char* end;
+	int n;
+	int m = i + 1;
 
+	for(n = 0; n < m;)
+	{
+		if(*begin == '/')
+		{
+			if(n == i)
+			{
+				begin++;
+				end = begin;
+				i = 0;
+			}
+			else
+			{
+				begin++;
+				n++;
+			}
+			
+		}
+		else if(i == 0)
+		{
+			if(*end == '/')
+			{
+				*end = '\0';
+				n++;
+			}
+			else if(*end == '\0')
+			{
+				n++;
+			}
+			else
+			{
+				end++;
+			}			
+		}
+		else
+		{
+			if(*begin == '\0')
+			{
+				begin = "";
+				break;
+			}
+			else
+			{
+				begin++;
+			}
+		}
+	}
+	
+	return begin;
+}
 
 
 
