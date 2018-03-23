@@ -107,12 +107,12 @@
 (newline)
 
 
-(display "test procedure list->json...")
+(display "test procedure list-parser...")
 (display
     (if 
-            (equal? (list->json querylist) "{\"user\":\"igropyr\",\"psw\":\"catapult\"}")
-        "    ok"
-        "    error"))
+            (equal? (list-parser querylist) "{\"user\":\"igropyr\",\"psw\":\"catapult\"}")
+        "   ok"
+        "   error"))
 (newline)
 (newline)
 
