@@ -4,7 +4,7 @@
     val
     str-index
     split
-    list->json
+    list-parser
   )
   (import
     (scheme)
@@ -47,7 +47,7 @@
                             (list s)))))))
 
 
-    (define list->json
+    (define list-parser
         (lambda (lst)
             (let loop ((lst lst)(x "{"))
                 (if (null? (cdr lst))
