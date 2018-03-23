@@ -4,6 +4,7 @@
     val
     str-index
     split
+    list->json
   )
   (import
     (scheme)
@@ -44,5 +45,19 @@
                         (if i 
                             (cons (substring s 0 i) (loop (substring s (+ i 1) (string-length s))))
                             (list s)))))))
+
+
+    (define list->json
+        (lambda (lst)
+            (let loop ((lst lst)(x "{"))
+                (if (null? (cdr lst))
+                    (string-append x "\"" (caar lst) "\":\"" 
+                        (if (list? (cdar lst))
+                            (loop (cdar lst) "{")
+                            (cdr (car lst))) "\"}")
+                    (loop (cdr lst) (string-append x "\"" (caar lst) "\":\"" 
+                        (if (list? (cdar lst))
+                            (loop (cdar lst) "{")
+                            (cdar lst)) "\"," ))))))
 
 )
