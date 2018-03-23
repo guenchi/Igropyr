@@ -4,6 +4,8 @@
 
 (define header "HTTP/1.1\r\n Host: 127.0.0.1:8081\r\nUpgrade-Insecure-Requests: 1\r\nAccept: text/html,application/xhtml+xml,application/xml,q=0.9,*/*,q=0.8\r\nUser-Agent: Mozilla/5.0 (Macintosh, Intel Mac OS X 10_13_3) AppleWebKit/604.5.6 (KHTML, like Gecko) Version/11.0.3 Safari/604.5.6\r\nAccept-Language: zh-cn\r\nAccept-Encoding: gzip, deflate\r\nConnection: keep-alive\r\n")
 
+(define querylist (list (cons "user" "igropyr") (cons "psw" "catapult")))
+
 (define testlist
     (list
         (cons 'a 'a)
@@ -34,7 +36,7 @@
             (equal? (ref testlist "c") 'c)
             (equal? (ref testlist 'num) 123))
         "           ok"
-        "           error\n"))
+        "           error"))
 (newline)
 
 (display "test procedure val...")
@@ -46,7 +48,7 @@
             (equal? (val testlist 'c) "c")
             (equal? (val testlist 123) 'num))
         "           ok"
-        "           error\n"))
+        "           error"))
 (newline)
 
 (display "test procedure set...")
@@ -57,7 +59,7 @@
             (equal? (ref serverset 'connections) 1024)
             (equal? (ref serverset 'keepalive) 5000))
         "           ok"
-        "           error\n"))
+        "           error"))
 (newline)
 
 
@@ -70,7 +72,7 @@
             (equal? (ref (listen "127.0.0.1" 80) 'ip) "127.0.0.1")
             (equal? (ref (listen "127.0.0.1" 80) 'port) 80))
         "        ok"
-        "        error\n"))
+        "        error"))
 (newline)
 
 (display "test procedure head-parser...")
@@ -85,7 +87,7 @@
             (equal? (header-parser header "Connection") "keep-alive")
             (equal? (header-parser header "Cookie") ""))
         "   ok"
-        "   error\n"))
+        "   error"))
 (newline)
 
 
@@ -101,7 +103,16 @@
             (par "/abc/*/efg" "/abc/ace/efg")
             (par "/a*/abc" "/alm/abc"))
         "           ok"
-        "           error\n"))
+        "           error"))
+(newline)
+
+
+(display "test procedure list->json...")
+(display
+    (if 
+            (equal? (list->json querylist) "{\"user\":\"igropyr\",\"psw\":\"catapult\"}")
+        "    ok"
+        "    error"))
 (newline)
 (newline)
 
