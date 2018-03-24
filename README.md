@@ -84,10 +84,6 @@ $ raven run example.sc
 
 Manuel: https://guenchi.gitbooks.io/igropyr/
 
-We recommand use ***Catapult*** as Webframework
+We recommand use ***Catapult*** as Webframework： https://github.com/guenchi/Catapult
 
-https://github.com/guenchi/Catapult
-
-a HTML template parser may help:
-
-https://github.com/guenchi/Liber
+a HTML template parser may help:  https://github.com/guenchi/Liber
