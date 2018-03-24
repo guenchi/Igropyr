@@ -82,8 +82,8 @@ then
 $ raven run example.sc
 ```
 
-***Igropyr's manuel***: https://guenchi.gitbooks.io/igropyr/
+***Igropyr's manuel***:  https://guenchi.gitbooks.io/igropyr/
 
 We recommand use ***Catapult*** as Webframework： https://github.com/guenchi/Catapult
 
-a HTML template parser may help:  https://github.com/guenchi/Liber
+a HTML template parser may help:   https://github.com/guenchi/Liber
