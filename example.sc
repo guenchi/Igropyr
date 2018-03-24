@@ -5,11 +5,11 @@
 (define get
         (lambda (request_header pathinfo query_string)
             (response 200 "text/html"
-                (string-append "<p>path is:" pathinfo "</br>query is:" (if query_string query_string "nothing"))))))
+                (string-append "<p>path is:" pathinfo "</br>query is:" (if query_string query_string "nothing")))))
                 
 (define post
         (lambda (request_header pathinfo payload)
-            (response 200 "application/json" "{\"hello\":\"world\"}"))))
+            (response 200 "application/json" "{\"hello\":\"world\"}")))
 
 (server 
     (request get)
