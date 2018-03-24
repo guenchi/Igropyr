@@ -82,7 +82,7 @@ then
 $ raven run example.sc
 ```
 
-Manuel: https://guenchi.gitbooks.io/igropyr/
+Igropyr's manuel: https://guenchi.gitbooks.io/igropyr/
 
 We recommand use ***Catapult*** as Webframework： https://github.com/guenchi/Catapult
 
