@@ -65,7 +65,7 @@ or simply use Raven to install Igropyr:
 (set 
     ('staticpath    "/usr/local/www")   ;to define the static path    
     ('connections   3600)               ;to define the max connections, default is 1024
-    ('keepalive     3600))             ;keepalive timeout, 0 for short connection, default is 5000 (ms)
+    ('keepalive     3600))              ;keepalive timeout, 0 for short connection, default is 5000 (ms)
 ```
 
 (listen) may define like:
