@@ -24,7 +24,7 @@
   )
 
   (define igr_request
-    (foreign-procedure "igr_handle_request" (iptr iptr) int))
+    (foreign-procedure "igr_handle_request" (uptr uptr) int))
 
   (define igr_response
     (foreign-procedure "igr_response" (int string string string) string))
