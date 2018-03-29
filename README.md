@@ -87,3 +87,13 @@ $ raven run example.sc
 We recommand use ***Catapult*** as Webframework: https://github.com/guenchi/Catapult
 
 a HTML template parser may help:   https://github.com/guenchi/Liber
+
+***todo list***
+
+https
+
+connections limite
+
+keep-alive
+
+json->list parser
