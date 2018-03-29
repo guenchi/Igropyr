@@ -95,7 +95,7 @@ https
 
 connections limite
 
-keep-alive
+long-connection
 
 json->list parser
 ```
