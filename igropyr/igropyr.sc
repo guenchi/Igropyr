@@ -37,14 +37,21 @@
                         (else (loop (+ i 1))))))))
 
     (define split
-        (lambda (s c)
-            (let loop ((s s))
-                (if (string=? s "")
-                    '()
-                    (let ((i (str-index s c)))
-                        (if i 
-                            (cons (substring s 0 i) (loop (substring s (+ i 1) (string-length s))))
-                            (list s)))))))
+      (lambda (s c)
+        (letrec* ((len (string-length s))
+            (walk (lambda (str begin end rst)
+                    (cond ((>= begin len) rst)
+                          ((or (= end len) (char=? (string-ref str end) c))
+                            (walk
+                              str 
+                              (+ end 1)
+                              (+ end 1)
+                              (if (= begin end) 
+                                rst
+                                (cons (substring str begin end) rst))))
+                          (else
+                            (walk str begin (+ end 1) rst))))))
+    (reverse (walk s 0 0 '())))))
 
 
     (define list-parser
