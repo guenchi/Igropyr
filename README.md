@@ -93,6 +93,8 @@ a HTML template parser may help:   https://github.com/guenchi/Liber
 ```
 https
 
+http2
+
 connections limite
 
 long-connection
