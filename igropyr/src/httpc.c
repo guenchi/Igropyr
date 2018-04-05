@@ -7,7 +7,7 @@
 #include <memory.h>
 #include <ctype.h>
 
-#define IGROPYR_VERSION "0.2.7"
+#define IGROPYR_VERSION "0.2.8"
 
 
 uv_tcp_t    _server;
