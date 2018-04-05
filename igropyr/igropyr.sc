@@ -2,8 +2,8 @@
   (export
     ref
     val
-    str-index
     split
+    json-parser
     list-parser
   )
   (import
@@ -27,15 +27,6 @@
                     (caar str)
                     (val (cdr str) x)))))
 
-    (define str-index
-        (lambda (s c)
-            (let ((n (string-length s)))
-                (let loop ((i 0))
-                    (cond 
-                        ((>= i n) #f)
-                        ((char=? (string-ref s i) c) i)
-                        (else (loop (+ i 1))))))))
-
     (define split
         (lambda (s c)
             (letrec* ((len (string-length s))
@@ -51,7 +42,36 @@
                                         rst
                                         (cons (substring str begin end) rst))))
                             (else (walk str begin (+ end 1) rst))))))
-            (reverse (walk s 0 0 '())))))
+    (reverse (walk s 0 0 '())))))
+
+
+    (define parser
+        (lambda (x)
+            (let ((c (string-ref x 0))(length (string-length x)))
+                (cond 
+                    ((equal? c #\{)
+                        (string-append "(("
+                            (parser (substring x 1 length))))
+                    ((equal? c #\:)
+                        (string-append " . "
+                            (parser (substring x 1 length))))
+                    ((equal? c #\,)
+                        (string-append ")(" 
+                            (parser (substring x 1 length))))
+                    ((equal? c #\})
+                        (string-append "))"
+                            (if (> length 1)
+                                (parser (substring x 1 length))
+                                "")))
+                    (else 
+                        (string-append (make-string 1 c)
+                            (parser (substring x 1 length))))))))
+    
+    (define json-parser
+        (lambda (x)
+            (read 
+                (open-input-string 
+                    (parser x)))))
 
 
     (define list-parser
@@ -66,5 +86,6 @@
                         (if (list? (cdar lst))
                             (loop (cdar lst) "{")
                             (cdar lst)) "\"," ))))))
+
 
 )
