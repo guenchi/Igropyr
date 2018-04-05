@@ -98,6 +98,4 @@ http/2.0
 connections limite
 
 long-connection
-
-json->list parser
 ```
