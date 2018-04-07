@@ -45,33 +45,48 @@
     (reverse (walk s 0 0 '())))))
 
 
-    (define parser
-        (lambda (x)
-            (let ((c (string-ref x 0))(length (string-length x)))
-                (cond 
-                    ((equal? c #\{)
-                        (string-append "(("
-                            (parser (substring x 1 length))))
-                    ((equal? c #\:)
-                        (string-append " . "
-                            (parser (substring x 1 length))))
-                    ((equal? c #\,)
-                        (string-append ")(" 
-                            (parser (substring x 1 length))))
-                    ((equal? c #\})
-                        (string-append "))"
-                            (if (> length 1)
-                                (parser (substring x 1 length))
-                                "")))
-                    (else 
-                        (string-append (make-string 1 c)
-                            (parser (substring x 1 length))))))))
-    
     (define json-parser
-        (lambda (x)
+        (lambda (s)
             (read 
-                (open-input-string 
-                    (parser x)))))
+                (open-input-string
+                    (let l
+                        ((s s)
+                        (bgn 0)
+                        (end 0)
+                        (rst '())
+                        (len (string-length s)) 
+                        (quts? #f))
+                        (cond
+                            ((>= end len)
+                                (apply string-append (reverse rst)))
+                            ((and quts? (not (char=? (string-ref s end) #\")))
+                                (l s bgn (+ end 1) rst len quts?))
+                            (else
+                                (case (string-ref s end)
+                                    ((#\{ #\[)
+                                        (l s (+ end 1) (+ end 1) 
+                                            (cons 
+                                                (string-append 
+                                                    (substring s bgn end) "((" ) rst) len quts?))
+                                    ((#\} #\])
+                                        (l s (+ end 1) (+ end 1) 
+                                            (cons 
+                                                (string-append 
+                                                    (substring s bgn end) "))") rst) len quts?))
+                                    (#\:
+                                        (l s (+ end 1) (+ end 1) 
+                                            (cons 
+                                                (string-append 
+                                                    (substring s bgn end) " . ") rst) len quts?))
+                                    (#\,
+                                        (l s (+ end 1) (+ end 1) 
+                                            (cons 
+                                                (string-append 
+                                                    (substring s bgn end) ")(") rst) len quts?))
+                                    (#\"
+                                        (l s bgn (+ end 1) rst len (not quts?)))
+                                    (else
+                                        (l s bgn (+ end 1) rst len quts?))))))))))
 
 
     (define list-parser
@@ -86,5 +101,14 @@
                         (if (list? (cdar lst))
                             (loop (cdar lst) "{")
                             (cdar lst)) "\"," ))))))
+                                     
+                                     
+       (define array-formater
+        (lambda (x)
+            (let l ((x x)(n 0))
+                (cons (cons n (caar x)) 
+                    (if (null? (cdr x))
+                        '()
+                         (l (cdr x) (+ n 1)))))))
 
 )
