@@ -49,7 +49,7 @@
         (lambda (s)
             (read (open-input-string
                 (let l
-                    ((s s)(bgn 0)(end 0)(rst '())(len (string-length s))(quts? #f)(lst '(#\{)))
+                    ((s s)(bgn 0)(end 0)(rst '())(len (string-length s))(quts? #f)(lst '(#t)))
                     (cond
                         ((= end len)
                             (apply string-append (reverse rst)))
@@ -61,7 +61,7 @@
                                 (l s (+ end 1) (+ end 1) 
                                     (cons 
                                         (string-append 
-                                            (substring s bgn end) "((" ) rst) len quts? (cons #\{ lst)))
+                                            (substring s bgn end) "((" ) rst) len quts? (cons #t lst)))
                             (#\}
                                 (l s (+ end 1) (+ end 1) 
                                     (cons 
@@ -71,7 +71,7 @@
                                 (l s (+ end 1) (+ end 1) 
                                     (cons
                                         (string-append 
-                                            (substring s bgn end) "#(") rst) len quts? (cons #\[ lst)))
+                                            (substring s bgn end) "#(") rst) len quts? (cons #f lst)))
                             (#\]
                                 (l s (+ end 1) (+ end 1) 
                                     (cons 
@@ -87,7 +87,7 @@
                                     (cons 
                                         (string-append 
                                             (substring s bgn end) 
-                                            (if (char=? #\{ (car lst)) ")(" " ")) rst) len quts? lst))
+                                            (if (car lst) ")(" " ")) rst) len quts? lst))
                             (#\"
                                 (l s bgn (+ end 1) rst len (not quts?) lst))
                             (else
