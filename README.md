@@ -90,7 +90,7 @@ $ raven run example.sc
 
 ***JSON*** Parser https://github.com/guenchi/json *(Recommand)*
 
-***Liber***: HTML template  https://github.com/guenchi/Liber
+***Liber***: HTML Template  https://github.com/guenchi/Liber
 
 ***todo list***
 
