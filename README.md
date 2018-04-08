@@ -84,9 +84,13 @@ $ raven run example.sc
 
 ***Igropyr's manuel***:  https://guenchi.gitbooks.io/igropyr/
 
-We recommand use ***Catapult*** as Webframework: https://github.com/guenchi/Catapult
+Some libraries may help:
 
-a HTML template parser may help:   https://github.com/guenchi/Liber
+***Catapult*** Webframework: https://github.com/guenchi/Catapult *(Recommand)*
+
+***JSON*** Parser: https://github.com/guenchi/json *(Recommand)*
+
+***Liber*** HTML template:   https://github.com/guenchi/Liber
 
 ***todo list***
 
