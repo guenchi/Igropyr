@@ -96,16 +96,42 @@
 
     (define list-parser
         (lambda (lst)
-            (let loop ((lst lst)(x "{"))
-                (if (null? (cdr lst))
-                    (string-append x "\"" (caar lst) "\":\"" 
-                        (if (list? (cdar lst))
-                            (loop (cdar lst) "{")
-                            (cdr (car lst))) "\"}")
-                    (loop (cdr lst) (string-append x "\"" (caar lst) "\":\"" 
-                        (if (list? (cdar lst))
-                            (loop (cdar lst) "{")
-                            (cdar lst)) "\"," ))))))
+            (define f
+                (lambda (x)
+                    (if (string? x) 
+                        (string-append "\"" x "\"") 
+                        (number->string x))))
+            (define v
+                (lambda (x)
+                    (if (= x 0) "" ",")))
+            (define q
+                (lambda (x)
+                    (if (vector? x) "[" "{")))
+            (let l ((lst lst)(x (q lst)))
+                (if (vector? lst)
+                    (string-append x 
+                        (let t ((len (vector-length lst))(n 0)(y ""))
+                            (if (< n len)
+                                (t len (+ n 1)
+                                    (if (atom? (vector-ref lst n))
+                                        (if (vector? (vector-ref lst n))
+                                            (l (vector-ref lst n) (string-append y (v n) "["))
+                                            (string-append y (v n) (f (vector-ref lst n))))
+                                        (l (vector-ref lst n) (string-append y (v n) "{"))))
+                                (string-append y "]"))))
+                    (if (null? (cdr lst))
+                        (string-append x (f (caar lst)) ":"
+                            (if (list? (cdar lst))
+                                (l (cdar lst) (q (cdar lst)))
+                                (if (vector? (cdar lst))
+                                    (l (cdar lst) x)
+                                    (f (cdar lst)))) "}")
+                        (l (cdr lst)
+                            (if (list? (cdar lst))
+                                (string-append x (f (caar lst)) ":" (l (cdar lst) "{") ",")
+                                (if (vector? (cdar lst))
+                                    (string-append x (f (caar lst)) ":" (l (cdar lst) "[") ",")
+                                    (string-append x (f (caar lst)) ":" (f (cdar lst)) ",")))))))))
                                      
                                      
 
