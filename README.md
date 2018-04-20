@@ -88,7 +88,7 @@ $ raven run example.sc
 ## Libraries may help:
 
 
-***Catapult***: Webframework `raven install catapult` https://github.com/guenchi/Catapult *(Recommand)*
+***Ballista***: Webframework `raven install catapult` https://github.com/guenchi/Ballista *(Recommand)*
 
 ***JSON*** library `raven install json` https://github.com/guenchi/json *(Recommand)*
 
