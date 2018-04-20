@@ -90,6 +90,8 @@ $ raven run example.sc
 
 ***Catapult***: Webframework `raven install catapult` https://github.com/guenchi/Catapult *(Recommand)*
 
+***JSON*** library `raven install json` https://github.com/guenchi/json *(Recommand)*
+
 ***mySQL*** bingding `raven install mysql` https://github.com/chclock/mysql *(Recommand)*
 
 ***Liber***: HTML Template `raven install liber` https://github.com/guenchi/Liber
