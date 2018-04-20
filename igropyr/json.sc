@@ -94,9 +94,10 @@
         (lambda (lst)
             (define f
                 (lambda (x)
-                    (if (string? x) 
-                        (string-append "\"" x "\"") 
-                        (number->string x))))
+                    (cond 
+                        ((string? x) (string-append "\"" x "\""))
+                        ((number? x) (number->string x))
+                        ((symbol? x) (symbol->string x)))))
             (define c
                 (lambda (x)
                     (if (= x 0) "" ",")))
