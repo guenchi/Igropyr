@@ -88,11 +88,13 @@ $ raven run example.sc
 ## Libraries may help:
 
 
-***Ballista***: Webframework `raven install catapult` https://github.com/guenchi/Ballista *(Recommand)*
+***Ballista***: Webframework `raven install ballista` https://github.com/guenchi/Ballista 
 
-***JSON*** library `raven install json` https://github.com/guenchi/json *(Recommand)*
+***Trabutium***: Webframework `raven install trabutium` https://github.com/guenchi/Trabutium
 
-***mySQL*** bingding `raven install mysql` https://github.com/chclock/mysql *(Recommand)*
+***JSON*** library `raven install json` https://github.com/guenchi/json 
+
+***mySQL*** bingding `raven install mysql` https://github.com/chclock/mysql 
 
 ***Liber***: HTML Template `raven install liber` https://github.com/guenchi/Liber
 
