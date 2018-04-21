@@ -88,9 +88,9 @@ $ raven run example.sc
 ## Libraries may help:
 
 
-***Ballista***: Webframework `raven install ballista` https://github.com/guenchi/Ballista (pure functional style)
+***Ballista***: Webframework `raven install ballista` https://github.com/guenchi/Ballista (Express style)
 
-***Trabutium***: Webframework `raven install trabutium` https://github.com/guenchi/Trabutium (express style)
+***Trabutium***: Webframework `raven install trabutium` https://github.com/guenchi/Trabutium (functional)
 
 ***JSON*** library `raven install json` https://github.com/guenchi/json
 
