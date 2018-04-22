@@ -44,11 +44,11 @@ or simply use Raven to install Igropyr:
 
 ```
 (define get
-    (lambda (request-header path-info query-string)
+    (lambda (header path query)
         (response 200 "text/plain" "Hello World")))
                 
 (define post
-    (lambda (request-header path-info payload)
+    (lambda (header path payload)
         (response 200 "text/plain" "Hello World")))
 
 (server 
