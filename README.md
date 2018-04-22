@@ -1,5 +1,5 @@
 # Igropyr
-for Chez Scheme, support Unix, MacOS, Linux, Windows
+Cross platform http-server for Chez Scheme
 
 How fast？ (test on single thread)
 ![image](https://github.com/guenchi/Igropyr/blob/master/benckmark.png?raw=true)
