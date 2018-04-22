@@ -90,7 +90,7 @@ $ raven run example.sc
 
 ***Ballista***: Webframework `raven install ballista` https://github.com/guenchi/Ballista (Express style)
 
-***Trabutium***: Webframework `raven install trabutium` https://github.com/guenchi/Trabutium (functional)
+***Trabutium***: Webframework `raven install trabutium` https://github.com/guenchi/Trabutium (pure functional)
 
 ***JSON*** library `raven install json` https://github.com/guenchi/json
 
