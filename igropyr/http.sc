@@ -83,28 +83,30 @@
         (string-append " " content)))
 
 
-(define-syntax set
-    (lambda (x)
-      (syntax-case x ()
-        ((_) #''())
-        ((_ (e1 e2)) #'(list (cons e1 e2)))
-        ((_ (e1 e2) (e3 e4) ...) #'(list (cons e1 e2) (cons e3 e4) ...)))))
+    (define-syntax set
+        (lambda (x)
+            (syntax-case x ()
+                ((_) (syntax '()))
+                ((_ (e1 e2)) (syntax (list (cons e1 e2))))
+                ((_ (e1 e2) (e3 e4) ...) (syntax (list (cons e1 e2) (cons e3 e4) ...))))))
 
-  (define-syntax listen
-    (lambda (x)
-      (syntax-case x ()
-        ((_) #''())
-        ((_ e) #'(cond 
-                  ((string? e) (list (cons 'ip e)))
-                  ((integer? e) (list (cons 'port e)))
-                  (else '())))
-        ((_ e1 e2) #'(list (cons 'ip e1)(cons 'port e2))))))
+    (define-syntax listen
+        (lambda (x)
+            (syntax-case x ()
+                ((_) (syntax '()))
+                ((_ e) (syntax 
+                            (cond 
+                                ((string? e) (list (cons 'ip e)))
+                                ((integer? e) (list (cons 'port e)))
+                                (else '()))))
+                ((_ e1 e2) (syntax 
+                                (list (cons 'ip e1)(cons 'port e2)))))))
 
-  (define-syntax errorpage
-    (lambda (x)
-      (syntax-case x ()
-        ((_ e) #'(igr_errorpage e ""))
-        ((_ e1 e2) #'(igr_errorpage e1 e2)))))
+    (define-syntax errorpage
+        (lambda (x)
+            (syntax-case x ()
+                ((_ e) (syntax (igr_errorpage e "")))
+                ((_ e1 e2) (syntax (igr_errorpage e1 e2))))))
 
   (define server 
     (lambda (res_get res_post set listen)
