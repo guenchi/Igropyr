@@ -84,6 +84,7 @@ $ raven run example.sc
 
 ***Igropyr's manuel***:  https://guenchi.gitbooks.io/igropyr/
 
+***Raven***: Chez Scheme Package Manager http://ravensc.com
 
 ## Libraries may help:
 
