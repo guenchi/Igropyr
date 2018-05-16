@@ -336,8 +336,8 @@ static void handle_get(uv_stream_t* client, const char* request_header, const ch
 		}
 		else
 		{
-		write_uv_data(client, respone, -1, 0, 1);
-		return;
+		    write_uv_data(client, respone, -1, 0, 1);
+		    return;
 		}
 	}
 }
@@ -368,8 +368,8 @@ static void handle_post(uv_stream_t* client, const char* request_header, const c
 	}
 	else
 	{
-	write_uv_data(client, respone, -1, 0, 1);
-	return;
+	    write_uv_data(client, respone, -1, 0, 1);
+	    return;
 	}
 }
 
@@ -532,15 +532,15 @@ char* igr_header_parser(char* http_header, char* key)
 	char* begin = strstr(http_header, key);
 	if(begin)
 	{
-	begin = begin + strlen(key);
-	begin ++;
-	while(isspace(*begin))
+	    begin = begin + strlen(key);
+	    begin ++;
+	    while(isspace(*begin))
 		begin++;
-	char* end;
-	for(end = begin + 1; *end != '\r'; end++)
-	{}
-	*end = '\0';
-	return begin;
+	    char* end;
+	    for(end = begin + 1; *end != '\r'; end++)
+	    {}
+	    *end = '\0';
+	    return begin;
 	}
 	else
 	{
