@@ -102,10 +102,11 @@
  
  
     (define-syntax errorpage
-        (lambda (x)
-            (syntax-case x ()
-                ((_ e) (syntax (igr_errorpage e "")))
-                ((_ e1 e2) (syntax (igr_errorpage e1 e2))))))
+        (syntax-rules ()
+            ((_ e) (igr_errorpage e ""))
+            ((_ e1 e2) (igr_errorpage e1 e2))))
+ 
+ 
 
   (define server 
     (lambda (res_get res_post set listen)
