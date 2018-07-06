@@ -87,19 +87,20 @@
         (syntax-rules ()
             ((_) '())
             ((_ (e1 e2) ...) (list (cons e1 e2) ...))))
+ 
+ 
 
     (define-syntax listen
-        (lambda (x)
-            (syntax-case x ()
-                ((_) (syntax '()))
-                ((_ e) (syntax 
-                            (cond 
-                                ((string? e) (list (cons 'ip e)))
-                                ((integer? e) (list (cons 'port e)))
-                                (else '()))))
-                ((_ e1 e2) (syntax 
-                                (list (cons 'ip e1)(cons 'port e2)))))))
+        (syntax-rules ()
+            ((_) '())
+            ((_ e) (cond 
+                        ((string? e) (list (cons 'ip e)))
+                        ((integer? e) (list (cons 'port e)))
+                        (else '())))
+            ((_ e1 e2) (list (cons 'ip e1)(cons 'port e2)))))
 
+ 
+ 
     (define-syntax errorpage
         (lambda (x)
             (syntax-case x ()
