@@ -84,11 +84,9 @@
 
 
     (define-syntax set
-        (lambda (x)
-            (syntax-case x ()
-                ((_) (syntax '()))
-                ((_ (e1 e2)) (syntax (list (cons e1 e2))))
-                ((_ (e1 e2) (e3 e4) ...) (syntax (list (cons e1 e2) (cons e3 e4) ...))))))
+        (syntax-rules ()
+            ((_) '())
+            ((_ (e1 e2) ...) (list (cons e1 e2) ...))))
 
     (define-syntax listen
         (lambda (x)
