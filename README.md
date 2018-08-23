@@ -1,5 +1,5 @@
 # Igropyr
-Cross platform http-server for Chez Scheme
+Cross platform async http-server for Chez Scheme
 
 How fast？ (test on single thread)
 ![image](https://github.com/guenchi/Igropyr/blob/master/benckmark.png?raw=true)
@@ -7,24 +7,10 @@ How fast？ (test on single thread)
 
 Chez Scheme run with the --script option and don't compile scheme code
 
-***Igropyr*** is
 
-```
-.a async Scheme web-server
+***Igropyr : Node***
 
-.a async Scheme http-server
-
-.a async Scheme socket-server
-
-.a async files reader/writer
-
-.a Scheme version's Node.js
-
-```
-***Node*** = Javascript + V8 + libuv
-
-***Igropyr*** = Scheme + ChezScheme + libuv
-
+Scheme + ChezScheme + libuv : Javascript + V8 + libuv
 
 
 ***install Igropyr***
