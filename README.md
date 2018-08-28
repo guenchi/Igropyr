@@ -81,6 +81,8 @@ $ raven run example.sc
 
 ***JSON*** library `raven install json` https://github.com/guenchi/json
 
+***JWT*** Json Web Token `raven install jwt` https://github.com/guenchi/jwt
+
 ***mySQL*** bingding `raven install mysql` https://github.com/chclock/mysql 
 
 ***Liber***: HTML Template `raven install liber` https://github.com/guenchi/Liber
