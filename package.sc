@@ -10,5 +10,6 @@
     ("build" . "cd ./lib/igropyr/src && cc -o3 -fPIC -shared httpc.c membuf.c -luv -o ../httpc.so")
     ("run" . "scheme --script")
     ("test" . "scheme --script server.sc"))
-("dependencies")
+("dependencies"
+    ("core" . "1.0.0"))
 ("devDependencies"))
