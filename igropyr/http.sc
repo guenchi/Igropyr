@@ -37,7 +37,8 @@
   )
   (import
     (scheme)
-    (igropyr igropyr)
+    (core alist)
+    (core string)
   )
 
 
