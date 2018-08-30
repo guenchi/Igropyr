@@ -25,6 +25,9 @@ or simply use Raven to install Igropyr:
 
 `$ raven install igropyr`
 
+***Attention***
+
+from 0.2.13 Igropyr move library (igropyr igropyr) to https://github.com/guenchi/core so from now on it dependence it.
 
 ***start server:***
 
@@ -74,6 +77,7 @@ $ raven run example.sc
 
 ## Libraries may help:
 
+***core***: commonly used small functions `raven install core` https://github.com/guenchi/core
 
 ***Ballista***: Webframework `raven install ballista` https://github.com/guenchi/Ballista (Express style)
 
@@ -88,6 +92,9 @@ $ raven run example.sc
 ***Liber***: HTML Template `raven install liber` https://github.com/guenchi/Liber
 
 
+
+
+ 
 ## todo list
 
 ```
