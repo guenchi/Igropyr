@@ -38,7 +38,6 @@
   (import
     (scheme)
     (core alist)
-    (core string)
   )
 
 
