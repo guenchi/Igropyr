@@ -77,7 +77,7 @@ $ raven run example.sc
 
 ## Libraries may help:
 
-***core***: commonly used small functions `raven install core` https://github.com/guenchi/core
+***Core***: commonly used small functions `raven install core` https://github.com/guenchi/Core
 
 ***Ballista***: Webframework `raven install ballista` https://github.com/guenchi/Ballista (Express style)
 
