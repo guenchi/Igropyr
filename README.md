@@ -71,25 +71,25 @@ then
 $ raven run example.sc
 ```
 
-***Igropyr's manuel***:  https://guenchi.gitbooks.io/igropyr/
+***[Igropyr's manuel](https://guenchi.gitbooks.io/igropyr/)***
 
-***Raven***: Chez Scheme Package Manager http://ravensc.com
+***[Raven](http://ravensc.com)***: Chez Scheme Package Manager 
 
 ## Libraries may help:
 
-***Core***: commonly used small functions `raven install core` https://github.com/guenchi/Core
+***[Core](https://github.com/guenchi/Core)***: commonly used small functions `raven install core`
 
-***Ballista***: Webframework `raven install ballista` https://github.com/guenchi/Ballista (Express style)
+***[Ballista]***: Webframework `raven install ballista` https://github.com/guenchi/Ballista (Express style)
 
-***Catapult***: Webframework `raven install catapult` https://github.com/guenchi/Catapult (purely functional)
+***[Catapult]***: Webframework `raven install catapult` https://github.com/guenchi/Catapult (purely functional)
 
-***JSON*** library `raven install json` https://github.com/guenchi/json
+***[JSON]*** library `raven install json` https://github.com/guenchi/json
 
-***JWT*** Json Web Token `raven install jwt` https://github.com/guenchi/jwt
+***[JWT]*** Json Web Token `raven install jwt` https://github.com/guenchi/jwt
 
-***mySQL*** bingding `raven install mysql` https://github.com/chclock/mysql 
+***[mySQL]*** bingding `raven install mysql` https://github.com/chclock/mysql 
 
-***Liber***: HTML Template `raven install liber` https://github.com/guenchi/Liber
+***[Liber]***: HTML Template `raven install liber` https://github.com/guenchi/Liber
 
 
 
