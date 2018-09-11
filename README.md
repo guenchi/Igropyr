@@ -27,7 +27,7 @@ or simply use Raven to install Igropyr:
 
 ***Attention***
 
-from 0.2.13 Igropyr move library (igropyr igropyr) to https://github.com/guenchi/core so from now on it dependence it.
+from 0.2.13 Igropyr move library (igropyr igropyr) to [Core](https://github.com/guenchi/core) so from now on it dependence it.
 
 ***start server:***
 
