@@ -77,19 +77,19 @@ $ raven run example.sc
 
 ## Libraries may help:
 
-***[Core](https://github.com/guenchi/Core)***: commonly used small functions `raven install core`
+***[Core](https://github.com/guenchi/Core)*** : commonly used small functions `raven install core`
 
-***[Ballista]***: Webframework `raven install ballista` https://github.com/guenchi/Ballista (Express style)
+***[Ballista](https://github.com/guenchi/Ballista)*** : Webframework `raven install ballista` (Express style)
 
-***[Catapult]***: Webframework `raven install catapult` https://github.com/guenchi/Catapult (purely functional)
+***[Catapult](https://github.com/guenchi/Catapult)*** : Webframework `raven install catapult` (purely functional)
 
-***[JSON]*** library `raven install json` https://github.com/guenchi/json
+***[JSON](https://github.com/guenchi/json)*** library `raven install json`
 
-***[JWT]*** Json Web Token `raven install jwt` https://github.com/guenchi/jwt
+***[JWT](https://github.com/guenchi/jwt)*** Json Web Token `raven install jwt` 
 
-***[mySQL]*** bingding `raven install mysql` https://github.com/chclock/mysql 
+***[mySQL](https://github.com/chclock/mysql)*** bingding `raven install mysql`  
 
-***[Liber]***: HTML Template `raven install liber` https://github.com/guenchi/Liber
+***[Liber](https://github.com/guenchi/Liber)*** : HTML Template `raven install liber` 
 
 
 
