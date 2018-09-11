@@ -73,7 +73,7 @@ $ raven run example.sc
 
 ***[Igropyr's manuel](https://guenchi.gitbooks.io/igropyr/)***
 
-***[Raven](http://ravensc.com)***: Chez Scheme Package Manager 
+***[Raven](http://ravensc.com)*** : Chez Scheme Package Manager 
 
 ## Libraries may help:
 
