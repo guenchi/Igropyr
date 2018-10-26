@@ -37,7 +37,7 @@
   )
   (import
     (scheme)
-    (core alist)
+    (only (core alist) ref)
   )
 
 
@@ -108,31 +108,13 @@
  
  
 
-  (define server 
-    (lambda (res_get res_post set listen)
-      (let ((staticpath (ref set 'staticpath))
-            ;(connections (ref set 'connections))
-            ;(keepalive (ref set 'keepalive))
-            (ip (ref listen 'ip))
-            (port (ref listen 'port)))
-        (begin 
-          (igr_request res_get res_post)
-          (igr_init
-            (if (null? staticpath)
-            ""
-            staticpath)
-        ;(if (null? connections)
-        ;   1024
-        ;   connections)
-        ;(if (null? keepalive)
-        ;   5000
-        ;   keepalive)
-          (if (null? ip)
-            "0.0.0.0"
-            ip)
-          (if (null? port)
-            80
-            port))))))
+    (define server 
+        (lambda (res_get res_post set listen)
+            (define staticpath (or (ref set 'staticpath) ""))
+            (define ip (or (ref listen 'ip) "0.0.0.0")) 
+            (define port (or (ref listen 'port) 8080)) 
+            (igr_request res_get res_post)
+            (igr_init staticpath ip port)))
 
 
 
