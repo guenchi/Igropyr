@@ -1,5 +1,5 @@
 (("name" . "igropyr")
-("version" . "0.2.13")
+("version" . "0.2.15")
 ("description" . "a async Scheme http server base on libuv")
 ("keywords"
     ("Scheme" "http-server" "async"))
@@ -11,5 +11,5 @@
     ("run" . "scheme --script")
     ("test" . "scheme --script server.sc"))
 ("dependencies"
-    ("core" . "1.0.0"))
+    ("core" . "1.3.1"))
 ("devDependencies"))
