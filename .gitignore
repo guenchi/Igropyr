@@ -2,5 +2,4 @@
 *.sc#*
 .#*.sc
 
-/lib
 httpc.so
