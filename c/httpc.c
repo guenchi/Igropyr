@@ -65,13 +65,6 @@ static void after_uv_close_client(uv_handle_t* client)
 
 static void after_uv_write(uv_write_t* w, int status) 
 {
-	//	     !!!  !!!  !!!
-	//
-	//这里可能会有内存泄漏问题 如果这里释放 scheme会报内存被错误释放
-	//if(w->data)
-	//	free(w->data); //copyed data
-	//
-
 	uv_close((uv_handle_t*)w->handle, after_uv_close_client);
 	free(w);
 }
