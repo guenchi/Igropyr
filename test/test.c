@@ -5,7 +5,7 @@
 
 
 
-char* request_get(char* head, char * path, char* query)
+char* request_get(const char* head, const char * path, const char* query)
 {
     char* context = "text/html";
     char* cookie = "";
@@ -13,7 +13,7 @@ char* request_get(char* head, char * path, char* query)
     return igr_response(200, context, cookie, query);
 }
 
-char* request_post(char* head, char * path, char* payload)
+char* request_post(const char* head, const char * path, const char* payload)
 {
     char* context = "text/html";
     char* cookie = "";
