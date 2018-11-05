@@ -9,7 +9,7 @@
 ("scripts" 
     ("build" . "cd ./lib/igropyr/c && cc -o3 -fPIC -shared httpc.c membuf.c -luv -o ../httpc.so")
     ("run" . "scheme --script")
-    ("test" . "scheme --script server.sc"))
+    ("test" . "cd ./lib/igropyr/test && cc -o3 -fPIC test.c -luv -o ../../test"))
 ("dependencies"
     ("core" . "1.3.1"))
 ("devDependencies"))
