@@ -21,15 +21,12 @@ char* request_post(const char* head, const char * path, const char* payload)
     return igr_response(200, context, cookie, payload);
 }
 
-igr_res _request_get = &request_get;
-igr_res _request_post = &request_post;
-
 int main(void)
 {
     char* static_path = "/static/path/";
     char* ip = "0.0.0.0";
     
-    igr_handle_request( _request_get, _request_post);
+    igr_handle_request( request_get, request_post);
     igr_init ( static_path, ip, 8080 );
 }
 
