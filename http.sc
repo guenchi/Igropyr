@@ -36,7 +36,7 @@
     par
   )
   (import
-    (scheme)
+    (chezscheme)
     (only (core alist) ref)
   )
 
