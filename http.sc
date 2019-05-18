@@ -44,8 +44,7 @@
   (define lib (load-shared-object "./lib/igropyr/httpc.so"))
 
   (define igr_init
-    (foreign-procedure "igr_init" (string string int) int)
-  )
+    (foreign-procedure "igr_init" (string string int) int))
 
   (define igr_request
     (foreign-procedure "igr_handle_request" (uptr uptr) int))
@@ -68,9 +67,9 @@
 
   (define request
     (lambda (info)
-        (let ((code (foreign-callable info (string string string) string)))
-            (lock-object code)
-            (foreign-callable-entry-point code))))
+      (let ((code (foreign-callable info (string string string) string)))
+        (lock-object code)
+        (foreign-callable-entry-point code))))
 
   (define response
     (lambda (status type content)
@@ -84,37 +83,37 @@
 
 
     (define-syntax set
-        (syntax-rules ()
-            ((_) '())
-            ((_ (e1 e2) ...) (list (cons e1 e2) ...))))
+      (syntax-rules ()
+        ((_) '())
+        ((_ (e1 e2) ...) (list (cons e1 e2) ...))))
  
  
 
     (define-syntax listen
-        (syntax-rules ()
-            ((_) '())
-            ((_ e) (cond 
-                        ((string? e) (list (cons 'ip e)))
-                        ((integer? e) (list (cons 'port e)))
-                        (else '())))
-            ((_ e1 e2) (list (cons 'ip e1)(cons 'port e2)))))
+      (syntax-rules ()
+        ((_) '())
+        ((_ e) (cond 
+                  ((string? e) (list (cons 'ip e)))
+                  ((integer? e) (list (cons 'port e)))
+                  (else '())))
+        ((_ e1 e2) (list (cons 'ip e1)(cons 'port e2)))))
 
  
  
     (define-syntax errorpage
-        (syntax-rules ()
-            ((_ e) (igr_errorpage e ""))
-            ((_ e1 e2) (igr_errorpage e1 e2))))
+      (syntax-rules ()
+        ((_ e) (igr_errorpage e ""))
+        ((_ e1 e2) (igr_errorpage e1 e2))))
  
  
 
     (define server 
-        (lambda (res_get res_post set listen)
-            (define staticpath (or (ref set 'staticpath) ""))
-            (define ip (or (ref listen 'ip) "0.0.0.0")) 
-            (define port (or (ref listen 'port) 8080)) 
-            (igr_request res_get res_post)
-            (igr_init staticpath ip port)))
+      (lambda (res_get res_post set listen)
+        (define staticpath (or (ref set 'staticpath) ""))
+        (define ip (or (ref listen 'ip) "0.0.0.0")) 
+        (define port (or (ref listen 'port) 8080)) 
+        (igr_request res_get res_post)
+        (igr_init staticpath ip port)))
 
 
 
