@@ -14,3 +14,20 @@ Igropyr is committed to providing efficient, stable industrial grade servers.
 ## Will it be better?
 
 In the second edition being designed, Igropyr draws on the wisdom of Erlang and will automatically extend the thread to other hosts. Automated distributed service provisioning and load balancing are its main goals.
+
+
+## Igropyr ecosystem
+
+***[Ballista](https://github.com/guenchi/Ballista)*** : Express style webframework
+
+***[Catapult](https://github.com/guenchi/Catapult)*** : purely functional webframework 
+
+***[Core](https://github.com/guenchi/Core)*** : commonly used small functions 
+
+***[JSON](https://github.com/guenchi/json)*** : Json parser and toolfunctions
+
+***[JWT](https://github.com/guenchi/jwt)*** : Json Web Token
+
+***[mySQL](https://github.com/chclock/mysql)*** : mySQL Chez Scheme bingding
+
+***[Liber](https://github.com/guenchi/Liber)*** : HTML Template
