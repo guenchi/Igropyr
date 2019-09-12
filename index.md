@@ -1,3 +1,5 @@
+![image](img/greekfire.jpg)
+
 ## What is the Igropyr?
 
 Igropyr (gr.Υγρόν πυρ: Greek fire) is the secret weapon of the Schemers.
