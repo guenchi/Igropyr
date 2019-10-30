@@ -307,7 +307,7 @@ more information, see [example.sc](https://github.com/guenchi/Igropyr/blob/maste
 
 ***[Core](https://github.com/guenchi/Core)*** : commonly used small functions 
 
-***[JSON](https://github.com/guenchi/json)*** : Json parser and toolfunctions
+***[JSON](https://guenchi.github.io/json/)*** : Json parser and toolfunctions
 
 ***[JWT](https://github.com/guenchi/jwt)*** : Json Web Token
 
