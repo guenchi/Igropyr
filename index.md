@@ -20,7 +20,7 @@ In the second edition being designed, Igropyr draws on the wisdom of Erlang and 
 
 ***Igropyr dependence libuv, make sure you have installed it.***
 
-- use Raven to install Igropyr:
+- use [Raven](http://ravensc.com) to install Igropyr:
 
 `$ raven install igropyr`
 
@@ -34,7 +34,7 @@ In the second edition being designed, Igropyr draws on the wisdom of Erlang and 
 
 ## Procedures
 
-***server***
+### server
 
 procedure: `(server get post set listen)`
 
