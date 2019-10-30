@@ -81,10 +81,11 @@ This callback must return a string which include a standard http header then req
 
 ### response
 
+```
+procedure: (response status type content)
 
-`procedure: (response status type content)`
-
-`int -> string -> string / list -> string`
+int -> string -> string / list -> string
+```
 
 `response` accepts three parameters: `http status code`, `return type` and `content`, which `status` must be a number, `type` must be a string.
 
@@ -97,9 +98,11 @@ When `content` is a string, it will send as `response content` with a empty cook
 
 ### sendfile
 
-procedure: `(sendfile type path_file)`
+```
+procedure: (sendfile type path_file)
 
-`string -> string -> string`
+string -> string -> string
+```
 
 sendfile accepts two parameters: `MIME type` and `path_file`.
 
@@ -110,9 +113,11 @@ When type is `""`, the `MIME type` is automatelly detected.
 
 ### set
 
-procedure: `(set (name value) ...)`
+```
+procedure: (set (name value) ...)
 
-`(symbol any) -> ... -> association list`
+(symbol any) -> ... -> association list
+```
 
 `set` accepts any number of s-expressions which is used to configure server settings.
 
@@ -129,13 +134,17 @@ The missing settings automatically apply defaults.
 
 ### listen
 
-procedure: `(listen)`
+```
+procedure: (listen)
 
-`() ->  association list`
+() ->  association list
+```
 
-procedure: `(listen ip)`
+```
+procedure: (listen ip)
 
-`string ->  association list`
+string ->  association list
+```
 
 procedure: `(listen port)`
 
