@@ -66,6 +66,7 @@ exemple for use server:
 
 ```
 procedure: (request callback)
+
 (func list -> string -> string -> string) -> unspecified
 ```
 
@@ -81,7 +82,7 @@ This callback must return a string which include a standard http header then req
 ### response
 
 
-procedure: `(response status type content)`
+`procedure: (response status type content)`
 
 `int -> string -> string / list -> string`
 
