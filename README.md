@@ -1,6 +1,8 @@
 # Igropyr
 Cross platform async http-server for Chez Scheme
 
+## [Manual](https://guenchi.github.io/Igropyr)
+
 How fast？ (test on single thread)
 ![image](https://github.com/guenchi/Igropyr/blob/gh-pages/img/ab.png)
 (MacBook Pro Retina, High Sierra 10.13.3, Mid 2014 2.2 GHz Intel Core i7, 16 GB 1600 MHz DDR3)
@@ -11,9 +13,6 @@ Chez Scheme run with the --script option and don't compile scheme code
 ***Igropyr : Node***
 
 Scheme + ChezScheme + libuv : Javascript + V8 + libuv
-
-
-## [Manual](https://guenchi.github.io/Igropyr)***
 
 
 ## Libraries may help:
