@@ -296,7 +296,7 @@ then
 $ raven run example.sc
 ```
 
-more information, see https://github.com/guenchi/Igropyr/blob/master/example/example.sc
+more information, see [example.sc](https://github.com/guenchi/Igropyr/blob/master/example/example.sc)
 
 
 ## Igropyr ecosystem
