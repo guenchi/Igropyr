@@ -17,13 +17,13 @@ Scheme + ChezScheme + libuv : Javascript + V8 + libuv
 
 ## Libraries may help:
 
-***[Ballista](https://github.com/guenchi/Ballista)*** : Webframework `raven install ballista` (Express style)
+***[Ballista](https://guenchi.github.io/Ballista)*** : Webframework `raven install ballista` (Express style)
 
-***[Catapult](https://github.com/guenchi/Catapult)*** : Webframework `raven install catapult` (purely functional)
+***[Catapult](https://guenchi.github.io/Catapult)*** : Webframework `raven install catapult` (purely functional)
 
-***[Core](https://github.com/guenchi/Core)*** : commonly used small functions `raven install core`
+***[Core](https://guenchi.github.io/Core)*** : commonly used small functions `raven install core`
 
-***[JSON](https://github.com/guenchi/json)*** library `raven install json`
+***[JSON](https://guenchi.github.io/json)*** library `raven install json`
 
 ***[JWT](https://github.com/guenchi/jwt)*** Json Web Token `raven install jwt` 
 
