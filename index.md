@@ -301,11 +301,11 @@ more information, see [example.sc](https://github.com/guenchi/Igropyr/blob/maste
 
 ## Igropyr ecosystem
 
-***[Ballista](https://github.com/guenchi/Ballista)*** : Express style webframework
+***[Ballista](https://guenchi.github.io/Ballista/)*** : Express style webframework
 
-***[Catapult](https://github.com/guenchi/Catapult)*** : purely functional webframework 
+***[Catapult](https://guenchi.github.io/Catapult)*** : purely functional webframework 
 
-***[Core](https://github.com/guenchi/Core)*** : commonly used small functions 
+***[Core](https://guenchi.github.io/Core)*** : commonly used small functions 
 
 ***[JSON](https://guenchi.github.io/json/)*** : Json parser and toolfunctions
 
