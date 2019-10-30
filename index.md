@@ -60,7 +60,7 @@ exemple for use server:
   (listen))
 ```
 
-***request***
+### request
 
 procedure: `(request callback)`
 
@@ -75,7 +75,7 @@ When a POST request received, request will passe three arguments (request_header
 This callback must return a string which include a standard http header then request calls the Igropyr's C functionl to send it back to client.
 
 
-***response***
+### response
 
 
 procedure: `(response status type content)`
@@ -91,7 +91,7 @@ When `content` is a string, it will send as `response content` with a empty cook
 `response` format these information to a stirng with a standard http header, prepare to use for the request. Usually use to build the callback of request.
 
 
-***sendfile***
+### sendfile
 
 procedure: `(sendfile type path_file)`
 
@@ -104,7 +104,7 @@ When type is `""`, the `MIME type` is automatelly detected.
 `sendfile` usually use to build the callback of request.
 
 
-***set***
+### set
 
 procedure: `(set (name value) ...)`
 
@@ -123,7 +123,7 @@ Valid values ​​for `name` are:
 The missing settings automatically apply defaults.
 
 
-***listen***
+### listen
 
 procedure: `(listen)`
 
@@ -152,7 +152,7 @@ When listen accepts two parameters, the values is used to set the listen ip and 
 The missing settings automatically apply defaults:ip: 0.0.0.0 port: 80
 
 
-***errorpage***
+### errorpage
 
 procedure: `(errorpage error_code)`
 
@@ -167,7 +167,7 @@ errorpage accepts one or two arguments, the first arguments is the status code, 
 errorpage Returns prepare a string with standard http headers for easily return error page to the client.
 
 
-***par***
+### par
 
 procedure: `(par router_path request_path)`
 
@@ -201,7 +201,7 @@ so:
 (par "/foo/b*" "/foo/far") => #f
 ```
 
-***header-parser***
+### header-parser
 
 procedure: `(header-parser header key)`
 
@@ -210,7 +210,7 @@ procedure: `(header-parser header key)`
 header-parser is an efficient implementation for finding the corresponding value in the http-header.
 
 
-***path-parser***
+### path-parser
 
 procedure: `(header-parser path index)`
 
