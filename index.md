@@ -36,9 +36,11 @@ In the second edition being designed, Igropyr draws on the wisdom of Erlang and 
 
 ### server
 
-procedure: `(server get post set listen)`
+```
+procedure: (server get post set listen)
 
-`return: unspecified`
+return: unspecified
+```
 
 server turn on the server listening.
 
@@ -62,9 +64,10 @@ exemple for use server:
 
 ### request
 
-procedure: `(request callback)`
-
-`(func list -> string -> string -> string) -> unspecified`
+```
+procedure: (request callback)
+(func list -> string -> string -> string) -> unspecified
+```
 
 request accept a procedure that takes three arguments as a callback.
 
