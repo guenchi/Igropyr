@@ -42,7 +42,7 @@ procedure: (server get post set listen)
 return: unspecified
 ```
 
-server turn on the server listening.
+`server` turn on the server listening.
 
 The first two arguments to accept a callback procedure, who is run when the server received a GET and POST request.
 
@@ -52,7 +52,7 @@ The second two arguments to accept a association list, the server will configure
 
 The last two lists one is struct with the key of 'staticpath, 'connection and 'keepalive, and the other with the key of 'ip and 'port.
 
-exemple for use server:
+example for use `server`:
 
 ```
 (server
@@ -70,7 +70,7 @@ procedure: (request callback)
 (func list -> string -> string -> string) -> unspecified
 ```
 
-request accept a procedure that takes three arguments as a callback.
+`request` accept a procedure that takes three arguments as a callback.
 
 When a GET request received, request will passe three arguments (request_header, path_info, query_string) to the callback.
 
@@ -104,7 +104,7 @@ procedure: (sendfile type path_file)
 string -> string -> string
 ```
 
-sendfile accepts two parameters: `MIME type` and `path_file`.
+`sendfile` accepts two parameters: `MIME type` and `path_file`.
 
 When type is `""`, the `MIME type` is automatelly detected.
 
@@ -158,13 +158,13 @@ procedure: (listen ip port)
 string -> number ->  association list
 ```
 
-listen accepts zero to two arguments to set the ip and port that server listen on.
+`listen` accepts zero to two arguments to set the ip and port that server listen on.
 
-When listen accepts a string argument, its value is used to set the ip.
+When `listen` accepts a string argument, its value is used to set the ip.
 
-When listen accepts a int parameter, its value is used to set the port.
+When `listen` accepts a int parameter, its value is used to set the port.
 
-When listen accepts two parameters, the values is used to set the listen ip and port by order.
+When `listen` accepts two parameters, the values is used to set the listen ip and port by order.
 
 The missing settings automatically apply defaults:ip: 0.0.0.0 port: 80
 
@@ -183,9 +183,9 @@ procedure: (errorpage error_code error_info)
 number -> string -> string
 ```
 
-errorpage accepts one or two arguments, the first arguments is the status code, the second arguments is an error message.
+`errorpage` accepts one or two arguments, the first arguments is the `status code`, the second arguments is an error message.
 
-errorpage Returns prepare a string with standard http headers for easily return error page to the client.
+`errorpage` Returns prepare a string with standard http headers for easily return error page to the client.
 
 
 ### par
@@ -232,7 +232,7 @@ procedure: (header-parser header key)
 string -> string -> string
 ```
 
-header-parser is an efficient implementation for finding the corresponding value in the http-header.
+`header-parser` is an efficient implementation for finding the corresponding value in the http-header.
 
 
 ### path-parser
@@ -273,7 +273,7 @@ string -> number -> string
   (listen))
 ```
 
-(set) may define like:
+`(set)` may define like:
 
 ```
 (set 
@@ -282,7 +282,7 @@ string -> number -> string
   ('keepalive     3600))              ;keepalive timeout, 0 for short connection, default is 5000 (ms)
 ```
 
-(listen) may define like:
+`(listen)` may define like:
 
 ```
 (listen "127.0.0.1" 8080)               ;define the ip and port that server listen on
