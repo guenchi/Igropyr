@@ -146,13 +146,17 @@ procedure: (listen ip)
 string ->  association list
 ```
 
-procedure: `(listen port)`
+```
+procedure: (listen port)
 
-`number ->  association list`
+number ->  association list
+```
 
-procedure: `(listen ip port)`
+```
+procedure: (listen ip port)
 
-`string -> number ->  association list`
+string -> number ->  association list
+```
 
 listen accepts zero to two arguments to set the ip and port that server listen on.
 
@@ -167,13 +171,17 @@ The missing settings automatically apply defaults:ip: 0.0.0.0 port: 80
 
 ### errorpage
 
-procedure: `(errorpage error_code)`
+```
+procedure: (errorpage error_code)
 
-`number -> string`
+number -> string
+```
 
-procedure: `(errorpage error_code error_info)`
+```
+procedure: (errorpage error_code error_info)
 
-`number -> string -> string`
+number -> string -> string
+```
 
 errorpage accepts one or two arguments, the first arguments is the status code, the second arguments is an error message.
 
@@ -182,9 +190,11 @@ errorpage Returns prepare a string with standard http headers for easily return 
 
 ### par
 
-procedure: `(par router_path request_path)`
+```
+procedure: (par router_path request_path)
 
-`string -> string -> boolean`
+string -> string -> boolean
+```
 
 `par` is an efficient string fuzzy comparison procedure.
 
@@ -216,18 +226,22 @@ so:
 
 ### header-parser
 
-procedure: `(header-parser header key)`
+```
+procedure: (header-parser header key)
 
-`string -> string -> string`
+string -> string -> string
+```
 
 header-parser is an efficient implementation for finding the corresponding value in the http-header.
 
 
 ### path-parser
 
-procedure: `(header-parser path index)`
+```
+procedure: (header-parser path index)
 
-`string -> number -> string`
+string -> number -> string
+```
 
 `path-parser` return the specific element in the path.
 
@@ -245,27 +259,27 @@ procedure: `(header-parser path index)`
 
 ```
 (define get
-    (lambda (header path query)
-        (response 200 "text/plain" "Hello World")))
+  (lambda (header path query)
+    (response 200 "text/plain" "Hello World")))
                 
 (define post
-    (lambda (header path payload)
-        (response 200 "text/plain" "Hello World")))
+  (lambda (header path payload)
+    (response 200 "text/plain" "Hello World")))
 
 (server 
-    (request get) 
-    (request post)
-    (set) 
-    (listen))
+  (request get) 
+  (request post)
+  (set) 
+  (listen))
 ```
 
 (set) may define like:
 
 ```
 (set 
-    ('staticpath    "/usr/local/www")   ;to define the static path    
-    ('connections   3600)               ;to define the max connections, default is 1024
-    ('keepalive     3600))              ;keepalive timeout, 0 for short connection, default is 5000 (ms)
+  ('staticpath    "/usr/local/www")   ;to define the static path    
+  ('connections   3600)               ;to define the max connections, default is 1024
+  ('keepalive     3600))              ;keepalive timeout, 0 for short connection, default is 5000 (ms)
 ```
 
 (listen) may define like:
