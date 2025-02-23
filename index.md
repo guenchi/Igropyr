@@ -28,6 +28,12 @@ In the second edition being designed, Igropyr draws on the wisdom of Erlang and 
 
 `$ cd igropyr/src && cc -fPIC -shared httpc.c membuf.c -luv -o ../httpc.so`
 
+If you use a Macbook after M1 and install libuv with Homebrew:
+
+you should expo `/opt/homebrew/lib` and `/opt/homebrew/include` or do this with label `-L` and `-I` :
+
+`$ cd igropyr/src && cc -fPIC -L /opt/homebrew/lib  -I /opt/homebrew/include  -shared httpc.c membuf.c -luv -o ../httpc.so`
+
 ## Use
 
 `(import (igropyr http))`
