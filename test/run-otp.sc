@@ -1,0 +1,67 @@
+;;; Igropyr entry point: Express-style HTTP server on libuv with an
+;;; Erlang-style worker pool (Let It Crash).
+;;;
+;;; Run (from the project root):
+;;;   ulimit -n 10240        # macOS defaults to 256; ab -c 500 needs more
+;;;   export CHEZSCHEMELIBDIRS=.:lib
+;;;   export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
+;;;   scheme --script test/run-otp.sc
+;;;
+;;; Acceptance checks (see 需求.md):
+;;;   ab -n 50000 -c 500 http://127.0.0.1:8080/     (two rounds, 0 failures)
+;;;   printf 'GET / HTTP/1.1\r\nHost: x' | nc 127.0.0.1 8080 &   # half request
+;;;   for i in $(seq 8); do curl -m 2 localhost:8080/stuck & done # recovers <=35s
+;;;   curl localhost:8080/crash                     # 500, service keeps running
+
+(import (chezscheme)
+        (igropyr actor)
+        (igropyr uv)
+        (igropyr otp)
+        (igropyr http))
+
+(define app (create-app))
+
+;; middleware: request log line (comment out under load testing if noisy)
+(app-use app
+  (lambda (req res next)
+    (next)))
+
+(app-get app "/"
+  (lambda (req res)
+    (send-html! res "<h1>Igropyr</h1><p>Chez Scheme + libuv + actors</p>")))
+
+(app-get app "/json"
+  (lambda (req res)
+    (send-json! res (list (cons 'name "igropyr")
+                          (cons 'engine "chez-scheme")
+                          (cons 'io "libuv")
+                          (cons 'workers 8)))))
+
+(app-get app "/users/:id"
+  (lambda (req res)
+    (send-json! res (list (cons 'user (req-param req "id"))
+                          (cons 'q (map (lambda (kv)
+                                          (cons (string->symbol (car kv)) (cdr kv)))
+                                        (req-query req)))))))
+
+(app-post app "/echo"
+  (lambda (req res)
+    (send-text! res (utf8->string (req-body req)))))
+
+(app-get app "/crash"
+  (lambda (req res)
+    ;; Let It Crash: the worker dies, the supervisor retries 3 times and
+    ;; then answers 500; the pool is refilled and service continues.
+    (raise 'handler-crashed)))
+
+(app-get app "/stuck"
+  (lambda (req res)
+    ;; CPU-spinning handler: preemptive scheduling keeps the rest of the
+    ;; system responsive; the supervisor kills this worker after 30s.
+    (let loop ((n 0)) (loop (+ n 1)))))
+
+(app-static app "/static" "./public")
+
+(start-scheduler
+  (lambda ()
+    (app-listen app 8080 8)))
