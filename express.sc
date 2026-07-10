@@ -291,6 +291,14 @@
   (define (path-has-dotdot? s)
     (exists (lambda (p) (string=? p "..")) (string-split s #\/)))
 
+  ;; a NUL byte can truncate a path in a lower-level file API, slipping
+  ;; past an extension/suffix check (e.g. "safe.txt\x0;.jpg")
+  (define (path-has-nul? s)
+    (let loop ((i 0))
+      (and (< i (string-length s))
+           (or (fx= (char->integer (string-ref s i)) 0)
+               (loop (+ i 1))))))
+
   ;; ---- static file cache -----------------------------------------------------
   ;;
   ;; Files are read once and kept in memory keyed by path; a request
@@ -481,7 +489,22 @@
     (app-middlewares-set! a (append (app-middlewares a) (list mw))))
 
   (define (app-static a prefix root)
-    (app-statics-set! a (append (app-statics a) (list (cons prefix root)))))
+    (unless (and (string? prefix) (> (string-length prefix) 0)
+                 (char=? (string-ref prefix 0) #\/))
+      (assertion-violation 'app-static
+        "mount prefix must be an absolute URL path" prefix))
+    (unless (and (string? root) (> (string-length root) 0)
+                 (not (path-has-nul? root)))
+      (assertion-violation 'app-static
+        "static root must be a non-empty path without NUL" root))
+    ;; store one canonical spelling: drop a trailing slash so "/assets/"
+    ;; and "/assets" have identical segment-boundary behaviour (root "/"
+    ;; itself is left as-is)
+    (let ((p (if (and (> (string-length prefix) 1)
+                      (char=? (string-ref prefix (- (string-length prefix) 1)) #\/))
+                 (substring prefix 0 (- (string-length prefix) 1))
+                 prefix)))
+      (app-statics-set! a (append (app-statics a) (list (cons p root))))))
 
   ;; websocket route: session is (lambda (ws req) ...), run in the
   ;; connection's own process; :param segments work as in app-get
@@ -513,23 +536,48 @@
   (define (static-relative prefix path)
     (let ((pl (string-length prefix)) (nl (string-length path)))
       (cond
+        ((string=? prefix "/")                     ; root mount
+         (and (> nl 0) (char=? (string-ref path 0) #\/)
+              (substring path 1 nl)))
         ((not (string-prefix? prefix path)) #f)
         ((= nl pl) "")                             ; exactly the mount root
         ((char=? (string-ref path pl) #\/)          ; prefix + "/..."
          (substring path (+ pl 1) nl))
         (else #f))))                                ; e.g. "/assets-private"
 
+  ;; Resolve a URL-relative name under root without letting it escape.
+  ;; Chez has no portable realpath, so reject any symbolic link in the
+  ;; untrusted part of the path (stricter than following the link and
+  ;; comparing platform-specific canonical spellings) -- this blocks
+  ;; symlink-based escapes as well as ".." and NUL. Returns the safe
+  ;; absolute path or #f.
+  (define (safe-static-path root rel)
+    (and (not (path-has-dotdot? rel))
+         (not (path-has-nul? rel))
+         (let loop ((base root) (parts (string-split rel #\/)))
+           (cond
+             ((null? parts) base)
+             ((or (string=? (car parts) "") (string=? (car parts) "."))
+              (loop base (cdr parts)))
+             (else
+              (let ((next (string-append base "/" (car parts))))
+                (and (not (guard (e (#t #t)) (file-symbolic-link? next)))
+                     (loop next (cdr parts)))))))))
+
   (define (try-static a req r)
     (and (eq? (req-method req) 'GET)
          (exists
            (lambda (entry)
              (let* ((prefix (car entry)) (root (cdr entry))
-                    (rel (static-relative prefix (req-path req))))
+                    (rel (static-relative prefix (req-path req)))
+                    (path (and rel (safe-static-path root rel))))
                (and rel
                     (begin
-                      ;; serve-static! caches, rejects ".." segments, and
-                      ;; answers 304 on a matching If-None-Match
-                      (serve-static! r req (string-append root "/" rel))
+                      ;; safe-static-path rejects "..", NUL, and symlink
+                      ;; escapes; serve-static! then caches + answers 304
+                      (if path
+                          (serve-static! r req path)
+                          (begin (set-status! r 403) (send-text! r "Forbidden")))
                       #t))))
            (app-statics a))))
 

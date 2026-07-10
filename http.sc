@@ -41,6 +41,10 @@
 
   (define header-limit 8192)
   (define body-limit 1048576)
+  ;; Bytes a client may pipeline while the current handler is still
+  ;; producing its response. Without a cap a slow handler or a streaming
+  ;; response lets a peer grow the reader's buffer without bound.
+  (define pipeline-limit (+ header-limit body-limit))
   (define read-timeout-ms 30000)   ; slow/half requests reaped after this
   (define await-timeout-ms 60000)  ; reader waits this long for a response
 
@@ -128,7 +132,9 @@
   ;; %XX escapes are octets of a UTF-8 sequence: collect bytes first,
   ;; decode as UTF-8 once at the end (decoding each %XX to a character
   ;; directly would mangle multi-byte sequences like %E4%B8%AD).
-  (define (percent-decode s)
+  ;; plus-as-space?: only in query strings does "+" mean a space; in a
+  ;; path "+" is a literal plus, so the caller controls it.
+  (define (percent-decode s plus-as-space?)
     (let ((n (string-length s)))
       (let-values (((p get) (open-bytevector-output-port)))
         (let loop ((i 0))
@@ -141,7 +147,8 @@
                        (begin (put-u8 p v) (loop (+ i 3)))
                        (begin (put-bytevector p (string->utf8 (string ch)))
                               (loop (+ i 1))))))
-                ((char=? ch #\+) (put-u8 p 32) (loop (+ i 1)))
+                ((and plus-as-space? (char=? ch #\+))
+                 (put-u8 p 32) (loop (+ i 1)))
                 (else
                  (put-bytevector p (string->utf8 (string ch)))
                  (loop (+ i 1)))))))
@@ -153,9 +160,9 @@
         (map (lambda (kv)
                (let ((parts (string-split kv #\=)))
                  (if (>= (length parts) 2)
-                     (cons (percent-decode (car parts))
-                           (percent-decode (cadr parts)))
-                     (cons (percent-decode (car parts)) ""))))
+                     (cons (percent-decode (car parts) #t)
+                           (percent-decode (cadr parts) #t))
+                     (cons (percent-decode (car parts) #t) ""))))
              (string-split s #\&))))
 
   (define (strip-cr l)
@@ -208,7 +215,8 @@
                     (version (caddr rl))
                     (qpos (string-index target #\?))
                     (path (percent-decode
-                            (if qpos (substring target 0 qpos) target)))
+                            (if qpos (substring target 0 qpos) target)
+                            #f))                     ; "+" is literal in a path
                     (query (if qpos
                                (parse-query
                                  (substring target (+ qpos 1)
@@ -639,7 +647,11 @@
         (if eof? (tcp-close! c) (reader-loop c srv leftover)))
       (`#(conn-closed) 'done)
       (`#(streaming) (await-streaming c srv leftover))
-      (`#(tcp-data ,bv) (await-response c srv (bv-append leftover bv) eof?))
+      (`#(tcp-data ,bv)
+        (let ((buf (bv-append leftover bv)))
+          (if (> (bytevector-length buf) pipeline-limit)
+              (tcp-close! c)                        ; peer over-pipelining
+              (await-response c srv buf eof?))))
       (`#(tcp-eof) (await-response c srv leftover #t))
       (`#(tcp-error ,e) (await-response c srv leftover #t))))
 
@@ -650,7 +662,11 @@
     (receive (after 'infinity #f)
       (`#(next-request) (reader-loop c srv leftover))
       (`#(conn-closed) 'done)
-      (`#(tcp-data ,bv) (await-streaming c srv (bv-append leftover bv)))
+      (`#(tcp-data ,bv)
+        (let ((buf (bv-append leftover bv)))
+          (if (> (bytevector-length buf) pipeline-limit)
+              (begin (tcp-close! c) 'done)
+              (await-streaming c srv buf))))
       (`#(tcp-eof) (tcp-close! c) 'done)
       (`#(tcp-error ,e) (tcp-close! c) 'done)))
 
