@@ -306,9 +306,9 @@
                 "Content-Length: " (number->string (bytevector-length body))
                 "\r\nConnection: " (if ka "keep-alive" "close")
                 "\r\n\r\n"))
-             (full (bv-append (string->utf8 head) body))
              (owner (conn-owner c)))
-        (tcp-write! c full
+        ;; head and body are written as two segments -- no bv-append copy
+        (tcp-writev! c (list (string->utf8 head) body)
           (lambda (st)
             (if (and ka (>= st 0))
                 (send owner (vector 'next-request))
@@ -374,17 +374,20 @@
 
   ;; Write one chunk (string or bytevector). #f when the stream is not
   ;; open any more (e.g. the client disconnected) -- stop the loop then.
+  (define crlf-bv (string->utf8 "\r\n"))
+
   (define (res-write! r data)
     (let ((bv (if (string? data) (string->utf8 data) data))
           (c (res-conn r)))
       (and (eq? (res-mode r) 'streaming)
            (eq? (conn-state c) 'open)
            (> (bytevector-length bv) 0)
-           (tcp-write! c
-             (bv-append
-               (string->utf8
-                 (string-append (number->string (bytevector-length bv) 16) "\r\n"))
-               (bv-append bv (string->utf8 "\r\n")))
+           ;; chunk = <hex size>CRLF <data> CRLF, written as three segments
+           (tcp-writev! c
+             (list (string->utf8
+                     (string-append (number->string (bytevector-length bv) 16) "\r\n"))
+                   bv
+                   crlf-bv)
              #f))))
 
   ;; Finish the stream: terminating chunk, then the usual keep-alive /

@@ -13,7 +13,7 @@
 (library (igropyr uv)
   (export uv-init! uv-poll! now-ms uv-set-deliver!
           tcp-listen! tcp-stop-listen! tcp-connect!
-          tcp-read-start! tcp-write! tcp-close!
+          tcp-read-start! tcp-write! tcp-writev! tcp-close!
           conn? conn-handle conn-owner conn-set-owner!
           conn-state conn-count uv-strerror)
   (import (chezscheme))
@@ -50,6 +50,7 @@
   (define uv-read-start  (foreign-procedure "uv_read_start" (void* void* void*) int))
   (define uv-read-stop   (foreign-procedure "uv_read_stop" (void*) int))
   (define uv-write       (foreign-procedure "uv_write" (void* void* void* unsigned-int void*) int))
+  (define uv-try-write   (foreign-procedure "uv_try_write" (void* void* unsigned-int) int))
   (define uv-close       (foreign-procedure "uv_close" (void* void*) void))
   (define uv-is-closing  (foreign-procedure "uv_is_closing" (void*) int))
   (define uv-strerror    (foreign-procedure "uv_strerror" (int) string))
@@ -58,6 +59,7 @@
   (define uv-timer-stop  (foreign-procedure "uv_timer_stop" (void*) int))
   (define memcpy-from-c  (foreign-procedure "memcpy" (u8* void* size_t) void*))
   (define memcpy-to-c    (foreign-procedure "memcpy" (void* u8* size_t) void*))
+  (define memcpy-cc      (foreign-procedure "memcpy" (void* void* size_t) void*))
 
   (define UV-CONNECT 2)
   (define tcp-handle-size (uv-handle-size UV-TCP))
@@ -108,6 +110,11 @@
   (define sockaddr-buf 0)
   (define read-buf 0)
   (define read-buf-size 65536)
+  ;; reusable scratch for the uv_try_write fast path (single OS thread,
+  ;; used only for the duration of a synchronous try_write)
+  (define write-scratch 0)
+  (define write-scratch-size 65536)
+  (define scratch-buf 0)             ; one reusable uv_buf_t
 
   ;; ---- callbacks ----------------------------------------------------
 
@@ -243,7 +250,9 @@
     (set! wakeup-timer (foreign-alloc timer-handle-size))
     (check 'uv-timer-init (uv-timer-init uv-loop wakeup-timer))
     (set! sockaddr-buf (foreign-alloc 128))
-    (set! read-buf (foreign-alloc read-buf-size)))
+    (set! read-buf (foreign-alloc read-buf-size))
+    (set! write-scratch (foreign-alloc write-scratch-size))
+    (set! scratch-buf (foreign-alloc buf-t-size)))
 
   ;; Pump the event loop. timeout-ms = 0: poll without blocking.
   ;; timeout-ms > 0: block in the OS poller until I/O arrives or the
@@ -299,31 +308,74 @@
     (when (eq? (conn-state c) 'open)
       (uv-read-start (conn-handle c) on-alloc-entry on-read-entry)))
 
-  ;; Queue a write. Allocates one foreign block laid out as
-  ;; [uv_write_t][uv_buf_t][payload]; write_cb frees it. on-done (or #f)
-  ;; is called with the libuv status; it runs in callback context so it
-  ;; must not yield. Returns #f if the write could not be queued (conn
-  ;; closing or immediate error), in which case on-done ran with -1.
-  (define (tcp-write! c bv on-done)
+  ;; Queue `len` bytes for an async write. fill-data! copies them into
+  ;; the foreign data area. Allocates one block [uv_write_t][uv_buf_t]
+  ;; [payload]; write_cb frees it and runs on-done in callback context
+  ;; (must not yield). Returns #t if queued, #f on immediate error.
+  (define (enqueue-write! c len fill-data! on-done)
+    (let* ((block (foreign-alloc (+ write-req-size buf-t-size len)))
+           (buf-ptr (+ block write-req-size))
+           (data-ptr (+ buf-ptr buf-t-size)))
+      (fill-data! data-ptr)
+      (foreign-set! 'void* buf-ptr 0 data-ptr)
+      (foreign-set! 'unsigned-64 buf-ptr 8 len)
+      (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
+        (if (< r 0)
+            (begin (foreign-free block) (when on-done (on-done r)) #f)
+            (begin
+              (hashtable-set! write-table block
+                (or on-done (lambda (status) (void))))
+              #t)))))
+
+  ;; Write a sequence of bytevectors as one response. Small writes take
+  ;; the uv_try_write fast path: the segments are packed into the shared
+  ;; scratch buffer and written synchronously, skipping the write_req /
+  ;; write_cb / hashtable / foreign-alloc of the queued path entirely --
+  ;; on-done runs inline with status 0. A partial write or EAGAIN falls
+  ;; back to the queued path for the unwritten remainder; writes larger
+  ;; than the scratch go straight to the queued path. on-done runs in
+  ;; caller context on the fast path (safe: not inside a libuv callback)
+  ;; and in callback context on the queued path; either way it must not
+  ;; yield. Returns #f if the connection is not open (on-done ran -1).
+  (define (tcp-writev! c segs on-done)
     (if (not (eq? (conn-state c) 'open))
         (begin (when on-done (on-done -1)) #f)
-        (let* ((n (bytevector-length bv))
-               (block (foreign-alloc (+ write-req-size buf-t-size n)))
-               (buf-ptr (+ block write-req-size))
-               (data-ptr (+ buf-ptr buf-t-size)))
-          (memcpy-to-c data-ptr bv n)
-          (foreign-set! 'void* buf-ptr 0 data-ptr)
-          (foreign-set! 'unsigned-64 buf-ptr 8 n)
-          (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
-            (if (< r 0)
-                (begin
-                  (foreign-free block)
-                  (when on-done (on-done r))
-                  #f)
-                (begin
-                  (hashtable-set! write-table block
-                    (or on-done (lambda (status) (void))))
-                  #t))))))
+        (let ((total (fold-left (lambda (a b) (+ a (bytevector-length b))) 0 segs)))
+          (cond
+            ((<= total write-scratch-size)
+             ;; pack segments into scratch, then try to write in one shot
+             (let loop ((ss segs) (off 0))
+               (unless (null? ss)
+                 (let ((n (bytevector-length (car ss))))
+                   (memcpy-to-c (+ write-scratch off) (car ss) n)
+                   (loop (cdr ss) (+ off n)))))
+             (foreign-set! 'void* scratch-buf 0 write-scratch)
+             (foreign-set! 'unsigned-64 scratch-buf 8 total)
+             (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))
+               (cond
+                 ((= n total)                       ; fully written now
+                  (when on-done (on-done 0)) #t)
+                 ((and (> n 0) (< n total))         ; partial: queue the rest
+                  (enqueue-write! c (- total n)
+                    (lambda (dest) (memcpy-cc dest (+ write-scratch n) (- total n)))
+                    on-done))
+                 (else                              ; EAGAIN/0: queue all
+                  (enqueue-write! c total
+                    (lambda (dest) (memcpy-cc dest write-scratch total))
+                    on-done)))))
+            (else                                    ; too big for scratch
+             (enqueue-write! c total
+               (lambda (dest)
+                 (let loop ((ss segs) (off 0))
+                   (unless (null? ss)
+                     (let ((n (bytevector-length (car ss))))
+                       (memcpy-to-c (+ dest off) (car ss) n)
+                       (loop (cdr ss) (+ off n))))))
+               on-done))))))
+
+  ;; single-bytevector write (websocket / redis / mysql)
+  (define (tcp-write! c bv on-done)
+    (tcp-writev! c (list bv) on-done))
 
   ;; Idempotent close; memory is freed only in close_cb, so there is no
   ;; double-close and no fd leak.
