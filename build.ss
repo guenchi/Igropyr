@@ -6,10 +6,9 @@
 ;;; because CHEZSCHEMELIBEXTS lists .so before .sc, they are then loaded
 ;;; in preference to the sources. Re-run after editing any source.
 ;;;
-;;; Hot-path files (uv, actor, http) are compiled at optimize-level 3
-;;; (their bytevector loops are all bounded by explicit < n guards and
-;;; their record access is type-safe); the rest use level 2. Interrupt
-;;; traps are left ON -- preemptive scheduling depends on them.
+;;; Everything is compiled at optimize-level 2: full optimization with
+;;; all type/bounds checks kept -- safe by default. Interrupt traps are
+;;; left ON -- preemptive scheduling depends on them.
 
 (import (chezscheme))
 
@@ -17,15 +16,15 @@
 ;; already-compiled dependencies are picked up as .so.
 (define units
   '(("igropyr/platform.sc" . 2)
-    ("igropyr/libuv.sc" . 3)
-    ("igropyr/actor.sc" . 3)
+    ("igropyr/libuv.sc" . 2)
+    ("igropyr/actor.sc" . 2)
     ("igropyr/json.sc" . 2)
     ("igropyr/gzip.sc" . 2)
     ("igropyr/otp.sc" . 2)
     ("igropyr/websocket.sc" . 2)
     ("igropyr/ws-client.sc" . 2)
     ("igropyr/gen-server.sc" . 2)
-    ("igropyr/http.sc" . 3)
+    ("igropyr/http.sc" . 2)
     ("igropyr/pubsub.sc" . 2)
     ("igropyr/express.sc" . 2)
     ("igropyr/session.sc" . 2)

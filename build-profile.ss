@@ -20,7 +20,7 @@
     "igropyr/express.sc" "igropyr/session.sc" "igropyr/middleware.sc" "igropyr/metrics.sc" "igropyr/client.sc"
     "igropyr/redis.sc" "igropyr/mysql.sc"))
 
-(parameterize ((optimize-level 3)
+(parameterize ((optimize-level 2)
                (generate-inspector-information #f))
   (for-each
     (lambda (f) (printf "compiling (profiled) ~a\n" f) (compile-library f))

@@ -7,10 +7,8 @@
 ;;;
 ;;; Interrupt traps stay on (preemptive scheduling needs them).
 ;;;
-;;; optimize-level 3 (unsafe): cross-library procedure integration PLUS
-;;; elided type/bounds checks. Safe here because every bytevector loop is
-;;; bounded by an explicit < n / >= n guard and record access is
-;;; type-correct -- verified by the full test suite after each build.
+;;; optimize-level 2: full cross-library procedure integration with all
+;;; type/bounds checks kept -- safe by default for release builds.
 
 (import (chezscheme))
 
@@ -23,7 +21,7 @@
     "igropyr/express.sc" "igropyr/session.sc" "igropyr/middleware.sc" "igropyr/metrics.sc" "igropyr/client.sc"
     "igropyr/redis.sc" "igropyr/mysql.sc"))
 
-(parameterize ((optimize-level 3)
+(parameterize ((optimize-level 2)
                (generate-inspector-information #f))
   (for-each
     (lambda (f)

@@ -615,20 +615,18 @@ worker death             : #(DOWN ,pid ,reason)          ; 通过 monitor
 从源码运行（`scheme --script`）会解释执行 library。部署时应编译。两个选项：
 
 ```sh
-# 分库 .so 文件（hot-path 文件 optimize-level 3，其余为 2）。
+# 分库 .so 文件（optimize-level 2：完整优化，保留全部 type/bounds check）。
 # 当 CHEZSCHEMELIBEXTS 中 .so 位于 .sc 前面时，会自动加载 .so 而不是源码。
 # 这适合开发，因为 --script 仍然可用。
 scheme --libdirs .:lib --script igropyr/build.ss
 
 # Whole-program：把每个 library + app 折叠进一个优化后的 program
-#（cross-library inlining，optimize-level 3）。用 --program 运行它。
+#（cross-library inlining，optimize-level 2）。用 --program 运行它。
 scheme --libdirs .:lib --script igropyr/build-whole.ss
 scheme --program igropyr/app.so
 ```
 
 编辑任何源码后都要重新构建。Interrupt trap 保持启用（抢占式调度需要它）。
-optimize-level 3 会省略 bounds/type check；所有 bytevector loop 都有 guard，
-并在每次 build 后运行完整测试套件确认。
 
 Profile-guided optimization（`build-profile.ss` 做 instrumentation，
 压测后通过 `/admin/profdump` 收集，`build-pgo.ss` 用 profile 重新编译）可用，

@@ -1309,6 +1309,10 @@ Igropyr 代码只使用圆括号 `()`。不要使用方括号 `[]`。
 
 所有代码都使用 R6RS library form。使用显式 import 和 export。避免 top-level mutation（在 library 内部使用 private state，或在进程中共享状态；不要使用 library variable）。
 
+### `.sc` 后缀
+
+Igropyr 的全部源文件刻意使用 `.sc` 后缀。作者倡导以 `.sc` 表明意图：代码遵循严格的 R6RS 语义、面向生产环境——以区别于 `.scm` 的"什么方言都可能"和 Chez 私有味道的 `.ss`。展望未来，本项目（很可能）会迈向 R7RS Large。
+
 ### 命名约定
 
 - **Predicate** 以 `?` 结尾：`process-alive?`、`queue-empty?`

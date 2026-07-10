@@ -677,21 +677,20 @@ Running from source (`scheme --script`) interprets the libraries. For
 deployment, compile. Two options:
 
 ```sh
-# Per-library .so files (hot-path files at optimize-level 3, rest at 2).
-# Loaded automatically in place of the sources (.so precedes .sc in
-# CHEZSCHEMELIBEXTS). Good for development, since --script keeps working.
+# Per-library .so files (optimize-level 2: full optimization, all
+# type/bounds checks kept). Loaded automatically in place of the sources
+# (.so precedes .sc in CHEZSCHEMELIBEXTS). Good for development, since
+# --script keeps working.
 scheme --libdirs .:lib --script igropyr/build.ss
 
 # Whole-program: fold every library + the app into one optimized program
-# (cross-library inlining, optimize-level 3). Run it with --program.
+# (cross-library inlining, optimize-level 2). Run it with --program.
 scheme --libdirs .:lib --script igropyr/build-whole.ss
 scheme --program igropyr/app.so
 ```
 
 Re-run the build after editing any source. Interrupt traps stay enabled
-(preemptive scheduling needs them). optimize-level 3 elides bounds/type
-checks; the bytevector loops are all guarded and the full test suite is
-run after each build to confirm.
+(preemptive scheduling needs them).
 
 Profile-guided optimization (`build-profile.ss` to instrument,
 `/admin/profdump` to collect after driving load, `build-pgo.ss` to

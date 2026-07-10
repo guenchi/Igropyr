@@ -1942,6 +1942,10 @@ The `#!chezscheme` header is required when the code uses Chez-specific features 
 
 All code is in R6RS library form. Use explicit imports and exports. Avoid top-level mutation (use private state within libraries, or shared state in processes, never in library variables).
 
+### The `.sc` Extension
+
+Igropyr deliberately uses the `.sc` extension for every source file. The author advocates `.sc` as a statement of intent: the code is written against strict R6RS semantics and is aimed at production use — as opposed to the anything-goes connotation of `.scm` or the Chez-flavored `.ss`. Looking ahead, the project will (very likely) move toward R7RS Large.
+
 ### Naming Conventions
 
 - **Predicates** end with `?`: `process-alive?`, `queue-empty?`
