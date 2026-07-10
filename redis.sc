@@ -123,17 +123,32 @@
 
   (define connection-lost (vector 'redis-error "connection lost"))
 
-  ;; FIFO of pids waiting for replies, oldest first
+  ;; Each waiter is a mutable pair (from . live?). A caller that times
+  ;; out cancels itself (live? -> #f); its still-queued reply is then
+  ;; consumed and discarded here instead of being delivered late into
+  ;; the caller's mailbox, where the next call would mis-read it. The
+  ;; entry stays in the FIFO so request/reply alignment is preserved.
+  ;; A caller has at most one outstanding command (redis is synchronous),
+  ;; so its pid uniquely identifies its waiter.
+  (define (reply-to! waiter v)
+    (when (cdr waiter)
+      (send (car waiter) (vector 'redis-reply v))))
+
   (define (conn-loop c buf waiters)
     (receive
       (`#(redis-cmd ,args ,from)
         (if (eq? (conn-state c) 'open)
             (begin
               (tcp-write! c (encode-command args) #f)
-              (conn-loop c buf (append waiters (list from))))
+              (conn-loop c buf (append waiters (list (cons from #t)))))
             (begin
               (send from (vector 'redis-reply connection-lost))
               (conn-loop c buf waiters))))
+      (`#(redis-cancel ,from)
+        (for-each
+          (lambda (p) (when (eq? (car p) from) (set-cdr! p #f)))
+          waiters)
+        (conn-loop c buf waiters))
       (`#(tcp-data ,bv)
         (let drain ((buf (bv-append buf bv)) (waiters waiters))
           (let-values (((v next) (parse-reply buf 0)))
@@ -141,21 +156,17 @@
                 (conn-loop c buf waiters)
                 (begin
                   (when (pair? waiters)
-                    (send (car waiters) (vector 'redis-reply v)))
+                    (reply-to! (car waiters) v))
                   (drain (bv-sub buf next (bytevector-length buf))
                          (if (pair? waiters) (cdr waiters) '())))))))
       (`#(redis-quit)
-        (for-each
-          (lambda (w) (send w (vector 'redis-reply connection-lost)))
-          waiters)
+        (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
         (tcp-close! c))
       (`#(tcp-eof) (fail-all c waiters))
       (`#(tcp-error ,e) (fail-all c waiters))))
 
   (define (fail-all c waiters)
-    (for-each
-      (lambda (w) (send w (vector 'redis-reply connection-lost)))
-      waiters)
+    (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
     (tcp-close! c))
 
   ;; ---- public API ----------------------------------------------------------------
@@ -184,10 +195,13 @@
                                    (uv-strerror status)
                                    "connect timeout")))))))))
 
-  ;; Run one command; blocks only the calling green process.
+  ;; Run one command; blocks only the calling green process. On timeout
+  ;; the connection process is told to drop the (still-pending) reply, so
+  ;; it can never surface in a later call.
   (define (redis rc . args)
     (send rc (vector 'redis-cmd args self))
     (receive (after reply-timeout-ms
+                (send rc (vector 'redis-cancel self))
                 (raise (vector 'redis-error "reply timeout")))
       (`#(redis-reply ,v)
         (if (and (vector? v) (eq? (vector-ref v 0) 'redis-error))

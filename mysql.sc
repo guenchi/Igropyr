@@ -546,16 +546,31 @@
 
   ;; ---- connection process ----------------------------------------------------------------
 
+  ;; A transport/protocol failure (as opposed to a server-side SQL error,
+  ;; which carries a real positive MySQL error code) means the connection
+  ;; is no longer trustworthy: its framing may be desynchronised.
+  (define (transport-dead? r)
+    (and (vector? r) (eq? (vector-ref r 0) 'mysql-error)
+         (< (vector-ref r 1) 0)))
+
   ;; notify (a pid or #f): told #(mysql-idle ,self) after each finished
-  ;; query, so a pool can hand this connection its next task
+  ;; query, so a pool can hand this connection its next task. Replies
+  ;; carry the caller's ref so a late reply (after the caller timed out)
+  ;; cannot be mis-read by that caller's next query. On a transport
+  ;; error the connection is closed and this process exits -- the pool's
+  ;; monitor then rebuilds it, rather than the dead connection returning
+  ;; to the idle set.
   (define (serve-loop c bufbox notify)
     (receive
-      (`#(mysql-query ,sql ,from)
+      (`#(mysql-query ,sql ,ref ,from)
         (let ((r (guard (e (#t (as-mysql-error e "query failed")))
                    (run-query! c bufbox sql))))
-          (send from (vector 'mysql-reply r)))
-        (when notify (send notify (vector 'mysql-idle self)))
-        (serve-loop c bufbox notify))
+          (send from (vector 'mysql-reply ref r))
+          (if (transport-dead? r)
+              (tcp-close! c)                        ; exit -> DOWN -> rebuild
+              (begin
+                (when notify (send notify (vector 'mysql-idle self)))
+                (serve-loop c bufbox notify)))))
       (`#(mysql-quit)
         (send-packet! c (bytevector 1) 0)          ; COM_QUIT
         (tcp-close! c))
@@ -598,7 +613,7 @@
   (define (pool-loop n host port user password db)
     (define me self)
     (define idle '())
-    (define busy (make-eq-hashtable))   ; conn pid -> caller pid
+    (define busy (make-eq-hashtable))   ; conn pid -> (caller-pid . ref)
     (define pending-front '())
     (define pending-back '())
     (define (pending?) (or (pair? pending-front) (pair? pending-back)))
@@ -611,24 +626,26 @@
         x))
     (define (connect!)
       (monitor (start-connection host port user password db me me)))
-    (define (assign! c sql from)
-      (hashtable-set! busy c from)
-      (send c (vector 'mysql-query sql from)))
+    ;; a job is #(sql ref from)
+    (define (assign! c job)
+      (hashtable-set! busy c (cons (vector-ref job 2) (vector-ref job 1)))
+      (send c (vector 'mysql-query (vector-ref job 0)
+                      (vector-ref job 1) (vector-ref job 2))))
     (define (make-available! c)
       (hashtable-delete! busy c)
       (if (pending?)
-          (let ((job (pop-pending!)))
-            (assign! c (car job) (cdr job)))
+          (assign! c (pop-pending!))
           (set! idle (cons c idle))))
     (do ((i 0 (+ i 1))) ((= i n)) (connect!))
     (let loop ()
       (receive
-        (`#(mysql-query ,sql ,from)
-          (if (pair? idle)
-              (let ((c (car idle)))
-                (set! idle (cdr idle))
-                (assign! c sql from))
-              (set! pending-back (cons (cons sql from) pending-back)))
+        (`#(mysql-query ,sql ,ref ,from)
+          (let ((job (vector sql ref from)))
+            (if (pair? idle)
+                (let ((c (car idle)))
+                  (set! idle (cdr idle))
+                  (assign! c job))
+                (set! pending-back (cons job pending-back))))
           (loop))
         (`#(mysql-idle ,c)
           (make-available! c)
@@ -649,11 +666,12 @@
           ;; connect workers already scheduled their own retry above
           (when (or (memq pid idle) (hashtable-contains? busy pid))
             (set! idle (remq pid idle))
-            (let ((from (hashtable-ref busy pid #f)))
+            (let ((entry (hashtable-ref busy pid #f)))
               (hashtable-delete! busy pid)
-              (when from
-                (send from (vector 'mysql-reply
-                                   (vector 'mysql-error -1 "connection lost")))))
+              (when entry
+                (send (car entry)
+                      (vector 'mysql-reply (cdr entry)
+                              (vector 'mysql-error -1 "connection lost")))))
             (connect!))
           (loop))
         (`#(mysql-quit)
@@ -686,15 +704,19 @@
       (random-seed (+ 1 (mod (now-ms) 4000000000)))
       (spawn (lambda () (pool-loop n host port user password db)))))
 
-  ;; Run one SQL statement; blocks only the calling green process.
+  ;; Run one SQL statement; blocks only the calling green process. The
+  ;; per-call ref (a fresh gensym) is echoed in the reply, so if this
+  ;; call times out, a late reply carrying the old ref will not be
+  ;; matched by the caller's next query.
   (define (mysql-query mc sql)
-    (send mc (vector 'mysql-query sql self))
-    (receive (after query-timeout-ms
-                (raise (vector 'mysql-error -1 "query timeout")))
-      (`#(mysql-reply ,r)
-        (if (and (vector? r) (eq? (vector-ref r 0) 'mysql-error))
-            (raise r)
-            r))))
+    (let ((ref (gensym)))
+      (send mc (vector 'mysql-query sql ref self))
+      (receive (after query-timeout-ms
+                  (raise (vector 'mysql-error -1 "query timeout")))
+        (`#(mysql-reply ,@ref ,r)
+          (if (and (vector? r) (eq? (vector-ref r 0) 'mysql-error))
+              (raise r)
+              r)))))
 
   (define (mysql-close! mc)
     (send mc (vector 'mysql-quit)))
