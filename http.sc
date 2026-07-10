@@ -106,21 +106,27 @@
           ((char=? (string-ref s i) ch) i)
           (else (scan (+ i 1)))))))
 
+  ;; %XX escapes are octets of a UTF-8 sequence: collect bytes first,
+  ;; decode as UTF-8 once at the end (decoding each %XX to a character
+  ;; directly would mangle multi-byte sequences like %E4%B8%AD).
   (define (percent-decode s)
     (let ((n (string-length s)))
-      (call-with-string-output-port
-        (lambda (p)
-          (let loop ((i 0))
-            (when (< i n)
-              (let ((ch (string-ref s i)))
-                (cond
-                  ((and (char=? ch #\%) (< (+ i 2) (+ n 0)))
-                   (let ((v (string->number (substring s (+ i 1) (+ i 3)) 16)))
-                     (if v
-                         (begin (write-char (integer->char v) p) (loop (+ i 3)))
-                         (begin (write-char ch p) (loop (+ i 1))))))
-                  ((char=? ch #\+) (write-char #\space p) (loop (+ i 1)))
-                  (else (write-char ch p) (loop (+ i 1)))))))))))
+      (let-values (((p get) (open-bytevector-output-port)))
+        (let loop ((i 0))
+          (when (< i n)
+            (let ((ch (string-ref s i)))
+              (cond
+                ((and (char=? ch #\%) (< (+ i 2) n))
+                 (let ((v (string->number (substring s (+ i 1) (+ i 3)) 16)))
+                   (if v
+                       (begin (put-u8 p v) (loop (+ i 3)))
+                       (begin (put-bytevector p (string->utf8 (string ch)))
+                              (loop (+ i 1))))))
+                ((char=? ch #\+) (put-u8 p 32) (loop (+ i 1)))
+                (else
+                 (put-bytevector p (string->utf8 (string ch)))
+                 (loop (+ i 1)))))))
+        (utf8->string (get)))))
 
   (define (parse-query s)
     (if (string=? s "")
