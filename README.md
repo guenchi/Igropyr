@@ -1,5 +1,7 @@
 # Igropyr
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 A high-concurrency HTTP server for [Chez Scheme](https://cisco.github.io/ChezScheme/),
 built directly on [libuv](https://libuv.org/) through Chez's FFI (no C shim),
 with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
@@ -51,7 +53,7 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
   connection/request/pool counters), `http-shutdown!` (drain in-flight
   requests, refuse new connections)
 - **Multi-process scaling** — `SO_REUSEPORT` bind option for
-  kernel-balanced multi-process listening on Linux/FreeBSD (pair with
+  kernel-balanced multi-process listening on Linux (pair with
   pm2 or systemd)
 - **HTTP/1.1 keep-alive & pipelining** — persistent connections by default
   on 1.1; each connection's reader process loops over successive requests
@@ -64,21 +66,24 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
   laptop (`ab -n 50000 -c 500`, zero failed requests)
 
 For architecture, the actor model, the libuv-callback invariant, and
-contribution guidelines, see [docs/MANUAL.md](docs/MANUAL.md).
+contribution guidelines, see [docs/MANUAL.md](docs/MANUAL.md) or
+[简体中文手册](docs/MANUAL.zh-CN.md).
 
 ## Requirements
 
 - Chez Scheme 10.x
 - libuv 1.x
+- zlib 1.x
+- macOS or Linux on x86_64/arm64
 
 ```sh
 brew install chezscheme libuv        # macOS
-# apt install chezscheme libuv1-dev  # Debian/Ubuntu
+# apt install chezscheme libuv1-dev zlib1g-dev  # Debian/Ubuntu
 ```
 
-The libuv shared object path is set at the top of `uv.sc`
-(`/opt/homebrew/lib/libuv.1.dylib` by default); adjust it for your system,
-e.g. `libuv.so.1` on Linux.
+Igropyr selects the platform ABI and loads libuv, zlib, and the system C
+library automatically. Supported Chez machine types are macOS/Linux on
+x86_64 and arm64; an unsupported host fails at import time with a clear error.
 
 ## Getting started
 
@@ -89,7 +94,7 @@ is lowercase; on case-sensitive file systems the directory name must match):
 git clone https://github.com/guenchi/Igropyr igropyr
 export CHEZSCHEMELIBDIRS=.
 export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
-scheme --script igropyr/test/run-otp.sc
+chez --script igropyr/test/run-otp.sc   # `scheme` also works when provided
 ```
 
 Then:
@@ -407,6 +412,8 @@ being served.
 Server errors raise `#(redis-error msg)` / `#(mysql-error code msg)` in
 the caller — inside a route handler that means Let It Crash: the worker
 dies, the supervisor retries, the service keeps running.
+Redis bulk strings are binary-safe: valid UTF-8 comes back as a string,
+and non-UTF-8 data comes back as a bytevector.
 
 MySQL's `caching_sha2_password` fast path (challenge-response, no
 password on the wire) needs no configuration. The *full* auth path sends
@@ -640,7 +647,7 @@ mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
 
 The actor scheduler (`register`/`whereis`/`monitor`/`demonitor`) and the
 libuv-callback invariant that everything rests on are documented in
-[docs/MANUAL.md](docs/MANUAL.md).
+[docs/MANUAL.md](docs/MANUAL.md) and [docs/MANUAL.zh-CN.md](docs/MANUAL.zh-CN.md).
 
 Message protocol between processes:
 
@@ -714,14 +721,15 @@ trivial keep-alive route on an Apple Silicon laptop.
 
 ## Tests
 
-Layered smoke tests, each runnable on its own:
+Run the complete, self-asserting test suite:
 
 ```sh
-scheme --script igropyr/test/smoke-echo.sc        # FFI layer: bare echo server
-scheme --script igropyr/test/smoke-actor.sc       # scheduler: ping-pong, timeouts, preemption
-scheme --script igropyr/test/smoke-echo-actor.sc  # process-per-connection echo
-scheme --script igropyr/test/run-otp.sc           # the full HTTP server
+./igropyr/test/run-all.sh
 ```
+
+It checks library imports, actor scheduling, asynchronous file reads, strict
+HTTP framing/query behavior, and boot-failure propagation. The older echo and
+`run-otp.sc` programs remain available as interactive smoke/demo servers.
 
 ## License
 

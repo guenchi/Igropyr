@@ -145,7 +145,11 @@
 
   (define (panic what reason)
     (with-interrupts-disabled
-      (display "PANIC: ") (display what) (display " ") (write reason) (newline)
+      (display "PANIC: ") (display what) (display " ")
+      (if (condition? reason)
+          (display-condition reason (current-output-port))
+          (write reason))
+      (newline)
       (exit 70)))
 
   ;; ---- queues with precedence -------------------------------------------
@@ -542,8 +546,15 @@
       (lambda () (yield run-queue 0)))
     (set-timer process-default-ticks)
     (set! event-loop-pid (spawn event-loop))
-    (spawn boot-thunk)
-    (let forever ()
-      (receive (after 3600000 'tick))
-      (forever)))
+    (let ((boot-pid (spawn boot-thunk)))
+      ;; A boot failure (bind error, bad configuration, missing resource)
+      ;; must not leave a healthy event loop running with no application.
+      ;; Normal boot completion is expected after setup and is ignored.
+      (monitor boot-pid)
+      (let forever ()
+        (receive (after 3600000 (forever))
+          (`#(DOWN ,@boot-pid ,reason)
+            (if (eq? reason 'normal)
+                (forever)
+                (panic 'boot reason)))))))
 )

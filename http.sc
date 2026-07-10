@@ -41,6 +41,7 @@
 
   (define header-limit 8192)
   (define body-limit 1048576)
+  (define trailer-limit 8192)
   ;; Bytes a client may pipeline while the current handler is still
   ;; producing its response. Without a cap a slow handler or a streaming
   ;; response lets a peer grow the reader's buffer without bound.
@@ -158,11 +159,12 @@
     (if (string=? s "")
         '()
         (map (lambda (kv)
-               (let ((parts (string-split kv #\=)))
-                 (if (>= (length parts) 2)
-                     (cons (percent-decode (car parts) #t)
-                           (percent-decode (cadr parts) #t))
-                     (cons (percent-decode (car parts) #t) ""))))
+               (let ((eqp (string-index kv #\=)))
+                 (if eqp
+                     (cons (percent-decode (substring kv 0 eqp) #t)
+                           (percent-decode
+                             (substring kv (+ eqp 1) (string-length kv)) #t))
+                     (cons (percent-decode kv #t) ""))))
              (string-split s #\&))))
 
   (define (strip-cr l)
@@ -260,9 +262,26 @@
                      ((= n val) (check (cdr ps) val))
                      (else 'bad))))))))))
 
-  (define (chunked-body? headers)
+  (define (trim-ows s)
+    (let ((n (string-length s)))
+      (let ((start (let loop ((i 0))
+                     (if (and (< i n) (memv (string-ref s i) '(#\space #\tab)))
+                         (loop (+ i 1)) i)))
+            (end (let loop ((i n))
+                   (if (and (> i 0) (memv (string-ref s (- i 1)) '(#\space #\tab)))
+                       (loop (- i 1)) i))))
+        (if (< start end) (substring s start end) ""))))
+
+  ;; Only the transfer coding implemented by this server is one final,
+  ;; non-repeated "chunked" token. Everything else is rejected rather than
+  ;; falling back to Content-Length and disagreeing with an upstream proxy.
+  (define (transfer-encoding headers)
     (let ((p (assq 'transfer-encoding headers)))
-      (and p (string-ci=? (cdr p) "chunked"))))
+      (if (not p)
+          'absent
+          (let ((tokens (map (lambda (x) (string-downcase (trim-ows x)))
+                             (string-split (cdr p) #\,))))
+            (if (equal? tokens '("chunked")) 'chunked 'bad)))))
 
   ;; websocket upgrade request? returns the Sec-WebSocket-Key or #f
   (define (websocket-key headers)
@@ -481,6 +500,29 @@
               ((and (>= b 65) (<= b 70)) (loop (+ i 1) (+ (* v 16) (- b 55)) #t))
               (else #f))))))
 
+  (define forbidden-trailer-fields
+    '(transfer-encoding content-length host connection trailer upgrade))
+
+  (define (header-token-char? ch)
+    (or (char<=? #\a ch #\z) (char<=? #\A ch #\Z)
+        (char<=? #\0 ch #\9)
+        (memv ch '(#\! #\# #\$ #\% #\& #\' #\* #\+ #\- #\. #\^
+                   #\_ #\` #\| #\~))))
+
+  (define (valid-header-name? name)
+    (and (> (string-length name) 0)
+         (let loop ((i 0))
+           (or (= i (string-length name))
+               (and (header-token-char? (string-ref name i))
+                    (loop (+ i 1)))))))
+
+  (define (valid-trailer-line? bv start end)
+    (guard (e (#t #f))
+      (let ((kv (parse-header-line (utf8->string (bv-sub bv start end)))))
+        (and kv
+             (valid-header-name? (symbol->string (car kv)))
+             (not (memq (car kv) forbidden-trailer-fields))))))
+
   (define (bv-concat lst total)
     (let ((out (make-bytevector total)))
       (let loop ((l lst) (off 0))
@@ -505,21 +547,32 @@
                 ((not size) (values 'bad #f #f))
                 ((> (+ len size) body-limit) (values 'too-large #f #f))
                 ((= size 0)
-                 ;; skip optional trailers; a blank line ends the body
-                 (let scan ((p (+ eol 2)))
-                   (let ((e2 (find-crlf bv p)))
-                     (cond
-                       ((not e2) (values 'more #f #f))
-                       ((= e2 p)
-                        (values 'done (bv-concat (reverse chunks) len) (+ p 2)))
-                       (else (scan (+ e2 2)))))))
+                 ;; Validate and cap optional trailers; a blank line ends
+                 ;; the body. Trailer fields are currently ignored.
+                 (let ((trailer-start (+ eol 2)))
+                   (let scan ((p trailer-start))
+                     (let ((e2 (find-crlf bv p)))
+                       (cond
+                         ((not e2)
+                          (if (> (- (bytevector-length bv) trailer-start) trailer-limit)
+                              (values 'trailers-too-large #f #f)
+                              (values 'more #f #f)))
+                         ((> (- (+ e2 2) trailer-start) trailer-limit)
+                          (values 'trailers-too-large #f #f))
+                         ((= e2 p)
+                          (values 'done (bv-concat (reverse chunks) len) (+ p 2)))
+                         ((valid-trailer-line? bv p e2) (scan (+ e2 2)))
+                         (else (values 'bad #f #f)))))))
                 (else
                  (let ((dstart (+ eol 2)))
                    (if (< (bytevector-length bv) (+ dstart size 2))
                        (values 'more #f #f)
-                       (loop (+ dstart size 2)   ; data + trailing CRLF
-                             (cons (bv-sub bv dstart (+ dstart size)) chunks)
-                             (+ len size)))))))))))
+                       (if (not (and (= (bytevector-u8-ref bv (+ dstart size)) 13)
+                                     (= (bytevector-u8-ref bv (+ dstart size 1)) 10)))
+                           (values 'bad #f #f)
+                           (loop (+ dstart size 2)
+                                 (cons (bv-sub bv dstart (+ dstart size)) chunks)
+                                 (+ len size))))))))))))
 
   ;; ---- reader process ----------------------------------------------------------
 
@@ -553,9 +606,13 @@
           (let* ((headers (vector-ref parsed 4))
                  (wskey (websocket-key headers))
                  (resolver (unbox (http-server-wsbox srv)))
-                 (chunked? (chunked-body? headers))
+                 (te (transfer-encoding headers))
                  (clen (content-length headers)))
             (cond
+              ((or (eq? clen 'bad) (eq? te 'bad))
+               (quick-response! c 400 "Bad Request"))
+              ((and (eq? te 'chunked) (not (eq? clen 'absent)))
+               (quick-response! c 400 "Bad Request"))
               ;; websocket upgrade: resolve a session, shake hands, and
               ;; run the session in this reader process
               ((and wskey resolver)
@@ -567,13 +624,7 @@
                  (if session
                      (run-ws-session c acc hend wskey req session)
                      (quick-response! c 404 "Not Found"))))
-              ;; framing errors -> 400, close (bad/negative/conflicting
-              ;; Content-Length, or both Content-Length and chunked)
-              ((eq? clen 'bad)
-               (quick-response! c 400 "Bad Request"))
-              ((and chunked? (not (eq? clen 'absent)))
-               (quick-response! c 400 "Bad Request"))
-              (chunked?
+              ((eq? te 'chunked)
                (collect-chunked c srv acc parsed (+ hend 4)))
               (else
                (let ((n (if (eq? clen 'absent) 0 clen)))
@@ -622,6 +673,7 @@
            (`#(tcp-eof) (tcp-close! c))
            (`#(tcp-error ,e) (tcp-close! c))))
         ((too-large) (quick-response! c 413 "Payload Too Large"))
+        ((trailers-too-large) (quick-response! c 431 "Trailer Too Large"))
         (else (quick-response! c 400 "Bad Request")))))
 
   ;; Wait for the worker's response to complete. Data arriving meanwhile
@@ -731,7 +783,7 @@
   ;;       (check-ms . 5000)     ; ticker interval      (default 5000)
   ;;       (reuseport . #t)))    ; SO_REUSEPORT bind: run N OS processes
   ;;                             ; on the same port, kernel-balanced
-  ;;                             ; (Linux/FreeBSD; not macOS)
+  ;;                             ; (Linux; not macOS)
   (define (http-listen port handler . rest)
     (define opts
       (cond

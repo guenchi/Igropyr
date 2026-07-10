@@ -1,5 +1,7 @@
 # Igropyr Manual
 
+[English](MANUAL.md) | [简体中文](MANUAL.zh-CN.md)
+
 This manual covers the architecture, design patterns, and implementation details of Igropyr for developers building on or contributing to the framework.
 
 ## Table of Contents
@@ -115,7 +117,7 @@ Igropyr's concurrency is Erlang-style message passing over green processes. No s
 
 **Green Process**: A lightweight thread scheduled by the Igropyr runtime over a single OS thread. Context switch via `call/1cc` (continuation capture). One process per accepted connection, one per worker, one per database session, etc.
 
-**Process ID (pid)**: An integer. Compare with `eq?` or use `process-alive?` to check status.
+**Process ID (pid)**: An opaque process record. Compare with `eq?` or use `process-alive?` to check status; use `process-id` only for the numeric debug id.
 
 **Message**: A Scheme value (typically a vector or list) in the process's mailbox. Received by the `receive` macro.
 
@@ -166,9 +168,9 @@ Block until a message matches one of the patterns. Each clause is `(pattern body
 
 The timeout in milliseconds is measured from the moment `receive` is called. If no message matches and the timeout elapses, the timeout branch executes.
 
-#### `(self) → pid`
+#### `self → pid`
 
-Return the current process's pid. Works in any context.
+Identifier syntax that expands to the current process's pid. Use `self` directly; it is not a procedure call.
 
 ```scheme
 (send server (vector 'work-item self))
@@ -187,9 +189,9 @@ Link the current process to another. If the other process dies, this one receive
            (`#(EXIT ,p ,r) (display "linked process died\n")))))
 ```
 
-#### `(monitor pid) → void`
+#### `(monitor pid) → monitor-reference | #f`
 
-Monitor another process. If it dies, this one receives an `#(DOWN ,pid ,reason)` message but is not linked (won't die automatically). Many processes can monitor one target.
+Monitor another process. If it dies, this one receives an `#(DOWN ,pid ,reason)` message but is not linked (won't die automatically). Many processes can monitor one target. Returns a monitor reference for `demonitor`, or `#f` if the target is already dead (the `DOWN` message is delivered immediately in that case).
 
 ```scheme
 (spawn (lambda ()
@@ -199,9 +201,9 @@ Monitor another process. If it dies, this one receives an `#(DOWN ,pid ,reason)`
              (display "database crashed, reconnecting...\n")))))
 ```
 
-#### `(demonitor pid) → void`
+#### `(demonitor monitor-reference) → void`
 
-Cancel a previous `(monitor pid)` call. Any pending `#(DOWN ...)` message is discarded.
+Cancel a previous `(monitor pid)` call using the monitor reference it returned.
 
 #### `(process-trap-exit flag) → void`
 
@@ -727,7 +729,7 @@ SSE is a persistent connection where the server pushes text events to the client
              (let loop ((i 1))
                (when (<= i 10)
                  ;; sse-send! returns #f when the client closes the connection
-                 (when (sse-send! res (string-append "event: count\ndata: " 
+                 (when (sse-send! res (string-append "event: count\ndata: "
                                                      (number->string i) "\n\n"))
                    (sleep-ms 1000)
                    (loop (+ i 1))))
@@ -867,11 +869,11 @@ Pass configuration as an alist to `app-listen` or `http-listen`:
     (check-ms . 10000)))
 ```
 
-Or as positional arguments to `http-listen`:
+Or as a worker-count shortcut when only the pool size changes:
 
 ```scheme
-(http-listen 8080 handler 16 2 60000 10000)
-;; Params: port handler workers max-retries stuck-ms check-ms
+(http-listen 8080 handler 12)
+;; Params: port handler workers
 ```
 
 ### Monitoring the Pool
@@ -1418,7 +1420,7 @@ The `redis` function sends a command and parks the caller until the reply arrive
 **Return values**:
 
 - Simple string: `"OK"`, `"PONG"`, etc. → string
-- Bulk string: `"hello"` → string
+- Bulk string: `"hello"` → string for valid UTF-8, bytevector for binary data
 - Null: `nil` → `#f`
 - Integer: `:42` → number
 - Array: `[1,2,3]` → list (or vector, depending on context)
@@ -1497,10 +1499,15 @@ MySQL 9 uses `caching_sha2_password` by default. Igropyr supports:
 
 For older servers, `mysql_native_password` is also supported via auth-switch.
 
-If you need to force the insecure path (password sent in clear over an insecure connection):
+The full path is refused by default on plaintext connections because a
+MITM could substitute the server key. Pin the key, or explicitly opt in
+only on TLS or a trusted network:
 
 ```scheme
-(mysql-connect host port user password database #f '(allow-insecure-auth))
+(mysql-connect host port user password database
+  '((server-public-key . "-----BEGIN PUBLIC KEY-----...")))
+(mysql-connect host port user password database
+  '((allow-insecure-auth . #t)))
 ```
 
 **Security note**: Always use TLS for remote connections.
@@ -1510,7 +1517,7 @@ If you need to force the insecure path (password sent in clear over an insecure 
 For applications with many concurrent workers, instead of one connection, use `mysql-pool`:
 
 ```scheme
-(define pool (mysql-pool "127.0.0.1" 3306 "user" "password" "mydb" 8))
+(define pool (mysql-pool 8 "127.0.0.1" 3306 "user" "password" "mydb"))
 ;; Creates a pool of 8 connections
 
 ;; Workers query the pool; an idle connection is allocated:
@@ -1719,19 +1726,19 @@ scheme --script myapp.sc
 
 The script should call `(start-scheduler thunk)` at the end. The scheduler never returns; run in the foreground or wrap with your process supervisor (systemd, supervisor, etc.).
 
-### libuv Path
+### Native Libraries and Supported Platforms
 
-The libuv FFI loads a shared object by absolute path. Edit `libuv.sc` to adjust it for your system:
+Igropyr supports Chez Scheme 10 on macOS and Linux, on x86_64 and arm64.
+The internal platform layer automatically selects the correct ABI layout and
+loads libuv, zlib, and the system C library from standard shared-object names.
+Unsupported machine types fail during import with a list of expected platforms.
 
-```scheme
-;; macOS (homebrew):
-(load-shared-object "/opt/homebrew/lib/libuv.1.dylib")
+```bash
+# macOS
+brew install chezscheme libuv
 
-;; Linux (most distros):
-;; (load-shared-object "libuv.so.1")
-
-;; Or custom location:
-;; (load-shared-object "/usr/local/lib/libuv.so.1")
+# Debian/Ubuntu
+sudo apt-get install chezscheme libuv1-dev zlib1g-dev
 ```
 
 ### Building from Source (Advanced)
@@ -1739,10 +1746,11 @@ The libuv FFI loads a shared object by absolute path. Edit `libuv.sc` to adjust 
 Igropyr is pure Scheme with no build step. All `.sc` files are interpreted by Chez Scheme at runtime. If you want to precompile libraries for faster startup:
 
 ```bash
-# Create .chezscheme.so compiled versions
-scheme --compile-library-to-port igropyr/libuv.sc < /dev/null > igropyr/libuv.chezscheme.so
-scheme --compile-library-to-port igropyr/actor.sc < /dev/null > igropyr/actor.chezscheme.so
-# ... etc for each library
+# Per-library optimized build
+chez --libdirs .:lib --script igropyr/build.ss
+
+# Whole-program optimized build
+chez --libdirs .:lib --script igropyr/build-whole.ss
 ```
 
 Then Chez will load `.chezscheme.so` instead of `.sc`. This can reduce startup time but is not required.
@@ -1753,21 +1761,20 @@ Then Chez will load `.chezscheme.so` instead of `.sc`. This can reduce startup t
 
 ### Smoke Tests
 
-The `test/` directory contains layered smoke tests:
+The test directory contains self-asserting regression tests and interactive
+smoke/demo servers. Run every automated check with:
 
-- **smoke-actor.sc**: Tests the actor scheduler (spawn, send, receive, link).
-- **smoke-echo.sc**: Tests the HTTP core with a simple echo handler.
-- **smoke-echo-actor.sc**: Tests HTTP + actors + message passing.
-- **run-otp.sc**: Full integration test (HTTP + express + OTP + WebSocket + pubsub).
-
-Run the main test:
-
-```bash
-export CHEZSCHEMELIBDIRS=.:lib
-export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
-ulimit -n 10240
-scheme --script test/run-otp.sc
+```sh
+./igropyr/test/run-all.sh
 ```
+
+The suite verifies all library imports, the actor scheduler, asynchronous file
+reads (empty, multi-chunk, and missing files), HTTP framing/trailers/query
+parsing over real TCP, and observable boot failures. GitHub Actions runs the
+same entry point on macOS and Ubuntu.
+
+`smoke-echo.sc`, `smoke-echo-actor.sc`, and `run-otp.sc` remain interactive
+servers for manual exploration and load testing.
 
 Then in another terminal:
 

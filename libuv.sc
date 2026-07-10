@@ -17,14 +17,21 @@
           tcp-read-start! tcp-write! tcp-writev! tcp-close!
           conn? conn-handle conn-owner conn-set-owner!
           conn-state conn-count uv-strerror)
-  (import (chezscheme))
+  (import (chezscheme) (igropyr platform))
 
   ;; Shared objects must be loaded before the foreign-procedure
   ;; definitions below are evaluated (library body runs in order).
   (define shared-objects
     (begin
-      (load-shared-object "/opt/homebrew/lib/libuv.1.dylib")
-      (load-shared-object "libSystem.dylib")))
+      (ensure-supported-platform!)
+      (load-first-shared-object! 'libuv
+        (if (eq? platform-os 'macos)
+            '("/opt/homebrew/lib/libuv.1.dylib" "libuv.1.dylib" "libuv.dylib")
+            '("libuv.so.1" "libuv.so")))
+      (load-first-shared-object! 'libc
+        (if (eq? platform-os 'macos)
+            '("libSystem.B.dylib" "libSystem.dylib")
+            '("libc.so.6" "libc.so")))))
 
   ;; libuv enum constants (from uv.h, libuv 1.50)
   (define UV-RUN-NOWAIT 2)
@@ -49,7 +56,7 @@
   (define uv-fs-open  (foreign-procedure "uv_fs_open" (void* void* string int int void*) int))
   (define uv-fs-read  (foreign-procedure "uv_fs_read" (void* void* int void* unsigned-int long void*) int))
   (define uv-fs-close (foreign-procedure "uv_fs_close" (void* void* int void*) int))
-  (define uv-fs-stat  (foreign-procedure "uv_fs_stat" (void* void* string void*) int))
+  (define uv-fs-fstat (foreign-procedure "uv_fs_fstat" (void* void* int void*) int))
   (define uv-fs-get-result (foreign-procedure "uv_fs_get_result" (void*) ssize_t))
   (define uv-fs-get-statbuf (foreign-procedure "uv_fs_get_statbuf" (void*) void*))
   (define uv-fs-req-cleanup (foreign-procedure "uv_fs_req_cleanup" (void*) void))
@@ -75,7 +82,9 @@
   (define UV-GETADDRINFO 8)
   (define UV-FS 6)
   (define O-RDONLY 0)
-  (define ST-SIZE-OFFSET 56)        ; uv_stat_t.st_size on all platforms
+  (define UV-EINVAL -22)
+  (define S-IFMT #o170000)
+  (define S-IFREG #o100000)
   (define tcp-handle-size (uv-handle-size UV-TCP))
   (define timer-handle-size (uv-handle-size UV-TIMER))
   (define write-req-size (uv-req-size UV-WRITE))
@@ -211,45 +220,51 @@
       void))
 
   ;; walk the addrinfo linked list, return the first IPv4 as "a.b.c.d".
-  ;; macOS struct addrinfo: ai_family @ off 4, ai_addr @ off 32,
-  ;; ai_next @ off 40. macOS sockaddr_in: sin_addr @ off 4 (4 bytes).
+  ;; Supported LP64 addrinfo layouts share ai_family @ 4 and ai_next @ 40;
+  ;; ai_addr is selected by (igropyr platform). sockaddr_in.sin_addr @ 4.
   (define AF-INET 2)
   (define (addrinfo->ipv4 ai)
     (let loop ((ai ai))
       (if (= ai 0)
           #f
           (if (= (foreign-ref 'int ai 4) AF-INET)
-              (let ((sa (foreign-ref 'void* ai 32)))
+              (let ((sa (foreign-ref 'void* ai addrinfo-address-offset)))
                 (string-append
                   (number->string (foreign-ref 'unsigned-8 sa 4)) "."
                   (number->string (foreign-ref 'unsigned-8 sa 5)) "."
                   (number->string (foreign-ref 'unsigned-8 sa 6)) "."
                   (number->string (foreign-ref 'unsigned-8 sa 7))))
-              (loop (foreign-ref 'void* ai 40))))))
+              (loop (foreign-ref 'void* ai addrinfo-next-offset))))))
 
-  ;; Async whole-file read as a stat -> open -> read -> close chain, all
-  ;; on libuv's thread pool, so a slow or large read never blocks the
-  ;; scheduler. One reusable fs req drives the chain (cleaned up between
-  ;; steps). The owner gets #(file-read ,bytevector) or #(file-error ,e).
+  ;; Async whole-file read as an open -> fstat -> bounded read -> close
+  ;; chain, all on libuv's thread pool.
+  (define file-read-chunk-size 65536)
+
   (define-record-type (fs-op make-fs-op fs-op?)
     (fields
       (immutable owner fs-op-owner)
       (immutable path fs-op-path)
-      (mutable phase fs-op-phase fs-op-phase-set!)   ; stat|open|read|close
+      (mutable phase fs-op-phase fs-op-phase-set!)   ; open|fstat|read|close
       (mutable fd fs-op-fd fs-op-fd-set!)
       (mutable size fs-op-size fs-op-size-set!)
-      (mutable data fs-op-data fs-op-data-set!)      ; C read buffer
-      (mutable buf fs-op-buf fs-op-buf-set!)))        ; uv_buf_t
+      (mutable offset fs-op-offset fs-op-offset-set!)
+      (mutable chunks fs-op-chunks fs-op-chunks-set!)
+      (mutable data fs-op-data fs-op-data-set!)       ; C read buffer
+      (mutable buf fs-op-buf fs-op-buf-set!)))         ; uv_buf_t
+
+  (define (fs-body op)
+    (let ((out (make-bytevector (fs-op-offset op))))
+      (let loop ((xs (reverse (fs-op-chunks op))) (off 0))
+        (unless (null? xs)
+          (let ((bv (car xs)))
+            (bytevector-copy! bv 0 out off (bytevector-length bv))
+            (loop (cdr xs) (+ off (bytevector-length bv))))))
+      out))
 
   (define (fs-cleanup! op req)
     (when (> (fs-op-data op) 0) (foreign-free (fs-op-data op)))
     (when (> (fs-op-buf op) 0) (foreign-free (fs-op-buf op)))
     (hashtable-delete! fs-table req)
-    ;; release libuv's internal req resources before freeing the memory.
-    ;; Idempotent, so it is safe even where a step already cleaned the req
-    ;; (this is the single point that covers the stat/open failure paths,
-    ;; which reach here via fs-fail! without an earlier cleanup).
-    (uv-fs-req-cleanup req)
     (foreign-free req))
 
   (define (fs-fail! op req errno)
@@ -262,6 +277,36 @@
     (deliver (fs-op-owner op) (vector 'file-error errno))
     (fs-cleanup! op req))
 
+  (define (regular-file-mode? mode)
+    (= (bitwise-and mode S-IFMT) S-IFREG))
+
+  (define (start-fs-close! op req)
+    (fs-op-phase-set! op 'close)
+    (let ((r (uv-fs-close uv-loop req (fs-op-fd op) on-fs-entry)))
+      (when (< r 0)
+        (uv-fs-req-cleanup req)
+        (fs-fail! op req r))))
+
+  (define (start-fs-fstat! op req)
+    (fs-op-phase-set! op 'fstat)
+    (let ((r (uv-fs-fstat uv-loop req (fs-op-fd op) on-fs-entry)))
+      (when (< r 0)
+        (uv-fs-req-cleanup req)
+        (fs-fail! op req r))))
+
+  (define (start-fs-read! op req)
+    (let ((remaining (- (fs-op-size op) (fs-op-offset op))))
+      (if (<= remaining 0)
+          (start-fs-close! op req)
+          (let ((n (min file-read-chunk-size remaining)))
+            (fs-op-phase-set! op 'read)
+            (foreign-set! 'unsigned-64 (fs-op-buf op) 8 n)
+            (let ((r (uv-fs-read uv-loop req (fs-op-fd op) (fs-op-buf op) 1
+                                 (fs-op-offset op) on-fs-entry)))
+              (when (< r 0)
+                (uv-fs-req-cleanup req)
+                (fs-fail! op req r)))))))
+
   (define on-fs-code
     (foreign-callable
       (lambda (req)
@@ -269,43 +314,53 @@
               (result (uv-fs-get-result req)))
           (when op
             (case (fs-op-phase op)
-              ((stat)
-               (if (< result 0)
-                   (fs-fail! op req result)
-                   (let ((size (foreign-ref 'unsigned-64
-                                 (uv-fs-get-statbuf req) ST-SIZE-OFFSET)))
-                     (uv-fs-req-cleanup req)
-                     (fs-op-size-set! op size)
-                     (fs-op-phase-set! op 'open)
-                     (uv-fs-open uv-loop req (fs-op-path op)
-                                 O-RDONLY 0 on-fs-entry))))
               ((open)
+               (uv-fs-req-cleanup req)
                (if (< result 0)
                    (fs-fail! op req result)
                    (begin
-                     (uv-fs-req-cleanup req)
                      (fs-op-fd-set! op result)
-                     (let* ((size (fs-op-size op))
-                            (data (foreign-alloc (max 1 size)))
-                            (buf (foreign-alloc 16)))
-                       (fs-op-data-set! op data)
-                       (fs-op-buf-set! op buf)
-                       (foreign-set! 'void* buf 0 data)
-                       (foreign-set! 'unsigned-64 buf 8 size)
-                       (fs-op-phase-set! op 'read)
-                       (uv-fs-read uv-loop req (fs-op-fd op) buf 1 0 on-fs-entry)))))
+                     (start-fs-fstat! op req))))
+              ((fstat)
+               (if (< result 0)
+                   (begin
+                     (uv-fs-req-cleanup req)
+                     (fs-fail! op req result))
+                   (let* ((st (uv-fs-get-statbuf req))
+                          (mode (foreign-ref 'unsigned-64 st uv-stat-mode-offset))
+                          (size (foreign-ref 'unsigned-64 st uv-stat-size-offset)))
+                     (uv-fs-req-cleanup req)
+                     (fs-op-size-set! op size)
+                     (if (not (regular-file-mode? mode))
+                         (fs-fail! op req UV-EINVAL)
+                         (if (= size 0)
+                             (start-fs-close! op req)
+                             (let* ((data (foreign-alloc file-read-chunk-size))
+                                    (buf (foreign-alloc 16)))
+                               (fs-op-data-set! op data)
+                               (fs-op-buf-set! op buf)
+                               (foreign-set! 'void* buf 0 data)
+                               (start-fs-read! op req)))))))
               ((read)
                (uv-fs-req-cleanup req)
-               (if (< result 0)
-                   (fs-fail! op req result)
-                   (let ((bv (make-bytevector result)))
-                     (memcpy-from-c bv (fs-op-data op) result)
-                     (fs-op-phase-set! op 'close)
-                     ;; hand the data over now; close is fire-and-forget
-                     (deliver (fs-op-owner op) (vector 'file-read bv))
-                     (uv-fs-close uv-loop req (fs-op-fd op) on-fs-entry))))
+               (cond
+                 ((< result 0) (fs-fail! op req result))
+                 ((= result 0) (start-fs-close! op req))
+                 (else
+                  (let* ((remaining (- (fs-op-size op) (fs-op-offset op)))
+                         (n (min result remaining))
+                         (bv (make-bytevector n)))
+                    (memcpy-from-c bv (fs-op-data op) n)
+                    (fs-op-chunks-set! op (cons bv (fs-op-chunks op)))
+                    (fs-op-offset-set! op (+ (fs-op-offset op) n))
+                    (if (>= (fs-op-offset op) (fs-op-size op))
+                        (start-fs-close! op req)
+                        (start-fs-read! op req))))))
               ((close)
                (uv-fs-req-cleanup req)
+               (if (< result 0)
+                   (deliver (fs-op-owner op) (vector 'file-error result))
+                   (deliver (fs-op-owner op) (vector 'file-read (fs-body op))))
                (fs-cleanup! op req))))))
       (void*)
       void))
@@ -431,13 +486,12 @@
   ;; blocks the scheduler, even for large files or slow filesystems.
   (define (file-read-async! path owner)
     (let ((req (foreign-alloc fs-req-size))
-          (op (make-fs-op owner path 'stat -1 0 0 0)))
+          (op (make-fs-op owner path 'open -1 0 0 '() 0 0)))
       (hashtable-set! fs-table req op)
-      (let ((r (uv-fs-stat uv-loop req path on-fs-entry)))
+      (let ((r (uv-fs-open uv-loop req path O-RDONLY 0 on-fs-entry)))
         (when (< r 0)
-          (hashtable-delete! fs-table req)
-          (foreign-free req)
-          (deliver owner (vector 'file-error r))))))
+          (uv-fs-req-cleanup req)
+          (fs-fail! op req r)))))
 
   ;; Async DNS. The owner process later receives #(dns-resolved ,ip-string)
   ;; or #(dns-failed ,errno). libuv resolves on its thread pool, so the

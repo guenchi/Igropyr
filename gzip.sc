@@ -8,11 +8,19 @@
 
 (library (igropyr gzip)
   (export gzip-compress gzip-acceptable?)
-  (import (chezscheme))
+  (import (chezscheme) (igropyr platform))
 
   (define zlib-loaded
-    (begin (load-shared-object "libz.dylib")
-           (load-shared-object "libSystem.dylib")))
+    (begin
+      (ensure-supported-platform!)
+      (load-first-shared-object! 'zlib
+        (if (eq? platform-os 'macos)
+            '("libz.1.dylib" "libz.dylib")
+            '("libz.so.1" "libz.so")))
+      (load-first-shared-object! 'libc
+        (if (eq? platform-os 'macos)
+            '("libSystem.B.dylib" "libSystem.dylib")
+            '("libc.so.6" "libc.so")))))
 
   (define zlib-version   (foreign-procedure "zlibVersion" () string))
   (define deflate-init2  (foreign-procedure "deflateInit2_"

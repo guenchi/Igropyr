@@ -17,7 +17,7 @@
 (generate-wpo-files #t)                 ; emit .wpo alongside each .so
 
 (define libs
-  '("igropyr/libuv.sc" "igropyr/actor.sc" "igropyr/json.sc"
+  '("igropyr/platform.sc" "igropyr/libuv.sc" "igropyr/actor.sc" "igropyr/json.sc"
     "igropyr/gzip.sc" "igropyr/otp.sc" "igropyr/websocket.sc" "igropyr/ws-client.sc"
     "igropyr/gen-server.sc" "igropyr/http.sc" "igropyr/pubsub.sc"
     "igropyr/express.sc" "igropyr/session.sc" "igropyr/middleware.sc" "igropyr/metrics.sc" "igropyr/client.sc"
