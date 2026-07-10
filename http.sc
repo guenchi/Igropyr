@@ -1,26 +1,38 @@
 #!chezscheme
-;;; (igropyr http) -- HTTP/1.1 server with an Express-style API.
+;;; (igropyr http) -- HTTP/1.1 core, in the spirit of Node's `http` module.
+;;;
+;;; The core knows the protocol, not the framework: it parses requests,
+;;; owns the connection lifecycle, runs every request through the fault-
+;;; tolerant worker pool, and encodes responses. It exposes exactly one
+;;; entry point:
+;;;
+;;;   (http-listen port (lambda (req res) ...))          ; 8 workers
+;;;   (http-listen port (lambda (req res) ...) workers)
+;;;
+;;; There is no router, no middleware, no MIME table here -- those are
+;;; framework concerns; see (igropyr express) for one such layer, or
+;;; build your own: anything that produces a (lambda (req res)) handler
+;;; sits on the same footing as express.
+;;;
+;;; Response primitives (the res.end level): set-status!, set-header!,
+;;; res-send!. Convenience encoders (JSON, files, ...) belong to layers.
 ;;;
 ;;; Connection lifecycle:
 ;;;   accept -> one reader process per connection (a half-sent request
 ;;;   parks only its own reader and is reaped by a 30s timeout)
 ;;;   reader parses request line/headers/body incrementally, then sends
 ;;;   #(submit-task #(task ,id ,conn ,request)) to the supervisor;
-;;;   a pool worker runs middleware + route handler and writes the
-;;;   response; the write-completion callback tells the reader to parse
-;;;   the next request (keep-alive) or closes the connection.
-;;;
-;;; API: create-app, app-get/post/put/delete (with :param segments),
-;;; app-use (middleware), app-static, app-listen; request accessors;
-;;; set-status!, send-text!/send-html!/send-json!/send-file!.
+;;;   a pool worker runs the handler and writes the response; the
+;;;   write-completion callback tells the reader to parse the next
+;;;   request (keep-alive) or closes the connection.
 
 (library (igropyr http)
-  (export create-app app-get app-post app-put app-delete
-          app-use app-static app-listen
-          req-method req-path req-query req-params req-headers
-          req-header req-body req-param
-          set-status! set-header! send-text! send-html! send-json! send-file!
-          res-conn)
+  (export http-listen
+          req-method req-path req-query req-headers req-header req-body
+          req-keep-alive? req-params req-params-set!
+          set-status! set-header! res-send!
+          res-conn res-status res-headers res-keep-alive?
+          send-response!)
   (import (chezscheme) (igropyr actor) (igropyr uv) (igropyr otp))
 
   (define header-limit 8192)
@@ -65,17 +77,14 @@
       (immutable method req-method)      ; symbol: GET POST ...
       (immutable path req-path)          ; decoded path string
       (immutable query req-query)        ; alist of (string . string)
-      (mutable params req-params req-params-set!) ; alist, set by router
+      ;; free slot owned by framework layers (e.g. router path params)
+      (mutable params req-params req-params-set!)
       (immutable headers req-headers)    ; alist of (symbol . string)
       (immutable body req-body)          ; bytevector
       (immutable keep-alive? req-keep-alive?)))
 
   (define (req-header req name)
     (let ((p (assq name (req-headers req))))
-      (and p (cdr p))))
-
-  (define (req-param req name)
-    (let ((p (assoc name (req-params req))))
       (and p (cdr p))))
 
   ;; ---- parsing --------------------------------------------------------------
@@ -88,6 +97,14 @@
           ((char=? (string-ref s i) ch)
            (loop (+ i 1) (+ i 1) (cons (substring s start i) acc)))
           (else (loop (+ i 1) start acc))))))
+
+  (define (string-index s ch)
+    (let ((n (string-length s)))
+      (let scan ((i 0))
+        (cond
+          ((= i n) #f)
+          ((char=? (string-ref s i) ch) i)
+          (else (scan (+ i 1)))))))
 
   (define (percent-decode s)
     (let ((n (string-length s)))
@@ -115,14 +132,6 @@
                            (percent-decode (cadr parts)))
                      (cons (percent-decode (car parts)) ""))))
              (string-split s #\&))))
-
-  (define (string-index s ch)
-    (let ((n (string-length s)))
-      (let scan ((i 0))
-        (cond
-          ((= i n) #f)
-          ((char=? (string-ref s i) ch) i)
-          (else (scan (+ i 1)))))))
 
   (define (strip-cr l)
     (let ((n (string-length l)))
@@ -227,7 +236,7 @@
     (send-response! c status '(("Content-Type" . "text/plain"))
                     (string->utf8 text) #f))
 
-  ;; ---- res record + Express-style helpers --------------------------------------
+  ;; ---- res record + primitives (the res.end level) ----------------------------
 
   (define-record-type (res make-res res?)
     (fields
@@ -237,220 +246,38 @@
       (immutable keep-alive? res-keep-alive?)))
 
   (define (set-status! r s) (res-status-set! r s))
+
   (define (set-header! r k v)
     (res-headers-set! r (cons (cons k v) (res-headers r))))
 
-  (define (finish! r ctype body)
-    (send-response! (res-conn r) (res-status r)
-                    (cons (cons "Content-Type" ctype) (res-headers r))
+  ;; Send the response: current status + accumulated headers + body
+  ;; bytevector. One shot per request; later calls are ignored.
+  (define (res-send! r body)
+    (send-response! (res-conn r) (res-status r) (res-headers r)
                     body (res-keep-alive? r)))
 
-  (define (send-text! r s) (finish! r "text/plain; charset=utf-8" (string->utf8 s)))
-  (define (send-html! r s) (finish! r "text/html; charset=utf-8" (string->utf8 s)))
-  (define (send-json! r obj) (finish! r "application/json" (string->utf8 (json->string obj))))
+  ;; ---- task execution (inside a pool worker) -----------------------------------
 
-  ;; ---- tiny JSON writer: alist -> object, list -> array ------------------------
-
-  (define (json-escape s)
-    (call-with-string-output-port
-      (lambda (p)
-        (string-for-each
-          (lambda (ch)
-            (case ch
-              ((#\") (display "\\\"" p))
-              ((#\\) (display "\\\\" p))
-              ((#\newline) (display "\\n" p))
-              ((#\return) (display "\\r" p))
-              ((#\tab) (display "\\t" p))
-              (else (write-char ch p))))
-          s))))
-
-  (define (json->string x)
-    (cond
-      ((eq? x #t) "true")
-      ((eq? x #f) "false")
-      ((eq? x 'null) "null")
-      ((number? x)
-       (if (exact? x) (number->string x) (number->string (exact->inexact x))))
-      ((string? x) (string-append "\"" (json-escape x) "\""))
-      ((symbol? x) (string-append "\"" (json-escape (symbol->string x)) "\""))
-      ((and (list? x) (pair? x) (pair? (car x)))   ; alist -> object
-       (string-append
-         "{"
-         (fold-right
-           (lambda (kv acc)
-             (let ((entry (string-append
-                            "\"" (json-escape
-                                   (if (symbol? (car kv))
-                                       (symbol->string (car kv))
-                                       (car kv)))
-                            "\":" (json->string (cdr kv)))))
-               (if (string=? acc "") entry (string-append entry "," acc))))
-           "" x)
-         "}"))
-      ((list? x)                                    ; list -> array
-       (string-append
-         "["
-         (fold-right
-           (lambda (v acc)
-             (if (string=? acc "")
-                 (json->string v)
-                 (string-append (json->string v) "," acc)))
-           "" x)
-         "]"))
-      (else "null")))
-
-  ;; ---- static files ---------------------------------------------------------------
-
-  (define (mime-type path)
-    (let* ((dot (let scan ((i (- (string-length path) 1)))
-                  (cond ((< i 0) #f)
-                        ((char=? (string-ref path i) #\.) i)
-                        (else (scan (- i 1))))))
-           (ext (and dot (string-downcase
-                           (substring path (+ dot 1) (string-length path))))))
-      (cond
-        ((equal? ext "html") "text/html; charset=utf-8")
-        ((equal? ext "css") "text/css")
-        ((equal? ext "js") "application/javascript")
-        ((equal? ext "json") "application/json")
-        ((equal? ext "txt") "text/plain; charset=utf-8")
-        ((equal? ext "png") "image/png")
-        ((equal? ext "jpg") "image/jpeg")
-        ((equal? ext "jpeg") "image/jpeg")
-        ((equal? ext "gif") "image/gif")
-        ((equal? ext "svg") "image/svg+xml")
-        ((equal? ext "ico") "image/x-icon")
-        (else "application/octet-stream"))))
-
-  (define (read-file-bv path)
-    (guard (e (#t #f))
-      (and (file-exists? path)
-           (call-with-port (open-file-input-port path)
-             (lambda (p)
-               (let ((bv (get-bytevector-all p)))
-                 (if (eof-object? bv) empty-bv bv)))))))
-
-  (define (path-has-dotdot? s)
-    (let ((parts (string-split s #\/)))
-      (exists (lambda (p) (string=? p "..")) parts)))
-
-  (define (send-file! r path)
-    (if (path-has-dotdot? path)
-        (begin (set-status! r 403) (send-text! r "Forbidden"))
-        (let ((bv (read-file-bv path)))
-          (if bv
-              (finish! r (mime-type path) bv)
-              (begin (set-status! r 404) (send-text! r "Not Found"))))))
-
-  ;; ---- router ---------------------------------------------------------------------
-
-  ;; "/users/:id" -> ("users" ":id"); "/" -> ()
-  (define (split-segments path)
-    (filter (lambda (s) (not (string=? s ""))) (string-split path #\/)))
-
-  ;; match pattern segments against path segments; alist of params or #f
-  (define (match-segments psegs segs)
-    (let loop ((ps psegs) (ss segs) (params '()))
-      (cond
-        ((and (null? ps) (null? ss)) params)
-        ((or (null? ps) (null? ss)) #f)
-        ((and (> (string-length (car ps)) 0)
-              (char=? (string-ref (car ps) 0) #\:))
-         (loop (cdr ps) (cdr ss)
-               (cons (cons (substring (car ps) 1 (string-length (car ps)))
-                           (car ss))
-                     params)))
-        ((string=? (car ps) (car ss))
-         (loop (cdr ps) (cdr ss) params))
-        (else #f))))
-
-  ;; ---- app ------------------------------------------------------------------------
-
-  (define-record-type (app make-app-record app?)
-    (fields
-      (mutable routes app-routes app-routes-set!)       ; list of #(method segs handler)
-      (mutable middlewares app-middlewares app-middlewares-set!)
-      (mutable statics app-statics app-statics-set!)))  ; list of (prefix . root)
-
-  (define (create-app) (make-app-record '() '() '()))
-
-  (define (add-route! a method pattern handler)
-    (app-routes-set! a
-      (append (app-routes a)
-              (list (vector method (split-segments pattern) handler)))))
-
-  (define (app-get a pattern handler) (add-route! a 'GET pattern handler))
-  (define (app-post a pattern handler) (add-route! a 'POST pattern handler))
-  (define (app-put a pattern handler) (add-route! a 'PUT pattern handler))
-  (define (app-delete a pattern handler) (add-route! a 'DELETE pattern handler))
-
-  ;; middleware: (lambda (req res next) ...); call (next) to continue
-  (define (app-use a mw)
-    (app-middlewares-set! a (append (app-middlewares a) (list mw))))
-
-  (define (app-static a prefix root)
-    (app-statics-set! a (append (app-statics a) (list (cons prefix root)))))
-
-  (define (string-prefix? p s)
-    (and (>= (string-length s) (string-length p))
-         (string=? p (substring s 0 (string-length p)))))
-
-  (define (try-static a req r)
-    (and (eq? (req-method req) 'GET)
-         (exists
-           (lambda (entry)
-             (let ((prefix (car entry)) (root (cdr entry)))
-               (and (string-prefix? prefix (req-path req))
-                    (begin
-                      (send-file! r
-                        (string-append root
-                          (substring (req-path req)
-                                     (string-length prefix)
-                                     (string-length (req-path req)))))
-                      #t))))
-           (app-statics a))))
-
-  (define (route-dispatch a req r)
-    (let ((segs (split-segments (req-path req))))
-      (let loop ((routes (app-routes a)))
-        (cond
-          ((null? routes)
-           (or (try-static a req r)
-               (begin (set-status! r 404) (send-text! r "Not Found"))))
-          (else
-           (let ((route (car routes)))
-             (let ((params (and (eq? (vector-ref route 0) (req-method req))
-                                (match-segments (vector-ref route 1) segs))))
-               (if params
-                   (begin
-                     (req-params-set! req params)
-                     ((vector-ref route 2) req r))
-                   (loop (cdr routes))))))))))
-
-  ;; Executed inside a pool worker; a crash here kills the worker (Let It
-  ;; Crash) and the supervisor takes over.
-  (define (run-app-task a task)
+  ;; A crash here kills the worker (Let It Crash): the supervisor retries
+  ;; the task up to 3 times, then answers 500 via fail-task below.
+  (define (run-task handler task)
     (let* ((c (vector-ref task 2))
            (req (vector-ref task 3))
-           (r (make-res c 200 '() (req-keep-alive? req)))
-           (endpoint (lambda () (route-dispatch a req r))))
-      ((fold-right
-         (lambda (mw next) (lambda () (mw req r next)))
-         endpoint
-         (app-middlewares a)))
+           (r (make-res c 200 '() (req-keep-alive? req))))
+      (handler req r)
       ;; handler finished without responding: don't leave the client hanging
       (unless (conn-responded? c)
         (set-status! r 404)
-        (send-text! r "Not Found"))))
+        (set-header! r "Content-Type" "text/plain; charset=utf-8")
+        (res-send! r (string->utf8 "Not Found")))))
 
   ;; supervisor gave up on the task (crash retries exhausted, or stuck
   ;; worker killed): last-resort 500 unless a response already went out
-  (define (fail-app-task task)
+  (define (fail-task task)
     (let ((c (vector-ref task 2)))
       (quick-response! c 500 "Internal Server Error")))
 
-  ;; ---- reader process ----------------------------------------------------------------
+  ;; ---- reader process ----------------------------------------------------------
 
   (define task-counter 0)
   (define (next-task-id!)
@@ -517,15 +344,17 @@
       (`#(tcp-eof) (await-response c sup leftover #t))
       (`#(tcp-error ,e) (await-response c sup leftover #t))))
 
-  ;; ---- listen ------------------------------------------------------------------------
+  ;; ---- listen ------------------------------------------------------------------
 
-  ;; Start the worker pool and the TCP listener. Must run inside the
-  ;; scheduler (call from the start-scheduler boot thunk).
-  (define (app-listen a port . opts)
+  ;; Start the worker pool and the TCP listener; handler is
+  ;; (lambda (req res) ...), run inside a pool worker for every request.
+  ;; Must run inside the scheduler (call from the start-scheduler boot
+  ;; thunk). Returns the supervisor pid.
+  (define (http-listen port handler . opts)
     (let* ((nworkers (if (pair? opts) (car opts) 8))
            (sup (start-worker-pool nworkers
-                  (lambda (task) (run-app-task a task))
-                  fail-app-task)))
+                  (lambda (task) (run-task handler task))
+                  fail-task)))
       (tcp-listen! "0.0.0.0" port 511
         (lambda (c)
           ;; libuv callback context: spawn + register only, no yielding

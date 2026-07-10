@@ -17,7 +17,8 @@
         (igropyr actor)
         (igropyr uv)
         (igropyr otp)
-        (igropyr http))
+        (igropyr http)
+        (igropyr express))
 
 (define app (create-app))
 

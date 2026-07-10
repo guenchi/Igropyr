@@ -4,7 +4,10 @@ A high-concurrency HTTP server for [Chez Scheme](https://cisco.github.io/ChezSch
 built directly on [libuv](https://libuv.org/) through Chez's FFI (no C shim),
 with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
 
-- **Express-style API** — `create-app`, `app-get`, `app-listen`, `send-json!`, ...
+- **Core / framework split, like Node and Express** — the core exposes one
+  entry point, `(http-listen port (lambda (req res) ...))`; the bundled
+  `(igropyr express)` layer (`create-app`, `app-get`, `send-json!`, ...) is
+  optional, and alternative frameworks can be built on the same core
 - **Green processes** — thousands of lightweight processes scheduled over one
   OS thread; continuation-based context switching with preemption, so even a
   CPU-spinning handler cannot freeze the system
@@ -53,10 +56,13 @@ curl -X POST -d 'hello' localhost:8080/echo
 
 ## Writing an application
 
+With the bundled Express-style layer:
+
 ```scheme
 (import (chezscheme)
         (igropyr actor)
-        (igropyr http))
+        (igropyr http)
+        (igropyr express))
 
 (define app (create-app))
 
@@ -101,16 +107,45 @@ curl -X POST -d 'hello' localhost:8080/echo
 Set status and extra headers first, then send exactly once:
 
 ```scheme
-(set-status! res 201)
+(set-status! res 201)               ; core primitive
 (set-header! res "X-Request-Id" "abc")
-(send-text! res "created")     ; text/plain
-(send-html! res "<h1>hi</h1>") ; text/html
-(send-json! res obj)           ; alist -> object, list -> array
-(send-file! res "path/to/f")   ; MIME type from extension
+(send-text! res "created")     ; text/plain        (express)
+(send-html! res "<h1>hi</h1>") ; text/html         (express)
+(send-json! res obj)           ; alist -> object, list -> array (express)
+(send-file! res "path/to/f")   ; MIME type from extension       (express)
 ```
 
 A second send on the same request is ignored, so a supervisor fallback can
 never corrupt a response that already went out.
+
+## The core API (build your own framework)
+
+The core is framework-agnostic, like Node's `http` module: it owns
+parsing, connections, the worker pool and response encoding, and takes a
+single handler. Everything express does is expressible in user space:
+
+```scheme
+(import (chezscheme) (igropyr actor) (igropyr http))
+
+(start-scheduler
+  (lambda ()
+    (http-listen 8080
+      (lambda (req res)
+        (case (req-method req)
+          ((GET)
+           (set-header! res "Content-Type" "text/plain")
+           (res-send! res (string->utf8 (req-path req))))
+          (else
+           (set-status! res 405)
+           (res-send! res (string->utf8 "Method Not Allowed"))))))))
+```
+
+Core primitives: `set-status!`, `set-header!`, `res-send!` (body
+bytevector; Content-Length, Connection and the one-shot guard are handled
+for you). Request accessors as above, minus `req-param` (route params are
+a framework concern; the core request carries a free `req-params` slot
+for layers to use). The fault-tolerance semantics below come with the
+core, whatever layer you put on top.
 
 ## Fault tolerance semantics
 
@@ -130,12 +165,14 @@ These apply automatically; nothing to configure:
 ## Architecture
 
 ```
-uv.sc     libuv FFI: event loop, TCP, write queue, GC-rooting registries
-actor.sc  green processes: spawn/send/receive, link/monitor, preemptive
-          scheduler (call/1cc + timer interrupt), run/sleep queues
-otp.sc    supervisor + fixed worker pool + stuck-worker ticker
-http.sc   incremental HTTP/1.1 parser, router, middleware, static files,
-          Express-style API
+uv.sc      libuv FFI: event loop, TCP, write queue, GC-rooting registries
+actor.sc   green processes: spawn/send/receive, link/monitor, preemptive
+           scheduler (call/1cc + timer interrupt), run/sleep queues
+otp.sc     supervisor + fixed worker pool + stuck-worker ticker
+http.sc    core: incremental HTTP/1.1 parser, connection lifecycle,
+           response encoding, http-listen (single-handler entry point)
+express.sc framework layer (optional): router with :param segments,
+           middleware chain, static files, JSON/text/html/file encoders
 ```
 
 Message protocol between processes:
