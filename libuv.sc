@@ -280,12 +280,25 @@
   (define (regular-file-mode? mode)
     (= (bitwise-and mode S-IFMT) S-IFREG))
 
+  ;; Deliver the accumulated data and release the op. Reached only after
+  ;; every read completed, so a close error (rare; e.g. NFS) must not
+  ;; discard the data -- success is reported regardless of how close went.
+  (define (fs-finish! op req)
+    (deliver (fs-op-owner op) (vector 'file-read (fs-body op)))
+    (fs-cleanup! op req))
+
   (define (start-fs-close! op req)
     (fs-op-phase-set! op 'close)
     (let ((r (uv-fs-close uv-loop req (fs-op-fd op) on-fs-entry)))
       (when (< r 0)
+        ;; could not queue the close: close synchronously instead, and
+        ;; still deliver -- the data was fully read before this point
         (uv-fs-req-cleanup req)
-        (fs-fail! op req r))))
+        (let ((creq (foreign-alloc fs-req-size)))
+          (uv-fs-close uv-loop creq (fs-op-fd op) 0)   ; sync close, ignore
+          (uv-fs-req-cleanup creq)
+          (foreign-free creq))
+        (fs-finish! op req))))
 
   (define (start-fs-fstat! op req)
     (fs-op-phase-set! op 'fstat)
@@ -358,10 +371,7 @@
                         (start-fs-read! op req))))))
               ((close)
                (uv-fs-req-cleanup req)
-               (if (< result 0)
-                   (deliver (fs-op-owner op) (vector 'file-error result))
-                   (deliver (fs-op-owner op) (vector 'file-read (fs-body op))))
-               (fs-cleanup! op req))))))
+               (fs-finish! op req))))))
       (void*)
       void))
 

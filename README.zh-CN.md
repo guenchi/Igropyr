@@ -76,7 +76,7 @@ Igropyr 会自动选择平台 ABI，并加载 libuv、zlib 和系统 C 库。
 git clone https://github.com/guenchi/Igropyr igropyr
 export CHEZSCHEMELIBDIRS=.
 export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
-chez --script igropyr/test/run-otp.sc   # 提供 `scheme` 时也可以使用它
+scheme --script igropyr/test/run-otp.sc   # 部分发行版下命令名为 `chez`
 ```
 
 然后：

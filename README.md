@@ -94,7 +94,7 @@ is lowercase; on case-sensitive file systems the directory name must match):
 git clone https://github.com/guenchi/Igropyr igropyr
 export CHEZSCHEMELIBDIRS=.
 export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
-chez --script igropyr/test/run-otp.sc   # `scheme` also works when provided
+scheme --script igropyr/test/run-otp.sc   # `chez` also works on some distros
 ```
 
 Then:
