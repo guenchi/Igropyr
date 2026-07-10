@@ -19,6 +19,12 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
   crashed workers are replaced and the task retried (at most 3 times, then
   the client gets a 500); workers stuck for more than 30 s are killed and
   replaced; a slow or half-sent request only ever blocks its own reader process
+- **Failure hook (remote retry ring)** — when retries are exhausted or a
+  stuck worker is killed (killed first, so no execution is in flight), an
+  optional `on-failure` handler answers a structured JSON fault instead
+  of the plain 500, on the same keep-alive connection — the client
+  resubmits (changed parameters, carried state) and gets a fresh retry
+  round; unset, the plain 500 remains
 - **Hot code swapping** — replace the handler (or individual routes) on a
   live server: the listener, open connections and worker pool stay up,
   in-flight requests finish on the old code

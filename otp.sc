@@ -31,8 +31,11 @@
   (define (task-id-of task) (vector-ref task 1))
 
   ;; run-task: (lambda (task) ...) executed inside a worker; may crash.
-  ;; fail-task: (lambda (task) ...) executed by the supervisor when a
-  ;; task is given up on; must not block (writing a 500 is fine).
+  ;; fail-task: (lambda (task info) ...) executed by the supervisor when
+  ;; a task is given up on; must not block (writing a response or
+  ;; requeueing an urgent task is fine). info is an alist:
+  ;;   ((kind . crash|stuck) (reason . <exit reason>)
+  ;;    (attempts . <executions>) (elapsed-ms . <last run's duration>))
   ;; Optional trailing args: max-retries stuck-ms check-ms.
   ;; Returns the supervisor pid; send it #(submit-task ,task).
   (define (start-worker-pool n run-task fail-task . opts)
@@ -98,11 +101,18 @@
           (dispatch! (pop-pending!))
           (loop))))
 
-    (define (give-up! task)
+    (define (give-up! task info)
       (hashtable-delete! attempts (task-id-of task))
       ;; never let a bad fail-task take the supervisor down
       (guard (e (#t (void)))
-        (fail-task task)))
+        (fail-task task info)))
+
+    (define (fail-info kind reason id elapsed)
+      (list (cons 'kind kind)
+            (cons 'reason reason)
+            (cons 'id id)
+            (cons 'attempts (+ 1 (hashtable-ref attempts id 0)))
+            (cons 'elapsed-ms elapsed)))
 
     (define (handle-down w reason)
       (set! idle (remq w idle))
@@ -113,12 +123,15 @@
         (spawn-worker!)                    ; keep the pool at n workers
         (when entry
           (let* ((task (car entry))
-                 (id (task-id-of task)))
+                 (id (task-id-of task))
+                 (elapsed (- (now-ms) (cdr entry))))
             (if was-stuck?
-                (give-up! task)            ; no retry for stuck tasks
+                ;; no retry for stuck tasks; the worker is already dead,
+                ;; so the failure report describes a settled state
+                (give-up! task (fail-info 'stuck reason id elapsed))
                 (let ((a (+ 1 (hashtable-ref attempts id 0))))
                   (if (> a max-retries)
-                      (give-up! task)
+                      (give-up! task (fail-info 'crash reason id elapsed))
                       (begin
                         (hashtable-set! attempts id a)
                         (if (null? idle)
@@ -141,6 +154,12 @@
     (let loop ()
       (receive
         (`#(submit-task ,task) (dispatch! task))
+        ;; latency-sensitive tasks (e.g. failure notifications) jump the
+        ;; queue instead of waiting behind the regular backlog
+        (`#(submit-urgent ,task)
+          (if (null? idle)
+              (push-front! task)
+              (dispatch! task)))
         (`#(task-completed ,task-id ,w)
           (when (hashtable-ref busy w #f)
             (hashtable-delete! busy w)

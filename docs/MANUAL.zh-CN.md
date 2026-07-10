@@ -664,6 +664,53 @@ Igropyr 的容错基于 Erlang 的 "Let It Crash" 原则：不要试图在 handl
 ;; Params: port handler workers
 ```
 
+### 故障钩子（remote 重试环）
+
+默认情况下，被放弃的 task 回复裸 `500` 并关闭连接。池选项 `on-failure`
+用你自己的 handler 替换它：在一个**新 worker** 上运行，走正常响应路径——
+因此 **keep-alive 得以保留**，客户端可以在同一条连接上重新提交：
+
+```scheme
+(app-listen app 8080
+  `((stuck-ms . 3000)          ; 快失败：尽早杀掉卡死的 worker
+    (check-ms . 1000)
+    (on-failure . ,(make-fault-handler))))   ; 内置模版，也可自定义
+```
+
+内置模版以 503 状态回复
+`{"fault":"crash"|"stuck","attempts":n,"elapsed-ms":t,"retryable":true}`
+（`(make-fault-handler 500)` 可覆盖状态码）。自定义 handler 形如
+`(lambda (req res info) ...)`，`info` 为：
+
+| key | 含义 |
+|---|---|
+| `kind` | `crash`（重试耗尽）或 `stuck`（worker 被杀） |
+| `reason` | 最后一次执行的 raise 值 / 退出原因 |
+| `id` | task id，用于日志串联 |
+| `attempts` | 该请求的总执行次数 |
+| `elapsed-ms` | 最后一次执行的耗时 |
+
+客户端可以依赖的语义——**先杀后告**，故障响应到达时**没有在途执行**：
+
+| kind | 服务端状态 | 客户端的合理动作 |
+|---|---|---|
+| `crash` | handler 体执行了 `attempts` 次，各次副作用可能已落地 | 换参数重提，或查询状态后补偿 |
+| `stuck` | worker 执行中被杀，副作用部分执行、断点未知 | 带状态重提，或回滚 |
+
+每次重新提交都是**新 task**：全新的重试预算、完整的新一轮重试
+（有意如此——昨天的瞬时故障不应污染今天的请求）。把 `stuck-ms` 调短后，
+客户端几秒内就能得知确定状态，在原来干等 30 秒的时间里可以带着信息环绕
+重试多轮。
+
+两道栅栏保证钩子安全：它只运行**一次**（钩子内的 raise 被捕获并回落到
+裸 500——不会形成重试循环）；钩子自身卡死会被同一个 ticker 收割，同样
+回落。若（流式）响应已部分发出，钩子无法运行——连接照旧关闭。
+
+注意：`error-handler` 中间件用 `guard` 包住 handler，崩溃到不了
+supervisor——在它后面重试和 `on-failure` 都不会触发。`error-handler`
+用于*预期内*的业务错误，故障钩子用于 Let-It-Crash 类故障；不要用兜底
+guard 包住可能崩溃的 handler。
+
 ### 监控 Pool
 
 使用 `(http-stats srv)` 获取当前 pool 状态：

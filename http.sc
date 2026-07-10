@@ -463,27 +463,51 @@
   ;; ---- task execution (inside a pool worker) -----------------------------------
 
   ;; A crash here kills the worker (Let It Crash): the supervisor retries
-  ;; the task up to 3 times, then answers 500 via fail-task below.
-  ;; Task shape: #(task id conn req token)
-  (define (run-task handler task)
+  ;; the task up to 3 times, then answers via fail-task below.
+  ;; Task shapes: #(task id conn req token)          -- a request
+  ;;              #(fail id conn req token info)     -- a failure report
+  (define (run-task handler on-failure task)
     (let* ((c (vector-ref task 2))
            (req (vector-ref task 3))
            (token (vector-ref task 4))
            (r (make-res c token req 200 '() (req-keep-alive? req) 'plain)))
-      (handler req r)
-      ;; handler finished without responding: don't leave the client hanging
-      (unless (unbox token)
-        (set-status! r 404)
-        (set-header! r "Content-Type" "text/plain; charset=utf-8")
-        (res-send! r (string->utf8 "Not Found")))))
+      (if (eq? (vector-ref task 0) 'fail)
+          ;; failure hook: one attempt by construction. A raise inside the
+          ;; hook is caught (the worker survives, so the supervisor never
+          ;; retries it) and falls back to the plain 500.
+          (begin
+            (guard (e (#t (void)))
+              (when on-failure
+                (on-failure req r (vector-ref task 5))))
+            (unless (unbox token)
+              (quick-response! c 500 "Internal Server Error" token)))
+          (begin
+            (handler req r)
+            ;; handler finished without responding: don't leave the client hanging
+            (unless (unbox token)
+              (set-status! r 404)
+              (set-header! r "Content-Type" "text/plain; charset=utf-8")
+              (res-send! r (string->utf8 "Not Found")))))))
 
-  ;; supervisor gave up on the task (crash retries exhausted, or stuck
-  ;; worker killed): last-resort 500 unless the request's token was
-  ;; already claimed (partial or complete response already went out)
-  (define (fail-task task)
+  ;; The supervisor gave up on the task (crash retries exhausted, or a
+  ;; stuck worker was killed -- killed FIRST, so by the time the client
+  ;; hears about it there is no in-flight execution left). With an
+  ;; on-failure hook configured the request is requeued as an urgent
+  ;; failure task: a fresh worker runs the hook, which answers through
+  ;; the normal response path (keep-alive preserved), enabling a
+  ;; fail-fast retry loop on one connection. Without a hook -- or when
+  ;; the hook's own task fails, or a partial response already went out
+  ;; -- the last-resort 500 (which closes) is used.
+  (define (fail-task sup on-failure task info)
     (let ((c (vector-ref task 2))
+          (req (vector-ref task 3))
           (token (vector-ref task 4)))
-      (quick-response! c 500 "Internal Server Error" token)))
+      (if (and on-failure
+               (eq? (vector-ref task 0) 'task)
+               (not (unbox token)))
+          (send sup (vector 'submit-urgent
+                      (vector 'fail (vector-ref task 1) c req token info)))
+          (quick-response! c 500 "Internal Server Error" token))))
 
   ;; ---- chunked transfer-encoding (request side) ----------------------------------
 
@@ -748,7 +772,10 @@
       (immutable sup http-server-sup)
       (immutable hbox http-server-hbox)
       (immutable wsbox http-server-wsbox)
-      (immutable started http-server-started)))
+      (immutable started http-server-started)
+      ;; this server's listener handle, so shutdown stops only this
+      ;; server (several servers may listen in one process)
+      (mutable listener http-server-listener http-server-listener-set!)))
 
   (define (http-swap! srv handler)
     (set-box! (http-server-hbox srv) handler))
@@ -771,7 +798,7 @@
   ;; their readers idle out. Call from a detached process, never from a
   ;; pool worker (the worker itself counts as busy -- deadlock).
   (define (http-shutdown! srv)
-    (tcp-stop-listen!)
+    (tcp-stop-listen! (http-server-listener srv))
     (let drain ()
       (let ((s (pool-stats (http-server-sup srv))))
         (if (and (= 0 (cdr (assq 'busy s)))
@@ -787,10 +814,17 @@
   ;; The optional third argument configures the pool: either a plain
   ;; integer (worker count) or an alist:
   ;;   (http-listen 8080 handler
-  ;;     '((workers . 16)        ; pool size            (default 8)
+  ;;     `((workers . 16)        ; pool size            (default 8)
   ;;       (max-retries . 3)     ; crash retries        (default 3)
   ;;       (stuck-ms . 30000)    ; stuck-kill threshold (default 30000)
   ;;       (check-ms . 5000)     ; ticker interval      (default 5000)
+  ;;       (on-failure . ,proc)  ; failure hook: (lambda (req res info))
+  ;;                             ; runs on a fresh worker when retries are
+  ;;                             ; exhausted or a stuck worker was killed;
+  ;;                             ; info: ((kind . crash|stuck) (reason . r)
+  ;;                             ;        (id . task-id) (attempts . n)
+  ;;                             ;        (elapsed-ms . t)).
+  ;;                             ; Unset: plain 500 as always.
   ;;       (reuseport . #t)))    ; SO_REUSEPORT bind: run N OS processes
   ;;                             ; on the same port, kernel-balanced
   ;;                             ; (Linux; not macOS)
@@ -806,20 +840,25 @@
         (if p (cdr p) default)))
     (let* ((hbox (box handler))
            (wsbox (box #f))
+           (obox (box (opt 'on-failure #f)))
+           (supbox (box #f))
            (sup (start-worker-pool (opt 'workers 8)
-                  (lambda (task) (run-task (unbox hbox) task))
-                  fail-task
+                  (lambda (task) (run-task (unbox hbox) (unbox obox) task))
+                  (lambda (task info)
+                    (fail-task (unbox supbox) (unbox obox) task info))
                   (opt 'max-retries 3)
                   (opt 'stuck-ms 30000)
                   (opt 'check-ms 5000)))
-           (srv (make-http-server sup hbox wsbox (now-ms))))
-      (tcp-listen! "0.0.0.0" port 511
-        (lambda (c)
-          ;; libuv callback context: spawn + register only, no yielding
-          (let ((pid (spawn (make-reader c srv))))
-            (conn-set-owner! c pid)
-            (tcp-read-start! c)))
-        (if (opt 'reuseport #f) 2 0))   ; UV_TCP_REUSEPORT
+           (srv (make-http-server sup hbox wsbox (now-ms) 0)))
+      (set-box! supbox sup)
+      (http-server-listener-set! srv
+        (tcp-listen! "0.0.0.0" port 511
+          (lambda (c)
+            ;; libuv callback context: spawn + register only, no yielding
+            (let ((pid (spawn (make-reader c srv))))
+              (conn-set-owner! c pid)
+              (tcp-read-start! c)))
+          (if (opt 'reuseport #f) 2 0)))  ; UV_TCP_REUSEPORT
       (display (string-append "igropyr listening on http://0.0.0.0:"
                               (number->string port) "\n"))
       srv))

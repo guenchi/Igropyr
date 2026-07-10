@@ -21,7 +21,7 @@
           app-use app-static app-ws app-listen app->handler
           req-param req-json req-form req-cookie set-cookie!
           send-text! send-html! send-json! send-file!
-          sse-start! sse-send!)
+          sse-start! sse-send! make-fault-handler)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
           (igropyr json) (igropyr gzip))
 
@@ -263,6 +263,31 @@
   ;; returns #f when the client is gone -- stop the producer loop then
   (define (sse-send! res data)
     (res-write! res (string-append "data: " data "\n\n")))
+
+  ;; ---- pool failure hook template -----------------------------------------------
+  ;; Ready-made on-failure handler for app-listen's pool options. When the
+  ;; pool gives up on a request (crash retries exhausted, or a stuck
+  ;; worker killed -- killed first, so no execution is in flight), it
+  ;; replies a small JSON envelope instead of the plain 500:
+  ;;   {"fault":"crash"|"stuck", "attempts":n, "elapsed-ms":t, "retryable":true}
+  ;; The connection stays open (keep-alive), so the client can resubmit
+  ;; -- changed parameters, carried state -- on the same connection and
+  ;; get a fresh retry round. Optional argument overrides the HTTP status
+  ;; (default 503). For custom envelopes write your own
+  ;; (lambda (req res info) ...) instead.
+  ;;   (app-listen app 8080 `((stuck-ms . 3000) (check-ms . 1000)
+  ;;                          (on-failure . ,(make-fault-handler))))
+  (define (make-fault-handler . rest)
+    (let ((status (if (pair? rest) (car rest) 503)))
+      (lambda (req res info)
+        (define (ref k d)
+          (let ((p (assq k info))) (if p (cdr p) d)))
+        (set-status! res status)
+        (send-json! res
+          (list (cons 'fault (symbol->string (ref 'kind 'crash)))
+                (cons 'attempts (ref 'attempts 1))
+                (cons 'elapsed-ms (ref 'elapsed-ms 0))
+                (cons 'retryable #t))))))
 
   ;; ---- static files -----------------------------------------------------------
 

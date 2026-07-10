@@ -129,13 +129,15 @@
   (define deliver (lambda (owner msg) (void)))
   (define (uv-set-deliver! proc) (set! deliver proc))
 
-  ;; accept hook: (accept-proc conn); installed by tcp-listen!
-  (define accept-proc (lambda (c) (void)))
+  ;; live listeners: handle address -> accept hook, one entry per
+  ;; tcp-listen!. Keyed dispatch (not a single global) so several
+  ;; servers can listen on different ports in one process; the table
+  ;; also roots the listener handles for the GC.
+  (define listener-table (make-eqv-hashtable))
 
   ;; global libuv state, allocated in uv-init!
   (define uv-loop 0)
   (define wakeup-timer 0)
-  (define listener 0)                ; rooted here for the process lifetime
   (define sockaddr-buf 0)
   (define read-buf 0)
   (define read-buf-size 65536)
@@ -212,10 +214,14 @@
             (uv-tcp-init uv-loop client)
             (if (< (uv-accept server client) 0)
                 (uv-close client on-close-entry)
-                (let ((c (make-conn client #f 'open)))
+                (let ((c (make-conn client #f 'open))
+                      (p (hashtable-ref listener-table server #f)))
                   (uv-tcp-nodelay client 1)
                   (hashtable-set! conn-table client c)
-                  (accept-proc c))))))
+                  (if p
+                      (p c)
+                      ;; listener already stopped: refuse the straggler
+                      (tcp-close! c)))))))
       (void* int)
       void))
 
@@ -474,22 +480,27 @@
   ;; optional trailing arg: uv_tcp_bind flags (UV_TCP_REUSEPORT = 2,
   ;; kernel-balanced multi-process listening; Linux/FreeBSD only)
   (define (tcp-listen! host port backlog on-accept . opts)
-    (set! accept-proc on-accept)
     (let ((flags (if (pair? opts) (car opts) 0))
           (l (foreign-alloc tcp-handle-size)))
       (check 'uv-tcp-init (uv-tcp-init uv-loop l))
       (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
       (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf flags))
       (check 'uv-listen (uv-listen l backlog on-connection-entry))
-      (set! listener l)
+      (hashtable-set! listener-table l on-accept)
       l))
 
   ;; Stop accepting new connections (graceful shutdown step 1);
-  ;; established connections are unaffected.
-  (define (tcp-stop-listen!)
-    (when (> listener 0)
-      (uv-close listener on-close-entry)
-      (set! listener 0)))
+  ;; established connections are unaffected. With a listener handle
+  ;; (tcp-listen!'s return value) stops that server only; with no
+  ;; argument stops every listener in the process.
+  (define (tcp-stop-listen! . rest)
+    (define (stop! l)
+      (when (hashtable-ref listener-table l #f)
+        (hashtable-delete! listener-table l)
+        (uv-close l on-close-entry)))
+    (if (pair? rest)
+        (stop! (car rest))
+        (vector-for-each stop! (hashtable-keys listener-table))))
 
   ;; Read a whole file on libuv's thread pool. The owner process later
   ;; receives #(file-read ,bytevector) or #(file-error ,errno). Never

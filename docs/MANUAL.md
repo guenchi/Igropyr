@@ -876,6 +876,60 @@ Or as a worker-count shortcut when only the pool size changes:
 ;; Params: port handler workers
 ```
 
+### The Failure Hook (remote retry ring)
+
+By default a given-up task answers a plain `500` and closes the
+connection. The `on-failure` pool option replaces that with your own
+handler, run on a **fresh worker**, answering through the normal
+response path — so **keep-alive is preserved** and the client can
+resubmit on the same connection:
+
+```scheme
+(app-listen app 8080
+  `((stuck-ms . 3000)          ; fail fast: kill stuck workers early
+    (check-ms . 1000)
+    (on-failure . ,(make-fault-handler))))   ; bundled template, or your own
+```
+
+The bundled template replies
+`{"fault":"crash"|"stuck","attempts":n,"elapsed-ms":t,"retryable":true}`
+with status 503 (`(make-fault-handler 500)` overrides the status). A
+custom handler is `(lambda (req res info) ...)` with `info`:
+
+| key | meaning |
+|---|---|
+| `kind` | `crash` (retries exhausted) or `stuck` (worker killed) |
+| `reason` | the raise value / exit reason of the last execution |
+| `id` | the task id, for log correlation |
+| `attempts` | total executions of this request |
+| `elapsed-ms` | duration of the last execution |
+
+Semantics the client can rely on — the **kill happens first**, so when
+the failure answer arrives there is **no in-flight execution left**:
+
+| kind | server state | sensible client action |
+|---|---|---|
+| `crash` | handler body ran `attempts` times; each run's side effects may have landed | resubmit with changed parameters, or query state and compensate |
+| `stuck` | worker killed mid-flight; side effects partially applied at an unknown point | resubmit carrying state, or roll back |
+
+Every resubmission is a **new task**: fresh attempt budget, a full new
+retry round (deliberate — a transient failure yesterday must not
+poison today's request). With a short `stuck-ms` the client learns the
+definite state in seconds instead of waiting out the old 30 s, and can
+ring through several informed retries in the same wall-clock time.
+
+Two fences keep the hook safe: it runs **once** (a raise inside it is
+caught and falls back to the plain 500 — no retry loop), and if it
+gets stuck it is reaped by the same ticker and also falls back. If a
+partial (streaming) response already went out, the hook cannot run —
+the connection just closes, as before.
+
+Caveat: the `error-handler` middleware wraps handlers in a `guard`, so
+crashes never reach the supervisor — retries and `on-failure` never
+trigger behind it. Use `error-handler` for *expected* business errors,
+the failure hook for Let-It-Crash faults; do not wrap crash-prone
+handlers in a blanket guard.
+
 ### Monitoring the Pool
 
 Use `(http-stats srv)` to get current pool state:
