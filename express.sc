@@ -20,7 +20,8 @@
   (export create-app app-get app-post app-put app-delete
           app-use app-static app-ws app-listen app->handler
           req-param req-json
-          send-text! send-html! send-json! send-file!)
+          send-text! send-html! send-json! send-file!
+          sse-start! sse-send!)
   (import (chezscheme) (igropyr actor) (igropyr http) (igropyr json))
 
   ;; ---- string helpers -----------------------------------------------------
@@ -56,6 +57,20 @@
   (define (req-json req)
     (guard (e (#t #f))
       (string->json (utf8->string (req-body req)))))
+
+  ;; ---- Server-Sent Events -------------------------------------------------
+  ;; Detach long streams from the pool worker:
+  ;;   (sse-start! res)
+  ;;   (spawn (lambda () ... (sse-send! res data) ... (res-end! res)))
+
+  (define (sse-start! res)
+    (set-header! res "Content-Type" "text/event-stream")
+    (set-header! res "Cache-Control" "no-cache")
+    (res-begin! res))
+
+  ;; returns #f when the client is gone -- stop the producer loop then
+  (define (sse-send! res data)
+    (res-write! res (string-append "data: " data "\n\n")))
 
   ;; ---- static files -----------------------------------------------------------
 

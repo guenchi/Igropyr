@@ -31,6 +31,7 @@
           req-method req-path req-query req-headers req-header req-body
           req-keep-alive? req-params req-params-set!
           set-status! set-header! res-send!
+          res-begin! res-write! res-end!
           res-conn res-status res-headers res-keep-alive?
           send-response!)
   (import (chezscheme) (igropyr actor) (igropyr uv) (igropyr otp)
@@ -260,7 +261,9 @@
       (immutable conn res-conn)
       (mutable status res-status res-status-set!)
       (mutable headers res-headers res-headers-set!)
-      (immutable keep-alive? res-keep-alive?)))
+      (immutable keep-alive? res-keep-alive?)
+      ;; plain | streaming | done
+      (mutable mode res-mode res-mode-set!)))
 
   (define (set-status! r s) (res-status-set! r s))
 
@@ -273,6 +276,64 @@
     (send-response! (res-conn r) (res-status r) (res-headers r)
                     body (res-keep-alive? r)))
 
+  ;; ---- streaming responses (Transfer-Encoding: chunked) ------------------------
+
+  ;; Begin a streamed response: send status + headers now, body comes in
+  ;; chunks. Marks the request as responded (the supervisor fallback
+  ;; stays away) and tells the reader to wait for the stream to finish.
+  ;; A long stream should be detached from the pool worker:
+  ;;   (res-begin! r) (spawn (lambda () ... (res-write! r x) ... (res-end! r)))
+  (define (res-begin! r)
+    (let ((c (res-conn r)))
+      (unless (conn-responded? c)
+        (conn-set-responded! c #t)
+        (res-mode-set! r 'streaming)
+        (tcp-write! c
+          (string->utf8
+            (string-append
+              "HTTP/1.1 " (number->string (res-status r)) " "
+              (status-text (res-status r)) "\r\n"
+              (apply string-append
+                     (map (lambda (h)
+                            (string-append (car h) ": " (cdr h) "\r\n"))
+                          (res-headers r)))
+              "Transfer-Encoding: chunked\r\nConnection: "
+              (if (res-keep-alive? r) "keep-alive" "close")
+              "\r\n\r\n"))
+          #f)
+        (send (conn-owner c) (vector 'streaming)))))
+
+  ;; Write one chunk (string or bytevector). #f when the stream is not
+  ;; open any more (e.g. the client disconnected) -- stop the loop then.
+  (define (res-write! r data)
+    (let ((bv (if (string? data) (string->utf8 data) data))
+          (c (res-conn r)))
+      (and (eq? (res-mode r) 'streaming)
+           (eq? (conn-state c) 'open)
+           (> (bytevector-length bv) 0)
+           (tcp-write! c
+             (bv-append
+               (string->utf8
+                 (string-append (number->string (bytevector-length bv) 16) "\r\n"))
+               (bv-append bv (string->utf8 "\r\n")))
+             #f))))
+
+  ;; Finish the stream: terminating chunk, then the usual keep-alive /
+  ;; close continuation.
+  (define (res-end! r)
+    (when (eq? (res-mode r) 'streaming)
+      (res-mode-set! r 'done)
+      (let* ((c (res-conn r))
+             (owner (conn-owner c))
+             (ka (res-keep-alive? r)))
+        (tcp-write! c (string->utf8 "0\r\n\r\n")
+          (lambda (st)
+            (if (and ka (>= st 0))
+                (send owner (vector 'next-request))
+                (begin
+                  (tcp-close! c)
+                  (send owner (vector 'conn-closed)))))))))
+
   ;; ---- task execution (inside a pool worker) -----------------------------------
 
   ;; A crash here kills the worker (Let It Crash): the supervisor retries
@@ -280,7 +341,7 @@
   (define (run-task handler task)
     (let* ((c (vector-ref task 2))
            (req (vector-ref task 3))
-           (r (make-res c 200 '() (req-keep-alive? req))))
+           (r (make-res c 200 '() (req-keep-alive? req) 'plain)))
       (handler req r)
       ;; handler finished without responding: don't leave the client hanging
       (unless (conn-responded? c)
@@ -458,9 +519,21 @@
       (`#(next-request)
         (if eof? (tcp-close! c) (reader-loop c srv leftover)))
       (`#(conn-closed) 'done)
+      (`#(streaming) (await-streaming c srv leftover))
       (`#(tcp-data ,bv) (await-response c srv (bv-append leftover bv) eof?))
       (`#(tcp-eof) (await-response c srv leftover #t))
       (`#(tcp-error ,e) (await-response c srv leftover #t))))
+
+  ;; A streamed (chunked/SSE) response is in progress: wait without a
+  ;; deadline. On client disconnect the reader closes and exits; the
+  ;; producer notices through res-write! returning #f.
+  (define (await-streaming c srv leftover)
+    (receive (after 'infinity #f)
+      (`#(next-request) (reader-loop c srv leftover))
+      (`#(conn-closed) 'done)
+      (`#(tcp-data ,bv) (await-streaming c srv (bv-append leftover bv)))
+      (`#(tcp-eof) (tcp-close! c) 'done)
+      (`#(tcp-error ,e) (tcp-close! c) 'done)))
 
   ;; ---- websocket session ---------------------------------------------------------
 

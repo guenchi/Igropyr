@@ -19,6 +19,7 @@
         (igropyr otp)
         (igropyr http)
         (igropyr websocket)
+        (igropyr json)
         (igropyr express))
 
 (define app (create-app))
@@ -84,6 +85,27 @@
     (let loop ((n 0)) (loop (+ n 1)))))
 
 (app-static app "/static" "./public")
+
+;; JSON request body parsing: POST {"name":"x"} -> {"hello":"x"}
+(app-post app "/echo-json"
+  (lambda (req res)
+    (let ((j (req-json req)))
+      (if j
+          (send-json! res (list (cons 'hello (or (json-ref j "name") 'null))))
+          (begin (set-status! res 400)
+                 (send-json! res (list (cons 'error "invalid json"))))))))
+
+;; Server-Sent Events: five ticks, one per 300ms, then done. The stream
+;; runs in its own process; the pool worker is released immediately.
+(app-get app "/sse"
+  (lambda (req res)
+    (sse-start! res)
+    (spawn
+      (lambda ()
+        (let loop ((i 1))
+          (if (and (<= i 5) (sse-send! res (string-append "tick " (number->string i))))
+              (begin (sleep-ms 300) (loop (+ i 1)))
+              (res-end! res)))))))
 
 ;; Hot reload demo: registering a route that already exists replaces it
 ;; in the live app -- no restart, listener and connections untouched.
