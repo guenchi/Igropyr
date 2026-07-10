@@ -18,7 +18,15 @@
 (library (igropyr client)
   (export http-request http-get http-post
           response? response-status response-headers response-body
-          response-header)
+          response-header
+          ;; Re-exported app-facing (igropyr actor) surface: this library
+          ;; can be the sole entry point of a client-only program (a
+          ;; crawler, an API caller), which still needs the scheduler and
+          ;; process primitives. Same original bindings as those
+          ;; re-exported by (igropyr http) -- importing both never
+          ;; conflicts.
+          start-scheduler spawn send receive self
+          sleep-ms kill register whereis process-id)
   (import (chezscheme) (igropyr actor) (igropyr libuv))
 
   (define default-timeout-ms 30000)

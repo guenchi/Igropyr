@@ -89,11 +89,12 @@ curl -X POST -d 'hello' localhost:8080/echo
 
 ## 编写应用
 
-使用内置的 Express 风格层：
+使用内置的 Express 风格层。`(igropyr http)` 是核心层，重导出了面向应用的
+actor 接口（`start-scheduler`、`spawn`、`receive` 等）；express、websocket
+及其他组件按需插拔：
 
 ```scheme
 (import (chezscheme)
-        (igropyr actor)
         (igropyr http)
         (igropyr express))
 
@@ -167,10 +168,11 @@ pool 及其容错行为可配置；传入 alist 代替 worker 数量即可
 ## 核心 API（构建自己的框架）
 
 核心与框架无关，类似 Node 的 `http` module：它负责 parsing、连接、worker pool 和 response encoding，
-并接收一个 handler。express 做的所有事情都可以在用户空间表达：
+并接收一个 handler。它重导出了面向应用的 actor 接口，因此单个 import 即可。
+express 做的所有事情都可以在用户空间表达：
 
 ```scheme
-(import (chezscheme) (igropyr actor) (igropyr http))
+(import (chezscheme) (igropyr http))
 
 (start-scheduler
   (lambda ()

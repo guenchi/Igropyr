@@ -13,15 +13,15 @@
 ;;;   for i in $(seq 8); do curl -m 2 localhost:8080/stuck & done # recovers <=35s
 ;;;   curl localhost:8080/crash                     # 500, service keeps running
 
+;; (igropyr http) is the core and re-exports the app-facing actor surface
+;; (start-scheduler, spawn, receive, ...); express, websocket and the
+;; other batteries plug in on demand.
 (import (chezscheme)
-        (igropyr actor)
-        (igropyr libuv)
-        (igropyr otp)
         (igropyr http)
+        (igropyr express)
         (igropyr websocket)
         (igropyr json)
-        (igropyr pubsub)
-        (igropyr express))
+        (igropyr pubsub))
 
 (define app (create-app))
 

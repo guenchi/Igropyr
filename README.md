@@ -107,11 +107,13 @@ curl -X POST -d 'hello' localhost:8080/echo
 
 ## Writing an application
 
-With the bundled Express-style layer:
+With the bundled Express-style layer. `(igropyr http)` is the core and
+re-exports the app-facing actor surface (`start-scheduler`, `spawn`,
+`receive`, ...); express, websocket and the other batteries plug in on
+demand:
 
 ```scheme
 (import (chezscheme)
-        (igropyr actor)
         (igropyr http)
         (igropyr express))
 
@@ -190,10 +192,11 @@ never corrupt a response that already went out.
 
 The core is framework-agnostic, like Node's `http` module: it owns
 parsing, connections, the worker pool and response encoding, and takes a
-single handler. Everything express does is expressible in user space:
+single handler. It re-exports the app-facing actor surface, so it is a
+single import too. Everything express does is expressible in user space:
 
 ```scheme
-(import (chezscheme) (igropyr actor) (igropyr http))
+(import (chezscheme) (igropyr http))
 
 (start-scheduler
   (lambda ()

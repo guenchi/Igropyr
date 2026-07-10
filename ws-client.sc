@@ -16,7 +16,18 @@
 ;;; #(ws-client-error msg).
 
 (library (igropyr ws-client)
-  (export ws-connect)
+  (export ws-connect
+          ;; Re-exported session operations from (igropyr websocket):
+          ;; ws-connect returns a session that is only usable through
+          ;; these, so a client-only program imports this library alone.
+          ws-recv ws-send-text! ws-send-binary! ws-close!
+          ;; Re-exported app-facing (igropyr actor) surface, for the same
+          ;; reason as (igropyr client): a client-only program still needs
+          ;; the scheduler and process primitives. Same original bindings
+          ;; as those re-exported by (igropyr http) -- importing both
+          ;; never conflicts.
+          start-scheduler spawn send receive self
+          sleep-ms kill register whereis process-id)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr websocket))
 
   (define connect-timeout-ms 10000)

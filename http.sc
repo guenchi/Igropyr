@@ -35,7 +35,17 @@
           set-status! set-header! res-send!
           res-begin! res-write! res-end!
           res-conn res-req res-status res-headers res-keep-alive?
-          send-response! parse-query)
+          send-response! parse-query
+          ;; Re-exported app-facing (igropyr actor) surface, so a core
+          ;; application imports this library alone. Advanced primitives
+          ;; (link/monitor/trap-exit, spawn&link) stay behind an explicit
+          ;; (igropyr actor) import. Re-exporting the same original
+          ;; bindings from several libraries is legal in R6RS: every
+          ;; import path reaches the same binding, so importing this
+          ;; library together with (igropyr actor) or (igropyr express)
+          ;; never conflicts.
+          start-scheduler spawn send receive self
+          sleep-ms kill register whereis process-id)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr otp)
           (igropyr websocket))
 
