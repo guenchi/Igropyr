@@ -27,7 +27,7 @@
 ;;;   request (keep-alive) or closes the connection.
 
 (library (igropyr http)
-  (export http-listen http-swap! http-set-ws! http-set-fast!
+  (export http-listen http-swap! http-set-ws!
           http-stats http-shutdown!
           req-method req-path req-query req-headers req-header req-body
           req-keep-alive? req-params req-params-set!
@@ -581,16 +581,9 @@
                      (quick-response! c 413 "Payload Too Large")
                      (collect-body c srv acc parsed n (+ hend 4 n))))))))))
 
-  ;; Dispatch the parsed request. A "fast" route (the app-supplied
-  ;; predicate returns true) is run inline in the reader process,
-  ;; skipping the worker-pool round trip (submit-task -> worker ->
-  ;; task-completed -> DOWN, ~4 messages + a context switch per
-  ;; request). The trade-off: a fast handler loses the pool's crash
-  ;; retry and stuck-kill; a crash is caught here and answered 500 (only
-  ;; this connection is affected), and a fast handler that blocks or
-  ;; loops freezes only its own connection. Mark a route fast only when
-  ;; its handler is pure and returns promptly. Everything else goes
-  ;; through the pool.
+  ;; Dispatch the parsed request to the worker pool, then await the
+  ;; response. Every request goes through the pool, so every handler gets
+  ;; the same fault tolerance (crash retry, stuck-worker kill).
   (define (dispatch-request! c srv parsed body leftover)
     (let* ((headers (vector-ref parsed 4))
            (req (make-request (vector-ref parsed 0)
@@ -602,18 +595,10 @@
                               (keep-alive? (vector-ref parsed 3) headers)
                               '()))
            (id (next-task-id!))
-           (token (make-token))
-           (fast? (unbox (http-server-fbox srv))))
-      (if (and fast? (fast? req))
-          ;; inline fast path: run the handler here, catch crashes
-          (let ((task (vector 'task id c req token)))
-            (guard (e (#t (quick-response! c 500 "Internal Server Error" token)))
-              (run-task (unbox (http-server-hbox srv)) task))
-            (await-response c srv leftover #f))
-          (begin
-            (send (http-server-sup srv)
-              (vector 'submit-task (vector 'task id c req token)))
-            (await-response c srv leftover #f)))))
+           (token (make-token)))
+      (send (http-server-sup srv)
+        (vector 'submit-task (vector 'task id c req token)))
+      (await-response c srv leftover #f)))
 
   (define (collect-body c srv acc parsed clen total)
     (if (>= (bytevector-length acc) total)
@@ -696,13 +681,11 @@
   ;; http-swap! upgrades the code with zero downtime (in-flight requests
   ;; finish on the old handler; new requests get the new one).
   ;; wsbox holds the websocket resolver: (lambda (req) session-or-#f).
-  ;; fbox holds the fast-route predicate: (lambda (req) bool), or #f.
   (define-record-type (http-server make-http-server http-server?)
     (fields
       (immutable sup http-server-sup)
       (immutable hbox http-server-hbox)
       (immutable wsbox http-server-wsbox)
-      (immutable fbox http-server-fbox)
       (immutable started http-server-started)))
 
   (define (http-swap! srv handler)
@@ -710,12 +693,6 @@
 
   (define (http-set-ws! srv resolver)
     (set-box! (http-server-wsbox srv) resolver))
-
-  ;; Install the fast-route predicate. When it returns true for a
-  ;; request, that request runs inline in the reader (bypassing the
-  ;; worker pool). See dispatch-request! for the trade-offs.
-  (define (http-set-fast! srv pred)
-    (set-box! (http-server-fbox srv) pred))
 
   ;; runtime snapshot: open connections, total requests, uptime, and the
   ;; worker pool's idle/busy/pending counters
@@ -767,14 +744,13 @@
         (if p (cdr p) default)))
     (let* ((hbox (box handler))
            (wsbox (box #f))
-           (fbox (box #f))
            (sup (start-worker-pool (opt 'workers 8)
                   (lambda (task) (run-task (unbox hbox) task))
                   fail-task
                   (opt 'max-retries 3)
                   (opt 'stuck-ms 30000)
                   (opt 'check-ms 5000)))
-           (srv (make-http-server sup hbox wsbox fbox (now-ms))))
+           (srv (make-http-server sup hbox wsbox (now-ms))))
       (tcp-listen! "0.0.0.0" port 511
         (lambda (c)
           ;; libuv callback context: spawn + register only, no yielding

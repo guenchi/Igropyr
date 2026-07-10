@@ -30,12 +30,11 @@
   (lambda (req res next)
     (next)))
 
-;; pure, prompt handlers -> fast route (runs inline, bypasses the pool)
-(app-get-fast app "/"
+(app-get app "/"
   (lambda (req res)
     (send-html! res "<h1>Igropyr</h1><p>Chez Scheme + libuv + actors</p>")))
 
-(app-get-fast app "/json"
+(app-get app "/json"
   (lambda (req res)
     (send-json! res (list (cons 'name "igropyr")
                           (cons 'engine "chez-scheme")
@@ -90,7 +89,6 @@
 
 ;; Admin endpoint: dump PGO profile counters to disk. Only meaningful on
 ;; a profiling build (compiled with compile-profile); a no-op otherwise.
-;; Pooled (not fast) since it has a side effect.
 (app-get app "/admin/profdump"
   (lambda (req res)
     (guard (e (#t (send-text! res "no profile data")))

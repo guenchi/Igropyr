@@ -510,28 +510,6 @@ are masked as RFC 6455 requires).
 
 `wss` is refused — reach TLS-only endpoints through a proxy.
 
-## Fast routes
-
-By default every request goes through the worker pool, which buys crash
-retry and stuck-kill at the cost of ~4 inter-process messages and a
-context switch per request. For a handler that is pure and returns
-promptly, that round trip is the dominant per-request cost. Mark such a
-route *fast* and it runs inline in the connection's reader process,
-skipping the pool:
-
-```scheme
-(app-get-fast app "/" (lambda (req res) (send-html! res "hi")))
-;; also app-post-fast / app-put-fast / app-delete-fast
-```
-
-Measured on a trivial keep-alive route, this cuts per-request CPU by
-~20% (roughly 145k -> 200k req/s at one saturated core). The trade-off:
-a fast handler loses the pool's fault tolerance — a crash is caught and
-answered `500` for that one connection (no retry), and a handler that
-blocks or loops freezes only its own connection (no 30 s stuck-kill).
-Use it only for pure, prompt handlers; leave anything with side effects,
-database calls, or heavy work on the default pooled path.
-
 ## Fault tolerance semantics
 
 These apply to pooled routes (the default); nothing to configure:
@@ -641,7 +619,7 @@ actor.sc   green processes: spawn/send/receive, link/monitor/register,
 otp.sc     supervisor + fixed worker pool + stuck-worker ticker
 http.sc    core: incremental HTTP/1.1 parser (content-length + chunked),
            connection lifecycle, response encoding, websocket upgrade,
-           streaming, fast routes, http-listen / http-swap! / http-set-ws!
+           streaming, http-listen / http-swap! / http-set-ws!
 websocket.sc  WebSocket codec (server + client roles): handshake key,
               frame encode/decode, ws-recv / ws-send-text! / ws-close!
 ws-client.sc  outbound WebSocket (ws-connect)

@@ -10,21 +10,20 @@ This guide covers the architecture, design patterns, and implementation details 
 4. [Writing an HTTP Handler](#writing-an-http-handler)
 5. [WebSocket](#websocket)
 6. [Streaming and SSE](#streaming-and-sse)
-7. [Fast Routes](#fast-routes)
-8. [Hot Code Swapping and Graceful Shutdown](#hot-code-swapping-and-graceful-shutdown)
-9. [Fault Tolerance](#fault-tolerance)
-10. [OTP Patterns](#otp-patterns)
-11. [Middleware Suite](#middleware-suite)
-12. [Sessions](#sessions)
-13. [Metrics](#metrics)
-14. [Outbound HTTP Client](#outbound-http-client)
-15. [Database Clients](#database-clients)
-16. [Async File Reads](#async-file-reads)
-17. [JSON and gzip](#json-and-gzip)
-18. [Running and Building](#running-and-building)
-19. [Testing](#testing)
-20. [Code Style](#code-style)
-21. [Common Pitfalls](#common-pitfalls)
+7. [Hot Code Swapping and Graceful Shutdown](#hot-code-swapping-and-graceful-shutdown)
+8. [Fault Tolerance](#fault-tolerance)
+9. [OTP Patterns](#otp-patterns)
+10. [Middleware Suite](#middleware-suite)
+11. [Sessions](#sessions)
+12. [Metrics](#metrics)
+13. [Outbound HTTP Client](#outbound-http-client)
+14. [Database Clients](#database-clients)
+15. [Async File Reads](#async-file-reads)
+16. [JSON and gzip](#json-and-gzip)
+17. [Running and Building](#running-and-building)
+18. [Testing](#testing)
+19. [Code Style](#code-style)
+20. [Common Pitfalls](#common-pitfalls)
 
 ---
 
@@ -737,49 +736,6 @@ SSE is a persistent connection where the server pushes text events to the client
 ```
 
 The spawned process runs independently: the handler returns, the worker is freed, and the event loop pumps the persistent connection to the client. If the client closes the browser tab or connection is lost, `sse-send!` detects it and returns `#f`, allowing the producer loop to exit cleanly.
-
----
-
-## Fast Routes
-
-By default, every HTTP request is dispatched from the reader process to the worker pool, processed by a worker, and the response is written back. This round-trip takes time and provides retry semantics on crash.
-
-**Fast routes** run the handler inline in the reader process, bypassing the pool entirely.
-
-### API
-
-- `(app-get-fast app pattern handler)` — register a GET route that runs inline
-- `(app-post-fast app pattern handler)`, `(app-put-fast ...)`, `(app-delete-fast ...)`
-
-### Trade-Offs
-
-**Pros**:
-- Zero-copy dispatch: no message-passing overhead.
-- Faster for pure, stateless handlers (path parameter extraction, config reads).
-
-**Cons**:
-- **No crash recovery**: An uncaught exception in the handler answers HTTP 500 for that one connection only; the reader process dies and that TCP client is disconnected. No automatic retry.
-- **Blocks that one connection**: A blocking operation (infinite loop, `sleep-ms`, slow database query) freezes only that client's connection, not the entire server. Other connections on the same reader are stalled.
-
-### When to Use
-
-Use fast routes for:
-- Simple static computations (route parameter extraction, config lookups)
-- Pure functions with no I/O or external dependencies
-- API endpoints that must respond in < 1 ms
-
-**Do not use for**:
-- Database queries
-- Calls to `(receive ...)`, `(sleep-ms ...)`, or any blocking operation
-- Code that might crash (or catch exceptions carefully)
-
-### Example
-
-```scheme
-(app-get-fast app "/health"
-  (lambda (req res)
-    (send-json! res (list (cons 'status "ok")))))
-```
 
 ---
 
