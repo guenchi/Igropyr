@@ -38,10 +38,15 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
 - **Non-blocking Redis and MySQL clients** — pure Scheme, same event
   loop; callers park their green process while the OS thread keeps
   serving; MySQL comes with a self-healing connection pool
-- **Non-blocking HTTP client** — outbound `http-get` / `http-post` with
-  async DNS (libuv thread pool), same park-the-caller model
+- **Non-blocking HTTP & WebSocket clients** — outbound `http-get` /
+  `http-post` and `ws-connect`, both with async DNS (libuv thread pool)
+  and the same park-the-caller model
+- **Async file reads** — static files are read on libuv's thread pool,
+  so a large or cold read never blocks the scheduler
 - **gzip compression** — responses negotiated via `Accept-Encoding`;
   static files cache their compressed form
+- **Ops-ready** — rate limiting, a global error handler, and a
+  Prometheus `/metrics` endpoint
 - **Runtime introspection & graceful shutdown** — `http-stats` (live
   connection/request/pool counters), `http-shutdown!` (drain in-flight
   requests, refuse new connections)
@@ -446,10 +451,12 @@ order matters (outermost first).
 ```scheme
 (import (igropyr session) (igropyr middleware))
 
+(app-use app (error-handler))              ; outermost: catch -> 500 JSON
 (app-use app (logger))                     ; "GET /path -> 200 (3ms)"
 (app-use app (security-headers '((hsts . #t))))  ; X-Frame-Options, nosniff, ...
 (app-use app (cors '((origin . "https://app.example.com")
                      (credentials . #t))))       ; + 204 OPTIONS preflight
+(app-use app (rate-limit '((max . 100) (window . 60000))))  ; 429 over limit
 
 ;; cookie-based sessions backed by a gen-server store (sids from the OS
 ;; CSPRNG, TTL-pruned); the session is loaded onto the request and saved
@@ -469,6 +476,37 @@ Middleware can also stash arbitrary values on the request for later
 handlers with `req-set-local!` / `req-local` (this is how sessions ride
 along). Writing your own is just `(lambda (req res next) ...)` — call
 `(next)` to continue, or respond and return to short-circuit.
+
+Prometheus metrics: a middleware records every request, and an endpoint
+renders per-status counts, request-duration, and connection/pool gauges:
+
+```scheme
+(import (igropyr metrics))
+(define m (make-metrics))                   ; at boot
+(app-use app (metrics-middleware m))
+;; after app-listen returns the server:
+(app-get app "/metrics" (metrics-endpoint m srv))
+;;   igropyr_requests_total{status="200"} 1234
+;;   igropyr_request_duration_ms_sum 45210
+;;   igropyr_connections 12  ... igropyr_pool_busy 3
+```
+
+## Outbound WebSocket
+
+`ws-connect` dials a `ws://` URL, does the upgrade handshake, and returns
+a client-role session — the same object the server side uses, so
+`ws-recv` / `ws-send-text!` / `ws-close!` work unchanged (outbound frames
+are masked as RFC 6455 requires).
+
+```scheme
+(import (igropyr ws-client))
+(let ((w (ws-connect "ws://127.0.0.1:8080/chat/42")))
+  (ws-send-text! w "hello")
+  (ws-recv w)                 ; -> #(text s) | #(binary bv) | #(close)
+  (ws-close! w))
+```
+
+`wss` is refused — reach TLS-only endpoints through a proxy.
 
 ## Fast routes
 
@@ -594,15 +632,17 @@ the original scheme from `X-Forwarded-Proto`.
 ## Architecture
 
 ```
-libuv.sc   libuv FFI: event loop, TCP, async DNS, write queue, GC roots
+libuv.sc   libuv FFI: event loop, TCP, async DNS, async file reads,
+           write queue, GC roots
 actor.sc   green processes: spawn/send/receive, link/monitor/register,
            preemptive scheduler (call/1cc + timer interrupt), run/sleep queues
 otp.sc     supervisor + fixed worker pool + stuck-worker ticker
 http.sc    core: incremental HTTP/1.1 parser (content-length + chunked),
            connection lifecycle, response encoding, websocket upgrade,
            streaming, fast routes, http-listen / http-swap! / http-set-ws!
-websocket.sc  WebSocket codec: SHA-1/base64 handshake key, frame
-              encode/decode, ws-recv / ws-send-text! / ws-close!
+websocket.sc  WebSocket codec (server + client roles): handshake key,
+              frame encode/decode, ws-recv / ws-send-text! / ws-close!
+ws-client.sc  outbound WebSocket (ws-connect)
 express.sc framework layer (optional): router with :param segments,
            middleware chain, static files (cached + gzip), app-ws,
            forms/cookies, SSE, JSON/text/html/file encoders
@@ -611,7 +651,8 @@ gzip.sc    gzip compression via zlib
 gen-server.sc  OTP gen-server (call/cast/info)
 pubsub.sc  topic publish/subscribe with dead-subscriber cleanup
 session.sc     cookie sessions on a gen-server store
-middleware.sc  cors / security-headers / logger
+middleware.sc  cors / security-headers / logger / rate-limit / error-handler
+metrics.sc     Prometheus /metrics endpoint
 client.sc  non-blocking outbound HTTP client (async DNS)
 redis.sc   non-blocking Redis client (RESP2), pipelined
 mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
