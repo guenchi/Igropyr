@@ -63,9 +63,9 @@ brew install chezscheme libuv        # macOS
 # apt install chezscheme libuv1-dev  # Debian/Ubuntu
 ```
 
-The libuv shared object path is set at the top of `uv.sc`
-(`/opt/homebrew/lib/libuv.1.dylib` by default); adjust it for your system,
-e.g. `libuv.so.1` on Linux.
+`uv.sc` probes the standard macOS and Linux libuv sonames, including the
+usual Homebrew locations. If libuv is installed in a non-standard prefix,
+make that directory visible to the platform dynamic loader.
 
 ## Getting started
 
@@ -76,7 +76,7 @@ is lowercase; on case-sensitive file systems the directory name must match):
 git clone https://github.com/guenchi/Igropyr igropyr
 export CHEZSCHEMELIBDIRS=.
 export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
-scheme --script igropyr/test/run-otp.sc
+chez --script igropyr/test/run-otp.sc
 ```
 
 Then:
@@ -370,6 +370,8 @@ being served.
 (redis r "GET" "greeting")             ; -> "hello"
 (redis r "GET" "missing")              ; -> #f        (nil)
 (redis r "LRANGE" "l" 0 -1)            ; -> ("a" "b") (arrays -> lists)
+;; Valid UTF-8 bulk strings are returned as strings; arbitrary binary bulk
+;; strings are returned as bytevectors instead of failing UTF-8 decoding.
 
 ;; MySQL (text protocol; caching_sha2_password, both fast and full
 ;; RSA paths, so it works against MySQL 8/9 out of the box)
@@ -519,19 +521,19 @@ first, as in Erlang:
 
 ## Building for production
 
-Running from source (`scheme --script`) interprets the libraries. For
+Running from source (`chez --script`) interprets the libraries. For
 deployment, compile. Two options:
 
 ```sh
 # Per-library .so files (hot-path files at optimize-level 3, rest at 2).
 # Loaded automatically in place of the sources (.so precedes .sc in
 # CHEZSCHEMELIBEXTS). Good for development, since --script keeps working.
-scheme --libdirs .:lib --script igropyr/build.ss
+chez --libdirs .:lib --script igropyr/build.ss
 
 # Whole-program: fold every library + the app into one optimized program
 # (cross-library inlining, optimize-level 3). Run it with --program.
-scheme --libdirs .:lib --script igropyr/build-whole.ss
-scheme --program igropyr/app.so
+chez --libdirs .:lib --script igropyr/build-whole.ss
+chez --program igropyr/app.so
 ```
 
 Re-run the build after editing any source. Interrupt traps stay enabled
@@ -565,10 +567,11 @@ trivial keep-alive route on an Apple Silicon laptop.
 Layered smoke tests, each runnable on its own:
 
 ```sh
-scheme --script igropyr/test/smoke-echo.sc        # FFI layer: bare echo server
-scheme --script igropyr/test/smoke-actor.sc       # scheduler: ping-pong, timeouts, preemption
-scheme --script igropyr/test/smoke-echo-actor.sc  # process-per-connection echo
-scheme --script igropyr/test/run-otp.sc           # the full HTTP server
+chez --script igropyr/test/smoke-echo.sc        # FFI layer: bare echo server
+chez --script igropyr/test/smoke-actor.sc       # scheduler: ping-pong, timeouts, preemption
+chez --script igropyr/test/smoke-echo-actor.sc  # process-per-connection echo
+chez --script igropyr/test/run-otp.sc           # the full HTTP server
+chez --script igropyr/test/security-regression.sc # HTTP/security regression suite
 ```
 
 ## License

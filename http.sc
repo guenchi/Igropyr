@@ -40,6 +40,11 @@
 
   (define header-limit 8192)
   (define body-limit 1048576)
+  (define trailer-limit 8192)
+  ;; Bytes a client may pipeline while the current handler is still
+  ;; producing its response.  Without a cap a slow handler/stream lets a
+  ;; peer grow the reader's bytevector without bound.
+  (define pipeline-limit (+ header-limit body-limit))
   (define read-timeout-ms 30000)   ; slow/half requests reaped after this
   (define await-timeout-ms 60000)  ; reader waits this long for a response
 
@@ -112,20 +117,33 @@
   ;; %XX escapes are octets of a UTF-8 sequence: collect bytes first,
   ;; decode as UTF-8 once at the end (decoding each %XX to a character
   ;; directly would mangle multi-byte sequences like %E4%B8%AD).
-  (define (percent-decode s)
+  (define (hex-value ch)
+    (let ((c (char->integer ch)))
+      (cond
+        ((and (>= c 48) (<= c 57)) (- c 48))
+        ((and (>= c 65) (<= c 70)) (- c 55))
+        ((and (>= c 97) (<= c 102)) (- c 87))
+        (else #f))))
+
+  (define (percent-decode s plus-as-space?)
     (let ((n (string-length s)))
       (let-values (((p get) (open-bytevector-output-port)))
         (let loop ((i 0))
           (when (< i n)
             (let ((ch (string-ref s i)))
               (cond
-                ((and (char=? ch #\%) (< (+ i 2) n))
-                 (let ((v (string->number (substring s (+ i 1) (+ i 3)) 16)))
-                   (if v
-                       (begin (put-u8 p v) (loop (+ i 3)))
-                       (begin (put-bytevector p (string->utf8 (string ch)))
-                              (loop (+ i 1))))))
-                ((char=? ch #\+) (put-u8 p 32) (loop (+ i 1)))
+                ((char=? ch #\%)
+                 (if (< (+ i 2) n)
+                     (let ((hi (hex-value (string-ref s (+ i 1))))
+                           (lo (hex-value (string-ref s (+ i 2)))))
+                       (if (and hi lo)
+                           (begin (put-u8 p (+ (* hi 16) lo)) (loop (+ i 3)))
+                           (assertion-violation 'percent-decode
+                             "invalid percent escape" s)))
+                     (assertion-violation 'percent-decode
+                       "truncated percent escape" s)))
+                ((and plus-as-space? (char=? ch #\+))
+                 (put-u8 p 32) (loop (+ i 1)))
                 (else
                  (put-bytevector p (string->utf8 (string ch)))
                  (loop (+ i 1)))))))
@@ -135,11 +153,14 @@
     (if (string=? s "")
         '()
         (map (lambda (kv)
-               (let ((parts (string-split kv #\=)))
-                 (if (>= (length parts) 2)
-                     (cons (percent-decode (car parts))
-                           (percent-decode (cadr parts)))
-                     (cons (percent-decode (car parts)) ""))))
+               ;; Split only at the first '='; values such as signatures
+               ;; and base64 tokens commonly contain further '=' bytes.
+               (let ((eq (string-index kv #\=)))
+                 (if eq
+                     (cons (percent-decode (substring kv 0 eq) #t)
+                           (percent-decode
+                             (substring kv (+ eq 1) (string-length kv)) #t))
+                     (cons (percent-decode kv #t) ""))))
              (string-split s #\&))))
 
   (define (strip-cr l)
@@ -148,36 +169,60 @@
           (substring l 0 (- n 1))
           l)))
 
-  ;; "Content-Length: 42" -> (content-length . "42"), or #f
+  (define (http-token? s)
+    (and (string? s) (> (string-length s) 0)
+         (let loop ((i 0))
+           (if (= i (string-length s))
+               #t
+               (let ((c (char->integer (string-ref s i))))
+                 (and (or (and (>= c 48) (<= c 57))
+                          (and (>= c 65) (<= c 90))
+                          (and (>= c 97) (<= c 122))
+                          (memv c '(33 35 36 37 38 39 42 43 45 46
+                                    94 95 96 124 126)))
+                      (loop (+ i 1))))))))
+
+  (define (trim-ows s)
+    (let ((n (string-length s)))
+      (let left ((a 0))
+        (if (and (< a n) (memv (string-ref s a) '(#\space #\tab)))
+            (left (+ a 1))
+            (let right ((b n))
+              (if (and (> b a) (memv (string-ref s (- b 1))
+                                           '(#\space #\tab)))
+                  (right (- b 1))
+                  (substring s a b)))))))
+
+  ;; "Content-Length: 42" -> (content-length . "42"), or #f.
+  ;; Malformed field names and values are rejected instead of silently
+  ;; disappearing from the request.
   (define (parse-header-line l)
     (let ((colon (string-index l #\:)))
       (and colon
-           (let ((k (string->symbol (string-downcase (substring l 0 colon))))
-                 (v (let trim ((j (+ colon 1)))
-                      (if (and (< j (string-length l))
-                               (char=? (string-ref l j) #\space))
-                          (trim (+ j 1))
-                          (substring l j (string-length l))))))
-             (cons k v)))))
+           (let* ((name (substring l 0 colon))
+                  (v (trim-ows (substring l (+ colon 1) (string-length l)))))
+             (and (http-token? name)
+                  (not (string-index v #\return))
+                  (not (string-index v (integer->char 0)))
+                  (cons (string->symbol (string-downcase name)) v))))))
 
   ;; Repeated header fields are coalesced into one comma-joined value
   ;; (RFC 7230); this lets content-length see "5,6" and reject the
   ;; conflict, and keeps request accessors single-valued.
   (define (parse-header-lines lines)
-    (let ((acc (fold-right
-                 (lambda (l a)
-                   (let ((kv (and (not (string=? l "")) (parse-header-line l))))
-                     (if (not kv)
-                         a
-                         (let ((prev (assq (car kv) a)))
-                           (if prev
-                               (begin
-                                 (set-cdr! prev
-                                   (string-append (cdr prev) "," (cdr kv)))
-                                 a)
-                               (cons kv a))))))
-                 '() lines)))
-      acc))
+    (let loop ((ls lines) (acc '()))
+      (cond
+        ((null? ls) acc)
+        ((string=? (car ls) "") (loop (cdr ls) acc))
+        (else
+         (let ((kv (parse-header-line (car ls))))
+           (and kv
+                (let ((prev (assq (car kv) acc)))
+                  (if prev
+                      (begin
+                        (set-cdr! prev (string-append (cdr prev) "," (cdr kv)))
+                        (loop (cdr ls) acc))
+                      (loop (cdr ls) (cons kv acc))))))))))
 
   ;; Parse request line + headers from the header block.
   ;; Returns #(method path query version headers) or #f on malformed input.
@@ -187,19 +232,23 @@
              (lines (map strip-cr (string-split text #\newline)))
              (rl (string-split (car lines) #\space)))
         (and (= (length rl) 3)
+             (http-token? (car rl))
              (let* ((method (string->symbol (car rl)))
                     (target (cadr rl))
                     (version (caddr rl))
                     (qpos (string-index target #\?))
                     (path (percent-decode
-                            (if qpos (substring target 0 qpos) target)))
+                            (if qpos (substring target 0 qpos) target) #f))
                     (query (if qpos
                                (parse-query
                                  (substring target (+ qpos 1)
                                             (string-length target)))
                                '()))
                     (headers (parse-header-lines (cdr lines))))
-               (vector method path query version headers))))))
+               (and headers
+                    (or (string=? version "HTTP/1.1")
+                        (string=? version "HTTP/1.0"))
+                    (vector method path query version headers)))))))
 
   ;; a valid Content-Length is one or more identical strings of ASCII
   ;; digits (parse-header-lines coalesces repeats into one comma-joined
@@ -219,9 +268,9 @@
           (let ((parts (let split ((s (cdr p)) (acc '()) (start 0) (i 0))
                          (cond
                            ((= i (string-length s))
-                            (reverse (cons (substring s start i) acc)))
+                            (reverse (cons (trim-ows (substring s start i)) acc)))
                            ((char=? (string-ref s i) #\,)
-                            (split s (cons (substring s start i) acc)
+                            (split s (cons (trim-ows (substring s start i)) acc)
                                    (+ i 1) (+ i 1)))
                            (else (split s acc start (+ i 1)))))))
             ;; every repeated value must be a valid digit string and equal
@@ -236,22 +285,38 @@
                      ((= n val) (check (cdr ps) val))
                      (else 'bad))))))))))
 
-  (define (chunked-body? headers)
+  ;; Only chunked request transfer coding is implemented.  Any other
+  ;; value must be rejected; treating it as a bodyless request would
+  ;; desynchronise the keep-alive stream.
+  (define (transfer-encoding headers)
     (let ((p (assq 'transfer-encoding headers)))
-      (and p (string-ci=? (cdr p) "chunked"))))
+      (cond
+        ((not p) 'absent)
+        ((string-ci=? (trim-ows (cdr p)) "chunked") 'chunked)
+        (else 'bad))))
+
+  (define (comma-header-has-token? value wanted)
+    (exists (lambda (part) (string-ci=? (trim-ows part) wanted))
+            (string-split value #\,)))
 
   ;; websocket upgrade request? returns the Sec-WebSocket-Key or #f
   (define (websocket-key headers)
     (let ((u (assq 'upgrade headers))
-          (k (assq 'sec-websocket-key headers)))
-      (and u k (string-ci=? (cdr u) "websocket") (cdr k))))
+          (cn (assq 'connection headers))
+          (k (assq 'sec-websocket-key headers))
+          (v (assq 'sec-websocket-version headers)))
+      (and u cn k v
+           (string-ci=? (trim-ows (cdr u)) "websocket")
+           (comma-header-has-token? (cdr cn) "upgrade")
+           (string=? (trim-ows (cdr v)) "13")
+           (not (string=? (trim-ows (cdr k)) ""))
+           (trim-ows (cdr k)))))
 
   (define (keep-alive? version headers)
-    (let* ((p (assq 'connection headers))
-           (cn (and p (string-downcase (cdr p)))))
+    (let ((p (assq 'connection headers)))
       (if (string=? version "HTTP/1.1")
-          (not (equal? cn "close"))
-          (equal? cn "keep-alive"))))
+          (not (and p (comma-header-has-token? (cdr p) "close")))
+          (and p (comma-header-has-token? (cdr p) "keep-alive")))))
 
   ;; ---- responses -------------------------------------------------------------
 
@@ -279,15 +344,20 @@
   (define (framing-header? name)
     (member (string-downcase name) framing-headers))
 
-  ;; Reject header names/values carrying CR or LF (response splitting).
-  (define (header-safe? s)
-    (not (or (string-index s #\return) (string-index s #\newline))))
+  ;; Reject malformed names and values carrying control delimiters
+  ;; (response splitting).  NUL is rejected as well because downstream
+  ;; proxies often treat it inconsistently.
+  (define (header-value-safe? s)
+    (and (string? s)
+         (not (or (string-index s #\return)
+                  (string-index s #\newline)
+                  (string-index s (integer->char 0))))))
 
   (define (render-headers headers)
     (apply string-append
       (map (lambda (h)
              (let ((k (car h)) (v (cdr h)))
-               (if (and (header-safe? k) (header-safe? v)
+               (if (and (http-token? k) (header-value-safe? v)
                         (not (framing-header? k)))
                    (string-append k ": " v "\r\n")
                    "")))                 ; silently drop unsafe/framing
@@ -340,7 +410,7 @@
   ;; Silently ignore header names/values containing CR or LF; they are
   ;; also rejected again at render time.
   (define (set-header! r k v)
-    (when (and (header-safe? k) (header-safe? v))
+    (when (and (http-token? k) (header-value-safe? v))
       (res-headers-set! r (cons (cons k v) (res-headers r)))))
 
   ;; Send the response: current status + accumulated headers + body
@@ -469,8 +539,8 @@
     (let loop ((pos start) (chunks '()) (len 0))
       (let ((eol (find-crlf bv pos)))
         (if (not eol)
-            (if (> (- (bytevector-length bv) start) (+ body-limit 1024))
-                (values 'too-large #f #f)
+            (if (> (- (bytevector-length bv) pos) 1024)
+                (values 'bad #f #f)
                 (values 'more #f #f))
             (let ((size (parse-chunk-size bv pos eol)))
               (cond
@@ -478,20 +548,39 @@
                 ((> (+ len size) body-limit) (values 'too-large #f #f))
                 ((= size 0)
                  ;; skip optional trailers; a blank line ends the body
-                 (let scan ((p (+ eol 2)))
+                 (let ((trailer-start (+ eol 2)))
+                   (let scan ((p trailer-start))
                    (let ((e2 (find-crlf bv p)))
                      (cond
-                       ((not e2) (values 'more #f #f))
-                       ((= e2 p)
+                       ;; A complete blank line wins even when pipelined
+                       ;; bytes follow it; those bytes are not trailers.
+                       ((and e2 (= e2 p))
                         (values 'done (bv-concat (reverse chunks) len) (+ p 2)))
-                       (else (scan (+ e2 2)))))))
+                       ((and e2 (> (- e2 trailer-start) trailer-limit))
+                        (values 'trailers-too-large #f #f))
+                       ((not e2)
+                        (if (> (- (bytevector-length bv) trailer-start)
+                               trailer-limit)
+                            (values 'trailers-too-large #f #f)
+                            (values 'more #f #f)))
+                       ;; Trailer fields use the same basic syntax as
+                       ;; normal headers.  Decode/check one line at a time.
+                       ((guard (e (#t #t))
+                          (not (parse-header-line
+                                 (utf8->string (bv-sub bv p e2)))))
+                        (values 'bad #f #f))
+                       (else (scan (+ e2 2))))))))
                 (else
                  (let ((dstart (+ eol 2)))
                    (if (< (bytevector-length bv) (+ dstart size 2))
                        (values 'more #f #f)
-                       (loop (+ dstart size 2)   ; data + trailing CRLF
-                             (cons (bv-sub bv dstart (+ dstart size)) chunks)
-                             (+ len size)))))))))))
+                       (let ((tail (+ dstart size)))
+                         (if (not (and (= (bytevector-u8-ref bv tail) 13)
+                                       (= (bytevector-u8-ref bv (+ tail 1)) 10)))
+                             (values 'bad #f #f)
+                             (loop (+ tail 2)
+                                   (cons (bv-sub bv dstart tail) chunks)
+                                   (+ len size)))))))))))))
 
   ;; ---- reader process ----------------------------------------------------------
 
@@ -506,6 +595,11 @@
   (define (reader-loop c srv acc)
     (let ((hend (find-header-end acc)))
       (cond
+        ;; Check the located header too: libuv may deliver a complete
+        ;; oversized header in one read, in which case checking only the
+        ;; no-terminator branch lets it bypass header-limit.
+        ((and hend (> (+ hend 4) header-limit))
+         (quick-response! c 431 "Header Too Large"))
         (hend (have-header c srv acc hend))
         ((> (bytevector-length acc) header-limit)
          (quick-response! c 431 "Header Too Large"))
@@ -525,12 +619,23 @@
           (let* ((headers (vector-ref parsed 4))
                  (wskey (websocket-key headers))
                  (resolver (unbox (http-server-wsbox srv)))
-                 (chunked? (chunked-body? headers))
+                 (te (transfer-encoding headers))
                  (clen (content-length headers)))
             (cond
-              ;; websocket upgrade: resolve a session, shake hands, and
-              ;; run the session in this reader process
-              ((and wskey resolver)
+              ;; framing errors -> 400, close (bad/negative/conflicting
+              ;; Content-Length, or both Content-Length and chunked)
+              ((eq? clen 'bad)
+               (quick-response! c 400 "Bad Request"))
+              ((eq? te 'bad)
+               (quick-response! c 400 "Bad Request"))
+              ((and (eq? te 'chunked) (not (eq? clen 'absent)))
+               (quick-response! c 400 "Bad Request"))
+              ;; websocket upgrade: only after normal HTTP framing has
+              ;; been validated, otherwise a malformed request body can
+              ;; be mistaken for the first WebSocket frame.
+              ((and wskey resolver
+                    (eq? (vector-ref parsed 0) 'GET)
+                    (string=? (vector-ref parsed 3) "HTTP/1.1"))
                (let* ((req (make-request (vector-ref parsed 0)
                                          (vector-ref parsed 1)
                                          (vector-ref parsed 2)
@@ -539,13 +644,7 @@
                  (if session
                      (run-ws-session c acc hend wskey req session)
                      (quick-response! c 404 "Not Found"))))
-              ;; framing errors -> 400, close (bad/negative/conflicting
-              ;; Content-Length, or both Content-Length and chunked)
-              ((eq? clen 'bad)
-               (quick-response! c 400 "Bad Request"))
-              ((and chunked? (not (eq? clen 'absent)))
-               (quick-response! c 400 "Bad Request"))
-              (chunked?
+              ((eq? te 'chunked)
                (collect-chunked c srv acc parsed (+ hend 4)))
               (else
                (let ((n (if (eq? clen 'absent) 0 clen)))
@@ -608,6 +707,7 @@
            (`#(tcp-eof) (tcp-close! c))
            (`#(tcp-error ,e) (tcp-close! c))))
         ((too-large) (quick-response! c 413 "Payload Too Large"))
+        ((trailers-too-large) (quick-response! c 431 "Trailers Too Large"))
         (else (quick-response! c 400 "Bad Request")))))
 
   ;; Wait for the worker's response to complete. Data arriving meanwhile
@@ -618,7 +718,11 @@
         (if eof? (tcp-close! c) (reader-loop c srv leftover)))
       (`#(conn-closed) 'done)
       (`#(streaming) (await-streaming c srv leftover))
-      (`#(tcp-data ,bv) (await-response c srv (bv-append leftover bv) eof?))
+      (`#(tcp-data ,bv)
+        (let ((next (bv-append leftover bv)))
+          (if (> (bytevector-length next) pipeline-limit)
+              (tcp-close! c)
+              (await-response c srv next eof?))))
       (`#(tcp-eof) (await-response c srv leftover #t))
       (`#(tcp-error ,e) (await-response c srv leftover #t))))
 
@@ -629,7 +733,11 @@
     (receive (after 'infinity #f)
       (`#(next-request) (reader-loop c srv leftover))
       (`#(conn-closed) 'done)
-      (`#(tcp-data ,bv) (await-streaming c srv (bv-append leftover bv)))
+      (`#(tcp-data ,bv)
+        (let ((next (bv-append leftover bv)))
+          (if (> (bytevector-length next) pipeline-limit)
+              (begin (tcp-close! c) 'done)
+              (await-streaming c srv next))))
       (`#(tcp-eof) (tcp-close! c) 'done)
       (`#(tcp-error ,e) (tcp-close! c) 'done)))
 

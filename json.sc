@@ -180,9 +180,19 @@
 
   (define (number->json v)
     (cond
+      ((not (real? v))
+       (assertion-violation 'json->string
+         "JSON numbers must be real" v))
       ((and (exact? v) (integer? v)) (number->string v))
-      ((and (real? v) (or (nan? v) (infinite? v))) "null")
-      ((exact? v) (number->string (exact->inexact v)))
+      ((or (nan? v) (infinite? v))
+       (assertion-violation 'json->string
+         "JSON cannot represent NaN or infinity" v))
+      ((exact? v)
+       (let ((inexact (exact->inexact v)))
+         (if (or (nan? inexact) (infinite? inexact))
+             (assertion-violation 'json->string
+               "JSON number is outside the supported range" v)
+             (number->string inexact))))
       (else (number->string v))))
 
   (define (json->string x)

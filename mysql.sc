@@ -324,7 +324,14 @@
         (set-box! bufbox (bv-append (unbox bufbox) bv))
         (k))
       (`#(tcp-eof) (mysql-fail -1 "connection closed by server"))
-      (`#(tcp-error ,e) (mysql-fail -1 "connection error"))))
+      (`#(tcp-error ,e) (mysql-fail -1 "connection error"))
+      ;; A timed-out caller cannot safely leave a command running on a
+      ;; reusable protocol stream.  Close this connection; a pool will
+      ;; replace it after DOWN, while a standalone client gets a clean
+      ;; failure instead of a desynchronised next query.
+      (`#(mysql-cancel ,ref ,from)
+        (tcp-close! c)
+        (mysql-fail -1 "query cancelled after caller timeout"))))
 
   ;; ---- length-encoded values -------------------------------------------------------
 
@@ -605,6 +612,11 @@
       (`#(mysql-quit)
         (send-packet! c (bytevector 1) 0)          ; COM_QUIT
         (tcp-close! c))
+      (`#(mysql-cancel ,ref ,from)
+        ;; The reply may have won the race with the caller timeout.  The
+        ;; cancellation still quarantines the connection so no unread
+        ;; packet can affect a later query.
+        (tcp-close! c))
       (`#(tcp-data ,bv)                            ; stray data between queries
         (set-box! bufbox (bv-append (unbox bufbox) bv))
         (serve-loop c bufbox notify))
@@ -667,6 +679,23 @@
       (if (pending?)
           (assign! c (pop-pending!))
           (set! idle (cons c idle))))
+    (define (cancel-pending! ref from)
+      (define (keep? job)
+        (not (and (eq? (vector-ref job 1) ref)
+                  (eq? (vector-ref job 2) from))))
+      (set! pending-front (filter keep? pending-front))
+      (set! pending-back (filter keep? pending-back)))
+    (define (cancel-busy! ref from)
+      (let-values (((cs entries) (hashtable-entries busy)))
+        (vector-for-each
+          (lambda (c entry)
+            (when (and (eq? (car entry) from) (eq? (cdr entry) ref))
+              ;; Keep the connection in busy bookkeeping so DOWN causes
+              ;; a replacement, but suppress a second reply to a caller
+              ;; that has already timed out.
+              (hashtable-set! busy c (cons #f ref))
+              (send c (vector 'mysql-cancel ref from))))
+          cs entries)))
     (do ((i 0 (+ i 1))) ((= i n)) (connect!))
     (let loop ()
       (receive
@@ -677,6 +706,10 @@
                   (set! idle (cdr idle))
                   (assign! c job))
                 (set! pending-back (cons job pending-back))))
+          (loop))
+        (`#(mysql-cancel ,ref ,from)
+          (cancel-pending! ref from)
+          (cancel-busy! ref from)
           (loop))
         (`#(mysql-idle ,c)
           (make-available! c)
@@ -699,7 +732,7 @@
             (set! idle (remq pid idle))
             (let ((entry (hashtable-ref busy pid #f)))
               (hashtable-delete! busy pid)
-              (when entry
+              (when (and entry (car entry))
                 (send (car entry)
                       (vector 'mysql-reply (cdr entry)
                               (vector 'mysql-error -1 "connection lost")))))
@@ -737,6 +770,9 @@
   ;; immediately: queries queue until connections come up. Same optional
   ;; db + options as mysql-connect.
   (define (mysql-pool n host port user password . rest)
+    (unless (and (integer? n) (exact? n) (> n 0))
+      (assertion-violation 'mysql-pool
+        "pool size must be a positive exact integer" n))
     (let ((db (if (pair? rest) (car rest) #f))
           (opts (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) '())))
       (spawn (lambda () (pool-loop n host port user password db opts)))))
@@ -746,14 +782,21 @@
   ;; call times out, a late reply carrying the old ref will not be
   ;; matched by the caller's next query.
   (define (mysql-query mc sql)
-    (let ((ref (gensym)))
+    (let ((ref (gensym)) (deadline (+ (now-ms) query-timeout-ms)))
       (send mc (vector 'mysql-query sql ref self))
-      (receive (after query-timeout-ms
-                  (raise (vector 'mysql-error -1 "query timeout")))
-        (`#(mysql-reply ,@ref ,r)
-          (if (and (vector? r) (eq? (vector-ref r 0) 'mysql-error))
-              (raise r)
-              r)))))
+      (let wait ()
+        (let ((remaining (max 0 (- deadline (now-ms)))))
+          (receive (after remaining
+                      (send mc (vector 'mysql-cancel ref self))
+                      (raise (vector 'mysql-error -1 "query timeout")))
+            (`#(mysql-reply ,got ,r)
+              (if (eq? got ref)
+                  (if (and (vector? r) (eq? (vector-ref r 0) 'mysql-error))
+                      (raise r)
+                      r)
+                  ;; Consume a stale timed-out reply instead of leaving
+                  ;; it in this process mailbox forever.
+                  (wait))))))))
 
   (define (mysql-close! mc)
     (send mc (vector 'mysql-quit)))

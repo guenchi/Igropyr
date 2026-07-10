@@ -101,9 +101,18 @@
                        ((< n 0) (values #f next))          ; nil
                        ((< (bytevector-length buf) (+ next n 2))
                         (values 'more #f))
+                       ((not (and (= (bytevector-u8-ref buf (+ next n)) 13)
+                                  (= (bytevector-u8-ref buf (+ next n 1)) 10)))
+                        (values (vector 'redis-error "bad bulk terminator")
+                                (+ next n 2)))
                        (else
-                        (values (utf8->string (bv-sub buf next (+ next n)))
-                                (+ next n 2))))))
+                        ;; RESP bulk strings are binary-safe.  Preserve the
+                        ;; convenient string result for valid UTF-8, but do
+                        ;; not let arbitrary bytes crash the connection
+                        ;; process: invalid UTF-8 is returned as a bytevector.
+                        (let ((raw (bv-sub buf next (+ next n))))
+                          (values (guard (e (#t raw)) (utf8->string raw))
+                                  (+ next n 2)))))))
                   ((#\*)
                    (let ((n (string->number line)))
                      (cond
@@ -123,30 +132,34 @@
 
   (define connection-lost (vector 'redis-error "connection lost"))
 
-  ;; Each waiter is a mutable pair (from . live?). A caller that times
-  ;; out cancels itself (live? -> #f); its still-queued reply is then
+  ;; Each waiter is #(from ref live?). A caller that times out cancels
+  ;; its exact ref (live? -> #f); its still-queued reply is then
   ;; consumed and discarded here instead of being delivered late into
   ;; the caller's mailbox, where the next call would mis-read it. The
   ;; entry stays in the FIFO so request/reply alignment is preserved.
-  ;; A caller has at most one outstanding command (redis is synchronous),
-  ;; so its pid uniquely identifies its waiter.
+  ;; Replies also echo ref, closing the small race where a reply was
+  ;; delivered just as the caller's timeout fired.
   (define (reply-to! waiter v)
-    (when (cdr waiter)
-      (send (car waiter) (vector 'redis-reply v))))
+    (when (vector-ref waiter 2)
+      (send (vector-ref waiter 0)
+            (vector 'redis-reply (vector-ref waiter 1) v))))
 
   (define (conn-loop c buf waiters)
     (receive
-      (`#(redis-cmd ,args ,from)
+      (`#(redis-cmd ,args ,ref ,from)
         (if (eq? (conn-state c) 'open)
             (begin
               (tcp-write! c (encode-command args) #f)
-              (conn-loop c buf (append waiters (list (cons from #t)))))
+              (conn-loop c buf (append waiters (list (vector from ref #t)))))
             (begin
-              (send from (vector 'redis-reply connection-lost))
+              (send from (vector 'redis-reply ref connection-lost))
               (conn-loop c buf waiters))))
-      (`#(redis-cancel ,from)
+      (`#(redis-cancel ,ref ,from)
         (for-each
-          (lambda (p) (when (eq? (car p) from) (set-cdr! p #f)))
+          (lambda (w)
+            (when (and (eq? (vector-ref w 0) from)
+                       (eq? (vector-ref w 1) ref))
+              (vector-set! w 2 #f)))
           waiters)
         (conn-loop c buf waiters))
       (`#(tcp-data ,bv)
@@ -199,14 +212,19 @@
   ;; the connection process is told to drop the (still-pending) reply, so
   ;; it can never surface in a later call.
   (define (redis rc . args)
-    (send rc (vector 'redis-cmd args self))
-    (receive (after reply-timeout-ms
-                (send rc (vector 'redis-cancel self))
-                (raise (vector 'redis-error "reply timeout")))
-      (`#(redis-reply ,v)
-        (if (and (vector? v) (eq? (vector-ref v 0) 'redis-error))
-            (raise v)
-            v))))
+    (let ((ref (gensym)) (deadline (+ (now-ms) reply-timeout-ms)))
+      (send rc (vector 'redis-cmd args ref self))
+      (let wait ()
+        (let ((remaining (max 0 (- deadline (now-ms)))))
+          (receive (after remaining
+                      (send rc (vector 'redis-cancel ref self))
+                      (raise (vector 'redis-error "reply timeout")))
+            (`#(redis-reply ,got ,v)
+              (if (eq? got ref)
+                  (if (and (vector? v) (eq? (vector-ref v 0) 'redis-error))
+                      (raise v)
+                      v)
+                  (wait))))))))
 
   (define (redis-close! rc)
     (send rc (vector 'redis-quit)))

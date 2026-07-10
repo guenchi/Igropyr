@@ -1,7 +1,7 @@
 ;;; build.ss -- compile all Igropyr libraries to .so for production.
 ;;;
 ;;; Run from the project root (the parent of igropyr/):
-;;;   scheme --libdirs .:lib --script igropyr/build.ss
+;;;   chez --libdirs .:lib --script igropyr/build.ss
 ;;; or with CHEZSCHEMELIBDIRS set. Produces one .so per source file;
 ;;; because CHEZSCHEMELIBEXTS lists .so before .sc, they are then loaded
 ;;; in preference to the sources. Re-run after editing any source.

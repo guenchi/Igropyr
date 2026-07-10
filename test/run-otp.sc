@@ -5,7 +5,7 @@
 ;;;   ulimit -n 10240        # macOS defaults to 256; ab -c 500 needs more
 ;;;   export CHEZSCHEMELIBDIRS=.:lib
 ;;;   export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
-;;;   scheme --script test/run-otp.sc
+;;;   chez --script test/run-otp.sc
 ;;;
 ;;; Acceptance checks (see 需求.md):
 ;;;   ab -n 50000 -c 500 http://127.0.0.1:8080/     (two rounds, 0 failures)

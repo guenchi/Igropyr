@@ -1,6 +1,6 @@
 ;;; Smoke test for (igropyr actor): ping-pong, after timeout, monitor,
 ;;; preemption of a CPU-spinning process, link/EXIT.
-;;; Run: scheme --script test/smoke-actor.sc (from the project root)
+;;; Run: chez --script test/smoke-actor.sc (from the project root)
 
 (import (chezscheme) (igropyr actor) (igropyr uv))
 

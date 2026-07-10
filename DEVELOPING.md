@@ -1088,35 +1088,25 @@ export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm
 ulimit -n 10240
 
 # Run
-scheme --script myapp.sc
+chez --script myapp.sc
 ```
 
 The script should call `(start-scheduler thunk)` at the end. The scheduler never returns; run in the foreground or wrap with your process supervisor (systemd, supervisor, etc.).
 
 ### libuv Path
 
-The libuv FFI loads a shared object by absolute path. Edit `uv.sc` to adjust it for your system:
-
-```scheme
-;; macOS (homebrew):
-(load-shared-object "/opt/homebrew/lib/libuv.1.dylib")
-
-;; Linux (most distros):
-;; (load-shared-object "libuv.so.1")
-
-;; Or custom location:
-;; (load-shared-object "/usr/local/lib/libuv.so.1")
-```
+The libuv FFI probes standard macOS and Linux sonames plus the common
+Homebrew prefixes. For a custom installation, expose its library directory
+through the platform dynamic-loader search path.
 
 ### Building from Source (Advanced)
 
 Igropyr is pure Scheme with no build step. All `.sc` files are interpreted by Chez Scheme at runtime. If you want to precompile libraries for faster startup:
 
 ```bash
-# Create .chezscheme.so compiled versions
-scheme --compile-library-to-port igropyr/uv.sc < /dev/null > igropyr/uv.chezscheme.so
-scheme --compile-library-to-port igropyr/actor.sc < /dev/null > igropyr/actor.chezscheme.so
-# ... etc for each library
+# From the parent directory of igropyr, compile every library in
+# dependency order using the repository build script.
+chez --libdirs .:lib --script igropyr/build.ss
 ```
 
 Then Chez will load `.chezscheme.so` instead of `.sc`. This can reduce startup time but is not required.
@@ -1140,7 +1130,7 @@ Run the main test:
 export CHEZSCHEMELIBDIRS=.:lib
 export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
 ulimit -n 10240
-scheme --script test/run-otp.sc
+chez --script test/run-otp.sc
 ```
 
 Then in another terminal:
@@ -1211,7 +1201,7 @@ Create a test script:
 Run it:
 
 ```bash
-scheme --script test-myfeature.sc
+chez --script test-myfeature.sc
 echo $?  # Exit code 0 = success
 ```
 

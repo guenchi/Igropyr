@@ -36,9 +36,31 @@
   ;; Optional trailing args: max-retries stuck-ms check-ms.
   ;; Returns the supervisor pid; send it #(submit-task ,task).
   (define (start-worker-pool n run-task fail-task . opts)
+    (when (> (length opts) 3)
+      (assertion-violation 'start-worker-pool
+        "expected at most max-retries, stuck-ms and check-ms" opts))
     (let* ((max-retries (if (>= (length opts) 1) (car opts) default-max-retries))
            (stuck-ms (if (>= (length opts) 2) (cadr opts) default-stuck-ms))
            (check-ms (if (>= (length opts) 3) (caddr opts) default-check-ms)))
+      (unless (and (integer? n) (exact? n) (> n 0))
+        (assertion-violation 'start-worker-pool
+          "worker count must be a positive exact integer" n))
+      (unless (procedure? run-task)
+        (assertion-violation 'start-worker-pool
+          "run-task must be a procedure" run-task))
+      (unless (procedure? fail-task)
+        (assertion-violation 'start-worker-pool
+          "fail-task must be a procedure" fail-task))
+      (unless (and (integer? max-retries) (exact? max-retries)
+                   (>= max-retries 0))
+        (assertion-violation 'start-worker-pool
+          "max-retries must be a non-negative exact integer" max-retries))
+      (unless (and (integer? stuck-ms) (exact? stuck-ms) (> stuck-ms 0))
+        (assertion-violation 'start-worker-pool
+          "stuck-ms must be a positive exact integer" stuck-ms))
+      (unless (and (integer? check-ms) (exact? check-ms) (> check-ms 0))
+        (assertion-violation 'start-worker-pool
+          "check-ms must be a positive exact integer" check-ms))
       (let ((sup (spawn (lambda ()
                           (supervisor n run-task fail-task
                                       max-retries stuck-ms)))))

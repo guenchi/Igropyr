@@ -274,6 +274,12 @@
   (define (path-has-dotdot? s)
     (exists (lambda (p) (string=? p "..")) (string-split s #\/)))
 
+  (define (path-has-nul? s)
+    (let loop ((i 0))
+      (and (< i (string-length s))
+           (or (= (char->integer (string-ref s i)) 0)
+               (loop (+ i 1))))))
+
   ;; Whole-file read on the worker (blocking; fine for small local
   ;; files, not a streaming file server).
   (define (send-file! r path)
@@ -374,7 +380,21 @@
     (app-middlewares-set! a (append (app-middlewares a) (list mw))))
 
   (define (app-static a prefix root)
-    (app-statics-set! a (append (app-statics a) (list (cons prefix root)))))
+    (unless (and (string? prefix) (> (string-length prefix) 0)
+                 (char=? (string-ref prefix 0) #\/))
+      (assertion-violation 'app-static
+        "mount prefix must be an absolute URL path" prefix))
+    (unless (and (string? root) (> (string-length root) 0)
+                 (not (path-has-nul? root)))
+      (assertion-violation 'app-static
+        "static root must be a non-empty path without NUL" root))
+    ;; Store one canonical spelling so "/assets/" and "/assets" have
+    ;; identical segment-boundary behaviour.  Root itself stays "/".
+    (let ((p (if (and (> (string-length prefix) 1)
+                      (char=? (string-ref prefix (- (string-length prefix) 1)) #\/))
+                 (substring prefix 0 (- (string-length prefix) 1))
+                 prefix)))
+      (app-statics-set! a (append (app-statics a) (list (cons p root))))))
 
   ;; websocket route: session is (lambda (ws req) ...), run in the
   ;; connection's own process; :param segments work as in app-get
@@ -406,23 +426,46 @@
   (define (static-relative prefix path)
     (let ((pl (string-length prefix)) (nl (string-length path)))
       (cond
+        ((string=? prefix "/")
+         (and (> nl 0) (char=? (string-ref path 0) #\/)
+              (substring path 1 nl)))
         ((not (string-prefix? prefix path)) #f)
         ((= nl pl) "")                             ; exactly the mount root
         ((char=? (string-ref path pl) #\/)          ; prefix + "/..."
          (substring path (+ pl 1) nl))
         (else #f))))                                ; e.g. "/assets-private"
 
+  ;; Resolve a URL-relative name without allowing it to leave the mount.
+  ;; Chez has no portable realpath primitive, so reject symbolic links in
+  ;; the untrusted portion of the path.  This is deliberately stricter
+  ;; than following a symlink and trying to compare platform-specific
+  ;; canonical path spellings, and blocks symlink-based escapes.
+  (define (safe-static-path root rel)
+    (and (not (path-has-dotdot? rel))
+         (not (path-has-nul? rel))
+         (let loop ((base root) (parts (string-split rel #\/)))
+           (cond
+             ((null? parts) base)
+             ((or (string=? (car parts) "") (string=? (car parts) "."))
+              (loop base (cdr parts)))
+             (else
+              (let ((next (string-append base "/" (car parts))))
+                (and (not (guard (e (#t #t)) (file-symbolic-link? next)))
+                     (loop next (cdr parts)))))))))
+
   (define (try-static a req r)
     (and (eq? (req-method req) 'GET)
          (exists
            (lambda (entry)
              (let* ((prefix (car entry)) (root (cdr entry))
-                    (rel (static-relative prefix (req-path req))))
+                    (rel (static-relative prefix (req-path req)))
+                    (path (and rel (safe-static-path root rel))))
                (and rel
                     (begin
-                      ;; send-file! rejects any ".." segment, keeping the
-                      ;; resolved file inside root
-                      (send-file! r (string-append root "/" rel))
+                      (if path
+                          (send-file! r path)
+                          (begin (set-status! r 403)
+                                 (send-text! r "Forbidden")))
                       #t))))
            (app-statics a))))
 
