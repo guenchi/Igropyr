@@ -24,6 +24,11 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
   green process, so server push is just a message send
 - **Chunked transfer-encoding** — `Transfer-Encoding: chunked` request
   bodies are decoded transparently
+- **Non-blocking Redis and MySQL clients** — pure Scheme, same event
+  loop; callers park their green process while the OS thread keeps
+  serving; MySQL comes with a self-healing connection pool
+- **HTTP/1.1 keep-alive & pipelining** — persistent connections by default
+  on 1.1; each connection's reader process loops over successive requests
 - **Fast** — ~35 k req/s at 500 concurrent connections on an Apple Silicon
   laptop (`ab -n 50000 -c 500`, zero failed requests)
 
@@ -217,6 +222,43 @@ call `ws-send-text!` — writes are safe from any green process. On the
 bare core, register a resolver with `(http-set-ws! srv (lambda (req)
 session-or-#f))`.
 
+## Redis and MySQL
+
+Both clients ride the same libuv loop and actor model: each database
+connection is one green process; a caller sends it a message and parks
+in `receive` until the reply lands. No OS thread ever blocks — a
+hundred workers can wait on the database while other requests keep
+being served.
+
+```scheme
+(import (igropyr redis) (igropyr mysql))
+
+;; Redis (RESP2): concurrent commands are pipelined over one connection
+(define r (redis-connect "127.0.0.1" 6379))
+(redis r "SET" "greeting" "hello")     ; -> "OK"
+(redis r "GET" "greeting")             ; -> "hello"
+(redis r "GET" "missing")              ; -> #f        (nil)
+(redis r "LRANGE" "l" 0 -1)            ; -> ("a" "b") (arrays -> lists)
+
+;; MySQL (text protocol; caching_sha2_password, both fast and full
+;; RSA paths, so it works against MySQL 8/9 out of the box)
+(define db (mysql-connect "127.0.0.1" 3306 "user" "password" "mydb"))
+(mysql-query db "SELECT id, name FROM users")
+  ;; -> #(rows ("id" "name") (("1" "Alice") ("2" "Bob")))  NULL -> #f
+(mysql-query db "INSERT INTO users (name) VALUES ('Eve')")
+  ;; -> #(ok 1 3)   ; affected rows, last insert id
+
+;; MySQL pool: n real connections behind one dispatcher; queries run in
+;; parallel, dead connections are replaced automatically, and the pool
+;; is used exactly like a single connection
+(define pool (mysql-pool 8 "127.0.0.1" 3306 "user" "password" "mydb"))
+(mysql-query pool "SELECT ...")
+```
+
+Server errors raise `#(redis-error msg)` / `#(mysql-error code msg)` in
+the caller — inside a route handler that means Let It Crash: the worker
+dies, the supervisor retries, the service keeps running.
+
 ## Fault tolerance semantics
 
 These apply automatically; nothing to configure:
@@ -247,6 +289,8 @@ websocket.sc  WebSocket codec: SHA-1/base64 handshake key, frame
 express.sc framework layer (optional): router with :param segments,
            middleware chain, static files, app-ws, JSON/text/html/file
            encoders
+redis.sc   non-blocking Redis client (RESP2), pipelined
+mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
 ```
 
 Message protocol between processes:
