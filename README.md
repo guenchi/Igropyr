@@ -56,8 +56,10 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
 - **HTTP/1.1 keep-alive & pipelining** — persistent connections by default
   on 1.1; each connection's reader process loops over successive requests
 - **Hardened** — strict `Content-Length` validation, per-request response
-  isolation, response-header injection guard, static-mount boundary
-  checks, WebSocket frame validation with a reassembly cap
+  isolation, response-header injection guard, static-mount boundary +
+  symlink-escape + NUL-byte checks, pipeline flood cap, WebSocket frame
+  validation with strict UTF-8 (1007 close) and a reassembly cap,
+  binary-safe Redis replies, request-id matching on all DB/HTTP clients
 - **Fast** — ~35 k req/s at 500 concurrent connections on an Apple Silicon
   laptop (`ab -n 50000 -c 500`, zero failed requests)
 
