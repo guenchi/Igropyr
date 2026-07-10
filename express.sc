@@ -19,9 +19,9 @@
 (library (igropyr express)
   (export create-app app-get app-post app-put app-delete
           app-use app-static app-ws app-listen app->handler
-          req-param
+          req-param req-json
           send-text! send-html! send-json! send-file!)
-  (import (chezscheme) (igropyr actor) (igropyr http))
+  (import (chezscheme) (igropyr actor) (igropyr http) (igropyr json))
 
   ;; ---- string helpers -----------------------------------------------------
 
@@ -46,59 +46,16 @@
 
   (define (send-text! r s) (finish! r "text/plain; charset=utf-8" (string->utf8 s)))
   (define (send-html! r s) (finish! r "text/html; charset=utf-8" (string->utf8 s)))
+  ;; serialization comes from (igropyr json): alist -> object,
+  ;; vector or list -> array, 'null -> null
   (define (send-json! r obj)
     (finish! r "application/json; charset=utf-8"
              (string->utf8 (json->string obj))))
 
-  ;; tiny JSON writer: alist -> object, list -> array
-  (define (json-escape s)
-    (call-with-string-output-port
-      (lambda (p)
-        (string-for-each
-          (lambda (ch)
-            (case ch
-              ((#\") (display "\\\"" p))
-              ((#\\) (display "\\\\" p))
-              ((#\newline) (display "\\n" p))
-              ((#\return) (display "\\r" p))
-              ((#\tab) (display "\\t" p))
-              (else (write-char ch p))))
-          s))))
-
-  (define (json->string x)
-    (cond
-      ((eq? x #t) "true")
-      ((eq? x #f) "false")
-      ((eq? x 'null) "null")
-      ((number? x)
-       (if (exact? x) (number->string x) (number->string (exact->inexact x))))
-      ((string? x) (string-append "\"" (json-escape x) "\""))
-      ((symbol? x) (string-append "\"" (json-escape (symbol->string x)) "\""))
-      ((and (list? x) (pair? x) (pair? (car x)))   ; alist -> object
-       (string-append
-         "{"
-         (fold-right
-           (lambda (kv acc)
-             (let ((entry (string-append
-                            "\"" (json-escape
-                                   (if (symbol? (car kv))
-                                       (symbol->string (car kv))
-                                       (car kv)))
-                            "\":" (json->string (cdr kv)))))
-               (if (string=? acc "") entry (string-append entry "," acc))))
-           "" x)
-         "}"))
-      ((list? x)                                    ; list -> array
-       (string-append
-         "["
-         (fold-right
-           (lambda (v acc)
-             (if (string=? acc "")
-                 (json->string v)
-                 (string-append (json->string v) "," acc)))
-           "" x)
-         "]"))
-      (else "null")))
+  ;; parse a JSON request body; #f when the body is not valid JSON
+  (define (req-json req)
+    (guard (e (#t #f))
+      (string->json (utf8->string (req-body req)))))
 
   ;; ---- static files -----------------------------------------------------------
 
