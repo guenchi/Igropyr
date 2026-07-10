@@ -11,8 +11,8 @@
 ;;; Each returns a middleware: (lambda (req res next) ...).
 
 (library (igropyr middleware)
-  (export cors security-headers logger)
-  (import (chezscheme) (igropyr actor) (igropyr libuv)
+  (export cors security-headers logger rate-limit error-handler)
+  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr gen-server)
           (igropyr http) (igropyr express))
 
   (define (opt alist key default)
@@ -77,4 +77,66 @@
                    (req-method req) (req-path req)
                    (res-status res) (- (now-ms) t0))
           (flush-output-port port)))))
+
+  ;; ---- rate limiting ---------------------------------------------------
+  ;; Fixed-window counter per key in a gen-server store. Over the limit
+  ;; within the window -> 429. Default key is the X-Forwarded-For header
+  ;; (the client IP behind a proxy); pass 'key (lambda (req) string) to
+  ;; key on something else. Options: 'max (default 100), 'window ms
+  ;; (default 60000), 'key.
+  (define (make-rate-store)
+    (gen-server-start
+      (lambda () (make-hashtable string-hash string=?))
+      ;; call #(check key max window) -> 'ok | 'limited
+      (lambda (msg from tbl)
+        (let ((key (vector-ref msg 1))
+              (limit (vector-ref msg 2))
+              (window (vector-ref msg 3))
+              (now (now-ms)))
+          (let ((entry (hashtable-ref tbl key #f)))
+            (cond
+              ((or (not entry) (> now (cdr entry)))   ; new window
+               (hashtable-set! tbl key (cons 1 (+ now window)))
+               (values 'ok tbl))
+              ((< (car entry) limit)
+               (set-car! entry (+ 1 (car entry)))
+               (values 'ok tbl))
+              (else (values 'limited tbl))))))
+      (lambda (msg tbl) tbl)))
+
+  (define (default-rate-key req)
+    (or (req-header req 'x-forwarded-for) "global"))
+
+  (define (rate-limit . rest)
+    (let* ((o (if (pair? rest) (car rest) '()))
+           (max-req (opt o 'max 100))
+           (window-ms (opt o 'window 60000))
+           (key-fn (opt o 'key default-rate-key))
+           (store (make-rate-store)))
+      (lambda (req res next)
+        (if (eq? 'ok (gen-server-call store
+                       (vector 'check (key-fn req) max-req window-ms)))
+            (next)
+            (begin
+              (set-status! res 429)
+              (set-header! res "Retry-After" (number->string (div window-ms 1000)))
+              (send-json! res (list (cons 'error "rate limit exceeded"))))))))
+
+  ;; ---- global error handler --------------------------------------------
+  ;; Wraps the rest of the chain in a guard: an exception from any inner
+  ;; middleware or the handler is caught here instead of crashing the
+  ;; worker. Register it OUTERMOST (first app-use). Note this opts out of
+  ;; Let It Crash for the wrapped handlers -- a caught error answers a
+  ;; structured 500 (or your 'handler), with no supervisor retry. If the
+  ;; handler already responded, the fallback is dropped (token guard).
+  (define (default-error-response e req res)
+    (set-status! res 500)
+    (send-json! res (list (cons 'error "internal server error"))))
+
+  (define (error-handler . rest)
+    (let ((handle (opt (if (pair? rest) (car rest) '())
+                       'handler default-error-response)))
+      (lambda (req res next)
+        (guard (e (#t (handle e req res)))
+          (next)))))
 )
