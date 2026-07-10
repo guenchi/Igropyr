@@ -1,7 +1,5 @@
 # Igropyr Manual
 
-[English](MANUAL.md) | [简体中文](MANUAL.zh-CN.md)
-
 This manual covers the architecture, design patterns, and implementation details of Igropyr for developers building on or contributing to the framework.
 
 ## Table of Contents

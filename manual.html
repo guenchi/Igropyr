@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manual — Igropyr</title>
+<meta name="description" content="The Igropyr manual: architecture, the actor model, the libuv-callback invariant, fault tolerance, conversations, clients, and more.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="logo"><a href="index.html" style="color:inherit"><span>λ</span> Igropyr</a></div>
+    <div class="links">
+      <a href="index.html">Home</a>
+      <a href="agent.html">Agent</a>
+      <a href="https://github.com/guenchi/Igropyr">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<div class="manualhead">
+  <div class="wrap">
+    <h1>Manual</h1>
+    <div class="langtoggle">
+      <button id="btn-en" class="on" onclick="loadManual('en')">English</button>
+      <button id="btn-zh" onclick="loadManual('zh')">简体中文</button>
+    </div>
+  </div>
+</div>
+
+<main id="md" class="md-body">
+  <p class="md-loading">Loading the manual…</p>
+</main>
+
+<footer>
+  <div class="links">
+    <a href="index.html">Igropyr</a>
+    <a href="agent.html">Agent</a>
+    <a href="https://github.com/guenchi/Igropyr">GitHub</a>
+  </div>
+  <div>The Igropyr manual, rendered from <code>docs/</code>.</div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script>
+  var SRC = { en: 'docs/MANUAL.md', zh: 'docs/MANUAL.zh-CN.md' };
+
+  function slug(s) {
+    return s.toLowerCase().trim()
+      .replace(/[^\w一-龥\s-]/g, '')
+      .replace(/\s+/g, '-');
+  }
+
+  function loadManual(lang) {
+    document.getElementById('btn-en').classList.toggle('on', lang === 'en');
+    document.getElementById('btn-zh').classList.toggle('on', lang === 'zh');
+    document.documentElement.lang = (lang === 'zh') ? 'zh' : 'en';
+    var el = document.getElementById('md');
+    el.innerHTML = '<p class="md-loading">Loading…</p>';
+    fetch(SRC[lang]).then(function (r) {
+      if (!r.ok) throw new Error(r.status);
+      return r.text();
+    }).then(function (md) {
+      el.innerHTML = marked.parse(md, { gfm: true, breaks: false });
+      // give headings stable ids so the in-doc table of contents jumps work
+      el.querySelectorAll('h1,h2,h3,h4').forEach(function (h) {
+        if (!h.id) h.id = slug(h.textContent);
+      });
+      if (location.hash) {
+        var t = document.getElementById(location.hash.slice(1));
+        if (t) t.scrollIntoView();
+      }
+    }).catch(function (e) {
+      el.innerHTML = '<p class="md-loading">Could not render the manual ('
+        + e.message + '). Read it on '
+        + '<a href="' + SRC[lang] + '">the raw file</a> or on '
+        + '<a href="https://github.com/guenchi/Igropyr/blob/master/'
+        + SRC[lang] + '">GitHub</a>.</p>';
+    });
+  }
+
+  loadManual('en');
+</script>
+
+</body>
+</html>

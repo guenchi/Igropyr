@@ -1,7 +1,5 @@
 # Igropyr 手册
 
-[English](MANUAL.md) | [简体中文](MANUAL.zh-CN.md)
-
 本手册面向基于 Igropyr 构建应用或参与框架贡献的开发者，介绍 Igropyr 的架构、设计模式和实现细节。
 
 ## 目录
