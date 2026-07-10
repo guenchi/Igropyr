@@ -495,6 +495,34 @@ first, as in Erlang:
   (`#(tcp-eof) (close)))
 ```
 
+## Building for production
+
+Running from source (`scheme --script`) interprets the libraries. For
+deployment, compile. Two options:
+
+```sh
+# Per-library .so files (hot-path files at optimize-level 3, rest at 2).
+# Loaded automatically in place of the sources (.so precedes .sc in
+# CHEZSCHEMELIBEXTS). Good for development, since --script keeps working.
+scheme --libdirs .:lib --script igropyr/build.ss
+
+# Whole-program: fold every library + the app into one optimized program
+# (cross-library inlining, optimize-level 3). Run it with --program.
+scheme --libdirs .:lib --script igropyr/build-whole.ss
+scheme --program igropyr/app.so
+```
+
+Re-run the build after editing any source. Interrupt traps stay enabled
+(preemptive scheduling needs them). optimize-level 3 elides bounds/type
+checks; the bytevector loops are all guarded and the full test suite is
+run after each build to confirm.
+
+Note on where the time goes: for a trivial handler the per-request cost
+is dominated by syscalls, HTTP parsing, and message passing, not Scheme
+arithmetic, so compilation buys only a few percent there — it matters
+most for CPU-heavy handlers (large JSON, crypto, data munging). To cut
+the per-request overhead of a trivial route, mark it *fast* (see below).
+
 ## Load testing
 
 macOS defaults to 256 file descriptors per process; raise the limit in both
@@ -502,8 +530,13 @@ the server and the benchmark shell:
 
 ```sh
 ulimit -n 10240
-ab -n 50000 -c 500 http://127.0.0.1:8080/
+ab -k -n 100000 -c 200 http://127.0.0.1:8080/     # keep-alive
 ```
+
+A single `ab` process is itself the bottleneck on loopback (one core
+saturates the benchmark, not the server); run several in parallel to
+find the server's real ceiling — around 145 k req/s on one core for a
+trivial keep-alive route on an Apple Silicon laptop.
 
 ## Tests
 
