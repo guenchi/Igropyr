@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>node-to-igropyr — translate Node.js/Express to Igropyr</title>
+<meta name="description" content="node-to-igropyr: an AI agent that ports Node.js/Express (JS/TS) to Igropyr, re-architecting to the actor model and Let It Crash rather than transliterating async/await and try/catch.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="logo"><a href="index.html" style="color:inherit"><span>λ</span> Igropyr</a></div>
+    <div class="links">
+      <a href="index.html">Home</a>
+      <a href="https://github.com/guenchi/Igropyr/blob/master/docs/MANUAL.md">Manual</a>
+      <a href="https://github.com/guenchi/Igropyr">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header>
+  <div class="wrap">
+    <div class="lam" style="display:flex;align-items:center;justify-content:center;gap:18px">
+      <img src="nodejs-gray.svg" alt="Node.js" width="46" height="46">
+      <span style="color:var(--dim);font-weight:300">→</span>
+      <span>λ</span>
+    </div>
+    <h1>node-to-igropyr</h1>
+    <p class="tag">Hand it a Node.js route, a middleware, or a whole small
+       Express app — get back the <b>Igropyr port</b>.</p>
+    <p class="sub">An AI coding agent &middot; re-architecture, not transliteration</p>
+    <div class="cta">
+      <a class="btn primary" href="agent/node-to-igropyr.md">Get the agent</a>
+      <a class="btn ghost" href="index.html">Back to Igropyr</a>
+    </div>
+  </div>
+</header>
+
+<!-- ================= WHAT IT DOES ================= -->
+<section id="what">
+  <div class="wrap">
+    <div class="kicker">What it does</div>
+    <h2>Re-architecture, not transliteration</h2>
+    <p class="lead">Node's single-threaded event loop with Promises,
+       <code>async/await</code> and defensive <code>try/catch</code> becomes
+       Igropyr's Erlang-style actor model with <code>spawn</code>/<code>send</code>/<code>receive</code>,
+       a supervised worker pool, and Let&nbsp;It&nbsp;Crash. The agent produces
+       Scheme a maintainer of the repo would have written — not JavaScript
+       wearing parentheses.</p>
+    <div class="cards">
+      <div class="card">
+        <div class="ic">⟶</div>
+        <h3>async/await → straight-line</h3>
+        <p>The scheduler yields for you. I/O calls already block only the
+           calling process, so promise chains flatten into ordinary
+           sequential code — no promise type invented.</p>
+      </div>
+      <div class="card">
+        <div class="ic">✦</div>
+        <h3>try/catch → Let It Crash</h3>
+        <p>Blanket 500-catchers are deleted: that is the worker
+           supervisor's job. A <code>guard</code> stays only where there is
+           a specific, meaningful recovery.</p>
+      </div>
+      <div class="card">
+        <div class="ic">⚙</div>
+        <h3>shared state → gen-server</h3>
+        <p>A module-level <code>Map</code> shared across requests becomes a
+           process (gen-server), because workers never share mutable state
+           except through a process.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= MAPPING ================= -->
+<section id="mapping">
+  <div class="wrap">
+    <div class="kicker">The mapping</div>
+    <h2>How Node constructs land in Igropyr</h2>
+    <p class="lead">A selection from the agent's conversion table. It reads
+       the real library source before writing, since the API evolves.</p>
+    <table class="maptable">
+      <thead><tr><th>Node.js / Express</th><th>Igropyr</th></tr></thead>
+      <tbody>
+        <tr><td><code>async function</code> / <code>await p</code></td>
+            <td>straight-line synchronous Scheme; I/O parks the calling process only</td></tr>
+        <tr><td><code>try { } catch → 500</code></td>
+            <td>delete it — the supervisor retries then answers 500 (Let It Crash)</td></tr>
+        <tr><td><code>app.get('/x', h)</code></td>
+            <td><code>(app-get app "/x" (lambda (req res) ...))</code></td></tr>
+        <tr><td><code>(req, res, next)</code></td>
+            <td><code>(lambda (req res next) ...)</code> — call <code>(next)</code></td></tr>
+        <tr><td><code>req.params.id</code></td>
+            <td><code>(req-param req "id")</code></td></tr>
+        <tr><td><code>req.body</code> (json)</td>
+            <td><code>(req-json req)</code>; read with <code>(json-ref j "name")</code></td></tr>
+        <tr><td><code>res.json(obj)</code></td>
+            <td><code>(send-json! res alist)</code></td></tr>
+        <tr><td><code>res.status(c)</code></td>
+            <td><code>(set-status! res c)</code> then a <code>send-*!</code></td></tr>
+        <tr><td>SSE / <code>res.write</code></td>
+            <td><code>(sse-start! res)</code> + <code>(sse-send! res msg)</code> in a spawned process</td></tr>
+        <tr><td><code>ws.on('message')</code></td>
+            <td><code>(app-ws app "/p" (lambda (ws req) ...))</code>, loop on <code>(ws-recv ws)</code></td></tr>
+        <tr><td><code>setInterval</code> / worker</td>
+            <td><code>(spawn (lambda () (let loop () ... (sleep-ms n) (loop))))</code></td></tr>
+        <tr><td><code>EventEmitter</code> / pub-sub</td>
+            <td><code>(igropyr pubsub)</code>: <code>subscribe</code> / <code>publish</code></td></tr>
+        <tr><td>stateful singleton</td>
+            <td>a <code>gen-server</code> (<code>(igropyr gen-server)</code>)</td></tr>
+        <tr><td><code>JSON.parse</code> / <code>stringify</code></td>
+            <td><code>(string->json s)</code> / <code>(json->string v)</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ================= USE + CODE ================= -->
+<section id="use">
+  <div class="wrap">
+    <div class="kicker">Get it</div>
+    <h2>The agent, in one file</h2>
+    <p class="lead">It is a single Markdown agent definition — house rules,
+       the full conversion table, the invariants, the workflow, and the
+       current public API surface. Feed it to any AI coding agent as its
+       instructions and point it at the Node code to port.</p>
+    <div class="cta" style="justify-content:flex-start">
+      <a class="btn primary" href="agent/node-to-igropyr.md" download>Download node-to-igropyr.md</a>
+      <a class="btn ghost" href="agent/node-to-igropyr.md">View raw</a>
+    </div>
+    <p class="backlink">Hard rules it never breaks: round parens only, English
+       comments, and it reads the real <code>.sc</code> source before writing —
+       flagging anything with no clean Igropyr equivalent rather than
+       inventing an API.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="links">
+    <a href="index.html">Igropyr</a>
+    <a href="https://github.com/guenchi/Igropyr/blob/master/docs/MANUAL.md">Manual</a>
+    <a href="https://github.com/guenchi/Igropyr">GitHub</a>
+  </div>
+  <div>node-to-igropyr &mdash; an AI agent for porting Node.js/Express to Igropyr.</div>
+</footer>
+
+</body>
+</html>
