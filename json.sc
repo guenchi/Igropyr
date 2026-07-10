@@ -180,8 +180,12 @@
 
   (define (number->json v)
     (cond
+      ;; a non-real (e.g. complex) would serialize to invalid JSON
+      ((not (real? v))
+       (assertion-violation 'json->string "JSON numbers must be real" v))
       ((and (exact? v) (integer? v)) (number->string v))
-      ((and (real? v) (or (nan? v) (infinite? v))) "null")
+      ;; JSON has no NaN/Infinity; emit null as JSON.stringify does
+      ((or (nan? v) (infinite? v)) "null")
       ((exact? v) (number->string (exact->inexact v)))
       (else (number->string v))))
 

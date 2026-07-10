@@ -205,7 +205,7 @@
   ;; decode one frame at `start`; unmasks a masked payload.
   ;; expect-masked?: server role requires client frames masked; client
   ;; role requires server frames unmasked. -> #(fin? op payload end) |
-  ;; 'more | 'bad
+  ;; 'more | 'bad | 'too-large
   (define (decode-frame bv start expect-masked?)
     (let ((have (- (bytevector-length bv) start)))
       (if (< have 2)
@@ -249,7 +249,15 @@
                     (else (values len7 0)))))
               (cond
                 ((not plen) 'more)
-                ((> plen max-frame) 'bad)
+                ;; extended lengths must use their minimal encoding, and
+                ;; the 64-bit form must not set its sign bit (RFC 6455 5.2)
+                ((and (fx= len7 126) (< plen 126)) 'bad)
+                ((and (fx= len7 127)
+                      (or (< plen 65536)
+                          (> (bytevector-u8-ref bv (+ start 2)) 127))) 'bad)
+                ;; a close frame's payload is 0 or >= 2 bytes, never 1
+                ((and (fx= op 8) (fx= plen 1)) 'bad)
+                ((> plen max-frame) 'too-large)
                 (else
                  (let* ((mask-off (+ start 2 lenbytes))
                         (data-off (+ mask-off (if masked? 4 0)))
@@ -296,7 +304,20 @@
         (tcp-write! c (encode-frame 8 (make-bytevector 0) (ws-client? w))
           (lambda (st) (tcp-close! c))))))
 
-  ;; block until a complete frame is available (runs in the owning process)
+  ;; close with a status code (RFC 6455 7.4): 1002 protocol error,
+  ;; 1007 invalid UTF-8 in a text message, 1009 message too big
+  (define (ws-fail! w code)
+    (unless (unbox (ws-closedbox w))
+      (set-box! (ws-closedbox w) #t)
+      (let ((c (ws-conn w))
+            (payload (bytevector (fxand (fxsrl code 8) #xFF)
+                                 (fxand code #xFF))))
+        (tcp-write! c (encode-frame 8 payload (ws-client? w))
+          (lambda (st) (tcp-close! c))))))
+
+  ;; block until a complete frame is available (runs in the owning
+  ;; process). -> a #(fin op payload end) frame, or a reason symbol:
+  ;; 'protocol-error | 'message-too-large | 'close
   (define (next-frame! w)
     (let loop ()
       (let* ((buf (unbox (ws-bufbox w)))
@@ -307,7 +328,8 @@
            (set-box! (ws-bufbox w)
                      (bv-sub buf (vector-ref r 3) (bytevector-length buf)))
            r)
-          ((eq? r 'bad) 'close)
+          ((eq? r 'bad) 'protocol-error)
+          ((eq? r 'too-large) 'message-too-large)
           (else
            (receive
              (`#(tcp-data ,bv)
@@ -316,26 +338,70 @@
              (`#(tcp-eof) 'close)
              (`#(tcp-error ,e) 'close)))))))
 
+  ;; Strict UTF-8 validation (RFC 3629): rejects overlong encodings,
+  ;; surrogates (ED A0..BF), and code points above U+10FFFF. Chez's
+  ;; utf8->string silently substitutes U+FFFD, so a text message must be
+  ;; validated here to honour RFC 6455's 1007 requirement.
+  (define (utf8-cont? bv i)
+    (fx= (fxand (bytevector-u8-ref bv i) #xC0) #x80))
+
+  (define (valid-utf8? bv)
+    (let ((n (bytevector-length bv)))
+      (let loop ((i 0))
+        (if (>= i n)
+            #t
+            (let ((b (bytevector-u8-ref bv i)))
+              (cond
+                ((< b #x80) (loop (+ i 1)))                  ; ASCII
+                ((< b #xC2) #f)                              ; stray cont / overlong
+                ((< b #xE0)                                  ; 2-byte
+                 (and (< (+ i 1) n) (utf8-cont? bv (+ i 1))
+                      (loop (+ i 2))))
+                ((< b #xF0)                                  ; 3-byte
+                 (and (< (+ i 2) n) (utf8-cont? bv (+ i 1)) (utf8-cont? bv (+ i 2))
+                      (let ((b1 (bytevector-u8-ref bv (+ i 1))))
+                        (cond ((= b #xE0) (>= b1 #xA0))      ; no overlong
+                              ((= b #xED) (<= b1 #x9F))      ; no surrogate
+                              (else #t)))
+                      (loop (+ i 3))))
+                ((< b #xF5)                                  ; 4-byte
+                 (and (< (+ i 3) n) (utf8-cont? bv (+ i 1))
+                      (utf8-cont? bv (+ i 2)) (utf8-cont? bv (+ i 3))
+                      (let ((b1 (bytevector-u8-ref bv (+ i 1))))
+                        (cond ((= b #xF0) (>= b1 #x90))      ; no overlong
+                              ((= b #xF4) (<= b1 #x8F))      ; <= U+10FFFF
+                              (else #t)))
+                      (loop (+ i 4))))
+                (else #f)))))))
+
   ;; Block until the next complete message.
   ;; -> #(text ,string) | #(binary ,bytevector) | #(close)
   ;; Pings are answered, pongs ignored, fragments reassembled. A message
   ;; whose reassembled size would exceed max-message, or a frame that
   ;; violates the fragmentation sequence (a continuation with no message
-  ;; in progress, or a new data frame mid-message), closes the socket.
+  ;; in progress, or a new data frame mid-message), closes the socket with
+  ;; the appropriate status code. Invalid UTF-8 in a text message is a
+  ;; 1007 close (rather than a crash).
   (define (ws-recv w)
     (define (deliver op parts)
       (let ((body (bv-concat (reverse parts))))
-        (if (= op 1)
-            (vector 'text (utf8->string body))
-            (vector 'binary body))))
+        (cond
+          ((= op 2) (vector 'binary body))
+          ((valid-utf8? body) (vector 'text (utf8->string body)))
+          (else (ws-fail! w 1007) (vector 'close)))))   ; invalid UTF-8
     (if (unbox (ws-closedbox w))
         (vector 'close)
         ;; op = opcode of the in-progress message (#f = none); size =
         ;; bytes accumulated so far
         (let loop ((op #f) (parts '()) (size 0))
           (let ((f (next-frame! w)))
-            (if (eq? f 'close)
-                (begin (ws-close! w) (vector 'close))
+            (if (not (vector? f))
+                (begin
+                  (case f
+                    ((protocol-error) (ws-fail! w 1002))
+                    ((message-too-large) (ws-fail! w 1009))
+                    (else (ws-close! w)))
+                  (vector 'close))
                 (let* ((fin? (vector-ref f 0))
                        (fop (vector-ref f 1))
                        (payload (vector-ref f 2))
@@ -346,15 +412,15 @@
                     ((8) (ws-close! w) (vector 'close))
                     ((0)                                    ; continuation frame
                      (cond
-                       ((not op) (ws-close! w) (vector 'close)) ; no message started
-                       ((> new-size max-message) (ws-close! w) (vector 'close))
+                       ((not op) (ws-fail! w 1002) (vector 'close)) ; no message started
+                       ((> new-size max-message) (ws-fail! w 1009) (vector 'close))
                        (else
                         (let ((parts (cons payload parts)))
                           (if fin? (deliver op parts) (loop op parts new-size))))))
                     (else                                   ; new data frame (1/2)
                      (cond
-                       (op (ws-close! w) (vector 'close))    ; previous msg unfinished
-                       ((> new-size max-message) (ws-close! w) (vector 'close))
+                       (op (ws-fail! w 1002) (vector 'close))    ; previous msg unfinished
+                       ((> new-size max-message) (ws-fail! w 1009) (vector 'close))
                        (fin? (deliver fop (list payload)))
                        (else (loop fop (list payload) new-size)))))))))))
 )
