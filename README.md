@@ -22,15 +22,36 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
   in-flight requests finish on the old code
 - **WebSocket** — RFC 6455 upgrade on the same port; each socket is its own
   green process, so server push is just a message send
+- **Streaming responses & SSE** — chunked response body via
+  `res-begin!`/`res-write!`/`res-end!`; Server-Sent Events helpers on top
+- **OTP building blocks** — `gen-server` (call/cast/info), a process
+  registry (`register`/`whereis`), and topic PubSub with automatic
+  cleanup of dead subscribers
+- **JSON** — a safe recursive-descent parser (no `read`; full escape and
+  surrogate handling) and writer
+- **Forms & cookies** — `req-form` parses urlencoded and multipart bodies
+  (file uploads included); `req-cookie` / `set-cookie!`
 - **Chunked transfer-encoding** — `Transfer-Encoding: chunked` request
   bodies are decoded transparently
 - **Non-blocking Redis and MySQL clients** — pure Scheme, same event
   loop; callers park their green process while the OS thread keeps
   serving; MySQL comes with a self-healing connection pool
+- **Runtime introspection & graceful shutdown** — `http-stats` (live
+  connection/request/pool counters), `http-shutdown!` (drain in-flight
+  requests, refuse new connections)
+- **Multi-process scaling** — `SO_REUSEPORT` bind option for
+  kernel-balanced multi-process listening on Linux/FreeBSD (pair with
+  pm2 or systemd)
 - **HTTP/1.1 keep-alive & pipelining** — persistent connections by default
   on 1.1; each connection's reader process loops over successive requests
+- **Hardened** — strict `Content-Length` validation, per-request response
+  isolation, response-header injection guard, static-mount boundary
+  checks, WebSocket frame validation with a reassembly cap
 - **Fast** — ~35 k req/s at 500 concurrent connections on an Apple Silicon
   laptop (`ab -n 50000 -c 500`, zero failed requests)
+
+For architecture, the actor model, the libuv-callback invariant, and
+contribution guidelines, see [DEVELOPING.md](DEVELOPING.md).
 
 ## Requirements
 
@@ -222,6 +243,116 @@ call `ws-send-text!` — writes are safe from any green process. On the
 bare core, register a resolver with `(http-set-ws! srv (lambda (req)
 session-or-#f))`.
 
+## Streaming responses and SSE
+
+Stream a body with chunked transfer-encoding. Detach a long stream from
+the pool worker by spawning a producer process, so the worker returns to
+the pool immediately:
+
+```scheme
+(app-get app "/sse"
+  (lambda (req res)
+    (sse-start! res)                      ; text/event-stream, chunked
+    (spawn
+      (lambda ()
+        (let loop ((i 1))
+          ;; sse-send! returns #f once the client disconnects
+          (if (and (<= i 5) (sse-send! res (string-append "tick " (number->string i))))
+              (begin (sleep-ms 300) (loop (+ i 1)))
+              (res-end! res)))))))
+```
+
+The lower-level primitives are `res-begin!`, `res-write!` (string or
+bytevector; returns `#f` if the client is gone), and `res-end!`.
+
+## JSON
+
+`(igropyr json)` is a safe recursive-descent parser — it never calls
+`read`, so it is safe on untrusted request bodies — plus a writer.
+Objects map to alists (string keys), arrays to vectors, `null` to
+`'null`.
+
+```scheme
+(import (igropyr json))
+(string->json "{\"a\":[1,2],\"b\":\"x\"}")   ; => (("a" . #(1 2)) ("b" . "x"))
+(json->string '(("ok" . #t) ("n" . 42)))     ; => "{\"ok\":true,\"n\":42}"
+(json-ref (string->json "{\"a\":{\"b\":9}}") "a" "b")  ; => 9
+```
+
+In a handler, `req-json` parses the request body (returns `#f` on
+invalid JSON) and `send-json!` serializes:
+
+```scheme
+(app-post app "/api"
+  (lambda (req res)
+    (let ((j (req-json req)))
+      (send-json! res (list (cons 'echo (json-ref j "name")))))))
+```
+
+## Forms and cookies
+
+`req-form` parses both `application/x-www-form-urlencoded` and
+`multipart/form-data`; text fields are strings and uploads are
+`#(file ,filename ,content-type ,bytevector)`.
+
+```scheme
+(app-post app "/upload"
+  (lambda (req res)
+    (for-each
+      (lambda (kv)
+        (let ((v (cdr kv)))
+          (when (vector? v)               ; a file part
+            (save-file (vector-ref v 1) (vector-ref v 3)))))
+      (req-form req))
+    (send-text! res "ok")))
+
+(app-get app "/login"
+  (lambda (req res)
+    (set-cookie! res "sid" "abc123" "Path=/" "HttpOnly")
+    (send-text! res (or (req-cookie req "sid") "no session"))))
+```
+
+## OTP building blocks
+
+Beyond raw `spawn`/`send`/`receive`, three OTP-style libraries make
+stateful services and fan-out easy.
+
+A `gen-server` is a stateful service reduced to callbacks; calls carry a
+unique tag and monitor the server, so a crash surfaces immediately
+instead of hanging:
+
+```scheme
+(import (igropyr gen-server))
+(gen-server-start-named 'counter
+  (lambda () 0)                                  ; init -> state
+  (lambda (msg from state) (values (+ state 1) (+ state 1)))  ; handle-call
+  (lambda (msg state) state))                    ; handle-cast
+(gen-server-call 'counter 'incr)                 ; => 1  (by registered name)
+```
+
+The process registry decouples a name from the pid behind it, so a
+supervised service can be found again after a restart:
+`(register 'db pid)`, `(whereis 'db)`.
+
+PubSub is topic fan-out; dead subscribers are pruned automatically, which
+pairs naturally with one-process-per-WebSocket chat rooms:
+
+```scheme
+(import (igropyr pubsub))
+(start-pubsub!)                                  ; once, at boot
+(app-ws app "/chat/:room"
+  (lambda (ws req)
+    (let ((topic (string->symbol (req-param req "room"))))
+      (subscribe topic)
+      (spawn (lambda ()                          ; relay room traffic to this socket
+               (let lp () (receive (`#(pub ,t ,m) (ws-send-text! ws m) (lp))))))
+      (let lp ()
+        (let ((m (ws-recv ws)))
+          (if (eq? (vector-ref m 0) 'text)
+              (begin (publish topic (vector-ref m 1)) (lp))
+              'closed))))))
+```
+
 ## Redis and MySQL
 
 Both clients ride the same libuv loop and actor model: each database
@@ -259,6 +390,19 @@ Server errors raise `#(redis-error msg)` / `#(mysql-error code msg)` in
 the caller — inside a route handler that means Let It Crash: the worker
 dies, the supervisor retries, the service keeps running.
 
+MySQL's `caching_sha2_password` fast path (challenge-response, no
+password on the wire) needs no configuration. The *full* auth path sends
+the password RSA-encrypted; doing that over a plaintext connection is
+refused by default (a MITM could substitute the key). Enable it by
+pinning the server key or opting in explicitly:
+
+```scheme
+(mysql-connect host port user pw "db"
+  '((server-public-key . "-----BEGIN PUBLIC KEY-----...")))   ; pinned key
+(mysql-connect host port user pw "db"
+  '((allow-insecure-auth . #t)))                              ; TLS/trusted net only
+```
+
 ## Fault tolerance semantics
 
 These apply automatically; nothing to configure:
@@ -274,6 +418,38 @@ These apply automatically; nothing to configure:
 - **Slow clients**: each connection is owned by its own reader process; a
   half-sent request parks only that reader and is reaped after 30 s.
 
+## Runtime introspection and graceful shutdown
+
+`app-listen` / `http-listen` return the server. `http-stats` gives a live
+snapshot; `http-shutdown!` stops accepting and drains in-flight requests
+before returning (call it from a detached process, never from a pool
+worker):
+
+```scheme
+(define srv (app-listen app 8080))
+(app-get app "/stats" (lambda (req res) (send-json! res (http-stats srv))))
+;;   => {"connections":12,"requests":34210,"uptime-ms":90000,
+;;       "idle":5,"busy":3,"pending":0}
+(spawn (lambda () (http-shutdown! srv) (exit 0)))   ; graceful stop
+```
+
+## Multi-process scaling
+
+Chez runs on one OS thread, so a single process saturates one core. To
+use all cores, run N processes bound to the same port with
+`SO_REUSEPORT` and let the kernel balance connections (Linux 3.9+ /
+FreeBSD 12+; not macOS):
+
+```scheme
+(app-listen app 8080 '((reuseport . #t)))
+```
+
+Launch and supervise the N processes with pm2 (fork mode) or systemd.
+Because processes share nothing, per-process state (the worker pool, the
+route table, PubSub topics, WebSocket rooms) is local to each — share
+across processes through Redis, and use Redis pub/sub as a cross-process
+event bus.
+
 ## Architecture
 
 ```
@@ -287,11 +463,18 @@ http.sc    core: incremental HTTP/1.1 parser (content-length + chunked),
 websocket.sc  WebSocket codec: SHA-1/base64 handshake key, frame
               encode/decode, ws-recv / ws-send-text! / ws-close!
 express.sc framework layer (optional): router with :param segments,
-           middleware chain, static files, app-ws, JSON/text/html/file
-           encoders
+           middleware chain, static files, app-ws, forms/cookies,
+           SSE, JSON/text/html/file encoders
+json.sc    safe recursive-descent JSON parser + writer
+gen-server.sc  OTP gen-server (call/cast/info)
+pubsub.sc  topic publish/subscribe with dead-subscriber cleanup
 redis.sc   non-blocking Redis client (RESP2), pipelined
 mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
 ```
+
+The actor scheduler (`register`/`whereis`/`monitor`/`demonitor`) and the
+libuv-callback invariant that everything rests on are documented in
+[DEVELOPING.md](DEVELOPING.md).
 
 Message protocol between processes:
 
