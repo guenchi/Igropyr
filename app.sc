@@ -15,7 +15,7 @@
 
 (import (chezscheme)
         (igropyr actor)
-        (igropyr uv)
+        (igropyr libuv)
         (igropyr otp)
         (igropyr http)
         (igropyr websocket)

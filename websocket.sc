@@ -18,7 +18,7 @@
   (export ws-accept-key sha1 base64-encode
           make-ws ws? ws-conn
           ws-recv ws-send-text! ws-send-binary! ws-close!)
-  (import (chezscheme) (igropyr actor) (igropyr uv))
+  (import (chezscheme) (igropyr actor) (igropyr libuv))
 
   (define max-frame 1048576)          ; single frame payload cap
   (define max-message 8388608)        ; reassembled multi-frame message cap

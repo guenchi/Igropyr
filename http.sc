@@ -35,7 +35,7 @@
           res-begin! res-write! res-end!
           res-conn res-status res-headers res-keep-alive?
           send-response! parse-query)
-  (import (chezscheme) (igropyr actor) (igropyr uv) (igropyr otp)
+  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr otp)
           (igropyr websocket))
 
   (define header-limit 8192)

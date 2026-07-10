@@ -346,7 +346,7 @@ A callback can:
    (deliver-message supervisor (vector 'submit-task task))
    ```
 
-   The `deliver-message` function is internal to (igropyr uv). It's hooked by `uv-set-deliver!` and simply enqueues the message in the target process's mailbox without yielding.
+   The `deliver-message` function is internal to (igropyr libuv). It's hooked by `uv-set-deliver!` and simply enqueues the message in the target process's mailbox without yielding.
 
 4. **Read from the process registry** (read-only):
    ```scheme

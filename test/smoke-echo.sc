@@ -1,10 +1,10 @@
-;;; Smoke test for (igropyr uv): a bare echo server with no actor layer.
+;;; Smoke test for (igropyr libuv): a bare echo server with no actor layer.
 ;;; The deliver hook is abused to handle messages synchronously; the
 ;;; conn itself plays the role of the owner pid.
 ;;; Run: scheme --script test/smoke-echo.sc  (from the project root,
 ;;; with CHEZSCHEMELIBDIRS/CHEZSCHEMELIBEXTS set; see CLAUDE.md)
 
-(import (chezscheme) (igropyr uv))
+(import (chezscheme) (igropyr libuv))
 
 (uv-init!)
 

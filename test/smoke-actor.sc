@@ -2,7 +2,7 @@
 ;;; preemption of a CPU-spinning process, link/EXIT.
 ;;; Run: scheme --script test/smoke-actor.sc (from the project root)
 
-(import (chezscheme) (igropyr actor) (igropyr uv))
+(import (chezscheme) (igropyr actor) (igropyr libuv))
 
 (define (fail msg)
   (display "FAIL: ") (display msg) (newline)

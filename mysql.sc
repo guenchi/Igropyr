@@ -24,7 +24,7 @@
 
 (library (igropyr mysql)
   (export mysql-connect mysql-pool mysql-query mysql-close!)
-  (import (chezscheme) (igropyr actor) (igropyr uv)
+  (import (chezscheme) (igropyr actor) (igropyr libuv)
           (only (igropyr websocket) sha1))
 
   (define connect-timeout-ms 10000)

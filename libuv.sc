@@ -1,4 +1,4 @@
-;;; (igropyr uv) -- minimal libuv FFI layer for Igropyr.
+;;; (igropyr libuv) -- minimal libuv FFI layer for Igropyr.
 ;;;
 ;;; This library talks to libuv directly through Chez's FFI: no C shim.
 ;;; It knows nothing about green processes; message delivery to the
@@ -10,7 +10,7 @@
 ;;; messages. Yielding would unwind a continuation through a C stack
 ;;; frame and corrupt the process.
 
-(library (igropyr uv)
+(library (igropyr libuv)
   (export uv-init! uv-poll! now-ms uv-set-deliver!
           tcp-listen! tcp-stop-listen! tcp-connect!
           tcp-read-start! tcp-write! tcp-writev! tcp-close!

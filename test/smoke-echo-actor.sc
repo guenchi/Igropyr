@@ -3,7 +3,7 @@
 ;;; connections only park their own process.
 ;;; Run: scheme --script test/smoke-echo-actor.sc
 
-(import (chezscheme) (igropyr actor) (igropyr uv))
+(import (chezscheme) (igropyr actor) (igropyr libuv))
 
 (define (reader c)
   (lambda ()

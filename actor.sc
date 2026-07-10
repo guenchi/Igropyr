@@ -21,7 +21,7 @@
           register unregister whereis
           sleep-ms process-alive? process-id
           start-scheduler)
-  (import (chezscheme) (igropyr uv))
+  (import (chezscheme) (igropyr libuv))
 
   (define process-default-ticks 100000)
 
