@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Igropyr — a fault-tolerant web server in pure Chez Scheme</title>
-<meta name="description" content="Igropyr: crashes heal themselves, code swaps hot, faults speak a protocol, and dialogues are processes. Erlang-style actors on libuv, written entirely in Chez Scheme.">
+<meta name="description" content="Igropyr: crashes heal themselves, code hot-swaps, faults speak a protocol, and dialogues are processes. Erlang-style actors on libuv, written entirely in Chez Scheme.">
 <style>
   :root {
     --bg: #ffffff;
@@ -209,7 +209,7 @@
     <div class="lam">λ</div>
     <h1>Igropyr</h1>
     <p class="tag">A web server where <b>crashes heal themselves</b>,
-       <b>code swaps hot</b>, <b>faults speak a protocol</b>, and
+       <b>code hot-swaps</b>, <b>faults speak a protocol</b>, and
        <b>dialogues are processes</b>.</p>
     <p class="sub">Pure Chez Scheme &middot; Erlang-style actors &middot; libuv event loop &middot; MIT</p>
     <div class="cta">
@@ -228,12 +228,12 @@ scheme --script igropyr/test/run-otp.sc
 <section id="crash">
   <div class="wrap">
     <div class="kicker">01 &middot; Fault tolerance</div>
-    <h2>Crashes heal themselves</h2>
+    <h2>Let It Crash</h2>
     <p class="lead">Every request runs in a supervised worker pool.
        Handlers don't defend — they crash, and the system recovers.</p>
     <div class="feature">
       <div class="txt">
-        <h3>Let It Crash, for HTTP</h3>
+        <h3>Crashes heal themselves</h3>
         <ul>
           <li>A crashed worker is <b>replaced instantly</b>; the task is
               retried on a fresh worker, up to 3 times, before the client
