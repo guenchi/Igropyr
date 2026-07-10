@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Igropyr — a fault-tolerant web server in pure Chez Scheme</title>
 <meta name="description" content="Igropyr: crashes heal themselves, code hot-swaps, faults speak a protocol, and dialogues are processes. Erlang-style actors on libuv, written entirely in Chez Scheme.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <style>
   :root {
     --bg: #ffffff;
@@ -119,6 +120,16 @@
   .card h3 { font-size: 18px; margin-bottom: 10px; }
   .card p { color: var(--dim); font-size: 14.5px; }
   .card code { color: var(--acc); font-size: 13px; }
+
+  /* ---- full feature list ---- */
+  .fgrid { max-width: 760px; margin-top: 38px; }
+  .fitem { margin-bottom: 16px; color: var(--dim);
+           font-size: 15px; line-height: 1.6;
+           padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+  .fitem:last-child { border-bottom: none; }
+  .fitem b { color: var(--fg); font-weight: 600; }
+  .fitem code { color: var(--acc); font-size: 12.5px;
+                background: var(--bg2); padding: 1px 4px; border-radius: 4px; }
 
   /* ---- numbers strip ---- */
   .strip { display: flex; justify-content: center; gap: 64px;
@@ -408,6 +419,42 @@ scheme --script igropyr/test/run-otp.sc
       <div><div class="num">0</div><div class="lbl">failed requests under ab -c 500</div></div>
       <div><div class="num">≤35s</div><div class="lbl">full recovery from a stuck pool</div></div>
       <div><div class="num">1</div><div class="lbl">OS thread</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= FULL FEATURE LIST ================= -->
+<section id="features">
+  <div class="wrap">
+    <div class="kicker">Everything included</div>
+    <h2>The complete feature list</h2>
+    <p class="lead">One dependency-free tree of R6RS libraries. No plugins to
+       hunt down — the batteries are in the box.</p>
+    <div class="fgrid">
+      <div class="fitem"><b>Core / framework split, like Node and Express</b> — the core exposes one entry point, <code>(http-listen port (lambda (req res) ...))</code>; the bundled <code>(igropyr express)</code> layer (<code>create-app</code>, <code>app-get</code>, <code>send-json!</code>, ...) is optional, and alternative frameworks can be built on the same core</div>
+      <div class="fitem"><b>Green processes</b> — thousands of lightweight processes scheduled over one OS thread; continuation-based context switching with preemption, so even a CPU-spinning handler cannot freeze the system</div>
+      <div class="fitem"><b>Pure message passing</b> — <code>spawn</code> / <code>send</code> / <code>receive</code> / <code>link</code> / <code>monitor</code>; no shared state between processes</div>
+      <div class="fitem"><b>Fault tolerant by default</b> — a fixed worker pool behind a supervisor: crashed workers are replaced and the task retried (at most 3 times, then the client gets a 500); workers stuck for more than 30 s are killed and replaced; a slow or half-sent request only ever blocks its own reader process</div>
+      <div class="fitem"><b>Failure hook (remote retry ring)</b> — when retries are exhausted or a stuck worker is killed (killed first, so no execution is in flight), an optional <code>on-failure</code> handler answers a structured JSON fault instead of the plain 500, on the same keep-alive connection — the client resubmits (changed parameters, carried state) and gets a fresh retry round; unset, the plain 500 remains</div>
+      <div class="fitem"><b>Conversations (process-per-dialogue)</b> — a multi-request dialogue runs as one green process holding live state — even an open database transaction — across rounds; <code>suspend!</code> answers and parks, <code>conversation-resume!</code> continues, and death for any reason (crash, TTL) means guaranteed rollback: a later resume gets <code>gone</code></div>
+      <div class="fitem"><b>Hot code swapping</b> — replace the handler (or individual routes) on a live server: the listener, open connections and worker pool stay up, in-flight requests finish on the old code</div>
+      <div class="fitem"><b>WebSocket</b> — RFC 6455 upgrade on the same port; each socket is its own green process, so server push is just a message send</div>
+      <div class="fitem"><b>Streaming responses &amp; SSE</b> — chunked response body via <code>res-begin!</code>/<code>res-write!</code>/<code>res-end!</code>; Server-Sent Events helpers on top</div>
+      <div class="fitem"><b>OTP building blocks</b> — <code>gen-server</code> (call/cast/info), a process registry (<code>register</code>/<code>whereis</code>), and topic PubSub with automatic cleanup of dead subscribers</div>
+      <div class="fitem"><b>JSON</b> — a safe recursive-descent parser (no <code>read</code>; full escape and surrogate handling) and writer</div>
+      <div class="fitem"><b>Forms &amp; cookies</b> — <code>req-form</code> parses urlencoded and multipart bodies (file uploads included); <code>req-cookie</code> / <code>set-cookie!</code></div>
+      <div class="fitem"><b>Middleware suite</b> — cookie sessions (gen-server store, CSPRNG sids), CORS with preflight, security headers, and an access logger</div>
+      <div class="fitem"><b>Chunked transfer-encoding</b> — <code>Transfer-Encoding: chunked</code> request bodies are decoded transparently</div>
+      <div class="fitem"><b>Non-blocking Redis and MySQL clients</b> — pure Scheme, same event loop; callers park their green process while the OS thread keeps serving; MySQL comes with a self-healing connection pool</div>
+      <div class="fitem"><b>Non-blocking HTTP &amp; WebSocket clients</b> — outbound <code>http-get</code> / <code>http-post</code> and <code>ws-connect</code>, both with async DNS (libuv thread pool) and the same park-the-caller model</div>
+      <div class="fitem"><b>Async file reads</b> — static files are read on libuv's thread pool, so a large or cold read never blocks the scheduler</div>
+      <div class="fitem"><b>gzip compression</b> — responses negotiated via <code>Accept-Encoding</code>; static files cache their compressed form</div>
+      <div class="fitem"><b>Ops-ready</b> — rate limiting, a global error handler, and a Prometheus <code>/metrics</code> endpoint</div>
+      <div class="fitem"><b>Runtime introspection &amp; graceful shutdown</b> — <code>http-stats</code> (live connection/request/pool counters), <code>http-shutdown!</code> (drain in-flight requests, refuse new connections)</div>
+      <div class="fitem"><b>Multi-process scaling</b> — <code>SO_REUSEPORT</code> bind option for kernel-balanced multi-process listening on Linux (pair with pm2 or systemd)</div>
+      <div class="fitem"><b>HTTP/1.1 keep-alive &amp; pipelining</b> — persistent connections by default on 1.1; each connection's reader process loops over successive requests</div>
+      <div class="fitem"><b>Hardened</b> — strict <code>Content-Length</code> validation, per-request response isolation, response-header injection guard, static-mount boundary + symlink-escape + NUL-byte checks, pipeline flood cap, WebSocket frame validation with strict UTF-8 (1007 close) and a reassembly cap, binary-safe Redis replies, request-id matching on all DB/HTTP clients</div>
+      <div class="fitem"><b>Fast</b> — ~35 k req/s at 500 concurrent connections on an Apple Silicon laptop (<code>ab -n 50000 -c 500</code>, zero failed requests)</div>
     </div>
   </div>
 </section>
