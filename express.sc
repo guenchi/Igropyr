@@ -23,8 +23,8 @@
           req-param req-json req-form req-cookie set-cookie!
           send-text! send-html! send-json! send-file!
           sse-start! sse-send!)
-  (import (chezscheme) (igropyr actor) (igropyr http) (igropyr json)
-          (igropyr gzip))
+  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+          (igropyr json) (igropyr gzip))
 
   ;; ---- string helpers -----------------------------------------------------
 
@@ -288,14 +288,6 @@
         ((equal? ext "ico") "image/x-icon")
         (else "application/octet-stream"))))
 
-  (define (read-file-bv path)
-    (guard (e (#t #f))
-      (and (file-exists? path)
-           (call-with-port (open-file-input-port path)
-             (lambda (p)
-               (let ((bv (get-bytevector-all p)))
-                 (if (eof-object? bv) (make-bytevector 0) bv)))))))
-
   (define (path-has-dotdot? s)
     (exists (lambda (p) (string=? p "..")) (string-split s #\/)))
 
@@ -321,6 +313,15 @@
     (string-append "W/\"" (number->string size 16) "-"
                    (number->string mtime 16) "\""))
 
+  ;; read a file on libuv's thread pool; the caller (a pool worker or
+  ;; reader process) parks until the read finishes, so a large or slow
+  ;; read never blocks the scheduler. Returns the bytevector or #f.
+  (define (read-file-async path)
+    (file-read-async! path self)
+    (receive (after 30000 #f)
+      (`#(file-read ,bv) bv)
+      (`#(file-error ,e) #f)))
+
   ;; return the cache entry for path (reading/refreshing as needed), or #f
   (define (static-entry path)
     (let ((mt (file-mtime path)))
@@ -328,7 +329,7 @@
            (let ((cached (hashtable-ref static-cache path #f)))
              (if (and cached (= (vector-ref cached 0) mt))
                  cached
-                 (let ((body (read-file-bv path)))
+                 (let ((body (read-file-async path)))
                    (and body
                         (let* ((size (bytevector-length body))
                                ;; entry: #(mtime size etag ctype body gzip-box)

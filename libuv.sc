@@ -13,6 +13,7 @@
 (library (igropyr libuv)
   (export uv-init! uv-poll! now-ms uv-set-deliver!
           tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
+          file-read-async!
           tcp-read-start! tcp-write! tcp-writev! tcp-close!
           conn? conn-handle conn-owner conn-set-owner!
           conn-state conn-count uv-strerror)
@@ -45,6 +46,13 @@
   (define uv-tcp-connect (foreign-procedure "uv_tcp_connect" (void* void* void* void*) int))
   (define uv-getaddrinfo (foreign-procedure "uv_getaddrinfo" (void* void* void* string void* void*) int))
   (define uv-freeaddrinfo (foreign-procedure "uv_freeaddrinfo" (void*) void))
+  (define uv-fs-open  (foreign-procedure "uv_fs_open" (void* void* string int int void*) int))
+  (define uv-fs-read  (foreign-procedure "uv_fs_read" (void* void* int void* unsigned-int long void*) int))
+  (define uv-fs-close (foreign-procedure "uv_fs_close" (void* void* int void*) int))
+  (define uv-fs-stat  (foreign-procedure "uv_fs_stat" (void* void* string void*) int))
+  (define uv-fs-get-result (foreign-procedure "uv_fs_get_result" (void*) ssize_t))
+  (define uv-fs-get-statbuf (foreign-procedure "uv_fs_get_statbuf" (void*) void*))
+  (define uv-fs-req-cleanup (foreign-procedure "uv_fs_req_cleanup" (void*) void))
   (define uv-tcp-bind    (foreign-procedure "uv_tcp_bind" (void* void* unsigned-int) int))
   (define uv-tcp-nodelay (foreign-procedure "uv_tcp_nodelay" (void* int) int))
   (define uv-listen      (foreign-procedure "uv_listen" (void* int void*) int))
@@ -65,11 +73,15 @@
 
   (define UV-CONNECT 2)
   (define UV-GETADDRINFO 8)
+  (define UV-FS 6)
+  (define O-RDONLY 0)
+  (define ST-SIZE-OFFSET 56)        ; uv_stat_t.st_size on all platforms
   (define tcp-handle-size (uv-handle-size UV-TCP))
   (define timer-handle-size (uv-handle-size UV-TIMER))
   (define write-req-size (uv-req-size UV-WRITE))
   (define connect-req-size (uv-req-size UV-CONNECT))
   (define getaddrinfo-req-size (uv-req-size UV-GETADDRINFO))
+  (define fs-req-size (uv-req-size UV-FS))
   (define buf-t-size 16)             ; uv_buf_t on arm64: {void* base; size_t len}
 
   ;; monotonic milliseconds
@@ -100,6 +112,8 @@
   (define connect-table (make-eqv-hashtable))
   ;; pending DNS lookups: getaddrinfo req address -> owner-pid
   (define getaddrinfo-table (make-eqv-hashtable))
+  ;; pending async file reads: fs req address -> fs-op record
+  (define fs-table (make-eqv-hashtable))
   (define (conn-count) (hashtable-size conn-table))
 
   ;; delivery hook: (deliver owner-pid msg); installed by (igropyr actor)
@@ -213,6 +227,84 @@
                   (number->string (foreign-ref 'unsigned-8 sa 7))))
               (loop (foreign-ref 'void* ai 40))))))
 
+  ;; Async whole-file read as a stat -> open -> read -> close chain, all
+  ;; on libuv's thread pool, so a slow or large read never blocks the
+  ;; scheduler. One reusable fs req drives the chain (cleaned up between
+  ;; steps). The owner gets #(file-read ,bytevector) or #(file-error ,e).
+  (define-record-type (fs-op make-fs-op fs-op?)
+    (fields
+      (immutable owner fs-op-owner)
+      (immutable path fs-op-path)
+      (mutable phase fs-op-phase fs-op-phase-set!)   ; stat|open|read|close
+      (mutable fd fs-op-fd fs-op-fd-set!)
+      (mutable size fs-op-size fs-op-size-set!)
+      (mutable data fs-op-data fs-op-data-set!)      ; C read buffer
+      (mutable buf fs-op-buf fs-op-buf-set!)))        ; uv_buf_t
+
+  (define (fs-cleanup! op req)
+    (when (> (fs-op-data op) 0) (foreign-free (fs-op-data op)))
+    (when (> (fs-op-buf op) 0) (foreign-free (fs-op-buf op)))
+    (hashtable-delete! fs-table req)
+    (foreign-free req))
+
+  (define (fs-fail! op req errno)
+    ;; if a fd is open, close it (fire-and-forget) before reporting
+    (when (>= (fs-op-fd op) 0)
+      (let ((creq (foreign-alloc fs-req-size)))
+        (uv-fs-close uv-loop creq (fs-op-fd op) 0)   ; sync close, ignore
+        (uv-fs-req-cleanup creq)
+        (foreign-free creq)))
+    (deliver (fs-op-owner op) (vector 'file-error errno))
+    (fs-cleanup! op req))
+
+  (define on-fs-code
+    (foreign-callable
+      (lambda (req)
+        (let ((op (hashtable-ref fs-table req #f))
+              (result (uv-fs-get-result req)))
+          (when op
+            (case (fs-op-phase op)
+              ((stat)
+               (if (< result 0)
+                   (fs-fail! op req result)
+                   (let ((size (foreign-ref 'unsigned-64
+                                 (uv-fs-get-statbuf req) ST-SIZE-OFFSET)))
+                     (uv-fs-req-cleanup req)
+                     (fs-op-size-set! op size)
+                     (fs-op-phase-set! op 'open)
+                     (uv-fs-open uv-loop req (fs-op-path op)
+                                 O-RDONLY 0 on-fs-entry))))
+              ((open)
+               (if (< result 0)
+                   (fs-fail! op req result)
+                   (begin
+                     (uv-fs-req-cleanup req)
+                     (fs-op-fd-set! op result)
+                     (let* ((size (fs-op-size op))
+                            (data (foreign-alloc (max 1 size)))
+                            (buf (foreign-alloc 16)))
+                       (fs-op-data-set! op data)
+                       (fs-op-buf-set! op buf)
+                       (foreign-set! 'void* buf 0 data)
+                       (foreign-set! 'unsigned-64 buf 8 size)
+                       (fs-op-phase-set! op 'read)
+                       (uv-fs-read uv-loop req (fs-op-fd op) buf 1 0 on-fs-entry)))))
+              ((read)
+               (uv-fs-req-cleanup req)
+               (if (< result 0)
+                   (fs-fail! op req result)
+                   (let ((bv (make-bytevector result)))
+                     (memcpy-from-c bv (fs-op-data op) result)
+                     (fs-op-phase-set! op 'close)
+                     ;; hand the data over now; close is fire-and-forget
+                     (deliver (fs-op-owner op) (vector 'file-read bv))
+                     (uv-fs-close uv-loop req (fs-op-fd op) on-fs-entry))))
+              ((close)
+               (uv-fs-req-cleanup req)
+               (fs-cleanup! op req))))))
+      (void*)
+      void))
+
   ;; getaddrinfo_cb: tell the owner #(dns-resolved ,ip) or #(dns-failed ,e)
   (define on-getaddrinfo-code
     (foreign-callable
@@ -270,10 +362,11 @@
       (lock-object on-connection-code)
       (lock-object on-connect-code)
       (lock-object on-getaddrinfo-code)
+      (lock-object on-fs-code)
       (lock-object on-timer-code)
       (vector on-alloc-code on-read-code on-close-code
               on-write-code on-connection-code on-connect-code
-              on-getaddrinfo-code on-timer-code)))
+              on-getaddrinfo-code on-fs-code on-timer-code)))
 
   (define on-alloc-entry (foreign-callable-entry-point on-alloc-code))
   (define on-read-entry (foreign-callable-entry-point on-read-code))
@@ -282,6 +375,7 @@
   (define on-connection-entry (foreign-callable-entry-point on-connection-code))
   (define on-connect-entry (foreign-callable-entry-point on-connect-code))
   (define on-getaddrinfo-entry (foreign-callable-entry-point on-getaddrinfo-code))
+  (define on-fs-entry (foreign-callable-entry-point on-fs-code))
   (define on-timer-entry (foreign-callable-entry-point on-timer-code))
 
   ;; ---- public API ----------------------------------------------------
@@ -326,6 +420,19 @@
     (when (> listener 0)
       (uv-close listener on-close-entry)
       (set! listener 0)))
+
+  ;; Read a whole file on libuv's thread pool. The owner process later
+  ;; receives #(file-read ,bytevector) or #(file-error ,errno). Never
+  ;; blocks the scheduler, even for large files or slow filesystems.
+  (define (file-read-async! path owner)
+    (let ((req (foreign-alloc fs-req-size))
+          (op (make-fs-op owner path 'stat -1 0 0 0)))
+      (hashtable-set! fs-table req op)
+      (let ((r (uv-fs-stat uv-loop req path on-fs-entry)))
+        (when (< r 0)
+          (hashtable-delete! fs-table req)
+          (foreign-free req)
+          (deliver owner (vector 'file-error r))))))
 
   ;; Async DNS. The owner process later receives #(dns-resolved ,ip-string)
   ;; or #(dns-failed ,errno). libuv resolves on its thread pool, so the
