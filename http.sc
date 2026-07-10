@@ -33,7 +33,7 @@
           req-keep-alive? req-params req-params-set!
           set-status! set-header! res-send!
           res-begin! res-write! res-end!
-          res-conn res-status res-headers res-keep-alive?
+          res-conn res-req res-status res-headers res-keep-alive?
           send-response! parse-query)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr otp)
           (igropyr websocket))
@@ -329,6 +329,7 @@
     (fields
       (immutable conn res-conn)
       (immutable token res-token)          ; per-request one-shot claim
+      (immutable req res-req)              ; the request, for layers (e.g. gzip)
       (mutable status res-status res-status-set!)
       (mutable headers res-headers res-headers-set!)
       (immutable keep-alive? res-keep-alive?)
@@ -415,7 +416,7 @@
     (let* ((c (vector-ref task 2))
            (req (vector-ref task 3))
            (token (vector-ref task 4))
-           (r (make-res c token 200 '() (req-keep-alive? req) 'plain)))
+           (r (make-res c token req 200 '() (req-keep-alive? req) 'plain)))
       (handler req r)
       ;; handler finished without responding: don't leave the client hanging
       (unless (unbox token)

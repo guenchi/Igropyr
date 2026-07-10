@@ -23,7 +23,8 @@
           req-param req-json req-form req-cookie set-cookie!
           send-text! send-html! send-json! send-file!
           sse-start! sse-send!)
-  (import (chezscheme) (igropyr actor) (igropyr http) (igropyr json))
+  (import (chezscheme) (igropyr actor) (igropyr http) (igropyr json)
+          (igropyr gzip))
 
   ;; ---- string helpers -----------------------------------------------------
 
@@ -42,9 +43,33 @@
 
   ;; ---- response encoders (the res.json level) --------------------------------
 
+  ;; compress bodies over this size when the client accepts gzip and the
+  ;; content type is worth compressing (already-compressed formats like
+  ;; images are skipped)
+  (define gzip-min-size 1024)
+
+  (define (compressible-type? ctype)
+    (let ((prefixes '("text/" "application/json" "application/javascript"
+                      "application/xml" "image/svg+xml")))
+      (exists (lambda (p)
+                (and (>= (string-length ctype) (string-length p))
+                     (string=? (substring ctype 0 (string-length p)) p)))
+              prefixes)))
+
   (define (finish! r ctype body)
     (set-header! r "Content-Type" ctype)
-    (res-send! r body))
+    (let ((ae (req-header (res-req r) 'accept-encoding)))
+      (if (and (> (bytevector-length body) gzip-min-size)
+               (compressible-type? ctype)
+               (gzip-acceptable? ae))
+          (let ((gz (gzip-compress body 6)))
+            (if gz
+                (begin
+                  (set-header! r "Content-Encoding" "gzip")
+                  (set-header! r "Vary" "Accept-Encoding")
+                  (res-send! r gz))
+                (res-send! r body)))          ; compression failed: send raw
+          (res-send! r body))))
 
   (define (send-text! r s) (finish! r "text/plain; charset=utf-8" (string->utf8 s)))
   (define (send-html! r s) (finish! r "text/html; charset=utf-8" (string->utf8 s)))
@@ -306,8 +331,10 @@
                  (let ((body (read-file-bv path)))
                    (and body
                         (let* ((size (bytevector-length body))
+                               ;; entry: #(mtime size etag ctype body gzip-box)
+                               ;; gzip-box holds the lazily-built gzip body
                                (e (vector mt size (etag-of size mt)
-                                          (mime-type path) body)))
+                                          (mime-type path) body (box #f))))
                           (when (<= size max-cache-file)
                             (hashtable-set! static-cache path e))
                           e))))))))
@@ -324,22 +351,44 @@
 
   ;; Serve a static file with caching + conditional request. abs-path is
   ;; already inside the mount root; caller has done the boundary check.
+  ;; gzip ETag differs from the plain one so a client cannot confuse the
+  ;; two representations: W/"..." -> W/"...-gz"
+  (define (gzip-etag etag)
+    (string-append (substring etag 0 (- (string-length etag) 1)) "-gz\""))
+
   (define (serve-static! r req abs-path)
     (if (path-has-dotdot? abs-path)
         (begin (set-status! r 403) (send-text! r "Forbidden"))
         (let ((e (static-entry abs-path)))
           (if (not e)
               (begin (set-status! r 404) (send-text! r "Not Found"))
-              (let ((etag (vector-ref e 2))
-                    (ctype (vector-ref e 3))
-                    (body (vector-ref e 4)))
-                (set-header! r "ETag" etag)
+              (let* ((size (vector-ref e 1))
+                     (etag (vector-ref e 2))
+                     (ctype (vector-ref e 3))
+                     (body (vector-ref e 4))
+                     (gzbox (vector-ref e 5))
+                     ;; use gzip when the client accepts it and it's worth it
+                     (gz (and (> size gzip-min-size)
+                              (compressible-type? ctype)
+                              (gzip-acceptable? (req-header req 'accept-encoding))
+                              (or (unbox gzbox)
+                                  (let ((g (gzip-compress body 6)))
+                                    (when g (set-box! gzbox g))
+                                    g))))
+                     (tag (if gz (gzip-etag etag) etag)))
+                (set-header! r "ETag" tag)
                 (set-header! r "Cache-Control" "public, max-age=3600")
-                (if (equal? (req-header req 'if-none-match) etag)
-                    ;; client already has this exact version
-                    (begin (set-status! r 304) (res-send! r (make-bytevector 0)))
-                    (begin (set-header! r "Content-Type" ctype)
-                           (res-send! r body))))))))
+                (when gz (set-header! r "Vary" "Accept-Encoding"))
+                (cond
+                  ((equal? (req-header req 'if-none-match) tag)
+                   (set-status! r 304) (res-send! r (make-bytevector 0)))
+                  (gz
+                   (set-header! r "Content-Encoding" "gzip")
+                   (set-header! r "Content-Type" ctype)
+                   (res-send! r gz))
+                  (else
+                   (set-header! r "Content-Type" ctype)
+                   (res-send! r body))))))))
 
   ;; ---- router -------------------------------------------------------------------
 

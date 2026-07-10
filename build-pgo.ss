@@ -18,8 +18,9 @@
 
 (define libs
   '("igropyr/libuv.sc" "igropyr/actor.sc" "igropyr/json.sc"
-    "igropyr/otp.sc" "igropyr/websocket.sc" "igropyr/gen-server.sc"
-    "igropyr/http.sc" "igropyr/pubsub.sc" "igropyr/express.sc"
+    "igropyr/gzip.sc" "igropyr/otp.sc" "igropyr/websocket.sc"
+    "igropyr/gen-server.sc" "igropyr/http.sc" "igropyr/pubsub.sc"
+    "igropyr/express.sc" "igropyr/client.sc"
     "igropyr/redis.sc" "igropyr/mysql.sc"))
 
 (parameterize ((optimize-level 3)
