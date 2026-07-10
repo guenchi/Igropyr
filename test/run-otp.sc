@@ -18,7 +18,7 @@
         (igropyr uv)
         (igropyr otp)
         (igropyr http)
-        (igropyr ws)
+        (igropyr websocket)
         (igropyr express))
 
 (define app (create-app))

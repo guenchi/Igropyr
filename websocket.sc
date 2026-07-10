@@ -1,5 +1,5 @@
 #!chezscheme
-;;; (igropyr ws) -- WebSocket (RFC 6455) codec and session primitives.
+;;; (igropyr websocket) -- WebSocket (RFC 6455) codec and session primitives.
 ;;;
 ;;; Pure protocol layer: SHA-1 + base64 for the upgrade handshake key,
 ;;; frame encoding/decoding (masking, fragmentation, ping/pong, close),
@@ -14,7 +14,7 @@
 ;;;
 ;;; ws-recv answers pings automatically and handles fragmented messages.
 
-(library (igropyr ws)
+(library (igropyr websocket)
   (export ws-accept-key sha1 base64-encode
           make-ws ws? ws-conn
           ws-recv ws-send-text! ws-send-binary! ws-close!)

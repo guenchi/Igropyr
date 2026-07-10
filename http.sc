@@ -34,7 +34,7 @@
           res-conn res-status res-headers res-keep-alive?
           send-response!)
   (import (chezscheme) (igropyr actor) (igropyr uv) (igropyr otp)
-          (igropyr ws))
+          (igropyr websocket))
 
   (define header-limit 8192)
   (define body-limit 1048576)

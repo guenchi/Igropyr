@@ -199,7 +199,7 @@ process. Pings are answered and fragmented messages reassembled
 automatically.
 
 ```scheme
-(import (igropyr ws))
+(import (igropyr websocket))
 
 (app-ws app "/ws"                      ; :param segments work here too
   (lambda (ws req)
@@ -242,8 +242,8 @@ otp.sc     supervisor + fixed worker pool + stuck-worker ticker
 http.sc    core: incremental HTTP/1.1 parser (content-length + chunked),
            connection lifecycle, response encoding, websocket upgrade,
            http-listen / http-swap! / http-set-ws!
-ws.sc      WebSocket codec: SHA-1/base64 handshake key, frame
-           encode/decode, ws-recv / ws-send-text! / ws-close!
+websocket.sc  WebSocket codec: SHA-1/base64 handshake key, frame
+              encode/decode, ws-recv / ws-send-text! / ws-close!
 express.sc framework layer (optional): router with :param segments,
            middleware chain, static files, app-ws, JSON/text/html/file
            encoders
