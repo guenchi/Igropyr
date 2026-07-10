@@ -12,7 +12,8 @@
 
 (library (igropyr uv)
   (export uv-init! uv-poll! now-ms uv-set-deliver!
-          tcp-listen! tcp-connect! tcp-read-start! tcp-write! tcp-close!
+          tcp-listen! tcp-stop-listen! tcp-connect!
+          tcp-read-start! tcp-write! tcp-close!
           conn? conn-handle conn-owner conn-set-owner!
           conn-state conn-responded? conn-set-responded!
           conn-count uv-strerror)
@@ -259,15 +260,25 @@
           (uv-run uv-loop UV-RUN-ONCE)
           (uv-timer-stop wakeup-timer))))
 
-  (define (tcp-listen! host port backlog on-accept)
+  ;; optional trailing arg: uv_tcp_bind flags (UV_TCP_REUSEPORT = 2,
+  ;; kernel-balanced multi-process listening; Linux/FreeBSD only)
+  (define (tcp-listen! host port backlog on-accept . opts)
     (set! accept-proc on-accept)
-    (let ((l (foreign-alloc tcp-handle-size)))
+    (let ((flags (if (pair? opts) (car opts) 0))
+          (l (foreign-alloc tcp-handle-size)))
       (check 'uv-tcp-init (uv-tcp-init uv-loop l))
       (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
-      (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf 0))
+      (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf flags))
       (check 'uv-listen (uv-listen l backlog on-connection-entry))
       (set! listener l)
       l))
+
+  ;; Stop accepting new connections (graceful shutdown step 1);
+  ;; established connections are unaffected.
+  (define (tcp-stop-listen!)
+    (when (> listener 0)
+      (uv-close listener on-close-entry)
+      (set! listener 0)))
 
   ;; Outbound TCP connection. The owner process later receives
   ;; #(tcp-connected ,conn) or #(tcp-connect-failed ,errno). Call

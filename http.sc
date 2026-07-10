@@ -28,12 +28,13 @@
 
 (library (igropyr http)
   (export http-listen http-swap! http-set-ws!
+          http-stats http-shutdown!
           req-method req-path req-query req-headers req-header req-body
           req-keep-alive? req-params req-params-set!
           set-status! set-header! res-send!
           res-begin! res-write! res-end!
           res-conn res-status res-headers res-keep-alive?
-          send-response!)
+          send-response! parse-query)
   (import (chezscheme) (igropyr actor) (igropyr uv) (igropyr otp)
           (igropyr websocket))
 
@@ -566,13 +567,37 @@
     (fields
       (immutable sup http-server-sup)
       (immutable hbox http-server-hbox)
-      (immutable wsbox http-server-wsbox)))
+      (immutable wsbox http-server-wsbox)
+      (immutable started http-server-started)))
 
   (define (http-swap! srv handler)
     (set-box! (http-server-hbox srv) handler))
 
   (define (http-set-ws! srv resolver)
     (set-box! (http-server-wsbox srv) resolver))
+
+  ;; runtime snapshot: open connections, total requests, uptime, and the
+  ;; worker pool's idle/busy/pending counters
+  (define (http-stats srv)
+    (append
+      (list (cons 'connections (conn-count))
+            (cons 'requests task-counter)
+            (cons 'uptime-ms (- (now-ms) (http-server-started srv))))
+      (pool-stats (http-server-sup srv))))
+
+  ;; Graceful shutdown: stop accepting, then wait until every accepted
+  ;; request has been answered (busy = pending = 0). Established
+  ;; keep-alive connections stay open but receive no new dispatches;
+  ;; their readers idle out. Call from a detached process, never from a
+  ;; pool worker (the worker itself counts as busy -- deadlock).
+  (define (http-shutdown! srv)
+    (tcp-stop-listen!)
+    (let drain ()
+      (let ((s (pool-stats (http-server-sup srv))))
+        (if (and (= 0 (cdr (assq 'busy s)))
+                 (= 0 (cdr (assq 'pending s))))
+            'done
+            (begin (sleep-ms 100) (drain))))))
 
   ;; Start the worker pool and the TCP listener; handler is
   ;; (lambda (req res) ...), run inside a pool worker for every request.
@@ -585,7 +610,10 @@
   ;;     '((workers . 16)        ; pool size            (default 8)
   ;;       (max-retries . 3)     ; crash retries        (default 3)
   ;;       (stuck-ms . 30000)    ; stuck-kill threshold (default 30000)
-  ;;       (check-ms . 5000)))   ; ticker interval      (default 5000)
+  ;;       (check-ms . 5000)     ; ticker interval      (default 5000)
+  ;;       (reuseport . #t)))    ; SO_REUSEPORT bind: run N OS processes
+  ;;                             ; on the same port, kernel-balanced
+  ;;                             ; (Linux/FreeBSD; not macOS)
   (define (http-listen port handler . rest)
     (define opts
       (cond
@@ -604,13 +632,14 @@
                   (opt 'max-retries 3)
                   (opt 'stuck-ms 30000)
                   (opt 'check-ms 5000)))
-           (srv (make-http-server sup hbox wsbox)))
+           (srv (make-http-server sup hbox wsbox (now-ms))))
       (tcp-listen! "0.0.0.0" port 511
         (lambda (c)
           ;; libuv callback context: spawn + register only, no yielding
           (let ((pid (spawn (make-reader c srv))))
             (conn-set-owner! c pid)
-            (tcp-read-start! c))))
+            (tcp-read-start! c)))
+        (if (opt 'reuseport #f) 2 0))   ; UV_TCP_REUSEPORT
       (display (string-append "igropyr listening on http://0.0.0.0:"
                               (number->string port) "\n"))
       srv))

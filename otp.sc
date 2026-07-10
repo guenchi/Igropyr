@@ -21,7 +21,7 @@
 ;;; Task shape (built by the http layer): #(task ,task-id ,conn ,request)
 
 (library (igropyr otp)
-  (export start-worker-pool)
+  (export start-worker-pool pool-stats)
   (import (chezscheme) (igropyr actor) (igropyr uv))
 
   (define default-max-retries 3)
@@ -148,8 +148,24 @@
             (set! idle (cons w idle)))
           (drain!))
         (`#(check-stuck-workers) (check-stuck!))
+        (`#(get-stats ,from ,ref)
+          (send from
+            (vector 'pool-stats ref
+              (list (cons 'idle (length idle))
+                    (cons 'busy (hashtable-size busy))
+                    (cons 'pending (+ (length pending-front)
+                                      (length pending-back)))))))
         (`#(DOWN ,w ,reason)
           (handle-down w reason)
           (drain!)))
       (loop)))
+
+  ;; synchronous stats snapshot from the supervisor
+  (define stats-ref 0)
+  (define (pool-stats sup)
+    (set! stats-ref (+ stats-ref 1))
+    (let ((ref stats-ref))
+      (send sup (vector 'get-stats self ref))
+      (receive (after 5000 (raise 'pool-stats-timeout))
+        (`#(pool-stats ,@ref ,s) s))))
 )
