@@ -12,7 +12,7 @@
 
 (library (igropyr uv)
   (export uv-init! uv-poll! now-ms uv-set-deliver!
-          tcp-listen! tcp-read-start! tcp-write! tcp-close!
+          tcp-listen! tcp-connect! tcp-read-start! tcp-write! tcp-close!
           conn? conn-handle conn-owner conn-set-owner!
           conn-state conn-responded? conn-set-responded!
           conn-count uv-strerror)
@@ -42,6 +42,7 @@
   (define uv-req-size    (foreign-procedure "uv_req_size" (int) size_t))
   (define uv-ip4-addr    (foreign-procedure "uv_ip4_addr" (string int void*) int))
   (define uv-tcp-init    (foreign-procedure "uv_tcp_init" (void* void*) int))
+  (define uv-tcp-connect (foreign-procedure "uv_tcp_connect" (void* void* void* void*) int))
   (define uv-tcp-bind    (foreign-procedure "uv_tcp_bind" (void* void* unsigned-int) int))
   (define uv-tcp-nodelay (foreign-procedure "uv_tcp_nodelay" (void* int) int))
   (define uv-listen      (foreign-procedure "uv_listen" (void* int void*) int))
@@ -58,9 +59,11 @@
   (define memcpy-from-c  (foreign-procedure "memcpy" (u8* void* size_t) void*))
   (define memcpy-to-c    (foreign-procedure "memcpy" (void* u8* size_t) void*))
 
+  (define UV-CONNECT 2)
   (define tcp-handle-size (uv-handle-size UV-TCP))
   (define timer-handle-size (uv-handle-size UV-TIMER))
   (define write-req-size (uv-req-size UV-WRITE))
+  (define connect-req-size (uv-req-size UV-CONNECT))
   (define buf-t-size 16)             ; uv_buf_t on arm64: {void* base; size_t len}
 
   ;; monotonic milliseconds
@@ -90,6 +93,8 @@
   ;;   into freed memory -- the classic crash under high concurrency.
   (define conn-table (make-eqv-hashtable))
   (define write-table (make-eqv-hashtable))
+  ;; pending outbound connects: req address -> (handle . owner-pid)
+  (define connect-table (make-eqv-hashtable))
   (define (conn-count) (hashtable-size conn-table))
 
   ;; delivery hook: (deliver owner-pid msg); installed by (igropyr actor)
@@ -181,6 +186,27 @@
       (void* int)
       void))
 
+  ;; connect_cb for outbound connections: register the conn and tell the
+  ;; owner process #(tcp-connected ,conn) or #(tcp-connect-failed ,errno).
+  (define on-connect-code
+    (foreign-callable
+      (lambda (req status)
+        (let ((entry (hashtable-ref connect-table req #f)))
+          (hashtable-delete! connect-table req)
+          (foreign-free req)
+          (when entry
+            (let ((handle (car entry)) (owner (cdr entry)))
+              (if (< status 0)
+                  (begin
+                    (uv-close handle on-close-entry)
+                    (deliver owner (vector 'tcp-connect-failed status)))
+                  (let ((c (make-conn handle owner 'open #f)))
+                    (uv-tcp-nodelay handle 1)
+                    (hashtable-set! conn-table handle c)
+                    (deliver owner (vector 'tcp-connected c))))))))
+      (void* int)
+      void))
+
   ;; timer_cb for the poll wakeup timer: exists only to bound the
   ;; blocking uv_run(ONCE) wait; does nothing.
   (define on-timer-code
@@ -198,15 +224,18 @@
       (lock-object on-close-code)
       (lock-object on-write-code)
       (lock-object on-connection-code)
+      (lock-object on-connect-code)
       (lock-object on-timer-code)
       (vector on-alloc-code on-read-code on-close-code
-              on-write-code on-connection-code on-timer-code)))
+              on-write-code on-connection-code on-connect-code
+              on-timer-code)))
 
   (define on-alloc-entry (foreign-callable-entry-point on-alloc-code))
   (define on-read-entry (foreign-callable-entry-point on-read-code))
   (define on-close-entry (foreign-callable-entry-point on-close-code))
   (define on-write-entry (foreign-callable-entry-point on-write-code))
   (define on-connection-entry (foreign-callable-entry-point on-connection-code))
+  (define on-connect-entry (foreign-callable-entry-point on-connect-code))
   (define on-timer-entry (foreign-callable-entry-point on-timer-code))
 
   ;; ---- public API ----------------------------------------------------
@@ -239,6 +268,23 @@
       (check 'uv-listen (uv-listen l backlog on-connection-entry))
       (set! listener l)
       l))
+
+  ;; Outbound TCP connection. The owner process later receives
+  ;; #(tcp-connected ,conn) or #(tcp-connect-failed ,errno). Call
+  ;; tcp-read-start! on the conn after the connected message arrives.
+  (define (tcp-connect! host port owner)
+    (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
+    (let ((h (foreign-alloc tcp-handle-size))
+          (req (foreign-alloc connect-req-size)))
+      (check 'uv-tcp-init (uv-tcp-init uv-loop h))
+      (hashtable-set! connect-table req (cons h owner))
+      (let ((r (uv-tcp-connect req h sockaddr-buf on-connect-entry)))
+        (when (< r 0)
+          (hashtable-delete! connect-table req)
+          (foreign-free req)
+          (uv-close h on-close-entry)
+          (error 'tcp-connect! (uv-strerror r)))
+        #t)))
 
   ;; Start delivering #(tcp-data ...) messages to the conn's owner.
   ;; Call after conn-set-owner!.
