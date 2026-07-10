@@ -15,17 +15,18 @@ This manual covers the architecture, design patterns, and implementation details
 7. [Hot Code Swapping and Graceful Shutdown](#hot-code-swapping-and-graceful-shutdown)
 8. [Fault Tolerance](#fault-tolerance)
 9. [OTP Patterns](#otp-patterns)
-10. [Middleware Suite](#middleware-suite)
-11. [Sessions](#sessions)
-12. [Metrics](#metrics)
-13. [Outbound HTTP Client](#outbound-http-client)
-14. [Database Clients](#database-clients)
-15. [Async File Reads](#async-file-reads)
-16. [JSON and gzip](#json-and-gzip)
-17. [Running and Building](#running-and-building)
-18. [Testing](#testing)
-19. [Code Style](#code-style)
-20. [Common Pitfalls](#common-pitfalls)
+10. [Conversations](#conversations)
+11. [Middleware Suite](#middleware-suite)
+12. [Sessions](#sessions)
+13. [Metrics](#metrics)
+14. [Outbound HTTP Client](#outbound-http-client)
+15. [Database Clients](#database-clients)
+16. [Async File Reads](#async-file-reads)
+17. [JSON and gzip](#json-and-gzip)
+18. [Running and Building](#running-and-building)
+19. [Testing](#testing)
+20. [Code Style](#code-style)
+21. [Common Pitfalls](#common-pitfalls)
 
 ---
 
@@ -1164,6 +1165,71 @@ Use **bare spawn** when:
 - The process is driven by external events (e.g., a WebSocket reader waiting for frames).
 - There's no request/reply pattern (one-way messages).
 - You want full control over the receive loop.
+
+---
+
+## Conversations
+
+`(igropyr conversation)` runs a multi-request dialogue as **one green
+process** — the actor-model formulation of "web programming with
+continuations". The process's local bindings are the conversation
+state, including live resources a session store cannot hold: an open
+database transaction, a file handle, a reservation with a TTL. Control
+flow is program text — "the user is at the confirm step" means the
+process is parked *at that line*, and a step order the code cannot
+express cannot happen.
+
+```scheme
+(app-post app "/transfer"
+  (lambda (req res)
+    (let-values (((id reply)
+                  (conversation-start!
+                    (lambda (req suspend!)
+                      (let ((tx (begin-tx!)))          ; live, held across rounds
+                        (guard (e (#t (rollback! tx) (raise e)))
+                          (let ((req2 (suspend! confirm-page-data)))
+                            (commit! tx)
+                            done-data))))
+                    req)))
+      (send-json! res (cons (cons 'conv id) reply)))))
+
+(app-post app "/transfer/:id"
+  (lambda (req res)
+    (let ((r (conversation-resume! (req-param req "id") req)))
+      (if (conversation-gone? r)
+          (begin (set-status! res 410)
+                 (send-json! res '((fault . "gone") (rolled-back . #t))))
+          (send-json! res r)))))
+```
+
+API: `(conversation-start! flow req [ttl-ms])` spawns the flow and
+returns `(values id first-reply)`; inside the flow, `(suspend! reply)`
+answers the current round and parks until the next
+`(conversation-resume! id req)`, which returns the flow's next reply —
+or `'gone`. The flow's return value is the final reply; the process
+then exits. Default TTL 300 000 ms; expiry raises
+`'conversation-expired` inside the flow so a `guard` can roll back.
+
+The conversation never touches the connection: pool workers stay the
+protocol adapters, parking until the flow replies, so the pool's
+stuck-killer and failure hook keep protecting every round.
+
+**The `gone` guarantee.** Death for any reason — crash, TTL, normal
+completion — automatically unregisters the process, and every later
+resume returns `'gone`. For a flow holding a database transaction,
+dead process = dropped connection = the database itself rolled back:
+`gone` *guarantees* nothing committed. Combined with the failure
+hook's `crash`/`stuck` codes, a client always knows the definite
+server state — the full remote transaction ring.
+
+**Where to use it** — critical transactional flows: payments against
+internal strong-transaction operations, booking (the seat hold is the
+process's local state and `after` is its TTL), strictly ordered
+protocol dialogues. **Where not to** — ordinary stateless requests
+(they should stay zero-state with client-carried retries), and any
+step that waits on *human* think time while holding row locks: hold
+application-level reservations across human pauses, live transactions
+only across machine-paced rounds.
 
 ---
 

@@ -12,11 +12,12 @@
 4. [编写 HTTP Handler](#编写-http-handler)
 5. [容错](#容错)
 6. [OTP 模式](#otp-模式)
-7. [数据库客户端](#数据库客户端)
-8. [运行和构建](#运行和构建)
-9. [测试](#测试)
-10. [代码风格](#代码风格)
-11. [常见陷阱](#常见陷阱)
+7. [对话](#对话)
+8. [数据库客户端](#数据库客户端)
+9. [运行和构建](#运行和构建)
+10. [测试](#测试)
+11. [代码风格](#代码风格)
+12. [常见陷阱](#常见陷阱)
 
 ---
 
@@ -945,6 +946,59 @@ pubsub library 提供按 topic 组织 subscriber 的中央 registry。publisher 
 - 进程由外部事件驱动（例如等待 frame 的 WebSocket reader）。
 - 没有 request/reply pattern（单向消息）。
 - 想要完全控制 receive loop。
+
+---
+
+## 对话
+
+`(igropyr conversation)` 把一个多请求对话作为**一个绿色进程**运行——
+"web programming with continuations" 的 actor 模型表述。进程的局部绑定
+就是对话状态，包括 session 存储永远放不进去的活资源：打开的数据库事务、
+文件句柄、带 TTL 的预订。控制流即程序文本——"用户在确认步"意味着进程
+就停在那一行；代码表达不出来的步骤顺序不可能发生。
+
+```scheme
+(app-post app "/transfer"
+  (lambda (req res)
+    (let-values (((id reply)
+                  (conversation-start!
+                    (lambda (req suspend!)
+                      (let ((tx (begin-tx!)))          ; 活事务，跨轮持有
+                        (guard (e (#t (rollback! tx) (raise e)))
+                          (let ((req2 (suspend! confirm-page-data)))
+                            (commit! tx)
+                            done-data))))
+                    req)))
+      (send-json! res (cons (cons 'conv id) reply)))))
+
+(app-post app "/transfer/:id"
+  (lambda (req res)
+    (let ((r (conversation-resume! (req-param req "id") req)))
+      (if (conversation-gone? r)
+          (begin (set-status! res 410)
+                 (send-json! res '((fault . "gone") (rolled-back . #t))))
+          (send-json! res r)))))
+```
+
+API：`(conversation-start! flow req [ttl-ms])` 生成 flow 进程，返回
+`(values id 首轮回复)`；flow 内部 `(suspend! reply)` 应答当前轮并停车，
+直到下一次 `(conversation-resume! id req)`——后者返回 flow 的下一轮回复，
+或 `'gone`。flow 的返回值即最终回复，随后进程退出。默认 TTL 300 000 ms；
+过期在 flow 内 raise `'conversation-expired`，`guard` 里做回滚。
+
+对话进程从不接触连接：池 worker 仍是协议适配层，停车等 flow 出回复。
+因此池的 stuck-killer 与故障钩子继续保护每一轮。
+
+**`gone` 保证。** 进程因任何原因死亡——崩溃、TTL、正常结束——注册名
+自动清除，之后所有 resume 都返回 `'gone`。对持有数据库事务的 flow：
+进程死 = 连接断 = 数据库自己回滚，`gone` **保证**没有提交。与故障钩子
+的 `crash`/`stuck` code 合起来，客户端对服务端状态的认知完备——完整的
+远程事务环。
+
+**用在哪**——关键事务流程：内部强事务操作的支付、预订（座位锁就是进程
+局部状态，`after` 就是它的 TTL）、严格顺序的协议对话。**不用在哪**——
+普通无状态请求（应保持归零 + 客户端带状态重试）；以及任何持有行锁等待
+**人**思考的步骤：人的停顿用应用级预留跨越，活事务只跨机器节奏的轮次。
 
 ---
 

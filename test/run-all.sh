@@ -20,6 +20,7 @@ export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm
 "$scheme_bin" --script igropyr/test/file-read.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
 "$scheme_bin" --script igropyr/test/fault-hook.sc
+"$scheme_bin" --script igropyr/test/conversation.sc
 
 set +e
 boot_output=$("$scheme_bin" --script igropyr/test/smoke-boot-failure.sc 2>&1)

@@ -24,6 +24,7 @@
     ("igropyr/websocket.sc" . 2)
     ("igropyr/ws-client.sc" . 2)
     ("igropyr/gen-server.sc" . 2)
+    ("igropyr/conversation.sc" . 2)
     ("igropyr/http.sc" . 2)
     ("igropyr/pubsub.sc" . 2)
     ("igropyr/express.sc" . 2)

@@ -25,6 +25,12 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
   of the plain 500, on the same keep-alive connection — the client
   resubmits (changed parameters, carried state) and gets a fresh retry
   round; unset, the plain 500 remains
+- **Conversations (process-per-dialogue)** — a multi-request dialogue
+  (wizard, booking, transfer) runs as one green process holding live
+  state — even an open database transaction — across rounds;
+  `suspend!` answers and parks, `conversation-resume!` continues, and
+  death for any reason (crash, TTL) means guaranteed rollback: a later
+  resume gets `gone`
 - **Hot code swapping** — replace the handler (or individual routes) on a
   live server: the listener, open connections and worker pool stay up,
   in-flight requests finish on the old code

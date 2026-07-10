@@ -21,7 +21,8 @@
         (igropyr express)
         (igropyr websocket)
         (igropyr json)
-        (igropyr pubsub))
+        (igropyr pubsub)
+        (igropyr conversation))
 
 (define app (create-app))
 
@@ -161,6 +162,51 @@
       (lambda (req res)
         (send-text! res "v2 (hot swapped)")))
     (send-text! res "upgraded")))
+
+;; Conversation demo: a two-step transfer as one process. POST /transfer
+;; with an amount provisionally holds it and answers a conversation id;
+;; POST /transfer/:id with "confirm" commits, anything else cancels.
+;; Abandoning the dialogue (TTL) or a crash rolls the hold back -- the
+;; guard around the suspend! IS the transaction boundary. A resume after
+;; the conversation ended gets 410 Gone: guaranteed rolled back.
+(define account (box 1000))
+(app-post app "/transfer"
+  (lambda (req res)
+    (let ((amt (or (string->number (utf8->string (req-body req))) 0)))
+      (if (or (<= amt 0) (> amt (unbox account)))
+          (begin (set-status! res 400)
+                 (send-json! res (list (cons 'error "bad amount"))))
+          (let-values (((id reply)
+                        (conversation-start!
+                          (lambda (req suspend!)
+                            (set-box! account (- (unbox account) amt))  ; hold
+                            (guard (e (#t (set-box! account (+ (unbox account) amt))
+                                          (raise e)))                   ; roll back
+                              (let ((req2 (suspend! (list (cons 'step "confirm")
+                                                          (cons 'amount amt)))))
+                                (if (equal? (utf8->string (req-body req2)) "confirm")
+                                    (list (cons 'done #t)
+                                          (cons 'balance (unbox account)))
+                                    (begin
+                                      (set-box! account (+ (unbox account) amt))
+                                      (list (cons 'done #f)
+                                            (cons 'cancelled #t)))))))
+                          req
+                          15000)))                                      ; demo TTL 15s
+            (send-json! res (cons (cons 'conv id) reply)))))))
+
+(app-post app "/transfer/:id"
+  (lambda (req res)
+    (let ((r (conversation-resume! (req-param req "id") req)))
+      (if (conversation-gone? r)
+          (begin (set-status! res 410)
+                 (send-json! res (list (cons 'fault "gone")
+                                       (cons 'rolled-back #t))))
+          (send-json! res r)))))
+
+(app-get app "/transfer-balance"
+  (lambda (req res)
+    (send-json! res (list (cons 'balance (unbox account))))))
 
 ;; Chat rooms: WebSocket + PubSub. Every message a client sends is
 ;; published to its room topic; a forwarder process per connection
