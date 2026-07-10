@@ -88,6 +88,15 @@
 
 (app-static app "/static" "./public")
 
+;; Admin endpoint: dump PGO profile counters to disk. Only meaningful on
+;; a profiling build (compiled with compile-profile); a no-op otherwise.
+;; Pooled (not fast) since it has a side effect.
+(app-get app "/admin/profdump"
+  (lambda (req res)
+    (guard (e (#t (send-text! res "no profile data")))
+      (profile-dump-data "app.profile")
+      (send-text! res "profile dumped to app.profile"))))
+
 ;; Forms: urlencoded and multipart both land in req-form; file uploads
 ;; arrive as #(file name content-type bytes)
 (app-post app "/form"

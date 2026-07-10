@@ -539,6 +539,14 @@ Re-run the build after editing any source. Interrupt traps stay enabled
 checks; the bytevector loops are all guarded and the full test suite is
 run after each build to confirm.
 
+Profile-guided optimization (`build-profile.ss` to instrument,
+`/admin/profdump` to collect after driving load, `build-pgo.ss` to
+recompile with the profile) is available but **measured no improvement
+here** — for an I/O-bound server whose per-request cost is syscalls,
+message passing, and scheduling, there is no hot/cold branch structure
+for PGO to reorder, and whole-program already inlines across libraries.
+Keep it in mind only if you add branch-heavy CPU-bound handlers.
+
 Note on where the time goes: for a trivial handler the per-request cost
 is dominated by syscalls, HTTP parsing, and message passing, not Scheme
 arithmetic, so compilation buys only a few percent there — it matters
