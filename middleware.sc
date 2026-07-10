@@ -85,24 +85,41 @@
   ;; key on something else. Options: 'max (default 100), 'window ms
   ;; (default 60000), 'key.
   (define (make-rate-store)
-    (gen-server-start
-      (lambda () (make-hashtable string-hash string=?))
-      ;; call #(check key max window) -> 'ok | 'limited
-      (lambda (msg from tbl)
-        (let ((key (vector-ref msg 1))
-              (limit (vector-ref msg 2))
-              (window (vector-ref msg 3))
-              (now (now-ms)))
-          (let ((entry (hashtable-ref tbl key #f)))
-            (cond
-              ((or (not entry) (> now (cdr entry)))   ; new window
-               (hashtable-set! tbl key (cons 1 (+ now window)))
-               (values 'ok tbl))
-              ((< (car entry) limit)
-               (set-car! entry (+ 1 (car entry)))
-               (values 'ok tbl))
-              (else (values 'limited tbl))))))
-      (lambda (msg tbl) tbl)))
+    (let ((store
+           (gen-server-start
+             (lambda () (make-hashtable string-hash string=?))
+             ;; call #(check key max window) -> 'ok | 'limited
+             (lambda (msg from tbl)
+               (let ((key (vector-ref msg 1))
+                     (limit (vector-ref msg 2))
+                     (window (vector-ref msg 3))
+                     (now (now-ms)))
+                 (let ((entry (hashtable-ref tbl key #f)))
+                   (cond
+                     ((or (not entry) (> now (cdr entry)))   ; new window
+                      (hashtable-set! tbl key (cons 1 (+ now window)))
+                      (values 'ok tbl))
+                     ((< (car entry) limit)
+                      (set-car! entry (+ 1 (car entry)))
+                      (values 'ok tbl))
+                     (else (values 'limited tbl))))))
+             ;; cast 'prune: drop keys whose window has elapsed, so a
+             ;; long-lived limiter does not accumulate stale IPs
+             (lambda (msg tbl)
+               (when (eq? (vector-ref msg 0) 'prune)
+                 (let ((now (now-ms)))
+                   (let-values (((ks vs) (hashtable-entries tbl)))
+                     (vector-for-each
+                       (lambda (k v) (when (< (cdr v) now) (hashtable-delete! tbl k)))
+                       ks vs))))
+               tbl))))
+      ;; prune once a minute
+      (spawn (lambda ()
+               (let loop ()
+                 (sleep-ms 60000)
+                 (gen-server-cast store (vector 'prune))
+                 (loop))))
+      store))
 
   (define (default-rate-key req)
     (or (req-header req 'x-forwarded-for) "global"))

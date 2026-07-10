@@ -245,6 +245,11 @@
     (when (> (fs-op-data op) 0) (foreign-free (fs-op-data op)))
     (when (> (fs-op-buf op) 0) (foreign-free (fs-op-buf op)))
     (hashtable-delete! fs-table req)
+    ;; release libuv's internal req resources before freeing the memory.
+    ;; Idempotent, so it is safe even where a step already cleaned the req
+    ;; (this is the single point that covers the stat/open failure paths,
+    ;; which reach here via fs-fail! without an earlier cleanup).
+    (uv-fs-req-cleanup req)
     (foreign-free req))
 
   (define (fs-fail! op req errno)

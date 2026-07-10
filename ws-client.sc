@@ -116,19 +116,25 @@
                             needle) #t)
                  (else (search (+ i 1)))))))))
 
+  (define max-handshake-header 16384)   ; cap on the 101 response headers
+
   ;; read until the response headers are complete, then verify
   (define (await-handshake c key buf)
     (let ((hend (find-header-end buf)))
-      (if hend
-          (if (verify-response buf (+ hend 2) key)
-              ;; leftover bytes after \r\n\r\n belong to the ws stream
-              (make-ws-client c (bv-sub buf (+ hend 4) (bytevector-length buf)))
-              (begin (tcp-close! c) (fail "handshake rejected")))
-          (receive (after connect-timeout-ms
-                      (tcp-close! c) (fail "handshake timeout"))
-            (`#(tcp-data ,bv) (await-handshake c key (bv-append buf bv)))
-            (`#(tcp-eof) (tcp-close! c) (fail "connection closed during handshake"))
-            (`#(tcp-error ,e) (tcp-close! c) (fail "connection error"))))))
+      (cond
+        (hend
+         (if (verify-response buf (+ hend 2) key)
+             ;; leftover bytes after \r\n\r\n belong to the ws stream
+             (make-ws-client c (bv-sub buf (+ hend 4) (bytevector-length buf)))
+             (begin (tcp-close! c) (fail "handshake rejected"))))
+        ((> (bytevector-length buf) max-handshake-header)
+         (tcp-close! c) (fail "handshake header too large"))
+        (else
+         (receive (after connect-timeout-ms
+                     (tcp-close! c) (fail "handshake timeout"))
+           (`#(tcp-data ,bv) (await-handshake c key (bv-append buf bv)))
+           (`#(tcp-eof) (tcp-close! c) (fail "connection closed during handshake"))
+           (`#(tcp-error ,e) (tcp-close! c) (fail "connection error")))))))
 
   ;; ---- public API ------------------------------------------------------
 

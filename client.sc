@@ -23,6 +23,7 @@
 
   (define default-timeout-ms 30000)
   (define default-port 80)
+  (define max-response 33554432)      ; 32 MiB response cap (DoS guard)
 
   ;; ---- bytevector helpers ---------------------------------------------
 
@@ -223,8 +224,11 @@
     (receive (after timeout (err! "response timeout"))
       (`#(tcp-data ,bv)
         (let ((buf (bv-append buf bv)))
-          (if eof-mode
-              (client-loop c caller ref buf eof-mode timeout)
+          (cond
+            ((> (bytevector-length buf) max-response) (err! "response too large"))
+            (eof-mode
+              (client-loop c caller ref buf eof-mode timeout))
+            (else
               (let ((res (parse-response buf)))
                 (case (vector-ref res 0)
                   ((done) (reply! (vector-ref res 1)))
@@ -232,7 +236,7 @@
                    (client-loop c caller ref buf
                      (list (vector-ref res 1) (vector-ref res 2) (vector-ref res 3))
                      timeout))
-                  (else (client-loop c caller ref buf #f timeout)))))))
+                  (else (client-loop c caller ref buf #f timeout))))))))
       (`#(tcp-eof)
         (if eof-mode
             (reply! (make-response (car eof-mode) (cadr eof-mode)
@@ -267,7 +271,13 @@
                 (`#(dns-resolved ,ip)
                   (tcp-connect! ip port self)
                   (receive (after timeout
-                              (send caller (vector 'http-error ref "connect timeout")))
+                              (send caller (vector 'http-error ref "connect timeout"))
+                              ;; the connect is still in flight; if it
+                              ;; lands after we gave up, close it so the
+                              ;; conn/fd is not leaked
+                              (receive (after 5000 'done)
+                                (`#(tcp-connected ,c) (tcp-close! c))
+                                (`#(tcp-connect-failed ,e) 'done)))
                     (`#(tcp-connected ,c)
                       (tcp-read-start! c)
                       (tcp-write! c (build-request method host path headers body) #f)
