@@ -18,6 +18,7 @@
         (igropyr uv)
         (igropyr otp)
         (igropyr http)
+        (igropyr ws)
         (igropyr express))
 
 (define app (create-app))
@@ -83,6 +84,36 @@
     (let loop ((n 0)) (loop (+ n 1)))))
 
 (app-static app "/static" "./public")
+
+;; Hot reload demo: registering a route that already exists replaces it
+;; in the live app -- no restart, listener and connections untouched.
+;; GET /version -> "v1"; GET /upgrade swaps it; GET /version -> "v2".
+(app-get app "/version"
+  (lambda (req res)
+    (send-text! res "v1")))
+
+(app-get app "/upgrade"
+  (lambda (req res)
+    (app-get app "/version"
+      (lambda (req res)
+        (send-text! res "v2 (hot swapped)")))
+    (send-text! res "upgraded")))
+
+;; WebSocket echo: each connection runs in its own process; server push
+;; is just (ws-send-text! ws ...) from anywhere holding the ws.
+(app-ws app "/ws"
+  (lambda (ws req)
+    (ws-send-text! ws "welcome")
+    (let loop ()
+      (let ((m (ws-recv ws)))
+        (case (vector-ref m 0)
+          ((text)
+           (ws-send-text! ws (string-append "echo: " (vector-ref m 1)))
+           (loop))
+          ((binary)
+           (ws-send-binary! ws (vector-ref m 1))
+           (loop))
+          (else 'closed))))))
 
 (start-scheduler
   (lambda ()

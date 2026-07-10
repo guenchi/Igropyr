@@ -18,7 +18,7 @@
 
 (library (igropyr express)
   (export create-app app-get app-post app-put app-delete
-          app-use app-static app-listen app->handler
+          app-use app-static app-ws app-listen app->handler
           req-param
           send-text! send-html! send-json! send-file!)
   (import (chezscheme) (igropyr actor) (igropyr http))
@@ -177,14 +177,23 @@
     (fields
       (mutable routes app-routes app-routes-set!)       ; list of #(method segs handler)
       (mutable middlewares app-middlewares app-middlewares-set!)
-      (mutable statics app-statics app-statics-set!)))  ; list of (prefix . root)
+      (mutable statics app-statics app-statics-set!)    ; list of (prefix . root)
+      (mutable ws-routes app-ws-routes app-ws-routes-set!))) ; list of (segs . session)
 
-  (define (create-app) (make-app-record '() '() '()))
+  (define (create-app) (make-app-record '() '() '() '()))
 
+  ;; Registering a route that already exists (same method + pattern)
+  ;; REPLACES it -- this is what makes hot reloading work: re-evaluating
+  ;; a routes file against a live app swaps the handlers in place.
   (define (add-route! a method pattern handler)
-    (app-routes-set! a
-      (append (app-routes a)
-              (list (vector method (split-segments pattern) handler)))))
+    (let ((segs (split-segments pattern)))
+      (app-routes-set! a
+        (append
+          (filter (lambda (r)
+                    (not (and (eq? (vector-ref r 0) method)
+                              (equal? (vector-ref r 1) segs))))
+                  (app-routes a))
+          (list (vector method segs handler))))))
 
   (define (app-get a pattern handler) (add-route! a 'GET pattern handler))
   (define (app-post a pattern handler) (add-route! a 'POST pattern handler))
@@ -197,6 +206,29 @@
 
   (define (app-static a prefix root)
     (app-statics-set! a (append (app-statics a) (list (cons prefix root)))))
+
+  ;; websocket route: session is (lambda (ws req) ...), run in the
+  ;; connection's own process; :param segments work as in app-get
+  (define (app-ws a pattern session)
+    (let ((segs (split-segments pattern)))
+      (app-ws-routes-set! a
+        (append
+          (filter (lambda (r) (not (equal? (car r) segs)))
+                  (app-ws-routes a))
+          (list (cons segs session))))))
+
+  ;; resolver handed to the core: request -> session procedure or #f
+  (define (ws-resolver a)
+    (lambda (req)
+      (let ((segs (split-segments (req-path req))))
+        (let loop ((rs (app-ws-routes a)))
+          (cond
+            ((null? rs) #f)
+            (else
+             (let ((params (match-segments (caar rs) segs)))
+               (if params
+                   (begin (req-params-set! req params) (cdar rs))
+                   (loop (cdr rs))))))))))
 
   (define (try-static a req r)
     (and (eq? (req-method req) 'GET)
@@ -239,6 +271,11 @@
          (lambda () (route-dispatch a req r))
          (app-middlewares a)))))
 
+  ;; Returns the http-server, so callers can http-swap! the whole
+  ;; handler later. Route/middleware mutations on the app are live
+  ;; anyway (app->handler reads the app on every request).
   (define (app-listen a port . opts)
-    (apply http-listen port (app->handler a) opts))
+    (let ((srv (apply http-listen port (app->handler a) opts)))
+      (http-set-ws! srv (ws-resolver a))
+      srv))
 )

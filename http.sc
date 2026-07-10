@@ -27,13 +27,14 @@
 ;;;   request (keep-alive) or closes the connection.
 
 (library (igropyr http)
-  (export http-listen
+  (export http-listen http-swap! http-set-ws!
           req-method req-path req-query req-headers req-header req-body
           req-keep-alive? req-params req-params-set!
           set-status! set-header! res-send!
           res-conn res-status res-headers res-keep-alive?
           send-response!)
-  (import (chezscheme) (igropyr actor) (igropyr uv) (igropyr otp))
+  (import (chezscheme) (igropyr actor) (igropyr uv) (igropyr otp)
+          (igropyr ws))
 
   (define header-limit 8192)
   (define body-limit 1048576)
@@ -190,6 +191,16 @@
     (let ((p (assq 'content-length headers)))
       (if p (or (string->number (cdr p)) 0) 0)))
 
+  (define (chunked-body? headers)
+    (let ((p (assq 'transfer-encoding headers)))
+      (and p (string-ci=? (cdr p) "chunked"))))
+
+  ;; websocket upgrade request? returns the Sec-WebSocket-Key or #f
+  (define (websocket-key headers)
+    (let ((u (assq 'upgrade headers))
+          (k (assq 'sec-websocket-key headers)))
+      (and u k (string-ci=? (cdr u) "websocket") (cdr k))))
+
   (define (keep-alive? version headers)
     (let* ((p (assq 'connection headers))
            (cn (and p (string-downcase (cdr p)))))
@@ -283,6 +294,71 @@
     (let ((c (vector-ref task 2)))
       (quick-response! c 500 "Internal Server Error")))
 
+  ;; ---- chunked transfer-encoding (request side) ----------------------------------
+
+  (define (find-crlf bv start)
+    (let ((n (bytevector-length bv)))
+      (let loop ((i start))
+        (cond
+          ((>= (+ i 1) n) #f)
+          ((and (fx= (bytevector-u8-ref bv i) 13)
+                (fx= (bytevector-u8-ref bv (+ i 1)) 10))
+           i)
+          (else (loop (+ i 1)))))))
+
+  ;; hex chunk size, stopping at ';' (chunk extensions); #f if malformed
+  (define (parse-chunk-size bv start end)
+    (let loop ((i start) (v 0) (any #f))
+      (if (= i end)
+          (and any v)
+          (let ((b (bytevector-u8-ref bv i)))
+            (cond
+              ((= b 59) (and any v))                                 ; ';'
+              ((and (>= b 48) (<= b 57)) (loop (+ i 1) (+ (* v 16) (- b 48)) #t))
+              ((and (>= b 97) (<= b 102)) (loop (+ i 1) (+ (* v 16) (- b 87)) #t))
+              ((and (>= b 65) (<= b 70)) (loop (+ i 1) (+ (* v 16) (- b 55)) #t))
+              (else #f))))))
+
+  (define (bv-concat lst total)
+    (let ((out (make-bytevector total)))
+      (let loop ((l lst) (off 0))
+        (if (null? l)
+            out
+            (let ((x (car l)))
+              (bytevector-copy! x 0 out off (bytevector-length x))
+              (loop (cdr l) (+ off (bytevector-length x))))))))
+
+  ;; Try to parse a complete chunked body starting at `start`.
+  ;; -> (values 'done body end-index) | (values 'more #f #f)
+  ;;  | (values 'too-large #f #f) | (values 'bad #f #f)
+  (define (parse-chunked-body bv start)
+    (let loop ((pos start) (chunks '()) (len 0))
+      (let ((eol (find-crlf bv pos)))
+        (if (not eol)
+            (if (> (- (bytevector-length bv) start) (+ body-limit 1024))
+                (values 'too-large #f #f)
+                (values 'more #f #f))
+            (let ((size (parse-chunk-size bv pos eol)))
+              (cond
+                ((not size) (values 'bad #f #f))
+                ((> (+ len size) body-limit) (values 'too-large #f #f))
+                ((= size 0)
+                 ;; skip optional trailers; a blank line ends the body
+                 (let scan ((p (+ eol 2)))
+                   (let ((e2 (find-crlf bv p)))
+                     (cond
+                       ((not e2) (values 'more #f #f))
+                       ((= e2 p)
+                        (values 'done (bv-concat (reverse chunks) len) (+ p 2)))
+                       (else (scan (+ e2 2)))))))
+                (else
+                 (let ((dstart (+ eol 2)))
+                   (if (< (bytevector-length bv) (+ dstart size 2))
+                       (values 'more #f #f)
+                       (loop (+ dstart size 2)   ; data + trailing CRLF
+                             (cons (bv-sub bv dstart (+ dstart size)) chunks)
+                             (+ len size)))))))))))
+
   ;; ---- reader process ----------------------------------------------------------
 
   (define task-counter 0)
@@ -290,14 +366,14 @@
     (set! task-counter (+ task-counter 1))
     task-counter)
 
-  (define (make-reader c sup)
-    (lambda () (reader-loop c sup empty-bv)))
+  (define (make-reader c srv)
+    (lambda () (reader-loop c srv empty-bv)))
 
-  (define (reader-loop c sup acc)
+  (define (reader-loop c srv acc)
     (conn-set-responded! c #f)
     (let ((hend (find-header-end acc)))
       (cond
-        (hend (have-header c sup acc hend))
+        (hend (have-header c srv acc hend))
         ((> (bytevector-length acc) header-limit)
          (quick-response! c 431 "Header Too Large"))
         (else
@@ -305,69 +381,145 @@
                      (if (> (bytevector-length acc) 0)
                          (quick-response! c 408 "Request Timeout")
                          (tcp-close! c)))   ; idle connection: just close
-           (`#(tcp-data ,bv) (reader-loop c sup (bv-append acc bv)))
+           (`#(tcp-data ,bv) (reader-loop c srv (bv-append acc bv)))
            (`#(tcp-eof) (tcp-close! c))
            (`#(tcp-error ,e) (tcp-close! c)))))))
 
-  (define (have-header c sup acc hend)
+  (define (have-header c srv acc hend)
     (let ((parsed (parse-head acc hend)))
       (if (not parsed)
           (quick-response! c 400 "Bad Request")
-          (let ((clen (content-length (vector-ref parsed 4))))
-            (if (> clen body-limit)
-                (quick-response! c 413 "Payload Too Large")
-                (collect-body c sup acc parsed (+ hend 4 clen)))))))
+          (let* ((headers (vector-ref parsed 4))
+                 (wskey (websocket-key headers))
+                 (resolver (unbox (http-server-wsbox srv))))
+            (cond
+              ;; websocket upgrade: resolve a session, shake hands, and
+              ;; run the session in this reader process
+              ((and wskey resolver)
+               (let* ((req (make-request (vector-ref parsed 0)
+                                         (vector-ref parsed 1)
+                                         (vector-ref parsed 2)
+                                         '() headers empty-bv #f))
+                      (session (resolver req)))
+                 (if session
+                     (run-ws-session c acc hend wskey req session)
+                     (quick-response! c 404 "Not Found"))))
+              ((chunked-body? headers)
+               (collect-chunked c srv acc parsed (+ hend 4)))
+              (else
+               (let ((clen (content-length headers)))
+                 (if (> clen body-limit)
+                     (quick-response! c 413 "Payload Too Large")
+                     (collect-body c srv acc parsed (+ hend 4 clen))))))))))
 
-  (define (collect-body c sup acc parsed total)
+  ;; hand the parsed request to the worker pool, then await the response
+  (define (dispatch-request! c srv parsed body leftover)
+    (let* ((headers (vector-ref parsed 4))
+           (req (make-request (vector-ref parsed 0)
+                              (vector-ref parsed 1)
+                              (vector-ref parsed 2)
+                              '()
+                              headers
+                              body
+                              (keep-alive? (vector-ref parsed 3) headers)))
+           (id (next-task-id!)))
+      (send (http-server-sup srv) (vector 'submit-task (vector 'task id c req)))
+      (await-response c srv leftover #f)))
+
+  (define (collect-body c srv acc parsed total)
     (if (>= (bytevector-length acc) total)
-        (let* ((headers (vector-ref parsed 4))
-               (body-start (- total (content-length headers)))
-               (body (bv-sub acc body-start total))
-               (leftover (bv-sub acc total (bytevector-length acc)))
-               (req (make-request (vector-ref parsed 0)
-                                  (vector-ref parsed 1)
-                                  (vector-ref parsed 2)
-                                  '()
-                                  headers
-                                  body
-                                  (keep-alive? (vector-ref parsed 3) headers)))
-               (id (next-task-id!)))
-          (send sup (vector 'submit-task (vector 'task id c req)))
-          (await-response c sup leftover #f))
+        (let ((body-start (- total (content-length (vector-ref parsed 4)))))
+          (dispatch-request! c srv parsed
+            (bv-sub acc body-start total)
+            (bv-sub acc total (bytevector-length acc))))
         (receive (after read-timeout-ms (quick-response! c 408 "Request Timeout"))
-          (`#(tcp-data ,bv) (collect-body c sup (bv-append acc bv) parsed total))
+          (`#(tcp-data ,bv) (collect-body c srv (bv-append acc bv) parsed total))
           (`#(tcp-eof) (tcp-close! c))
           (`#(tcp-error ,e) (tcp-close! c)))))
 
+  (define (collect-chunked c srv acc parsed body-start)
+    (let-values (((st body end) (parse-chunked-body acc body-start)))
+      (case st
+        ((done)
+         (dispatch-request! c srv parsed body
+           (bv-sub acc end (bytevector-length acc))))
+        ((more)
+         (receive (after read-timeout-ms (quick-response! c 408 "Request Timeout"))
+           (`#(tcp-data ,bv) (collect-chunked c srv (bv-append acc bv) parsed body-start))
+           (`#(tcp-eof) (tcp-close! c))
+           (`#(tcp-error ,e) (tcp-close! c))))
+        ((too-large) (quick-response! c 413 "Payload Too Large"))
+        (else (quick-response! c 400 "Bad Request")))))
+
   ;; Wait for the worker's response to complete. Data arriving meanwhile
   ;; (pipelining) is buffered; EOF is remembered so we stop after replying.
-  (define (await-response c sup leftover eof?)
+  (define (await-response c srv leftover eof?)
     (receive (after await-timeout-ms (tcp-close! c))
       (`#(next-request)
-        (if eof? (tcp-close! c) (reader-loop c sup leftover)))
+        (if eof? (tcp-close! c) (reader-loop c srv leftover)))
       (`#(conn-closed) 'done)
-      (`#(tcp-data ,bv) (await-response c sup (bv-append leftover bv) eof?))
-      (`#(tcp-eof) (await-response c sup leftover #t))
-      (`#(tcp-error ,e) (await-response c sup leftover #t))))
+      (`#(tcp-data ,bv) (await-response c srv (bv-append leftover bv) eof?))
+      (`#(tcp-eof) (await-response c srv leftover #t))
+      (`#(tcp-error ,e) (await-response c srv leftover #t))))
+
+  ;; ---- websocket session ---------------------------------------------------------
+
+  ;; 101 handshake, then hand the connection to the session procedure,
+  ;; still inside this reader process (one process per ws connection).
+  ;; A crashing session just closes its own connection.
+  (define (run-ws-session c acc hend key req session)
+    (conn-set-responded! c #t)
+    (tcp-write! c
+      (string->utf8
+        (string-append
+          "HTTP/1.1 101 Switching Protocols\r\n"
+          "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+          "Sec-WebSocket-Accept: " (ws-accept-key key)
+          "\r\n\r\n"))
+      #f)
+    (let ((w (make-ws c (bv-sub acc (+ hend 4) (bytevector-length acc)))))
+      (guard (e (#t (void)))
+        (session w req))
+      (ws-close! w)))
 
   ;; ---- listen ------------------------------------------------------------------
+
+  ;; The running server: worker-pool supervisor plus two swappable slots.
+  ;; hbox holds the (lambda (req res)) handler -- replacing it with
+  ;; http-swap! upgrades the code with zero downtime (in-flight requests
+  ;; finish on the old handler; new requests get the new one).
+  ;; wsbox holds the websocket resolver: (lambda (req) session-or-#f).
+  (define-record-type (http-server make-http-server http-server?)
+    (fields
+      (immutable sup http-server-sup)
+      (immutable hbox http-server-hbox)
+      (immutable wsbox http-server-wsbox)))
+
+  (define (http-swap! srv handler)
+    (set-box! (http-server-hbox srv) handler))
+
+  (define (http-set-ws! srv resolver)
+    (set-box! (http-server-wsbox srv) resolver))
 
   ;; Start the worker pool and the TCP listener; handler is
   ;; (lambda (req res) ...), run inside a pool worker for every request.
   ;; Must run inside the scheduler (call from the start-scheduler boot
-  ;; thunk). Returns the supervisor pid.
+  ;; thunk). Returns an http-server usable with http-swap!/http-set-ws!.
   (define (http-listen port handler . opts)
     (let* ((nworkers (if (pair? opts) (car opts) 8))
+           (hbox (box handler))
+           (wsbox (box #f))
            (sup (start-worker-pool nworkers
-                  (lambda (task) (run-task handler task))
-                  fail-task)))
+                  (lambda (task) (run-task (unbox hbox) task))
+                  fail-task))
+           (srv (make-http-server sup hbox wsbox)))
       (tcp-listen! "0.0.0.0" port 511
         (lambda (c)
           ;; libuv callback context: spawn + register only, no yielding
-          (let ((pid (spawn (make-reader c sup))))
+          (let ((pid (spawn (make-reader c srv))))
             (conn-set-owner! c pid)
             (tcp-read-start! c))))
       (display (string-append "igropyr listening on http://0.0.0.0:"
                               (number->string port) "\n"))
-      sup))
+      srv))
 )

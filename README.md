@@ -17,6 +17,13 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
   crashed workers are replaced and the task retried (at most 3 times, then
   the client gets a 500); workers stuck for more than 30 s are killed and
   replaced; a slow or half-sent request only ever blocks its own reader process
+- **Hot code swapping** — replace the handler (or individual routes) on a
+  live server: the listener, open connections and worker pool stay up,
+  in-flight requests finish on the old code
+- **WebSocket** — RFC 6455 upgrade on the same port; each socket is its own
+  green process, so server push is just a message send
+- **Chunked transfer-encoding** — `Transfer-Encoding: chunked` request
+  bodies are decoded transparently
 - **Fast** — ~35 k req/s at 500 concurrent connections on an Apple Silicon
   laptop (`ab -n 50000 -c 500`, zero failed requests)
 
@@ -147,6 +154,57 @@ a framework concern; the core request carries a free `req-params` slot
 for layers to use). The fault-tolerance semantics below come with the
 core, whatever layer you put on top.
 
+## Hot code swapping
+
+Two levels, both zero-downtime (listener, open connections and the worker
+pool are untouched; requests already executing finish on the old code):
+
+- **Route level (express)**: registering a route that already exists
+  *replaces* it on the live app. Re-evaluating a routes file against a
+  running app is a hot reload:
+
+  ```scheme
+  (app-get app "/version" v2-handler)   ; replaces the old /version
+  ```
+
+- **Handler level (core)**: `app-listen` / `http-listen` return the server;
+  swap the entire handler — even a different framework layer — atomically:
+
+  ```scheme
+  (define srv (app-listen app 8080))
+  (http-swap! srv (app->handler another-app))
+  (http-set-ws! srv another-ws-resolver)
+  ```
+
+Try it on the demo server: `GET /version` answers `v1`; `GET /upgrade`
+replaces the route; `GET /version` now answers `v2 (hot swapped)`.
+
+## WebSocket
+
+Served on the same port via the standard upgrade handshake. Each
+connection runs in its own green process; `ws-recv` blocks only that
+process. Pings are answered and fragmented messages reassembled
+automatically.
+
+```scheme
+(import (igropyr ws))
+
+(app-ws app "/ws"                      ; :param segments work here too
+  (lambda (ws req)
+    (ws-send-text! ws "welcome")
+    (let loop ()
+      (let ((m (ws-recv ws)))          ; #(text s) | #(binary bv) | #(close)
+        (case (vector-ref m 0)
+          ((text) (ws-send-text! ws (vector-ref m 1)) (loop))
+          ((binary) (ws-send-binary! ws (vector-ref m 1)) (loop))
+          (else 'closed))))))
+```
+
+Server push from other processes: hand them the `ws` (or its pid) and
+call `ws-send-text!` — writes are safe from any green process. On the
+bare core, register a resolver with `(http-set-ws! srv (lambda (req)
+session-or-#f))`.
+
 ## Fault tolerance semantics
 
 These apply automatically; nothing to configure:
@@ -169,10 +227,14 @@ uv.sc      libuv FFI: event loop, TCP, write queue, GC-rooting registries
 actor.sc   green processes: spawn/send/receive, link/monitor, preemptive
            scheduler (call/1cc + timer interrupt), run/sleep queues
 otp.sc     supervisor + fixed worker pool + stuck-worker ticker
-http.sc    core: incremental HTTP/1.1 parser, connection lifecycle,
-           response encoding, http-listen (single-handler entry point)
+http.sc    core: incremental HTTP/1.1 parser (content-length + chunked),
+           connection lifecycle, response encoding, websocket upgrade,
+           http-listen / http-swap! / http-set-ws!
+ws.sc      WebSocket codec: SHA-1/base64 handshake key, frame
+           encode/decode, ws-recv / ws-send-text! / ws-close!
 express.sc framework layer (optional): router with :param segments,
-           middleware chain, static files, JSON/text/html/file encoders
+           middleware chain, static files, app-ws, JSON/text/html/file
+           encoders
 ```
 
 Message protocol between processes:
