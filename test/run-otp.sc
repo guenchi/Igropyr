@@ -102,6 +102,13 @@
                          v))))
            (req-form req)))))
 
+;; Header injection guard: a CRLF-carrying value is dropped, not emitted
+(app-get app "/inject"
+  (lambda (req res)
+    (set-header! res "X-Test" "safe")
+    (set-header! res "X-Evil" "a\r\nInjected: yes")
+    (send-text! res "ok")))
+
 ;; Cookies: /cookie/set plants one, /cookie/get reads it back
 (app-get app "/cookie/set"
   (lambda (req res)

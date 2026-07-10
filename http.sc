@@ -160,12 +160,24 @@
                           (substring l j (string-length l))))))
              (cons k v)))))
 
+  ;; Repeated header fields are coalesced into one comma-joined value
+  ;; (RFC 7230); this lets content-length see "5,6" and reject the
+  ;; conflict, and keeps request accessors single-valued.
   (define (parse-header-lines lines)
-    (fold-right
-      (lambda (l acc)
-        (let ((kv (and (not (string=? l "")) (parse-header-line l))))
-          (if kv (cons kv acc) acc)))
-      '() lines))
+    (let ((acc (fold-right
+                 (lambda (l a)
+                   (let ((kv (and (not (string=? l "")) (parse-header-line l))))
+                     (if (not kv)
+                         a
+                         (let ((prev (assq (car kv) a)))
+                           (if prev
+                               (begin
+                                 (set-cdr! prev
+                                   (string-append (cdr prev) "," (cdr kv)))
+                                 a)
+                               (cons kv a))))))
+                 '() lines)))
+      acc))
 
   ;; Parse request line + headers from the header block.
   ;; Returns #(method path query version headers) or #f on malformed input.
@@ -189,9 +201,40 @@
                     (headers (parse-header-lines (cdr lines))))
                (vector method path query version headers))))))
 
+  ;; a valid Content-Length is one or more identical strings of ASCII
+  ;; digits (parse-header-lines coalesces repeats into one comma-joined
+  ;; value). Returns a non-negative integer, 'absent, or 'bad.
+  (define (all-digits? s)
+    (and (> (string-length s) 0)
+         (let loop ((i 0))
+           (cond
+             ((= i (string-length s)) #t)
+             ((char<=? #\0 (string-ref s i) #\9) (loop (+ i 1)))
+             (else #f)))))
+
   (define (content-length headers)
     (let ((p (assq 'content-length headers)))
-      (if p (or (string->number (cdr p)) 0) 0)))
+      (if (not p)
+          'absent
+          (let ((parts (let split ((s (cdr p)) (acc '()) (start 0) (i 0))
+                         (cond
+                           ((= i (string-length s))
+                            (reverse (cons (substring s start i) acc)))
+                           ((char=? (string-ref s i) #\,)
+                            (split s (cons (substring s start i) acc)
+                                   (+ i 1) (+ i 1)))
+                           (else (split s acc start (+ i 1)))))))
+            ;; every repeated value must be a valid digit string and equal
+            (let check ((ps parts) (val #f))
+              (cond
+                ((null? ps) val)
+                ((not (all-digits? (car ps))) 'bad)
+                (else
+                 (let ((n (string->number (car ps))))
+                   (cond
+                     ((not val) (check (cdr ps) n))
+                     ((= n val) (check (cdr ps) val))
+                     (else 'bad))))))))))
 
   (define (chunked-body? headers)
     (let ((p (assq 'transfer-encoding headers)))
@@ -222,21 +265,44 @@
       ((500) "Internal Server Error") ((503) "Service Unavailable")
       (else "Unknown")))
 
-  ;; Write a full response. The completion callback (libuv context: no
-  ;; yielding) tells the reader to continue (keep-alive) or closes the
-  ;; connection and lets the reader finish. Guarded by conn-responded?
-  ;; so a supervisor fallback 500 can never double-write.
-  (define (send-response! c status headers body ka)
-    (unless (conn-responded? c)
-      (conn-set-responded! c #t)
+  ;; Per-request response token: a one-shot claim shared by every path
+  ;; that might answer a single request (the handler, the streaming
+  ;; helpers, and the supervisor's fallback 500). Claiming is atomic, so
+  ;; a stale write from a previous keep-alive request can never bleed
+  ;; into the next one, and a fallback can never double-write.
+  (define (make-token) (box #f))
+  (define (claim! token) (and (not (unbox token)) (set-box! token #t) #t))
+
+  ;; Framing headers are always emitted by the framework; drop any the
+  ;; user set so they cannot be duplicated or conflict.
+  (define framing-headers '("content-length" "connection" "transfer-encoding"))
+  (define (framing-header? name)
+    (member (string-downcase name) framing-headers))
+
+  ;; Reject header names/values carrying CR or LF (response splitting).
+  (define (header-safe? s)
+    (not (or (string-index s #\return) (string-index s #\newline))))
+
+  (define (render-headers headers)
+    (apply string-append
+      (map (lambda (h)
+             (let ((k (car h)) (v (cdr h)))
+               (if (and (header-safe? k) (header-safe? v)
+                        (not (framing-header? k)))
+                   (string-append k ": " v "\r\n")
+                   "")))                 ; silently drop unsafe/framing
+           headers)))
+
+  ;; Write a full response, guarded by the request's token. The libuv
+  ;; write callback (no yielding) tells the reader to continue
+  ;; (keep-alive) or closes the connection.
+  (define (send-response! c token status headers body ka)
+    (when (claim! token)
       (let* ((head
               (string-append
                 "HTTP/1.1 " (number->string status) " " (status-text status)
                 "\r\n"
-                (apply string-append
-                       (map (lambda (h)
-                              (string-append (car h) ": " (cdr h) "\r\n"))
-                            headers))
+                (render-headers headers)
                 "Content-Length: " (number->string (bytevector-length body))
                 "\r\nConnection: " (if ka "keep-alive" "close")
                 "\r\n\r\n"))
@@ -250,9 +316,11 @@
                   (tcp-close! c)
                   (send owner (vector 'conn-closed)))))))))
 
-  ;; minimal error response; always closes
-  (define (quick-response! c status text)
-    (send-response! c status '(("Content-Type" . "text/plain"))
+  ;; minimal error response; always closes. Uses a fresh token unless
+  ;; one is supplied (reader-level errors have no task yet).
+  (define (quick-response! c status text . tok)
+    (send-response! c (if (pair? tok) (car tok) (make-token))
+                    status '(("Content-Type" . "text/plain"))
                     (string->utf8 text) #f))
 
   ;; ---- res record + primitives (the res.end level) ----------------------------
@@ -260,6 +328,7 @@
   (define-record-type (res make-res res?)
     (fields
       (immutable conn res-conn)
+      (immutable token res-token)          ; per-request one-shot claim
       (mutable status res-status res-status-set!)
       (mutable headers res-headers res-headers-set!)
       (immutable keep-alive? res-keep-alive?)
@@ -268,13 +337,16 @@
 
   (define (set-status! r s) (res-status-set! r s))
 
+  ;; Silently ignore header names/values containing CR or LF; they are
+  ;; also rejected again at render time.
   (define (set-header! r k v)
-    (res-headers-set! r (cons (cons k v) (res-headers r))))
+    (when (and (header-safe? k) (header-safe? v))
+      (res-headers-set! r (cons (cons k v) (res-headers r)))))
 
   ;; Send the response: current status + accumulated headers + body
   ;; bytevector. One shot per request; later calls are ignored.
   (define (res-send! r body)
-    (send-response! (res-conn r) (res-status r) (res-headers r)
+    (send-response! (res-conn r) (res-token r) (res-status r) (res-headers r)
                     body (res-keep-alive? r)))
 
   ;; ---- streaming responses (Transfer-Encoding: chunked) ------------------------
@@ -286,18 +358,14 @@
   ;;   (res-begin! r) (spawn (lambda () ... (res-write! r x) ... (res-end! r)))
   (define (res-begin! r)
     (let ((c (res-conn r)))
-      (unless (conn-responded? c)
-        (conn-set-responded! c #t)
+      (when (claim! (res-token r))
         (res-mode-set! r 'streaming)
         (tcp-write! c
           (string->utf8
             (string-append
               "HTTP/1.1 " (number->string (res-status r)) " "
               (status-text (res-status r)) "\r\n"
-              (apply string-append
-                     (map (lambda (h)
-                            (string-append (car h) ": " (cdr h) "\r\n"))
-                          (res-headers r)))
+              (render-headers (res-headers r))
               "Transfer-Encoding: chunked\r\nConnection: "
               (if (res-keep-alive? r) "keep-alive" "close")
               "\r\n\r\n"))
@@ -339,22 +407,26 @@
 
   ;; A crash here kills the worker (Let It Crash): the supervisor retries
   ;; the task up to 3 times, then answers 500 via fail-task below.
+  ;; Task shape: #(task id conn req token)
   (define (run-task handler task)
     (let* ((c (vector-ref task 2))
            (req (vector-ref task 3))
-           (r (make-res c 200 '() (req-keep-alive? req) 'plain)))
+           (token (vector-ref task 4))
+           (r (make-res c token 200 '() (req-keep-alive? req) 'plain)))
       (handler req r)
       ;; handler finished without responding: don't leave the client hanging
-      (unless (conn-responded? c)
+      (unless (unbox token)
         (set-status! r 404)
         (set-header! r "Content-Type" "text/plain; charset=utf-8")
         (res-send! r (string->utf8 "Not Found")))))
 
   ;; supervisor gave up on the task (crash retries exhausted, or stuck
-  ;; worker killed): last-resort 500 unless a response already went out
+  ;; worker killed): last-resort 500 unless the request's token was
+  ;; already claimed (partial or complete response already went out)
   (define (fail-task task)
-    (let ((c (vector-ref task 2)))
-      (quick-response! c 500 "Internal Server Error")))
+    (let ((c (vector-ref task 2))
+          (token (vector-ref task 4)))
+      (quick-response! c 500 "Internal Server Error" token)))
 
   ;; ---- chunked transfer-encoding (request side) ----------------------------------
 
@@ -432,7 +504,6 @@
     (lambda () (reader-loop c srv empty-bv)))
 
   (define (reader-loop c srv acc)
-    (conn-set-responded! c #f)
     (let ((hend (find-header-end acc)))
       (cond
         (hend (have-header c srv acc hend))
@@ -453,7 +524,9 @@
           (quick-response! c 400 "Bad Request")
           (let* ((headers (vector-ref parsed 4))
                  (wskey (websocket-key headers))
-                 (resolver (unbox (http-server-wsbox srv))))
+                 (resolver (unbox (http-server-wsbox srv)))
+                 (chunked? (chunked-body? headers))
+                 (clen (content-length headers)))
             (cond
               ;; websocket upgrade: resolve a session, shake hands, and
               ;; run the session in this reader process
@@ -466,13 +539,19 @@
                  (if session
                      (run-ws-session c acc hend wskey req session)
                      (quick-response! c 404 "Not Found"))))
-              ((chunked-body? headers)
+              ;; framing errors -> 400, close (bad/negative/conflicting
+              ;; Content-Length, or both Content-Length and chunked)
+              ((eq? clen 'bad)
+               (quick-response! c 400 "Bad Request"))
+              ((and chunked? (not (eq? clen 'absent)))
+               (quick-response! c 400 "Bad Request"))
+              (chunked?
                (collect-chunked c srv acc parsed (+ hend 4)))
               (else
-               (let ((clen (content-length headers)))
-                 (if (> clen body-limit)
+               (let ((n (if (eq? clen 'absent) 0 clen)))
+                 (if (> n body-limit)
                      (quick-response! c 413 "Payload Too Large")
-                     (collect-body c srv acc parsed (+ hend 4 clen))))))))))
+                     (collect-body c srv acc parsed n (+ hend 4 n))))))))))
 
   ;; hand the parsed request to the worker pool, then await the response
   (define (dispatch-request! c srv parsed body leftover)
@@ -484,18 +563,19 @@
                               headers
                               body
                               (keep-alive? (vector-ref parsed 3) headers)))
-           (id (next-task-id!)))
-      (send (http-server-sup srv) (vector 'submit-task (vector 'task id c req)))
+           (id (next-task-id!))
+           (token (make-token)))
+      (send (http-server-sup srv)
+        (vector 'submit-task (vector 'task id c req token)))
       (await-response c srv leftover #f)))
 
-  (define (collect-body c srv acc parsed total)
+  (define (collect-body c srv acc parsed clen total)
     (if (>= (bytevector-length acc) total)
-        (let ((body-start (- total (content-length (vector-ref parsed 4)))))
-          (dispatch-request! c srv parsed
-            (bv-sub acc body-start total)
-            (bv-sub acc total (bytevector-length acc))))
+        (dispatch-request! c srv parsed
+          (bv-sub acc (- total clen) total)
+          (bv-sub acc total (bytevector-length acc)))
         (receive (after read-timeout-ms (quick-response! c 408 "Request Timeout"))
-          (`#(tcp-data ,bv) (collect-body c srv (bv-append acc bv) parsed total))
+          (`#(tcp-data ,bv) (collect-body c srv (bv-append acc bv) parsed clen total))
           (`#(tcp-eof) (tcp-close! c))
           (`#(tcp-error ,e) (tcp-close! c)))))
 
@@ -542,7 +622,6 @@
   ;; still inside this reader process (one process per ws connection).
   ;; A crashing session just closes its own connection.
   (define (run-ws-session c acc hend key req session)
-    (conn-set-responded! c #t)
     (tcp-write! c
       (string->utf8
         (string-append

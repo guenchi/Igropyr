@@ -369,18 +369,30 @@
                    (begin (req-params-set! req params) (cdar rs))
                    (loop (cdr rs))))))))))
 
+  ;; The request path relative to a mount prefix, or #f if it does not
+  ;; belong to this mount. The prefix must align on a path boundary:
+  ;; "/assets" matches "/assets" and "/assets/x", but NOT "/assets-x",
+  ;; so a sibling directory cannot be reached by prefix confusion.
+  (define (static-relative prefix path)
+    (let ((pl (string-length prefix)) (nl (string-length path)))
+      (cond
+        ((not (string-prefix? prefix path)) #f)
+        ((= nl pl) "")                             ; exactly the mount root
+        ((char=? (string-ref path pl) #\/)          ; prefix + "/..."
+         (substring path (+ pl 1) nl))
+        (else #f))))                                ; e.g. "/assets-private"
+
   (define (try-static a req r)
     (and (eq? (req-method req) 'GET)
          (exists
            (lambda (entry)
-             (let ((prefix (car entry)) (root (cdr entry)))
-               (and (string-prefix? prefix (req-path req))
+             (let* ((prefix (car entry)) (root (cdr entry))
+                    (rel (static-relative prefix (req-path req))))
+               (and rel
                     (begin
-                      (send-file! r
-                        (string-append root
-                          (substring (req-path req)
-                                     (string-length prefix)
-                                     (string-length (req-path req)))))
+                      ;; send-file! rejects any ".." segment, keeping the
+                      ;; resolved file inside root
+                      (send-file! r (string-append root "/" rel))
                       #t))))
            (app-statics a))))
 

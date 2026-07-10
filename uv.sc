@@ -15,8 +15,7 @@
           tcp-listen! tcp-stop-listen! tcp-connect!
           tcp-read-start! tcp-write! tcp-close!
           conn? conn-handle conn-owner conn-set-owner!
-          conn-state conn-responded? conn-set-responded!
-          conn-count uv-strerror)
+          conn-state conn-count uv-strerror)
   (import (chezscheme))
 
   ;; Shared objects must be loaded before the foreign-procedure
@@ -80,10 +79,7 @@
     (fields
       (immutable handle conn-handle)             ; foreign address of uv_tcp_t
       (mutable owner conn-owner conn-set-owner!) ; pid of the reader process
-      (mutable state conn-state conn-set-state!) ; open | closing | closed
-      ;; set once a response has been written; checked by the supervisor
-      ;; before writing a fallback 500 to avoid double responses
-      (mutable responded? conn-responded? conn-set-responded!)))
+      (mutable state conn-state conn-set-state!))) ; open | closing | closed
 
   ;; GC roots (the "keep-live" story):
   ;; - conn-table roots every live connection's Scheme state while libuv
@@ -180,7 +176,7 @@
             (uv-tcp-init uv-loop client)
             (if (< (uv-accept server client) 0)
                 (uv-close client on-close-entry)
-                (let ((c (make-conn client #f 'open #f)))
+                (let ((c (make-conn client #f 'open)))
                   (uv-tcp-nodelay client 1)
                   (hashtable-set! conn-table client c)
                   (accept-proc c))))))
@@ -201,7 +197,7 @@
                   (begin
                     (uv-close handle on-close-entry)
                     (deliver owner (vector 'tcp-connect-failed status)))
-                  (let ((c (make-conn handle owner 'open #f)))
+                  (let ((c (make-conn handle owner 'open)))
                     (uv-tcp-nodelay handle 1)
                     (hashtable-set! conn-table handle c)
                     (deliver owner (vector 'tcp-connected c))))))))
