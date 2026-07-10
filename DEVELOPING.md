@@ -50,7 +50,7 @@ Independent libraries:
 
 ### Each Layer's Responsibility
 
-- **libuv (uv.sc)**: Direct FFI bindings to libuv. Manages TCP handles, read/write buffers, and event polling. Delivers data into the upper layers via callbacks.
+- **libuv (libuv.sc)**: Direct FFI bindings to libuv. Manages TCP handles, read/write buffers, and event polling. Delivers data into the upper layers via callbacks.
 
 - **Actor (actor.sc)**: Green process scheduler with continuation-based context switching. One OS thread, preemptive scheduling via timer interrupt, message-passing mailboxes, link/monitor for process relationships.
 
@@ -1061,7 +1061,7 @@ export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm
 - **CHEZSCHEMELIBDIRS**: Colon-separated list of directories to search for R6RS libraries. Include `.` for the current directory.
 - **CHEZSCHEMELIBEXTS**: Colon-separated list of file extensions and their compiled forms (`.so`). Chez tries each extension in order.
 
-Igropyr uses the `.sc` extension for all source files. The library search will find `igropyr/uv.sc`, `igropyr/actor.sc`, etc.
+Igropyr uses the `.sc` extension for all source files. The library search will find `igropyr/libuv.sc`, `igropyr/actor.sc`, etc.
 
 ### Directory Case Sensitivity
 
@@ -1095,7 +1095,7 @@ The script should call `(start-scheduler thunk)` at the end. The scheduler never
 
 ### libuv Path
 
-The libuv FFI loads a shared object by absolute path. Edit `uv.sc` to adjust it for your system:
+The libuv FFI loads a shared object by absolute path. Edit `libuv.sc` to adjust it for your system:
 
 ```scheme
 ;; macOS (homebrew):
@@ -1114,7 +1114,7 @@ Igropyr is pure Scheme with no build step. All `.sc` files are interpreted by Ch
 
 ```bash
 # Create .chezscheme.so compiled versions
-scheme --compile-library-to-port igropyr/uv.sc < /dev/null > igropyr/uv.chezscheme.so
+scheme --compile-library-to-port igropyr/libuv.sc < /dev/null > igropyr/libuv.chezscheme.so
 scheme --compile-library-to-port igropyr/actor.sc < /dev/null > igropyr/actor.chezscheme.so
 # ... etc for each library
 ```

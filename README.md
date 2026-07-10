@@ -36,6 +36,10 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
 - **Non-blocking Redis and MySQL clients** — pure Scheme, same event
   loop; callers park their green process while the OS thread keeps
   serving; MySQL comes with a self-healing connection pool
+- **Non-blocking HTTP client** — outbound `http-get` / `http-post` with
+  async DNS (libuv thread pool), same park-the-caller model
+- **gzip compression** — responses negotiated via `Accept-Encoding`;
+  static files cache their compressed form
 - **Runtime introspection & graceful shutdown** — `http-stats` (live
   connection/request/pool counters), `http-shutdown!` (drain in-flight
   requests, refuse new connections)
@@ -408,6 +412,30 @@ pinning the server key or opting in explicitly:
   '((allow-insecure-auth . #t)))                              ; TLS/trusted net only
 ```
 
+## Outbound HTTP
+
+The HTTP *client* rides the same model: each request runs in its own
+green process (async DNS via libuv's thread pool, then connect/send/
+read) while the caller parks. Handy for calling other services from
+inside a handler.
+
+```scheme
+(import (igropyr client))
+
+(let ((r (http-get "http://api.internal/users/42")))
+  (response-status r)                       ; -> 200
+  (response-header r 'content-type)         ; -> "application/json"
+  (utf8->string (response-body r)))          ; body is a bytevector
+
+(http-post "http://api.internal/events" "{\"type\":\"click\"}"
+           '((headers . (("Content-Type" . "application/json")))
+             (timeout . 5000)))
+```
+
+One connection per request (no pooling); a transport failure or timeout
+raises `#(http-client-error msg)`. https is not supported directly —
+reach TLS-only endpoints through a proxy (see HTTPS below).
+
 ## Fast routes
 
 By default every request goes through the worker pool, which buys crash
@@ -477,24 +505,78 @@ route table, PubSub topics, WebSocket rooms) is local to each — share
 across processes through Redis, and use Redis pub/sub as a cross-process
 event bus.
 
+## HTTPS / TLS
+
+Igropyr speaks plain HTTP; terminate TLS in a reverse proxy in front of
+it. This is the standard deployment and gets you automatic certificates,
+HTTP/2 to the browser, and OCSP stapling for free, without the server
+owning TLS or its CVE surface.
+
+**Caddy** (automatic Let's Encrypt certificates, one line per host):
+
+```caddyfile
+example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+That is the whole config — Caddy obtains and renews the certificate on
+its own. WebSocket upgrades pass through unchanged.
+
+**nginx** (manual or certbot-managed certificate), forwarding both plain
+requests and WebSocket upgrades, and balancing across the reuseport
+processes:
+
+```nginx
+upstream igropyr {
+    server 127.0.0.1:8080;      # add more if not sharing a port via SO_REUSEPORT
+    keepalive 64;
+}
+
+server {
+    listen 443 ssl;
+    server_name example.com;
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://igropyr;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # WebSocket upgrade
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}
+```
+
+With `SO_REUSEPORT` (see above) all worker processes share `:8080`, so
+one `upstream` entry suffices; otherwise give each process its own port
+and list them all. Read the client's real IP from `X-Forwarded-For` and
+the original scheme from `X-Forwarded-Proto`.
+
 ## Architecture
 
 ```
-uv.sc      libuv FFI: event loop, TCP, write queue, GC-rooting registries
-actor.sc   green processes: spawn/send/receive, link/monitor, preemptive
-           scheduler (call/1cc + timer interrupt), run/sleep queues
+libuv.sc   libuv FFI: event loop, TCP, async DNS, write queue, GC roots
+actor.sc   green processes: spawn/send/receive, link/monitor/register,
+           preemptive scheduler (call/1cc + timer interrupt), run/sleep queues
 otp.sc     supervisor + fixed worker pool + stuck-worker ticker
 http.sc    core: incremental HTTP/1.1 parser (content-length + chunked),
            connection lifecycle, response encoding, websocket upgrade,
-           http-listen / http-swap! / http-set-ws!
+           streaming, fast routes, http-listen / http-swap! / http-set-ws!
 websocket.sc  WebSocket codec: SHA-1/base64 handshake key, frame
               encode/decode, ws-recv / ws-send-text! / ws-close!
 express.sc framework layer (optional): router with :param segments,
-           middleware chain, static files, app-ws, forms/cookies,
-           SSE, JSON/text/html/file encoders
+           middleware chain, static files (cached + gzip), app-ws,
+           forms/cookies, SSE, JSON/text/html/file encoders
 json.sc    safe recursive-descent JSON parser + writer
+gzip.sc    gzip compression via zlib
 gen-server.sc  OTP gen-server (call/cast/info)
 pubsub.sc  topic publish/subscribe with dead-subscriber cleanup
+client.sc  non-blocking outbound HTTP client (async DNS)
 redis.sc   non-blocking Redis client (RESP2), pipelined
 mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
 ```
