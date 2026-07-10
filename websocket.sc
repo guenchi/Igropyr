@@ -16,7 +16,7 @@
 
 (library (igropyr websocket)
   (export ws-accept-key sha1 base64-encode
-          make-ws ws? ws-conn
+          make-ws make-ws-client ws? ws-conn
           ws-recv ws-send-text! ws-send-binary! ws-close!)
   (import (chezscheme) (igropyr actor) (igropyr libuv))
 
@@ -167,29 +167,46 @@
 
   ;; ---- frame codec ----------------------------------------------------------
 
-  ;; encode a server frame (FIN set, no mask)
-  (define (encode-frame op payload)
+  ;; 4 random mask bytes (client frames MUST be masked, RFC 6455 5.3)
+  (define (random-mask)
+    (call-with-port (open-file-input-port "/dev/urandom")
+      (lambda (p) (get-bytevector-n p 4))))
+
+  ;; Encode a frame (FIN set). mask? masks the payload with a random key
+  ;; (client role); servers send unmasked.
+  (define (encode-frame op payload mask?)
     (let* ((n (bytevector-length payload))
            (hlen (cond ((< n 126) 2) ((< n 65536) 4) (else 10)))
-           (bv (make-bytevector (+ hlen n))))
+           (mlen (if mask? 4 0))
+           (bv (make-bytevector (+ hlen mlen n))))
       (bytevector-u8-set! bv 0 (fxior #x80 op))
-      (cond
-        ((< n 126) (bytevector-u8-set! bv 1 n))
-        ((< n 65536)
-         (bytevector-u8-set! bv 1 126)
-         (bytevector-u8-set! bv 2 (fxsrl n 8))
-         (bytevector-u8-set! bv 3 (fxand n #xFF)))
-        (else
-         (bytevector-u8-set! bv 1 127)
-         (do ((i 0 (+ i 1))) ((= i 8))
-           (bytevector-u8-set! bv (+ 2 i)
-             (fxand (bitwise-arithmetic-shift-right n (* 8 (- 7 i))) #xFF)))))
-      (bytevector-copy! payload 0 bv hlen n)
+      (let ((mbit (if mask? #x80 0)))
+        (cond
+          ((< n 126) (bytevector-u8-set! bv 1 (fxior mbit n)))
+          ((< n 65536)
+           (bytevector-u8-set! bv 1 (fxior mbit 126))
+           (bytevector-u8-set! bv 2 (fxsrl n 8))
+           (bytevector-u8-set! bv 3 (fxand n #xFF)))
+          (else
+           (bytevector-u8-set! bv 1 (fxior mbit 127))
+           (do ((i 0 (+ i 1))) ((= i 8))
+             (bytevector-u8-set! bv (+ 2 i)
+               (fxand (bitwise-arithmetic-shift-right n (* 8 (- 7 i))) #xFF))))))
+      (if mask?
+          (let ((mkey (random-mask)))
+            (bytevector-copy! mkey 0 bv hlen 4)
+            (do ((i 0 (+ i 1))) ((= i n))
+              (bytevector-u8-set! bv (+ hlen 4 i)
+                (fxxor (bytevector-u8-ref payload i)
+                       (bytevector-u8-ref mkey (fxand i 3))))))
+          (bytevector-copy! payload 0 bv hlen n))
       bv))
 
-  ;; decode one frame at `start`; unmasks client payloads
-  ;; -> #(fin? opcode payload end-index) | 'more | 'bad
-  (define (decode-frame bv start)
+  ;; decode one frame at `start`; unmasks a masked payload.
+  ;; expect-masked?: server role requires client frames masked; client
+  ;; role requires server frames unmasked. -> #(fin? op payload end) |
+  ;; 'more | 'bad
+  (define (decode-frame bv start expect-masked?)
     (let ((have (- (bytevector-length bv) start)))
       (if (< have 2)
           'more
@@ -202,12 +219,12 @@
                  (len7 (fxand b1 #x7F))
                  (control? (fx>= op 8)))
             ;; RFC 6455 framing checks (all fatal -> 'bad, close):
-            ;;  - client frames MUST be masked
+            ;;  - masking must match the peer role
             ;;  - RSV bits are zero (no extensions negotiated)
             ;;  - opcode must be known (0,1,2,8,9,10)
             ;;  - control frames must be final and <= 125 bytes
             (cond
-              ((not masked?) 'bad)
+              ((not (eq? (and masked? #t) expect-masked?)) 'bad)
               ((not (fx= rsv 0)) 'bad)
               ((not (memv op '(0 1 2 8 9 10))) 'bad)
               ((and control? (or (not fin?) (fx> len7 125))) 'bad)
@@ -253,14 +270,20 @@
     (fields
       (immutable conn ws-conn)
       (immutable bufbox ws-bufbox)       ; box of unconsumed bytes
-      (immutable closedbox ws-closedbox)))
+      (immutable closedbox ws-closedbox)
+      (immutable client? ws-client?)))    ; client role masks outbound frames
 
+  ;; server-side session (frames it sends are unmasked; incoming masked)
   (define (make-ws conn leftover)
-    (make-ws-record conn (box leftover) (box #f)))
+    (make-ws-record conn (box leftover) (box #f) #f))
+
+  ;; client-side session (frames it sends are masked; incoming unmasked)
+  (define (make-ws-client conn leftover)
+    (make-ws-record conn (box leftover) (box #f) #t))
 
   (define (ws-send-frame! w op payload)
     (and (not (unbox (ws-closedbox w)))
-         (tcp-write! (ws-conn w) (encode-frame op payload) #f)))
+         (tcp-write! (ws-conn w) (encode-frame op payload (ws-client? w)) #f)))
 
   (define (ws-send-text! w s) (ws-send-frame! w 1 (string->utf8 s)))
   (define (ws-send-binary! w bv) (ws-send-frame! w 2 bv))
@@ -270,14 +293,15 @@
     (unless (unbox (ws-closedbox w))
       (set-box! (ws-closedbox w) #t)
       (let ((c (ws-conn w)))
-        (tcp-write! c (encode-frame 8 (make-bytevector 0))
+        (tcp-write! c (encode-frame 8 (make-bytevector 0) (ws-client? w))
           (lambda (st) (tcp-close! c))))))
 
   ;; block until a complete frame is available (runs in the owning process)
   (define (next-frame! w)
     (let loop ()
       (let* ((buf (unbox (ws-bufbox w)))
-             (r (decode-frame buf 0)))
+             ;; server expects masked frames; client expects unmasked
+             (r (decode-frame buf 0 (not (ws-client? w)))))
         (cond
           ((vector? r)
            (set-box! (ws-bufbox w)
