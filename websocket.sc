@@ -20,7 +20,8 @@
           ws-recv ws-send-text! ws-send-binary! ws-close!)
   (import (chezscheme) (igropyr actor) (igropyr uv))
 
-  (define max-frame 1048576)
+  (define max-frame 1048576)          ; single frame payload cap
+  (define max-message 8388608)        ; reassembled multi-frame message cap
 
   ;; ---- bytevector helpers -------------------------------------------------
 
@@ -195,9 +196,22 @@
           (let* ((b0 (bytevector-u8-ref bv start))
                  (b1 (bytevector-u8-ref bv (+ start 1)))
                  (fin? (fx> (fxand b0 #x80) 0))
+                 (rsv (fxand b0 #x70))
                  (op (fxand b0 #x0F))
                  (masked? (fx> (fxand b1 #x80) 0))
-                 (len7 (fxand b1 #x7F)))
+                 (len7 (fxand b1 #x7F))
+                 (control? (fx>= op 8)))
+            ;; RFC 6455 framing checks (all fatal -> 'bad, close):
+            ;;  - client frames MUST be masked
+            ;;  - RSV bits are zero (no extensions negotiated)
+            ;;  - opcode must be known (0,1,2,8,9,10)
+            ;;  - control frames must be final and <= 125 bytes
+            (cond
+              ((not masked?) 'bad)
+              ((not (fx= rsv 0)) 'bad)
+              ((not (memv op '(0 1 2 8 9 10))) 'bad)
+              ((and control? (or (not fin?) (fx> len7 125))) 'bad)
+              (else
             (let-values
                 (((plen lenbytes)
                   (cond
@@ -231,7 +245,7 @@
                              (bytevector-u8-set! payload i
                                (fxxor (bytevector-u8-ref payload i)
                                       (bytevector-u8-ref bv (+ mask-off (mod i 4)))))))
-                         (vector fin? op payload end)))))))))))
+                         (vector fin? op payload end)))))))))))))
 
   ;; ---- ws session object -----------------------------------------------------
 
@@ -280,7 +294,10 @@
 
   ;; Block until the next complete message.
   ;; -> #(text ,string) | #(binary ,bytevector) | #(close)
-  ;; Pings are answered, pongs ignored, fragments reassembled.
+  ;; Pings are answered, pongs ignored, fragments reassembled. A message
+  ;; whose reassembled size would exceed max-message, or a frame that
+  ;; violates the fragmentation sequence (a continuation with no message
+  ;; in progress, or a new data frame mid-message), closes the socket.
   (define (ws-recv w)
     (define (deliver op parts)
       (let ((body (bv-concat (reverse parts))))
@@ -289,22 +306,31 @@
             (vector 'binary body))))
     (if (unbox (ws-closedbox w))
         (vector 'close)
-        (let loop ((op #f) (parts '()))
+        ;; op = opcode of the in-progress message (#f = none); size =
+        ;; bytes accumulated so far
+        (let loop ((op #f) (parts '()) (size 0))
           (let ((f (next-frame! w)))
             (if (eq? f 'close)
                 (begin (ws-close! w) (vector 'close))
-                (let ((fin? (vector-ref f 0))
-                      (fop (vector-ref f 1))
-                      (payload (vector-ref f 2)))
+                (let* ((fin? (vector-ref f 0))
+                       (fop (vector-ref f 1))
+                       (payload (vector-ref f 2))
+                       (new-size (+ size (bytevector-length payload))))
                   (case fop
-                    ((9) (ws-send-frame! w 10 payload) (loop op parts)) ; ping
-                    ((10) (loop op parts))                              ; pong
+                    ((9) (ws-send-frame! w 10 payload) (loop op parts size)) ; ping
+                    ((10) (loop op parts size))                              ; pong
                     ((8) (ws-close! w) (vector 'close))
-                    ((0)                                                ; continuation
-                     (let ((parts (cons payload parts)))
-                       (if fin? (deliver (or op 2) parts) (loop op parts))))
-                    (else
-                     (if fin?
-                         (deliver fop (list payload))
-                         (loop fop (list payload)))))))))))
+                    ((0)                                    ; continuation frame
+                     (cond
+                       ((not op) (ws-close! w) (vector 'close)) ; no message started
+                       ((> new-size max-message) (ws-close! w) (vector 'close))
+                       (else
+                        (let ((parts (cons payload parts)))
+                          (if fin? (deliver op parts) (loop op parts new-size))))))
+                    (else                                   ; new data frame (1/2)
+                     (cond
+                       (op (ws-close! w) (vector 'close))    ; previous msg unfinished
+                       ((> new-size max-message) (ws-close! w) (vector 'close))
+                       (fin? (deliver fop (list payload)))
+                       (else (loop fop (list payload) new-size)))))))))))
 )
