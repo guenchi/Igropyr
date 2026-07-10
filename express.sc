@@ -18,6 +18,7 @@
 
 (library (igropyr express)
   (export create-app app-get app-post app-put app-delete
+          app-get-fast app-post-fast app-put-fast app-delete-fast
           app-use app-static app-ws app-listen app->handler
           req-param req-json req-form req-cookie set-cookie!
           send-text! send-html! send-json! send-file!
@@ -317,14 +318,17 @@
       (mutable routes app-routes app-routes-set!)       ; list of #(method segs handler)
       (mutable middlewares app-middlewares app-middlewares-set!)
       (mutable statics app-statics app-statics-set!)    ; list of (prefix . root)
-      (mutable ws-routes app-ws-routes app-ws-routes-set!))) ; list of (segs . session)
+      (mutable ws-routes app-ws-routes app-ws-routes-set!) ; list of (segs . session)
+      (mutable fast app-fast app-fast-set!)))           ; list of (method . segs)
 
-  (define (create-app) (make-app-record '() '() '() '()))
+  (define (create-app) (make-app-record '() '() '() '() '()))
 
   ;; Registering a route that already exists (same method + pattern)
   ;; REPLACES it -- this is what makes hot reloading work: re-evaluating
   ;; a routes file against a live app swaps the handlers in place.
-  (define (add-route! a method pattern handler)
+  ;; fast? marks the route for inline execution (bypassing the worker
+  ;; pool); see app-get-fast and the README for the trade-offs.
+  (define (add-route! a method pattern handler fast?)
     (let ((segs (split-segments pattern)))
       (app-routes-set! a
         (append
@@ -332,12 +336,38 @@
                     (not (and (eq? (vector-ref r 0) method)
                               (equal? (vector-ref r 1) segs))))
                   (app-routes a))
-          (list (vector method segs handler))))))
+          (list (vector method segs handler))))
+      ;; keep the fast set in sync: drop any old entry, re-add if fast?
+      (app-fast-set! a
+        (filter (lambda (k)
+                  (not (and (eq? (car k) method) (equal? (cdr k) segs))))
+                (app-fast a)))
+      (when fast?
+        (app-fast-set! a (cons (cons method segs) (app-fast a))))))
 
-  (define (app-get a pattern handler) (add-route! a 'GET pattern handler))
-  (define (app-post a pattern handler) (add-route! a 'POST pattern handler))
-  (define (app-put a pattern handler) (add-route! a 'PUT pattern handler))
-  (define (app-delete a pattern handler) (add-route! a 'DELETE pattern handler))
+  (define (app-get a pattern handler) (add-route! a 'GET pattern handler #f))
+  (define (app-post a pattern handler) (add-route! a 'POST pattern handler #f))
+  (define (app-put a pattern handler) (add-route! a 'PUT pattern handler #f))
+  (define (app-delete a pattern handler) (add-route! a 'DELETE pattern handler #f))
+
+  ;; Fast variants: the handler runs inline in the reader process,
+  ;; skipping the worker-pool round trip. Use only for pure, prompt
+  ;; handlers -- they lose crash retry and stuck-kill (a crash answers
+  ;; 500 for that one connection; a block/loop freezes that connection).
+  (define (app-get-fast a pattern handler) (add-route! a 'GET pattern handler #t))
+  (define (app-post-fast a pattern handler) (add-route! a 'POST pattern handler #t))
+  (define (app-put-fast a pattern handler) (add-route! a 'PUT pattern handler #t))
+  (define (app-delete-fast a pattern handler) (add-route! a 'DELETE pattern handler #t))
+
+  ;; predicate handed to the core: does this request hit a fast route?
+  (define (app-fast-predicate a)
+    (lambda (req)
+      (let ((m (req-method req)) (segs (split-segments (req-path req))))
+        (let loop ((fs (app-fast a)))
+          (cond
+            ((null? fs) #f)
+            ((and (eq? (caar fs) m) (match-segments (cdar fs) segs)) #t)
+            (else (loop (cdr fs))))))))
 
   ;; middleware: (lambda (req res next) ...); call (next) to continue
   (define (app-use a mw)
@@ -428,5 +458,6 @@
   (define (app-listen a port . opts)
     (let ((srv (apply http-listen port (app->handler a) opts)))
       (http-set-ws! srv (ws-resolver a))
+      (http-set-fast! srv (app-fast-predicate a))
       srv))
 )

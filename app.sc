@@ -30,11 +30,12 @@
   (lambda (req res next)
     (next)))
 
-(app-get app "/"
+;; pure, prompt handlers -> fast route (runs inline, bypasses the pool)
+(app-get-fast app "/"
   (lambda (req res)
     (send-html! res "<h1>Igropyr</h1><p>Chez Scheme + libuv + actors</p>")))
 
-(app-get app "/json"
+(app-get-fast app "/json"
   (lambda (req res)
     (send-json! res (list (cons 'name "igropyr")
                           (cons 'engine "chez-scheme")

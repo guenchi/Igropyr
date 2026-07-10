@@ -403,9 +403,31 @@ pinning the server key or opting in explicitly:
   '((allow-insecure-auth . #t)))                              ; TLS/trusted net only
 ```
 
+## Fast routes
+
+By default every request goes through the worker pool, which buys crash
+retry and stuck-kill at the cost of ~4 inter-process messages and a
+context switch per request. For a handler that is pure and returns
+promptly, that round trip is the dominant per-request cost. Mark such a
+route *fast* and it runs inline in the connection's reader process,
+skipping the pool:
+
+```scheme
+(app-get-fast app "/" (lambda (req res) (send-html! res "hi")))
+;; also app-post-fast / app-put-fast / app-delete-fast
+```
+
+Measured on a trivial keep-alive route, this cuts per-request CPU by
+~20% (roughly 145k -> 200k req/s at one saturated core). The trade-off:
+a fast handler loses the pool's fault tolerance — a crash is caught and
+answered `500` for that one connection (no retry), and a handler that
+blocks or loops freezes only its own connection (no 30 s stuck-kill).
+Use it only for pure, prompt handlers; leave anything with side effects,
+database calls, or heavy work on the default pooled path.
+
 ## Fault tolerance semantics
 
-These apply automatically; nothing to configure:
+These apply to pooled routes (the default); nothing to configure:
 
 - **Crash**: a handler that raises kills its worker. The supervisor spawns a
   replacement and retries the task, at most 3 times (4 executions total);
