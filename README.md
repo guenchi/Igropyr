@@ -64,7 +64,7 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
   laptop (`ab -n 50000 -c 500`, zero failed requests)
 
 For architecture, the actor model, the libuv-callback invariant, and
-contribution guidelines, see [DEVELOPING.md](DEVELOPING.md).
+contribution guidelines, see [docs/MANUAL.md](docs/MANUAL.md).
 
 ## Requirements
 
@@ -640,7 +640,7 @@ mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
 
 The actor scheduler (`register`/`whereis`/`monitor`/`demonitor`) and the
 libuv-callback invariant that everything rests on are documented in
-[DEVELOPING.md](DEVELOPING.md).
+[docs/MANUAL.md](docs/MANUAL.md).
 
 Message protocol between processes:
 

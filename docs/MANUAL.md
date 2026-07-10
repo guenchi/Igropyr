@@ -1,6 +1,6 @@
-# Igropyr Developer Guide
+# Igropyr Manual
 
-This guide covers the architecture, design patterns, and implementation details of Igropyr for developers building on or contributing to the framework.
+This manual covers the architecture, design patterns, and implementation details of Igropyr for developers building on or contributing to the framework.
 
 ## Table of Contents
 
