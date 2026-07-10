@@ -1,5 +1,7 @@
 # Igropyr Developer Guide
 
+**English** | [简体中文](DEVELOPING.zh-CN.md)
+
 This guide covers the architecture, design patterns, and implementation details of Igropyr for developers building on or contributing to the framework.
 
 ## Table of Contents
