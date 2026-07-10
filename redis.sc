@@ -52,6 +52,39 @@
            i)
           (else (loop (+ i 1)))))))
 
+  ;; strict UTF-8 check (RFC 3629); Chez's utf8->string substitutes
+  ;; U+FFFD, so a binary value must be detected here to keep it raw
+  (define (utf8-cont? bv i)
+    (fx= (fxand (bytevector-u8-ref bv i) #xC0) #x80))
+
+  (define (valid-utf8? bv)
+    (let ((n (bytevector-length bv)))
+      (let loop ((i 0))
+        (if (>= i n)
+            #t
+            (let ((b (bytevector-u8-ref bv i)))
+              (cond
+                ((< b #x80) (loop (+ i 1)))
+                ((< b #xC2) #f)
+                ((< b #xE0)
+                 (and (< (+ i 1) n) (utf8-cont? bv (+ i 1)) (loop (+ i 2))))
+                ((< b #xF0)
+                 (and (< (+ i 2) n) (utf8-cont? bv (+ i 1)) (utf8-cont? bv (+ i 2))
+                      (let ((b1 (bytevector-u8-ref bv (+ i 1))))
+                        (cond ((= b #xE0) (>= b1 #xA0))
+                              ((= b #xED) (<= b1 #x9F))
+                              (else #t)))
+                      (loop (+ i 3))))
+                ((< b #xF5)
+                 (and (< (+ i 3) n) (utf8-cont? bv (+ i 1))
+                      (utf8-cont? bv (+ i 2)) (utf8-cont? bv (+ i 3))
+                      (let ((b1 (bytevector-u8-ref bv (+ i 1))))
+                        (cond ((= b #xF0) (>= b1 #x90))
+                              ((= b #xF4) (<= b1 #x8F))
+                              (else #t)))
+                      (loop (+ i 4))))
+                (else #f)))))))
+
   ;; ---- RESP encoding ------------------------------------------------------
 
   (define (arg->bv a)
@@ -101,9 +134,18 @@
                        ((< n 0) (values #f next))          ; nil
                        ((< (bytevector-length buf) (+ next n 2))
                         (values 'more #f))
+                       ((not (and (= (bytevector-u8-ref buf (+ next n)) 13)
+                                  (= (bytevector-u8-ref buf (+ next n 1)) 10)))
+                        (values (vector 'redis-error "bad bulk terminator")
+                                (+ next n 2)))
                        (else
-                        (values (utf8->string (bv-sub buf next (+ next n)))
-                                (+ next n 2))))))
+                        ;; RESP bulk strings are binary-safe: keep the
+                        ;; convenient string for valid UTF-8, but return
+                        ;; raw bytes otherwise (Chez would substitute
+                        ;; U+FFFD, corrupting binary values)
+                        (let ((raw (bv-sub buf next (+ next n))))
+                          (values (if (valid-utf8? raw) (utf8->string raw) raw)
+                                  (+ next n 2)))))))
                   ((#\*)
                    (let ((n (string->number line)))
                      (cond
@@ -123,30 +165,33 @@
 
   (define connection-lost (vector 'redis-error "connection lost"))
 
-  ;; Each waiter is a mutable pair (from . live?). A caller that times
-  ;; out cancels itself (live? -> #f); its still-queued reply is then
-  ;; consumed and discarded here instead of being delivered late into
-  ;; the caller's mailbox, where the next call would mis-read it. The
-  ;; entry stays in the FIFO so request/reply alignment is preserved.
-  ;; A caller has at most one outstanding command (redis is synchronous),
-  ;; so its pid uniquely identifies its waiter.
+  ;; Each waiter is #(from ref live?). A caller that times out cancels
+  ;; its exact ref (live? -> #f); its still-queued reply is then consumed
+  ;; and discarded here instead of being delivered late into the caller's
+  ;; mailbox. The entry stays in the FIFO so request/reply alignment is
+  ;; preserved. Replies echo ref too, closing the small race where a
+  ;; reply is delivered just as the caller's timeout fires (a bare pid
+  ;; match could then mis-read that reply on the caller's next call).
   (define (reply-to! waiter v)
-    (when (cdr waiter)
-      (send (car waiter) (vector 'redis-reply v))))
+    (when (vector-ref waiter 2)
+      (send (vector-ref waiter 0)
+            (vector 'redis-reply (vector-ref waiter 1) v))))
 
   (define (conn-loop c buf waiters)
     (receive
-      (`#(redis-cmd ,args ,from)
+      (`#(redis-cmd ,args ,ref ,from)
         (if (eq? (conn-state c) 'open)
             (begin
               (tcp-write! c (encode-command args) #f)
-              (conn-loop c buf (append waiters (list (cons from #t)))))
+              (conn-loop c buf (append waiters (list (vector from ref #t)))))
             (begin
-              (send from (vector 'redis-reply connection-lost))
+              (send from (vector 'redis-reply ref connection-lost))
               (conn-loop c buf waiters))))
-      (`#(redis-cancel ,from)
+      (`#(redis-cancel ,ref ,from)
         (for-each
-          (lambda (p) (when (eq? (car p) from) (set-cdr! p #f)))
+          (lambda (w) (when (and (eq? (vector-ref w 0) from)
+                                 (eq? (vector-ref w 1) ref))
+                        (vector-set! w 2 #f)))
           waiters)
         (conn-loop c buf waiters))
       (`#(tcp-data ,bv)
@@ -195,18 +240,20 @@
                                    (uv-strerror status)
                                    "connect timeout")))))))))
 
-  ;; Run one command; blocks only the calling green process. On timeout
-  ;; the connection process is told to drop the (still-pending) reply, so
-  ;; it can never surface in a later call.
+  ;; Run one command; blocks only the calling green process. The per-call
+  ;; ref (a gensym) is echoed in the reply; on timeout the connection is
+  ;; told to drop the still-pending reply, and the ref match means even a
+  ;; reply already in the mailbox cannot be read by a later call.
   (define (redis rc . args)
-    (send rc (vector 'redis-cmd args self))
-    (receive (after reply-timeout-ms
-                (send rc (vector 'redis-cancel self))
-                (raise (vector 'redis-error "reply timeout")))
-      (`#(redis-reply ,v)
-        (if (and (vector? v) (eq? (vector-ref v 0) 'redis-error))
-            (raise v)
-            v))))
+    (let ((ref (gensym)))
+      (send rc (vector 'redis-cmd args ref self))
+      (receive (after reply-timeout-ms
+                  (send rc (vector 'redis-cancel ref self))
+                  (raise (vector 'redis-error "reply timeout")))
+        (`#(redis-reply ,@ref ,v)
+          (if (and (vector? v) (eq? (vector-ref v 0) 'redis-error))
+              (raise v)
+              v)))))
 
   (define (redis-close! rc)
     (send rc (vector 'redis-quit)))
