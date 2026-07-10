@@ -274,15 +274,72 @@
   (define (path-has-dotdot? s)
     (exists (lambda (p) (string=? p "..")) (string-split s #\/)))
 
-  ;; Whole-file read on the worker (blocking; fine for small local
-  ;; files, not a streaming file server).
+  ;; ---- static file cache -----------------------------------------------------
+  ;;
+  ;; Files are read once and kept in memory keyed by path; a request
+  ;; re-reads only when the file's mtime has changed. This turns the
+  ;; common case (serving an unchanged index.html / css / js) from a
+  ;; blocking disk read + fresh allocation into a hashtable lookup, and
+  ;; supplies a weak ETag for conditional requests (304 Not Modified).
+  ;; Files larger than max-cache-file are served but not cached.
+
+  (define max-cache-file (* 1024 1024))   ; 1 MiB per-file cache cap
+  ;; path -> #(mtime size etag content-type body)
+  (define static-cache (make-hashtable string-hash string=?))
+
+  (define (file-mtime path)
+    (guard (e (#t #f))
+      (and (file-exists? path)
+           (time-second (file-modification-time path)))))
+
+  (define (etag-of size mtime)
+    (string-append "W/\"" (number->string size 16) "-"
+                   (number->string mtime 16) "\""))
+
+  ;; return the cache entry for path (reading/refreshing as needed), or #f
+  (define (static-entry path)
+    (let ((mt (file-mtime path)))
+      (and mt
+           (let ((cached (hashtable-ref static-cache path #f)))
+             (if (and cached (= (vector-ref cached 0) mt))
+                 cached
+                 (let ((body (read-file-bv path)))
+                   (and body
+                        (let* ((size (bytevector-length body))
+                               (e (vector mt size (etag-of size mt)
+                                          (mime-type path) body)))
+                          (when (<= size max-cache-file)
+                            (hashtable-set! static-cache path e))
+                          e))))))))
+
+  ;; Public helper: send a file (cached read; no conditional request
+  ;; since there is no req here). Path traversal is rejected.
   (define (send-file! r path)
     (if (path-has-dotdot? path)
         (begin (set-status! r 403) (send-text! r "Forbidden"))
-        (let ((bv (read-file-bv path)))
-          (if bv
-              (finish! r (mime-type path) bv)
+        (let ((e (static-entry path)))
+          (if e
+              (finish! r (vector-ref e 3) (vector-ref e 4))
               (begin (set-status! r 404) (send-text! r "Not Found"))))))
+
+  ;; Serve a static file with caching + conditional request. abs-path is
+  ;; already inside the mount root; caller has done the boundary check.
+  (define (serve-static! r req abs-path)
+    (if (path-has-dotdot? abs-path)
+        (begin (set-status! r 403) (send-text! r "Forbidden"))
+        (let ((e (static-entry abs-path)))
+          (if (not e)
+              (begin (set-status! r 404) (send-text! r "Not Found"))
+              (let ((etag (vector-ref e 2))
+                    (ctype (vector-ref e 3))
+                    (body (vector-ref e 4)))
+                (set-header! r "ETag" etag)
+                (set-header! r "Cache-Control" "public, max-age=3600")
+                (if (equal? (req-header req 'if-none-match) etag)
+                    ;; client already has this exact version
+                    (begin (set-status! r 304) (res-send! r (make-bytevector 0)))
+                    (begin (set-header! r "Content-Type" ctype)
+                           (res-send! r body))))))))
 
   ;; ---- router -------------------------------------------------------------------
 
@@ -420,9 +477,9 @@
                     (rel (static-relative prefix (req-path req))))
                (and rel
                     (begin
-                      ;; send-file! rejects any ".." segment, keeping the
-                      ;; resolved file inside root
-                      (send-file! r (string-append root "/" rel))
+                      ;; serve-static! caches, rejects ".." segments, and
+                      ;; answers 304 on a matching If-None-Match
+                      (serve-static! r req (string-append root "/" rel))
                       #t))))
            (app-statics a))))
 
