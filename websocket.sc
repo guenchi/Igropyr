@@ -188,7 +188,7 @@
       bv))
 
   ;; decode one frame at `start`; unmasks client payloads
-  ;; -> #(fin? opcode payload end-index) | 'more | 'bad
+  ;; -> #(fin? opcode payload end-index) | 'more | 'bad | 'too-large
   (define (decode-frame bv start)
     (let ((have (- (bytevector-length bv) start)))
       (if (< have 2)
@@ -232,7 +232,14 @@
                     (else (values len7 0)))))
               (cond
                 ((not plen) 'more)
-                ((> plen max-frame) 'bad)
+                ;; Extended lengths must use their minimal encoding and
+                ;; the RFC 6455 64-bit form must not set its sign bit.
+                ((and (fx= len7 126) (< plen 126)) 'bad)
+                ((and (fx= len7 127)
+                      (or (< plen 65536)
+                          (> (bytevector-u8-ref bv (+ start 2)) 127))) 'bad)
+                ((and (= op 8) (= plen 1)) 'bad)
+                ((> plen max-frame) 'too-large)
                 (else
                  (let* ((mask-off (+ start 2 lenbytes))
                         (data-off (+ mask-off (if masked? 4 0)))
@@ -273,6 +280,15 @@
         (tcp-write! c (encode-frame 8 (make-bytevector 0))
           (lambda (st) (tcp-close! c))))))
 
+  (define (ws-fail! w code)
+    (unless (unbox (ws-closedbox w))
+      (set-box! (ws-closedbox w) #t)
+      (let ((c (ws-conn w))
+            (payload (bytevector (fxand (fxsrl code 8) #xFF)
+                                 (fxand code #xFF))))
+        (tcp-write! c (encode-frame 8 payload)
+          (lambda (st) (tcp-close! c))))))
+
   ;; block until a complete frame is available (runs in the owning process)
   (define (next-frame! w)
     (let loop ()
@@ -283,7 +299,8 @@
            (set-box! (ws-bufbox w)
                      (bv-sub buf (vector-ref r 3) (bytevector-length buf)))
            r)
-          ((eq? r 'bad) 'close)
+          ((eq? r 'bad) 'protocol-error)
+          ((eq? r 'too-large) 'message-too-large)
           (else
            (receive
              (`#(tcp-data ,bv)
@@ -302,7 +319,8 @@
     (define (deliver op parts)
       (let ((body (bv-concat (reverse parts))))
         (if (= op 1)
-            (vector 'text (utf8->string body))
+            (guard (e (#t (ws-fail! w 1007) (vector 'close)))
+              (vector 'text (utf8->string body)))
             (vector 'binary body))))
     (if (unbox (ws-closedbox w))
         (vector 'close)
@@ -310,8 +328,13 @@
         ;; bytes accumulated so far
         (let loop ((op #f) (parts '()) (size 0))
           (let ((f (next-frame! w)))
-            (if (eq? f 'close)
-                (begin (ws-close! w) (vector 'close))
+            (if (not (vector? f))
+                (begin
+                  (case f
+                    ((protocol-error) (ws-fail! w 1002))
+                    ((message-too-large) (ws-fail! w 1009))
+                    (else (ws-close! w)))
+                  (vector 'close))
                 (let* ((fin? (vector-ref f 0))
                        (fop (vector-ref f 1))
                        (payload (vector-ref f 2))
@@ -322,15 +345,15 @@
                     ((8) (ws-close! w) (vector 'close))
                     ((0)                                    ; continuation frame
                      (cond
-                       ((not op) (ws-close! w) (vector 'close)) ; no message started
-                       ((> new-size max-message) (ws-close! w) (vector 'close))
+                       ((not op) (ws-fail! w 1002) (vector 'close)) ; no message started
+                       ((> new-size max-message) (ws-fail! w 1009) (vector 'close))
                        (else
                         (let ((parts (cons payload parts)))
                           (if fin? (deliver op parts) (loop op parts new-size))))))
                     (else                                   ; new data frame (1/2)
                      (cond
-                       (op (ws-close! w) (vector 'close))    ; previous msg unfinished
-                       ((> new-size max-message) (ws-close! w) (vector 'close))
+                       (op (ws-fail! w 1002) (vector 'close)) ; previous msg unfinished
+                       ((> new-size max-message) (ws-fail! w 1009) (vector 'close))
                        (fin? (deliver fop (list payload)))
                        (else (loop fop (list payload) new-size)))))))))))
 )

@@ -1,7 +1,7 @@
 ;;; Smoke test: process-per-connection echo server on the actor layer.
 ;;; Each accepted connection gets its own reader process; slow or idle
 ;;; connections only park their own process.
-;;; Run: scheme --script test/smoke-echo-actor.sc
+;;; Run: chez --script test/smoke-echo-actor.sc
 
 (import (chezscheme) (igropyr actor) (igropyr uv))
 

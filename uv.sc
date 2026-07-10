@@ -20,10 +20,25 @@
 
   ;; Shared objects must be loaded before the foreign-procedure
   ;; definitions below are evaluated (library body runs in order).
+  (define (load-first-shared-object who names)
+    (let loop ((xs names))
+      (if (null? xs)
+          (error who "could not load any supported shared object" names)
+          (guard (e (#t (loop (cdr xs))))
+            (load-shared-object (car xs))))))
+
   (define shared-objects
     (begin
-      (load-shared-object "/opt/homebrew/lib/libuv.1.dylib")
-      (load-shared-object "libSystem.dylib")))
+      ;; Prefer loader-searchable sonames, with common Homebrew paths as
+      ;; fallbacks.  Linux names are included so importing the library is
+      ;; not tied to one macOS/ARM64 installation.
+      (load-first-shared-object 'libuv
+        '("libuv.1.dylib" "libuv.dylib"
+          "/opt/homebrew/lib/libuv.1.dylib"
+          "/usr/local/lib/libuv.1.dylib"
+          "libuv.so.1" "libuv.so"))
+      (load-first-shared-object 'system-c-library
+        '("libSystem.B.dylib" "libSystem.dylib" "libc.so.6" "libc.so"))))
 
   ;; libuv enum constants (from uv.h, libuv 1.50)
   (define UV-RUN-NOWAIT 2)
@@ -64,7 +79,11 @@
   (define timer-handle-size (uv-handle-size UV-TIMER))
   (define write-req-size (uv-req-size UV-WRITE))
   (define connect-req-size (uv-req-size UV-CONNECT))
-  (define buf-t-size 16)             ; uv_buf_t on arm64: {void* base; size_t len}
+  ;; uv_buf_t on supported Unix libuv builds is {char* base; size_t len}.
+  ;; Derive offsets from the running Chez ABI instead of assuming arm64.
+  (define buf-base-offset 0)
+  (define buf-len-offset (foreign-sizeof 'void*))
+  (define buf-t-size (+ buf-len-offset (foreign-sizeof 'size_t)))
 
   ;; monotonic milliseconds
   (define (now-ms) (div (uv-hrtime) 1000000))
@@ -98,13 +117,15 @@
   (define deliver (lambda (owner msg) (void)))
   (define (uv-set-deliver! proc) (set! deliver proc))
 
-  ;; accept hook: (accept-proc conn); installed by tcp-listen!
-  (define accept-proc (lambda (c) (void)))
+  ;; listener handle -> (lambda (conn) ...).  Keeping this per listener
+  ;; avoids a later tcp-listen! call overwriting every existing server's
+  ;; accept callback.
+  (define accept-table (make-eqv-hashtable))
 
   ;; global libuv state, allocated in uv-init!
   (define uv-loop 0)
   (define wakeup-timer 0)
-  (define listener 0)                ; rooted here for the process lifetime
+  (define listeners '())             ; rooted here for their lifetimes
   (define sockaddr-buf 0)
   (define read-buf 0)
   (define read-buf-size 65536)
@@ -117,8 +138,8 @@
   (define on-alloc-code
     (foreign-callable
       (lambda (handle suggested buf)
-        (foreign-set! 'void* buf 0 read-buf)
-        (foreign-set! 'unsigned-64 buf 8 read-buf-size))
+        (foreign-set! 'void* buf buf-base-offset read-buf)
+        (foreign-set! 'size_t buf buf-len-offset read-buf-size))
       (void* size_t void*)
       void))
 
@@ -150,6 +171,8 @@
         (let ((c (hashtable-ref conn-table handle #f)))
           (hashtable-delete! conn-table handle)
           (when c (conn-set-state! c 'closed)))
+        (hashtable-delete! accept-table handle)
+        (set! listeners (remv handle listeners))
         (foreign-free handle))
       (void*)
       void))
@@ -172,14 +195,17 @@
     (foreign-callable
       (lambda (server status)
         (when (>= status 0)
-          (let ((client (foreign-alloc tcp-handle-size)))
+          (let ((client (foreign-alloc tcp-handle-size))
+                (accept-proc (hashtable-ref accept-table server #f)))
             (uv-tcp-init uv-loop client)
             (if (< (uv-accept server client) 0)
                 (uv-close client on-close-entry)
                 (let ((c (make-conn client #f 'open)))
                   (uv-tcp-nodelay client 1)
                   (hashtable-set! conn-table client c)
-                  (accept-proc c))))))
+                  (if accept-proc
+                      (accept-proc c)
+                      (tcp-close! c)))))))
       (void* int)
       void))
 
@@ -259,22 +285,27 @@
   ;; optional trailing arg: uv_tcp_bind flags (UV_TCP_REUSEPORT = 2,
   ;; kernel-balanced multi-process listening; Linux/FreeBSD only)
   (define (tcp-listen! host port backlog on-accept . opts)
-    (set! accept-proc on-accept)
+    (unless (procedure? on-accept)
+      (assertion-violation 'tcp-listen! "on-accept must be a procedure" on-accept))
     (let ((flags (if (pair? opts) (car opts) 0))
           (l (foreign-alloc tcp-handle-size)))
       (check 'uv-tcp-init (uv-tcp-init uv-loop l))
       (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
       (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf flags))
+      (hashtable-set! accept-table l on-accept)
       (check 'uv-listen (uv-listen l backlog on-connection-entry))
-      (set! listener l)
+      (set! listeners (cons l listeners))
       l))
 
   ;; Stop accepting new connections (graceful shutdown step 1);
   ;; established connections are unaffected.
   (define (tcp-stop-listen!)
-    (when (> listener 0)
-      (uv-close listener on-close-entry)
-      (set! listener 0)))
+    (for-each
+      (lambda (listener)
+        (when (= 0 (uv-is-closing listener))
+          (uv-close listener on-close-entry)))
+      listeners)
+    (set! listeners '()))
 
   ;; Outbound TCP connection. The owner process later receives
   ;; #(tcp-connected ,conn) or #(tcp-connect-failed ,errno). Call
@@ -312,8 +343,8 @@
                (buf-ptr (+ block write-req-size))
                (data-ptr (+ buf-ptr buf-t-size)))
           (memcpy-to-c data-ptr bv n)
-          (foreign-set! 'void* buf-ptr 0 data-ptr)
-          (foreign-set! 'unsigned-64 buf-ptr 8 n)
+          (foreign-set! 'void* buf-ptr buf-base-offset data-ptr)
+          (foreign-set! 'size_t buf-ptr buf-len-offset n)
           (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
             (if (< r 0)
                 (begin

@@ -2,8 +2,8 @@
 ;;; app into one optimized program object (app.so), enabling cross-library
 ;;; inlining that per-library .so files cannot get.
 ;;;
-;;;   scheme --libdirs .:lib --script igropyr/build-whole.ss
-;;;   scheme --program igropyr/app.so         # run the server
+;;;   chez --libdirs .:lib --script igropyr/build-whole.ss
+;;;   chez --program igropyr/app.so         # run the server
 ;;;
 ;;; Interrupt traps stay on (preemptive scheduling needs them).
 ;;;
