@@ -247,10 +247,15 @@
           (let ((h (sha1 (bv-append seed (integer->bytes counter 4)))))
             (loop (+ counter 1) (cons h parts) (+ got 20))))))
 
+  ;; OAEP seed must be unpredictable: read the OS CSPRNG, never a
+  ;; time-seeded PRNG.
   (define (random-bytes n)
-    (let ((out (make-bytevector n)))
-      (do ((i 0 (+ i 1))) ((= i n) out)
-        (bytevector-u8-set! out i (random 256)))))
+    (call-with-port (open-file-input-port "/dev/urandom")
+      (lambda (p)
+        (let ((bv (get-bytevector-n p n)))
+          (if (and (bytevector? bv) (= (bytevector-length bv) n))
+              bv
+              (mysql-fail -1 "could not read /dev/urandom"))))))
 
   ;; PKCS#1 v2.1 OAEP encrypt; k = modulus size in bytes
   (define (rsa-oaep-encrypt msg n e)
@@ -430,21 +435,47 @@
       (if db (bv-append (string->utf8 db) (bytevector 0)) empty-bv)
       (string->utf8 plugin) (bytevector 0)))
 
-  ;; full caching_sha2 path over a plain connection: fetch the server's
-  ;; RSA key and send the nonce-XORed password encrypted with OAEP
-  (define (full-auth! c bufbox password nonce seq)
-    (send-packet! c (bytevector 2) seq)           ; request public key
-    (let-values (((p sq) (next-packet! c bufbox)))
-      (unless (fx= (bytevector-u8-ref p 0) 1)
-        (mysql-fail -1 "expected server public key"))
-      (let-values (((n e) (parse-rsa-public-key
-                            (utf8->string (bv-sub p 1 (bytevector-length p))))))
-        (let ((plain (bv-xor (bv-append (string->utf8 password) (bytevector 0))
-                             nonce)))
-          (send-packet! c (rsa-oaep-encrypt plain n e) (+ sq 1))))))
+  ;; Full caching_sha2 path: the password is sent RSA-encrypted (only the
+  ;; scramble hash goes over the wire on the fast path). Encrypting with a
+  ;; key fetched over an unauthenticated plaintext connection lets a MITM
+  ;; substitute its own key and read the password, so this is refused by
+  ;; default. It is allowed only when the caller pins the server's public
+  ;; key (opts 'server-public-key, a PEM string) -- then we never trust a
+  ;; key from the wire -- or explicitly opts in with 'allow-insecure-auth
+  ;; (appropriate over TLS or a trusted local socket).
+  (define (full-auth! c bufbox password nonce seq opts)
+    (define pinned (assq-ref opts 'server-public-key))
+    (define (encrypt-with n e)
+      (let ((plain (bv-xor (bv-append (string->utf8 password) (bytevector 0))
+                           nonce)))
+        (send-packet! c (rsa-oaep-encrypt plain n e) (+ seq 1))))
+    (cond
+      (pinned
+       (let-values (((n e) (parse-rsa-public-key pinned)))
+         (encrypt-with n e)))
+      ((assq-ref opts 'allow-insecure-auth)
+       (send-packet! c (bytevector 2) seq)          ; request public key
+       (let-values (((p sq) (next-packet! c bufbox)))
+         (unless (fx= (bytevector-u8-ref p 0) 1)
+           (mysql-fail -1 "expected server public key"))
+         (let-values (((n e) (parse-rsa-public-key
+                               (utf8->string (bv-sub p 1 (bytevector-length p))))))
+           (let ((plain (bv-xor (bv-append (string->utf8 password) (bytevector 0))
+                                nonce)))
+             (send-packet! c (rsa-oaep-encrypt plain n e) (+ sq 1))))))
+      (else
+       (mysql-fail -1
+         (string-append
+           "full authentication would send the password RSA-encrypted "
+           "over an unencrypted connection; pass 'server-public-key to "
+           "pin the key, or 'allow-insecure-auth to permit it")))))
+
+  (define (assq-ref alist key)
+    (let ((p (and (pair? alist) (assq key alist))))
+      (and p (cdr p))))
 
   ;; drive the auth conversation to an OK packet (or raise)
-  (define (auth-loop! c bufbox user password nonce)
+  (define (auth-loop! c bufbox user password nonce opts)
     (let loop ()
       (let-values (((p seq) (next-packet! c bufbox)))
         (let ((b0 (bytevector-u8-ref p 0)))
@@ -458,7 +489,7 @@
                  ((fx= b1 4)                       ; full auth required
                   (if (= 0 (string-length password))
                       (begin (send-packet! c (bytevector 0) (+ seq 1)) (loop))
-                      (begin (full-auth! c bufbox password nonce (+ seq 1))
+                      (begin (full-auth! c bufbox password nonce (+ seq 1) opts)
                              (loop))))
                  (else (mysql-fail -1 "unexpected auth data")))))
             ((fx= b0 #xFE)                         ; AuthSwitchRequest
@@ -482,7 +513,7 @@
                                                      plugin))))))
             (else (mysql-fail -1 "unexpected packet during auth")))))))
 
-  (define (authenticate! c bufbox user password db)
+  (define (authenticate! c bufbox user password db opts)
     (let-values (((p seq) (next-packet! c bufbox)))
       (let-values (((nonce plugin) (parse-handshake p)))
         (let ((token (cond
@@ -494,7 +525,7 @@
                                               "unsupported auth plugin: " plugin))))))
           (send-packet! c (handshake-response user token db plugin) (+ seq 1))
           ;; full-auth path needs the nonce again
-          (auth-loop! c bufbox user password nonce)))))
+          (auth-loop! c bufbox user password nonce opts)))))
 
   ;; ---- queries ------------------------------------------------------------------------
 
@@ -582,7 +613,7 @@
 
   ;; spawn a connection worker; reports #(mysql-up ,self ok-or-error) to
   ;; report-to, then serves queries (notifying `notify` when idle)
-  (define (start-connection host port user password db notify report-to)
+  (define (start-connection host port user password db opts notify report-to)
     (spawn
       (lambda ()
         (let ((outcome
@@ -593,7 +624,7 @@
                    (`#(tcp-connected ,c)
                      (tcp-read-start! c)
                      (let ((bufbox (box empty-bv)))
-                       (authenticate! c bufbox user password db)
+                       (authenticate! c bufbox user password db opts)
                        (cons c bufbox)))
                    (`#(tcp-connect-failed ,e)
                      (mysql-fail -1 (uv-strerror e)))))))
@@ -610,7 +641,7 @@
   ;; the connection to the caller. Dead connections are replaced
   ;; automatically (1s backoff on failed connects); a caller whose
   ;; connection dies mid-query gets #(mysql-error -1 "connection lost").
-  (define (pool-loop n host port user password db)
+  (define (pool-loop n host port user password db opts)
     (define me self)
     (define idle '())
     (define busy (make-eq-hashtable))   ; conn pid -> (caller-pid . ref)
@@ -625,7 +656,7 @@
         (set! pending-front (cdr pending-front))
         x))
     (define (connect!)
-      (monitor (start-connection host port user password db me me)))
+      (monitor (start-connection host port user password db opts me me)))
     ;; a job is #(sql ref from)
     (define (assign! c job)
       (hashtable-set! busy c (cons (vector-ref job 2) (vector-ref job 1)))
@@ -684,11 +715,16 @@
   ;; ---- public API ----------------------------------------------------------------------------
 
   ;; Connect + authenticate a single connection; returns the connection
-  ;; process or raises #(mysql-error code msg).
+  ;; process or raises #(mysql-error code msg). Optional args after the
+  ;; password: db name, then an options alist, e.g.
+  ;;   (mysql-connect host port user pw "mydb"
+  ;;     '((server-public-key . "-----BEGIN PUBLIC KEY-----...")))
+  ;; Options: 'server-public-key (pin the RSA key for full auth),
+  ;;          'allow-insecure-auth (permit fetching it over plaintext).
   (define (mysql-connect host port user password . rest)
-    (let ((db (if (pair? rest) (car rest) #f)))
-      (random-seed (+ 1 (mod (now-ms) 4000000000)))
-      (start-connection host port user password db #f self)
+    (let ((db (if (pair? rest) (car rest) #f))
+          (opts (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) '())))
+      (start-connection host port user password db opts #f self)
       (receive (after (+ connect-timeout-ms 2000)
                   (raise (vector 'mysql-error -1 "connect timeout")))
         (`#(mysql-up ,pid ,status)
@@ -698,11 +734,12 @@
 
   ;; Pool of n connections; returns the dispatcher, which mysql-query
   ;; and mysql-close! accept exactly like a single connection. Usable
-  ;; immediately: queries queue until connections come up.
+  ;; immediately: queries queue until connections come up. Same optional
+  ;; db + options as mysql-connect.
   (define (mysql-pool n host port user password . rest)
-    (let ((db (if (pair? rest) (car rest) #f)))
-      (random-seed (+ 1 (mod (now-ms) 4000000000)))
-      (spawn (lambda () (pool-loop n host port user password db)))))
+    (let ((db (if (pair? rest) (car rest) #f))
+          (opts (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) '())))
+      (spawn (lambda () (pool-loop n host port user password db opts)))))
 
   ;; Run one SQL statement; blocks only the calling green process. The
   ;; per-call ref (a fresh gensym) is echoed in the reply, so if this
