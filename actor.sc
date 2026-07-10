@@ -17,7 +17,8 @@
 
 (library (igropyr actor)
   (export spawn spawn&link send receive self
-          link monitor process-trap-exit kill
+          link monitor demonitor process-trap-exit kill
+          register unregister whereis
           sleep-ms process-alive? process-id
           start-scheduler)
   (import (chezscheme) (igropyr uv))
@@ -114,6 +115,26 @@
   (define process-table (make-eqv-hashtable))
   (define pid-counter 0)
   (define event-loop-pid #f)
+
+  ;; process registry: names survive restarts, pids don't. A dead
+  ;; process is unregistered automatically (see @kill).
+  (define name->pid (make-eq-hashtable))
+  (define pid->name (make-eq-hashtable))
+
+  (define (register name pid)
+    (no-interrupts
+      (hashtable-set! name->pid name pid)
+      (hashtable-set! pid->name pid name))
+    pid)
+
+  (define (unregister name)
+    (no-interrupts
+      (let ((p (hashtable-ref name->pid name #f)))
+        (hashtable-delete! name->pid name)
+        (when p (hashtable-delete! pid->name p)))))
+
+  (define (whereis name)
+    (hashtable-ref name->pid name #f))
 
   (define-syntax no-interrupts
     (syntax-rules ()
@@ -275,14 +296,26 @@
                   (kill *self* (pcb-exit-reason p))))))))
 
   ;; Unidirectional watch: when p dies the caller gets #(DOWN ,p ,reason).
+  ;; Returns the monitor reference for demonitor, or #f if p was already
+  ;; dead (the DOWN message is delivered immediately in that case).
   (define (monitor p)
     (no-interrupts
       (if (alive? p)
           (let ((m (make-mon *self* p)))
             (pcb-monitors-set! *self* (cons m (pcb-monitors *self*)))
-            (pcb-monitors-set! p (cons m (pcb-monitors p))))
-          (@send *self* (vector 'DOWN p (pcb-exit-reason p)))))
-    p)
+            (pcb-monitors-set! p (cons m (pcb-monitors p)))
+            m)
+          (begin
+            (@send *self* (vector 'DOWN p (pcb-exit-reason p)))
+            #f))))
+
+  (define (demonitor m)
+    (when (mon? m)
+      (no-interrupts
+        (pcb-monitors-set! (mon-origin m)
+          (remq m (pcb-monitors (mon-origin m))))
+        (pcb-monitors-set! (mon-target m)
+          (remq m (pcb-monitors (mon-target m)))))))
 
   (define (process-trap-exit b)
     (pcb-trap-exit-set! *self* b))
@@ -310,6 +343,11 @@
       (pcb-sleeping?-set! p #f)
       (pcb-exit-reason-set! p reason)
       (hashtable-delete! process-table (pcb-id p))
+      ;; drop the registered name, if any
+      (let ((nm (hashtable-ref pid->name p #f)))
+        (when nm
+          (hashtable-delete! name->pid nm)
+          (hashtable-delete! pid->name p)))
       ;; notify/cascade links
       (let ((links (pcb-links p)))
         (pcb-links-set! p '())
@@ -413,10 +451,15 @@
 
   (define-syntax match-qp
     (lambda (stx)
-      (syntax-case stx (unquote)
+      (syntax-case stx (unquote unquote-splicing)
         ((_ (unquote v) x sk)
          (identifier? #'v)
          #'(let ((v x)) sk))
+        ;; ,@v matches only a value equal to the EXISTING binding v --
+        ;; selective receive by value (e.g. reply tags): `#(reply ,@ref ,v)
+        ((_ (unquote-splicing v) x sk)
+         (identifier? #'v)
+         #'(if (equal? v x) sk #f))
         ((_ #(p ...) x sk)
          (with-syntax ((n (length #'(p ...))))
            #'(if (and (vector? x) (fx= (vector-length x) n))

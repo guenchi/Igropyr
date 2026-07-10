@@ -20,6 +20,7 @@
         (igropyr http)
         (igropyr websocket)
         (igropyr json)
+        (igropyr pubsub)
         (igropyr express))
 
 (define app (create-app))
@@ -121,6 +122,26 @@
         (send-text! res "v2 (hot swapped)")))
     (send-text! res "upgraded")))
 
+;; Chat rooms: WebSocket + PubSub. Every message a client sends is
+;; published to its room topic; a forwarder process per connection
+;; relays room traffic back out. Dead connections clean themselves up
+;; (pubsub monitors its subscribers).
+(app-ws app "/chat/:room"
+  (lambda (ws req)
+    (let ((topic (string->symbol
+                   (string-append "room-" (req-param req "room")))))
+      (let ((fw (spawn
+                  (lambda ()
+                    (subscribe topic)
+                    (let lp ()
+                      (receive
+                        (`#(pub ,t ,m) (ws-send-text! ws m) (lp))))))))
+        (let lp ()
+          (let ((m (ws-recv ws)))
+            (if (eq? (vector-ref m 0) 'text)
+                (begin (publish topic (vector-ref m 1)) (lp))
+                (kill fw 'normal))))))))
+
 ;; WebSocket echo: each connection runs in its own process; server push
 ;; is just (ws-send-text! ws ...) from anywhere holding the ws.
 (app-ws app "/ws"
@@ -139,6 +160,7 @@
 
 (start-scheduler
   (lambda ()
+    (start-pubsub!)
     ;; pool config is optional: a plain integer means worker count;
     ;; the alist form configures fault tolerance too (values below are
     ;; the defaults)
