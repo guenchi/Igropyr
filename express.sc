@@ -46,7 +46,9 @@
 
   (define (send-text! r s) (finish! r "text/plain; charset=utf-8" (string->utf8 s)))
   (define (send-html! r s) (finish! r "text/html; charset=utf-8" (string->utf8 s)))
-  (define (send-json! r obj) (finish! r "application/json" (string->utf8 (json->string obj))))
+  (define (send-json! r obj)
+    (finish! r "application/json; charset=utf-8"
+             (string->utf8 (json->string obj))))
 
   ;; tiny JSON writer: alist -> object, list -> array
   (define (json-escape s)
