@@ -13,7 +13,7 @@
 (library (igropyr uv)
   (export uv-init! uv-poll! now-ms uv-set-deliver!
           tcp-listen! tcp-stop-listen! tcp-connect!
-          tcp-read-start! tcp-write! tcp-close!
+          tcp-read-start! tcp-write! tcp-writev! tcp-close!
           conn? conn-handle conn-owner conn-set-owner!
           conn-state conn-count uv-strerror)
   (import (chezscheme))
@@ -330,31 +330,63 @@
     (when (eq? (conn-state c) 'open)
       (uv-read-start (conn-handle c) on-alloc-entry on-read-entry)))
 
-  ;; Queue a write. Allocates one foreign block laid out as
-  ;; [uv_write_t][uv_buf_t][payload]; write_cb frees it. on-done (or #f)
-  ;; is called with the libuv status; it runs in callback context so it
-  ;; must not yield. Returns #f if the write could not be queued (conn
-  ;; closing or immediate error), in which case on-done ran with -1.
+  ;; Queue a gathered write. Allocates one foreign block laid out as
+  ;; [uv_write_t][uv_buf_t][payloads]; write_cb frees it. Scheme
+  ;; bytevectors are copied directly into adjacent final async-safe foreign
+  ;; locations, avoiding an intermediate Scheme bytevector. Because those
+  ;; payloads are contiguous, expose them to libuv as one coalesced uv_buf_t:
+  ;; multiple adjacent iovecs only add writev syscall overhead.
+  (define (tcp-writev! c chunks on-done)
+    (define chunk-vector
+      (cond
+        ((vector? chunks) chunks)
+        ((list? chunks) (list->vector chunks))
+        (else
+         (assertion-violation 'tcp-writev!
+           "chunks must be a vector or proper list" chunks))))
+    (define count (vector-length chunk-vector))
+    (define (chunk-ref i) (vector-ref chunk-vector i))
+    (when (= count 0)
+      (assertion-violation 'tcp-writev! "chunks must not be empty" chunks))
+    (let validate ((i 0) (total 0))
+      (if (= i count)
+          (if (not (eq? (conn-state c) 'open))
+              (begin (when on-done (on-done -1)) #f)
+              (let* ((bufs-size buf-t-size)
+                     (block (foreign-alloc (+ write-req-size bufs-size total)))
+                     (buf-ptr (+ block write-req-size))
+                     (payload-start (+ buf-ptr bufs-size)))
+                (let fill ((j 0) (offset 0))
+                  (when (< j count)
+                    (let* ((bv (chunk-ref j))
+                           (n (bytevector-length bv))
+                           (data (+ payload-start offset)))
+                      (when (> n 0) (memcpy-to-c data bv n))
+                      (fill (+ j 1) (+ offset n)))))
+                (foreign-set! 'void* buf-ptr buf-base-offset payload-start)
+                (foreign-set! 'size_t buf-ptr buf-len-offset total)
+                (let ((r (uv-write block (conn-handle c) buf-ptr 1
+                                   on-write-entry)))
+                  (if (< r 0)
+                      (begin
+                        (foreign-free block)
+                        (when on-done (on-done r))
+                        #f)
+                      (begin
+                        (hashtable-set! write-table block
+                          (or on-done (lambda (status) (void))))
+                        #t)))))
+          (let ((bv (chunk-ref i)))
+            (unless (bytevector? bv)
+              (assertion-violation 'tcp-writev!
+                "every chunk must be a bytevector" bv))
+            (validate (+ i 1) (+ total (bytevector-length bv)))))))
+
+  ;; Backwards-compatible single-buffer write.
   (define (tcp-write! c bv on-done)
-    (if (not (eq? (conn-state c) 'open))
-        (begin (when on-done (on-done -1)) #f)
-        (let* ((n (bytevector-length bv))
-               (block (foreign-alloc (+ write-req-size buf-t-size n)))
-               (buf-ptr (+ block write-req-size))
-               (data-ptr (+ buf-ptr buf-t-size)))
-          (memcpy-to-c data-ptr bv n)
-          (foreign-set! 'void* buf-ptr buf-base-offset data-ptr)
-          (foreign-set! 'size_t buf-ptr buf-len-offset n)
-          (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
-            (if (< r 0)
-                (begin
-                  (foreign-free block)
-                  (when on-done (on-done r))
-                  #f)
-                (begin
-                  (hashtable-set! write-table block
-                    (or on-done (lambda (status) (void))))
-                  #t))))))
+    (unless (bytevector? bv)
+      (assertion-violation 'tcp-write! "expected bytevector" bv))
+    (tcp-writev! c (vector bv) on-done))
 
   ;; Idempotent close; memory is freed only in close_cb, so there is no
   ;; double-close and no fd leak.

@@ -368,12 +368,19 @@
   ;; predicate handed to the core: does this request hit a fast route?
   (define (app-fast-predicate a)
     (lambda (req)
-      (let ((m (req-method req)) (segs (split-segments (req-path req))))
-        (let loop ((fs (app-fast a)))
-          (cond
-            ((null? fs) #f)
-            ((and (eq? (caar fs) m) (match-segments (cdar fs) segs)) #t)
-            (else (loop (cdr fs))))))))
+      ;; Most pooled applications have no fast routes. Read the mutable
+      ;; route list first so that case avoids allocating path segments,
+      ;; while routes registered after app-listen remain visible.
+      (let ((fs (app-fast a)))
+        (and (pair? fs)
+             (let ((m (req-method req))
+                   (segs (split-segments (req-path req))))
+               (let loop ((fs fs))
+                 (cond
+                   ((null? fs) #f)
+                   ((and (eq? (caar fs) m)
+                         (match-segments (cdar fs) segs)) #t)
+                   (else (loop (cdr fs))))))))))
 
   ;; middleware: (lambda (req res next) ...); call (next) to continue
   (define (app-use a mw)
