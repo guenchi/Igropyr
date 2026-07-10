@@ -31,6 +31,7 @@
           http-stats http-shutdown!
           req-method req-path req-query req-headers req-header req-body
           req-keep-alive? req-params req-params-set!
+          req-local req-set-local!
           set-status! set-header! res-send!
           res-begin! res-write! res-end!
           res-conn res-req res-status res-headers res-keep-alive?
@@ -84,7 +85,22 @@
       (mutable params req-params req-params-set!)
       (immutable headers req-headers)    ; alist of (symbol . string)
       (immutable body req-body)          ; bytevector
-      (immutable keep-alive? req-keep-alive?)))
+      (immutable keep-alive? req-keep-alive?)
+      ;; per-request scratch alist for middleware to stash values
+      ;; (session, authenticated user, ...) for later handlers
+      (mutable locals req-locals req-locals-set!)))
+
+  ;; get/set a named value on the request (used by middleware to pass
+  ;; data down the chain to the handler)
+  (define (req-local req key)
+    (let ((p (assq key (req-locals req))))
+      (and p (cdr p))))
+
+  (define (req-set-local! req key val)
+    (let ((p (assq key (req-locals req))))
+      (if p
+          (set-cdr! p val)
+          (req-locals-set! req (cons (cons key val) (req-locals req))))))
 
   (define (req-header req name)
     (let ((p (assq name (req-headers req))))
@@ -538,7 +554,7 @@
                (let* ((req (make-request (vector-ref parsed 0)
                                          (vector-ref parsed 1)
                                          (vector-ref parsed 2)
-                                         '() headers empty-bv #f))
+                                         '() headers empty-bv #f '()))
                       (session (resolver req)))
                  (if session
                      (run-ws-session c acc hend wskey req session)
@@ -575,7 +591,8 @@
                               '()
                               headers
                               body
-                              (keep-alive? (vector-ref parsed 3) headers)))
+                              (keep-alive? (vector-ref parsed 3) headers)
+                              '()))
            (id (next-task-id!))
            (token (make-token))
            (fast? (unbox (http-server-fbox srv))))
