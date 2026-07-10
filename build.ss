@@ -29,6 +29,7 @@
     ("igropyr/express.sc" . 2)
     ("igropyr/session.sc" . 2)
     ("igropyr/middleware.sc" . 2)
+    ("igropyr/metrics.sc" . 2)
     ("igropyr/client.sc" . 2)
     ("igropyr/redis.sc" . 2)
     ("igropyr/mysql.sc" . 2)))
