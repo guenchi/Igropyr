@@ -12,7 +12,7 @@
 
 (library (igropyr libuv)
   (export uv-init! uv-poll! now-ms uv-set-deliver!
-          tcp-listen! tcp-stop-listen! tcp-connect!
+          tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
           tcp-read-start! tcp-write! tcp-writev! tcp-close!
           conn? conn-handle conn-owner conn-set-owner!
           conn-state conn-count uv-strerror)
@@ -43,6 +43,8 @@
   (define uv-ip4-addr    (foreign-procedure "uv_ip4_addr" (string int void*) int))
   (define uv-tcp-init    (foreign-procedure "uv_tcp_init" (void* void*) int))
   (define uv-tcp-connect (foreign-procedure "uv_tcp_connect" (void* void* void* void*) int))
+  (define uv-getaddrinfo (foreign-procedure "uv_getaddrinfo" (void* void* void* string void* void*) int))
+  (define uv-freeaddrinfo (foreign-procedure "uv_freeaddrinfo" (void*) void))
   (define uv-tcp-bind    (foreign-procedure "uv_tcp_bind" (void* void* unsigned-int) int))
   (define uv-tcp-nodelay (foreign-procedure "uv_tcp_nodelay" (void* int) int))
   (define uv-listen      (foreign-procedure "uv_listen" (void* int void*) int))
@@ -62,10 +64,12 @@
   (define memcpy-cc      (foreign-procedure "memcpy" (void* void* size_t) void*))
 
   (define UV-CONNECT 2)
+  (define UV-GETADDRINFO 8)
   (define tcp-handle-size (uv-handle-size UV-TCP))
   (define timer-handle-size (uv-handle-size UV-TIMER))
   (define write-req-size (uv-req-size UV-WRITE))
   (define connect-req-size (uv-req-size UV-CONNECT))
+  (define getaddrinfo-req-size (uv-req-size UV-GETADDRINFO))
   (define buf-t-size 16)             ; uv_buf_t on arm64: {void* base; size_t len}
 
   ;; monotonic milliseconds
@@ -94,6 +98,8 @@
   (define write-table (make-eqv-hashtable))
   ;; pending outbound connects: req address -> (handle . owner-pid)
   (define connect-table (make-eqv-hashtable))
+  ;; pending DNS lookups: getaddrinfo req address -> owner-pid
+  (define getaddrinfo-table (make-eqv-hashtable))
   (define (conn-count) (hashtable-size conn-table))
 
   ;; delivery hook: (deliver owner-pid msg); installed by (igropyr actor)
@@ -190,6 +196,40 @@
       (void* int)
       void))
 
+  ;; walk the addrinfo linked list, return the first IPv4 as "a.b.c.d".
+  ;; macOS struct addrinfo: ai_family @ off 4, ai_addr @ off 32,
+  ;; ai_next @ off 40. macOS sockaddr_in: sin_addr @ off 4 (4 bytes).
+  (define AF-INET 2)
+  (define (addrinfo->ipv4 ai)
+    (let loop ((ai ai))
+      (if (= ai 0)
+          #f
+          (if (= (foreign-ref 'int ai 4) AF-INET)
+              (let ((sa (foreign-ref 'void* ai 32)))
+                (string-append
+                  (number->string (foreign-ref 'unsigned-8 sa 4)) "."
+                  (number->string (foreign-ref 'unsigned-8 sa 5)) "."
+                  (number->string (foreign-ref 'unsigned-8 sa 6)) "."
+                  (number->string (foreign-ref 'unsigned-8 sa 7))))
+              (loop (foreign-ref 'void* ai 40))))))
+
+  ;; getaddrinfo_cb: tell the owner #(dns-resolved ,ip) or #(dns-failed ,e)
+  (define on-getaddrinfo-code
+    (foreign-callable
+      (lambda (req status ai)
+        (let ((owner (hashtable-ref getaddrinfo-table req #f)))
+          (hashtable-delete! getaddrinfo-table req)
+          (foreign-free req)
+          (if (< status 0)
+              (when owner (deliver owner (vector 'dns-failed status)))
+              (let ((ip (addrinfo->ipv4 ai)))
+                (uv-freeaddrinfo ai)
+                (when owner
+                  (deliver owner
+                    (if ip (vector 'dns-resolved ip) (vector 'dns-failed -1))))))))
+      (void* int void*)
+      void))
+
   ;; connect_cb for outbound connections: register the conn and tell the
   ;; owner process #(tcp-connected ,conn) or #(tcp-connect-failed ,errno).
   (define on-connect-code
@@ -229,10 +269,11 @@
       (lock-object on-write-code)
       (lock-object on-connection-code)
       (lock-object on-connect-code)
+      (lock-object on-getaddrinfo-code)
       (lock-object on-timer-code)
       (vector on-alloc-code on-read-code on-close-code
               on-write-code on-connection-code on-connect-code
-              on-timer-code)))
+              on-getaddrinfo-code on-timer-code)))
 
   (define on-alloc-entry (foreign-callable-entry-point on-alloc-code))
   (define on-read-entry (foreign-callable-entry-point on-read-code))
@@ -240,6 +281,7 @@
   (define on-write-entry (foreign-callable-entry-point on-write-code))
   (define on-connection-entry (foreign-callable-entry-point on-connection-code))
   (define on-connect-entry (foreign-callable-entry-point on-connect-code))
+  (define on-getaddrinfo-entry (foreign-callable-entry-point on-getaddrinfo-code))
   (define on-timer-entry (foreign-callable-entry-point on-timer-code))
 
   ;; ---- public API ----------------------------------------------------
@@ -284,6 +326,18 @@
     (when (> listener 0)
       (uv-close listener on-close-entry)
       (set! listener 0)))
+
+  ;; Async DNS. The owner process later receives #(dns-resolved ,ip-string)
+  ;; or #(dns-failed ,errno). libuv resolves on its thread pool, so the
+  ;; scheduler is not blocked.
+  (define (dns-resolve! host owner)
+    (let ((req (foreign-alloc getaddrinfo-req-size)))
+      (hashtable-set! getaddrinfo-table req owner)
+      (let ((r (uv-getaddrinfo uv-loop req on-getaddrinfo-entry host 0 0)))
+        (when (< r 0)
+          (hashtable-delete! getaddrinfo-table req)
+          (foreign-free req)
+          (deliver owner (vector 'dns-failed r))))))
 
   ;; Outbound TCP connection. The owner process later receives
   ;; #(tcp-connected ,conn) or #(tcp-connect-failed ,errno). Call
