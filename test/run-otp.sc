@@ -49,6 +49,27 @@
   (lambda (req res)
     (send-text! res (utf8->string (req-body req)))))
 
+;; Single-crash takeover demo: for any given :key the FIRST execution
+;; raises; the supervisor retries on another worker, which responds.
+;; The reply proves the takeover (worker pids differ) and that the task
+;; context (key + query) survived the crash. Use a fresh :key per test.
+(define once-log (make-hashtable string-hash string=?))
+(app-get app "/once/:key"
+  (lambda (req res)
+    (let* ((k (req-param req "key"))
+           (runs (append (hashtable-ref once-log k '())
+                         (list (process-id self)))))
+      (hashtable-set! once-log k runs)
+      (if (= (length runs) 1)
+          (raise 'first-attempt-crash)
+          (send-json! res
+            (list (cons 'attempt (length runs))
+                  (cons 'workers runs)
+                  (cons 'key k)
+                  (cons 'query (map (lambda (kv)
+                                      (cons (string->symbol (car kv)) (cdr kv)))
+                                    (req-query req)))))))))
+
 (app-get app "/crash"
   (lambda (req res)
     ;; Let It Crash: the worker dies, the supervisor retries 3 times and
