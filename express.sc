@@ -19,7 +19,7 @@
 (library (igropyr express)
   (export create-app app-get app-post app-put app-delete
           app-use app-static app-ws app-listen app->handler
-          req-param req-json
+          req-param req-json req-form req-cookie set-cookie!
           send-text! send-html! send-json! send-file!
           sse-start! sse-send!)
   (import (chezscheme) (igropyr actor) (igropyr http) (igropyr json))
@@ -57,6 +57,173 @@
   (define (req-json req)
     (guard (e (#t #f))
       (string->json (utf8->string (req-body req)))))
+
+  ;; ---- cookies --------------------------------------------------------------
+
+  (define (string-trim s)
+    (let ((n (string-length s)))
+      (let ((a (let lp ((i 0)) (if (and (< i n) (char=? (string-ref s i) #\space))
+                                   (lp (+ i 1)) i)))
+            (b (let lp ((i n)) (if (and (> i 0) (char=? (string-ref s (- i 1)) #\space))
+                                   (lp (- i 1)) i))))
+        (if (< a b) (substring s a b) ""))))
+
+  (define (string-index s ch)
+    (let ((n (string-length s)))
+      (let lp ((i 0))
+        (cond ((= i n) #f)
+              ((char=? (string-ref s i) ch) i)
+              (else (lp (+ i 1)))))))
+
+  ;; value of a cookie sent by the client, or #f
+  (define (req-cookie req name)
+    (let ((h (req-header req 'cookie)))
+      (and h
+           (let lp ((parts (string-split h #\;)))
+             (cond
+               ((null? parts) #f)
+               (else
+                (let* ((kv (string-trim (car parts)))
+                       (eqp (string-index kv #\=)))
+                  (if (and eqp (string=? (substring kv 0 eqp) name))
+                      (substring kv (+ eqp 1) (string-length kv))
+                      (lp (cdr parts))))))))))
+
+  ;; add a Set-Cookie header; extra attribute strings are appended:
+  ;;   (set-cookie! res "sid" "abc" "Path=/" "HttpOnly" "Max-Age=3600")
+  (define (set-cookie! res name value . attrs)
+    (set-header! res "Set-Cookie"
+      (apply string-append name "=" value
+             (map (lambda (a) (string-append "; " a)) attrs))))
+
+  ;; ---- form bodies (urlencoded + multipart/form-data) ---------------------------
+
+  (define (bv-sub bv start end)
+    (let ((r (make-bytevector (- end start))))
+      (bytevector-copy! bv start r 0 (- end start))
+      r))
+
+  ;; first occurrence of needle in bv at or after `from`
+  (define (bv-search bv needle from)
+    (let ((n (bytevector-length bv))
+          (m (bytevector-length needle)))
+      (let outer ((i from))
+        (cond
+          ((> (+ i m) n) #f)
+          ((let inner ((j 0))
+             (cond ((= j m) #t)
+                   ((fx= (bytevector-u8-ref bv (+ i j))
+                         (bytevector-u8-ref needle j))
+                    (inner (+ j 1)))
+                   (else #f)))
+           i)
+          (else (outer (+ i 1)))))))
+
+  ;; boundary=... from a Content-Type header (possibly quoted)
+  (define (multipart-boundary ct)
+    (let ((key "boundary="))
+      (let lp ((i 0))
+        (cond
+          ((> (+ i (string-length key)) (string-length ct)) #f)
+          ((string=? (substring ct i (+ i (string-length key))) key)
+           (let* ((start (+ i (string-length key)))
+                  (raw (let scan ((j start))
+                         (if (or (= j (string-length ct))
+                                 (memv (string-ref ct j) '(#\; #\space)))
+                             (substring ct start j)
+                             (scan (+ j 1))))))
+             (if (and (> (string-length raw) 1)
+                      (char=? (string-ref raw 0) #\"))
+                 (substring raw 1 (- (string-length raw) 1))
+                 raw)))
+          (else (lp (+ i 1)))))))
+
+  ;; "form-data; name=\"a\"; filename=\"b\"" -> value of one attribute
+  (define (disposition-attr line attr)
+    (let ((key (string-append attr "=\"")))
+      (let lp ((i 0))
+        (cond
+          ((> (+ i (string-length key)) (string-length line)) #f)
+          ((string=? (substring line i (+ i (string-length key))) key)
+           (let ((start (+ i (string-length key))))
+             (let scan ((j start))
+               (cond ((= j (string-length line)) #f)
+                     ((char=? (string-ref line j) #\") (substring line start j))
+                     (else (scan (+ j 1)))))))
+          (else (lp (+ i 1)))))))
+
+  ;; parse one multipart part: header block + payload
+  ;; -> (name . string-value) or (name . #(file filename content-type bytes))
+  (define (parse-part bv start end)
+    (let ((hend (bv-search bv (string->utf8 "\r\n\r\n") start)))
+      (and hend (<= (+ hend 4) end)
+           (let* ((head (utf8->string (bv-sub bv start hend)))
+                  (data (bv-sub bv (+ hend 4) end))
+                  (disp (let lp ((lines (string-split head #\newline)))
+                          (cond
+                            ((null? lines) "")
+                            ((let ((l (car lines)))
+                               (and (>= (string-length l) 20)
+                                    (string-ci=? (substring l 0 20)
+                                                 "content-disposition:")))
+                             (car lines))
+                            (else (lp (cdr lines))))))
+                  (name (disposition-attr disp "name"))
+                  (filename (disposition-attr disp "filename"))
+                  (ctype (let lp ((lines (string-split head #\newline)))
+                           (cond
+                             ((null? lines) "application/octet-stream")
+                             ((let ((l (car lines)))
+                                (and (>= (string-length l) 13)
+                                     (string-ci=? (substring l 0 13)
+                                                  "content-type:")))
+                              (string-trim
+                                (let ((l (car lines)))
+                                  (let ((s (substring l 13 (string-length l))))
+                                    (if (and (> (string-length s) 0)
+                                             (char=? (string-ref s (- (string-length s) 1))
+                                                     #\return))
+                                        (substring s 0 (- (string-length s) 1))
+                                        s)))))
+                             (else (lp (cdr lines)))))))
+             (and name
+                  (cons name
+                        (if filename
+                            (vector 'file filename ctype data)
+                            (utf8->string data))))))))
+
+  (define (parse-multipart bv boundary)
+    (let ((delim (string->utf8 (string-append "--" boundary))))
+      (let lp ((pos (or (bv-search bv delim 0) (bytevector-length bv)))
+               (acc '()))
+        (let ((part-start (+ pos (bytevector-length delim) 2))) ; skip \r\n
+          (if (or (> part-start (bytevector-length bv))
+                  ;; "--" right after the delimiter: final boundary
+                  (and (<= (+ pos (bytevector-length delim) 2) (bytevector-length bv))
+                       (fx= (bytevector-u8-ref bv (+ pos (bytevector-length delim))) 45)
+                       (fx= (bytevector-u8-ref bv (+ pos (bytevector-length delim) 1)) 45)))
+              (reverse acc)
+              (let ((next (bv-search bv delim part-start)))
+                (if (not next)
+                    (reverse acc)
+                    (let ((part (parse-part bv part-start (- next 2)))) ; strip \r\n
+                      (lp next (if part (cons part acc) acc))))))))))
+
+  ;; Parse a form body. urlencoded -> alist of strings; multipart ->
+  ;; alist where text fields are strings and uploads are
+  ;; #(file ,filename ,content-type ,bytevector). '() otherwise.
+  (define (req-form req)
+    (let ((ct (or (req-header req 'content-type) "")))
+      (cond
+        ((and (>= (string-length ct) 33)
+              (string-ci=? (substring ct 0 33)
+                           "application/x-www-form-urlencoded"))
+         (parse-query (utf8->string (req-body req))))
+        ((and (>= (string-length ct) 19)
+              (string-ci=? (substring ct 0 19) "multipart/form-data"))
+         (let ((b (multipart-boundary ct)))
+           (if b (parse-multipart (req-body req) b) '())))
+        (else '()))))
 
   ;; ---- Server-Sent Events -------------------------------------------------
   ;; Detach long streams from the pool worker:

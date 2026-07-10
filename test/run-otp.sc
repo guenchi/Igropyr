@@ -87,6 +87,31 @@
 
 (app-static app "/static" "./public")
 
+;; Forms: urlencoded and multipart both land in req-form; file uploads
+;; arrive as #(file name content-type bytes)
+(app-post app "/form"
+  (lambda (req res)
+    (send-json! res
+      (map (lambda (kv)
+             (cons (car kv)
+                   (let ((v (cdr kv)))
+                     (if (vector? v)
+                         (list (cons 'filename (vector-ref v 1))
+                               (cons 'type (vector-ref v 2))
+                               (cons 'size (bytevector-length (vector-ref v 3))))
+                         v))))
+           (req-form req)))))
+
+;; Cookies: /cookie/set plants one, /cookie/get reads it back
+(app-get app "/cookie/set"
+  (lambda (req res)
+    (set-cookie! res "sid" "abc123" "Path=/" "HttpOnly")
+    (send-text! res "cookie set")))
+
+(app-get app "/cookie/get"
+  (lambda (req res)
+    (send-text! res (or (req-cookie req "sid") "no cookie"))))
+
 ;; JSON request body parsing: POST {"name":"x"} -> {"hello":"x"}
 (app-post app "/echo-json"
   (lambda (req res)
