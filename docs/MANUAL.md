@@ -1,8 +1,8 @@
-# Igropyr Developer Guide
+# Igropyr Manual
 
-[English](DEVELOPING.md) | [简体中文](DEVELOPING.zh-CN.md)
+[English](MANUAL.md) | [简体中文](MANUAL.zh-CN.md)
 
-This guide covers the architecture, design patterns, and implementation details of Igropyr for developers building on or contributing to the framework.
+This manual covers the architecture, design patterns, and implementation details of Igropyr for developers building on or contributing to the framework.
 
 ## Table of Contents
 
@@ -10,13 +10,22 @@ This guide covers the architecture, design patterns, and implementation details 
 2. [The Actor Model](#the-actor-model)
 3. [The Core Invariant](#the-core-invariant)
 4. [Writing an HTTP Handler](#writing-an-http-handler)
-5. [Fault Tolerance](#fault-tolerance)
-6. [OTP Patterns](#otp-patterns)
-7. [Database Clients](#database-clients)
-8. [Running and Building](#running-and-building)
-9. [Testing](#testing)
-10. [Code Style](#code-style)
-11. [Common Pitfalls](#common-pitfalls)
+5. [WebSocket](#websocket)
+6. [Streaming and SSE](#streaming-and-sse)
+7. [Hot Code Swapping and Graceful Shutdown](#hot-code-swapping-and-graceful-shutdown)
+8. [Fault Tolerance](#fault-tolerance)
+9. [OTP Patterns](#otp-patterns)
+10. [Middleware Suite](#middleware-suite)
+11. [Sessions](#sessions)
+12. [Metrics](#metrics)
+13. [Outbound HTTP Client](#outbound-http-client)
+14. [Database Clients](#database-clients)
+15. [Async File Reads](#async-file-reads)
+16. [JSON and gzip](#json-and-gzip)
+17. [Running and Building](#running-and-building)
+18. [Testing](#testing)
+19. [Code Style](#code-style)
+20. [Common Pitfalls](#common-pitfalls)
 
 ---
 
@@ -607,6 +616,209 @@ The handler receives `req` and `res` objects. Accessors and response functions a
 
 ---
 
+## WebSocket
+
+Igropyr implements the WebSocket protocol (RFC 6455) with two sides: server-side handlers and an outbound client.
+
+### Server-Side WebSocket
+
+A WebSocket route is registered with `app-ws` and runs in its own process per connection. The handler receives a `ws` session object and the upgrade request.
+
+#### API
+
+- `(app-ws app pattern (lambda (ws req) ...))` — register a WebSocket route with a session handler
+- `(ws-recv ws)` → `#(text ,string) | #(binary ,bytevector) | #(close)` — block until a complete message arrives (handles fragmentation, ping/pong, UTF-8 validation)
+- `(ws-send-text! ws string)` → boolean — send a text message; #f if closed
+- `(ws-send-binary! ws bytevector)` → boolean — send binary data
+- `(ws-close! ws)` — idempotent close (sends close frame and closes the socket)
+
+#### UTF-8 Validation and Frame Limits
+
+Text messages are validated for strict UTF-8 (RFC 3629): overlong encodings, surrogates, and code points above U+10FFFF are rejected. Invalid UTF-8 triggers a 1007 (Invalid frame payload data) close.
+
+Frame size is capped at 1 MiB (max-frame); reassembled messages are capped at 8 MiB (max-message). Violations trigger a 1009 (Message too big) close.
+
+#### One Process Per Connection
+
+Each WebSocket connection runs in its own spawned green process. When the handler calls `ws-recv`, it blocks in that process's message loop until a frame arrives from the network. Multiple concurrent WebSocket connections run in parallel processes on the single OS thread.
+
+#### Example: Echo Server
+
+```scheme
+(app-ws app "/echo"
+  (lambda (ws req)
+    (ws-send-text! ws "welcome")
+    (let loop ()
+      (let ((msg (ws-recv ws)))
+        (case (vector-ref msg 0)
+          ((text)
+           (ws-send-text! ws (string-append "echo: " (vector-ref msg 1)))
+           (loop))
+          ((binary)
+           (ws-send-binary! ws (vector-ref msg 1))
+           (loop))
+          ((close) (ws-close! ws)))))))
+```
+
+### WebSocket Client
+
+Connect to a remote WebSocket server with the same session object. Outbound frames are masked per RFC 6455 (client role); the server-side role is automatic.
+
+#### API
+
+- `(ws-connect "ws://host:port/path")` → ws session (blocks until handshake completes) or raises `#(ws-client-error ,message)`
+- `(ws-send-text! ws string)`, `(ws-send-binary! ws bv)`, `(ws-close! ws)` — same as server-side
+- `(ws-recv ws)` — same as server-side
+
+Note: `wss://` (TLS) is not supported; put a TLS proxy in front of the server.
+
+#### Example: Client
+
+```scheme
+(spawn (lambda ()
+         (let ((ws (ws-connect "ws://127.0.0.1:8080/echo")))
+           (ws-send-text! ws "hello")
+           (let ((msg (ws-recv ws)))
+             (display (vector-ref msg 1))
+             (ws-close! ws)))))
+```
+
+---
+
+## Streaming and SSE
+
+HTTP handlers run in the worker pool and are expected to complete quickly. For long-running responses (file uploads, real-time updates), detach the response into its own process.
+
+### Streaming Primitives
+
+The low-level streaming API lets you write chunked responses:
+
+- `(res-begin! res)` — set response headers (Content-Type, etc.) and start streaming; must be called before any `res-write!`
+- `(res-write! res bytevector)` — write a chunk to the TCP buffer (non-blocking; may queue internally)
+- `(res-end! res)` — flush and close the response
+
+```scheme
+(app-get app "/download"
+  (lambda (req res)
+    (set-header! res "Content-Type" "application/octet-stream")
+    (set-header! res "Content-Disposition" "attachment; filename=\"data.bin\"")
+    (res-begin! res)
+    (res-write! res (string->utf8 "part 1\n"))
+    (sleep-ms 100)
+    (res-write! res (string->utf8 "part 2\n"))
+    (res-end! res)))
+```
+
+### Server-Sent Events (SSE)
+
+SSE is a persistent connection where the server pushes text events to the client over HTTP/1.1. Use `sse-start!` to begin, then spawn a separate process to push events.
+
+#### API
+
+- `(sse-start! res)` — set SSE headers (Content-Type: text/event-stream, no caching) and begin streaming
+- `(sse-send! res "data\n")` → boolean or void — write an event line; returns #f if the client is gone, otherwise void
+
+#### Example: Real-Time Updates
+
+```scheme
+(app-get app "/sse"
+  (lambda (req res)
+    (sse-start! res)
+    ;; Detach the event producer into its own process so the handler returns quickly
+    (spawn (lambda ()
+             (let loop ((i 1))
+               (when (<= i 10)
+                 ;; sse-send! returns #f when the client closes the connection
+                 (when (sse-send! res (string-append "event: count\ndata: "
+                                                     (number->string i) "\n\n"))
+                   (sleep-ms 1000)
+                   (loop (+ i 1))))
+               ;; Close the response when done (or when client closed)
+               (res-end! res))))))
+```
+
+The spawned process runs independently: the handler returns, the worker is freed, and the event loop pumps the persistent connection to the client. If the client closes the browser tab or connection is lost, `sse-send!` detects it and returns `#f`, allowing the producer loop to exit cleanly.
+
+---
+
+## Hot Code Swapping and Graceful Shutdown
+
+Igropyr supports replacing the request handler and individual routes without stopping the server or dropping in-flight requests.
+
+### Hot Swapping the Handler
+
+Use `http-swap!` to replace the entire handler:
+
+```scheme
+(let ((srv (app-listen app 8080)))
+  (spawn (lambda ()
+           (sleep-ms 60000)
+           ;; After 1 minute, reload routes and swap handler
+           (let ((new-app (load-routes!)))  ; your app-reloading code
+             (http-swap! srv (app->handler new-app))))))
+```
+
+The server's in-flight requests finish normally. New requests use the new handler.
+
+### Updating Individual Routes
+
+Routes on an app object are live: re-registering a route (same method + pattern) replaces the old handler in-place.
+
+```scheme
+(define app (create-app))
+(app-listen app 8080)
+
+;; Initially:
+(app-get app "/version" (lambda (req res) (send-text! res "v1")))
+
+;; Later, hot-swap this one route:
+(app-get app "/version" (lambda (req res) (send-text! res "v2")))
+```
+
+### Runtime Statistics
+
+Use `http-stats` to inspect the pool and connection state:
+
+```scheme
+(let ((srv (app-listen app 8080)))
+  (app-get app "/stats"
+    (lambda (req res)
+      (send-json! res (http-stats srv)))))
+```
+
+Returns:
+
+```scheme
+((idle . 5)          ; idle workers
+ (busy . 2)          ; workers processing a task
+ (pending . 1)       ; queued tasks waiting for a worker
+ (total-requests . 12345)      ; cumulative requests served
+ (active-connections . 23)     ; open TCP connections
+ (uptime-ms . 3600000))        ; server uptime in milliseconds
+```
+
+### Graceful Shutdown
+
+`http-shutdown!` stops accepting new connections and waits until all in-flight requests complete:
+
+```scheme
+(let ((srv (app-listen app 8080)))
+  (spawn (lambda ()
+           ;; Graceful shutdown after 5 minutes
+           (sleep-ms (* 5 60 1000))
+           (http-shutdown! srv)
+           (exit 0))))
+```
+
+The server will:
+1. Stop calling `tcp-listen!` to accept new connections.
+2. Poll the pool state until all workers are idle and the queue is empty.
+3. Return.
+
+Your code can then clean up and exit.
+
+---
+
 ## Fault Tolerance
 
 Igropyr's fault tolerance is based on Erlang's "Let It Crash" principle: don't try to recover from all errors in the handler; instead, let workers crash and have a supervisor restart them.
@@ -901,6 +1113,286 @@ Use **bare spawn** when:
 
 ---
 
+## Middleware Suite
+
+Igropyr includes a standard set of middleware for common concerns: CORS, security headers, logging, rate limiting, and error handling. Each middleware is a function `(lambda (req res next) ...)` that can inspect/modify the request, optionally call `(next)` to continue the chain, or respond directly.
+
+### CORS
+
+Handle Cross-Origin Resource Sharing with configurable options.
+
+```scheme
+(import (igropyr middleware))
+
+;; Permissive (allow all origins):
+(app-use app (cors))
+
+;; Strict (specify origin, methods, etc.):
+(app-use app (cors '((origin . "https://app.example.com")
+                      (methods . "GET,POST,PUT")
+                      (headers . "Content-Type,Authorization")
+                      (credentials . #t)
+                      (max-age . "86400"))))
+```
+
+The middleware sets `Access-Control-Allow-*` headers. If the request is an OPTIONS preflight, it answers with 204 No Content and does not call `(next)`.
+
+### Security Headers
+
+Add conservative security headers by default:
+
+```scheme
+(app-use app (security-headers))
+
+;; Or customize:
+(app-use app (security-headers '((frame-options . "SAMEORIGIN")
+                                 (referrer-policy . "strict-origin-when-cross-origin")
+                                 (hsts . #t)
+                                 (content-security-policy . "default-src 'self'"))))
+```
+
+Sets `X-Content-Type-Options: nosniff`, `X-Frame-Options`, `Referrer-Policy`, optionally `Strict-Transport-Security` and `Content-Security-Policy`.
+
+### Logger
+
+Log each request (method, path, status) after it completes:
+
+```scheme
+(app-use app (logger))
+
+;; Or log to a file:
+(let ((p (open-file-output-port "/var/log/app.log"
+                                (file-options replace))))
+  (app-use app (logger '((port . p)))))
+```
+
+Output format: `METHOD path -> status (Nms)`.
+
+### Rate Limiter
+
+Limit request rate by IP or custom key:
+
+```scheme
+(app-use app (rate-limit))
+
+;; Or customize:
+(app-use app (rate-limit '((max-requests . 100)
+                            (window-ms . 60000)
+                            (key-fn . (lambda (req)
+                                        (req-header req 'x-forwarded-for))))))
+```
+
+The default allows 100 requests per 60 seconds per IP. When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
+
+### Error Handler
+
+Catch unhandled exceptions and respond with a nice error page:
+
+```scheme
+(app-use app (error-handler))
+
+;; Or customize the response:
+(app-use app (error-handler '((show-details . #f))))
+```
+
+When a handler raises an exception that the middleware chain doesn't catch, the error handler responds with HTTP 500 and a JSON error body. If `show-details` is true, includes the exception message (useful for development).
+
+### Request-Local Storage
+
+Middleware can pass data to downstream handlers via `req-local` and `req-set-local!`:
+
+```scheme
+(app-use app
+  (lambda (req res next)
+    ;; Authentication middleware: set user on the request
+    (let ((auth (req-header req 'authorization)))
+      (if auth
+          (let ((user (parse-auth-header auth)))
+            (req-set-local! req 'user user)
+            (next))
+          (begin (set-status! res 401) (send-text! res "Unauthorized"))))))
+
+;; Later, in a handler:
+(app-get app "/me"
+  (lambda (req res)
+    (let ((user (req-local req 'user)))
+      (if user
+          (send-json! res (list (cons 'name (car user))))
+          (begin (set-status! res 403)
+                 (send-text! res "Forbidden"))))))
+```
+
+---
+
+## Sessions
+
+Igropyr provides cookie-based session storage with a TTL, automatic pruning, and CSPRNG-generated session IDs.
+
+### Setup
+
+At boot, create a session store and register the middleware:
+
+```scheme
+(import (igropyr session))
+
+(define app (create-app))
+(define store (make-session-store))  ; default: 30-min TTL
+(app-use app (session-middleware store))
+(app-listen app 8080)
+```
+
+### API
+
+- `(make-session-store [ttl-ms])` → store — create a session store (default TTL 30 min = 1800000 ms)
+- `(session-middleware store)` → middleware — register the session middleware
+- `(req-session req)` → session object — get the current request's session (or create one)
+- `(session-get session key)` → value or #f — read a key from the session
+- `(session-set! session key value)` → void — write a key to the session
+- `(session-clear! session)` → void — clear all data and send a Set-Cookie with empty value
+
+### Implementation Details
+
+Sessions are stored in a gen-server (actor) with a string-keyed hashtable: `sid -> (data . expiry-timestamp)`. The middleware reads the session cookie (defaults to "sid"), loads the session onto the request, and after the handler runs, persists changes back to the store. If a new session was created, it sends a Set-Cookie header with a fresh sid (16 random bytes from `/dev/urandom`, hex-encoded).
+
+A background process wakes every 1 minute and prunes expired sessions.
+
+### Weak Consistency Note
+
+If the same client makes two concurrent requests with the same session ID, both handlers see the session data as it was at the start of the request. Writes from one handler will be silently overwritten if the other handler's write completes later. For consistent updates, use a database transaction or a serialization lock (e.g., a gen-server).
+
+### Example
+
+```scheme
+(app-post app "/login"
+  (lambda (req res)
+    (let ((username (assoc "username" (req-form req)))
+          (password (assoc "password" (req-form req))))
+      (if (and username password (valid-password? (cdr username) (cdr password)))
+          (let ((s (req-session req)))
+            (session-set! s 'user (cdr username))
+            (send-json! res (list (cons 'ok #t))))
+          (begin (set-status! res 401)
+                 (send-json! res (list (cons 'error "bad credentials"))))))))
+
+(app-get app "/profile"
+  (lambda (req res)
+    (let ((s (req-session req)))
+      (let ((user (session-get s 'user)))
+        (if user
+            (send-json! res (list (cons 'user user)))
+            (begin (set-status! res 403)
+                   (send-text! res "Not logged in")))))))
+```
+
+---
+
+## Metrics
+
+Collect and expose Prometheus-format metrics for request counts, latencies, and pool health.
+
+### Setup
+
+Create a metrics collector and register the middleware:
+
+```scheme
+(import (igropyr metrics))
+
+(define app (create-app))
+(define metrics (make-metrics))
+(app-use app (metrics-middleware metrics))
+(let ((srv (app-listen app 8080)))
+  ;; Expose metrics on /metrics
+  (app-get app "/metrics" (metrics-endpoint metrics srv)))
+```
+
+### API
+
+- `(make-metrics)` → collector — create a metrics gen-server
+- `(metrics-middleware collector)` → middleware — record each request's status and latency
+- `(metrics-endpoint collector server)` → handler — HTTP handler that renders metrics in Prometheus text format
+
+### Output Example
+
+```
+# HELP igropyr_requests_total HTTP requests by status
+# TYPE igropyr_requests_total counter
+igropyr_requests_total{status="200"} 1234
+igropyr_requests_total{status="404"} 10
+igropyr_requests_total{status="500"} 2
+# HELP igropyr_request_duration_ms Request duration summary
+# TYPE igropyr_request_duration_ms summary
+igropyr_request_duration_ms_sum 45678
+igropyr_request_duration_ms_count 1246
+# TYPE igropyr_connections gauge
+igropyr_connections 5
+# TYPE igropyr_busy_workers gauge
+igropyr_busy_workers 2
+# TYPE igropyr_idle_workers gauge
+igropyr_idle_workers 6
+# TYPE igropyr_pending_tasks gauge
+igropyr_pending_tasks 0
+# TYPE igropyr_uptime_ms gauge
+igropyr_uptime_ms 3600000
+```
+
+Scrape this endpoint every 10-15 seconds with Prometheus, Grafana, or similar.
+
+---
+
+## Outbound HTTP Client
+
+Make outbound HTTP/1.1 requests from your handlers or background processes. The client runs in the caller's green process and parks until the response arrives, allowing other work to continue on the OS thread.
+
+### API
+
+- `(http-get url)` → response — fetch a URL (GET)
+- `(http-post url body [options])` → response — POST a body (string or bytevector)
+- `(http-request method url [options])` → response — generic request
+
+Response accessors:
+- `(response-status resp)` → integer (200, 404, etc.)
+- `(response-headers resp)` → alist of (string . string) pairs
+- `(response-header resp "Name")` → value or #f
+- `(response-body resp)` → bytevector (decoded if chunked)
+
+Options:
+- `(body . ,bytevector)` or `(body . ,string)` — request body
+- `(headers . ((("Header" . "value") ...)))` — custom headers
+- `(timeout . ,ms)` — default 30000 ms
+
+### Error Handling
+
+Transport errors or timeouts raise `#(http-client-error ,message)`.
+
+```scheme
+(guard (e ((and (vector? e) (eq? (vector-ref e 0) 'http-client-error))
+            (let ((msg (vector-ref e 1)))
+              (display (string-append "HTTP error: " msg "\n")))))
+  (http-get "http://example.com/"))
+```
+
+### Async DNS
+
+The client performs DNS resolution asynchronously on libuv's thread pool, so the scheduler is never blocked by a slow DNS server.
+
+### Example
+
+```scheme
+(app-get app "/proxy"
+  (lambda (req res)
+    (let* ((target (req-param req "url"))
+           (resp (http-get target)))
+      (if (= (response-status resp) 200)
+          (begin
+            (set-header! res "Content-Type" (response-header resp "Content-Type"))
+            (res-send! res (response-body resp)))
+          (begin
+            (set-status! res (response-status resp))
+            (send-text! res "upstream error"))))))
+```
+
+---
+
 ## Database Clients
 
 ### Redis
@@ -1051,6 +1543,140 @@ For applications with many concurrent workers, instead of one connection, use `m
 ```
 
 From the HTTP perspective, the database query is non-blocking: the worker's process parks in `receive`, but the OS thread keeps serving other requests via other workers and connections.
+
+---
+
+## Async File Reads
+
+Reading files is a blocking operation at the OS level. Igropyr provides `file-read-async!` to offload file I/O to libuv's thread pool, so the scheduler never blocks.
+
+### API
+
+- `(file-read-async! path owner)` → void — start an async file read on the thread pool; the owner process receives `#(file-read ,bytevector)` on success or `#(file-error ,code)` on failure
+
+The function is internal to `(igropyr libuv)` but used by the static file serving code in Express.
+
+### Implementation
+
+Behind the scenes, libuv's async file operations follow this sequence:
+1. Call `uv_fs_stat` to get the file size (thread pool).
+2. Open the file with `uv_fs_open` (thread pool).
+3. Read the file with `uv_fs_read` (thread pool).
+4. Close with `uv_fs_close` (thread pool).
+5. Send the result back to the owner process via a message.
+
+All of this happens on a separate thread, so a large or slow read (network mount, spinning disk, etc.) never blocks the scheduler.
+
+### Why Static Files Use It
+
+The Express layer's `app-static` uses `file-read-async!` to serve static files without blocking:
+
+```scheme
+(app-static app "/assets" "./public")
+```
+
+When a request hits `/assets/style.css`, the handler:
+1. Checks the static file cache (hashtable lookup, O(1)).
+2. If not cached or file was modified, calls `file-read-async!`.
+3. Parks the worker in `receive` until the file bytes arrive.
+4. Sends the response.
+
+During the wait, the worker is not consuming CPU; other workers keep serving requests.
+
+### Custom Async File Reads
+
+If you need to read a file in a handler:
+
+```scheme
+(app-get app "/file/:name"
+  (lambda (req res)
+    (let ((name (req-param req "name")))
+      (file-read-async! (string-append "./data/" name) self)
+      (receive (after 30000 #f)
+        (`#(file-read ,bv)
+          (send-file! res (string-append "./data/" name)))
+        (`#(file-error ,code)
+          (set-status! res 500)
+          (send-text! res "read error"))))))
+```
+
+---
+
+## JSON and gzip
+
+Igropyr includes a complete JSON parser/serializer and gzip compression support.
+
+### JSON
+
+The `(igropyr json)` library provides safe JSON parsing for untrusted input (HTTP request bodies).
+
+#### Data Model
+
+JSON is mapped to Scheme types:
+- Object `{}` → alist with string keys: `(("a" . 1) ("b" . 2))`
+- Array `[]` → vector: `#(1 2 3)`
+- String → string
+- Number → number
+- `true`, `false` → `#t`, `#f`
+- `null` → `'null`
+
+#### API
+
+- `(string->json s)` → parsed value; raises `#(json-error ,msg ,pos)` on bad input
+- `(json->string x)` → JSON string (alists → objects, vectors → arrays, plain lists also become arrays)
+- `(json-ref x key ...)` → value or #f; recursive descent by string/symbol key (objects) or integer index (arrays)
+
+The parser is a recursive-descent, safe for untrusted input.
+
+#### Example
+
+```scheme
+(let ((body (utf8->string (req-body req))))
+  (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'json-error))
+              (begin (set-status! res 400)
+                     (send-json! res (list (cons 'error "malformed json"))))))
+    (let ((data (string->json body)))
+      ;; data is an alist
+      (let ((name (assoc "name" data)))
+        (if name
+            (send-json! res (list (cons 'greeting (string-append "hi " (cdr name)))))
+            (begin (set-status! res 400)
+                   (send-json! res (list (cons 'error "missing name")))))))))
+```
+
+Path access via `json-ref`:
+
+```scheme
+(let ((data (string->json body)))
+  (let ((first-name (json-ref data "person" "name" "first")))
+    ;; if data is {"person":{"name":{"first":"alice",...},...},...}
+    ;; then first-name is "alice"
+    ))
+```
+
+### gzip Compression
+
+The `(igropyr gzip)` library compresses bytevectors to gzip format (used by browsers). Compression is done via FFI to zlib.
+
+#### API
+
+- `(gzip-compress bv level)` → compressed bytevector or #f on failure (level 1..9; 6 is default)
+- `(gzip-acceptable? accept-encoding-header)` → boolean; checks if client sent Accept-Encoding: gzip
+
+The Express layer uses these automatically:
+- Dynamic responses (JSON, HTML) are gzip-encoded if the client accepts it and the result is >1 KiB.
+- Static files are cached uncompressed but gzip-encoded on-demand if the client accepts it.
+
+You can also manually compress:
+
+```scheme
+(let ((gz (gzip-compress (string->utf8 "some large text") 6)))
+  (if gz
+      (begin
+        (set-header! res "Content-Encoding" "gzip")
+        (res-send! res gz))
+      (res-send! res (string->utf8 "some large text"))))
+```
 
 ---
 
