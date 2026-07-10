@@ -31,6 +31,8 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
   surrogate handling) and writer
 - **Forms & cookies** — `req-form` parses urlencoded and multipart bodies
   (file uploads included); `req-cookie` / `set-cookie!`
+- **Middleware suite** — cookie sessions (gen-server store, CSPRNG sids),
+  CORS with preflight, security headers, and an access logger
 - **Chunked transfer-encoding** — `Transfer-Encoding: chunked` request
   bodies are decoded transparently
 - **Non-blocking Redis and MySQL clients** — pure Scheme, same event
@@ -436,6 +438,38 @@ One connection per request (no pooling); a transport failure or timeout
 raises `#(http-client-error msg)`. https is not supported directly —
 reach TLS-only endpoints through a proxy (see HTTPS below).
 
+## Middleware suite
+
+Ready-made middleware for common needs. Register them with `app-use`;
+order matters (outermost first).
+
+```scheme
+(import (igropyr session) (igropyr middleware))
+
+(app-use app (logger))                     ; "GET /path -> 200 (3ms)"
+(app-use app (security-headers '((hsts . #t))))  ; X-Frame-Options, nosniff, ...
+(app-use app (cors '((origin . "https://app.example.com")
+                     (credentials . #t))))       ; + 204 OPTIONS preflight
+
+;; cookie-based sessions backed by a gen-server store (sids from the OS
+;; CSPRNG, TTL-pruned); the session is loaded onto the request and saved
+;; after the handler if it changed
+(define store (make-session-store))         ; at boot
+(app-use app (session-middleware store))
+
+(app-get app "/visits"
+  (lambda (req res)
+    (let* ((s (req-session req))
+           (n (+ 1 (or (session-get s 'visits) 0))))
+      (session-set! s 'visits n)             ; persisted automatically
+      (send-json! res (list (cons 'visits n))))))
+```
+
+Middleware can also stash arbitrary values on the request for later
+handlers with `req-set-local!` / `req-local` (this is how sessions ride
+along). Writing your own is just `(lambda (req res next) ...)` — call
+`(next)` to continue, or respond and return to short-circuit.
+
 ## Fast routes
 
 By default every request goes through the worker pool, which buys crash
@@ -576,6 +610,8 @@ json.sc    safe recursive-descent JSON parser + writer
 gzip.sc    gzip compression via zlib
 gen-server.sc  OTP gen-server (call/cast/info)
 pubsub.sc  topic publish/subscribe with dead-subscriber cleanup
+session.sc     cookie sessions on a gen-server store
+middleware.sc  cors / security-headers / logger
 client.sc  non-blocking outbound HTTP client (async DNS)
 redis.sc   non-blocking Redis client (RESP2), pipelined
 mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
