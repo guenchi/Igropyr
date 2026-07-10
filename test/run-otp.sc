@@ -117,4 +117,11 @@
 
 (start-scheduler
   (lambda ()
-    (app-listen app 8080 8)))
+    ;; pool config is optional: a plain integer means worker count;
+    ;; the alist form configures fault tolerance too (values below are
+    ;; the defaults)
+    (app-listen app 8080
+      '((workers . 8)
+        (max-retries . 3)
+        (stuck-ms . 30000)
+        (check-ms . 5000)))))

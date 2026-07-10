@@ -98,6 +98,18 @@ With the bundled Express-style layer:
     (app-listen app 8080 8)))   ; port 8080, 8 workers (default 8)
 ```
 
+The pool and its fault tolerance are configurable — pass an alist instead
+of the worker count (any key may be omitted; values below are the
+defaults):
+
+```scheme
+(app-listen app 8080
+  '((workers . 8)         ; pool size
+    (max-retries . 3)     ; crash retries per task, then 500
+    (stuck-ms . 30000)    ; busy longer than this => killed & replaced
+    (check-ms . 5000)))   ; how often the ticker checks for stuck workers
+```
+
 ### Request accessors
 
 | Procedure | Result |

@@ -505,13 +505,32 @@
   ;; (lambda (req res) ...), run inside a pool worker for every request.
   ;; Must run inside the scheduler (call from the start-scheduler boot
   ;; thunk). Returns an http-server usable with http-swap!/http-set-ws!.
-  (define (http-listen port handler . opts)
-    (let* ((nworkers (if (pair? opts) (car opts) 8))
-           (hbox (box handler))
+  ;;
+  ;; The optional third argument configures the pool: either a plain
+  ;; integer (worker count) or an alist:
+  ;;   (http-listen 8080 handler
+  ;;     '((workers . 16)        ; pool size            (default 8)
+  ;;       (max-retries . 3)     ; crash retries        (default 3)
+  ;;       (stuck-ms . 30000)    ; stuck-kill threshold (default 30000)
+  ;;       (check-ms . 5000)))   ; ticker interval      (default 5000)
+  (define (http-listen port handler . rest)
+    (define opts
+      (cond
+        ((null? rest) '())
+        ((integer? (car rest)) (list (cons 'workers (car rest))))
+        ((or (null? (car rest)) (pair? (car rest))) (car rest))
+        (else (assertion-violation 'http-listen "bad options" (car rest)))))
+    (define (opt key default)
+      (let ((p (assq key opts)))
+        (if p (cdr p) default)))
+    (let* ((hbox (box handler))
            (wsbox (box #f))
-           (sup (start-worker-pool nworkers
+           (sup (start-worker-pool (opt 'workers 8)
                   (lambda (task) (run-task (unbox hbox) task))
-                  fail-task))
+                  fail-task
+                  (opt 'max-retries 3)
+                  (opt 'stuck-ms 30000)
+                  (opt 'check-ms 5000)))
            (srv (make-http-server sup hbox wsbox)))
       (tcp-listen! "0.0.0.0" port 511
         (lambda (c)

@@ -4,11 +4,12 @@
 ;;; A fixed pool of worker processes executes tasks handed in by reader
 ;;; processes. The supervisor monitors every worker:
 ;;;   - crash: replacement worker is spawned; the task is retried at most
-;;;     3 times (4 executions total), then fail-task runs (HTTP 500) and
-;;;     the task is dropped;
-;;;   - stuck > 30s (detected by a 5s ticker): the worker is killed and
-;;;     replaced; the task is NOT retried (retrying an infinite loop
-;;;     would re-stick the pool) and fail-task runs.
+;;;     max-retries times (default 3, so 4 executions total), then
+;;;     fail-task runs (HTTP 500) and the task is dropped;
+;;;   - stuck > stuck-ms (default 30s, detected by a check-ms ticker,
+;;;     default 5s): the worker is killed and replaced; the task is NOT
+;;;     retried (retrying an infinite loop would re-stick the pool) and
+;;;     fail-task runs.
 ;;;
 ;;; All coordination is message passing; the supervisor's bookkeeping
 ;;; tables are private to its process. Protocol (from 需求.md):
@@ -23,25 +24,31 @@
   (export start-worker-pool)
   (import (chezscheme) (igropyr actor) (igropyr uv))
 
-  (define stuck-threshold-ms 30000)
-  (define check-interval-ms 5000)
-  (define max-retries 3)
+  (define default-max-retries 3)
+  (define default-stuck-ms 30000)
+  (define default-check-ms 5000)
 
   (define (task-id-of task) (vector-ref task 1))
 
   ;; run-task: (lambda (task) ...) executed inside a worker; may crash.
   ;; fail-task: (lambda (task) ...) executed by the supervisor when a
   ;; task is given up on; must not block (writing a 500 is fine).
+  ;; Optional trailing args: max-retries stuck-ms check-ms.
   ;; Returns the supervisor pid; send it #(submit-task ,task).
-  (define (start-worker-pool n run-task fail-task)
-    (let ((sup (spawn (lambda () (supervisor n run-task fail-task)))))
-      (spawn (lambda () (ticker sup)))
-      sup))
+  (define (start-worker-pool n run-task fail-task . opts)
+    (let* ((max-retries (if (>= (length opts) 1) (car opts) default-max-retries))
+           (stuck-ms (if (>= (length opts) 2) (cadr opts) default-stuck-ms))
+           (check-ms (if (>= (length opts) 3) (caddr opts) default-check-ms)))
+      (let ((sup (spawn (lambda ()
+                          (supervisor n run-task fail-task
+                                      max-retries stuck-ms)))))
+        (spawn (lambda () (ticker sup check-ms)))
+        sup)))
 
-  (define (ticker sup)
-    (sleep-ms check-interval-ms)
+  (define (ticker sup interval-ms)
+    (sleep-ms interval-ms)
     (send sup (vector 'check-stuck-workers))
-    (ticker sup))
+    (ticker sup interval-ms))
 
   (define (worker sup run-task)
     (lambda ()
@@ -52,7 +59,7 @@
             (send sup (vector 'task-completed (task-id-of task) self))
             (loop))))))
 
-  (define (supervisor n run-task fail-task)
+  (define (supervisor n run-task fail-task max-retries stuck-ms)
     (define idle '())
     (define busy (make-eq-hashtable))      ; worker pid -> (task . start-ms)
     (define stuck (make-eq-hashtable))     ; worker pid -> #t (kill in flight)
@@ -123,7 +130,7 @@
         (let-values (((ws entries) (hashtable-entries busy)))
           (vector-for-each
             (lambda (w entry)
-              (when (and (> (- now (cdr entry)) stuck-threshold-ms)
+              (when (and (> (- now (cdr entry)) stuck-ms)
                          (not (hashtable-ref stuck w #f)))
                 (hashtable-set! stuck w #t)
                 (kill w 'stuck-killed)))   ; DOWN follows; handled above
