@@ -20,10 +20,11 @@
   (export create-app app-get app-post app-put app-delete
           app-use app-static app-ws app-listen app->handler
           req-param req-json req-form req-cookie set-cookie!
+          req-sexpr send-sexpr! app-rpc
           send-text! send-html! send-json! send-file!
           sse-start! sse-send! make-fault-handler)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
-          (igropyr json) (igropyr gzip))
+          (igropyr json) (igropyr gzip) (igropyr sexpr))
 
   ;; ---- string helpers -----------------------------------------------------
 
@@ -82,6 +83,22 @@
   (define (req-json req)
     (guard (e (#t #f))
       (string->json (utf8->string (req-body req)))))
+
+  ;; ---- s-expression bodies: Scheme-to-Scheme RPC ---------------------------
+  ;; (igropyr sexpr) is the safe parser -- whitelisted data, depth
+  ;; limited, never the host reader. Payloads are DATA: dispatch on a
+  ;; tag, never evaluate.
+
+  ;; parse an s-expression body; #f when invalid (or over 1 MiB)
+  (define (req-sexpr req)
+    (guard (e (#t #f))
+      (let ((body (req-body req)))
+        (and (<= (bytevector-length body) (* 1024 1024))
+             (string->sexpr (utf8->string body))))))
+
+  (define (send-sexpr! r x)
+    (finish! r "application/sexpr; charset=utf-8"
+             (string->utf8 (sexpr->string x))))
 
   ;; ---- cookies --------------------------------------------------------------
 
@@ -478,6 +495,26 @@
   (define (app-post a pattern handler) (add-route! a 'POST pattern handler))
   (define (app-put a pattern handler) (add-route! a 'PUT pattern handler))
   (define (app-delete a pattern handler) (add-route! a 'DELETE pattern handler))
+
+  ;; RPC endpoint sugar: requests are (tag arg ...); the tag picks a
+  ;; handler from the alist, which receives the argument list and
+  ;; returns the reply datum. Unknown tags and bad payloads answer
+  ;; (error ...) data, never a crash.
+  ;;   (app-rpc app "/rpc"
+  ;;     `((get-user . ,(lambda (args) ...))
+  ;;       (add      . ,(lambda (args) (apply + args)))))
+  (define (app-rpc app path handlers)
+    (app-post app path
+      (lambda (req res)
+        (let ((msg (req-sexpr req)))
+          (if (and (pair? msg) (symbol? (car msg)))
+              (let ((h (assq (car msg) handlers)))
+                (if h
+                    (send-sexpr! res
+                      (guard (e (#t (list 'error 'handler-failed)))
+                        (list 'ok ((cdr h) (cdr msg)))))
+                    (send-sexpr! res (list 'error 'unknown-tag (car msg)))))
+              (send-sexpr! res (list 'error 'bad-payload)))))))
 
   ;; middleware: (lambda (req res next) ...); call (next) to continue
   (define (app-use a mw)
