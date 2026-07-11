@@ -21,10 +21,12 @@
           app-use app-static app-ws app-listen app->handler
           req-param req-json req-form req-cookie set-cookie!
           req-sexpr send-sexpr! app-rpc
+          ws-send-sexpr! ws-recv-sexpr sse-send-sexpr!
           send-text! send-html! send-json! send-file!
           sse-start! sse-send! make-fault-handler)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
-          (igropyr json) (igropyr gzip) (igropyr sexpr))
+          (igropyr json) (igropyr gzip) (igropyr sexpr)
+          (only (igropyr websocket) ws-recv ws-send-text!))
 
   ;; ---- string helpers -----------------------------------------------------
 
@@ -515,6 +517,34 @@
                         (list 'ok ((cdr h) (cdr msg)))))
                     (send-sexpr! res (list 'error 'unknown-tag (car msg)))))
               (send-sexpr! res (list 'error 'bad-payload)))))))
+
+  ;; ---- s-expressions over WebSocket and SSE ---------------------------------
+  ;; a message is one datum: write to send, safe-parse on receive --
+  ;; the natural framing for pushed data.
+
+  (define (ws-send-sexpr! ws x)
+    (ws-send-text! ws (sexpr->string x)))
+
+  ;; -> datum | 'close (connection over) | #f (binary or bad datum)
+  (define (ws-recv-sexpr ws)
+    (let ((m (ws-recv ws)))
+      (cond
+        ((and (vector? m) (eq? (vector-ref m 0) 'text))
+         (guard (e (#t #f)) (string->sexpr (vector-ref m 1))))
+        ((and (vector? m) (eq? (vector-ref m 0) 'close)) 'close)
+        (else #f))))
+
+  ;; one event, data = one datum. A literal newline inside a string
+  ;; datum splits into multiple data: lines; EventSource rejoins them
+  ;; with \n on the client, so the datum survives intact.
+  (define (sse-send-sexpr! res x)
+    (let* ((text (sexpr->string x))
+           (lines (string-split text #\newline)))
+      (res-write! res
+        (string-append
+          (apply string-append
+                 (map (lambda (l) (string-append "data: " l "\n")) lines))
+          "\n"))))
 
   ;; middleware: (lambda (req res next) ...); call (next) to continue
   (define (app-use a mw)
