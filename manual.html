@@ -77,12 +77,15 @@
       el.innerHTML = '<p class="md-loading">Could not render the manual ('
         + e.message + '). Read it on '
         + '<a href="' + SRC[lang] + '">the raw file</a> or on '
-        + '<a href="https://github.com/guenchi/Igropyr/blob/master/'
+        + '<a href="https://github.com/guenchi/Igropyr/blob/website/'
         + SRC[lang] + '">GitHub</a>.</p>';
     });
   }
 
-  loadManual('en');
+  // language from ?lang=zh or #zh, else default English
+  var q = (location.search.match(/[?&]lang=(zh|en)/) || [])[1];
+  var initial = q || (/^#?zh/.test(location.hash) ? 'zh' : 'en');
+  loadManual(initial === 'zh' ? 'zh' : 'en');
 </script>
 
 </body>

@@ -371,10 +371,6 @@ scheme --script igropyr/test/run-otp.sc
         <span class="fdesc">persistent connections by default on 1.1; each connection's reader process loops over successive requests</span>
       </div>
       <div class="fitem">
-        <span class="fterm"><b>Hardened</b></span>
-        <span class="fdesc">strict <code>Content-Length</code> validation, per-request response isolation, response-header injection guard, static-mount boundary + symlink-escape + NUL-byte checks, pipeline flood cap, WebSocket frame validation with strict UTF-8 (1007 close) and a reassembly cap, binary-safe Redis replies, request-id matching on all DB/HTTP clients</span>
-      </div>
-      <div class="fitem">
         <span class="fterm"><b>Fast</b></span>
         <span class="fdesc">~35 k req/s at 500 concurrent connections on an Apple Silicon laptop (<code>ab -n 50000 -c 500</code>, zero failed requests)</span>
       </div>
