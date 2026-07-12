@@ -64,10 +64,15 @@
               (background (var panel)) (border (px 1) solid (var line))
               (border-radius (px 10)) (padding (px 18) (px 22)) (font-size (px 14)))
       (".quick .c" (color (var com)))
-      ;; the hero canvas (fire honeycomb), bled off the top-right corner
+      ;; the hero canvas (fire honeycomb), bled off the top-right corner;
+      ;; visible on every width — bigger footprint on narrow screens so it
+      ;; still reads as a burning honeycomb behind the hero
       (.hive (position absolute) (top "-80px") (right "-120px")
-             (width "min(60vw, 1120px)") (height auto) (pointer-events none))
-      (@media "(max-width: 1100px)" (.hive (display none)))
+             (width "min(72vw, 1120px)") (height auto) (pointer-events none))
+      ;; on phones the fire fills the whole hero instead of a corner
+      (@media "(max-width: 700px)"
+        (.hive (top 0) (right auto) (left (pct 50)) (width "160vw")
+               (transform "translateX(-50%)") (height auto)))
       (@media "(prefers-reduced-motion: reduce)" (.hive (display none)))
 
       ;; ---- sections ----
