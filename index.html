@@ -327,6 +327,10 @@ scheme --script igropyr/test/run-otp.sc
         <span class="fdesc">a safe recursive-descent parser (no <code>read</code>; full escape and surrogate handling) and writer</span>
       </div>
       <div class="fitem">
+        <span class="fterm"><b>S-expression RPC</b></span>
+        <span class="fdesc">when the peer is also Scheme there is no codec: <code>(igropyr sexpr)</code> is a safe whitelisted parser (no <code>read</code>, depth-limited), and <code>app-rpc</code> / <code>send-sexpr!</code> / <code>ws-send-sexpr!</code> / <code>sse-send-sexpr!</code> carry one datum per message — exact ratios and bignums cross intact. The browser end is <a href="https://github.com/guenchi/Goeteia">Goeteia</a>'s <code>(web rpc/ws/sse)</code></span>
+      </div>
+      <div class="fitem">
         <span class="fterm"><b>Forms &amp; cookies</b></span>
         <span class="fdesc"><code>req-form</code> parses urlencoded and multipart bodies (file uploads included); <code>req-cookie</code> / <code>set-cookie!</code></span>
       </div>

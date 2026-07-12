@@ -21,10 +21,11 @@ This manual covers the architecture, design patterns, and implementation details
 15. [Database Clients](#database-clients)
 16. [Async File Reads](#async-file-reads)
 17. [JSON and gzip](#json-and-gzip)
-18. [Running and Building](#running-and-building)
-19. [Testing](#testing)
-20. [Code Style](#code-style)
-21. [Common Pitfalls](#common-pitfalls)
+18. [S-Expression RPC](#s-expression-rpc)
+19. [Running and Building](#running-and-building)
+20. [Testing](#testing)
+21. [Code Style](#code-style)
+22. [Common Pitfalls](#common-pitfalls)
 
 ---
 
@@ -455,6 +456,7 @@ The pattern `:name` in a route captures a path segment. Extract with `(req-param
 #### Request Body Parsing
 
 - `(req-json req)` → parsed JSON object (alist/vector/etc.) or #f if invalid
+- `(req-sexpr req)` → parsed s-expression datum or #f (see [S-Expression RPC](#s-expression-rpc))
 - `(req-form req)` → alist from urlencoded or multipart bodies
   - Text fields: `(name . "value")`
   - Files: `(name . #(file "filename" "content-type" #bytes))`
@@ -465,6 +467,7 @@ The pattern `:name` in a route captures a path segment. Extract with `(req-param
 - `(send-text! res text-string)` → sets Content-Type: text/plain; charset=utf-8
 - `(send-html! res html-string)` → sets Content-Type: text/html; charset=utf-8
 - `(send-json! res object)` → serializes and sets Content-Type: application/json
+- `(send-sexpr! res datum)` → serializes and sets Content-Type: application/sexpr (see [S-Expression RPC](#s-expression-rpc))
 - `(send-file! res path)` → streams a file to the client
 - `(set-status! res code)` → set HTTP status (default 200)
 - `(set-header! res "Name" "value")` → add/replace a response header
@@ -1795,6 +1798,188 @@ You can also manually compress:
         (res-send! res gz))
       (res-send! res (string->utf8 "some large text"))))
 ```
+
+---
+
+## S-Expression RPC
+
+When both ends of the wire speak Scheme, there is no codec to design:
+`write` on one side, `read` on the other, and the data is already
+structured. `(igropyr sexpr)` is the read side's discipline — a safe
+parser for untrusted bodies — and the Express layer builds
+request/reply, streaming, and REST-style resources on top. The browser
+counterpart is [Goeteia](https://github.com/guenchi/Goeteia)'s
+`(web rpc)` / `(web ws)` / `(web sse)`, so a web app can be Scheme end
+to end: exact integers and ratios cross the wire intact, and there is
+no JSON in the middle.
+
+### The (igropyr sexpr) Library
+
+Safe s-expression parsing and serialization. Recursive-descent, **not**
+the host reader — no `#`-syntax, no `eval`, depth-limited on parse and
+on write, safe for untrusted HTTP bodies.
+
+#### Wire Whitelist
+
+- Lists (proper and dotted — so alists work)
+- Symbols, strings
+- Exact integers, exact ratios
+- `#t` / `#f`, `()`
+
+Anything else fails loudly, on parse and on write alike. A
+numeric-shaped token must *be* a whitelisted number — `1.5` cannot slip
+through as a symbol.
+
+#### API
+
+- `(string->sexpr s [depth])` → one datum; raises `#(sexpr-error ,msg ,pos)` on bad input (default depth limit 64)
+- `(sexpr->string x)` → serialized string; raises on non-whitelist data (floats, vectors, procedures, cyclic lists)
+
+#### Interop Notes
+
+Strings escape only `\"` and `\\` on the wire; a literal newline inside
+a string is legal; `\n \t \r` are also accepted on read. These
+conventions match Goeteia's reader/writer exactly, so the two
+implementations round-trip byte for byte (verified both directions with
+a shared fixture of bignums, ratios, escaped strings, and dotted pairs).
+
+### Express Integration
+
+`req-sexpr` / `send-sexpr!` mirror `req-json` / `send-json!`:
+
+- `(req-sexpr req)` → parsed datum, or `#f` when the body is invalid or over 1 MiB
+- `(send-sexpr! res x)` → serializes and sets `Content-Type: application/sexpr; charset=utf-8`
+
+They aren't tied to any one endpoint — any route can serve
+`application/sexpr`, exactly like JSON.
+
+#### REST-Style Resources
+
+```scheme
+(define users '((1 . "ada") (2 . "alan")))
+
+(app-get app "/users/:id"
+  (lambda (req res)
+    (let ((u (assv (string->number (req-param req "id")) users)))
+      (if u
+          (send-sexpr! res (list 'user (cons 'id (car u)) (cons 'name (cdr u))))
+          (begin (set-status! res 404)
+                 (send-sexpr! res '(error not-found)))))))
+```
+
+Browser side — Goeteia's `(web rpc)`:
+
+```scheme
+(let ((u (rpc-get "/users/42")))     ; direct style over JSPI
+  u)                                  ; => (user (id . 42) (name . "ada"))
+```
+
+### app-rpc: Tagged Dispatch
+
+For request/reply RPC, `app-rpc` turns one endpoint into a dispatcher.
+Requests are `(tag arg ...)`; the tag selects a handler from an alist.
+Handlers receive the argument list and return the reply datum. Unknown
+tags and bad payloads answer `(error ...)` data — never a crash, never
+an evaluation.
+
+```scheme
+(define users '((1 . "ada") (2 . "alan")))
+
+(app-rpc app "/rpc"
+  `((add      . ,(lambda (args) (apply + args)))
+    (get-user . ,(lambda (args)
+                   (let ((u (assv (car args) users)))
+                     (if u
+                         (list 'user (cons 'id (car u)) (cons 'name (cdr u)))
+                         'not-found))))))
+```
+
+Every reply is wrapped: `(ok <result>)` on success;
+`(error unknown-tag <tag>)`, `(error handler-failed)`, or
+`(error bad-payload)` on failure.
+
+Browser side — Goeteia's `(web rpc)`:
+
+```scheme
+(rpc "/rpc" '(add 1 2 1/2))          ; => (ok 7/2)   -- the ratio survives
+(rpc "/rpc" '(get-user 1))           ; => (ok (user (id . 1) (name . "ada")))
+```
+
+That `1/2` is the whole point: it crosses the wire as an exact ratio and
+comes back as one. No floating-point JSON approximation anywhere in the
+path.
+
+### Pushed Data: WebSocket and SSE
+
+For datum streams, every message is one s-expression — the natural
+framing for discrete events.
+
+#### WebSocket
+
+- `(ws-send-sexpr! ws x)` → serialize and send one datum
+- `(ws-recv-sexpr ws)` → datum, or `'close` (connection over), or `#f` (a binary frame or an unparseable datum — the connection survives hostile input)
+
+```scheme
+(app-ws app "/chat/:room"
+  (lambda (ws req)
+    (let ((topic (string->symbol
+                   (string-append "room-" (req-param req "room")))))
+      ;; a forwarder relays room traffic back to this socket
+      (spawn (lambda ()
+               (subscribe topic)
+               (let lp () (receive (`#(pub ,t ,m) (ws-send-sexpr! ws m) (lp))))))
+      (let loop ()
+        (let ((m (ws-recv-sexpr ws)))
+          (cond
+            ((eq? m 'close) 'done)
+            ((and (pair? m) (eq? (car m) 'say))
+             (publish topic (list 'msg (cadr m)))
+             (loop))
+            (else (ws-send-sexpr! ws '(error bad-message)) (loop))))))))
+```
+
+Browser side — Goeteia's `(web ws)`:
+
+```scheme
+(define w (ws-connect! "wss://host/chat/lobby"
+            (lambda (datum) (render! datum))))   ; one datum per message
+(ws-send! w '(say "hello everyone"))
+```
+
+#### SSE
+
+- `(sse-send-sexpr! res x)` → frame one datum as an SSE event; a datum with embedded newlines splits into multiple `data:` lines, which `EventSource` rejoins losslessly on the client
+
+```scheme
+(app-get app "/progress"
+  (lambda (req res)
+    (sse-start! res)
+    (let loop ((i 1))
+      (when (<= i 100)
+        (when (sse-send-sexpr! res (list 'progress (cons 'percent i)))
+          (sleep-ms 100)
+          (loop (+ i 1)))))))
+```
+
+Browser side — Goeteia's `(web sse)`:
+
+```scheme
+(sse-connect! "/progress"
+  (lambda (datum)                      ; (progress (percent . 42))
+    (update-bar! (cdr (assq 'percent (cdr datum))))))
+```
+
+### Why This Matters
+
+A JSON API forces an impedance mismatch: Scheme data is serialized down
+to JSON's smaller type system (no exact rationals, no symbols, objects
+keyed only by strings), parsed back into whatever the other language
+models JSON as, and every field access is stringly-typed. When both ends
+are Scheme, none of that happens — the value you `write` is the value
+the peer `read`s, structure and exactness preserved. `(igropyr sexpr)`
+adds exactly one thing to that picture: the safety a network boundary
+demands — a whitelist, a depth limit, no evaluation — so untrusted bytes
+can never become code.
 
 ---
 

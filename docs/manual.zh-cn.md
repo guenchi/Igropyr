@@ -12,10 +12,11 @@
 6. [OTP 模式](#otp-模式)
 7. [对话](#对话)
 8. [数据库客户端](#数据库客户端)
-9. [运行和构建](#运行和构建)
-10. [测试](#测试)
-11. [代码风格](#代码风格)
-12. [常见陷阱](#常见陷阱)
+9. [S 表达式 RPC](#s-表达式-rpc)
+10. [运行和构建](#运行和构建)
+11. [测试](#测试)
+12. [代码风格](#代码风格)
+13. [常见陷阱](#常见陷阱)
 
 ---
 
@@ -446,6 +447,7 @@ route 中的 pattern `:name` 会捕获一个 path segment。用 `(req-param req 
 #### Request Body Parsing
 
 - `(req-json req)` → parsed JSON object（alist/vector 等）或 invalid 时 #f
+- `(req-sexpr req)` → 解析出的 s-expr datum 或 #f（见 [S 表达式 RPC](#s-表达式-rpc)）
 - `(req-form req)` → urlencoded 或 multipart body 解析得到的 alist
   - Text field：`(name . "value")`
   - File：`(name . #(file "filename" "content-type" #bytes))`
@@ -456,6 +458,7 @@ route 中的 pattern `:name` 会捕获一个 path segment。用 `(req-param req 
 - `(send-text! res text-string)` → 设置 Content-Type: text/plain; charset=utf-8
 - `(send-html! res html-string)` → 设置 Content-Type: text/html; charset=utf-8
 - `(send-json! res object)` → 序列化并设置 Content-Type: application/json
+- `(send-sexpr! res datum)` → 序列化并设置 Content-Type: application/sexpr（见 [S 表达式 RPC](#s-表达式-rpc)）
 - `(send-file! res path)` → 向 client stream 一个文件
 - `(set-status! res code)` → 设置 HTTP status（默认 200）
 - `(set-header! res "Name" "value")` → 添加 / 替换 response header
@@ -1149,6 +1152,174 @@ full path 在明文连接上默认被拒绝，因为 MITM 可能替换 server ke
 ```
 
 从 HTTP 视角看，数据库 query 是非阻塞的：worker 的进程暂停在 `receive` 中，但 OS 线程继续通过其它 worker 和连接服务其它请求。
+
+---
+
+## S 表达式 RPC
+
+当连线两端都说 Scheme 时，没有 codec 需要设计：一端 `write`，另一端
+`read`，数据本就是结构化的。`(igropyr sexpr)` 是读侧的纪律——针对不可信
+请求体的安全 parser——Express 层在其上搭出请求/应答、流式推送和 REST 风格
+资源。浏览器对端是 [Goeteia](https://github.com/guenchi/Goeteia) 的
+`(web rpc)` / `(web ws)` / `(web sse)`，于是一个 Web 应用可以两端全 Scheme：
+精确整数与分数无损过线，中间没有 JSON。
+
+### (igropyr sexpr) 库
+
+安全的 s-expr 解析与序列化。递归下降，**不是**宿主 reader——无 `#` 语法、
+无 `eval`、解析与写出双向限制深度，可安全处理不可信 HTTP 请求体。
+
+#### 线格式白名单
+
+- 列表（proper 与 dotted——所以 alist 可用）
+- 符号、字符串
+- 精确整数、精确分数
+- `#t` / `#f`、`()`
+
+其它一律在解析与写出两侧显式报错。形似数字的 token 必须*是*白名单内的
+数字——`1.5` 不会作为符号溜过去。
+
+#### API
+
+- `(string->sexpr s [depth])` → 一个 datum；坏输入抛 `#(sexpr-error ,msg ,pos)`（默认深度限制 64）
+- `(sexpr->string x)` → 序列化字符串；遇到非白名单数据（浮点、vector、过程、环状列表）报错
+
+#### 互操作说明
+
+线上字符串只转义 `\"` 与 `\\`；字符串内的字面换行是合法的；`\n \t \r` 在
+读取时也被接受。这些约定与 Goeteia 的 reader/writer 完全一致，两个实现逐字节
+往返一致（用含大整数、分数、转义字符串、点对的共享 fixture 双向验证过）。
+
+### Express 集成
+
+`req-sexpr` / `send-sexpr!` 与 `req-json` / `send-json!` 对称：
+
+- `(req-sexpr req)` → 解析出的 datum；请求体非法或超过 1 MiB 时为 `#f`
+- `(send-sexpr! res x)` → 序列化并设置 `Content-Type: application/sexpr; charset=utf-8`
+
+它们不绑定任何单一端点——任意路由都能提供 `application/sexpr`，和 JSON 一样。
+
+#### REST 风格资源
+
+```scheme
+(define users '((1 . "ada") (2 . "alan")))
+
+(app-get app "/users/:id"
+  (lambda (req res)
+    (let ((u (assv (string->number (req-param req "id")) users)))
+      (if u
+          (send-sexpr! res (list 'user (cons 'id (car u)) (cons 'name (cdr u))))
+          (begin (set-status! res 404)
+                 (send-sexpr! res '(error not-found)))))))
+```
+
+浏览器侧——Goeteia 的 `(web rpc)`：
+
+```scheme
+(let ((u (rpc-get "/users/42")))     ; JSPI 之上的直接风格
+  u)                                  ; => (user (id . 42) (name . "ada"))
+```
+
+### app-rpc：按 tag 派发
+
+对于请求/应答式 RPC，`app-rpc` 把一个端点变成派发器。请求是
+`(tag arg ...)`；tag 从 alist 里选出一个 handler。handler 收到参数列表、
+返回应答 datum。未知 tag 与坏 payload 应答 `(error ...)` 数据——绝不崩溃，
+绝不求值。
+
+```scheme
+(define users '((1 . "ada") (2 . "alan")))
+
+(app-rpc app "/rpc"
+  `((add      . ,(lambda (args) (apply + args)))
+    (get-user . ,(lambda (args)
+                   (let ((u (assv (car args) users)))
+                     (if u
+                         (list 'user (cons 'id (car u)) (cons 'name (cdr u)))
+                         'not-found))))))
+```
+
+每个应答都被包裹：成功 `(ok <结果>)`；失败
+`(error unknown-tag <tag>)`、`(error handler-failed)` 或
+`(error bad-payload)`。
+
+浏览器侧——Goeteia 的 `(web rpc)`：
+
+```scheme
+(rpc "/rpc" '(add 1 2 1/2))          ; => (ok 7/2)   -- 分数无损
+(rpc "/rpc" '(get-user 1))           ; => (ok (user (id . 1) (name . "ada")))
+```
+
+那个 `1/2` 正是关键：它作为精确分数过线，又作为精确分数回来。整条路径上
+没有任何浮点 JSON 近似。
+
+### 推送数据：WebSocket 与 SSE
+
+对于 datum 流，每条消息就是一个 s-expr——这是离散事件天然的分帧方式。
+
+#### WebSocket
+
+- `(ws-send-sexpr! ws x)` → 序列化并发送一个 datum
+- `(ws-recv-sexpr ws)` → datum，或 `'close`（连接结束），或 `#f`（二进制帧或不可解析的 datum——连接在敌意输入下存活）
+
+```scheme
+(app-ws app "/chat/:room"
+  (lambda (ws req)
+    (let ((topic (string->symbol
+                   (string-append "room-" (req-param req "room")))))
+      ;; 一个转发进程把房间流量转回这个 socket
+      (spawn (lambda ()
+               (subscribe topic)
+               (let lp () (receive (`#(pub ,t ,m) (ws-send-sexpr! ws m) (lp))))))
+      (let loop ()
+        (let ((m (ws-recv-sexpr ws)))
+          (cond
+            ((eq? m 'close) 'done)
+            ((and (pair? m) (eq? (car m) 'say))
+             (publish topic (list 'msg (cadr m)))
+             (loop))
+            (else (ws-send-sexpr! ws '(error bad-message)) (loop))))))))
+```
+
+浏览器侧——Goeteia 的 `(web ws)`：
+
+```scheme
+(define w (ws-connect! "wss://host/chat/lobby"
+            (lambda (datum) (render! datum))))   ; 每条消息一个 datum
+(ws-send! w '(say "hello everyone"))
+```
+
+#### SSE
+
+- `(sse-send-sexpr! res x)` → 把一个 datum 分帧为一个 SSE event；含内嵌换行的 datum 会拆成多条 `data:` 行，客户端 `EventSource` 无损重组
+
+```scheme
+(app-get app "/progress"
+  (lambda (req res)
+    (sse-start! res)
+    (let loop ((i 1))
+      (when (<= i 100)
+        (when (sse-send-sexpr! res (list 'progress (cons 'percent i)))
+          (sleep-ms 100)
+          (loop (+ i 1)))))))
+```
+
+浏览器侧——Goeteia 的 `(web sse)`：
+
+```scheme
+(sse-connect! "/progress"
+  (lambda (datum)                      ; (progress (percent . 42))
+    (update-bar! (cdr (assq 'percent (cdr datum))))))
+```
+
+### 为什么这很重要
+
+JSON API 强加了一层阻抗失配：你的 Scheme 数据被序列化到 JSON 更小的类型
+系统（没有精确分数、没有符号、对象只能用字符串做键），再被解析回对端语言
+对 JSON 的建模，而每次字段访问都是"字符串类型"的。当两端都是 Scheme 时，
+这些统统不发生——你 `write` 的值就是对端 `read` 到的值，结构与精确性都保留。
+`(igropyr sexpr)` 只往这幅图里加了一件事：网络边界所要求的安全——白名单、
+深度限制、不求值——于是不可信的字节永远无法变成代码。
 
 ---
 
