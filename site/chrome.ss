@@ -105,6 +105,7 @@
                          (font-weight 600) (color (var fg)) (font-size (px 15))
                          (text-decoration none))
       (".rpcwire .wnode:hover" (color (var acc)) (text-decoration none))
+      (".rpcwire .wnode.gt:hover" (color "#1550c4"))   ; Goeteia's lapis
       (".rpcwire .wnode img" (display block))
       (".rpcwire .warrow" (font-size (px 26)) (color (var dim)))
 

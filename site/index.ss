@@ -151,7 +151,7 @@
                 (img (@ (src "favicon.svg") (alt "Igropyr") (width "30") (height "30")))
                 "Igropyr")
               (span (@ (class "warrow")) "⇄")
-              (a (@ (class "wnode") (href "https://goeteia.dev"))
+              (a (@ (class "wnode gt") (href "https://goeteia.dev"))
                 (img (@ (src "goeteia-icon.svg") (alt "Goeteia") (width "26") (height "26")))
                 "Goeteia"))
             (pre ,(raw rpc-code))))))
