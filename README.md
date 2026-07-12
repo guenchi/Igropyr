@@ -4,7 +4,7 @@ A high-concurrency HTTP server for [Chez Scheme](https://cisco.github.io/ChezSch
 built directly on [libuv](https://libuv.org/) through Chez's FFI (no C shim),
 with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
 
-Website: **[igropyr.com](https://igropyr.com)** · Manual: **[igropyr.com/manual.html](https://igropyr.com/manual.html)**
+**[igropyr.com](https://igropyr.com)** · Manual: **[igropyr.com/manual.html](https://igropyr.com/manual.html)**
 
 - **Core / framework split, like Node and Express** — the core exposes one
   entry point, `(http-listen port (lambda (req res) ...))`; the bundled
