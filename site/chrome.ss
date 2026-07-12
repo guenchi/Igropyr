@@ -94,8 +94,8 @@
       (.n (color (var num))) (.f (color (var acc2)))
 
       ;; ---- secondary cards ----
-      (.cards (display grid) (grid-template-columns "repeat(3, 1fr)") (gap (px 20))
-              (margin-top (px 40)))
+      (.cards (display grid) (grid-template-columns "repeat(auto-fit, minmax(220px, 1fr))")
+              (gap (px 20)) (margin-top (px 40)))
       (.card (background (var panel)) (border (px 1) solid (var line))
              (border-radius (px 12)) (padding (px 26)))
       (".card .ic" (font-size (px 26)) (margin-bottom (px 12)))

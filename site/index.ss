@@ -149,7 +149,15 @@
             (p "One event loop feeds thousands of parked processes. DNS, file "
                "reads and database round-trips park " (em "the calling process")
                ", never the thread. Non-blocking HTTP/WebSocket clients and "
-               "Redis/MySQL drivers included.")))
+               "Redis/MySQL drivers included."))
+          (div (@ (class "card"))
+            (div (@ (class "ic")) "⇄")
+            (h3 "S-expression RPC")
+            (p "When the peer is Scheme too, there is no codec: " (code "(igropyr sexpr)")
+               " and " (code "app-rpc") " carry one s-expression per message — exact "
+               "ratios and bignums cross the wire intact, over HTTP, WebSocket or SSE. "
+               "The browser half is " (a (@ (href "https://goeteia.dev")) "Goeteia")
+               ", a Scheme-to-WebAssembly compiler — the honeycomb fire above is written in it.")))
         (div (@ (class "strip"))
           (div (div (@ (class "num")) "120k+") (div (@ (class "lbl")) "req/s, keep-alive, laptop"))
           (div (div (@ (class "num")) "0") (div (@ (class "lbl")) "failed requests under ab -c 500"))
