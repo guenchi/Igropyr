@@ -72,8 +72,29 @@ with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
 - **Fast** — ~35 k req/s at 500 concurrent connections on an Apple Silicon
   laptop (`ab -n 50000 -c 500`, zero failed requests)
 
-For architecture, the actor model, the libuv-callback invariant, and
-contribution guidelines, see [the manual](https://igropyr.com/manual.html).
+## Architecture
+
+A layered stack, each layer a thin surface over the one below:
+
+- **`(igropyr express)`** — routing, middleware, and the `req-*` / `send-*!`
+  request and response helpers; optional, and alternative frameworks can be
+  built on the core.
+- **HTTP core + WebSocket** — HTTP/1.1 parsing, keep-alive and pipelining,
+  chunked bodies, and the RFC 6455 upgrade.
+- **Actor scheduler** — thousands of green processes over one OS thread,
+  continuation-based context switches with preemption; `spawn` / `send` /
+  `receive` / `link` / `monitor`, no shared state.
+- **libuv FFI** — one event loop, reached through Chez's FFI (no C shim);
+  DNS, file reads and socket I/O park the calling process, never the thread.
+
+Fault tolerance is a **supervised worker pool**: a crashed worker is replaced
+and its task retried (at most 3 times, then a 500); a worker stuck past 30 s
+is killed and replaced; a slow request only ever blocks its own reader
+process. `gen-server`, `link` / `monitor` and topic PubSub are the OTP
+building blocks — isolation is by process, not by locks.
+
+For the actor model, the libuv-callback invariant, and contribution
+guidelines, see [the manual](https://igropyr.com/manual.html).
 
 ## Requirements
 
