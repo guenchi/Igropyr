@@ -1808,7 +1808,7 @@ When both ends of the wire speak Scheme, there is no codec to design:
 structured. `(igropyr sexpr)` is the read side's discipline — a safe
 parser for untrusted bodies — and the Express layer builds
 request/reply, streaming, and REST-style resources on top. The browser
-counterpart is [Goeteia](https://github.com/guenchi/Goeteia)'s
+counterpart is [Goeteia](https://goeteia.dev)'s
 `(web rpc)` / `(web ws)` / `(web sse)`, so a web app can be Scheme end
 to end: exact integers and ratios cross the wire intact, and there is
 no JSON in the middle.
@@ -2190,32 +2190,6 @@ Igropyr code uses only round parentheses `()`. Never use square brackets `[]`.
 ```
 
 Brackets are easy to confuse in deeply nested code. Uniformity prevents pairing errors. This is a project-wide invariant.
-
-### English Comments
-
-All comments are in English. Use clear, concise language. Comment *why*, not *what* (the code shows what).
-
-```scheme
-;; ✓ Good
-;; Skip whitespace at the start of the input; return the position of
-;; the first non-whitespace character.
-(define (skip-ws s i)
-  (if (and (< i (string-length s))
-           (char-whitespace? (string-ref s i)))
-      (skip-ws s (+ i 1))
-      i))
-
-;; ✗ Poor
-(define (skip-ws s i)
-  ;; Check if character is whitespace
-  (if (and (< i (string-length s))
-           ;; Get the character
-           (char-whitespace? (string-ref s i)))
-      ;; Increment i and recurse
-      (skip-ws s (+ i 1))
-      ;; Return i
-      i))
-```
 
 ### File Headers
 

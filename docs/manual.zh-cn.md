@@ -1160,7 +1160,7 @@ full path 在明文连接上默认被拒绝，因为 MITM 可能替换 server ke
 当连线两端都说 Scheme 时，没有 codec 需要设计：一端 `write`，另一端
 `read`，数据本就是结构化的。`(igropyr sexpr)` 是读侧的纪律——针对不可信
 请求体的安全 parser——Express 层在其上搭出请求/应答、流式推送和 REST 风格
-资源。浏览器对端是 [Goeteia](https://github.com/guenchi/Goeteia) 的
+资源。浏览器对端是 [Goeteia](https://goeteia.dev) 的
 `(web rpc)` / `(web ws)` / `(web sse)`，于是一个 Web 应用可以两端全 Scheme：
 精确整数与分数无损过线，中间没有 JSON。
 
@@ -1524,32 +1524,6 @@ Igropyr 代码只使用圆括号 `()`。不要使用方括号 `[]`。
 ```
 
 方括号在深层嵌套代码中容易混淆。统一风格可以避免配对错误。这是项目级不变量。
-
-### 英文注释
-
-所有注释都使用英文。使用清晰、简洁的语言。注释解释 *why*，不要解释 *what*（代码已经说明 what）。
-
-```scheme
-;; ✓ Good
-;; Skip whitespace at the start of the input; return the position of
-;; the first non-whitespace character.
-(define (skip-ws s i)
-  (if (and (< i (string-length s))
-           (char-whitespace? (string-ref s i)))
-      (skip-ws s (+ i 1))
-      i))
-
-;; ✗ Poor
-(define (skip-ws s i)
-  ;; Check if character is whitespace
-  (if (and (< i (string-length s))
-           ;; Get the character
-           (char-whitespace? (string-ref s i)))
-      ;; Increment i and recurse
-      (skip-ws s (+ i 1))
-      ;; Return i
-      i))
-```
 
 ### 文件头
 
