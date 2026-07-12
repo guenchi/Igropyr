@@ -2173,52 +2173,6 @@ watch -n 1 'curl -s localhost:8080/stats | jq'
 
 ## Code Style
 
-### Parentheses Only
-
-Igropyr code uses only round parentheses `()`. Never use square brackets `[]`.
-
-```scheme
-;; ✓ Correct
-(let ((x 1)) x)
-(lambda (x) x)
-(define (foo x) x)
-
-;; ✗ Wrong
-(let ([x 1]) x)
-(lambda [x] x)
-(define [foo x] x)
-```
-
-Brackets are easy to confuse in deeply nested code. Uniformity prevents pairing errors. This is a project-wide invariant.
-
-### File Headers
-
-Source files should start with a library declaration and a module docstring:
-
-```scheme
-#!chezscheme
-;;; (igropyr mylib) -- brief description of what this library does.
-;;;
-;;; Longer explanation: key concepts, entry points, assumptions.
-;;;
-;;; Example usage:
-;;;   (import (igropyr mylib))
-;;;   (my-function 42)
-
-(library (igropyr mylib)
-  (export my-function another-function)
-  (import (chezscheme))
-  
-  ;; ... implementation
-)
-```
-
-The `#!chezscheme` header is required when the code uses Chez-specific features (e.g., `@` identifiers, `#%$` primitives).
-
-### R6RS Libraries
-
-All code is in R6RS library form. Use explicit imports and exports. Avoid top-level mutation (use private state within libraries, or shared state in processes, never in library variables).
-
 ### The `.sc` Extension
 
 Igropyr deliberately uses the `.sc` extension for every source file. The author advocates `.sc` as a statement of intent: the code is written against strict R6RS semantics and is aimed at production use — as opposed to the anything-goes connotation of `.scm` or the Chez-flavored `.ss`. Looking ahead, the project will (very likely) move toward R7RS Large.
