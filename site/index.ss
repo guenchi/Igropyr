@@ -142,9 +142,9 @@
                "self-hosting Scheme-to-WebAssembly compiler; its " (code "(web rpc)")
                " / " (code "(web ws)") " / " (code "(web sse)") " speak the same wire "
                "format.")
-            (p "This site itself is written in pure Scheme, and compiled to HTML, "
-               "CSS and WebAssembly by " (a (@ (href "https://goeteia.dev")) "Goeteia")
-               " — the honeycomb fire above included."))
+            (p "This site itself is written in pure Scheme, and compiled to HTML "
+               "and CSS by " (a (@ (href "https://goeteia.dev")) "Goeteia")
+               " — the honeycomb fire above is rendered in real time."))
           (div (@ (class "rpccol"))
             (div (@ (class "rpcwire"))
               (a (@ (class "wnode") (href "https://igropyr.com"))
