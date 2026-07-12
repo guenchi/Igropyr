@@ -1,7 +1,7 @@
 (library (code-blocks)
   (export hero-quick crash-code hotswap-code faults-code conv-code)
   (import (rnrs))
-  (define hero-quick "npm i igropyr")
+  (define hero-quick "<span class=\"c\">$</span> npm i igropyr")
   (define crash-code "(<span class=\"f\">app-get</span> app <span class=\"s\">\"/crash\"</span>
   (<span class=\"k\">lambda</span> (req res)
     <span class=\"c\">;; the worker dies; the supervisor retries on a</span>
