@@ -93,6 +93,16 @@
       (.c (color (var com)) (font-style italic))
       (.n (color (var num))) (.f (color (var acc2)))
 
+      ;; ---- Igropyr <-> Goeteia interaction badge (section 05) ----
+      (.rpcwire (display flex) (align-items center) (justify-content center)
+                (gap (px 16)) (margin-bottom (px 22)))
+      (".rpcwire .wnode" (display inline-flex) (align-items center) (gap (px 9))
+                         (padding (px 9) (px 18) (px 9) (px 12)) (border (px 1) solid (var line))
+                         (border-radius (px 12)) (background (var panel))
+                         (font-weight 600) (color (var fg)) (font-size (px 15)))
+      (".rpcwire .wnode img" (display block))
+      (".rpcwire .warrow" (font-size (px 26)) (color (var dim)))
+
       ;; ---- secondary cards ----
       (.cards (display grid) (grid-template-columns "repeat(3, 1fr)") (gap (px 20))
               (margin-top (px 40)))

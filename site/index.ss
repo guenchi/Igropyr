@@ -145,7 +145,16 @@
             (p "This site itself is written in pure Scheme, and compiled to HTML, "
                "CSS and WebAssembly by " (a (@ (href "https://goeteia.dev")) "Goeteia")
                " — the honeycomb fire above included."))
-          (pre ,(raw rpc-code)))))
+          (div (@ (class "rpccol"))
+            (div (@ (class "rpcwire"))
+              (span (@ (class "wnode"))
+                (img (@ (src "favicon.svg") (alt "Igropyr") (width "26") (height "26")))
+                "Igropyr")
+              (span (@ (class "warrow")) "⇄")
+              (span (@ (class "wnode"))
+                (img (@ (src "goeteia-icon.svg") (alt "Goeteia") (width "26") (height "26")))
+                "Goeteia"))
+            (pre ,(raw rpc-code))))))
 
    ;; ---- foundations ----
    `(section (@ (id "foundations"))
