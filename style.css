@@ -5,7 +5,7 @@
     --line: #e2e7ee;
     --fg: #1f2430;
     --dim: #57606a;
-    --acc: #3f4348;      /* graphite metal */
+    --acc: #e8590c;      /* flame */
     --acc2: #0969da;     /* link blue */
     --warn: #9a6700;
     --kw: #8250df;
@@ -49,7 +49,7 @@
 
   /* ---- hero ---- */
   header { padding: 84px 0 64px; text-align: center;
-           background: radial-gradient(60% 50% at 50% 0%, #eef0f3 0%, transparent 100%); }
+           background: radial-gradient(62% 52% at 50% 0%, #fff0e6 0%, transparent 100%); }
   .lam { font-size: 52px; color: var(--acc); line-height: 1; }
   h1 { font-size: 56px; letter-spacing: -1px; margin: 10px 0 14px; }
   .tag { font-size: 21px; color: var(--dim); max-width: 640px; margin: 0 auto 12px; }

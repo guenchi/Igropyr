@@ -1,10 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-  <!-- regular flat-top hexagon -->
+  <defs>
+    <linearGradient id="flame" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffa129"/>
+      <stop offset="0.55" stop-color="#f2691a"/>
+      <stop offset="1" stop-color="#d63f0a"/>
+    </linearGradient>
+  </defs>
+  <!-- regular flat-top hexagon, flame fill -->
   <path d="M59.0 32.0 L45.5 55.38 L18.5 55.38 L5.0 32.0 L18.5 8.62 L45.5 8.62 Z"
-        fill="#ffffff" stroke="#1f2430" stroke-width="2.5"
+        fill="url(#flame)" stroke="#c0380a" stroke-width="2"
         stroke-linejoin="round"/>
-  <!-- black lambda, centred and clear of the edges -->
-  <g fill="none" stroke="#1f2430" stroke-width="6"
+  <!-- white lambda, centred and clear of the edges -->
+  <g fill="none" stroke="#ffffff" stroke-width="6"
      stroke-linecap="round" stroke-linejoin="round">
     <path d="M28 22 L42 45"/>
     <path d="M34.8 33.2 L22 45"/>
