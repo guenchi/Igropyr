@@ -175,10 +175,9 @@
     (cmd-draw-arrays! GL-POINTS 0 npoints)
     (cmd-flush!)))
 
-(js-eval "globalThis.__fire_gen = (globalThis.__fire_gen || 0) + 1")
-(define gen (js->number (js-get (js-global) "__fire_gen")))
+;; fire.wasm is loaded once per page, so a plain animation loop suffices
+;; (no in-browser recompile means no stale loop to guard against)
 (letrec ((tick (lambda _
-                 (when (= gen (js->number (js-get (js-global) "__fire_gen")))
-                   (frame!)
-                   (js-method (js-global) "requestAnimationFrame" tick)))))
+                 (frame!)
+                 (js-method (js-global) "requestAnimationFrame" tick))))
   (js-method (js-global) "requestAnimationFrame" tick))
