@@ -148,7 +148,7 @@
           (div (@ (class "rpccol"))
             (div (@ (class "rpcwire"))
               (a (@ (class "wnode") (href "https://igropyr.com"))
-                (img (@ (src "favicon.svg") (alt "Igropyr") (width "26") (height "26")))
+                (img (@ (src "favicon.svg") (alt "Igropyr") (width "30") (height "30")))
                 "Igropyr")
               (span (@ (class "warrow")) "⇄")
               (a (@ (class "wnode") (href "https://goeteia.dev"))
@@ -335,5 +335,4 @@
                   "speak a protocol, and dialogues are processes. Erlang-style "
                   "actors on libuv, written entirely in Chez Scheme.")
    body
-   (list `(script (@ (type "module"))
-            ,(raw "import { loadGoeteia } from './rt/web.mjs'; loadGoeteia('fire.wasm');")))))
+   (list `(script (@ (type "module") (src "fire.js"))))))

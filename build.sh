@@ -8,5 +8,4 @@ for p in index manual agent; do
     node rt/run.mjs "/tmp/ig-$p.wasm"
     echo "built $p.html ($(wc -c < "$p.html" | tr -d ' ') bytes)"
 done
-node rt/compile.mjs goeteia.wasm site/fire.ss fire.wasm
-echo "built fire.wasm ($(wc -c < fire.wasm | tr -d ' ') bytes)"
+# the hero fire (site/fire.ss) is compiled in the browser by fire.js, not here
