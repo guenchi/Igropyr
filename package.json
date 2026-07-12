@@ -27,9 +27,7 @@
   "files": [
     "*.sc",
     "*.ss",
-    "docs/",
     "test/",
-    "public/",
     "README.zh-CN.md"
   ]
 }
