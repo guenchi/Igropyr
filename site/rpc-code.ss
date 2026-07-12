@@ -1,7 +1,7 @@
 (library (rpc-code)
   (export rpc-code)
   (import (rnrs))
-  (define rpc-code "<span class=\"c\">;; one s-expression per message</span>
+  (define rpc-code "<span class=\"c\">;; Igropyr: one s-expression per message</span>
 (<span class=\"f\">app-rpc</span> app <span class=\"s\">\"/rpc\"</span>
   `((add      . ,(<span class=\"k\">lambda</span> (args) (apply + args)))
     (get-user . ,(<span class=\"k\">lambda</span> (args) (find-user (car args))))))
