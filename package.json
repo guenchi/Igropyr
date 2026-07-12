@@ -24,6 +24,10 @@
   },
   "license": "MIT",
   "author": "guenchi",
+  "scripts": {
+    "start": "CHEZSCHEMELIBDIRS=.. CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so scheme --script test/run-otp.sc",
+    "test": "bash test/run-all.sh"
+  },
   "files": [
     "*.sc",
     "*.ss",
