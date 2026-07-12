@@ -134,7 +134,10 @@
               (color (var dim)) (font-size (px 14)) (text-align center))
       ("footer .links" (margin-bottom (px 10)) (display flex) (gap (px 22))
                        (justify-content center))
-      ("footer .built" (margin-top (px 10)) (font-size (px 13)) (color (var dim)))
+      ;; the pure-Scheme credit line, its own band under the acknowledgements
+      (.builtnote (padding (px 30) 0) (text-align center) (color (var dim))
+                  (font-size (px 15 50)) (border-top (px 1) solid (var line)))
+      (".builtnote .wrap" (max-width (px 680)))
 
       (@media "(max-width: 840px)"
         (h1 (font-size (px 40)))
@@ -204,15 +207,11 @@
               (a (@ (href "manual.html")) "Manual")
               (a (@ (href "agent.html")) "Agent")
               (a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub")))))
-  ;; links: a list of (a ...) nodes; tagline: the remaining nodes.
-  ;; every page carries the "built in pure Scheme" line.
+  ;; links: a list of (a ...) nodes; tagline: the remaining nodes
   (define (foot links . tagline)
     `(footer
        (div (@ (class "links")) ,@links)
-       (div ,@tagline)
-       (div (@ (class "built"))
-         "本网站由纯 Scheme 写成，经 "
-         (a (@ (href "https://github.com/guenchi/Goeteia")) "Goeteia") " 编译。")))
+       (div ,@tagline)))
 
   ;; ---- assemble a document ----
   ;; head-extra: extra nodes for <head>; body-nodes: the page body;

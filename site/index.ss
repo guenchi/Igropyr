@@ -289,6 +289,13 @@
              (img (@ (src "swish-icon.png") (alt "Swish") (width "24") (height "24")))
              (span "Swish")))))
 
+   ;; a standalone credit, just below the acknowledgements
+   `(div (@ (class "builtnote"))
+      (div (@ (class "wrap"))
+        "And this site itself is written in pure Scheme — every page, every "
+        "style rule, and the WebGL fire above — compiled to HTML, CSS and "
+        "WebAssembly by " (a (@ (href "https://github.com/guenchi/Goeteia")) "Goeteia") "."))
+
    (foot (list `(a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub")
                `(a (@ (href "manual.html")) "Manual")
                `(a (@ (href "https://github.com/guenchi/Igropyr/blob/master/LICENSE")) "MIT License"))
