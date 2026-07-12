@@ -127,21 +127,24 @@
    `(section (@ (id "rpc"))
       (div (@ (class "wrap"))
         (div (@ (class "kicker")) "05 · Scheme talks to Scheme")
-        (h2 "Both ends speak Scheme")
+        (h2 "Communicate in S-expressions")
         (p (@ (class "lead")) "When the client is Scheme too, requests and replies "
            "are s-expressions — there is no codec to design. " (code "(igropyr sexpr)")
            " is the safe parser; " (code "app-rpc") " dispatches one datum per "
            "message, over HTTP, WebSocket or SSE.")
         (div (@ (class "feature"))
           (div (@ (class "txt"))
-            (h3 "Communicate in S-expressions")
+            (h3 "No codec on the wire")
             (p "Exact ratios and bignums cross the wire intact — no floating-point "
                "JSON approximation anywhere. " (code "(rpc \"/rpc\" '(add 1 2 1/2))")
                " comes back " (code "(ok 7/2)") ", the ratio preserved.")
             (p "The peer is " (a (@ (href "https://goeteia.dev")) "Goeteia") ", a "
                "self-hosting Scheme-to-WebAssembly compiler; its " (code "(web rpc)")
                " / " (code "(web ws)") " / " (code "(web sse)") " speak the same wire "
-               "format. The honeycomb fire above is written in it."))
+               "format.")
+            (p "This site itself is written in pure Scheme, and compiled to HTML, "
+               "CSS and WebAssembly by " (a (@ (href "https://goeteia.dev")) "Goeteia")
+               " — the honeycomb fire above included."))
           (pre ,(raw rpc-code)))))
 
    ;; ---- foundations ----
@@ -309,12 +312,6 @@
           (a (@ (class "credit") (href "https://github.com/becls/swish"))
              (img (@ (src "swish-icon.png") (alt "Swish") (width "24") (height "24")))
              (span "Swish")))))
-
-   ;; a standalone credit, just below the acknowledgements
-   `(div (@ (class "builtnote"))
-      (div (@ (class "wrap"))
-        "This site is written in pure Scheme, and compiled to HTML, CSS and "
-        "WebAssembly by " (a (@ (href "https://goeteia.dev")) "Goeteia")))
 
    (foot (list `(a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub")
                `(a (@ (href "manual.html")) "Manual")

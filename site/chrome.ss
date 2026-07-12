@@ -134,9 +134,6 @@
               (color (var dim)) (font-size (px 14)) (text-align center))
       ("footer .links" (margin-bottom (px 10)) (display flex) (gap (px 22))
                        (justify-content center))
-      ;; the pure-Scheme credit line, under the acknowledgements
-      (.builtnote (padding 0 0 (px 30)) (color (var dim)) (font-size (px 17)))
-
       (@media "(max-width: 840px)"
         (h1 (font-size (px 40)))
         (.feature (grid-template-columns "1fr"))
