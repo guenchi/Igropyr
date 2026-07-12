@@ -8,4 +8,4 @@
 <span class=\"c\">;; a Scheme browser -- Goeteia -- calls it. no JSON, no codec:</span>
 (<span class=\"f\">rpc</span> <span class=\"s\">\"/rpc\"</span> '(add <span class=\"n\">1</span> <span class=\"n\">2</span> <span class=\"n\">1/2</span>))
 <span class=\"c\">;; the Igropyr server returns</span>
-=&gt; (ok <span class=\"n\">7/2</span>) -- exact ratio intact"))
+(ok <span class=\"n\">7/2</span>) <span class=\"c\">;; -- exact ratio intact</span>"))
