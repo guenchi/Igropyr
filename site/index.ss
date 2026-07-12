@@ -143,8 +143,8 @@
                " / " (code "(web ws)") " / " (code "(web sse)") " speak the same wire "
                "format.")
             (p "This site itself is written in pure Scheme, and compiled to HTML "
-               "and CSS by " (a (@ (href "https://goeteia.dev")) "Goeteia")
-               " — the honeycomb fire above is rendered in real time."))
+               "and CSS — the honeycomb fire above is compiled in real time by "
+               (a (@ (href "https://goeteia.dev")) "Goeteia") "."))
           (div (@ (class "rpccol"))
             (div (@ (class "rpcwire"))
               (a (@ (class "wnode") (href "https://igropyr.com"))
