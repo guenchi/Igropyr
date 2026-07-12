@@ -1,0 +1,50 @@
+(library (code-blocks)
+  (export hero-quick crash-code hotswap-code faults-code conv-code)
+  (import (rnrs))
+  (define hero-quick "<span class=\"c\"># macOS: brew install chezscheme libuv &middot; Debian: apt install chezscheme libuv1-dev zlib1g-dev</span>
+git clone https://github.com/guenchi/Igropyr igropyr
+export CHEZSCHEMELIBDIRS=.
+scheme --script igropyr/test/run-otp.sc
+<span class=\"c\"># curl localhost:8080/ &mdash; and try killing it: curl localhost:8080/crash</span>")
+  (define crash-code "(<span class=\"f\">app-get</span> app <span class=\"s\">\"/crash\"</span>
+  (<span class=\"k\">lambda</span> (req res)
+    <span class=\"c\">;; the worker dies; the supervisor retries on a</span>
+    <span class=\"c\">;; fresh worker -- the pool refills itself</span>
+    (<span class=\"k\">raise</span> <span class=\"n\">'handler-crashed</span>)))
+
+(<span class=\"f\">app-get</span> app <span class=\"s\">\"/stuck\"</span>
+  (<span class=\"k\">lambda</span> (req res)
+    <span class=\"c\">;; a hot loop cannot freeze the system: preemption</span>
+    <span class=\"c\">;; keeps serving, the ticker kills this worker</span>
+    (<span class=\"k\">let</span> loop ((n <span class=\"n\">0</span>)) (loop (+ n <span class=\"n\">1</span>)))))")
+  (define hotswap-code "(<span class=\"f\">app-get</span> app <span class=\"s\">\"/version\"</span>
+  (<span class=\"k\">lambda</span> (req res) (<span class=\"f\">send-text!</span> res <span class=\"s\">\"v1\"</span>)))
+
+<span class=\"c\">;; hit /upgrade on the LIVE server:</span>
+(<span class=\"f\">app-get</span> app <span class=\"s\">\"/upgrade\"</span>
+  (<span class=\"k\">lambda</span> (req res)
+    (<span class=\"f\">app-get</span> app <span class=\"s\">\"/version\"</span>          <span class=\"c\">; re-register =</span>
+      (<span class=\"k\">lambda</span> (req res)                <span class=\"c\">; hot replace</span>
+        (<span class=\"f\">send-text!</span> res <span class=\"s\">\"v2 (hot swapped)\"</span>)))
+    (<span class=\"f\">send-text!</span> res <span class=\"s\">\"upgraded\"</span>)))")
+  (define faults-code "(<span class=\"f\">app-listen</span> app <span class=\"n\">8080</span>
+  `((stuck-ms . <span class=\"n\">3000</span>)          <span class=\"c\">; fail fast</span>
+    (check-ms . <span class=\"n\">1000</span>)
+    (on-failure . ,(<span class=\"f\">make-fault-handler</span>))))
+
+<span class=\"c\">;; the client receives, connection kept alive:</span>
+<span class=\"c\">;;   {\"fault\":\"crash\",\"attempts\":4,\"retryable\":true}</span>
+<span class=\"c\">;;   {\"fault\":\"stuck\",\"elapsed-ms\":3012,...}</span>
+<span class=\"c\">;; unset? the plain 500 remains. zero breakage.</span>")
+  (define conv-code "(<span class=\"f\">conversation-start!</span>
+  (<span class=\"k\">lambda</span> (req suspend!)
+    (<span class=\"k\">let</span> ((tx (begin-tx!)))       <span class=\"c\">; live, across requests</span>
+      (<span class=\"k\">guard</span> (e (#t (rollback! tx) (<span class=\"k\">raise</span> e)))
+        (<span class=\"k\">let</span> ((req2 (suspend! confirm-page)))
+          (commit! tx)
+          done))))
+  req)
+
+(<span class=\"f\">conversation-resume!</span> id req)   <span class=\"c\">; =&gt; reply | 'gone</span>
+<span class=\"c\">;; 'gone means: rolled back. guaranteed.</span>")
+)
