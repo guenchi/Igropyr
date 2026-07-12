@@ -136,7 +136,6 @@
                        (justify-content center))
       ;; the pure-Scheme credit line, under the acknowledgements
       (.builtnote (padding 0 0 (px 30)) (color (var dim)) (font-size (px 17)))
-      (".builtnote .wrap" (max-width (px 680)))
 
       (@media "(max-width: 840px)"
         (h1 (font-size (px 40)))
