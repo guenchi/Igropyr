@@ -97,9 +97,9 @@
       (.rpcwire (display flex) (align-items center) (justify-content center)
                 (gap (px 16)) (margin-bottom (px 22)))
       (".rpcwire .wnode" (display inline-flex) (align-items center) (gap (px 9))
-                         (padding (px 9) (px 18) (px 9) (px 12)) (border (px 1) solid (var line))
-                         (border-radius (px 12)) (background (var panel))
-                         (font-weight 600) (color (var fg)) (font-size (px 15)))
+                         (font-weight 600) (color (var fg)) (font-size (px 15))
+                         (text-decoration none))
+      (".rpcwire .wnode:hover" (color (var acc)) (text-decoration none))
       (".rpcwire .wnode img" (display block))
       (".rpcwire .warrow" (font-size (px 26)) (color (var dim)))
 
