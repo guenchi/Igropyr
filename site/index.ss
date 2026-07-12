@@ -2,7 +2,7 @@
 ;; The header's honeycomb is a WebGL fire (fire.wasm, compiled from
 ;; site/fire.ss); everything else is static (web html) SXML. The
 ;; syntax-highlighted code blocks come from (code-blocks) verbatim.
-(import (rnrs) (web html) (chrome) (code-blocks))
+(import (rnrs) (web html) (chrome) (code-blocks) (rpc-code))
 
 (define (fitem term . desc)
   `(div (@ (class "fitem"))
@@ -123,6 +123,27 @@
                "— a complete remote transaction ring."))
           (pre ,(raw conv-code)))))
 
+   ;; ---- 5. s-expression rpc ----
+   `(section (@ (id "rpc"))
+      (div (@ (class "wrap"))
+        (div (@ (class "kicker")) "05 · Scheme talks to Scheme")
+        (h2 "No codec on the wire")
+        (p (@ (class "lead")) "When the client is Scheme too, requests and replies "
+           "are s-expressions — there is no codec to design. " (code "(igropyr sexpr)")
+           " is the safe parser; " (code "app-rpc") " dispatches one datum per "
+           "message, over HTTP, WebSocket or SSE.")
+        (div (@ (class "feature"))
+          (div (@ (class "txt"))
+            (h3 "The browser half is Goeteia")
+            (p "Exact ratios and bignums cross the wire intact — no floating-point "
+               "JSON approximation anywhere. " (code "(rpc \"/rpc\" '(add 1 2 1/2))")
+               " comes back " (code "(ok 7/2)") ", the ratio preserved.")
+            (p "The peer is " (a (@ (href "https://goeteia.dev")) "Goeteia") ", a "
+               "self-hosting Scheme-to-WebAssembly compiler; its " (code "(web rpc)")
+               " / " (code "(web ws)") " / " (code "(web sse)") " speak the same wire "
+               "format. The honeycomb fire above is written in it."))
+          (pre ,(raw rpc-code)))))
+
    ;; ---- foundations ----
    `(section (@ (id "foundations"))
       (div (@ (class "wrap"))
@@ -149,15 +170,7 @@
             (p "One event loop feeds thousands of parked processes. DNS, file "
                "reads and database round-trips park " (em "the calling process")
                ", never the thread. Non-blocking HTTP/WebSocket clients and "
-               "Redis/MySQL drivers included."))
-          (div (@ (class "card"))
-            (div (@ (class "ic")) "⇄")
-            (h3 "S-expression RPC")
-            (p "When the peer is Scheme too, there is no codec: " (code "(igropyr sexpr)")
-               " and " (code "app-rpc") " carry one s-expression per message — exact "
-               "ratios and bignums cross the wire intact, over HTTP, WebSocket or SSE. "
-               "The browser half is " (a (@ (href "https://goeteia.dev")) "Goeteia")
-               ", a Scheme-to-WebAssembly compiler — the honeycomb fire above is written in it.")))
+               "Redis/MySQL drivers included.")))
         (div (@ (class "strip"))
           (div (div (@ (class "num")) "120k+") (div (@ (class "lbl")) "req/s, keep-alive, laptop"))
           (div (div (@ (class "num")) "0") (div (@ (class "lbl")) "failed requests under ab -c 500"))
