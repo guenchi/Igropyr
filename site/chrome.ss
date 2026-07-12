@@ -38,7 +38,7 @@
            (border-bottom (px 1) solid (var line)))
       ("nav .wrap" (display flex) (align-items center) (height (px 56)) (gap (px 22)))
       ("nav .logo" (font-weight 700) (color (var fg)) (font-size (px 17)))
-      ("nav .logo span" (color (var acc)))
+      ("nav .logo span" (color (var acc)) (font-size (px 21)) (vertical-align "-1px"))
       ("nav .links" (margin-left auto) (display flex) (gap (px 18)) (font-size (px 14)))
       ("nav .links a" (color (var dim)))
       ("nav .links a:hover" (color (var fg)) (text-decoration none))
