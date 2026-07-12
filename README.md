@@ -646,7 +646,7 @@ one `upstream` entry suffices; otherwise give each process its own port
 and list them all. Read the client's real IP from `X-Forwarded-For` and
 the original scheme from `X-Forwarded-Proto`.
 
-## Architecture
+## Internals
 
 ```
 libuv.sc   libuv FFI: event loop, TCP, async DNS, async file reads,
