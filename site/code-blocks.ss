@@ -1,12 +1,7 @@
 (library (code-blocks)
   (export hero-quick crash-code hotswap-code faults-code conv-code)
   (import (rnrs))
-  (define hero-quick "<span class=\"c\"># deps &mdash; macOS: brew install chezscheme libuv &middot; Debian: apt install chezscheme libuv1-dev zlib1g-dev</span>
-npm install igropyr
-export CHEZSCHEMELIBDIRS=node_modules
-export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
-scheme --script node_modules/igropyr/test/run-otp.sc
-<span class=\"c\"># curl localhost:8080/ &mdash; and try killing it: curl localhost:8080/crash</span>")
+  (define hero-quick "npm i igropyr")
   (define crash-code "(<span class=\"f\">app-get</span> app <span class=\"s\">\"/crash\"</span>
   (<span class=\"k\">lambda</span> (req res)
     <span class=\"c\">;; the worker dies; the supervisor retries on a</span>
