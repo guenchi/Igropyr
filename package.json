@@ -1,7 +1,7 @@
 {
   "name": "igropyr",
   "version": "1.0.0",
-  "description": "High-concurrency HTTP server framework for Chez Scheme: libuv via FFI, Erlang-style green processes (spawn/send/receive), Let-It-Crash worker pool, Express-style API, WebSocket, Redis/MySQL clients.",
+  "description": "High-concurrency HTTP server framework for Chez Scheme on libuv: Erlang-style green processes, a Let-It-Crash worker pool, process-per-dialogue conversations, and s-expression RPC.",
   "keywords": [
     "scheme",
     "chez-scheme",
