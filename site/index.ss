@@ -139,7 +139,7 @@
                "JSON approximation anywhere. " (code "(rpc \"/rpc\" '(add 1 2 1/2))")
                " comes back " (code "(ok 7/2)") ", the ratio preserved.")
             (p "The peer is " (a (@ (href "https://goeteia.dev")) "Goeteia") ", a "
-               "self-hosting Scheme-to-WebAssembly compiler; its " (code "(web rpc)")
+               "Scheme compiler that runs in WebAssembly; its " (code "(web rpc)")
                " / " (code "(web ws)") " / " (code "(web sse)") " speak the same wire "
                "format.")
             (p "This site itself is written in pure Scheme, and compiled to HTML "
