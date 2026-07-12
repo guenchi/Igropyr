@@ -6,15 +6,17 @@
       <stop offset="1" stop-color="#d63f0a"/>
     </linearGradient>
   </defs>
-  <!-- regular flat-top hexagon, flame fill -->
-  <path d="M59.0 32.0 L45.5 55.38 L18.5 55.38 L5.0 32.0 L18.5 8.62 L45.5 8.62 Z"
-        fill="url(#flame)" stroke="#c0380a" stroke-width="2"
-        stroke-linejoin="round"/>
-  <!-- white lambda, centred and clear of the edges -->
-  <g fill="none" stroke="#ffffff" stroke-width="6"
-     stroke-linecap="round" stroke-linejoin="round">
-    <path d="M28 22 L42 45"/>
-    <path d="M34.8 33.2 L22 45"/>
-    <path d="M28 22 L24.8 20.3"/>
+  <!-- the original mark, scaled up 1.14x about the centre so it fills
+       more of the frame (shape unchanged, just larger) -->
+  <g transform="translate(32 32) scale(1.14) translate(-32 -32)">
+    <path d="M59.0 32.0 L45.5 55.38 L18.5 55.38 L5.0 32.0 L18.5 8.62 L45.5 8.62 Z"
+          fill="url(#flame)" stroke="#c0380a" stroke-width="2"
+          stroke-linejoin="round"/>
+    <g fill="none" stroke="#ffffff" stroke-width="6"
+       stroke-linecap="round" stroke-linejoin="round">
+      <path d="M28 22 L42 45"/>
+      <path d="M34.8 33.2 L22 45"/>
+      <path d="M28 22 L24.8 20.3"/>
+    </g>
   </g>
 </svg>
