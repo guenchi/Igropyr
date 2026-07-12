@@ -134,9 +134,9 @@
               (color (var dim)) (font-size (px 14)) (text-align center))
       ("footer .links" (margin-bottom (px 10)) (display flex) (gap (px 22))
                        (justify-content center))
-      ;; the pure-Scheme credit line, its own band under the acknowledgements
-      (.builtnote (padding (px 30) 0) (text-align center) (color (var dim))
-                  (font-size (px 15 50)) (border-top (px 1) solid (var line)))
+      ;; the pure-Scheme credit line, under the acknowledgements
+      (.builtnote (padding 0 0 (px 30)) (text-align center) (color (var dim))
+                  (font-size (px 15 50)))
       (".builtnote .wrap" (max-width (px 680)))
 
       (@media "(max-width: 840px)"
