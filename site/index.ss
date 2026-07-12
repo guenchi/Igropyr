@@ -127,14 +127,14 @@
    `(section (@ (id "rpc"))
       (div (@ (class "wrap"))
         (div (@ (class "kicker")) "05 · Scheme talks to Scheme")
-        (h2 "No codec on the wire")
+        (h2 "Both ends speak Scheme")
         (p (@ (class "lead")) "When the client is Scheme too, requests and replies "
            "are s-expressions — there is no codec to design. " (code "(igropyr sexpr)")
            " is the safe parser; " (code "app-rpc") " dispatches one datum per "
            "message, over HTTP, WebSocket or SSE.")
         (div (@ (class "feature"))
           (div (@ (class "txt"))
-            (h3 "The browser half is Goeteia")
+            (h3 "Communicate in S-expressions")
             (p "Exact ratios and bignums cross the wire intact — no floating-point "
                "JSON approximation anywhere. " (code "(rpc \"/rpc\" '(add 1 2 1/2))")
                " comes back " (code "(ok 7/2)") ", the ratio preserved.")
