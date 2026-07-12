@@ -16,8 +16,7 @@
       (p (@ (class "md-loading")) "Loading the manual…"))
    (foot (list `(a (@ (href "index.html")) "Igropyr")
                `(a (@ (href "agent.html")) "Agent")
-               `(a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub"))
-         "The Igropyr manual, rendered from " '(code "docs/") ".")))
+               `(a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub")))))
 
 (write-file "manual.html"
   (render-page

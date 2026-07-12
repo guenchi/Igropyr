@@ -206,10 +206,11 @@
               (a (@ (href "agent.html")) "Agent")
               (a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub")))))
   ;; links: a list of (a ...) nodes; tagline: the remaining nodes
+  ;; (omitted entirely when none are given)
   (define (foot links . tagline)
     `(footer
        (div (@ (class "links")) ,@links)
-       (div ,@tagline)))
+       ,@(if (null? tagline) '() (list `(div ,@tagline)))))
 
   ;; ---- assemble a document ----
   ;; head-extra: extra nodes for <head>; body-nodes: the page body;

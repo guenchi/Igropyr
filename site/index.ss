@@ -213,7 +213,7 @@
              '(code "app-rpc") " / " '(code "send-sexpr!") " / " '(code "ws-send-sexpr!")
              " / " '(code "sse-send-sexpr!") " carry one datum per message — exact "
              "ratios and bignums cross intact. The browser end is "
-             '(a (@ (href "https://github.com/guenchi/Goeteia")) "Goeteia") "'s "
+             '(a (@ (href "https://goeteia.dev")) "Goeteia") "'s "
              '(code "(web rpc/ws/sse)"))
           ,(fitem "Forms & cookies"
              '(code "req-form") " parses urlencoded and multipart bodies (file "
@@ -293,7 +293,7 @@
    `(div (@ (class "builtnote"))
       (div (@ (class "wrap"))
         "This site is written in pure Scheme, and compiled to HTML, CSS and "
-        "WebAssembly by " (a (@ (href "https://github.com/guenchi/Goeteia")) "Goeteia")))
+        "WebAssembly by " (a (@ (href "https://goeteia.dev")) "Goeteia")))
 
    (foot (list `(a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub")
                `(a (@ (href "manual.html")) "Manual")
