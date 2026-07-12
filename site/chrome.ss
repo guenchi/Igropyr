@@ -134,7 +134,7 @@
               (color (var dim)) (font-size (px 14)) (text-align center))
       ("footer .links" (margin-bottom (px 10)) (display flex) (gap (px 22))
                        (justify-content center))
-      (".footer .built, footer .built" (margin-top (px 8)) (font-size (px 13)) (opacity (dec 0 7)))
+      ("footer .built" (margin-top (px 10)) (font-size (px 13)) (color (var dim)))
 
       (@media "(max-width: 840px)"
         (h1 (font-size (px 40)))
