@@ -1,7 +1,5 @@
 # Igropyr
 
-[English](README.md) | [简体中文](README.zh-CN.md)
-
 A high-concurrency HTTP server for [Chez Scheme](https://cisco.github.io/ChezScheme/),
 built directly on [libuv](https://libuv.org/) through Chez's FFI (no C shim),
 with Erlang-style message-passing concurrency and Let-It-Crash fault tolerance.
