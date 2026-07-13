@@ -1224,6 +1224,18 @@ full path 在明文连接上默认被拒绝，因为 MITM 可能替换 server ke
 - `(string->sexpr s [depth])` → 一个 datum；坏输入抛 `#(sexpr-error ,msg ,pos)`（默认深度限制 64）
 - `(sexpr->string x)` → 序列化字符串；遇到非白名单数据（浮点、vector、过程、环状列表）报错
 
+#### 扩展线模式
+
+`string->sexpr-extended` / `sexpr->string-extended` 为 igropyr 对 igropyr
+的链路（节点 mesh，对端就是同一份 codec）增加三种类型：
+
+- vector `#(...)` ——不允许 dotted tail，和列表一样受深度限制
+- bytevector `#vu8(...)` ——只接受裸的精确整数 0..255
+- 浮点数 `1.5`、`-2e10` ——**仅限有限值**：`inf`/`nan` 在读*和*写两侧都被
+  拒绝；Chez 打印能逐位读回的最短形式，浮点往返精确无损
+
+严格模式不受影响——它仍是面向 HTTP、与 Goeteia 兼容的格式，依旧拒绝这三种类型。
+
 #### 互操作说明
 
 线上字符串只转义 `\"` 与 `\\`；字符串内的字面换行是合法的；`\n \t \r` 在

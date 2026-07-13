@@ -1894,6 +1894,21 @@ through as a symbol.
 - `(string->sexpr s [depth])` → one datum; raises `#(sexpr-error ,msg ,pos)` on bad input (default depth limit 64)
 - `(sexpr->string x)` → serialized string; raises on non-whitelist data (floats, vectors, procedures, cyclic lists)
 
+#### Extended Wire Mode
+
+`string->sexpr-extended` / `sexpr->string-extended` add three types for
+igropyr-to-igropyr links (node meshes), where the peer is this same
+codec:
+
+- vectors `#(...)` — no dotted tail, depth-limited like lists
+- bytevectors `#vu8(...)` — bare exact integers 0..255 only
+- flonums `1.5`, `-2e10` — **finite only**: `inf`/`nan` are rejected on
+  read *and* write; Chez prints the shortest form that reads back
+  bit-identically, so floats round-trip exactly
+
+The strict mode is untouched — it remains the HTTP-facing,
+Goeteia-compatible format and still rejects all three.
+
 #### Interop Notes
 
 Strings escape only `\"` and `\\` on the wire; a literal newline inside
