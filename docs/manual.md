@@ -468,10 +468,30 @@ The pattern `:name` in a route captures a path segment. Extract with `(req-param
 - `(send-html! res html-string)` → sets Content-Type: text/html; charset=utf-8
 - `(send-json! res object)` → serializes and sets Content-Type: application/json
 - `(send-sexpr! res datum)` → serializes and sets Content-Type: application/sexpr (see [S-Expression RPC](#s-expression-rpc))
-- `(send-file! res path)` → streams a file to the client
+- `(send-file! res path)` → sends a file to the client (streamed if large; see [Async File Reads](#async-file-reads))
 - `(set-status! res code)` → set HTTP status (default 200)
 - `(set-header! res "Name" "value")` → add/replace a response header
 - `(set-cookie! res "name" "value" "Path=/" "HttpOnly")` → add Set-Cookie header
+
+Every encoder also accepts a **bytevector**, taken as the already-encoded
+body. When a response never changes, encode it **once at startup with
+`define`** rather than re-encoding the same constant on every request —
+the handler then just hands the framework a pointer, skipping the
+`string->utf8` (or JSON/s-expr serialization) each time:
+
+```scheme
+(define home-page (string->utf8 "<h1>hi</h1>"))            ; encoded once
+(define info-json (string->utf8 (json->string my-alist)))  ; serialized once
+
+(app-get app "/"     (lambda (req res) (send-html! res home-page)))
+(app-get app "/info" (lambda (req res) (send-json! res info-json)))
+```
+
+The same holds for anything derivable at startup (rendered templates,
+lookup tables, composed strings): compute it in a top-level `define`, not
+inside the handler. `send-text!`/`send-html!` take a string or bytevector;
+`send-json!` takes a value to serialize or a bytevector of ready JSON;
+`send-sexpr!` likewise.
 
 #### Streaming Response
 
@@ -560,6 +580,21 @@ Middleware is invoked in the order added, before the matching route handler.
 (app-static app "/assets" "./public")
 ;; GET /assets/style.css -> read ./public/style.css
 ```
+
+Files up to 1 MiB are read once and cached in memory; the file's mtime
+is re-checked at most once per second, so serving a hot asset is a
+hashtable lookup — no disk read and no `stat` syscall. Responses carry a
+weak ETag and `Cache-Control`, and a matching `If-None-Match` gets a 304.
+
+Files over 1 MiB are never buffered whole. They stream as a fixed-length
+response in 256 KiB chunks with backpressure — each chunk is read from
+disk only after the previous one has drained to the client, so a
+multi-gigabyte download to a slow peer costs one chunk of memory, and the
+pool worker is released immediately (the pump runs in its own process).
+Chunks go straight from libuv's read buffer to the socket without passing
+through the Scheme heap, so a large download generates no GC traffic. For
+a large file, a revalidation (`If-None-Match`) is answered from cached
+metadata with no file operation at all.
 
 #### Listening
 
@@ -693,7 +728,7 @@ HTTP handlers run in the worker pool and are expected to complete quickly. For l
 
 ### Streaming Primitives
 
-The low-level streaming API lets you write chunked responses:
+The low-level streaming API lets you write chunked responses (`Transfer-Encoding: chunked`, unknown length):
 
 - `(res-begin! res)` — set response headers (Content-Type, etc.) and start streaming; must be called before any `res-write!`
 - `(res-write! res bytevector)` — write a chunk to the TCP buffer (non-blocking; may queue internally)
@@ -710,6 +745,20 @@ The low-level streaming API lets you write chunked responses:
     (res-write! res (string->utf8 "part 2\n"))
     (res-end! res)))
 ```
+
+When the length is known up front (a file, a proxied download), the
+**fixed-length** variant sends a real `Content-Length` and applies
+backpressure — each write parks the producer until the chunk has drained
+to the client, so the producer runs at exactly the client's pace with one
+chunk in flight:
+
+- `(res-begin-file! res length)` — send status + headers + `Content-Length`; call from the worker, then spawn a pump for the writes (a long download must not occupy a worker)
+- `(res-write-file! res data)` → `'more | 'done | #f` — write one chunk (string or bytevector) and wait for it to drain; `#f` means the connection is gone
+- `(res-abort-file! res)` — a fixed-length response that can't be finished has one correct exit: close the connection (the promised length can never be met)
+
+This is what `app-static` and `send-file!` use internally to stream large
+files; reach for it directly only when you are producing a
+known-length body yourself.
 
 ### Server-Sent Events (SSE)
 
@@ -1673,36 +1722,46 @@ Reading files is a blocking operation at the OS level. Igropyr provides `file-re
 
 ### API
 
+Whole-file read (small files, buffered in one bytevector):
+
 - `(file-read-async! path owner)` → void — start an async file read on the thread pool; the owner process receives `#(file-read ,bytevector)` on success or `#(file-error ,code)` on failure
 
-The function is internal to `(igropyr libuv)` but used by the static file serving code in Express.
+Consumer-driven stream (large files, one chunk in flight):
+
+- `(file-stream-open! path owner)` → stream — open a file as a chunk stream; the owner later receives `#(file-stream ,stream ,size)` (ready; `size` from `fstat`) or `#(file-error ,code)`
+- `(file-stream-read! stream)` → void — pull the next chunk; the owner receives `#(file-chunk ,x)`, `#(file-eof)`, or `#(file-error ,code)`. Exactly one pull may be in flight, so a slow consumer holds one chunk of memory, not the file
+- `(file-stream-raw! stream)` → void — deliver chunk *lengths* instead of bytevectors; the bytes stay in the stream's C buffer (`file-stream-chunk-ptr`) so a consumer that only forwards them never touches the Scheme heap
+- `(file-stream-own! stream pid)` → void — hand delivery to another process (e.g. a pump spawned after opening)
+- `(file-stream-close! stream)` → void — abort/release early (idempotent); a pull in flight is cleaned up when its callback returns
+
+These are internal to `(igropyr libuv)` but used by the static file serving code in Express.
 
 ### Implementation
 
-Behind the scenes, libuv's async file operations follow this sequence:
-1. Call `uv_fs_stat` to get the file size (thread pool).
-2. Open the file with `uv_fs_open` (thread pool).
-3. Read the file with `uv_fs_read` (thread pool).
-4. Close with `uv_fs_close` (thread pool).
-5. Send the result back to the owner process via a message.
+Behind the scenes, each read is an open → fstat → read → close chain, all on libuv's thread pool:
+1. Open the file with `uv_fs_open`.
+2. `uv_fs_fstat` for the size (and to reject non-regular files).
+3. Read with `uv_fs_read` — the whole file (whole mode) or one bounded chunk per pull (stream mode).
+4. Close with `uv_fs_close`.
+5. Deliver the result to the owner process via a message.
 
 All of this happens on a separate thread, so a large or slow read (network mount, spinning disk, etc.) never blocks the scheduler.
 
 ### Why Static Files Use It
 
-The Express layer's `app-static` uses `file-read-async!` to serve static files without blocking:
+The Express layer's `app-static` uses these primitives to serve static files without blocking:
 
 ```scheme
 (app-static app "/assets" "./public")
 ```
 
 When a request hits `/assets/style.css`, the handler:
-1. Checks the static file cache (hashtable lookup, O(1)).
-2. If not cached or file was modified, calls `file-read-async!`.
-3. Parks the worker in `receive` until the file bytes arrive.
-4. Sends the response.
+1. Checks the static file cache (hashtable lookup, O(1)); within a 1-second window a hit needs no `stat` at all.
+2. On a miss it opens the file as a stream, so the size is known from `fstat` before any bytes are read.
+3. A file up to 1 MiB is pulled whole, cached, and served from memory. A larger file is streamed with backpressure from a detached pump process (raw chunks: libuv buffer → socket, no Scheme allocation), and only its metadata is cached — a later revalidation answers 304 with no file operation.
+4. The pool worker parks in `receive` only for the small-file case; a large-file worker returns as soon as the response head is written.
 
-During the wait, the worker is not consuming CPU; other workers keep serving requests.
+During any wait the worker is not consuming CPU; other workers keep serving requests.
 
 ### Custom Async File Reads
 
@@ -1786,7 +1845,7 @@ The `(igropyr gzip)` library compresses bytevectors to gzip format (used by brow
 
 The Express layer uses these automatically:
 - Dynamic responses (JSON, HTML) are gzip-encoded if the client accepts it and the result is >1 KiB.
-- Static files are cached uncompressed but gzip-encoded on-demand if the client accepts it.
+- Cached static files (up to 1 MiB) are stored uncompressed but gzip-encoded on-demand — and the compressed form is memoized — if the client accepts it. Large streamed files are sent as-is (never held in memory to compress).
 
 You can also manually compress:
 

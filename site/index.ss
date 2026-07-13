@@ -263,9 +263,11 @@
              "outbound " '(code "http-get") " / " '(code "http-post") " and "
              '(code "ws-connect") ", both with async DNS (libuv thread pool) and "
              "the same park-the-caller model")
-          ,(fitem "Async file reads"
+          ,(fitem "Async file reads & large-file streaming"
              "static files are read on libuv's thread pool, so a large or cold "
-             "read never blocks the scheduler")
+             "read never blocks the scheduler; files over 1 MiB stream with "
+             "backpressure (constant memory, no GC traffic) while small ones "
+             "are cached with a once-a-second freshness check")
           ,(fitem "gzip compression"
              "responses negotiated via " '(code "Accept-Encoding")
              "; static files cache their compressed form")

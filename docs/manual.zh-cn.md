@@ -459,14 +459,33 @@ route 中的 pattern `:name` 会捕获一个 path segment。用 `(req-param req 
 - `(send-html! res html-string)` → 设置 Content-Type: text/html; charset=utf-8
 - `(send-json! res object)` → 序列化并设置 Content-Type: application/json
 - `(send-sexpr! res datum)` → 序列化并设置 Content-Type: application/sexpr（见 [S 表达式 RPC](#s-表达式-rpc)）
-- `(send-file! res path)` → 向 client stream 一个文件
+- `(send-file! res path)` → 向 client 发送文件（大文件带背压流式传输，见下方 Static File Serving）
 - `(set-status! res code)` → 设置 HTTP status（默认 200）
 - `(set-header! res "Name" "value")` → 添加 / 替换 response header
 - `(set-cookie! res "name" "value" "Path=/" "HttpOnly")` → 添加 Set-Cookie header
 
+每个 encoder 也接受 **bytevector**，视为已编码好的响应体。对于内容不变的
+响应，应当在**启动时用 `define` 编码一次**，而不是每个请求重复编码同一个
+常量——handler 只需把指针交给框架，省掉每次的 `string->utf8`（或 JSON /
+s-expr 序列化）：
+
+```scheme
+(define home-page (string->utf8 "<h1>hi</h1>"))            ; 只编码一次
+(define info-json (string->utf8 (json->string my-alist)))  ; 只序列化一次
+
+(app-get app "/"     (lambda (req res) (send-html! res home-page)))
+(app-get app "/info" (lambda (req res) (send-json! res info-json)))
+```
+
+一切能在启动时算出的东西（渲染好的模板、查找表、拼接好的字符串）都同理：
+在顶层 `define` 里算好，不要放在 handler 里。`send-text!`/`send-html!`
+接受字符串或 bytevector；`send-json!` 接受待序列化的值或已就绪的 JSON
+bytevector；`send-sexpr!` 同理。
+
 #### Streaming Response
 
-对于大型或长时间运行的响应，使用 `res-begin!`、`res-write!`、`res-end!`：
+对于长度未知的大型或长时间运行的响应，使用 `res-begin!`、`res-write!`、
+`res-end!`（`Transfer-Encoding: chunked`）：
 
 ```scheme
 (app-get app "/stream"
@@ -479,6 +498,17 @@ route 中的 pattern `:name` 会捕获一个 path segment。用 `(req-param req 
     (res-write! res (string->utf8 "line 2\n"))
     (res-end! res)))
 ```
+
+当长度已知时（文件、代理下载），用**定长**变体发送真实的
+`Content-Length` 并施加背压——每次写入都让生产者停到该块排干到客户端为止，
+因此生产者以客户端的节奏运行，同时只有一块在途：
+
+- `(res-begin-file! res length)` — 发送 status + headers + `Content-Length`；在 worker 中调用，然后生成一个泵进程做后续写入（长下载不能占住 worker）
+- `(res-write-file! res data)` → `'more | 'done | #f` — 写一块（字符串或 bytevector）并等它排干；`#f` 表示连接已断
+- `(res-abort-file! res)` — 无法写完的定长响应只有一个正确出口：关闭连接（承诺的长度已无法满足）
+
+`app-static` 和 `send-file!` 内部正是用它来流式发送大文件；只有当你自己
+生成已知长度的响应体时才需要直接使用。
 
 #### Server-Sent Events (SSE)
 
@@ -551,6 +581,16 @@ Middleware 会按添加顺序调用，并位于匹配 route handler 之前。
 (app-static app "/assets" "./public")
 ;; GET /assets/style.css -> read ./public/style.css
 ```
+
+不超过 1 MiB 的文件读取一次后缓存在内存中；文件 mtime 最多每秒复查一次，
+因此服务热资源是 hashtable lookup——没有磁盘读取，也没有 `stat` 系统调用。
+响应带 weak ETag 和 `Cache-Control`，匹配的 `If-None-Match` 得到 304。
+
+超过 1 MiB 的文件不会整体读入内存：以定长响应按 256 KiB 分块流式发送，
+且带背压——上一块写完排干到客户端后才读下一块，因此慢客户端下载数 GB 也
+只占一块内存，且 worker 立即释放（泵在独立进程里跑）。数据块从 libuv 的
+读缓冲直接进 socket，不经过 Scheme 堆，所以大文件下载不产生 GC 压力。大
+文件的重验证（`If-None-Match`）用缓存的元数据回答，完全不碰文件。
 
 #### Listening
 
