@@ -45,8 +45,9 @@
 
 (library (igropyr node)
   (export node-start! node-connect! node-disconnect! node-self
-          rsend monitor-node demonitor-node node-peers)
+          rsend rcall monitor-node demonitor-node node-peers)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sexpr)
+          (igropyr gen-server)
           (only (igropyr websocket) sha1))
 
   (define max-frame 8388608)        ; 8 MiB per datum
@@ -73,6 +74,11 @@
   (define connectors (make-eq-hashtable))
   ;; node-name -> list of watcher pids
   (define watchers (make-eq-hashtable))
+  ;; rcall ref -> waiting caller pid (this node is the caller)
+  (define pending (make-eqv-hashtable))
+  (define rcall-counter 0)
+  (define (next-rcall-ref!)
+    (atomically (set! rcall-counter (+ rcall-counter 1)) rcall-counter))
 
   (define-syntax atomically
     (syntax-rules ()
@@ -264,16 +270,53 @@
 
   ;; ---- the link: one process per live connection ---------------------------
 
-  (define (dispatch! c d)
+  ;; the four wire shapes a link may carry (peer is the node at the far
+  ;; end of c). Anything else is a confused peer -> drop the link.
+  (define (dispatch! c peer d)
     (cond
-      ((and (pair? d) (eq? (car d) 'send)
-            (pair? (cdr d)) (symbol? (cadr d))
-            (pair? (cddr d)) (null? (cdddr d)))
+      ;; (send ,reg-name ,msg) -> deliver to that registered process
+      ((and (frame? d 'send 3) (symbol? (cadr d)))
        (let ((p (whereis (cadr d))))
          (when p (send p (caddr d)))))          ; unregistered name: drop
+      ;; (call ,reg-name ,ref ,msg) -> serve a cross-node rcall
+      ((and (frame? d 'call 4) (symbol? (cadr d)))
+       (let ((reg (cadr d)) (ref (caddr d)) (m (cadddr d)))
+         (spawn (lambda () (serve-rcall! peer reg ref m)))))
+      ;; (reply ,ref ,result) -> route back to the waiting rcall caller
+      ((frame? d 'reply 3)
+       (let ((ref (cadr d)) (result (caddr d)))
+         (let ((caller (atomically (hashtable-ref pending ref #f))))
+           (when caller (send caller (vector 'rcall-reply ref result))))))
       ((equal? d '(ping)) (write-frame! c '(pong)))
       ((equal? d '(pong)) (void))
       (else (raise 'protocol))))                ; confused peer: drop it
+
+  (define (frame? d tag len)
+    (and (pair? d) (eq? (car d) tag) (list? d) (= (length d) len)))
+
+  ;; callee side of an rcall: run the local gen-server call (which brings
+  ;; its own monitor + timeout), then ship the result back over the link.
+  ;; Any failure -- no such server, it died, it timed out, or a reply
+  ;; that will not serialize -- comes back as (error <reason-symbol>) so
+  ;; the caller never hangs.
+  (define (serve-rcall! peer reg ref m)
+    (let ((result (guard (e (#t (list 'error (rcall-reason e))))
+                    (list 'ok (gen-server-call reg m)))))
+      (let ((e (live-entry peer)))
+        (when e
+          (guard (e2 (#t (link-write peer (list 'reply ref
+                                                (list 'error 'not-serializable)))))
+            (write-frame! (vector-ref e 0) (list 'reply ref result)))))))
+
+  (define (rcall-reason e)
+    (if (and (vector? e) (> (vector-length e) 1) (symbol? (vector-ref e 1)))
+        (vector-ref e 1)                        ; e.g. gen-server-error tag
+        'unavailable))
+
+  ;; write one datum to a peer by name, if the link is live
+  (define (link-write peer datum)
+    (let ((e (live-entry peer)))
+      (and e (begin (write-frame! (vector-ref e 0) datum) #t))))
 
   (define (link-loop c peer buf last-seen)
     (let drain ((buf buf))
@@ -289,7 +332,7 @@
               (`#(tcp-eof) (raise 'closed))
               (`#(tcp-error ,e) (raise 'closed))
               (`#(node-stop) (raise 'stop)))
-            (begin (dispatch! c d) (drain rest))))))
+            (begin (dispatch! c peer d) (drain rest))))))
 
   ;; run the link until it drops, then clean up; never raises
   (define (run-link c peer buf)
@@ -420,4 +463,29 @@
             (write-frame! (vector-ref e 0) (list 'send reg-name msg))
             #t))
       (else #f)))
+
+  ;; Synchronous cross-node call to the GEN-SERVER registered as
+  ;; reg-name on node; returns its reply, blocking the caller (default
+  ;; 5s timeout). The own node name is a plain local gen-server-call.
+  ;; Raises #(rcall-error <reason> <target>) on no link, timeout, or a
+  ;; remote failure (no such server / it died / a non-serializable
+  ;; reply). Both msg and the reply must be extended-wire-safe.
+  (define (rcall node reg-name msg . rest)
+    (let ((timeout (if (pair? rest) (car rest) 5000)))
+      (cond
+        ((eq? node self-name) (gen-server-call reg-name msg timeout))
+        ((live-entry node)
+         => (lambda (e)
+              (let ((ref (next-rcall-ref!)))
+                (atomically (hashtable-set! pending ref self))
+                (write-frame! (vector-ref e 0) (list 'call reg-name ref msg))
+                (receive (after timeout
+                            (atomically (hashtable-delete! pending ref))
+                            (raise (vector 'rcall-error 'timeout reg-name)))
+                  (`#(rcall-reply ,@ref ,result)
+                    (atomically (hashtable-delete! pending ref))
+                    (if (eq? (car result) 'ok)
+                        (cadr result)
+                        (raise (vector 'rcall-error (cadr result) reg-name))))))))
+        (else (raise (vector 'rcall-error 'noconnection node))))))
 )

@@ -10,10 +10,22 @@
 ;;;   (subscribe 'room-1)             ; caller now receives...
 ;;;   (publish 'room-1 "hi")          ; ... #(pub room-1 "hi")
 ;;;   (unsubscribe 'room-1)
+;;;
+;;; Distribution: when (igropyr node) links are up, a publish is also
+;;; forwarded ONE HOP to every directly-connected peer, whose pubsub
+;;; server delivers it to its own local subscribers. This assumes a
+;;; fully-connected mesh (as Erlang does): with every node dialed to
+;;; every other, one hop reaches all subscribers, and a forwarded
+;;; message is never re-forwarded, so there are no loops or duplicates.
+;;; A distributed payload must be extended-wire-safe (see (igropyr
+;;; sexpr)); a payload that will not serialize is still delivered
+;;; locally, just not forwarded. With no node started, node-peers is
+;;; empty and publish behaves exactly as the single-node version.
 
 (library (igropyr pubsub)
   (export start-pubsub! subscribe unsubscribe publish)
-  (import (chezscheme) (igropyr actor) (igropyr gen-server))
+  (import (chezscheme) (igropyr actor) (igropyr gen-server)
+          (igropyr node))
 
   (define server-name 'igropyr-pubsub)
 
@@ -36,12 +48,31 @@
          (values 'ok topics))
         (else (values 'bad-request topics)))))
 
+  (define (deliver-local! topics topic payload)
+    (for-each
+      (lambda (p) (send p (vector 'pub topic payload)))
+      (hashtable-ref topics topic '())))
+
+  ;; forward one hop to every directly-connected peer's pubsub server,
+  ;; as a remote publish (rpub) it will deliver locally but not re-emit.
+  ;; Guarded per peer: a non-serializable payload degrades to local-only
+  ;; rather than crashing this server.
+  (define (forward! topic payload)
+    (for-each
+      (lambda (peer)
+        (guard (e (#t (void)))
+          (rsend peer server-name
+                 (vector 'gen-cast (vector 'rpub topic payload)))))
+      (node-peers)))
+
+  ;; pub  = a local publish: deliver here, then fan out to peers
+  ;; rpub = a publish arriving from a peer: deliver here only (no loop)
   (define (handle-cast msg topics)
-    (let ((topic (vector-ref msg 1))
+    (let ((tag (vector-ref msg 0))
+          (topic (vector-ref msg 1))
           (payload (vector-ref msg 2)))
-      (for-each
-        (lambda (p) (send p (vector 'pub topic payload)))
-        (hashtable-ref topics topic '()))
+      (deliver-local! topics topic payload)
+      (when (eq? tag 'pub) (forward! topic payload))
       topics))
 
   ;; DOWN from a dead subscriber: drop it from every topic

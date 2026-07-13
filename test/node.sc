@@ -7,7 +7,7 @@
 ;;;   - a peer with the WRONG secret never becomes a node
 ;;;   - rsend to a disconnected node returns #f; to self delivers locally
 
-(import (chezscheme) (igropyr actor) (igropyr node))
+(import (chezscheme) (igropyr actor) (igropyr node) (igropyr pubsub))
 
 (define port 18091)
 (define secret "test-mesh-secret")
@@ -26,6 +26,7 @@
 (start-scheduler
   (lambda ()
     (node-start! 'a secret port)
+    (start-pubsub!)
     (register 'main self)
     (monitor-node 'b)
 
@@ -75,6 +76,36 @@
             (unless (= n expect) (fail! "ordering" expect n))
             (loop (+ expect 1))))))
     (display "in-order burst ok\n")
+
+    ;; rcall: synchronous cross-node call to a gen-server on b
+    (unless (= 49 (rcall 'b 'calc (vector 'square 7)))
+      (fail! "rcall-value"))
+    (display "rcall round-trip ok\n")
+
+    ;; rcall to a gen-server that raises -> rcall-error, not a hang
+    (let ((got (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'rcall-error))
+                          (vector-ref e 1)))
+                 (rcall 'b 'calc (vector 'boom))
+                 'no-raise)))
+      (unless (memq got '(unavailable server-died call-failed))
+        (fail! "rcall-error-kind" got)))
+    (display "rcall remote failure -> rcall-error ok\n")
+
+    ;; rcall to a missing server -> rcall-error (no hang)
+    (let ((got (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'rcall-error)) #t))
+                 (rcall 'b 'nonesuch (vector 'x) 2000)
+                 #f)))
+      (unless got (fail! "rcall-missing")))
+    (display "rcall missing server -> rcall-error ok\n")
+
+    ;; distributed pubsub: a publish on node a must reach a subscriber
+    ;; on node b (b relays it back as #(heard ...))
+    (sleep-ms 300)                       ; let b's subscribe settle
+    (publish 'room "cross-node-hello")
+    (receive (after 5000 (fail! "dist-pubsub-timeout"))
+      (`#(heard ,m)
+        (unless (equal? m "cross-node-hello") (fail! "dist-pubsub-payload" m))))
+    (display "distributed pubsub fan-out ok\n")
 
     ;; peer exits -> node-down, and rsend turns #f
     (rsend 'b 'svc (vector 'quit))
