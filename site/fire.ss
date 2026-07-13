@@ -7,7 +7,7 @@
 ;; along every edge and meets in the middle — a burning fuse network.
 ;; Where the front burns, embers rise: a transform-feedback particle
 ;; system whose physics IS the vertex shader — each ember respawns at
-;; its home point on the lattice, kicks upward, sways, and dies, and
+;; its home point, pops upward, arcs over under gravity, and dies, and
 ;; only glows while the front is passing its home. Everything renders
 ;; through (web fx) over (web gl)'s command buffer: one bridge call per
 ;; frame, GPU-resident particle state, zero per-frame Scheme physics.
@@ -181,17 +181,18 @@
                  (set! pos (+ a_home (vec2 (* (- s (fl 0 50)) (fl 7))
                                            (fl 0))))
                  (set! vel (vec2 (* (- (fract (* s "7.3")) (fl 0 50))
-                                    "26.0")
-                                 (- (+ "24.0" (* s "40.0")))))
+                                    "30.0")
+                                 (- (+ "46.0" (* s "52.0")))))
                  (set! life (+ "0.6" (* (fract (* s "3.7")) "0.9")))
                  (set! seed (fract (+ seed "0.6180339"))))
-                ;; alive: rise, sway, slow
+                ;; alive: an arc -- the upward kick decays under
+                ;; gravity, so sparks pop up a little and fall
                 ((set! vel (+ a_vel
                               (vec2 (* (sin (+ (* u_time (fl 3))
                                                (* seed "40.0")))
                                        (* "16.0" u_dt))
-                                    (* "-30.0" u_dt))))
-                 (set! vel (* vel (max (- (fl 1) (* (fl 0 40) u_dt))
+                                    (* "150.0" u_dt))))
+                 (set! vel (* vel (max (- (fl 1) (* (fl 0 30) u_dt))
                                        (fl 0))))
                  (set! pos (+ a_pos (* vel u_dt)))))
        (set! v_pos pos)
