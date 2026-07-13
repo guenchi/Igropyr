@@ -72,15 +72,16 @@
                       res)
                     (begin (cleanup) #f))))))))
 
-  ;; does an Accept-Encoding header value allow gzip?
+  ;; does an Accept-Encoding header value allow gzip? Case-insensitive
+  ;; search in place: no downcased copy, no per-position substring.
   (define (gzip-acceptable? accept-encoding)
     (and accept-encoding
-         (let ((s (string-downcase accept-encoding))
-               (needle "gzip"))
-           (let ((n (string-length s)) (m (string-length needle)))
-             (let loop ((i 0))
-               (cond
-                 ((> (+ i m) n) #f)
-                 ((string=? (substring s i (+ i m)) needle) #t)
-                 (else (loop (+ i 1)))))))))
+         (let ((n (string-length accept-encoding)))
+           (let loop ((i 0))
+             (and (fx<= (fx+ i 4) n)
+                  (or (and (char-ci=? (string-ref accept-encoding i) #\g)
+                           (char-ci=? (string-ref accept-encoding (fx+ i 1)) #\z)
+                           (char-ci=? (string-ref accept-encoding (fx+ i 2)) #\i)
+                           (char-ci=? (string-ref accept-encoding (fx+ i 3)) #\p))
+                      (loop (fx+ i 1))))))))
 )

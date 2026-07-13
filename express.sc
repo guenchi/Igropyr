@@ -39,9 +39,14 @@
            (loop (+ i 1) (+ i 1) (cons (substring s start i) acc)))
           (else (loop (+ i 1) start acc))))))
 
+  ;; char-wise: no substring allocation on this per-request check
   (define (string-prefix? p s)
-    (and (>= (string-length s) (string-length p))
-         (string=? p (substring s 0 (string-length p)))))
+    (let ((pl (string-length p)))
+      (and (fx>= (string-length s) pl)
+           (let loop ((i 0))
+             (or (fx= i pl)
+                 (and (char=? (string-ref s i) (string-ref p i))
+                      (loop (fx+ i 1))))))))
 
   ;; ---- response encoders (the res.json level) --------------------------------
 
@@ -50,13 +55,12 @@
   ;; images are skipped)
   (define gzip-min-size 1024)
 
+  (define compressible-prefixes
+    '("text/" "application/json" "application/javascript"
+      "application/xml" "image/svg+xml"))
+
   (define (compressible-type? ctype)
-    (let ((prefixes '("text/" "application/json" "application/javascript"
-                      "application/xml" "image/svg+xml")))
-      (exists (lambda (p)
-                (and (>= (string-length ctype) (string-length p))
-                     (string=? (substring ctype 0 (string-length p)) p)))
-              prefixes)))
+    (exists (lambda (p) (string-prefix? p ctype)) compressible-prefixes))
 
   (define (finish! r ctype body)
     (set-header! r "Content-Type" ctype)
@@ -73,13 +77,24 @@
                 (res-send! r body)))          ; compression failed: send raw
           (res-send! r body))))
 
-  (define (send-text! r s) (finish! r "text/plain; charset=utf-8" (string->utf8 s)))
-  (define (send-html! r s) (finish! r "text/html; charset=utf-8" (string->utf8 s)))
+  ;; Every encoder also accepts a bytevector, taken as the body already
+  ;; encoded. The fast pattern for constant responses is to do the
+  ;; encoding ONCE at startup with define, so the handler just hands the
+  ;; framework a pointer:
+  ;;   (define home (string->utf8 "<h1>hi</h1>"))
+  ;;   (app-get app "/" (lambda (req res) (send-html! res home)))
+  (define (as-utf8 s) (if (string? s) (string->utf8 s) s))
+
+  (define (send-text! r s) (finish! r "text/plain; charset=utf-8" (as-utf8 s)))
+  (define (send-html! r s) (finish! r "text/html; charset=utf-8" (as-utf8 s)))
   ;; serialization comes from (igropyr json): alist -> object,
-  ;; vector or list -> array, 'null -> null
+  ;; vector or list -> array, 'null -> null. A bytevector is passed
+  ;; through as pre-serialized JSON (define it once at startup).
   (define (send-json! r obj)
     (finish! r "application/json; charset=utf-8"
-             (string->utf8 (json->string obj))))
+             (if (bytevector? obj)
+                 obj
+                 (string->utf8 (json->string obj)))))
 
   ;; parse a JSON request body; #f when the body is not valid JSON
   (define (req-json req)
@@ -98,9 +113,12 @@
         (and (<= (bytevector-length body) (* 1024 1024))
              (string->sexpr (utf8->string body))))))
 
+  ;; a bytevector is passed through as a pre-serialized datum
   (define (send-sexpr! r x)
     (finish! r "application/sexpr; charset=utf-8"
-             (string->utf8 (sexpr->string x))))
+             (if (bytevector? x)
+                 x
+                 (string->utf8 (sexpr->string x)))))
 
   ;; ---- cookies --------------------------------------------------------------
 
@@ -196,10 +214,12 @@
                      (else (scan (+ j 1)))))))
           (else (lp (+ i 1)))))))
 
+  (define crlf2-bv (string->utf8 "\r\n\r\n"))
+
   ;; parse one multipart part: header block + payload
   ;; -> (name . string-value) or (name . #(file filename content-type bytes))
   (define (parse-part bv start end)
-    (let ((hend (bv-search bv (string->utf8 "\r\n\r\n") start)))
+    (let ((hend (bv-search bv crlf2-bv start)))
       (and hend (<= (+ hend 4) end)
            (let* ((head (utf8->string (bv-sub bv start hend)))
                   (data (bv-sub bv (+ hend 4) end))
@@ -352,7 +372,12 @@
   ;; Files larger than max-cache-file are served but not cached.
 
   (define max-cache-file (* 1024 1024))   ; 1 MiB per-file cache cap
-  ;; path -> #(mtime size etag content-type body)
+  ;; A cached file's mtime is re-checked at most once per this many ms
+  ;; (nginx open_file_cache_valid works the same way, default 60s there).
+  ;; Within the window a hit costs a hashtable lookup and NO syscalls --
+  ;; the stat pair (exists? + mtime) dominated cached static serving.
+  (define stat-window-ms 1000)
+  ;; path -> #(mtime size etag content-type body gzip-box last-stat-ms)
   (define static-cache (make-hashtable string-hash string=?))
 
   (define (file-mtime path)
@@ -373,23 +398,28 @@
       (`#(file-read ,bv) bv)
       (`#(file-error ,e) #f)))
 
-  ;; return the cache entry for path (reading/refreshing as needed), or #f
+  ;; return the cache entry for path (reading/refreshing as needed), or #f.
+  ;; Within stat-window-ms of the last check the entry is trusted as-is;
+  ;; past it the mtime is re-checked (and the window restamped), and the
+  ;; file re-read only when the mtime actually changed.
   (define (static-entry path)
-    (let ((mt (file-mtime path)))
-      (and mt
-           (let ((cached (hashtable-ref static-cache path #f)))
-             (if (and cached (= (vector-ref cached 0) mt))
-                 cached
-                 (let ((body (read-file-async path)))
-                   (and body
-                        (let* ((size (bytevector-length body))
-                               ;; entry: #(mtime size etag ctype body gzip-box)
-                               ;; gzip-box holds the lazily-built gzip body
-                               (e (vector mt size (etag-of size mt)
-                                          (mime-type path) body (box #f))))
-                          (when (<= size max-cache-file)
-                            (hashtable-set! static-cache path e))
-                          e))))))))
+    (let ((cached (hashtable-ref static-cache path #f))
+          (now (now-ms)))
+      (if (and cached (< (- now (vector-ref cached 6)) stat-window-ms))
+          cached
+          (let ((mt (file-mtime path)))
+            (and mt
+                 (if (and cached (= (vector-ref cached 0) mt))
+                     (begin (vector-set! cached 6 now) cached)
+                     (let ((body (read-file-async path)))
+                       (and body
+                            (let* ((size (bytevector-length body))
+                                   ;; gzip-box holds the lazily-built gzip body
+                                   (e (vector mt size (etag-of size mt)
+                                              (mime-type path) body (box #f) now)))
+                              (when (<= size max-cache-file)
+                                (hashtable-set! static-cache path e))
+                              e)))))))))
 
   ;; Public helper: send a file (cached read; no conditional request
   ;; since there is no req here). Path traversal is rejected.
@@ -444,9 +474,18 @@
 
   ;; ---- router -------------------------------------------------------------------
 
-  ;; "/users/:id" -> ("users" ":id"); "/" -> ()
+  ;; "/users/:id" -> ("users" ":id"); "/" -> (). One pass, empty
+  ;; segments skipped during the split rather than filtered after.
   (define (split-segments path)
-    (filter (lambda (s) (not (string=? s ""))) (string-split path #\/)))
+    (let ((n (string-length path)))
+      (let loop ((i 0) (start 0) (acc '()))
+        (cond
+          ((fx= i n)
+           (reverse (if (fx> i start) (cons (substring path start i) acc) acc)))
+          ((char=? (string-ref path i) #\/)
+           (loop (fx+ i 1) (fx+ i 1)
+                 (if (fx> i start) (cons (substring path start i) acc) acc)))
+          (else (loop (fx+ i 1) start acc))))))
 
   ;; match pattern segments against path segments; alist of params or #f
   (define (match-segments psegs segs)
@@ -475,10 +514,23 @@
     (fields
       (mutable routes app-routes app-routes-set!)       ; list of #(method segs handler)
       (mutable middlewares app-middlewares app-middlewares-set!)
+      ;; the middleware list composed into one callable, rebuilt by
+      ;; app-use -- so a request pays no fold/list walk
+      (mutable mw-chain app-mw-chain app-mw-chain-set!)
       (mutable statics app-statics app-statics-set!)    ; list of (prefix . root)
       (mutable ws-routes app-ws-routes app-ws-routes-set!))) ; list of (segs . session)
 
-  (define (create-app) (make-app-record '() '() '() '()))
+  ;; chain shape: (lambda (req r tail) ...); tail runs the router
+  (define empty-chain (lambda (req r tail) (tail)))
+
+  (define (compose-chain mws)
+    (fold-right
+      (lambda (mw rest)
+        (lambda (req r tail) (mw req r (lambda () (rest req r tail)))))
+      empty-chain
+      mws))
+
+  (define (create-app) (make-app-record '() '() empty-chain '() '()))
 
   ;; Registering a route that already exists (same method + pattern)
   ;; REPLACES it -- this is what makes hot reloading work: re-evaluating
@@ -546,9 +598,12 @@
                  (map (lambda (l) (string-append "data: " l "\n")) lines))
           "\n"))))
 
-  ;; middleware: (lambda (req res next) ...); call (next) to continue
+  ;; middleware: (lambda (req res next) ...); call (next) to continue.
+  ;; The composed chain is rebuilt here, at registration time, so
+  ;; mutation stays live while requests just call the prebuilt chain.
   (define (app-use a mw)
-    (app-middlewares-set! a (append (app-middlewares a) (list mw))))
+    (app-middlewares-set! a (append (app-middlewares a) (list mw)))
+    (app-mw-chain-set! a (compose-chain (app-middlewares a))))
 
   (define (app-static a prefix root)
     (unless (and (string? prefix) (> (string-length prefix) 0)
@@ -662,12 +717,11 @@
 
   ;; Fold the app into the single (lambda (req res)) handler the core
   ;; expects: middlewares wrap the router, first-registered outermost.
+  ;; The chain was composed when the middleware was registered; a request
+  ;; only reads the chain slot (so app-use stays live) and runs it.
   (define (app->handler a)
     (lambda (req r)
-      ((fold-right
-         (lambda (mw next) (lambda () (mw req r next)))
-         (lambda () (route-dispatch a req r))
-         (app-middlewares a)))))
+      ((app-mw-chain a) req r (lambda () (route-dispatch a req r)))))
 
   ;; Returns the http-server, so callers can http-swap! the whole
   ;; handler later. Route/middleware mutations on the app are live
