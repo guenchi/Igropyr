@@ -89,6 +89,16 @@
           (unless (eq? got 'task-error) (fail! "task-error" got))))
       (display "handler crash -> task-error (no retry) ok\n")
 
+      ;; a non-serializable result must not strand the task: the worker
+      ;; turns it into a task-error instead of crashing on the reply
+      (let ((t (dpool-submit pool (vector 'unserializable))))
+        (let ((got (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'dpool-error))
+                              (vector-ref e 1)))
+                     (dpool-await pool t 10000)
+                     'no-raise)))
+          (unless (eq? got 'task-error) (fail! "unserializable-result" got))))
+      (display "non-serializable result -> task-error (not stranded) ok\n")
+
       ;; at-most-once: kill the node mid-task -> node-down, never re-run
       (let ((t (dpool-submit pool (vector 'slow 999 4000)
                              '((mode . at-most-once)))))

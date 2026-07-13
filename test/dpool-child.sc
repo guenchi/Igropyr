@@ -31,6 +31,7 @@
            (vector 'from name (vector-ref job 1)))
           ((die) (exit 0))
           ((boom) (raise 'handler-blew-up))
+          ((unserializable) car)              ; a procedure can't cross the wire
           (else (vector 'from name 'unknown)))))
     ;; park forever serving the worker
     (let loop () (receive (,_ (loop))))))

@@ -86,11 +86,13 @@
   ;;              noconnection synthesized when the link to node drops)
   ;;   caller-agents: mref -> agent pid         (self-watch only)
   ;; On the TARGET node:
-  ;;   callee-agents: mref -> agent pid         (one local monitor per
-  ;;              remote watch; killed on demon)
+  ;;   callee-agents: (peer . mref) -> agent pid  (one local monitor per
+  ;;              remote watch; killed on demon). Keyed by (peer . mref)
+  ;;              because mref is chosen by the watcher's own counter, so
+  ;;              two watchers collide on it -- the pair namespaces them.
   (define rmonitors (make-eqv-hashtable))
   (define caller-agents (make-eqv-hashtable))
-  (define callee-agents (make-eqv-hashtable))
+  (define callee-agents (make-hashtable equal-hash equal?))
   (define mref-counter 0)
   (define (next-mref!)
     (atomically (set! mref-counter (+ mref-counter 1)) mref-counter))
@@ -227,7 +229,11 @@
 
   (define (random-hex nbytes)
     (call-with-port (open-file-input-port "/dev/urandom")
-      (lambda (p) (bytevector->hex (get-bytevector-n p nbytes)))))
+      (lambda (p)
+        (let ((bv (get-bytevector-n p nbytes)))
+          (unless (and (bytevector? bv) (= (bytevector-length bv) nbytes))
+            (raise 'entropy))                   ; short read: fail closed
+          (bytevector->hex bv)))))
 
   (define (proof nonce name)
     (bytevector->hex
@@ -299,22 +305,36 @@
       ((and (frame? d 'call 4) (symbol? (cadr d)))
        (let ((reg (cadr d)) (ref (caddr d)) (m (cadddr d)))
          (spawn (lambda () (serve-rcall! peer reg ref m)))))
-      ;; (reply ,ref ,result) -> route back to the waiting rcall caller
+      ;; (reply ,ref ,result) -> route back to the waiting rcall caller,
+      ;; but only if the reply arrives from the node that call targeted
+      ;; (a ref is bound to its node, so one peer can't answer a call
+      ;; the caller sent to another)
       ((frame? d 'reply 3)
        (let ((ref (cadr d)) (result (caddr d)))
-         (let ((caller (atomically (hashtable-ref pending ref #f))))
-           (when caller (send caller (vector 'rcall-reply ref result))))))
-      ;; (mon ,name ,mref ,origin) -> watch our local reg-name for origin
+         (let ((slot (atomically (hashtable-ref pending ref #f))))
+           (when (and slot (eq? (vector-ref slot 1) peer))
+             (send (vector-ref slot 0) (vector 'rcall-reply ref result))))))
+      ;; (mon ,name ,mref ,origin) -> watch our local reg-name for origin.
+      ;; Register the agent in callee-agents SYNCHRONOUSLY (before it can
+      ;; run), so a demon frame that follows on this same link always
+      ;; finds it -- the agent spawn alone would race the demon.
       ((and (frame? d 'mon 4) (symbol? (cadr d)) (symbol? (cadddr d)))
-       (let ((name (cadr d)) (mref (caddr d)) (origin (cadddr d)))
-         (spawn (lambda () (mon-agent origin mref name)))))
-      ;; (mdown ,mref ,reason) -> the watched process/link is gone
+       (let* ((name (cadr d)) (mref (caddr d)) (origin (cadddr d))
+              (key (cons peer mref)))
+         (atomically
+           (hashtable-set! callee-agents key
+             (spawn (lambda () (mon-agent origin key name)))))))
+      ;; (mdown ,mref ,reason) -> the watched process/link is gone; only
+      ;; honor it from the node the monitor actually targets
       ((frame? d 'mdown 3)
        (let ((mref (cadr d)) (reason (caddr d)))
-         (fire-remote-down! mref reason)))
-      ;; (demon ,mref) -> stop a monitor we host
+         (let ((entry (atomically (hashtable-ref rmonitors mref #f))))
+           (when (and entry (eq? (vector-ref entry 1) peer))
+             (fire-remote-down! mref reason)))))
+      ;; (demon ,mref) -> stop a monitor we host for this peer
       ((frame? d 'demon 2)
-       (let ((agent (atomically (hashtable-ref callee-agents (cadr d) #f))))
+       (let ((agent (atomically
+                      (hashtable-ref callee-agents (cons peer (cadr d)) #f))))
          (when agent (send agent (vector 'demon-local)))))
       ((equal? d '(ping)) (write-frame! c '(pong)))
       ((equal? d '(pong)) (void))
@@ -354,20 +374,23 @@
   ;; missing name is an immediate 'noproc. The reason is shipped as-is
   ;; when wire-safe, else degraded to 'exit -- a monitor must always
   ;; deliver a DOWN, never wedge on a non-serializable reason.
-  (define (mon-agent origin mref name)
-    (let ((p (whereis name)))
+  ;; key is (peer . mref); dispatch registered us under it before we ran
+  (define (mon-agent origin key name)
+    (let ((mref (cdr key))
+          (p (whereis name)))
       (if (not p)
-          (link-write origin (list 'mdown mref 'noproc))
+          (begin
+            (atomically (hashtable-delete! callee-agents key))
+            (link-write origin (list 'mdown mref 'noproc)))
           (let ((m (monitor p)))
-            (atomically (hashtable-set! callee-agents mref self))
             (receive
               (`#(DOWN ,@p ,reason)
-                (atomically (hashtable-delete! callee-agents mref))
+                (atomically (hashtable-delete! callee-agents key))
                 (guard (e (#t (link-write origin (list 'mdown mref 'exit))))
                   (link-write origin (list 'mdown mref reason))))
               (`#(demon-local)
                 (demonitor m)
-                (atomically (hashtable-delete! callee-agents mref))))))))
+                (atomically (hashtable-delete! callee-agents key))))))))
 
   ;; watcher side: deliver #(remote-down node name reason) to the caller
   ;; that installed mref, once. Used for both a target-side mdown and a
@@ -567,16 +590,22 @@
         ((live-entry node)
          => (lambda (e)
               (let ((ref (next-rcall-ref!)))
-                (atomically (hashtable-set! pending ref self))
+                (atomically (hashtable-set! pending ref (vector self node)))
                 (write-frame! (vector-ref e 0) (list 'call reg-name ref msg))
                 (receive (after timeout
                             (atomically (hashtable-delete! pending ref))
                             (raise (vector 'rcall-error 'timeout reg-name)))
                   (`#(rcall-reply ,@ref ,result)
                     (atomically (hashtable-delete! pending ref))
-                    (if (eq? (car result) 'ok)
-                        (cadr result)
-                        (raise (vector 'rcall-error (cadr result) reg-name))))))))
+                    ;; a well-formed reply is (ok ,v) or (error ,reason);
+                    ;; anything else is a broken peer, not a hang
+                    (cond
+                      ((and (pair? result) (eq? (car result) 'ok) (pair? (cdr result)))
+                       (cadr result))
+                      ((and (pair? result) (eq? (car result) 'error) (pair? (cdr result)))
+                       (raise (vector 'rcall-error (cadr result) reg-name)))
+                      (else
+                       (raise (vector 'rcall-error 'bad-reply reg-name)))))))))
         (else (raise (vector 'rcall-error 'noconnection node))))))
 
   ;; Watch the process registered as name on node. The caller later

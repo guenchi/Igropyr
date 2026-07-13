@@ -89,8 +89,13 @@
                            (guard (e (#t (vector 'task-error (reason-of e))))
                              (vector 'ok (handler payload)))))
                       ;; reply to the coordinator; if it or the link is
-                      ;; gone the result is simply dropped
-                      (rsend rnode rname (vector 'dresult id result)))))
+                      ;; gone the result is simply dropped. A result that
+                      ;; won't serialize would crash rsend and strand the
+                      ;; task -- turn it into a task-error instead.
+                      (guard (e (#t (rsend rnode rname
+                                      (vector 'dresult id
+                                        (vector 'task-error 'not-serializable)))))
+                        (rsend rnode rname (vector 'dresult id result))))))
                 (loop))))))))
 
   ;; ---- coordinator (on the submitting node) ------------------------------
@@ -124,8 +129,27 @@
     (define inflight (make-eqv-hashtable))     ; id -> #(payload node mode)
     (define awaiters (make-eqv-hashtable))     ; id -> list of #(from ref)
     (define results (make-eqv-hashtable))      ; id -> result (awaited later)
+    ;; FIFO of stashed result ids, so a result nobody ever awaits cannot
+    ;; grow the table without bound (O(1) amortized eviction)
+    (define stash-front '())
+    (define stash-back '())
+    (define stash-n 0)
+    (define max-stashed 10000)
     (define queue '())                         ; #(id payload mode), no live node
     (define next-id 0)
+
+    (define (stash-result! id result)
+      (hashtable-set! results id result)
+      (set! stash-back (cons id stash-back))
+      (set! stash-n (+ stash-n 1))
+      (when (> stash-n max-stashed)
+        (when (null? stash-front)
+          (set! stash-front (reverse stash-back))
+          (set! stash-back '()))
+        (unless (null? stash-front)
+          (hashtable-delete! results (car stash-front))   ; no-op if already taken
+          (set! stash-front (cdr stash-front))
+          (set! stash-n (- stash-n 1)))))
 
     (define (pick-node!)
       (let loop ((tries (length live)))
@@ -168,7 +192,7 @@
                                   (vector 'dpool-result (vector-ref a 1) result)))
                 aws)
               (hashtable-delete! awaiters id))
-            (hashtable-set! results id result))))
+            (stash-result! id result))))
 
     (define (drain-queue!)
       (let ((q queue))
