@@ -184,7 +184,7 @@
                ", never the thread. Non-blocking HTTP/WebSocket clients and "
                "Redis/MySQL drivers included.")))
         (div (@ (class "strip"))
-          (div (div (@ (class "num")) "120k+") (div (@ (class "lbl")) "req/s, keep-alive, laptop"))
+          (div (div (@ (class "num")) "150k+") (div (@ (class "lbl")) "req/s, keep-alive, M4 Pro"))
           (div (div (@ (class "num")) "0") (div (@ (class "lbl")) "failed requests under ab -c 500"))
           (div (div (@ (class "num")) "≤35s") (div (@ (class "lbl")) "full recovery from a stuck pool"))
           (div (div (@ (class "num")) "1") (div (@ (class "lbl")) "OS thread")))))
@@ -284,8 +284,9 @@
              "persistent connections by default on 1.1; each connection's reader "
              "process loops over successive requests")
           ,(fitem "Fast"
-             "~35 k req/s at 500 concurrent connections on an Apple Silicon "
-             "laptop (" '(code "ab -n 50000 -c 500") ", zero failed requests)"))))
+             "~150 k req/s with keep-alive at 100 connections, and ~32 k req/s "
+             "at 500 concurrent connections (" '(code "ab -n 50000 -c 500")
+             ", zero failed requests), on an Apple M4 Pro"))))
 
    ;; ---- acknowledgements ----
    `(section (@ (id "thanks"))
