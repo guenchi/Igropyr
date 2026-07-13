@@ -1,8 +1,8 @@
 #!chezscheme
 ;;; (igropyr actor) -- Erlang-style green processes for Chez Scheme.
 ;;;
-;;; Continuation-based context switching (call/1cc), a precedence-ordered
-;;; run queue and sleep queue, mailboxes with a receive macro whose
+;;; Continuation-based context switching (call/1cc), a FIFO run queue,
+;;; an indexed min-heap sleep queue, mailboxes with a receive macro whose
 ;;; (after timeout ...) clause is only recognized in FIRST position,
 ;;; link/monitor with EXIT/DOWN notification, and preemptive scheduling
 ;;; via Chez's timer interrupt so a CPU-spinning process can still be
@@ -82,13 +82,15 @@
       (mutable winders pcb-winders pcb-winders-set!)
       (mutable exception-state pcb-exception-state pcb-exception-state-set!)
       (mutable inbox pcb-inbox pcb-inbox-set!)   ; queue sentinel; #f = dead
-      (mutable precedence pcb-precedence pcb-precedence-set!)
+      (mutable waketime pcb-waketime pcb-waketime-set!)
       (mutable sleeping? pcb-sleeping? pcb-sleeping?-set!)
       (mutable trap-exit pcb-trap-exit pcb-trap-exit-set!)
       (mutable sic pcb-sic pcb-sic-set!)         ; saved interrupt count
       (mutable links pcb-links pcb-links-set!)
       (mutable monitors pcb-monitors pcb-monitors-set!)
-      (mutable exit-reason pcb-exit-reason pcb-exit-reason-set!)))
+      (mutable exit-reason pcb-exit-reason pcb-exit-reason-set!)
+      ;; slot in the sleep heap; meaningful only while sleeping? is #t
+      (mutable heap-index pcb-heap-index pcb-heap-index-set!)))
 
   (define-record-type (mon make-mon mon?)
     (fields (immutable origin mon-origin) (immutable target mon-target)))
@@ -123,7 +125,6 @@
       ((set! id v) (set-virtual-register! 0 v))))
   (define-syntax self (identifier-syntax *self*))
   (define run-queue (make-queue))
-  (define sleep-queue (make-queue))
   ;; Roots every live pcb: a process parked in receive with no timeout
   ;; sits in no queue and would otherwise be collectable.
   (define process-table (make-eqv-hashtable))
@@ -166,41 +167,134 @@
       (newline)
       (exit 70)))
 
-  ;; ---- queues with precedence -------------------------------------------
+  ;; ---- run queue ------------------------------------------------------
 
-  (define (@enqueue p queue precedence)
-    (when (enqueued? p) (remove-q! p))
-    (pcb-precedence-set! p precedence)
-    (let find ((next queue))
-      (let ((prev (q-prev next)))
-        (if (or (eq? prev queue) (<= (pcb-precedence prev) precedence))
-            (insert-before! p next)
-            (find prev)))))
+  ;; Make p runnable: append to the run-queue tail (the run queue is
+  ;; FIFO; there are no priorities among runnable processes).
+  ;; Precondition: p is not queue-linked. A running, parked, fresh, or
+  ;; just-woken process never is, and @send guards its already-runnable
+  ;; case with enqueued?, so there is no removal check here.
+  (define (@run! p)
+    (insert-before! p run-queue))
 
-  ;; wake sleeping processes whose time has come
+  ;; ---- sleep heap -----------------------------------------------------
+
+  ;; Sleeping processes live in an indexed binary min-heap keyed by
+  ;; pcb-waketime (always a fixnum: receive-after clamps it), with
+  ;; pcb-heap-index tracking each sleeper's slot so a message arrival
+  ;; or kill removes an arbitrary sleeper without a scan. Why not a
+  ;; sorted list: with mixed timeout durations (5s gen-server calls
+  ;; among 60s keep-alives) a sorted insert of a short deadline walks
+  ;; past every longer one -- O(n) per timed receive, at exactly the
+  ;; connection counts where it hurts. Heap costs for the common cases:
+  ;; inserting the latest deadline ("now + constant" while older timers
+  ;; drain) is one compare; cancelling a young timer when its message
+  ;; arrives (the dominant @send path) re-settles near the bottom, ~one
+  ;; compare; expiry pops are O(log n) and happen at most once per
+  ;; timeout. Equal waketimes wake in unspecified relative order, as in
+  ;; Erlang.
+  (define sleep-heap (make-vector 64 #f))
+  (define sleep-count 0)
+
+  (define (@heap-place! i p)
+    (vector-set! sleep-heap i p)
+    (pcb-heap-index-set! p i))
+
+  ;; slot i is conceptually empty: settle p at i or above it
+  (define (@heap-up! i p)
+    (if (fx= i 0)
+        (@heap-place! 0 p)
+        (let* ((pi (fxsrl (fx- i 1) 1))
+               (parent (vector-ref sleep-heap pi)))
+          (if (fx< (pcb-waketime p) (pcb-waketime parent))
+              (begin (@heap-place! i parent) (@heap-up! pi p))
+              (@heap-place! i p)))))
+
+  ;; slot i is conceptually empty: settle p at i or below it
+  (define (@heap-down! i p)
+    (let ((l (fx+ (fxsll i 1) 1)))
+      (if (fx>= l sleep-count)
+          (@heap-place! i p)
+          (let* ((r (fx+ l 1))
+                 (c (if (and (fx< r sleep-count)
+                             (fx< (pcb-waketime (vector-ref sleep-heap r))
+                                  (pcb-waketime (vector-ref sleep-heap l))))
+                        r
+                        l))
+                 (cp (vector-ref sleep-heap c)))
+            (if (fx< (pcb-waketime cp) (pcb-waketime p))
+                (begin (@heap-place! i cp) (@heap-down! c p))
+                (@heap-place! i p))))))
+
+  ;; p is running (in no structure); put it to sleep until waketime
+  (define (@sleep! p waketime)
+    (pcb-waketime-set! p waketime)
+    (pcb-sleeping?-set! p #t)
+    (let ((n (vector-length sleep-heap)))
+      (when (fx= sleep-count n)
+        (let ((v (make-vector (fx* n 2) #f)))
+          (do ((i 0 (fx+ i 1)))
+              ((fx= i n))
+            (vector-set! v i (vector-ref sleep-heap i)))
+          (set! sleep-heap v))))
+    (let ((i sleep-count))
+      (set! sleep-count (fx+ i 1))
+      (@heap-up! i p)))
+
+  ;; Remove a sleeper (waketime reached, message arrived, or killed):
+  ;; the vacated last element is re-settled from p's old slot -- up if
+  ;; it beats the parent there, down otherwise. The caller clears
+  ;; pcb-sleeping?.
+  (define (@sleep-remove! p)
+    (let ((i (pcb-heap-index p))
+          (last (fx- sleep-count 1)))
+      (set! sleep-count last)
+      (let ((moved (vector-ref sleep-heap last)))
+        (vector-set! sleep-heap last #f)
+        (unless (eq? moved p)
+          (if (and (fx> i 0)
+                   (fx< (pcb-waketime moved)
+                        (pcb-waketime
+                          (vector-ref sleep-heap (fxsrl (fx- i 1) 1)))))
+              (@heap-up! i moved)
+              (@heap-down! i moved))))))
+
+  ;; Wake sleeping processes whose time has come. Called only from the
+  ;; event loop, never from @yield: reading the clock costs an FFI call,
+  ;; and paying it per context switch buys nothing -- a woken process
+  ;; joins the TAIL of the run queue either way, and the event-loop
+  ;; process runs once per scheduling round (with uv-poll!'s timeout
+  ;; aimed at the earliest deadline when idle), so waking from here adds
+  ;; at most a fraction of the round the process was already going to
+  ;; wait out.
   (define (@event-check)
-    (unless (queue-empty? sleep-queue)
+    (unless (fx= sleep-count 0)
       (let ((rt (now-ms)))
-        (let wake ((p (q-next sleep-queue)))
-          (when (and (not (eq? sleep-queue p)) (<= (pcb-precedence p) rt))
-            (let ((next (q-next p)))
-              (pcb-sleeping?-set! p #f)
-              (@enqueue p run-queue 0)
-              (wake next)))))))
+        (let wake ()
+          (unless (fx= sleep-count 0)
+            (let ((p (vector-ref sleep-heap 0)))
+              (when (fx<= (pcb-waketime p) rt)
+                (@sleep-remove! p)
+                (pcb-sleeping?-set! p #f)
+                (@run! p)
+                (wake))))))))
 
   ;; ---- context switch -----------------------------------------------------
 
-  (define (yield queue precedence)
-    (@yield queue precedence (disable-interrupts)))
+  (define (yield where waketime)
+    (@yield where waketime (disable-interrupts)))
 
-  (define (@yield-preserving-interrupts queue precedence)
+  (define (@yield-preserving-interrupts where waketime)
     (disable-interrupts)
-    (@yield queue precedence (enable-interrupts))
+    (@yield where waketime (enable-interrupts))
     (disable-interrupts))
 
-  ;; called with interrupts disabled; disable-count is the current count
-  (define (@yield queue precedence disable-count)
-    (@event-check)
+  ;; Called with interrupts disabled; disable-count is the current
+  ;; count. where is 'run (stay runnable), 'sleep (until waketime), or
+  ;; #f (park: blocked in receive, or dead). The running process is
+  ;; never queue-linked -- it was dequeued when it was scheduled -- so
+  ;; the #f case has nothing to remove.
+  (define (@yield where waketime disable-count)
     (when (alive? *self*)
       (pcb-winders-set! *self* (#%$current-winders))
       (pcb-exception-state-set! *self* (current-exception-state)))
@@ -211,8 +305,8 @@
         (when (alive? *self*)
           (pcb-cont-set! *self* k)
           (cond
-            (queue (@enqueue *self* queue precedence))
-            ((enqueued? *self*) (remove-q! *self*))))
+            ((eq? where 'run) (@run! *self*))
+            ((eq? where 'sleep) (@sleep! *self* waketime))))
         ;; context switch
         (when (alive? *self*)
           (pcb-sic-set! *self* disable-count))
@@ -280,21 +374,21 @@
   (define (@make-process cont)
     (set! pid-counter (+ pid-counter 1))
     (let ((p (make-pcb-record #f #f pid-counter cont '() #f (make-queue)
-                              0 #f #f 1 '() '() #f)))
+                              0 #f #f 1 '() '() #f 0)))
       (hashtable-set! process-table pid-counter p)
       p))
 
   (define (spawn thunk)
     (no-interrupts
       (let ((p (@make-process (@thunk->cont thunk))))
-        (@enqueue p run-queue 0)
+        (@run! p)
         p)))
 
   (define (spawn&link thunk)
     (no-interrupts
       (let ((p (@make-process (@thunk->cont thunk))))
         (@link p *self*)
-        (@enqueue p run-queue 0)
+        (@run! p)
         p)))
 
   (define (@link p1 p2)
@@ -353,7 +447,9 @@
     (when (alive? p)
       (when (eq? p event-loop-pid)
         (panic 'event-loop-terminated reason))
-      (when (enqueued? p) (remove-q! p))
+      (cond
+        ((pcb-sleeping? p) (@sleep-remove! p))
+        ((enqueued? p) (remove-q! p)))
       (pcb-cont-set! p #f)
       (pcb-winders-set! p '())
       (pcb-exception-state-set! p #f)
@@ -406,51 +502,57 @@
       (when inbox
         (insert-before! (make-msg m) inbox)
         (cond
-          ((pcb-sleeping? p)
+          ((pcb-sleeping? p)            ; timed receive: cancel the timer
+           (@sleep-remove! p)
            (pcb-sleeping?-set! p #f)
-           (@enqueue p run-queue 0))
+           (@run! p))
           ((eq? p *self*) (void))       ; running; will see it on next scan
           ((enqueued? p) (void))        ; already runnable
-          (else (@enqueue p run-queue 0)))))) ; parked in receive: wake
+          (else (@run! p))))))          ; parked in receive: wake
 
   ;; Core mailbox scan: scan the inbox against the
   ;; matcher; park (or sleep until waketime) when it runs dry; rescan on
   ;; wake; run the timeout handler once waketime has passed.
   (define ($receive matcher waketime timeout-handler)
-    (define (find-prev prev)
-      (let ((m (q-next prev)))
-        (cond
-          ((eq? (pcb-inbox *self*) m)
-           ;; inbox exhausted
-           (cond
-             ((not waketime)
-              (@yield-preserving-interrupts #f 0)
-              (find-prev prev))
-             ((< (now-ms) waketime)
-              (pcb-sleeping?-set! *self* #t)
-              (@yield-preserving-interrupts sleep-queue waketime)
-              (find-prev prev))
-             (else
-              (enable-interrupts)
-              (timeout-handler))))
-          ((not (q-prev m)) (find-prev m))   ; removed meanwhile; step over
-          (else
-           (enable-interrupts)
-           (let ((run (matcher (msg-contents m))))
-             (if run
-                 (begin
-                   (no-interrupts (remove-msg! m))
-                   (run))
-                 (begin
-                   (disable-interrupts)
-                   (find-prev m))))))))
     (disable-interrupts)
-    (find-prev (pcb-inbox *self*)))
+    ;; The inbox sentinel is stable across the parks below (a killed
+    ;; process never resumes), so it is read once instead of per
+    ;; scanned message.
+    (let ((inbox (pcb-inbox *self*)))
+      (let find-prev ((prev inbox))
+        (let ((m (q-next prev)))
+          (cond
+            ((eq? inbox m)
+             ;; inbox exhausted
+             (cond
+               ((not waketime)
+                (@yield-preserving-interrupts #f 0)
+                (find-prev prev))
+               ((fx< (now-ms) waketime)
+                (@yield-preserving-interrupts 'sleep waketime)
+                (find-prev prev))
+               (else
+                (enable-interrupts)
+                (timeout-handler))))
+            ((not (q-prev m)) (find-prev m))   ; removed meanwhile; step over
+            (else
+             (enable-interrupts)
+             (let ((run (matcher (msg-contents m))))
+               (if run
+                   (begin
+                     (no-interrupts (remove-msg! m))
+                     (run))
+                   (begin
+                     (disable-interrupts)
+                     (find-prev m))))))))))
 
   (define (receive-after matcher timeout timeout-handler)
     (cond
       ((and (integer? timeout) (exact? timeout) (>= timeout 0))
-       ($receive matcher (+ (now-ms) timeout) timeout-handler))
+       ;; clamp so waketime is always a fixnum (the queues compare
+       ;; precedences with fx ops); greatest-fixnum ms is ~73M years
+       ($receive matcher (min (+ (now-ms) timeout) (greatest-fixnum))
+                 timeout-handler))
       ((eq? timeout 'infinity)
        ($receive matcher #f #f))
       (else (assertion-violation 'receive "bad after timeout" timeout))))
@@ -533,10 +635,11 @@
   (define (system-sleep-time)
     (cond
       ((not (queue-empty? run-queue)) 0)
-      ((queue-empty? sleep-queue) 60000)   ; safety cap; I/O wakes uv_run
+      ((fx= sleep-count 0) 60000)          ; safety cap; I/O wakes uv_run
       (else
-       (min 60000
-            (max 0 (- (pcb-precedence (q-next sleep-queue)) (now-ms)))))))
+       (fxmin 60000
+              (fxmax 0 (fx- (pcb-waketime (vector-ref sleep-heap 0))
+                            (now-ms)))))))
 
   ;; Runs with interrupts permanently disabled (baseline disable count 1)
   ;; so the preemption timer can never fire inside uv_run or a libuv
@@ -546,7 +649,7 @@
     (let loop ()
       (uv-poll! (system-sleep-time))
       (no-interrupts (@event-check))
-      (yield run-queue 0)
+      (yield 'run 0)
       (loop)))
 
   ;; Boot the world: the calling (OS-level) continuation becomes process
@@ -557,7 +660,7 @@
     (uv-set-deliver! send)
     (set! *self* (@make-process #f))
     (timer-interrupt-handler
-      (lambda () (yield run-queue 0)))
+      (lambda () (yield 'run 0)))
     (set-timer process-default-ticks)
     (set! event-loop-pid (spawn event-loop))
     (let ((boot-pid (spawn boot-thunk)))

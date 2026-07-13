@@ -96,8 +96,12 @@
   (define fs-req-size (uv-req-size UV-FS))
   (define buf-t-size 16)             ; uv_buf_t on arm64: {void* base; size_t len}
 
-  ;; monotonic milliseconds
-  (define (now-ms) (div (uv-hrtime) 1000000))
+  ;; Monotonic milliseconds. uv_hrtime is nanoseconds since an
+  ;; arbitrary epoch (boot); it stays below 2^60 for ~36 years of
+  ;; uptime, so the value is always a fixnum and fxdiv avoids the
+  ;; generic-arithmetic div on this hot path (called per receive
+  ;; timeout and per event-loop pass).
+  (define (now-ms) (fxdiv (uv-hrtime) 1000000))
 
   (define (check who r)
     (if (< r 0)
