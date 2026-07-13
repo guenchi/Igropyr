@@ -99,15 +99,24 @@
 
   ;; ---- global scheduler state ------------------------------------------
 
-  ;; The current pcb lives in Chez virtual register 0 (igropyr claims
-  ;; register 0 process-wide; Chez provides 16, see virtual-register-count).
-  ;; With a constant index the compiler turns (virtual-register 0) into a
-  ;; single load at a fixed thread-context offset -- the fastest mutable
-  ;; global there is, on the hottest path in the system (every send,
-  ;; receive and context switch reads or writes *self*). It also solves
-  ;; what a box solved before: the exported `self` macro expands to a
-  ;; primitive call, so other libraries need no reference to an assigned
-  ;; library variable (forbidden by R6RS) and pay no box indirection.
+  ;; Virtual register allocation (Chez provides 16; see
+  ;; virtual-register-count). igropyr claims register 0 process-wide for
+  ;; the current pcb. Registers 1..15 are RESERVED, not free scratch:
+  ;; a register lives in the thread context, so its real value is being
+  ;; PER-OS-THREAD state, and it should be spent only on that. The one
+  ;; obvious future claimant is an SMP multi-scheduler (N OS threads,
+  ;; one run/sleep queue + uv loop each); those per-thread roots are
+  ;; what registers 1..3 are held for. Do NOT move an ordinary global
+  ;; (run-queue, uv-loop, a counter) into a register for "speed": at
+  ;; optimize-level 2 a library-variable reference already compiles to
+  ;; one load, exactly like a register, so there is no single-threaded
+  ;; win to be had -- only the finite register file to waste. (*self*
+  ;; earned register 0 for three reasons at once, not speed alone: it
+  ;; was a box, so two dependent loads; it is read/written on every
+  ;; send/receive/switch, and a box write also takes a GC write barrier
+  ;; that a register write does not; and the exported `self` needs a
+  ;; cross-library reference that R6RS forbids for an assigned variable.
+  ;; No other global meets that bar.)
   (define-syntax *self*
     (identifier-syntax
       (id (virtual-register 0))
