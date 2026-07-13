@@ -107,13 +107,43 @@
         (unless (equal? m "cross-node-hello") (fail! "dist-pubsub-payload" m))))
     (display "distributed pubsub fan-out ok\n")
 
-    ;; peer exits -> node-down, and rsend turns #f
+    ;; monitor-remote: watch b's 'watched process, kill it, observe the
+    ;; real exit reason cross the wire
+    (monitor-remote 'b 'watched)
+    (rsend 'b 'svc (vector 'kill-watched 'crash-reason))
+    (receive (after 5000 (fail! "remote-down-timeout"))
+      (`#(remote-down b watched ,reason)
+        (unless (eq? reason 'crash-reason) (fail! "remote-down-reason" reason))))
+    (display "monitor-remote -> remote-down with reason ok\n")
+
+    ;; watching a name that isn't registered -> immediate noproc
+    (monitor-remote 'b 'watched)                 ; now dead
+    (receive (after 5000 (fail! "noproc-timeout"))
+      (`#(remote-down b watched ,r) (unless (eq? r 'noproc) (fail! "noproc" r))))
+    (display "monitor-remote missing name -> noproc ok\n")
+
+    ;; demonitor: a demonitored watch must NOT fire when b dies
+    (let ((m (monitor-remote 'b 'svc)))
+      (demonitor-remote m))
+    (receive (after 400 'ok)
+      (`#(remote-down b svc ,_) (fail! "demonitor-still-fired")))
+    (display "demonitor-remote silences the watch ok\n")
+
+    ;; a live watch fires noconnection when the node's link drops
+    (monitor-remote 'b 'svc)
+
+    ;; peer exits -> node-down, remote-down(noconnection), rsend turns #f
     (rsend 'b 'svc (vector 'quit))
-    (receive (after 10000 (fail! "node-down-timeout"))
-      (`#(node-down b) 'ok))
+    (let wait ((down? #f) (noconn? #f))
+      (unless (and down? noconn?)
+        (receive (after 10000 (fail! "node-down-timeout" down? noconn?))
+          (`#(node-down b) (wait #t noconn?))
+          (`#(remote-down b svc ,r)
+            (unless (eq? r 'noconnection) (fail! "noconnection" r))
+            (wait down? #t)))))
     (when (memq 'b (node-peers)) (fail! "peers-still-b"))
     (unless (eq? #f (rsend 'b 'svc 'x)) (fail! "rsend-after-down"))
-    (display "node-down + rsend #f ok\n")
+    (display "node-down + remote-down(noconnection) + rsend #f ok\n")
 
     (display "ALL NODE TESTS PASSED\n")
     (exit 0)))

@@ -45,7 +45,8 @@
 
 (library (igropyr node)
   (export node-start! node-connect! node-disconnect! node-self
-          rsend rcall monitor-node demonitor-node node-peers)
+          rsend rcall monitor-node demonitor-node node-peers
+          monitor-remote demonitor-remote)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sexpr)
           (igropyr gen-server)
           (only (igropyr websocket) sha1))
@@ -79,6 +80,20 @@
   (define rcall-counter 0)
   (define (next-rcall-ref!)
     (atomically (set! rcall-counter (+ rcall-counter 1)) rcall-counter))
+
+  ;; cross-node process monitors. On the WATCHER node:
+  ;;   rmonitors: mref -> #(caller node name)   (for demonitor + the
+  ;;              noconnection synthesized when the link to node drops)
+  ;;   caller-agents: mref -> agent pid         (self-watch only)
+  ;; On the TARGET node:
+  ;;   callee-agents: mref -> agent pid         (one local monitor per
+  ;;              remote watch; killed on demon)
+  (define rmonitors (make-eqv-hashtable))
+  (define caller-agents (make-eqv-hashtable))
+  (define callee-agents (make-eqv-hashtable))
+  (define mref-counter 0)
+  (define (next-mref!)
+    (atomically (set! mref-counter (+ mref-counter 1)) mref-counter))
 
   (define-syntax atomically
     (syntax-rules ()
@@ -266,7 +281,9 @@
                (and e (eq? (vector-ref e 0) c)
                     (begin (hashtable-delete! peers name) #t))))))
       (tcp-close! c)
-      (when mine? (notify! name 'node-down))))
+      (when mine?
+        (fail-monitors-for! name)          ; DOWN(noconnection) for watchers
+        (notify! name 'node-down))))
 
   ;; ---- the link: one process per live connection ---------------------------
 
@@ -287,6 +304,18 @@
        (let ((ref (cadr d)) (result (caddr d)))
          (let ((caller (atomically (hashtable-ref pending ref #f))))
            (when caller (send caller (vector 'rcall-reply ref result))))))
+      ;; (mon ,name ,mref ,origin) -> watch our local reg-name for origin
+      ((and (frame? d 'mon 4) (symbol? (cadr d)) (symbol? (cadddr d)))
+       (let ((name (cadr d)) (mref (caddr d)) (origin (cadddr d)))
+         (spawn (lambda () (mon-agent origin mref name)))))
+      ;; (mdown ,mref ,reason) -> the watched process/link is gone
+      ((frame? d 'mdown 3)
+       (let ((mref (cadr d)) (reason (caddr d)))
+         (fire-remote-down! mref reason)))
+      ;; (demon ,mref) -> stop a monitor we host
+      ((frame? d 'demon 2)
+       (let ((agent (atomically (hashtable-ref callee-agents (cadr d) #f))))
+         (when agent (send agent (vector 'demon-local)))))
       ((equal? d '(ping)) (write-frame! c '(pong)))
       ((equal? d '(pong)) (void))
       (else (raise 'protocol))))                ; confused peer: drop it
@@ -317,6 +346,67 @@
   (define (link-write peer datum)
     (let ((e (live-entry peer)))
       (and e (begin (write-frame! (vector-ref e 0) datum) #t))))
+
+  ;; ---- cross-node process monitor ----------------------------------------
+
+  ;; target side: one process per remote watch. It locally monitors the
+  ;; registered process and reports its death back over the link. A
+  ;; missing name is an immediate 'noproc. The reason is shipped as-is
+  ;; when wire-safe, else degraded to 'exit -- a monitor must always
+  ;; deliver a DOWN, never wedge on a non-serializable reason.
+  (define (mon-agent origin mref name)
+    (let ((p (whereis name)))
+      (if (not p)
+          (link-write origin (list 'mdown mref 'noproc))
+          (let ((m (monitor p)))
+            (atomically (hashtable-set! callee-agents mref self))
+            (receive
+              (`#(DOWN ,@p ,reason)
+                (atomically (hashtable-delete! callee-agents mref))
+                (guard (e (#t (link-write origin (list 'mdown mref 'exit))))
+                  (link-write origin (list 'mdown mref reason))))
+              (`#(demon-local)
+                (demonitor m)
+                (atomically (hashtable-delete! callee-agents mref))))))))
+
+  ;; watcher side: deliver #(remote-down node name reason) to the caller
+  ;; that installed mref, once. Used for both a target-side mdown and a
+  ;; link drop (which synthesizes 'noconnection).
+  (define (fire-remote-down! mref reason)
+    (let ((entry (atomically
+                   (let ((e (hashtable-ref rmonitors mref #f)))
+                     (when e (hashtable-delete! rmonitors mref))
+                     e))))
+      (when entry
+        (send (vector-ref entry 0)
+              (vector 'remote-down (vector-ref entry 1) (vector-ref entry 2)
+                      reason)))))
+
+  ;; self-watch agent: same contract, but the target is local, so the
+  ;; DOWN is delivered straight to the caller (no link involved).
+  (define (self-mon-agent caller mref name)
+    (let ((p (whereis name)))
+      (if (not p)
+          (fire-remote-down! mref 'noproc)
+          (let ((m (monitor p)))
+            (receive
+              (`#(DOWN ,@p ,reason)
+                (atomically (hashtable-delete! caller-agents mref))
+                (fire-remote-down! mref reason))
+              (`#(demon-local)
+                (demonitor m)
+                (atomically (hashtable-delete! caller-agents mref))))))))
+
+  ;; every rmonitor watching a node whose link just dropped gets a
+  ;; synthesized noconnection (the target may be alive or dead -- across
+  ;; a broken link they're indistinguishable, as in Erlang)
+  (define (fail-monitors-for! node)
+    (let-values (((mrefs entries) (atomically (hashtable-entries rmonitors))))
+      (vector-for-each
+        (lambda (mref e)
+          (when (eq? (vector-ref e 1) node)
+            (fire-remote-down! mref 'noconnection)))
+        mrefs entries)))
 
   (define (link-loop c peer buf last-seen)
     (let drain ((buf buf))
@@ -488,4 +578,53 @@
                         (cadr result)
                         (raise (vector 'rcall-error (cadr result) reg-name))))))))
         (else (raise (vector 'rcall-error 'noconnection node))))))
+
+  ;; Watch the process registered as name on node. The caller later
+  ;; receives exactly one #(remote-down ,node ,name ,reason):
+  ;;   - reason = the target's exit reason when it dies
+  ;;   - 'noproc       if no such name is registered when the watch is
+  ;;                   established (which is asynchronous, so a target
+  ;;                   that dies in that window also reports noproc --
+  ;;                   monitor before the event that can kill it)
+  ;;   - 'noconnection if the link to node drops first (the target may
+  ;;                   be alive or dead -- indistinguishable across a
+  ;;                   broken link, as in Erlang)
+  ;; Returns a monitor ref for demonitor-remote. The own node name is a
+  ;; local watch (still reported as remote-down, for a uniform API).
+  ;; This is process-level; monitor-node is the node-level counterpart.
+  (define (monitor-remote node name)
+    (unless self-name
+      (assertion-violation 'monitor-remote "call node-start! first" node))
+    (let ((mref (next-mref!)))
+      (cond
+        ((eq? node self-name)
+         (atomically (hashtable-set! rmonitors mref (vector self node name)))
+         (let ((agent (spawn (lambda () (self-mon-agent self mref name)))))
+           (atomically (hashtable-set! caller-agents mref agent))))
+        ((live-entry node)
+         => (lambda (e)
+              (atomically (hashtable-set! rmonitors mref (vector self node name)))
+              (write-frame! (vector-ref e 0) (list 'mon name mref self-name))))
+        (else
+         ;; no link at all: report immediately, nothing to install
+         (send self (vector 'remote-down node name 'noconnection))))
+      mref))
+
+  ;; Cancel a monitor-remote. No further remote-down for it will arrive
+  ;; (a DOWN already in flight may still be delivered, as in Erlang).
+  (define (demonitor-remote mref)
+    (let ((entry (atomically
+                   (let ((e (hashtable-ref rmonitors mref #f)))
+                     (when e (hashtable-delete! rmonitors mref))
+                     e))))
+      (when entry
+        (let ((node (vector-ref entry 1)))
+          (if (eq? node self-name)
+              (let ((agent (atomically
+                             (let ((a (hashtable-ref caller-agents mref #f)))
+                               (hashtable-delete! caller-agents mref) a))))
+                (when (and agent (process-alive? agent))
+                  (send agent (vector 'demon-local))))
+              (link-write node (list 'demon mref))))))
+    (void))
 )

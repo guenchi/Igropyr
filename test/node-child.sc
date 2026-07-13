@@ -42,10 +42,20 @@
                (receive (`#(pub room ,m)
                           (rsend 'a 'main (vector 'heard m)) (loop))))))
 
+    ;; a process node a can monitor-remote; #(mon-die ,reason) makes it
+    ;; exit with that reason so the watcher observes it
+    (register 'watched
+      (spawn (lambda ()
+               (let loop ()
+                 (receive (`#(mon-die ,reason) (kill self reason)))))))
+
     (spawn (lambda () (sleep-ms 30000) (exit 1)))   ; safety net
     (let loop ()
       (receive
         (`#(add1 ,x ,payload)
           (rsend 'a 'main (vector 'ans (+ x 1) payload))
+          (loop))
+        (`#(kill-watched ,reason)
+          (let ((p (whereis 'watched))) (when p (kill p reason)))
           (loop))
         (`#(quit) (exit 0))))))
