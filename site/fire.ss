@@ -365,15 +365,20 @@
 ;; ---- the frame loop: fire front grows, wraps seamlessly ----
 (define CYCLE 8.5)
 (define TRAVEL (fl+ maxd 380.0))
+;; the burn pace, in front-seconds per real second.  The old
+;; fixed-step-per-frame advance tied the pace to the frame rate, so
+;; every performance improvement sped the fire up; this holds it
+;; still whatever the display or the frame cost does.  1.4 is the
+;; pace as tuned; raise or lower to taste
+(define PACE 1.4)
 (define bufs (cons emb-a emb-b))
 (define tw 0.0)
 (fx-loop!
  (lambda (t dt)
    (let ((dtc (if (fl<? dt 0.05) dt 0.05)))
-     ;; the front advances a fixed step per frame, exactly like the
-     ;; original fire -- the burn pace is the one you remember; only
-     ;; the ember physics runs on real dt
-     (set! tw (fl+ tw 0.016))
+     ;; the front advances on real time, PACE-scaled; the ember
+     ;; physics keeps its own real dt
+     (set! tw (fl+ tw (fl* dtc PACE)))
      (when (fl<? CYCLE tw) (set! tw (fl- tw CYCLE)))
      (let ((front (fl* (fl/ tw CYCLE) TRAVEL)))
        ;; embers step on the GPU: front buffer in, back buffer out
