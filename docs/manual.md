@@ -22,7 +22,10 @@ This manual covers the architecture, design patterns, and implementation details
 16. [Async File Reads](#async-file-reads)
 17. [JSON and gzip](#json-and-gzip)
 18. [S-Expression RPC](#s-expression-rpc)
-19. [Distribution: Node Links](#distribution-node-links)
+19. [Distribution](#distribution)
+    - [Node links, rsend / rcall, monitors](#distribution)
+    - [Automatic discovery (static, Redis)](#automatic-discovery)
+    - [Distributed task pool](#distributed-task-pool)
 20. [Running and Building](#running-and-building)
 21. [Testing](#testing)
 22. [Code Style](#code-style)
@@ -2058,7 +2061,7 @@ can never become code.
 
 ---
 
-## Distribution: Node Links
+## Distribution
 
 `(igropyr node)` connects igropyr instances — other cores on the same
 machine via loopback, or other machines over the network — into a mesh
