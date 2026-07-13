@@ -1,4 +1,4 @@
-// Run the self-hosted schwasm compiler (a wasm module): feed it the
+// Run the self-hosted goeteia compiler (a wasm module): feed it the
 // prelude plus a source file (with imports resolved), collect the
 // wasm bytes it emits.
 // Copyright (c) 2026 guenchi. MIT license; see LICENSE.
@@ -87,10 +87,22 @@ function libraryImports(text) {
     return [];
 }
 
-function resolveImports(text, dirs, visited = new Set()) {
+// a (%loc "file" line) marker: the compiler maps stream lines back
+// to source lines with these, so errors can say file:line
+function locMark(file, line) {
+    return `\n(%loc ${JSON.stringify(file)} ${line})\n`;
+}
+function lineAt(text, idx) {
+    let n = 1;
+    for (let i = 0; i < idx && i < text.length; i++)
+        if (text[i] === '\n') n++;
+    return n;
+}
+
+function resolveImports(text, dirs, visited = new Set(), file = 'input') {
     // replace top-level (import ...) spans with the inlined
     // libraries; every other byte passes through untouched
-    let result = '';
+    let result = locMark(file, 1);
     let at = 0;
     for (const [start, end] of topLevelSpans(text)) {
         const form = text.slice(start, end);
@@ -100,6 +112,7 @@ function resolveImports(text, dirs, visited = new Set()) {
                 .map(spec => loadLibrary(specTarget(spec), dirs, visited)
                              + '\n' + specAliases(spec))
                 .join('\n');
+            result += locMark(file, lineAt(text, end));
             at = end;
         }
     }
@@ -107,8 +120,8 @@ function resolveImports(text, dirs, visited = new Set()) {
 }
 
 function loadLibrary(spec, dirs, visited) {
-    // (rnrs ...) and (schwasm ...) come from the prelude
-    if (spec[0] === 'rnrs' || spec[0] === 'schwasm') return '';
+    // (rnrs ...) and (goeteia ...) come from the prelude
+    if (spec[0] === 'rnrs' || spec[0] === 'goeteia') return '';
     const key = spec.join('/');
     if (visited.has(key)) return '';
     visited.add(key);
@@ -117,26 +130,20 @@ function loadLibrary(spec, dirs, visited) {
         if (fs.existsSync(p)) {
             const text = fs.readFileSync(p, 'latin1');
             const deps = libraryImports(text)
-                .map(s => loadLibrary(s, dirs, visited))
+                .map(s => loadLibrary(specTarget(s), dirs, visited)
+                          + '\n' + specAliases(s))
                 .join('\n');
-            return deps + '\n' + text;
+            return deps + locMark(p, 1) + text;
         }
     }
     throw new Error(`library not found: (${spec.join(' ')})`);
 }
 
-async function main() {
-    const [compilerWasm, sourceFile, outFile] = process.argv.slice(2);
-    if (!outFile) {
-        console.error('usage: node compile.mjs <compiler.wasm> <input.ss> <output.wasm>');
-        process.exit(1);
-    }
-    const inDir = path.dirname(path.resolve(sourceFile));
-    const dirs = [inDir, path.join(inDir, 'lib'), path.join(here, '../lib')];
-    const prelude = fs.readFileSync(path.join(here, '../src/prelude.ss'), 'latin1');
-    const source = resolveImports(fs.readFileSync(sourceFile, 'latin1'), dirs);
-    const input = Buffer.from(prelude + '\n' + source, 'latin1');
+// the bundled self-hosted compiler, shipped at the package root
+const defaultCompiler = path.join(here, '../goeteia.wasm');
 
+// feed a prelude+source stream to the compiler, collect wasm bytes
+async function runCompiler(input, compilerWasm) {
     const out = [];
     let pos = 0;
     const { instance } = await WebAssembly.instantiate(
@@ -155,11 +162,67 @@ async function main() {
         instance.exports.main();
     } catch (e) {
         // compile errors print through the output channel before trapping
-        process.stderr.write(Buffer.from(out).toString('latin1'));
-        console.error(`\ncompile failed: ${e.message}`);
-        process.exit(1);
+        const err = new Error(`compile failed: ${e.message}`);
+        err.output = Buffer.from(out).toString('latin1');
+        throw err;
     }
-    fs.writeFileSync(outFile, Buffer.from(out));
+    return Buffer.from(out);
 }
 
-main();
+// Compile a source file to wasm bytes.  Resolves (import ...) forms
+// against the source directory, its lib/, and the bundled lib/, then
+// prepends the prelude and feeds the whole stream to the compiler.
+export async function compileToBytes(sourceFile, { compilerWasm = defaultCompiler } = {}) {
+    const inDir = path.dirname(path.resolve(sourceFile));
+    const dirs = [inDir, path.join(inDir, 'lib'), path.join(here, '../lib')];
+    const preludePath = path.join(here, '../src/prelude.ss');
+    const prelude = fs.readFileSync(preludePath, 'latin1');
+    const source = resolveImports(fs.readFileSync(sourceFile, 'latin1'),
+                                  dirs, new Set(), sourceFile);
+    const input = Buffer.from(locMark(preludePath, 1) + prelude
+                              + '\n' + source, 'latin1');
+    return runCompiler(input, compilerWasm);
+}
+
+// Compile source text (a REPL session, a playground snippet): imports
+// resolve against baseDir, its lib/, and the bundled lib/.
+export async function compileSource(text,
+    { baseDir = process.cwd(), compilerWasm = defaultCompiler,
+      name = 'repl' } = {}) {
+    const dirs = [baseDir, path.join(baseDir, 'lib'), path.join(here, '../lib')];
+    const preludePath = path.join(here, '../src/prelude.ss');
+    const prelude = fs.readFileSync(preludePath, 'latin1');
+    // utf-8 text to one-byte-per-char, matching the byte reader
+    const raw = Buffer.from(text, 'utf8').toString('latin1');
+    const source = resolveImports(raw, dirs, new Set(), name);
+    const input = Buffer.from(locMark(preludePath, 1) + prelude
+                              + '\n' + source, 'latin1');
+    return runCompiler(input, compilerWasm);
+}
+
+// Compile a source file straight to an output file.
+export async function compileFile(sourceFile, outFile, opts = {}) {
+    fs.writeFileSync(outFile, await compileToBytes(sourceFile, opts));
+}
+
+async function main() {
+    const args = process.argv.slice(2);
+    // legacy form: compile.mjs <compiler.wasm> <input.ss> <output.wasm>
+    // new form:    compile.mjs <input.ss> <output.wasm>  (bundled compiler)
+    let compilerWasm, sourceFile, outFile;
+    if (args.length >= 3) [compilerWasm, sourceFile, outFile] = args;
+    else [sourceFile, outFile] = args;
+    if (!sourceFile || !outFile) {
+        console.error('usage: node compile.mjs [<compiler.wasm>] <input.ss> <output.wasm>');
+        process.exit(1);
+    }
+    try {
+        await compileFile(sourceFile, outFile, compilerWasm ? { compilerWasm } : {});
+    } catch (e) {
+        if (e.output) process.stderr.write(e.output);
+        console.error(`\n${e.message}`);
+        process.exit(1);
+    }
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) main();

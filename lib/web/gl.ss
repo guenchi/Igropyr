@@ -31,9 +31,11 @@
 (library (web gl)
   (export gl-attach! gl-program! gl-buffer! gl-uniform!
           gl-texture! gl-texture-upload! gl-texture-data! gl-cubemap!
+          gl-cubemap-empty! gl-cube-face-fb! gl-slot-object!
           gl-target! gl-target-hdr! gl-target-msaa! gl-cube-target!
+          gl-target-mrt!
           cmd-bind-target! cmd-bind-canvas! cmd-resolve!
-          cmd-region! cmd-begin! cmd-flush! cmd-pos
+          cmd-region! cmd-begin! cmd-flush! cmd-pos cmd-draws
           cmd-clear! cmd-use-program! cmd-bind-buffer! cmd-buffer-data!
           cmd-vertex-attrib! cmd-uniform1f! cmd-uniform4f!
           cmd-uniform1i! cmd-uniform2f! cmd-uniform3f! cmd-uniform-matrix4!
@@ -44,6 +46,7 @@
           gl-ubo! gl-uniform-block! cmd-bind-ubo! cmd-ubo-data!
           gl-tf-program! cmd-tf-buffer! cmd-tf-begin! cmd-tf-end!
           cmd-bind-index! cmd-index-data! cmd-draw-elements!
+          cmd-index-data32! cmd-draw-elements32!
           cmd-attrib-divisor! cmd-draw-elements-instanced!
           cmd-uniform-matrices!
           cmd-draw-arrays! cmd-viewport! cmd-blend!
@@ -135,6 +138,57 @@
      "      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT,"
      "                                 gl.RENDERBUFFER, rb);"
      "    }"
+     "    gl.bindFramebuffer(gl.FRAMEBUFFER, null);"
+     "    slots[slot] = fb; },"
+     "  targetMrt(slot, tslot0, n, w, h) {"
+     "    const fb = gl.createFramebuffer();"
+     "    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);"
+     "    const bufs = [];"
+     "    for (let i = 0; i < n; i++) {"
+     "      const t = gl.createTexture();"
+     "      gl.bindTexture(gl.TEXTURE_2D, t);"
+     "      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0,"
+     "                    gl.RGBA, gl.HALF_FLOAT, null);"
+     "      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);"
+     "      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);"
+     "      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);"
+     "      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);"
+     "      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i,"
+     "                              gl.TEXTURE_2D, t, 0);"
+     "      bufs.push(gl.COLOR_ATTACHMENT0 + i);"
+     "      slots[tslot0 + i] = t;"
+     "    }"
+     "    const rb = gl.createRenderbuffer();"
+     "    gl.bindRenderbuffer(gl.RENDERBUFFER, rb);"
+     "    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);"
+     "    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT,"
+     "                               gl.RENDERBUFFER, rb);"
+     "    gl.drawBuffers(bufs);"
+     "    gl.bindFramebuffer(gl.FRAMEBUFFER, null);"
+     "    slots[slot] = fb; },"
+     "  slotObject(slot, obj) { slots[slot] = obj; },"
+     "  cubemapEmpty(slot, dim, levels) {"
+     "    const t = gl.createTexture();"
+     "    gl.bindTexture(gl.TEXTURE_CUBE_MAP, t);"
+     "    for (let l = 0; l < levels; l++)"
+     "      for (let i = 0; i < 6; i++)"
+     "        gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X + i, l, gl.RGBA,"
+     "                      dim >> l, dim >> l, 0, gl.RGBA,"
+     "                      gl.UNSIGNED_BYTE, null);"
+     "    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAX_LEVEL,"
+     "                     levels - 1);"
+     "    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER,"
+     "                     gl.LINEAR_MIPMAP_LINEAR);"
+     "    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);"
+     "    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);"
+     "    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);"
+     "    slots[slot] = t; },"
+     "  cubeFaceFb(slot, tslot, face, level) {"
+     "    const fb = gl.createFramebuffer();"
+     "    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);"
+     "    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,"
+     "                            gl.TEXTURE_CUBE_MAP_POSITIVE_X + face,"
+     "                            slots[tslot], level);"
      "    gl.bindFramebuffer(gl.FRAMEBUFFER, null);"
      "    slots[slot] = fb; },"
      "  cubeTarget(slot, tslot, dim) {"
@@ -302,6 +356,13 @@
      "     case 30: gl.activeTexture(gl.TEXTURE0 + u[p]);"
      "              gl.bindTexture(gl.TEXTURE_2D, null);"
      "              p += 1; break;"
+     "     case 36: gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,"
+     "               new Uint32Array(memory.buffer, u[p], u[p+1] >> 2),"
+     "               gl.DYNAMIC_DRAW); p += 2; break;"
+     "     case 37: { const m = u[p] === 0 ? gl.POINTS : u[p] === 1 ? gl.LINES"
+     "                : u[p] === 5 ? gl.TRIANGLE_STRIP : gl.TRIANGLES;"
+     "                gl.drawElements(m, u[p+1], gl.UNSIGNED_INT, 0);"
+     "                p += 2; break; }"
      "     case 31: gl.bindBufferBase(gl.UNIFORM_BUFFER, u[p],"
      "                                slots[u[p+1]]); p += 2; break;"
      "     case 33: gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0,"
@@ -359,6 +420,14 @@
   ;; a half-float target (RGBA16F): light in real HDR, tonemap later
   (define (gl-target-hdr! slot tslot w h)
     (js-method $gl "target" slot tslot w h 2))
+  ;; a multi render target (webgl2 drawBuffers): one framebuffer in
+  ;; `slot` with n half-float color attachments in slots tslot0..
+  ;; tslot0+n-1 plus a depth renderbuffer -- a shader with (out ...)
+  ;; forms writes them all in one pass.  Filters are NEAREST: a
+  ;; G-buffer is read back pixel for pixel, and half-float LINEAR
+  ;; would need one more extension for nothing
+  (define (gl-target-mrt! slot tslot0 n w h)
+    (js-method $gl "targetMrt" slot tslot0 n w h))
   ;; six half-float faces around a point: slots slot..slot+5 become
   ;; framebuffers (one per face, sharing a depth renderbuffer) and
   ;; tslot the cube map they render into -- point-light shadows
@@ -394,12 +463,25 @@
   ;; base, in +x -x +y -y +z -z order
   (define (gl-cubemap! slot base dim)
     (js-method $gl "cubemap" slot base dim))
+  ;; an empty cube map with an explicit mip chain, and a framebuffer
+  ;; aimed at one face of one level -- the plumbing (web ibl) uses to
+  ;; bake prefiltered environments
+  (define (gl-cubemap-empty! slot dim levels)
+    (js-method $gl "cubemapEmpty" slot dim levels))
+  (define (gl-cube-face-fb! slot tslot face level)
+    (js-method $gl "cubeFaceFb" slot tslot face level))
+  ;; park a host-owned GL object (say, an XRWebGLLayer's
+  ;; framebuffer) in the slot table, so commands can bind it
+  (define (gl-slot-object! slot obj)
+    (js-method $gl "slotObject" slot obj))
 
   ;; ---- the encoder: words into the staging memory ----
   (define $base 0)
   (define $p 0)
+  (define $draw-count 0)                ; draws encoded this frame
   (define (cmd-region! base) (set! $base base))
-  (define (cmd-begin!) (set! $p $base))
+  (define (cmd-begin!) (set! $p $base) (set! $draw-count 0))
+  (define ($draw!) (set! $draw-count (+ $draw-count 1)))
   (define (u! v) (%mem-i32-set! $p v) (set! $p (+ $p 4)))
   (define (f! v) (%mem-f32-set! $p v) (set! $p (+ $p 4)))
 
@@ -413,7 +495,7 @@
   (define (cmd-uniform4f! slot x y z w)
     (u! 7) (u! slot) (f! x) (f! y) (f! z) (f! w))
   (define (cmd-draw-arrays! mode first count)
-    (u! 8) (u! mode) (u! first) (u! count))
+    ($draw!) (u! 8) (u! mode) (u! first) (u! count))
   (define (cmd-bind-texture! unit slot) (u! 11) (u! unit) (u! slot))
   (define (cmd-bind-cubemap! unit slot) (u! 25) (u! unit) (u! slot))
   ;; unbind before rendering into a cube target's faces: a cube map
@@ -449,8 +531,13 @@
   ;; indexed meshes: a buffer slot bound as the element array, u16
   ;; indices uploaded from the staging memory, one drawElements
   (define (cmd-bind-index! slot) (u! 16) (u! slot))
+  ;; 32-bit indices (webgl2): meshes past 65536 vertices
+  (define (cmd-index-data32! base bytes) (u! 36) (u! base) (u! bytes))
+  (define (cmd-draw-elements32! mode count)
+    ($draw!) (u! 37) (u! mode) (u! count))
   (define (cmd-index-data! offset bytes) (u! 17) (u! offset) (u! bytes))
-  (define (cmd-draw-elements! mode count) (u! 18) (u! mode) (u! count))
+  (define (cmd-draw-elements! mode count)
+    ($draw!) (u! 18) (u! mode) (u! count))
   ;; render into an offscreen target, or back to the canvas
   (define (cmd-bind-target! slot) (u! 20) (u! slot))
   (define (cmd-resolve! slot rslot w h)  ; blit msaa -> its resolve fb
@@ -460,7 +547,7 @@
   ;; instance; one draw carries them all
   (define (cmd-attrib-divisor! loc div) (u! 22) (u! loc) (u! div))
   (define (cmd-draw-elements-instanced! mode count n)
-    (u! 23) (u! mode) (u! count) (u! n))
+    ($draw!) (u! 23) (u! mode) (u! count) (u! n))
   ;; ms: a vector of m4s (16-element flonum vectors) -- one upload
   ;; carries a whole skeleton's joint matrices
   (define (cmd-uniform-matrices! slot ms)
@@ -474,6 +561,7 @@
               (mat (+ i 1)))))
         (each (+ k 1)))))
   (define (cmd-pos) $p)                 ; for overflow checks by callers
+  (define (cmd-draws) $draw-count)      ; and HUDs counting the frame
   (define (cmd-viewport! x y w h) (u! 9) (u! x) (u! y) (u! w) (u! h))
   ;; blending for translucent draws: (cmd-blend! 'alpha) src-over,
   ;; (cmd-blend! 'add) additive glow, (cmd-blend! 'premul) src-over

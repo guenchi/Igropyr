@@ -31,6 +31,7 @@
   (export fx-init! fx-slot! fx-alloc! fx-buffer! fx-texture!
           fx-width fx-height
           fx-target! fx-target-hdr! fx-target-msaa! fx-resolve!
+          fx-target-mrt! fx-mrt-texture
           fx-cube-target! fx-bind-cube-face!
           fx-target? fx-target-texture
           fx-target-width fx-target-height
@@ -39,12 +40,12 @@
           fx-program? fx-program-slot fx-program-stride
           fx-program-istride
           fx-use! fx-use-instanced! fx-uniform!
-          fx-ticks! fx-loop!
+          fx-ticks! fx-loop! fx-loop-fixed!
           fx-init-input! key-down? pointer-x pointer-y pointer-down?
           pointer-lock! pointer-locked? pointer-motion!
           fx-fullscreen! fx-quad-program
           fx-fullscreen-use! fx-fullscreen-draw!)
-  (import (rnrs) (web js) (web gl) (web glsl))
+  (import (rnrs) (web js) (web gl) (web glsl) (web mat))
 
   (define ($fx-fl v) (if (flonum? v) v (exact->inexact v)))
 
@@ -58,11 +59,17 @@
     (let ((g (js-get (js-global) "__goeteia_fx_gen")))
       (if (js-truthy? g) (js->number g) 0)))
 
+  ;; the VAO cache: (program, buffer, instance buffer) -> vao slot
+  (define $fx-vaos (make-eq-hashtable))
+
   (define (fx-init! canvas)
     (set! $fx-canvas canvas)
     (gl-attach! canvas)
     (set! $fx-slot 0)
     (set! $fx-heap $fx-cmd-limit)
+    (set! $fx-vaos (make-eq-hashtable))
+    ;; 128 bytes of scratch turn every m4-mul into wasm SIMD
+    (m4-scratch! (fx-alloc! 128))
     ;; a fresh init retires loops from any earlier run of the page
     ;; (live editors re-run whole programs; fx-ticks! checks this)
     (js-set! (js-global) "__goeteia_fx_gen" (+ 1 ($fx-gen)))
@@ -109,6 +116,19 @@
            (tex (fx-slot!)))
       (gl-target-hdr! fb tex w h)
       ($make-fx-target fb tex w h #f)))
+
+  ;; a multi render target: n half-float attachments behind one
+  ;; framebuffer -- the G-buffer of deferred shading.  A fragment
+  ;; shader with (out 0 ...) (out 1 ...) forms (fx-program3!) fills
+  ;; every attachment in one pass; (fx-mrt-texture t i) is the
+  ;; texture that caught output i
+  (define (fx-target-mrt! n w h)
+    (let* ((fb (fx-slot!))
+           (t0 (fx-slot!)))
+      (let eat ((k 1)) (when (< k n) (fx-slot!) (eat (+ k 1))))
+      (gl-target-mrt! fb t0 n w h)
+      ($make-fx-target fb t0 w h #f)))
+  (define (fx-mrt-texture t i) (+ (fx-target-texture t) i))
 
   ;; a cube target: six faces around a point.  Bind face i, render
   ;; the world as the light sees it, then sample the texture with a
@@ -228,27 +248,54 @@
                     (loop (cdr as) (+ loc 1) (+ voff (* 4 size)) ioff
                           (cons (list loc size voff) vacc) iacc))))))))
 
-  ;; use-program, bind the buffer, then the attribs: the pointer
-  ;; captures the buffer bound at that moment
+  ;; use-program, then the attributes -- through a vertex array
+  ;; object: the first use of a (program, buffer[, instance buffer])
+  ;; trio binds the buffer and records every pointer into a fresh
+  ;; VAO; each later use rebinds the VAO in one word.  The array
+  ;; buffer is still bound every time because VAOs do not capture
+  ;; that binding, and dynamic streams upload right after fx-use!.
+  ;; The index binding IS VAO state: a caller's cmd-bind-index!
+  ;; lands in the open VAO and is restored with it.
+  ;; Keys pack three slot numbers into one fixnum, so slots must
+  ;; stay under 1024 -- far past any real scene
+  (define ($fx-vao-key pslot buf inst)
+    (+ (* pslot 1048576) (* buf 1024) (+ inst 1)))
+
   (define (fx-use! prog buf-slot)
-    (cmd-use-program! (fx-program-slot prog))
-    (cmd-bind-buffer! buf-slot)
-    (for-each (lambda (a)
-                (cmd-vertex-attrib! (car a) (cadr a)
-                                    (fx-program-stride prog) (caddr a)))
-              ($fx-program-attribs prog)))
+    ($fx-use-vao! prog buf-slot -1))
 
   ;; the instanced variant: vertex attributes from one buffer,
   ;; i_* attributes from another with divisor 1 (webgl2); draw with
   ;; cmd-draw-elements-instanced!
   (define (fx-use-instanced! prog buf-slot inst-slot)
-    (fx-use! prog buf-slot)
-    (cmd-bind-buffer! inst-slot)
-    (for-each (lambda (a)
-                (cmd-vertex-attrib! (car a) (cadr a)
-                                    (fx-program-istride prog) (caddr a))
-                (cmd-attrib-divisor! (car a) 1))
-              ($fx-program-iattribs prog)))
+    ($fx-use-vao! prog buf-slot inst-slot))
+
+  (define ($fx-use-vao! prog buf-slot inst-slot)
+    (cmd-use-program! (fx-program-slot prog))
+    (let* ((key ($fx-vao-key (fx-program-slot prog) buf-slot inst-slot))
+           (vao (hashtable-ref $fx-vaos key #f)))
+      (if vao
+          (begin
+            (cmd-bind-vao! vao)
+            (cmd-bind-buffer! buf-slot))
+          (let ((v (fx-slot!)))
+            (gl-vao! v)
+            (hashtable-set! $fx-vaos key v)
+            (cmd-bind-vao! v)
+            (cmd-bind-buffer! buf-slot)
+            (for-each (lambda (a)
+                        (cmd-vertex-attrib! (car a) (cadr a)
+                                            (fx-program-stride prog)
+                                            (caddr a)))
+                      ($fx-program-attribs prog))
+            (when (>= inst-slot 0)
+              (cmd-bind-buffer! inst-slot)
+              (for-each (lambda (a)
+                          (cmd-vertex-attrib! (car a) (cadr a)
+                                              (fx-program-istride prog)
+                                              (caddr a))
+                          (cmd-attrib-divisor! (car a) 1))
+                        ($fx-program-iattribs prog)))))))
 
   ;; dispatch on the declared type; sampler values are texture units
   (define (fx-uniform! prog name . vs)
@@ -298,6 +345,31 @@
        (when (> (cmd-pos) $fx-cmd-limit)
          (error 'fx-loop! "command region overflow" (cmd-pos)))
        (cmd-flush!))))
+
+  ;; the fixed-timestep variant: physics that must not depend on the
+  ;; frame rate.  sim runs zero or more times per frame, always with
+  ;; exactly `step` seconds; render runs once with alpha = how far
+  ;; into the next step the frame landed (blend previous/current
+  ;; states by it for perfectly smooth motion).  The accumulator is
+  ;; clamped to 4 steps so a background tab does not spiral
+  (define (fx-loop-fixed! step sim render)
+    (let ((acc 0.0)
+          (cap (fl* ($fx-fl step) 4.0)))
+      (fx-ticks!
+       (lambda (t dt)
+         (set! acc (fl+ acc dt))
+         (when (fl<? cap acc) (set! acc cap))
+         (let pump ()
+           (when (fl<? ($fx-fl step) acc)
+             (set! acc (fl- acc ($fx-fl step)))
+             (sim ($fx-fl step))
+             (pump)))
+         (cmd-begin!)
+         (cmd-viewport! 0 0 (fx-width) (fx-height))
+         (render (fl/ acc ($fx-fl step)) t dt)
+         (when (> (cmd-pos) $fx-cmd-limit)
+           (error 'fx-loop-fixed! "command region overflow" (cmd-pos)))
+         (cmd-flush!)))))
 
   ;; ---- polled input ----
   (define $fx-keys (make-hashtable string-hash string=?))

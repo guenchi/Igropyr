@@ -15,6 +15,7 @@ const SOURCES = [
     'lib/web/dom.ss',
     'lib/web/glsl.ss',
     'lib/web/gl.ss',
+    'lib/web/mat.ss',
     'lib/web/fx.ss',
     'site/hive-data.ss',
     'site/fire.ss',

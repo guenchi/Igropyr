@@ -15,6 +15,9 @@
 ;; Top-level forms:
 ;;   (attribute T name) (uniform T name) (varying T name)
 ;;   (precision P T)
+;;   (out loc T name)      -- a fragment output at an explicit
+;;                            location; ESSL 3.00 only (MRT), and it
+;;                            replaces gl_FragColor in that shader
 ;;   (define (name (T arg) ...) RET stmt ...)
 ;; Statements:
 ;;   (local T name expr)   -> "T name = expr;"
@@ -22,7 +25,9 @@
 ;;   (return expr) (return)
 ;;   (if c stmt ...)       / (if-else c (stmt ...) (stmt ...))
 ;;   (for (T name init cond step) stmt ...)
-;;                         -> "for (T name = init; cond; name = step)"
+;;                         -> "for (T name = init; cond; name += k)"
+;;                            (step (+ name k) / (- name k) becomes
+;;                            += / -= as ESSL 1.00 loops require)
 ;;   (discard)
 ;; Expressions:
 ;;   symbols pass through verbatim (p, gl_Position, v.xy);
@@ -114,14 +119,25 @@
                         "} "))
         ((for)
          ;; (for (T name init cond step) stmt ...) -- step is an
-         ;; expression assigned back to name each iteration
+         ;; expression assigned back to name each iteration.  ESSL
+         ;; 1.00 (Appendix A) only allows the loop index to advance
+         ;; by ++/--/+=/-=, so (+ name e) and (- name e) render as
+         ;; compound assignment; anything else is on the caller.
          (let* ((h (cadr s))
                 (ty (car h)) (name (cadr h)) (init (caddr h))
                 (c (cadddr h)) (step (list-ref h 4)))
            (string-append "for (" (symbol->string ty) " "
                           (symbol->string name) " = " (expr->glsl init)
                           "; " (expr->glsl c) "; "
-                          (symbol->string name) " = " (expr->glsl step)
+                          (if (and (pair? step) (pair? (cdr step))
+                                   (pair? (cddr step)) (null? (cdddr step))
+                                   (memq (car step) '(+ -))
+                                   (eq? (cadr step) name))
+                              (string-append (symbol->string name)
+                                             (if (eq? (car step) '+) " += " " -= ")
+                                             (expr->glsl (caddr step)))
+                              (string-append (symbol->string name) " = "
+                                             (expr->glsl step)))
                           ") { "
                           (apply string-append (map stmt->glsl (cddr s)))
                           "} ")))
@@ -144,6 +160,8 @@
       ((precision)
        (string-append "precision " (symbol->string (cadr f)) " "
                       (symbol->string (caddr f)) "; "))
+      ((out)
+       (error 'glsl "out needs the ESSL 3.00 dialect (fx-program3!)" f))
       ((define)
        ;; (define (name (T a) ...) RET stmt ...)
        (let* ((head (cadr f))
@@ -190,6 +208,13 @@
                             "[" (number->string (caddr (cadr f))) "]; ")
              (string-append kw " " (symbol->string (cadr f)) " "
                             (symbol->string (caddr f)) "; "))))
+      ((out)
+       ;; (out loc T name): one of several fragment outputs -- MRT.
+       ;; The location is explicit because with more than one output
+       ;; ESSL 3.00 wants them all pinned anyway
+       (string-append "layout(location = " (number->string (cadr f))
+                      ") out highp " (symbol->string (caddr f)) " "
+                      (symbol->string (cadddr f)) "; "))
       ((uniform-block)
        ;; members carry explicit highp: the vertex default is highp,
        ;; a mediump fragment default would otherwise disagree, and
@@ -214,8 +239,20 @@
 
   (define (glsl300-vs->string forms)
     ($glsl300 forms 'vertex ""))
+  ;; a shader that declares its own (out ...) forms replaces the
+  ;; default output entirely -- an implicit goe_FragColor would
+  ;; collide with an explicit location 0
+  (define ($glsl-has-out? forms)
+    (let loop ((fs forms))
+      (cond ((null? fs) #f)
+            ((eq? (caar fs) 'out) #t)
+            (else (loop (cdr fs))))))
+
   (define (glsl300-fs->string forms)
-    ($glsl300 forms 'fragment "out highp vec4 goe_FragColor; "))
+    ($glsl300 forms 'fragment
+              (if ($glsl-has-out? forms)
+                  ""
+                  "out highp vec4 goe_FragColor; ")))
 
   ;; the interface, extracted: shader forms are data, so the
   ;; attribute/uniform declarations that (web fx) wires up come from
