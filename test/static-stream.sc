@@ -151,7 +151,9 @@
             (assert! "keep-alive after stream"
                      (and (string=? (status-of head2) "200")
                           (bytevector=? body2 (string->utf8 small-text)))))
-          ;; 3. conditional request: 304, nothing streamed
+          ;; 3. conditional request: 304, nothing streamed. The first
+          ;; download cached the file's metadata, so within the stat
+          ;; window this must be answered without touching the file.
           (let-values (((head3 body3 rest3)
                         (roundtrip c
                           (string-append
@@ -161,6 +163,18 @@
             (assert! "big 304" (and (string=? (status-of head3) "304")
                                     (= (bytevector-length body3) 0)))))
         (tcp-close! c)))
+
+    ;; 3b. window-hit download: the metadata is cached, the body is not
+    ;; -- a fresh stream must be opened on demand, bytes intact
+    (let ((c (connect!)))
+      (let-values (((head body rest)
+                    (roundtrip c
+                      "GET /files/big.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                      empty-bv)))
+        (assert! "window-hit stream integrity"
+                 (and (string=? (status-of head) "200")
+                      (bytevector=? body big-bv))))
+      (tcp-close! c))
 
     ;; 4. client disconnects mid-download; the server must stay healthy
     (let ((c (connect!)))

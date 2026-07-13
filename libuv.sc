@@ -15,8 +15,9 @@
           tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
           file-read-async!
           file-stream-open! file-stream-read! file-stream-close!
-          file-stream-own!
-          tcp-read-start! tcp-write! tcp-writev! tcp-close!
+          file-stream-own! file-stream-raw! file-stream-chunk-ptr
+          tcp-read-start! tcp-write! tcp-writev! tcp-write-foreign!
+          tcp-close!
           conn? conn-handle conn-owner conn-set-owner!
           conn-state conn-count uv-strerror)
   (import (chezscheme) (igropyr platform))
@@ -251,8 +252,15 @@
   ;;   stream -- deliver one #(file-chunk ,bv) per read and park until
   ;;             the consumer pulls again (file-stream-read!): flow
   ;;             control is the consumer's write pace, so a large file
-  ;;             is served in constant memory (one chunk in flight)
+  ;;             is served in constant memory (one chunk in flight).
+  ;;             With file-stream-raw! the chunk STAYS in the op's C
+  ;;             buffer and only its length is delivered -- the consumer
+  ;;             sends it with tcp-write-foreign! (buffer -> kernel, no
+  ;;             per-chunk Scheme allocation, no GC traffic).
   (define file-read-chunk-size 65536)
+  ;; stream reads use bigger chunks: fewer thread-pool round trips per
+  ;; GB; memory per in-flight download is still just one chunk
+  (define stream-chunk-size 262144)
 
   (define-record-type (fs-op make-fs-op fs-op?)
     (fields
@@ -262,12 +270,16 @@
       (immutable req fs-op-req)                      ; uv_fs_t address
       (mutable phase fs-op-phase fs-op-phase-set!)   ; open|fstat|idle|read|close
       (mutable aborted? fs-op-aborted? fs-op-aborted?-set!)
+      (mutable raw? fs-op-raw? fs-op-raw?-set!)      ; deliver lengths, not bvs
       (mutable fd fs-op-fd fs-op-fd-set!)
       (mutable size fs-op-size fs-op-size-set!)
       (mutable offset fs-op-offset fs-op-offset-set!)
       (mutable chunks fs-op-chunks fs-op-chunks-set!)
       (mutable data fs-op-data fs-op-data-set!)       ; C read buffer
       (mutable buf fs-op-buf fs-op-buf-set!)))         ; uv_buf_t
+
+  (define (fs-chunk-cap op)
+    (if (eq? (fs-op-mode op) 'stream) stream-chunk-size file-read-chunk-size))
 
   (define (fs-body op)
     (let ((out (make-bytevector (fs-op-offset op))))
@@ -361,7 +373,7 @@
     (let ((remaining (- (fs-op-size op) (fs-op-offset op))))
       (if (<= remaining 0)
           (start-fs-close! op req)
-          (let ((n (min file-read-chunk-size remaining)))
+          (let ((n (min (fs-chunk-cap op) remaining)))
             (fs-op-phase-set! op 'read)
             (foreign-set! 'unsigned-64 (fs-op-buf op) 8 n)
             (let ((r (uv-fs-read uv-loop req (fs-op-fd op) (fs-op-buf op) 1
@@ -403,7 +415,7 @@
                             ;; ready: report the size, then park until the
                             ;; consumer pulls the first chunk
                             (when (> size 0)
-                              (let* ((data (foreign-alloc file-read-chunk-size))
+                              (let* ((data (foreign-alloc (fs-chunk-cap op)))
                                      (buf (foreign-alloc 16)))
                                 (fs-op-data-set! op data)
                                 (fs-op-buf-set! op buf)
@@ -414,7 +426,7 @@
                            ((= size 0)
                             (start-fs-close! op req))
                            (else
-                            (let* ((data (foreign-alloc file-read-chunk-size))
+                            (let* ((data (foreign-alloc (fs-chunk-cap op)))
                                    (buf (foreign-alloc 16)))
                               (fs-op-data-set! op data)
                               (fs-op-buf-set! op buf)
@@ -427,21 +439,29 @@
                      ((= result 0) (start-fs-close! op req))   ; early EOF
                      (else
                       (let* ((remaining (- (fs-op-size op) (fs-op-offset op)))
-                             (n (min result remaining))
-                             (bv (make-bytevector n)))
-                        (memcpy-from-c bv (fs-op-data op) n)
+                             (n (min result remaining)))
                         (fs-op-offset-set! op (+ (fs-op-offset op) n))
-                        (if (eq? (fs-op-mode op) 'stream)
-                            ;; hand over one chunk; the next read waits
-                            ;; for the consumer's file-stream-read!
-                            (begin
-                              (fs-op-phase-set! op 'idle)
-                              (deliver (fs-op-owner op) (vector 'file-chunk bv)))
-                            (begin
-                              (fs-op-chunks-set! op (cons bv (fs-op-chunks op)))
-                              (if (>= (fs-op-offset op) (fs-op-size op))
-                                  (start-fs-close! op req)
-                                  (start-fs-read! op req))))))))
+                        (cond
+                          ((fs-op-raw? op)
+                           ;; the bytes stay in the op's C buffer; hand
+                           ;; over just the length -- the consumer writes
+                           ;; straight from the buffer, zero Scheme alloc
+                           (fs-op-phase-set! op 'idle)
+                           (deliver (fs-op-owner op) (vector 'file-chunk n)))
+                          ((eq? (fs-op-mode op) 'stream)
+                           ;; hand over one chunk; the next read waits
+                           ;; for the consumer's file-stream-read!
+                           (let ((bv (make-bytevector n)))
+                             (memcpy-from-c bv (fs-op-data op) n)
+                             (fs-op-phase-set! op 'idle)
+                             (deliver (fs-op-owner op) (vector 'file-chunk bv))))
+                          (else
+                           (let ((bv (make-bytevector n)))
+                             (memcpy-from-c bv (fs-op-data op) n)
+                             (fs-op-chunks-set! op (cons bv (fs-op-chunks op)))
+                             (if (>= (fs-op-offset op) (fs-op-size op))
+                                 (start-fs-close! op req)
+                                 (start-fs-read! op req)))))))))
                   ((close)
                    (uv-fs-req-cleanup req)
                    (fs-finish! op req)))))))
@@ -571,7 +591,7 @@
 
   (define (fs-start! path owner mode)
     (let* ((req (foreign-alloc fs-req-size))
-           (op (make-fs-op owner path mode req 'open #f -1 0 0 '() 0 0)))
+           (op (make-fs-op owner path mode req 'open #f #f -1 0 0 '() 0 0)))
       (hashtable-set! fs-table req op)
       (let ((r (uv-fs-open uv-loop req path O-RDONLY 0 on-fs-entry)))
         (when (< r 0)
@@ -586,16 +606,28 @@
     (fs-start! path owner 'whole)
     (void))
 
-  ;; Open a file as a consumer-driven chunk stream. The owner later
-  ;; receives #(file-stream ,stream ,size) (ready; size from fstat) or
+  ;; Open a file as a consumer-driven chunk stream; returns the stream
+  ;; handle (also carried by the ready message, and needed to close a
+  ;; stream whose open never completed). The owner later receives
+  ;; #(file-stream ,stream ,size) (ready; size from fstat) or
   ;; #(file-error ,errno). Then each file-stream-read! yields exactly
-  ;; one of: #(file-chunk ,bv) (<= 64 KiB), #(file-eof) (all bytes
-  ;; delivered or the file shrank -- the fd is already closed), or
-  ;; #(file-error ,errno) (fd closed). One pull may be in flight at a
-  ;; time, so a slow consumer holds one chunk of memory, not the file.
+  ;; one of: #(file-chunk ,x) (a bytevector, or its length after
+  ;; file-stream-raw!), #(file-eof) (all bytes delivered or the file
+  ;; shrank -- the fd is already closed), or #(file-error ,errno) (fd
+  ;; closed). One pull may be in flight at a time, so a slow consumer
+  ;; holds one chunk of memory, not the file.
   (define (file-stream-open! path owner)
-    (fs-start! path owner 'stream)
-    (void))
+    (fs-start! path owner 'stream))
+
+  ;; Switch chunk delivery to lengths: the bytes stay in the stream's C
+  ;; buffer (file-stream-chunk-ptr) until the next pull, so a consumer
+  ;; that only forwards them (tcp-write-foreign!) never touches the
+  ;; Scheme heap. Set it before the first pull.
+  (define (file-stream-raw! op)
+    (fs-op-raw?-set! op #t))
+
+  (define (file-stream-chunk-ptr op)
+    (fs-op-data op))
 
   ;; Transfer delivery of subsequent messages to another process (e.g.
   ;; a pump spawned after the stream was opened). Call it before the
@@ -719,6 +751,30 @@
   ;; single-bytevector write (websocket / redis / mysql)
   (define (tcp-write! c bv on-done)
     (tcp-writev! c (list bv) on-done))
+
+  ;; Write len bytes straight from foreign memory (e.g. a file stream's
+  ;; chunk buffer): the fast path is buffer -> kernel with no copy at
+  ;; all; a partial write or EAGAIN copies only the unwritten remainder
+  ;; into the queued write block. The source buffer is free for reuse
+  ;; as soon as this returns. on-done as in tcp-writev!.
+  (define (tcp-write-foreign! c ptr len on-done)
+    (if (not (eq? (conn-state c) 'open))
+        (begin (when on-done (on-done -1)) #f)
+        (begin
+          (foreign-set! 'void* scratch-buf 0 ptr)
+          (foreign-set! 'unsigned-64 scratch-buf 8 len)
+          (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))
+            (cond
+              ((= n len)                          ; fully written now
+               (when on-done (on-done 0)) #t)
+              ((and (> n 0) (< n len))            ; partial: queue the rest
+               (enqueue-write! c (- len n)
+                 (lambda (dest) (memcpy-cc dest (+ ptr n) (- len n)))
+                 on-done))
+              (else                               ; EAGAIN/0: queue all
+               (enqueue-write! c len
+                 (lambda (dest) (memcpy-cc dest ptr len))
+                 on-done)))))))
 
   ;; Idempotent close; memory is freed only in close_cb, so there is no
   ;; double-close and no fd leak.

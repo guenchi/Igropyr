@@ -413,12 +413,15 @@
   ;; file re-read only when the mtime actually changed.
   ;;
   ;; A cache miss opens the file as a stream so the size is known (from
-  ;; fstat) BEFORE any bytes are read: a small file is pulled whole,
-  ;; cached, and served from memory as before; a large one returns a
-  ;; live one-shot #(stream handle size etag ctype) descriptor -- the
-  ;; caller must either pump it (stream-file!) or close it. Large files
-  ;; are never buffered whole and never cached.
+  ;; fstat) BEFORE any bytes are read. A small file is pulled whole,
+  ;; cached, and served from memory as before. A large one is cached as
+  ;; METADATA only (body slot = 'large): within the stat window a
+  ;; conditional request answers 304 with zero file operations, and a
+  ;; download opens a fresh stream on demand -- the miss itself returns
+  ;; a live one-shot #(stream handle size etag ctype) descriptor, which
+  ;; the caller must either pump (stream-file!) or close.
   (define (stream-entry? e) (eq? (vector-ref e 0) 'stream))
+  (define (large-entry? e) (eq? (vector-ref e 4) 'large))
 
   (define (static-entry path)
     (let ((cached (hashtable-ref static-cache path #f))
@@ -431,36 +434,50 @@
                      (begin (vector-set! cached 6 now) cached)
                      (open-entry path mt now)))))))
 
+  ;; open with a timeout that can never leak the fd: the handle comes
+  ;; back synchronously, so a timed-out open is closed via its handle
+  ;; (the abort flag also suppresses any late ready message).
+  ;; -> (values stream size) | (values #f #f)
+  (define (open-stream path)
+    (let ((st (file-stream-open! path self)))
+      (receive (after 30000 (begin (file-stream-close! st) (values #f #f)))
+        (`#(file-stream ,@st ,size) (values st size))
+        (`#(file-error ,e) (values #f #f)))))
+
   (define (open-entry path mt now)
-    (file-stream-open! path self)
-    (receive (after 30000 #f)
-      (`#(file-stream ,st ,size)
-        (if (<= size max-cache-file)
-            (let ((body (stream-read-all st size)))
-              (and body
-                   ;; gzip-box holds the lazily-built gzip body
-                   (let ((e (vector mt size (etag-of size mt)
-                                    (mime-type path) body (box #f) now)))
-                     (hashtable-set! static-cache path e)
-                     e)))
-            (vector 'stream st size (etag-of size mt) (mime-type path))))
-      (`#(file-error ,e) #f)))
+    (let-values (((st size) (open-stream path)))
+      (and st
+           (if (<= size max-cache-file)
+               (let ((body (stream-read-all st size)))
+                 (and body
+                      ;; gzip-box holds the lazily-built gzip body
+                      (let ((e (vector mt size (etag-of size mt)
+                                       (mime-type path) body (box #f) now)))
+                        (hashtable-set! static-cache path e)
+                        e)))
+               (let ((etag (etag-of size mt)) (ctype (mime-type path)))
+                 (hashtable-set! static-cache path
+                   (vector mt size etag ctype 'large #f now))
+                 (vector 'stream st size etag ctype))))))
 
   ;; Pump a large file through a fixed-length response from a detached
-  ;; process: the pool worker is released immediately, and each 64 KiB
-  ;; chunk is read only after the previous one drained to the client
-  ;; (res-write-file! waits) -- constant memory however slow the peer.
+  ;; process: the pool worker is released immediately, and each chunk
+  ;; is read only after the previous one drained to the client
+  ;; (res-write-chunk! waits) -- constant memory however slow the peer.
+  ;; The stream runs raw: chunks go C buffer -> socket without touching
+  ;; the Scheme heap, so a gigabyte download causes no GC traffic.
   (define (stream-file! r st size ctype)
     (set-header! r "Content-Type" ctype)
     (res-begin-file! r size)
     (spawn
       (lambda ()
         (file-stream-own! st self)
+        (file-stream-raw! st)
         (let loop ()
           (file-stream-read! st)
           (receive (after 30000 (res-abort-file! r))
-            (`#(file-chunk ,bv)
-              (case (res-write-file! r bv)
+            (`#(file-chunk ,len)
+              (case (res-write-chunk! r st len)
                 ((more) (loop))
                 ((done) (void))
                 (else (res-abort-file! r))))
@@ -468,6 +485,15 @@
             (`#(file-eof) (res-abort-file! r))
             (`#(file-error ,e) (res-abort-file! r))))
         (file-stream-close! st))))
+
+  ;; window-hit download of a large (metadata-cached) file: open a
+  ;; fresh stream on demand. Content-Length comes from the live fstat;
+  ;; etag/ctype from the metadata (<= 1s stale, like every window hit).
+  (define (serve-large! r ctype path)
+    (let-values (((st size) (open-stream path)))
+      (if st
+          (stream-file! r st size ctype)
+          (begin (set-status! r 404) (send-text! r "Not Found")))))
 
   ;; Public helper: send a file (cached read; no conditional request
   ;; since there is no req here). Path traversal is rejected. Files
@@ -480,6 +506,7 @@
             ((not e) (set-status! r 404) (send-text! r "Not Found"))
             ((stream-entry? e)
              (stream-file! r (vector-ref e 1) (vector-ref e 2) (vector-ref e 4)))
+            ((large-entry? e) (serve-large! r (vector-ref e 3) path))
             (else (finish! r (vector-ref e 3) (vector-ref e 4)))))))
 
   ;; Serve a static file with caching + conditional request. abs-path is
@@ -497,9 +524,10 @@
             ((not e)
              (set-status! r 404) (send-text! r "Not Found"))
             ((stream-entry? e)
-             ;; large file: conditional request still answered from the
-             ;; etag; otherwise stream it (no gzip -- the body is never
-             ;; held in memory to compress)
+             ;; large file, first request (cache miss): the stream is
+             ;; already open. Conditional requests answer from the etag;
+             ;; otherwise pump it (no gzip -- the body is never held in
+             ;; memory to compress).
              (let ((st (vector-ref e 1)) (size (vector-ref e 2))
                    (etag (vector-ref e 3)) (ctype (vector-ref e 4)))
                (set-header! r "ETag" etag)
@@ -510,6 +538,18 @@
                      (set-status! r 304)
                      (res-send! r (make-bytevector 0)))
                    (stream-file! r st size ctype))))
+            ((large-entry? e)
+             ;; large file, window hit: everything needed for a 304 is
+             ;; in the metadata -- a revalidation costs NO file
+             ;; operations at all; only a download opens the file
+             (let ((etag (vector-ref e 2)) (ctype (vector-ref e 3)))
+               (set-header! r "ETag" etag)
+               (set-header! r "Cache-Control" "public, max-age=3600")
+               (if (equal? (req-header req 'if-none-match) etag)
+                   (begin
+                     (set-status! r 304)
+                     (res-send! r (make-bytevector 0)))
+                   (serve-large! r ctype abs-path))))
             (else
              (let* ((size (vector-ref e 1))
                      (etag (vector-ref e 2))

@@ -34,7 +34,7 @@
           req-local req-set-local!
           set-status! set-header! res-send!
           res-begin! res-write! res-end!
-          res-begin-file! res-write-file! res-abort-file!
+          res-begin-file! res-write-file! res-write-chunk! res-abort-file!
           res-conn res-req res-status res-headers res-keep-alive?
           send-response! parse-query
           ;; Re-exported app-facing (igropyr actor) surface, so a core
@@ -556,11 +556,10 @@
   ;; length) instead carries the keep-alive/close continuation and is
   ;; not waited for. Returns 'more (continue), 'done (response
   ;; complete), or #f (connection gone -- call res-abort-file!).
-  (define (res-write-file! r data)
-    (let* ((bv (if (string? data) (string->utf8 data) data))
-           (c (res-conn r))
-           (n (bytevector-length bv))
-           (remaining (res-remaining r)))
+  ;; do-write issues the actual write: (do-write completion-callback).
+  (define (res-write-fixed! r n do-write)
+    (let ((c (res-conn r))
+          (remaining (res-remaining r)))
       (cond
         ((not (and (eq? (res-mode r) 'raw) (eq? (conn-state c) 'open))) #f)
         ((fx= n 0) 'more)
@@ -571,7 +570,7 @@
          (res-remaining-set! r 0)
          (res-mode-set! r 'done)
          (let ((owner (conn-owner c)) (ka (res-keep-alive? r)))
-           (tcp-write! c bv
+           (do-write
              (lambda (st)
                (if (and ka (>= st 0))
                    (send owner (vector 'next-request))
@@ -581,11 +580,37 @@
            'done))
         (else
          (res-remaining-set! r (- remaining n))
-         (let ((me self))
-           (tcp-write! c bv
-             (lambda (st) (send me (vector 'file-written st)))))
-         (receive
-           (`#(file-written ,st) (and (>= st 0) 'more)))))))
+         ;; The completion usually runs INLINE (uv_try_write wrote it
+         ;; all): the status lands in the box and no message or receive
+         ;; happens. Only a queued write parks this process. Safe: a
+         ;; callback can only run inline here or from the event loop,
+         ;; never between the unbox and the set-box! (no yield).
+         (let ((b (box 'pending)) (me self))
+           (do-write
+             (lambda (st)
+               (if (eq? (unbox b) 'pending)
+                   (set-box! b st)
+                   (send me (vector 'file-written st)))))
+           (let ((st (unbox b)))
+             (if (eq? st 'pending)
+                 (begin
+                   (set-box! b 'parked)
+                   (receive
+                     (`#(file-written ,st2) (and (>= st2 0) 'more))))
+                 (and (>= st 0) 'more))))))))
+
+  (define (res-write-file! r data)
+    (let ((bv (if (string? data) (string->utf8 data) data)))
+      (res-write-fixed! r (bytevector-length bv)
+        (lambda (done) (tcp-write! (res-conn r) bv done)))))
+
+  ;; raw-flavor sibling: the chunk is the file stream's C buffer
+  ;; (file-stream-raw!), written to the socket without ever becoming a
+  ;; bytevector -- fast path is buffer -> kernel, zero Scheme allocation.
+  (define (res-write-chunk! r st len)
+    (res-write-fixed! r len
+      (lambda (done)
+        (tcp-write-foreign! (res-conn r) (file-stream-chunk-ptr st) len done))))
 
   ;; A fixed-length response that cannot be completed (read error, file
   ;; shrank, client stalled out) has one correct exit: close the
