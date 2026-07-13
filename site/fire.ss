@@ -8,9 +8,12 @@
 ;; Where the front burns, embers rise: a transform-feedback particle
 ;; system whose physics IS the vertex shader — each ember respawns at
 ;; its home point, pops upward, arcs over under gravity, and dies, and
-;; only glows while the front is passing its home. Everything renders
-;; through (web fx) over (web gl)'s command buffer: one bridge call per
-;; frame, GPU-resident particle state, zero per-frame Scheme physics.
+;; only glows while the front is passing its home. The burn renders
+;; into an HDR (half-float) target where the tip runs past white; a
+;; threshold + separable blur turns the excess into a radiant halo,
+;; composited onto the transparent canvas. Everything renders through
+;; (web fx) over (web gl)'s command buffer: one bridge call per frame,
+;; GPU-resident particle state, zero per-frame Scheme physics.
 (import (rnrs) (web js) (web dom) (web gl) (web glsl) (web fx)
         (hive-data))
 
@@ -149,7 +152,10 @@
        (set! c (mix c (vec3 (fl 0 95) (fl 0 26) (fl 0 2)) (smoothstep (fl 0 10) (fl 0 35) t)))
        (set! c (mix c base (smoothstep (fl 0 35) (fl 1) t)))
        (local float av (mix (fl 1) (fl 0 28) (smoothstep (fl 0 05) (fl 1) t)))
-       (set! gl_FragColor (vec4 (* c flick) (* av soft)))))))
+       ;; the tip burns past white: HDR headroom the bloom pass finds
+       (local float hot (+ (fl 1) (* "2.2" (exp (- (/ (* v_heat v_heat)
+                                                      "60.0"))))))
+       (set! gl_FragColor (vec4 (* (* c flick) hot) (* av soft)))))))
 
 ;; ---- the embers: GPU particles, physics in the vertex shader ----
 ;; state: pos2 vel2 home2 (arrival life seed) = 36 bytes each; every
@@ -246,9 +252,80 @@
                           (vec3 (fl 1) (fl 0 66) (fl 0 20))
                           (smoothstep (fl 0 20) (fl 1) v_life)))
        (set! gl_FragColor
-             (vec4 (* c flick)
+             (vec4 (* (* c flick)
+                      (+ (fl 1) (* "1.4" (smoothstep (fl 0 60) (fl 1)
+                                                     v_life))))
                    (* (* v_gate soft)
                       (smoothstep (fl 0) (fl 0 30) v_life))))))))
+
+;; ---- HDR bloom: the scene renders past white into a half-float
+;; target; a threshold keeps what burns, a separable blur spreads it,
+;; and the composite lays fire plus halo onto the transparent canvas
+(define scene-t (fx-target-hdr! 1120 760))
+(define glow-a (fx-target! 560 380))
+(define glow-b (fx-target! 560 380))
+
+(define bright-q
+  (fx-fullscreen!
+   '((precision mediump float)
+     (uniform sampler2D u_scene)
+     (uniform vec2 u_texel)
+     (define (main) void
+       (local vec2 uv (* gl_FragCoord.xy u_texel))
+       (local vec4 c (texture2D u_scene uv))
+       (local float l (dot c.rgb (vec3 "0.2126" "0.7152" "0.0722")))
+       (set! gl_FragColor
+             (vec4 (* c.rgb (* c.a (smoothstep "1.0" "2.2" l)))
+                   (fl 1)))))))
+
+(define blur-q
+  (fx-fullscreen!
+   '((precision mediump float)
+     (uniform sampler2D u_src)
+     (uniform vec2 u_texel)
+     (uniform vec2 u_dir)
+     (define (tap (vec2 uv) (float o) (float w)) vec3
+       (local vec4 c (texture2D u_src (+ uv (* (* u_dir u_texel) o))))
+       (return (* c.rgb w)))
+     (define (main) void
+       (local vec2 uv (* gl_FragCoord.xy u_texel))
+       (local vec3 acc (tap uv (fl 0) "0.227027"))
+       (set! acc (+ acc (tap uv (fl 1) "0.1945946")))
+       (set! acc (+ acc (tap uv (- (fl 1)) "0.1945946")))
+       (set! acc (+ acc (tap uv (fl 2) "0.1216216")))
+       (set! acc (+ acc (tap uv (- (fl 2)) "0.1216216")))
+       (set! acc (+ acc (tap uv (fl 3) "0.054054")))
+       (set! acc (+ acc (tap uv (- (fl 3)) "0.054054")))
+       (set! acc (+ acc (tap uv (fl 4) "0.016216")))
+       (set! acc (+ acc (tap uv (- (fl 4)) "0.016216")))
+       (set! gl_FragColor (vec4 acc (fl 1)))))))
+
+(define comp-q
+  (fx-fullscreen!
+   '((precision mediump float)
+     (uniform sampler2D u_scene)
+     (uniform sampler2D u_glow)
+     (uniform vec2 u_texel)
+     (define (main) void
+       (local vec2 uv (* gl_FragCoord.xy u_texel))
+       (local vec4 c (texture2D u_scene uv))
+       (local vec4 g (texture2D u_glow uv))
+       (local vec3 sum (+ c.rgb (* g.rgb "1.15")))
+       ;; hue-preserving clamp: colors at or below 1 pass untouched,
+       ;; the HDR core normalizes down -- its excess lives in the halo
+       (local float mx (max (max sum.r sum.g) sum.b))
+       (set! sum (/ sum (max mx (fl 1))))
+       (local float ga (dot g.rgb (vec3 "0.5" "0.35" "0.15")))
+       (set! gl_FragColor
+             (vec4 sum (clamp (+ c.a (* ga "0.9"))
+                              (fl 0) (fl 1))))))))
+
+(define (glow-pass! q tgt tex setup)
+  (if tgt (fx-bind-target! tgt) (fx-bind-canvas!))
+  (fx-fullscreen-use! q 0.0)
+  (cmd-bind-texture! 0 tex)
+  (setup (fx-quad-program q))
+  (fx-fullscreen-draw! q))
 
 ;; ---- ember state: seeded on random fuse points, staggered lives ----
 (define EMB (fx-alloc! (* NEMBER 36)))
@@ -303,7 +380,10 @@
        (cmd-tf-begin!)
        (cmd-draw-arrays! GL-POINTS 0 NEMBER)
        (cmd-tf-end!)
-       ;; the lattice, then the sparks above it
+       ;; the lattice and sparks burn into the HDR target
+       (cmd-unbind-texture! 0)
+       (cmd-unbind-texture! 1)
+       (fx-bind-target! scene-t)
        (cmd-blend! 'alpha)
        (cmd-clear! 0.0 0.0 0.0 0.0)
        (fx-use! fuse-p fuse-buf)
@@ -314,4 +394,30 @@
        (fx-uniform! ember-draw 'front front)
        (fx-uniform! ember-draw 'time tw)
        (cmd-draw-arrays! GL-POINTS 0 NEMBER)
+       ;; what burns past white becomes a halo
+       (cmd-blend! 'off)
+       (glow-pass! bright-q glow-a (fx-target-texture scene-t)
+                   (lambda (p)
+                     (fx-uniform! p 'u_scene 0)
+                     (fx-uniform! p 'u_texel
+                                  (fl/ 1.0 560.0) (fl/ 1.0 380.0))))
+       (glow-pass! blur-q glow-b (fx-target-texture glow-a)
+                   (lambda (p)
+                     (fx-uniform! p 'u_src 0)
+                     (fx-uniform! p 'u_dir 1.0 0.0)
+                     (fx-uniform! p 'u_texel
+                                  (fl/ 1.0 560.0) (fl/ 1.0 380.0))))
+       (glow-pass! blur-q glow-a (fx-target-texture glow-b)
+                   (lambda (p)
+                     (fx-uniform! p 'u_src 0)
+                     (fx-uniform! p 'u_dir 0.0 1.0)
+                     (fx-uniform! p 'u_texel
+                                  (fl/ 1.0 560.0) (fl/ 1.0 380.0))))
+       (glow-pass! comp-q #f (fx-target-texture scene-t)
+                   (lambda (p)
+                     (cmd-bind-texture! 1 (fx-target-texture glow-a))
+                     (fx-uniform! p 'u_scene 0)
+                     (fx-uniform! p 'u_glow 1)
+                     (fx-uniform! p 'u_texel
+                                  (fl/ 1.0 1120.0) (fl/ 1.0 760.0))))
        (set! bufs (cons (cdr bufs) (car bufs)))))))
