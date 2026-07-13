@@ -1400,14 +1400,22 @@ JSON API 强加了一层阻抗失配：你的 Scheme 数据被序列化到 JSON 
 - `(node-connect! peer host port)` ——拨号并在断链后持续重拨
 - `(node-disconnect! peer)` ——停止重拨并断开现有链路
 - `(rsend node reg-name msg)` → `#t`/`#f` ——发给 node 上注册为 reg-name 的进程；`#t` 表示已交给活链路（送达仍不确认），`#f` 表示无链路。发给自己的节点名就是本地 send。
+- `(rcall node reg-name msg [timeout])` → reply ——对另一节点上注册为 reg-name 的 **gen-server** 做同步调用；阻塞调用方（默认 5s）。无链路、超时或远端失败（无此服务、崩溃、回复不可序列化）抛 `#(rcall-error ,reason ,target)`。发给自己的节点名就是本地 `gen-server-call`。
 - `(monitor-node name)` / `(demonitor-node name)` ——接收 `#(node-up ,name)` / `#(node-down ,name)`
 - `(node-peers)` ——已连接的对端名；`(node-self)` ——本节点名
+
+节点链路建立后，`(igropyr pubsub)` 自动**集群感知**：一次 `publish` 既投递
+给本地订阅者，也向每个直连 peer 转发一跳，由对方的 pubsub 服务投递给它自己
+的订阅者。这假设全连通 mesh（和 Erlang 一样）：一跳即达所有人，且转发过来的
+消息不再二次转发，因此无环无重复——聊天室例子无需改一行代码就跨节点工作。
+没有启动节点时，`publish` 就是单节点版本。
 
 ### 语义（有意照抄 Erlang）
 
 - 寻址只用**注册名**，从不用裸 pid——名字跨重启存活，pid 不行。
 - `rsend` 发后不理。同一对节点之间消息按发送顺序到达（每对一条 TCP）；
-  链路死了就静默丢弃——用 `monitor-node` 加应用层回执处理失败。
+  链路死了就静默丢弃——用 `monitor-node` 加应用层回执处理失败。`rcall`
+  是它的同步对应物，需要拿到答复时用。
 - 载荷走**扩展 sexpr 线模式**：vector、bytevector、有限浮点逐位无损过线，
   精确整数/分数保持精确。白名单之外的东西（闭包、record、pid、conn）
   在**发送端**的 `rsend` 处立刻报错。

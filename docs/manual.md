@@ -2091,8 +2091,18 @@ another. The semantics deliberately mirror Erlang distribution:
 - `(node-connect! peer host port)` — dial a peer and keep dialing whenever the link is down
 - `(node-disconnect! peer)` — stop dialing and drop the live link
 - `(rsend node reg-name msg)` → `#t`/`#f` — send `msg` to the process registered as `reg-name` on `node`; `#t` means handed to a live link (delivery still unconfirmed), `#f` means no link. The own node name is a plain local send.
+- `(rcall node reg-name msg [timeout])` → reply — synchronous call to the **gen-server** registered as `reg-name` on `node`; blocks the caller (default 5s). Raises `#(rcall-error ,reason ,target)` on no link, timeout, or a remote failure (no such server, it died, a non-serializable reply). The own node name is a plain local `gen-server-call`.
 - `(monitor-node name)` / `(demonitor-node name)` — receive `#(node-up ,name)` and `#(node-down ,name)`
 - `(node-peers)` — connected peer names; `(node-self)` — own name
+
+`(igropyr pubsub)` is **cluster-aware** once nodes are linked: a
+`publish` is delivered to local subscribers and forwarded one hop to
+every directly-connected peer, whose pubsub server delivers to its own
+subscribers. This assumes a fully-connected mesh (as Erlang does): one
+hop reaches everyone, and a forwarded message is never re-forwarded, so
+there are no loops or duplicates — the chat-room example works across
+nodes with no code change. With no node started, `publish` is exactly
+the single-node version.
 
 ### Semantics (Erlang's, on purpose)
 
@@ -2101,6 +2111,7 @@ another. The semantics deliberately mirror Erlang distribution:
 - `rsend` is fire-and-forget. Between one pair of nodes messages arrive
   in send order (one TCP connection per pair); on a dead link they are
   silently dropped — use `monitor-node` and application-level replies.
+  `rcall` is the synchronous counterpart, for when you need the answer.
 - Payloads cross in the **extended sexpr wire mode**: vectors,
   bytevectors and finite flonums arrive bit-intact, exact
   integers/ratios stay exact. Anything outside the whitelist (closures,
