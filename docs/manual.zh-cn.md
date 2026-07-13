@@ -1436,6 +1436,58 @@ gen-server 对其它进程不可见。节点链路就是桥：同机进程经 lo
 机器之间经网络组网，有状态的协同（聊天室扇出、单例服务、带故障转移的任务
 喷洒）重新变回普通的消息传递。
 
+### 分布式任务池
+
+`(igropyr dpool)` 把任务分散到成员节点上并发执行——本地 worker pool 的
+Let-It-Crash 从进程级升到**节点级**。协调器把任务轮转发给活着的成员，由
+`monitor-node` 驱动，节点一死立刻处理。
+
+```scheme
+;; 每个成员节点（b、c...）：用共享名字起一个 worker
+(node-start! 'b secret 4100)
+(dpool-worker-start 'render (lambda (job) (resize job)))
+
+;; 提交端：
+(node-start! 'a secret)
+(node-connect! 'b "10.0.0.2" 4100)   ; （以及其它成员）
+(define pool (dpool-start '(b c) 'render))
+(define t (dpool-submit pool (vector 'resize "x.png" 800)))
+(dpool-await pool t)                  ; -> handler 的返回值
+```
+
+**故障语义按池选、按任务可覆盖**——因为只有调用方知道一个任务能不能安全跑两次：
+
+- **`at-least-once`**（默认）——运行任务的节点在结果返回前死掉，任务重新
+  派给另一个活节点。它**一定会完成**（只要还有活节点），但**可能跑两次**
+  （节点也许跑完了、结果在网络路上、连接先断了）。只用于**幂等**任务。
+  设为默认是因为静默丢失的任务比重复执行的更难察觉。
+- **`at-most-once`**——节点死亡直接让任务失败；`dpool-await` 抛
+  `#(dpool-error node-down ,id)`，绝不重跑。用于无法幂等的副作用（"只扣一次款"）。
+
+```scheme
+(dpool-start '(b c) 'render '((mode . at-most-once)))     ; 池默认
+(dpool-submit pool payload '((mode . at-most-once)))       ; 单个任务
+```
+
+不提供 exactly-once：跨越崩溃时，没有任何消息传递系统能同时保证"不丢"和
+"不重"——那需要下游配合（幂等键、事务性收件箱）。**handler 在活节点上崩溃**
+与节点死亡不同：节点会把错误回复回来，`dpool-await` 抛
+`#(dpool-error task-error ,id)`，任务不重试——确定性的崩溃换个节点也只会再崩。
+
+任务载荷与结果必须是扩展线安全的（它们要过链路）。
+
+API：
+
+- `(dpool-worker-start name handler)` ——每个成员上；`handler` 是 `(lambda (payload) result)`，每个任务在自己的进程里跑
+- `(dpool-start members worker-name [opts])` → pool ——提交端；`opts` 可设 `(mode . at-least-once|at-most-once)`
+- `(dpool-submit pool payload [opts])` → task-id ——异步；`opts` 可覆盖 `mode`
+- `(dpool-await pool task-id [timeout])` → value ——阻塞；抛 `#(dpool-error ,reason ,id)`（`task-error` / `node-down` / `await-timeout`）
+- `(dpool-stats pool)` → `((live . n) (inflight . n) (queued . n))`
+
+若要的是跨集群的**单例**（唯一的全局调度器、唯一的锁持有者）而非分散工作，
+dpool 是错的工具——那需要共识，而网络分裂会把它变成脑裂。请用已经解决了共识
+的系统（Redis `SET NX`、etcd、Consul），不要在 igropyr 里选主。
+
 ---
 
 ## 运行和构建

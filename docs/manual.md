@@ -2138,6 +2138,68 @@ same-machine processes mesh over loopback, machines mesh over the
 network, and stateful coordination (chat fan-out, singleton services,
 work spraying with failover) becomes ordinary message passing again.
 
+### Distributed Task Pool
+
+`(igropyr dpool)` spreads tasks across member nodes and runs them
+concurrently — the local worker pool's Let-It-Crash story lifted from
+process level to node level. A coordinator round-robins tasks to live
+members and, driven by `monitor-node`, handles a node death at once.
+
+```scheme
+;; on every member node (b, c, ...): a worker under a shared name
+(node-start! 'b secret 4100)
+(dpool-worker-start 'render (lambda (job) (resize job)))
+
+;; on the submitting node:
+(node-start! 'a secret)
+(node-connect! 'b "10.0.0.2" 4100)   ; (and the other members)
+(define pool (dpool-start '(b c) 'render))
+(define t (dpool-submit pool (vector 'resize "x.png" 800)))
+(dpool-await pool t)                  ; -> the handler's return value
+```
+
+**Failure semantics are chosen per pool and overridable per task** —
+only the caller knows whether a task may safely run twice:
+
+- **`at-least-once`** (default) — if the node running a task dies before
+  its result returns, the task is re-dispatched to another live node. It
+  *will* complete (while any node lives) but *may* run twice (the node
+  might have finished and died with the reply in flight). Use for
+  **idempotent** tasks. It's the default because a silently dropped task
+  is harder to notice than a duplicated one.
+- **`at-most-once`** — a node death fails the task; `dpool-await` raises
+  `#(dpool-error node-down ,id)` and it is never re-run. For side effects
+  that can't be made idempotent ("charge once").
+
+```scheme
+(dpool-start '(b c) 'render '((mode . at-most-once)))     ; pool default
+(dpool-submit pool payload '((mode . at-most-once)))       ; per task
+```
+
+Exactly-once is not on offer: no message-passing system gives both
+"never dropped" and "never duplicated" across a crash — that needs
+downstream cooperation (idempotency keys, a transactional inbox). A task
+whose **handler crashes on a live node** is different from a node death:
+the node replies with the error, `dpool-await` raises
+`#(dpool-error task-error ,id)`, and the task is not retried — a
+deterministic crash would only re-crash elsewhere.
+
+Task payloads and results must be extended-wire-safe (they cross links).
+
+API:
+
+- `(dpool-worker-start name handler)` — on each member; `handler` is `(lambda (payload) result)`, each task in its own process
+- `(dpool-start members worker-name [opts])` → pool — on the submitter; `opts` may set `(mode . at-least-once|at-most-once)`
+- `(dpool-submit pool payload [opts])` → task-id — async; `opts` may override `mode`
+- `(dpool-await pool task-id [timeout])` → value — blocks; raises `#(dpool-error ,reason ,id)` (`task-error` / `node-down` / `await-timeout`)
+- `(dpool-stats pool)` → `((live . n) (inflight . n) (queued . n))`
+
+For a **singleton** across the cluster (one global scheduler, one lock
+holder) rather than spread work, dpool is the wrong tool — that needs
+consensus, which a partition turns into split-brain. Use a system that
+already solved it (Redis `SET NX`, etcd, Consul) instead of electing in
+igropyr.
+
 ---
 
 ## Running and Building
