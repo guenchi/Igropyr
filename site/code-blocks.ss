@@ -1,5 +1,5 @@
 (library (code-blocks)
-  (export hero-quick crash-code hotswap-code faults-code conv-code)
+  (export hero-quick crash-code hotswap-code faults-code conv-code cluster-code)
   (import (rnrs))
   (define hero-quick "<span class=\"c\">$</span> npm i igropyr")
   (define crash-code "(<span class=\"f\">app-get</span> app <span class=\"s\">\"/crash\"</span>
@@ -43,4 +43,17 @@
 
 (<span class=\"f\">conversation-resume!</span> id req)   <span class=\"c\">; =&gt; reply | 'gone</span>
 <span class=\"c\">;; 'gone means: rolled back. guaranteed.</span>")
+  (define cluster-code "(<span class=\"f\">node-start!</span> <span class=\"n\">'web-1</span> secret <span class=\"n\">4100</span> <span class=\"s\">\"0.0.0.0\"</span>)
+
+<span class=\"c\">;; discover peers via redis; nodes heartbeat</span>
+<span class=\"c\">;; themselves in and expire on their own</span>
+(<span class=\"f\">cluster-start</span>
+  `((name . <span class=\"s\">\"render-farm\"</span>)
+    (discover . (redis ,conn <span class=\"s\">\"10.0.0.1\"</span> <span class=\"n\">4100</span>))))
+
+<span class=\"c\">;; fan work across every live member; a node</span>
+<span class=\"c\">;; dying mid-task -&gt; the task reruns elsewhere</span>
+(<span class=\"k\">define</span> pool (<span class=\"f\">dpool-start</span> <span class=\"n\">'(web-1 web-2 web-3)</span> <span class=\"n\">'render</span>))
+(<span class=\"f\">dpool-await</span> pool
+  (<span class=\"f\">dpool-submit</span> pool #(resize <span class=\"s\">\"x.png\"</span> <span class=\"n\">800</span>)))")
 )
