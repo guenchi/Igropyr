@@ -56,8 +56,11 @@ conversations, and s-expression RPC.
 - **Non-blocking HTTP & WebSocket clients** — outbound `http-get` /
   `http-post` and `ws-connect`, both with async DNS (libuv thread pool)
   and the same park-the-caller model
-- **Async file reads** — static files are read on libuv's thread pool,
-  so a large or cold read never blocks the scheduler
+- **Static file serving** — hot files come from an in-memory cache (a
+  hashtable lookup: no disk read, no `stat` syscall; mtime re-checked at
+  most once a second). A cache miss reads once on libuv's thread pool, so
+  a cold read never blocks the scheduler; files over 1 MiB stream in
+  bounded chunks with backpressure, never read whole
 - **gzip compression** — responses negotiated via `Accept-Encoding`;
   static files cache their compressed form
 - **Ops-ready** — rate limiting, a global error handler, and a
