@@ -68,6 +68,16 @@ conversations, and s-expression RPC.
 - **Multi-process scaling** — `SO_REUSEPORT` bind option for
   kernel-balanced multi-process listening on Linux (pair with
   pm2 or systemd)
+- **Distributed actors** — connect nodes into a mesh (`(igropyr node)`):
+  `rsend`/`rcall` to a process registered on another node,
+  `monitor-node`/`monitor-remote`, cluster-wide PubSub, a distributed
+  task pool (`(igropyr dpool)`), and automatic discovery (`(igropyr
+  cluster)`, static or Redis)
+- **S-expression RPC** — when both ends are Scheme, `(igropyr sexpr)` is
+  a safe whitelisted codec (no `read`, depth-limited); `app-rpc` /
+  `send-sexpr!` / `ws-send-sexpr!` carry one datum per message, with an
+  extended wire mode (vectors, bytevectors, finite flonums) for the
+  node-to-node links
 - **HTTP/1.1 keep-alive & pipelining** — persistent connections by default
   on 1.1; each connection's reader process loops over successive requests
 - **Fast** — ~35 k req/s at 500 concurrent connections on an Apple Silicon
@@ -614,8 +624,79 @@ FreeBSD 12+; not macOS):
 Launch and supervise the N processes with pm2 (fork mode) or systemd.
 Because processes share nothing, per-process state (the worker pool, the
 route table, PubSub topics, WebSocket rooms) is local to each — share
-across processes through Redis, and use Redis pub/sub as a cross-process
-event bus.
+across processes through Redis, or connect them into an actor mesh with
+the distribution layer below.
+
+## Distribution across nodes
+
+`SO_REUSEPORT` scales stateless HTTP but leaves each process an island.
+`(igropyr node)` connects instances — other cores over loopback, other
+machines over the network — into a mesh where a process on one node can
+message a **registered name** on another. The semantics deliberately
+mirror Erlang distribution.
+
+```scheme
+(import (igropyr node))
+
+;; node b: identity + listener (127.0.0.1 unless a host is given)
+(node-start! 'b "shared-secret" 4100)
+(register 'worker self)
+
+;; node a: dial b (auto-reconnects), then talk to it
+(node-start! 'a "shared-secret")
+(node-connect! 'b "10.0.0.2" 4100)
+(rsend 'b 'worker (vector 'job 42))       ; fire-and-forget -> #t / #f
+(rcall 'b 'calc  (vector 'square 7))      ; synchronous gen-server call -> 49
+(monitor-node 'b)                         ; -> #(node-up b) / #(node-down b)
+(monitor-remote 'b 'worker)               ; -> #(remote-down b worker reason)
+```
+
+Addressing is by registered name (pids are memory objects; names survive
+restarts). `rsend` is fire-and-forget with per-pair ordering; `rcall` is
+its synchronous counterpart. Payloads cross in the extended s-expression
+wire mode, so vectors, bytevectors and finite flonums arrive intact and
+exact integers/ratios stay exact. `(igropyr pubsub)` becomes cluster-wide
+automatically once nodes are linked — a `publish` reaches subscribers on
+every node, so the chat-room example works across the mesh unchanged.
+
+**Distributed task pool** — spread work across nodes with the local
+worker pool's Let-It-Crash story lifted to node level:
+
+```scheme
+(import (igropyr dpool))
+(dpool-worker-start 'render (lambda (job) (resize job)))   ; on each member
+(define pool (dpool-start '(b c) 'render))                 ; on the submitter
+(dpool-await pool (dpool-submit pool (vector 'resize "x.png" 800)))
+```
+
+Failure mode is per pool, overridable per task: **at-least-once**
+(default; a node death re-dispatches the task — completes for sure, may
+run twice, needs idempotent tasks) or **at-most-once** (a node death
+fails it — never re-run). Exactly-once isn't offered: no message-passing
+system gives both across a crash.
+
+**Automatic discovery** — instead of dialing every peer by hand,
+`(igropyr cluster)` periodically asks a strategy for the member list and
+dials new ones:
+
+```scheme
+(import (igropyr cluster))
+(cluster-start `((discover . (static (b "10.0.0.2" 4100) (c "10.0.0.3" 4100)))))
+(cluster-start `((name . "myapp") (discover . (redis ,conn "10.0.0.1" 4100))))
+```
+
+The **redis** strategy heartbeats each node into a per-cluster sorted set
+scored by an expiry timestamp; a crashed node falls out on its own, with
+no central bookkeeping.
+
+> **Security:** the dist port is full control of the node — anyone on it
+> can message any registered process, including supervisors. The
+> handshake is a mutual HMAC-SHA1 challenge/response on the shared
+> secret, but there is no TLS and the port binds `127.0.0.1` by default.
+> Across machines, keep it on a private network (WireGuard, VPC). For a
+> cluster-wide singleton or leader election, use a system that already
+> solved consensus (Redis `SET NX`, etcd) — a network partition turns
+> in-process election into split-brain.
 
 ## HTTPS / TLS
 
