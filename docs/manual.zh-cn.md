@@ -1402,6 +1402,7 @@ JSON API 强加了一层阻抗失配：你的 Scheme 数据被序列化到 JSON 
 - `(rsend node reg-name msg)` → `#t`/`#f` ——发给 node 上注册为 reg-name 的进程；`#t` 表示已交给活链路（送达仍不确认），`#f` 表示无链路。发给自己的节点名就是本地 send。
 - `(rcall node reg-name msg [timeout])` → reply ——对另一节点上注册为 reg-name 的 **gen-server** 做同步调用；阻塞调用方（默认 5s）。无链路、超时或远端失败（无此服务、崩溃、回复不可序列化）抛 `#(rcall-error ,reason ,target)`。发给自己的节点名就是本地 `gen-server-call`。
 - `(monitor-node name)` / `(demonitor-node name)` ——接收 `#(node-up ,name)` / `#(node-down ,name)`
+- `(monitor-remote node name)` → ref / `(demonitor-remote ref)` ——监视 node 上注册为 name 的进程；监视方收到一个 `#(remote-down ,node ,name ,reason)`，`reason` 是目标的退出原因、`noproc`（建立监视时该名字未注册）、或 `noconnection`（链路先断——断链下目标死活不可区分，和 Erlang 一样）。这是 `monitor-node` 的**进程级**对应物。
 - `(node-peers)` ——已连接的对端名；`(node-self)` ——本节点名
 
 节点链路建立后，`(igropyr pubsub)` 自动**集群感知**：一次 `publish` 既投递
@@ -1420,6 +1421,9 @@ JSON API 强加了一层阻抗失配：你的 Scheme 数据被序列化到 JSON 
   精确整数/分数保持精确。白名单之外的东西（闭包、record、pid、conn）
   在**发送端**的 `rsend` 处立刻报错。
 - 双方同时互拨时确定性收敛：拨号方节点名较小的那条连接在两端同时胜出。
+- `monitor-remote` 按注册名监视远程**进程**（`monitor-node` 的进程级对应物）。
+  刻意不做跨节点 **link**：link 是双向级联 kill，需要远程终止能力，且网络分裂时
+  会误触发（断链看起来像对端死亡，会错杀健康进程）。单向的 monitor 观察已够用。
 
 ### 安全
 

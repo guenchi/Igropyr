@@ -2093,6 +2093,7 @@ another. The semantics deliberately mirror Erlang distribution:
 - `(rsend node reg-name msg)` → `#t`/`#f` — send `msg` to the process registered as `reg-name` on `node`; `#t` means handed to a live link (delivery still unconfirmed), `#f` means no link. The own node name is a plain local send.
 - `(rcall node reg-name msg [timeout])` → reply — synchronous call to the **gen-server** registered as `reg-name` on `node`; blocks the caller (default 5s). Raises `#(rcall-error ,reason ,target)` on no link, timeout, or a remote failure (no such server, it died, a non-serializable reply). The own node name is a plain local `gen-server-call`.
 - `(monitor-node name)` / `(demonitor-node name)` — receive `#(node-up ,name)` and `#(node-down ,name)`
+- `(monitor-remote node name)` → ref / `(demonitor-remote ref)` — watch the process registered as `name` on `node`; the watcher receives one `#(remote-down ,node ,name ,reason)` where `reason` is the target's exit reason, `noproc` (name not registered when the watch is established), or `noconnection` (the link dropped first — across a broken link the target being alive or dead is indistinguishable, as in Erlang). This is the **process-level** counterpart to `monitor-node`.
 - `(node-peers)` — connected peer names; `(node-self)` — own name
 
 `(igropyr pubsub)` is **cluster-aware** once nodes are linked: a
@@ -2118,6 +2119,12 @@ the single-node version.
   records, pids, conns) raises at the sender — loudly, at `rsend` time.
 - Both sides dialing at once resolves deterministically: the connection
   dialed by the smaller node name survives on both ends.
+- `monitor-remote` watches a remote *process* by registered name (the
+  process-level companion to `monitor-node`). There is deliberately no
+  cross-node **link**: a link is a bidirectional cascading kill, which
+  would need remote termination and mis-fires on a partition (a dropped
+  link looks like a peer death and would wrongly kill healthy
+  processes). One-way observation via monitor covers the need.
 
 ### Security
 
