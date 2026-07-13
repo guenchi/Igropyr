@@ -4,7 +4,9 @@
 ;; The hexagon lattice is a graph (site/hive-data.ss). Dijkstra from the
 ;; bottom-left vertex gives every point its "arrival distance"; a front
 ;; that grows with time ignites each point as it passes, so fire crawls
-;; along every edge and meets in the middle — a burning fuse network.
+;; along every edge and meets in the middle — and the web only exists
+;; where the fire has drawn it: unburned lattice is invisible, burned
+;; edges remain as solid lines, and the ashes dissolve before the wrap.
 ;; Where the front burns, embers rise: a transform-feedback particle
 ;; system whose physics IS the vertex shader — each ember respawns at
 ;; its home point, pops upward, arcs over under gravity, and dies, and
@@ -65,7 +67,7 @@
     (steps (+ k 1))))
 
 ;; ---- sample each edge into the fuse point cloud ----
-(define SP 2.6)
+(define SP 1.2)
 (define (edge-segs e)
   (let* ((a (vector-ref hive-ea e)) (b (vector-ref hive-eb e))
          (s (%fl->fx (fl/ (elen a b) SP))))
@@ -135,15 +137,16 @@
      (varying float v_heat)
      (varying float v_seed)
      (uniform float time)
+     (uniform float fade)               ; ashes dissolve before the wrap
      (define (main) void
+       ;; ahead of the front the web does not exist yet: the fire
+       ;; draws it into being
+       (if (< v_heat (fl 0)) (discard))
        (local vec2 d (- gl_PointCoord (vec2 (fl 0 50) (fl 0 50))))
        (local float r2 (dot d d))
        (if (> r2 (fl 0 25)) (discard))
        (local float soft (- (fl 1) (* r2 (fl 4))))
        (local vec3 base (vec3 (fl 0 91) (fl 0 51) (fl 0 36)))
-       (if (< v_heat (fl 0))
-           (set! gl_FragColor (vec4 base (* (fl 0 28) soft)))
-           (return))
        (local float flick (+ (fl 0 80) (* (fl 0 20) (sin (+ (* time (fl 22)) (* v_seed (fl 40)))))))
        (local float t (clamp (/ v_heat (fl 320)) (fl 0) (fl 1)))
        (local vec3 c (mix (vec3 (fl 1) (fl 0 93) (fl 0 62))
@@ -151,7 +154,8 @@
                           (smoothstep (fl 0) (fl 0 10) t)))
        (set! c (mix c (vec3 (fl 0 95) (fl 0 26) (fl 0 2)) (smoothstep (fl 0 10) (fl 0 35) t)))
        (set! c (mix c base (smoothstep (fl 0 35) (fl 1) t)))
-       (local float av (mix (fl 1) (fl 0 28) (smoothstep (fl 0 05) (fl 1) t)))
+       (local float av (* (mix (fl 1) (fl 0 22) (smoothstep (fl 0 05) (fl 1) t))
+                          fade))
        ;; the tip burns past white: HDR headroom the bloom pass finds
        (local float hot (+ (fl 1) (* "2.2" (exp (- (/ (* v_heat v_heat)
                                                       "60.0"))))))
@@ -389,6 +393,12 @@
        (fx-use! fuse-p fuse-buf)
        (fx-uniform! fuse-p 'front front)
        (fx-uniform! fuse-p 'time tw)
+       ;; the overshoot tail (past every arrival) dissolves the ashes,
+       ;; so the wrap lands on darkness and the next fuse lights clean
+       (fx-uniform! fuse-p 'fade
+                    (let ((f (fl- 1.0 (fl/ (fl- front (fl+ maxd 60.0))
+                                           300.0))))
+                      (if (fl<? f 0.0) 0.0 (if (fl<? 1.0 f) 1.0 f))))
        (cmd-draw-arrays! GL-POINTS 0 npoints)
        (fx-use! ember-draw (cdr bufs))
        (fx-uniform! ember-draw 'front front)
