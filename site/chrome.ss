@@ -86,6 +86,7 @@
       (.feature (display grid) (grid-template-columns "1fr 1fr") (gap (px 44))
                 (align-items center) (margin-top (px 40)))
       (".feature.flip .txt" (order 2))
+      (".feature > *" (min-width 0))   ; let overflow-x on inner <pre> win, not overflow the page
       (".feature h3" (font-size (px 24)) (margin-bottom (px 12)))
       (".feature p" (color (var dim)) (margin-bottom (px 12)))
       (".feature p b, .feature li b" (color (var fg)) (font-weight 600))
