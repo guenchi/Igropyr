@@ -43,13 +43,13 @@
 
 (<span class=\"f\">conversation-resume!</span> id req)   <span class=\"c\">; =&gt; reply | 'gone</span>
 <span class=\"c\">;; 'gone means: rolled back. guaranteed.</span>")
-  (define cluster-code "(<span class=\"f\">node-start!</span> <span class=\"n\">'web-1</span> secret <span class=\"n\">4100</span> <span class=\"s\">\"0.0.0.0\"</span>)
+  (define cluster-code "(<span class=\"f\">node-start!</span> <span class=\"n\">'web-1</span> secret <span class=\"n\">8888</span> <span class=\"s\">\"0.0.0.0\"</span>)
 
 <span class=\"c\">;; discover peers via redis; nodes heartbeat</span>
 <span class=\"c\">;; themselves in and expire on their own</span>
 (<span class=\"f\">cluster-start</span>
   `((name . <span class=\"s\">\"render-farm\"</span>)
-    (discover . (redis ,conn <span class=\"s\">\"10.0.0.1\"</span> <span class=\"n\">4100</span>))))
+    (discover . (redis ,conn <span class=\"s\">\"10.0.0.1\"</span> <span class=\"n\">8888</span>))))
 
 <span class=\"c\">;; fan work across every live member; a node</span>
 <span class=\"c\">;; dying mid-task -&gt; the task reruns elsewhere</span>
