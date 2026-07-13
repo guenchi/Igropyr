@@ -31,16 +31,26 @@
   (lambda (req res next)
     (next)))
 
+;; Constant responses are encoded ONCE here, at startup, with define --
+;; the handler hands the framework a ready bytevector instead of
+;; re-encoding (or re-serializing) the same value on every request.
+(define home-page
+  (string->utf8 "<h1>Igropyr</h1><p>Chez Scheme + libuv + actors</p>"))
+
 (app-get app "/"
   (lambda (req res)
-    (send-html! res "<h1>Igropyr</h1><p>Chez Scheme + libuv + actors</p>")))
+    (send-html! res home-page)))
+
+(define info-json
+  (string->utf8
+    (json->string (list (cons 'name "igropyr")
+                        (cons 'engine "chez-scheme")
+                        (cons 'io "libuv")
+                        (cons 'workers 8)))))
 
 (app-get app "/json"
   (lambda (req res)
-    (send-json! res (list (cons 'name "igropyr")
-                          (cons 'engine "chez-scheme")
-                          (cons 'io "libuv")
-                          (cons 'workers 8)))))
+    (send-json! res info-json)))
 
 (app-get app "/users/:id"
   (lambda (req res)

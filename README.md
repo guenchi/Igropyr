@@ -164,8 +164,9 @@ demand:
         (begin (set-status! res 403) (send-text! res "Forbidden")))))
 
 ;; static files: /assets/style.css -> ./public/style.css. Files are read
-;; once and cached in memory (re-read only when their mtime changes), so
-;; serving an unchanged asset is a hashtable lookup, not a disk read.
+;; once and cached in memory (re-read only when their mtime changes; the
+;; mtime itself is re-checked at most once per second), so serving a hot
+;; asset is a hashtable lookup -- no disk read, no stat syscall.
 ;; Responses carry a weak ETag and Cache-Control, and a matching
 ;; If-None-Match gets 304 Not Modified. Files over 1 MiB are served but
 ;; not cached.
@@ -215,6 +216,23 @@ Set status and extra headers first, then send exactly once:
 
 A second send on the same request is ignored, so a supervisor fallback can
 never corrupt a response that already went out.
+
+Every encoder also accepts a bytevector, taken as the already-encoded
+body. For a response that never changes, do the encoding **once at
+startup with `define`** instead of re-encoding the same constant on
+every request — the handler then just hands the framework a pointer:
+
+```scheme
+(define home-page (string->utf8 "<h1>hi</h1>"))          ; encoded once
+(define info-json (string->utf8 (json->string my-alist))) ; serialized once
+
+(app-get app "/"     (lambda (req res) (send-html! res home-page)))
+(app-get app "/info" (lambda (req res) (send-json! res info-json)))
+```
+
+The same applies to anything derivable at startup (rendered templates,
+lookup tables, composed strings): compute it in a `define` at top level,
+not inside the handler.
 
 ## The core API (build your own framework)
 

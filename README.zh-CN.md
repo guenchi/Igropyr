@@ -121,8 +121,8 @@ actor 接口（`start-scheduler`、`spawn`、`receive` 等）；express、websoc
         (begin (set-status! res 403) (send-text! res "Forbidden")))))
 
 ;; 静态文件：/assets/style.css -> ./public/style.css。文件读取一次后缓存在内存中
-;;（只有 mtime 变化时才重新读取），因此服务未变化的资源是 hashtable lookup，
-;; 不是磁盘读取。响应带 weak ETag 和 Cache-Control，匹配的 If-None-Match
+;;（只有 mtime 变化时才重新读取，mtime 本身最多每秒复查一次），因此服务热资源
+;; 是 hashtable lookup——没有磁盘读取，也没有 stat 系统调用。响应带 weak ETag 和 Cache-Control，匹配的 If-None-Match
 ;; 会得到 304 Not Modified。超过 1 MiB 的文件会被服务，但不会缓存。
 (app-static app "/assets" "./public")
 
@@ -168,6 +168,21 @@ pool 及其容错行为可配置；传入 alist 代替 worker 数量即可
 ```
 
 同一请求的第二次发送会被忽略，因此 supervisor fallback 永远不会破坏已经发出的响应。
+
+每个编码器也接受 bytevector，视为已编码好的响应体。对于内容不变的响应，
+应当在**启动时用 `define` 编码一次**，而不是每个请求重复编码同一个常量——
+handler 只需把指针交给框架：
+
+```scheme
+(define home-page (string->utf8 "<h1>hi</h1>"))           ; 只编码一次
+(define info-json (string->utf8 (json->string my-alist))) ; 只序列化一次
+
+(app-get app "/"     (lambda (req res) (send-html! res home-page)))
+(app-get app "/info" (lambda (req res) (send-json! res info-json)))
+```
+
+一切能在启动时算出的东西（渲染好的模板、查找表、拼接好的字符串）都同理：
+在顶层 `define` 里算好，不要放在 handler 里。
 
 ## 核心 API（构建自己的框架）
 
