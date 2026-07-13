@@ -2145,6 +2145,45 @@ same-machine processes mesh over loopback, machines mesh over the
 network, and stateful coordination (chat fan-out, singleton services,
 work spraying with failover) becomes ordinary message passing again.
 
+### Automatic Discovery
+
+`node-connect!` is manual: to form a mesh, every node dials every other,
+knowing each peer's name, host and port — O(N) config that has to change
+whenever the membership does. `(igropyr cluster)` adds the thin layer
+above it. A background process asks a **discovery strategy** for the
+member list each cycle and dials any peer it isn't linked to yet;
+`node-connect!`'s own reconnect and `monitor-node`'s up/down do the rest.
+
+```scheme
+(node-start! 'a secret 4100 "0.0.0.0")
+
+;; a fixed list (self is skipped)
+(cluster-start `((discover . (static (b "10.0.0.2" 4100)
+                                     (c "10.0.0.3" 4100)))))
+
+;; via Redis: no central bookkeeping, membership is self-maintaining
+(cluster-start `((name . "myapp")
+                 (discover . (redis ,conn "10.0.0.1" 4100))))  ; advertise self
+
+;; or any thunk returning ((name host port) ...)
+(cluster-start `((discover . ,(lambda () (my-lookup)))))
+```
+
+The **static** strategy is a fixed list. The **redis** strategy heartbeats
+each node's own `(name host port)` into a per-cluster sorted set scored by
+an expiry timestamp, prunes entries whose time has passed, and reads the
+live set — a crashed node falls out after `ttl-ms` on its own, with one
+key and no `SCAN`. A discovery failure (Redis down, a DNS blip) skips the
+round and keeps the links already up, so it never tears the mesh down.
+
+Options: `(name . "default")` namespaces the Redis key; `(interval-ms .
+5000)` the discovery period; `(ttl-ms . 15000)` how long a Redis
+registration lives without a heartbeat (keep it a few intervals).
+`(cluster-stop handle)` stops discovering; existing links stay up.
+
+For a singleton or leader across the cluster, this is still the wrong
+layer — see the note under the task pool below.
+
 ### Distributed Task Pool
 
 `(igropyr dpool)` spreads tasks across member nodes and runs them

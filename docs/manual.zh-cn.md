@@ -1440,6 +1440,39 @@ gen-server 对其它进程不可见。节点链路就是桥：同机进程经 lo
 机器之间经网络组网，有状态的协同（聊天室扇出、单例服务、带故障转移的任务
 喷洒）重新变回普通的消息传递。
 
+### 自动发现
+
+`node-connect!` 是手动的：组 mesh 要每个节点拨号其他每一个，还得知道每个 peer
+的名字/host/port——O(N) 配置，成员一变就要改。`(igropyr cluster)` 补上它上面
+那薄薄一层：一个后台进程每轮向**发现策略**要成员列表，对还没连上的拨号；
+`node-connect!` 自带的重连和 `monitor-node` 的上下线兜住其余。
+
+```scheme
+(node-start! 'a secret 4100 "0.0.0.0")
+
+;; 固定列表（自己会被跳过）
+(cluster-start `((discover . (static (b "10.0.0.2" 4100)
+                                     (c "10.0.0.3" 4100)))))
+
+;; 经 Redis：无中心记账，成员自维护
+(cluster-start `((name . "myapp")
+                 (discover . (redis ,conn "10.0.0.1" 4100))))  ; 广告自己
+
+;; 或任意返回 ((name host port) ...) 的 thunk
+(cluster-start `((discover . ,(lambda () (my-lookup)))))
+```
+
+**static** 策略是固定列表。**redis** 策略每轮把本节点的 `(name host port)`
+心跳进一个按过期时间戳打分的有序集合，剪掉过期项，读回活集——崩溃的节点在
+`ttl-ms` 后自己掉出，一个键、无需 `SCAN`。发现失败（Redis 挂了、DNS 抖动）
+只跳过这一轮、保留已建立的链路，绝不拆掉 mesh。
+
+选项：`(name . "default")` 给 Redis 键做命名空间；`(interval-ms . 5000)` 发现
+周期；`(ttl-ms . 15000)` Redis 注册在无心跳时的存活时长（设为几个周期）。
+`(cluster-stop handle)` 停止发现；已有链路保持。
+
+要跨集群单例或选主，这仍是错的层——见下方任务池那段说明。
+
 ### 分布式任务池
 
 `(igropyr dpool)` 把任务分散到成员节点上并发执行——本地 worker pool 的
