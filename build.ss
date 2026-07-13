@@ -22,6 +22,7 @@
     ("igropyr/gzip.sc" . 2)
     ("igropyr/otp.sc" . 2)
     ("igropyr/websocket.sc" . 2)
+    ("igropyr/node.sc" . 2)
     ("igropyr/ws-client.sc" . 2)
     ("igropyr/gen-server.sc" . 2)
     ("igropyr/conversation.sc" . 2)

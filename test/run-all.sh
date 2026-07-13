@@ -23,6 +23,7 @@ export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm
 "$scheme_bin" --script igropyr/test/sexpr-ws.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc
+"$scheme_bin" --script igropyr/test/node.sc
 "$scheme_bin" --script igropyr/test/fault-hook.sc
 "$scheme_bin" --script igropyr/test/conversation.sc
 
