@@ -289,7 +289,10 @@
 (fx-loop!
  (lambda (t dt)
    (let ((dtc (if (fl<? dt 0.05) dt 0.05)))
-     (set! tw (fl+ tw dtc))
+     ;; the front advances a fixed step per frame, exactly like the
+     ;; original fire -- the burn pace is the one you remember; only
+     ;; the ember physics runs on real dt
+     (set! tw (fl+ tw 0.016))
      (when (fl<? CYCLE tw) (set! tw (fl- tw CYCLE)))
      (let ((front (fl* (fl/ tw CYCLE) TRAVEL)))
        ;; embers step on the GPU: front buffer in, back buffer out
