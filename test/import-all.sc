@@ -6,6 +6,6 @@
         (igropyr conversation)
         (igropyr pubsub) (igropyr express) (igropyr session)
         (igropyr middleware) (igropyr metrics) (igropyr client)
-        (igropyr redis) (igropyr mysql) (igropyr node) (igropyr dpool))
+        (igropyr redis) (igropyr mysql) (igropyr node) (igropyr dpool) (igropyr cluster))
 (display "ALL LIBRARIES IMPORTED\n")
 

@@ -35,7 +35,8 @@
     ("igropyr/metrics.sc" . 2)
     ("igropyr/client.sc" . 2)
     ("igropyr/redis.sc" . 2)
-    ("igropyr/mysql.sc" . 2)))
+    ("igropyr/mysql.sc" . 2)
+    ("igropyr/cluster.sc" . 2)))
 
 (define (so-path src)
   (string-append (substring src 0 (- (string-length src) 3)) ".so"))
