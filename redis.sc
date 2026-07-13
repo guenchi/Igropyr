@@ -95,6 +95,8 @@
       ((number? a) (string->utf8 (number->string a)))
       (else (assertion-violation 'redis "bad command argument" a))))
 
+  (define crlf-bv (string->utf8 "\r\n"))
+
   (define (encode-command args)
     (let-values (((p get) (open-bytevector-output-port)))
       (put-bytevector p
@@ -106,7 +108,7 @@
               (string->utf8
                 (string-append "$" (number->string (bytevector-length bv)) "\r\n")))
             (put-bytevector p bv)
-            (put-bytevector p (string->utf8 "\r\n"))))
+            (put-bytevector p crlf-bv)))
         args)
       (get)))
 

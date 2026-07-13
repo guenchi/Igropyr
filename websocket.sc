@@ -25,13 +25,18 @@
 
   ;; ---- bytevector helpers -------------------------------------------------
 
+  ;; empty side returns the other unchanged (buffers are read-only here)
   (define (bv-append a b)
-    (let* ((la (bytevector-length a))
-           (lb (bytevector-length b))
-           (r (make-bytevector (+ la lb))))
-      (bytevector-copy! a 0 r 0 la)
-      (bytevector-copy! b 0 r la lb)
-      r))
+    (let ((la (bytevector-length a))
+          (lb (bytevector-length b)))
+      (cond
+        ((fx= la 0) b)
+        ((fx= lb 0) a)
+        (else
+         (let ((r (make-bytevector (fx+ la lb))))
+           (bytevector-copy! a 0 r 0 la)
+           (bytevector-copy! b 0 r la lb)
+           r)))))
 
   (define (bv-sub bv start end)
     (let ((r (make-bytevector (- end start))))
@@ -266,10 +271,13 @@
                        'more
                        (let ((payload (bv-sub bv data-off end)))
                          (when masked?
-                           (do ((i 0 (+ i 1))) ((= i plen))
+                           ;; per byte of every masked (client) frame:
+                           ;; fx ops and fxand i 3, not generic +/mod
+                           (do ((i 0 (fx+ i 1))) ((fx= i plen))
                              (bytevector-u8-set! payload i
                                (fxxor (bytevector-u8-ref payload i)
-                                      (bytevector-u8-ref bv (+ mask-off (mod i 4)))))))
+                                      (bytevector-u8-ref bv
+                                        (fx+ mask-off (fxand i 3)))))))
                          (vector fin? op payload end)))))))))))))
 
   ;; ---- ws session object -----------------------------------------------------
