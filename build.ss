@@ -28,6 +28,7 @@
     ("igropyr/conversation.sc" . 2)
     ("igropyr/http.sc" . 2)
     ("igropyr/pubsub.sc" . 2)
+    ("igropyr/dpool.sc" . 2)
     ("igropyr/express.sc" . 2)
     ("igropyr/session.sc" . 2)
     ("igropyr/middleware.sc" . 2)
