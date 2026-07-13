@@ -27,7 +27,7 @@
 ;;; fails to parse, an oversized frame, or an unknown shape drops the
 ;;; connection: a confused peer is a dead peer, never a guessed-at one.
 ;;;
-;;; Handshake (before anything else): mutual HMAC-SHA1 challenge/response
+;;; Handshake (before anything else): mutual HMAC-SHA256 challenge/response
 ;;; on a shared secret. The secret itself never crosses the wire and a
 ;;; recorded proof cannot be replayed against a fresh nonce:
 ;;;   acceptor -> (challenge <nonce-a>)
@@ -46,12 +46,20 @@
 (library (igropyr node)
   (export node-start! node-connect! node-disconnect! node-self
           rsend rcall monitor-node demonitor-node node-peers
-          monitor-remote demonitor-remote)
+          monitor-remote demonitor-remote node-set-limits!)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sexpr)
           (igropyr gen-server)
-          (only (igropyr websocket) sha1))
+          (only (igropyr crypto) hmac-sha256 bytevector->hex))
 
-  (define max-frame 8388608)        ; 8 MiB per datum
+  (define max-frame 8388608)        ; 8 MiB per datum, once authenticated
+  ;; Pre-auth, an unauthenticated peer may only send this many bytes per
+  ;; frame. The handshake datums -- (challenge n), (hello name proof n),
+  ;; (welcome name proof) -- are a few hundred bytes; 4 KiB is generous.
+  ;; This is the hard cap on how much attacker-chosen input reaches the
+  ;; parser before the HMAC is verified, so a stranger cannot make the
+  ;; node parse (allocate lists for, intern symbols from, build
+  ;; bytevectors out of) a multi-megabyte datum.
+  (define handshake-max-frame 4096)
   (define handshake-timeout-ms 5000)
   (define tick-ms 15000)            ; heartbeat interval
   (define dead-ms 60000)            ; silence longer than this = dead link
@@ -100,6 +108,32 @@
   (define-syntax atomically
     (syntax-rules ()
       ((_ body ...) (with-interrupts-disabled body ...))))
+
+  ;; ---- inbound backpressure -------------------------------------------
+  ;; A remote (call ...) spawns a process to serve it; a remote (mon ...)
+  ;; spawns a long-lived monitor agent. Both are driven purely by frames
+  ;; the peer sends, so without a ceiling one buggy or hostile -- but
+  ;; authenticated -- member could make this node spawn processes without
+  ;; bound. Two global caps hold the line (see dispatch!):
+  ;;   - serve-rcall processes in flight: over the cap the call is SHED,
+  ;;     answered at once with (error overload) so the caller fails fast
+  ;;     rather than hanging (queuing is pointless -- rcall has its own
+  ;;     timeout, and a held slot is a parked process either way).
+  ;;   - hosted monitors (callee-agents): over the cap the monitor is
+  ;;     REFUSED with (mdown ... overload).
+  ;; Generous by default -- a ceiling on a flood, not a throttle on
+  ;; healthy traffic; tune with node-set-limits!.
+  (define max-rcall-serving 256)
+  (define max-hosted-monitors 4096)
+  (define rcall-serving 0)
+
+  ;; take a serve-rcall slot iff one is free; #t if taken
+  (define (rcall-slot-take!)
+    (atomically
+      (and (fx< rcall-serving max-rcall-serving)
+           (begin (set! rcall-serving (fx+ rcall-serving 1)) #t))))
+  (define (rcall-slot-free!)
+    (atomically (set! rcall-serving (fx- rcall-serving 1))))
 
   (define (peer-entry name)
     (atomically (hashtable-ref peers name #f)))
@@ -169,16 +203,18 @@
                                   "\n"))))
       (tcp-writev! c (list head body) #f)))
 
-  ;; Try to split one frame off buf.
+  ;; Try to split one frame off buf. `limit` bounds the body length --
+  ;; handshake-max-frame during the handshake, max-frame once the link
+  ;; is authenticated.
   ;; -> (values datum rest) | (values 'more #f) ; raises 'protocol on junk
-  (define (parse-frame buf)
+  (define (parse-frame buf limit)
     (let ((n (bytevector-length buf)))
       (let scan ((i 0) (len 0))
         (cond
           ((fx> i 8) (raise 'protocol))            ; length header too long
           ((fx>= i n) (values 'more #f))
           ((fx= (bytevector-u8-ref buf i) 10)      ; newline
-           (when (or (fx= i 0) (> len max-frame)) (raise 'protocol))
+           (when (or (fx= i 0) (> len limit)) (raise 'protocol))
            (let ((total (fx+ i 1 len)))
              (if (< n total)
                  (values 'more #f)
@@ -193,39 +229,18 @@
   ;; Block (in the calling process) until one whole frame arrives.
   ;; -> (values datum rest) ; raises 'closed / 'timeout / 'protocol /
   ;; the sexpr-error vector on a malformed datum
-  (define (read-frame c buf timeout)
-    (let-values (((d rest) (parse-frame buf)))
+  (define (read-frame c buf timeout limit)
+    (let-values (((d rest) (parse-frame buf limit)))
       (if (eq? d 'more)
           (receive (after timeout (raise 'timeout))
-            (`#(tcp-data ,bv) (read-frame c (bv-append buf bv) timeout))
+            (`#(tcp-data ,bv) (read-frame c (bv-append buf bv) timeout limit))
             (`#(tcp-eof) (raise 'closed))
             (`#(tcp-error ,e) (raise 'closed))
             (`#(node-stop) (raise 'stop)))
           (values d rest))))
 
-  ;; ---- HMAC-SHA1 handshake proofs ----------------------------------------
-
-  (define (hmac-sha1 key msg)
-    (let* ((block 64)
-           (k (if (> (bytevector-length key) block) (sha1 key) key))
-           (k+ (make-bytevector block 0))
-           (ipad (make-bytevector block))
-           (opad (make-bytevector block)))
-      (bytevector-copy! k 0 k+ 0 (bytevector-length k))
-      (do ((i 0 (fx+ i 1))) ((fx= i block))
-        (let ((b (bytevector-u8-ref k+ i)))
-          (bytevector-u8-set! ipad i (fxxor b #x36))
-          (bytevector-u8-set! opad i (fxxor b #x5c))))
-      (sha1 (bv-append opad (sha1 (bv-append ipad msg))))))
-
-  (define hex-digits "0123456789abcdef")
-  (define (bytevector->hex bv)
-    (let* ((n (bytevector-length bv)) (s (make-string (* n 2))))
-      (do ((i 0 (fx+ i 1))) ((fx= i n) s)
-        (let ((b (bytevector-u8-ref bv i)))
-          (string-set! s (fx* i 2) (string-ref hex-digits (fxsrl b 4)))
-          (string-set! s (fx+ (fx* i 2) 1)
-                       (string-ref hex-digits (fxand b 15)))))))
+  ;; ---- HMAC-SHA256 handshake proofs --------------------------------------
+  ;; hmac-sha256 and bytevector->hex come from (igropyr crypto).
 
   (define (random-hex nbytes)
     (call-with-port (open-file-input-port "/dev/urandom")
@@ -237,7 +252,7 @@
 
   (define (proof nonce name)
     (bytevector->hex
-      (hmac-sha1 self-secret
+      (hmac-sha256 self-secret
         (string->utf8 (string-append nonce ":" (symbol->string name))))))
 
   ;; constant-time compare: an attacker probing digests byte by byte
@@ -280,6 +295,17 @@
       (and won? #t)))
 
   ;; idempotent: only removes the entry if it still belongs to this conn
+  ;; The link to `name` is gone, so every monitor we HOST on its behalf
+  ;; is now unreportable: tear them down (each demon-local demonitors the
+  ;; local process and frees its callee-agents slot). Without this a peer
+  ;; that connects, parks monitors, and drops -- over and over -- would
+  ;; leak agents and eventually exhaust max-hosted-monitors.
+  (define (drop-hosted-monitors! name)
+    (let-values (((keys agents) (atomically (hashtable-entries callee-agents))))
+      (vector-for-each
+        (lambda (k agent) (when (eq? (car k) name) (send agent (vector 'demon-local))))
+        keys agents)))
+
   (define (remove-peer! name c)
     (let ((mine?
            (atomically
@@ -288,6 +314,7 @@
                     (begin (hashtable-delete! peers name) #t))))))
       (tcp-close! c)
       (when mine?
+        (drop-hosted-monitors! name)       ; free monitors this peer parked here
         (fail-monitors-for! name)          ; DOWN(noconnection) for watchers
         (notify! name 'node-down))))
 
@@ -301,10 +328,17 @@
       ((and (frame? d 'send 3) (symbol? (cadr d)))
        (let ((p (whereis (cadr d))))
          (when p (send p (caddr d)))))          ; unregistered name: drop
-      ;; (call ,reg-name ,ref ,msg) -> serve a cross-node rcall
+      ;; (call ,reg-name ,ref ,msg) -> serve a cross-node rcall, unless we
+      ;; are already serving the maximum: then shed, answering (error
+      ;; overload) at once. The slot is released when the server finishes.
       ((and (frame? d 'call 4) (symbol? (cadr d)))
        (let ((reg (cadr d)) (ref (caddr d)) (m (cadddr d)))
-         (spawn (lambda () (serve-rcall! peer reg ref m)))))
+         (if (rcall-slot-take!)
+             (spawn (lambda ()
+                      (serve-rcall! peer reg ref m)
+                      (rcall-slot-free!)))
+             (guard (e (#t (void)))
+               (write-frame! c (list 'reply ref (list 'error 'overload)))))))
       ;; (reply ,ref ,result) -> route back to the waiting rcall caller,
       ;; but only if the reply arrives from the node that call targeted
       ;; (a ref is bound to its node, so one peer can't answer a call
@@ -314,16 +348,26 @@
          (let ((slot (atomically (hashtable-ref pending ref #f))))
            (when (and slot (eq? (vector-ref slot 1) peer))
              (send (vector-ref slot 0) (vector 'rcall-reply ref result))))))
-      ;; (mon ,name ,mref ,origin) -> watch our local reg-name for origin.
-      ;; Register the agent in callee-agents SYNCHRONOUSLY (before it can
-      ;; run), so a demon frame that follows on this same link always
-      ;; finds it -- the agent spawn alone would race the demon.
-      ((and (frame? d 'mon 4) (symbol? (cadr d)) (symbol? (cadddr d)))
-       (let* ((name (cadr d)) (mref (caddr d)) (origin (cadddr d))
+      ;; (mon ,name ,mref) -> watch our local reg-name for the peer at the
+      ;; far end of this link. The watcher node is `peer` (the identity
+      ;; the handshake authenticated), NOT a field in the frame: a node
+      ;; must not be able to name a THIRD node as the monitor origin and
+      ;; have our mdown notifications routed there. Register the agent in
+      ;; callee-agents SYNCHRONOUSLY (before it can run) so a demon frame
+      ;; that follows on this same link always finds it -- the agent spawn
+      ;; alone would race the demon.
+      ((and (frame? d 'mon 3) (symbol? (cadr d)))
+       (let* ((name (cadr d)) (mref (caddr d))
               (key (cons peer mref)))
-         (atomically
-           (hashtable-set! callee-agents key
-             (spawn (lambda () (mon-agent origin key name)))))))
+         (unless (atomically
+                   (and (fx< (hashtable-size callee-agents) max-hosted-monitors)
+                        (begin
+                          (hashtable-set! callee-agents key
+                            (spawn (lambda () (mon-agent peer key name))))
+                          #t)))
+           ;; at the hosting ceiling: refuse, tell the watcher at once
+           (guard (e (#t (void)))
+             (write-frame! c (list 'mdown mref 'overload))))))
       ;; (mdown ,mref ,reason) -> the watched process/link is gone; only
       ;; honor it from the node the monitor actually targets
       ((frame? d 'mdown 3)
@@ -374,20 +418,22 @@
   ;; missing name is an immediate 'noproc. The reason is shipped as-is
   ;; when wire-safe, else degraded to 'exit -- a monitor must always
   ;; deliver a DOWN, never wedge on a non-serializable reason.
-  ;; key is (peer . mref); dispatch registered us under it before we ran
-  (define (mon-agent origin key name)
+  ;; key is (peer . mref); dispatch registered us under it before we ran.
+  ;; watcher is that same peer -- the authenticated far end -- and is the
+  ;; only node we ever report this DOWN back to.
+  (define (mon-agent watcher key name)
     (let ((mref (cdr key))
           (p (whereis name)))
       (if (not p)
           (begin
             (atomically (hashtable-delete! callee-agents key))
-            (link-write origin (list 'mdown mref 'noproc)))
+            (link-write watcher (list 'mdown mref 'noproc)))
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
                 (atomically (hashtable-delete! callee-agents key))
-                (guard (e (#t (link-write origin (list 'mdown mref 'exit))))
-                  (link-write origin (list 'mdown mref reason))))
+                (guard (e (#t (link-write watcher (list 'mdown mref 'exit))))
+                  (link-write watcher (list 'mdown mref reason))))
               (`#(demon-local)
                 (demonitor m)
                 (atomically (hashtable-delete! callee-agents key))))))))
@@ -433,7 +479,7 @@
 
   (define (link-loop c peer buf last-seen)
     (let drain ((buf buf))
-      (let-values (((d rest) (parse-frame buf)))
+      (let-values (((d rest) (parse-frame buf max-frame)))
         (if (eq? d 'more)
             (receive (after tick-ms
                         (if (> (- (now-ms) last-seen) dead-ms)
@@ -458,7 +504,8 @@
     (guard (e (#t (tcp-close! c)))              ; failed handshake: just close
       (let ((nonce (random-hex 16)))
         (write-frame! c (list 'challenge nonce))
-        (let-values (((d buf) (read-frame c empty-bv handshake-timeout-ms)))
+        (let-values (((d buf) (read-frame c empty-bv handshake-timeout-ms
+                                          handshake-max-frame)))
           (unless (and (pair? d) (eq? (car d) 'hello)
                        (= (length d) 4)
                        (symbol? (cadr d))
@@ -484,14 +531,16 @@
           (guard (e ((eq? e 'stop) (tcp-close! c) (raise 'stop))
                     (#t (tcp-close! c)))
             (tcp-read-start! c)
-            (let-values (((d buf) (read-frame c empty-bv handshake-timeout-ms)))
+            (let-values (((d buf) (read-frame c empty-bv handshake-timeout-ms
+                                              handshake-max-frame)))
               (unless (and (pair? d) (eq? (car d) 'challenge)
                            (= (length d) 2) (string? (cadr d)))
                 (raise 'auth))
               (let ((nonce-b (random-hex 16)))
                 (write-frame! c
                   (list 'hello self-name (proof (cadr d) self-name) nonce-b))
-                (let-values (((d2 buf2) (read-frame c buf handshake-timeout-ms)))
+                (let-values (((d2 buf2) (read-frame c buf handshake-timeout-ms
+                                                    handshake-max-frame)))
                   (unless (and (pair? d2) (eq? (car d2) 'welcome)
                                (= (length d2) 3)
                                (eq? (cadr d2) peer)   ; it must BE who we dialed
@@ -523,6 +572,12 @@
   (define (node-start! name secret . rest)
     (unless (and (symbol? name) (string? secret))
       (assertion-violation 'node-start! "want (name-symbol secret-string)" name))
+    ;; A short secret makes the HMAC handshake brute-forceable; an empty
+    ;; one disables auth entirely. Refuse both. (The length is reported,
+    ;; never the secret itself.)
+    (when (< (string-length secret) 8)
+      (assertion-violation 'node-start!
+        "secret must be at least 8 characters" (string-length secret)))
     (when self-name
       (assertion-violation 'node-start! "node already started" self-name))
     (set! self-name name)
@@ -562,6 +617,22 @@
       (when e (send (vector-ref e 1) (vector 'node-stop))))
     (void))
 
+  ;; Tune the inbound backpressure ceilings: the max serve-rcall
+  ;; processes in flight and the max monitors hosted for remote watchers.
+  ;; #f leaves either at its current value. The defaults (256 / 4096)
+  ;; suit ordinary meshes; raise them for a hub node, lower them to bound
+  ;; a node more tightly. Takes effect immediately for new frames.
+  (define (node-set-limits! rcall-cap monitor-cap)
+    (when rcall-cap
+      (unless (and (integer? rcall-cap) (exact? rcall-cap) (> rcall-cap 0))
+        (assertion-violation 'node-set-limits! "rcall cap must be a positive integer" rcall-cap))
+      (set! max-rcall-serving rcall-cap))
+    (when monitor-cap
+      (unless (and (integer? monitor-cap) (exact? monitor-cap) (> monitor-cap 0))
+        (assertion-violation 'node-set-limits! "monitor cap must be a positive integer" monitor-cap))
+      (set! max-hosted-monitors monitor-cap))
+    (void))
+
   ;; Send msg to the process registered as reg-name on node. #t = handed
   ;; to a live link (delivery still unconfirmed, as within a node); #f =
   ;; no link. Own node name = plain local send. Raises if msg contains
@@ -580,9 +651,11 @@
   ;; Synchronous cross-node call to the GEN-SERVER registered as
   ;; reg-name on node; returns its reply, blocking the caller (default
   ;; 5s timeout). The own node name is a plain local gen-server-call.
-  ;; Raises #(rcall-error <reason> <target>) on no link, timeout, or a
+  ;; Raises #(rcall-error <reason> <target>) on no link, timeout, a
   ;; remote failure (no such server / it died / a non-serializable
-  ;; reply). Both msg and the reply must be extended-wire-safe.
+  ;; reply), or 'overload when the target is already serving its maximum
+  ;; concurrent rcalls (see node-set-limits!). Both msg and the reply
+  ;; must be extended-wire-safe.
   (define (rcall node reg-name msg . rest)
     (let ((timeout (if (pair? rest) (car rest) 5000)))
       (cond
@@ -618,6 +691,8 @@
   ;;   - 'noconnection if the link to node drops first (the target may
   ;;                   be alive or dead -- indistinguishable across a
   ;;                   broken link, as in Erlang)
+  ;;   - 'overload     if node is already hosting its maximum number of
+  ;;                   remote monitors and refuses another (node-set-limits!)
   ;; Returns a monitor ref for demonitor-remote. The own node name is a
   ;; local watch (still reported as remote-down, for a uniform API).
   ;; This is process-level; monitor-node is the node-level counterpart.
@@ -633,7 +708,9 @@
         ((live-entry node)
          => (lambda (e)
               (atomically (hashtable-set! rmonitors mref (vector self node name)))
-              (write-frame! (vector-ref e 0) (list 'mon name mref self-name))))
+              ;; no origin field: the target derives the watcher from the
+              ;; authenticated far end of this very link (see dispatch!)
+              (write-frame! (vector-ref e 0) (list 'mon name mref))))
         (else
          ;; no link at all: report immediately, nothing to install
          (send self (vector 'remote-down node name 'noconnection))))

@@ -25,7 +25,7 @@
 (library (igropyr mysql)
   (export mysql-connect mysql-pool mysql-query mysql-close!)
   (import (chezscheme) (igropyr actor) (igropyr libuv)
-          (only (igropyr websocket) sha1))
+          (only (igropyr crypto) sha1 sha256 base64-decode))
 
   (define connect-timeout-ms 10000)
   (define query-timeout-ms 60000)
@@ -65,114 +65,8 @@
               ((fx= (bytevector-u8-ref bv i) byte) i)
               (else (loop (+ i 1)))))))
 
-  ;; ---- SHA-256 --------------------------------------------------------------
-
-  (define mask32 #xFFFFFFFF)
-
-  (define (rotr32 x n)
-    (fxior (fxsrl x n)
-           (fxsll (fxand x (fx- (fxsll 1 n) 1)) (fx- 32 n))))
-
-  (define (shr32 x n) (fxsrl x n))
-
-  (define (add32 . xs) (fxand (apply fx+ xs) mask32))
-
-  (define sha256-k
-    '#(#x428a2f98 #x71374491 #xb5c0fbcf #xe9b5dba5 #x3956c25b #x59f111f1
-       #x923f82a4 #xab1c5ed5 #xd807aa98 #x12835b01 #x243185be #x550c7dc3
-       #x72be5d74 #x80deb1fe #x9bdc06a7 #xc19bf174 #xe49b69c1 #xefbe4786
-       #x0fc19dc6 #x240ca1cc #x2de92c6f #x4a7484aa #x5cb0a9dc #x76f988da
-       #x983e5152 #xa831c66d #xb00327c8 #xbf597fc7 #xc6e00bf3 #xd5a79147
-       #x06ca6351 #x14292967 #x27b70a85 #x2e1b2138 #x4d2c6dfc #x53380d13
-       #x650a7354 #x766a0abb #x81c2c92e #x92722c85 #xa2bfe8a1 #xa81a664b
-       #xc24b8b70 #xc76c51a3 #xd192e819 #xd6990624 #xf40e3585 #x106aa070
-       #x19a4c116 #x1e376c08 #x2748774c #x34b0bcb5 #x391c0cb3 #x4ed8aa4a
-       #x5b9cca4f #x682e6ff3 #x748f82ee #x78a5636f #x84c87814 #x8cc70208
-       #x90befffa #xa4506ceb #xbef9a3f7 #xc67178f2))
-
-  (define (sha256 msg)
-    (let* ((len (bytevector-length msg))
-           (padlen (let ((r (mod (+ len 1) 64)))
-                     (if (<= r 56) (- 56 r) (- 120 r))))
-           (total (+ len 1 padlen 8))
-           (buf (make-bytevector total 0))
-           (w (make-vector 64 0)))
-      (bytevector-copy! msg 0 buf 0 len)
-      (bytevector-u8-set! buf len #x80)
-      (do ((i 0 (+ i 1))) ((= i 8))
-        (bytevector-u8-set! buf (- total 1 i)
-          (fxand (bitwise-arithmetic-shift-right (* len 8) (* 8 i)) #xFF)))
-      (let blocks ((blk 0)
-                   (h0 #x6a09e667) (h1 #xbb67ae85) (h2 #x3c6ef372)
-                   (h3 #xa54ff53a) (h4 #x510e527f) (h5 #x9b05688c)
-                   (h6 #x1f83d9ab) (h7 #x5be0cd19))
-        (if (= blk (div total 64))
-            (let ((out (make-bytevector 32)))
-              (let put ((i 0) (hs (list h0 h1 h2 h3 h4 h5 h6 h7)))
-                (unless (null? hs)
-                  (let ((h (car hs)))
-                    (bytevector-u8-set! out i (fxsrl h 24))
-                    (bytevector-u8-set! out (+ i 1) (fxand (fxsrl h 16) #xFF))
-                    (bytevector-u8-set! out (+ i 2) (fxand (fxsrl h 8) #xFF))
-                    (bytevector-u8-set! out (+ i 3) (fxand h #xFF)))
-                  (put (+ i 4) (cdr hs))))
-              out)
-            (begin
-              (do ((t 0 (+ t 1))) ((= t 16))
-                (let ((b (+ (* blk 64) (* t 4))))
-                  (vector-set! w t
-                    (fxior (fxsll (bytevector-u8-ref buf b) 24)
-                           (fxsll (bytevector-u8-ref buf (+ b 1)) 16)
-                           (fxsll (bytevector-u8-ref buf (+ b 2)) 8)
-                           (bytevector-u8-ref buf (+ b 3))))))
-              (do ((t 16 (+ t 1))) ((= t 64))
-                (let ((s0 (let ((x (vector-ref w (- t 15))))
-                            (fxxor (rotr32 x 7) (rotr32 x 18) (shr32 x 3))))
-                      (s1 (let ((x (vector-ref w (- t 2))))
-                            (fxxor (rotr32 x 17) (rotr32 x 19) (shr32 x 10)))))
-                  (vector-set! w t
-                    (add32 (vector-ref w (- t 16)) s0 (vector-ref w (- t 7)) s1))))
-              (let rounds ((t 0) (a h0) (b h1) (c h2) (d h3)
-                           (e h4) (f h5) (g h6) (h h7))
-                (if (= t 64)
-                    (blocks (+ blk 1)
-                            (add32 h0 a) (add32 h1 b) (add32 h2 c) (add32 h3 d)
-                            (add32 h4 e) (add32 h5 f) (add32 h6 g) (add32 h7 h))
-                    (let* ((S1 (fxxor (rotr32 e 6) (rotr32 e 11) (rotr32 e 25)))
-                           (ch (fxxor (fxand e f) (fxand (fxxor e mask32) g)))
-                           (t1 (add32 h S1 ch (vector-ref sha256-k t) (vector-ref w t)))
-                           (S0 (fxxor (rotr32 a 2) (rotr32 a 13) (rotr32 a 22)))
-                           (mj (fxxor (fxand a b) (fxand a c) (fxand b c)))
-                           (t2 (add32 S0 mj)))
-                      (rounds (+ t 1)
-                              (add32 t1 t2) a b c
-                              (add32 d t1) e f g)))))))))
-
-  ;; ---- base64 decode ----------------------------------------------------------
-
-  (define (b64-value ch)
-    (cond
-      ((and (char<=? #\A ch) (char<=? ch #\Z)) (- (char->integer ch) 65))
-      ((and (char<=? #\a ch) (char<=? ch #\z)) (+ 26 (- (char->integer ch) 97)))
-      ((and (char<=? #\0 ch) (char<=? ch #\9)) (+ 52 (- (char->integer ch) 48)))
-      ((char=? ch #\+) 62)
-      ((char=? ch #\/) 63)
-      (else #f)))
-
-  (define (base64-decode s)
-    (let-values (((p get) (open-bytevector-output-port)))
-      (let loop ((i 0) (acc 0) (bits 0))
-        (if (= i (string-length s))
-            (get)
-            (let ((v (b64-value (string-ref s i))))
-              (if (not v)
-                  (loop (+ i 1) acc bits)   ; skip '=', newlines, etc.
-                  (let ((acc (+ (* acc 64) v)) (bits (+ bits 6)))
-                    (if (>= bits 8)
-                        (let ((keep (- bits 8)))
-                          (put-u8 p (fxand (bitwise-arithmetic-shift-right acc keep) #xFF))
-                          (loop (+ i 1) (fxand acc (- (fxsll 1 keep) 1)) keep))
-                        (loop (+ i 1) acc bits)))))))))
+  ;; SHA-256 and base64-decode (for the caching_sha2 auth scramble and
+  ;; the RSA public-key PEM) come from (igropyr crypto).
 
   ;; ---- minimal DER: extract RSA modulus and exponent from a PEM key --------------
 

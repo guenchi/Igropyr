@@ -23,7 +23,10 @@
 ;;; adds three types to the whitelist, for igropyr-to-igropyr links
 ;;; (node meshes) where the peer is this same codec:
 ;;;   vectors      #(...)       -- no dotted tail, depth-limited
-;;;   bytevectors  #vu8(...)    -- bare exact integers 0..255 only
+;;;   bytevectors  #vu8"b64"    -- base64 (RFC 4648) of the raw bytes;
+;;;                                ~1.33x on the wire and decoded in one
+;;;                                pass, vs the ~4x text and O(n)-list
+;;;                                blowup a #vu8(0 1 255 ...) form costs
 ;;;   flonums      1.5, -2e10   -- FINITE only; inf/nan are rejected
 ;;;                                on read AND write; Chez prints the
 ;;;                                shortest form that reads back
@@ -38,9 +41,16 @@
 (library (igropyr sexpr)
   (export string->sexpr sexpr->string
           string->sexpr-extended sexpr->string-extended)
-  (import (chezscheme))
+  (import (chezscheme) (only (igropyr crypto) base64-encode base64-decode))
 
   (define default-max-depth 64)
+  ;; Cap on a single atom token (symbol or number). Bounds two costs an
+  ;; untrusted sender could otherwise inflate without limit: interning a
+  ;; multi-megabyte symbol into the global symbol table, and the
+  ;; superlinear bignum build of an enormous digit run. 64 KiB is far
+  ;; above any real wire tag, name, or number; strings are not tokens
+  ;; and stay bounded by the caller's frame/body size limit instead.
+  (define default-max-token 65536)
 
   (define (sfail msg pos)
     (raise (vector 'sexpr-error msg pos)))
@@ -121,14 +131,14 @@
             ((#\()                               ; extended: vector
              (unless ext? (sfail "bad # literal" i))
              (parse-vector (+ i 1) depth))
-            ((#\v)                               ; extended: #vu8(...)
+            ((#\v)                               ; extended: #vu8"<base64>"
              (unless (and ext?
                           (< (+ i 3) n)
                           (char=? (string-ref s (+ i 1)) #\u)
                           (char=? (string-ref s (+ i 2)) #\8)
-                          (char=? (string-ref s (+ i 3)) #\())
+                          (char=? (string-ref s (+ i 3)) #\"))
                (sfail "bad # literal" i))
-             (parse-bytevector (+ i 4)))
+             (parse-bytevector-b64 (+ i 4)))
             (else (sfail "bad # literal" i)))))
       ;; extended: like a list body, but a dotted tail is illegal
       (define (parse-vector i depth)
@@ -144,17 +154,21 @@
               (else
                (let-values (((v j) (parse-value i (+ depth 1))))
                  (loop j (cons v acc))))))))
-      ;; extended: elements are BARE exact integers 0..255, nothing else
-      (define (parse-bytevector i)
-        (let loop ((i i) (acc '()))
-          (let ((i (skip i)))
-            (when (>= i n) (sfail "unterminated bytevector" i))
-            (if (char=? (string-ref s i) #\))
-                (values (u8-list->bytevector (reverse acc)) (+ i 1))
-                (let-values (((v j) (parse-atom i)))
-                  (unless (and (integer? v) (exact? v) (<= 0 v 255))
-                    (sfail "bytevector element out of range" i))
-                  (loop j (cons v acc)))))))
+      ;; extended: the payload is base64 (RFC 4648); read to the closing
+      ;; quote and decode straight into a bytevector -- no per-element
+      ;; list, so no O(n) allocation blowup. The base64 alphabet has no
+      ;; " or \, so there is nothing to escape; a stray char fails loudly.
+      (define (parse-bytevector-b64 start)
+        (let loop ((j start))
+          (cond
+            ((>= j n) (sfail "unterminated bytevector" start))
+            ((char=? (string-ref s j) #\")
+             (values (base64-decode (substring s start j)) (+ j 1)))
+            ((let ((c (string-ref s j)))
+               (or (char<=? #\A c #\Z) (char<=? #\a c #\z) (char<=? #\0 c #\9)
+                   (char=? c #\+) (char=? c #\/) (char=? c #\=)))
+             (loop (+ j 1)))
+            (else (sfail "bad base64 in bytevector" j)))))
       (define (digits? str a b)
         (and (< a b)
              (let lp ((i a))
@@ -213,6 +227,7 @@
       (define (parse-atom i)
         (let ((j (let lp ((j i))
                    (if (or (>= j n) (delim? (string-ref s j))) j (lp (+ j 1))))))
+          (when (> (- j i) default-max-token) (sfail "token too long" i))
           (let ((tok (substring s i j)))
             (cond
               ((token->number tok) => (lambda (v) (values v j)))
@@ -283,12 +298,9 @@
            (emit (vector-ref x i) p (+ depth 1) ext?)))
        (put-char p #\)))
       ((and ext? (bytevector? x))
-       (put-string p "#vu8(")
-       (let ((m (bytevector-length x)))
-         (do ((i 0 (+ i 1))) ((= i m))
-           (when (> i 0) (put-char p #\space))
-           (put-string p (number->string (bytevector-u8-ref x i)))))
-       (put-char p #\)))
+       (put-string p "#vu8\"")
+       (put-string p (base64-encode x))
+       (put-char p #\"))
       ((and ext? (flonum? x))
        (when (or (nan? x) (infinite? x))
          (sfail "non-finite flonum" 0))

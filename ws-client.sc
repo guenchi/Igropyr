@@ -28,7 +28,8 @@
           ;; never conflicts.
           start-scheduler spawn send receive self
           sleep-ms kill register whereis process-id)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr websocket))
+  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr websocket)
+          (only (igropyr crypto) base64-encode))
 
   (define connect-timeout-ms 10000)
   (define default-port 80)

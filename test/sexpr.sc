@@ -100,7 +100,7 @@
        (ext-round-trips? '(user (id . 42) (name . "ada") 1/3 #t)))
 (check "ext-wire-text"
        (string=? (sexpr->string-extended '#(1 #vu8(2 3) 4.5))
-                 "#(1 #vu8(2 3) 4.5)"))
+                 "#(1 #vu8\"AgM=\" 4.5)"))
 
 ;; extended mode still rejects everything outside ITS whitelist
 (check "ext-no-inf-read" (ext-parse-fails? "1e999"))       ; reads as +inf.0
@@ -110,13 +110,14 @@
 (check "ext-no-eval" (ext-parse-fails? "#;(walk in) 42"))
 (check "ext-no-dotted-vector" (ext-parse-fails? "#(1 . 2)"))
 (check "ext-vector-unterminated" (ext-parse-fails? "#(1 2"))
-(check "ext-bv-range" (ext-parse-fails? "#vu8(256)"))
-(check "ext-bv-negative" (ext-parse-fails? "#vu8(-1)"))
-(check "ext-bv-ratio" (ext-parse-fails? "#vu8(1/2)"))
-(check "ext-bv-float" (ext-parse-fails? "#vu8(1.5)"))
-(check "ext-bv-nested" (ext-parse-fails? "#vu8((1))"))
-(check "ext-bv-unterminated" (ext-parse-fails? "#vu8(1 2"))
-(check "ext-bv-bad-prefix" (ext-parse-fails? "#vu9(1)"))
+(check "ext-bv-base64-decode"                          ; "AgM=" -> bytes 2,3
+       (equal? (bytevector 2 3) (string->sexpr-extended "#vu8\"AgM=\"")))
+(check "ext-bv-base64-empty"
+       (equal? (bytevector) (string->sexpr-extended "#vu8\"\"")))
+(check "ext-bv-no-paren" (ext-parse-fails? "#vu8(1 2 3)"))   ; old form gone
+(check "ext-bv-bad-base64" (ext-parse-fails? "#vu8\"@@@\""))  ; not base64
+(check "ext-bv-unterminated" (ext-parse-fails? "#vu8\"AgM"))  ; no closing "
+(check "ext-bv-bad-prefix" (ext-parse-fails? "#vu9\"\""))
 (check "ext-no-write-proc" (ext-write-fails? car))
 (check "ext-depth-bomb"
        (ext-parse-fails?
@@ -125,7 +126,7 @@
 
 ;; the extension must not leak into strict mode
 (check "strict-still-no-vector" (parse-fails? "#(1 2 3)"))
-(check "strict-still-no-bv" (parse-fails? "#vu8(1)"))
+(check "strict-still-no-bv" (parse-fails? "#vu8\"AgM=\""))
 (check "strict-still-no-float" (parse-fails? "1.5"))
 (check "strict-still-no-write-bv" (write-fails? (bytevector 1)))
 

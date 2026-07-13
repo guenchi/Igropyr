@@ -15,10 +15,11 @@
 ;;; ws-recv answers pings automatically and handles fragmented messages.
 
 (library (igropyr websocket)
-  (export ws-accept-key sha1 base64-encode
+  (export ws-accept-key
           make-ws make-ws-client ws? ws-conn
           ws-recv ws-send-text! ws-send-binary! ws-close!)
-  (import (chezscheme) (igropyr actor) (igropyr libuv))
+  (import (chezscheme) (igropyr actor) (igropyr libuv)
+          (only (igropyr crypto) sha1 base64-encode))
 
   (define max-frame 1048576)          ; single frame payload cap
   (define max-message 8388608)        ; reassembled multi-frame message cap
@@ -53,117 +54,7 @@
                 (bytevector-copy! x 0 out off (bytevector-length x))
                 (loop (cdr l) (+ off (bytevector-length x)))))))))
 
-  ;; ---- SHA-1 (needed only for the handshake; not for security) --------------
-
-  (define mask32 #xFFFFFFFF)
-
-  (define (rotl32 x n)
-    (fxior (fxsll (fxand x (fx- (fxsll 1 (fx- 32 n)) 1)) n)
-           (fxsrl x (fx- 32 n))))
-
-  (define (add32 . xs)
-    (fxand (apply fx+ xs) mask32))
-
-  (define (sha1 msg)
-    (let* ((len (bytevector-length msg))
-           (padlen (let ((r (mod (+ len 1) 64)))
-                     (if (<= r 56) (- 56 r) (- 120 r))))
-           (total (+ len 1 padlen 8))
-           (buf (make-bytevector total 0))
-           (w (make-vector 80 0)))
-      (bytevector-copy! msg 0 buf 0 len)
-      (bytevector-u8-set! buf len #x80)
-      ;; 64-bit big-endian bit length
-      (do ((i 0 (+ i 1))) ((= i 8))
-        (bytevector-u8-set! buf (- total 1 i)
-          (fxand (bitwise-arithmetic-shift-right (* len 8) (* 8 i)) #xFF)))
-      (let blocks ((blk 0)
-                   (h0 #x67452301) (h1 #xEFCDAB89) (h2 #x98BADCFE)
-                   (h3 #x10325476) (h4 #xC3D2E1F0))
-        (if (= blk (div total 64))
-            (let ((out (make-bytevector 20)))
-              (let put ((i 0) (hs (list h0 h1 h2 h3 h4)))
-                (unless (null? hs)
-                  (let ((h (car hs)))
-                    (bytevector-u8-set! out i (fxsrl h 24))
-                    (bytevector-u8-set! out (+ i 1) (fxand (fxsrl h 16) #xFF))
-                    (bytevector-u8-set! out (+ i 2) (fxand (fxsrl h 8) #xFF))
-                    (bytevector-u8-set! out (+ i 3) (fxand h #xFF)))
-                  (put (+ i 4) (cdr hs))))
-              out)
-            (begin
-              (do ((t 0 (+ t 1))) ((= t 16))
-                (let ((b (+ (* blk 64) (* t 4))))
-                  (vector-set! w t
-                    (fxior (fxsll (bytevector-u8-ref buf b) 24)
-                           (fxsll (bytevector-u8-ref buf (+ b 1)) 16)
-                           (fxsll (bytevector-u8-ref buf (+ b 2)) 8)
-                           (bytevector-u8-ref buf (+ b 3))))))
-              (do ((t 16 (+ t 1))) ((= t 80))
-                (vector-set! w t
-                  (rotl32 (fxxor (vector-ref w (- t 3))
-                                 (vector-ref w (- t 8))
-                                 (vector-ref w (- t 14))
-                                 (vector-ref w (- t 16)))
-                          1)))
-              (let rounds ((t 0) (a h0) (b h1) (c h2) (d h3) (e h4))
-                (if (= t 80)
-                    (blocks (+ blk 1)
-                            (add32 h0 a) (add32 h1 b) (add32 h2 c)
-                            (add32 h3 d) (add32 h4 e))
-                    (let ((f (cond
-                               ((< t 20)
-                                (fxior (fxand b c)
-                                       (fxand (fxxor b mask32) d)))
-                               ((< t 40) (fxxor b c d))
-                               ((< t 60)
-                                (fxior (fxand b c) (fxand b d) (fxand c d)))
-                               (else (fxxor b c d))))
-                          (k (cond
-                               ((< t 20) #x5A827999)
-                               ((< t 40) #x6ED9EBA1)
-                               ((< t 60) #x8F1BBCDC)
-                               (else #xCA62C1D6))))
-                      (rounds (+ t 1)
-                              (add32 (rotl32 a 5) f e k (vector-ref w t))
-                              a (rotl32 b 30) c d)))))))))
-
-  ;; ---- base64 -----------------------------------------------------------------
-
-  (define b64-chars
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
-
-  (define (base64-encode bv)
-    (let ((n (bytevector-length bv)))
-      (call-with-string-output-port
-        (lambda (p)
-          (define (out i) (write-char (string-ref b64-chars i) p))
-          (let loop ((i 0))
-            (let ((left (- n i)))
-              (cond
-                ((>= left 3)
-                 (let ((b0 (bytevector-u8-ref bv i))
-                       (b1 (bytevector-u8-ref bv (+ i 1)))
-                       (b2 (bytevector-u8-ref bv (+ i 2))))
-                   (out (fxsrl b0 2))
-                   (out (fxior (fxsll (fxand b0 3) 4) (fxsrl b1 4)))
-                   (out (fxior (fxsll (fxand b1 15) 2) (fxsrl b2 6)))
-                   (out (fxand b2 63))
-                   (loop (+ i 3))))
-                ((= left 2)
-                 (let ((b0 (bytevector-u8-ref bv i))
-                       (b1 (bytevector-u8-ref bv (+ i 1))))
-                   (out (fxsrl b0 2))
-                   (out (fxior (fxsll (fxand b0 3) 4) (fxsrl b1 4)))
-                   (out (fxsll (fxand b1 15) 2))
-                   (write-char #\= p)))
-                ((= left 1)
-                 (let ((b0 (bytevector-u8-ref bv i)))
-                   (out (fxsrl b0 2))
-                   (out (fxsll (fxand b0 3) 4))
-                   (write-char #\= p)
-                   (write-char #\= p)))
-                (else (void)))))))))
+  ;; SHA-1 + base64 for the RFC 6455 accept-key live in (igropyr crypto).
 
   (define ws-guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 

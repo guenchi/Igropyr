@@ -67,7 +67,7 @@
         ;; simplest: kill b; if the task was on c it finishes anyway, if
         ;; on b it must reassign to c
         (rsend 'b 'render                 ; deliver #(die) straight to worker
-          (vector 'dtask -1 'a 'ignore (vector 'die)))
+          (vector 'dtask -1 'a 'ignore (vector 'die) 0))   ; 0 = dummy token
         (let ((r (dpool-await pool t 15000)))
           (unless (and (vector? r) (= (vector-ref r 2) 777))
             (fail! "at-least-once-value" r))
@@ -103,8 +103,8 @@
       (let ((t (dpool-submit pool (vector 'slow 999 4000)
                              '((mode . at-most-once)))))
         (sleep-ms 500)
-        (rsend 'b 'render (vector 'dtask -1 'a 'ignore (vector 'die)))
-        (rsend 'c 'render (vector 'dtask -1 'a 'ignore (vector 'die)))
+        (rsend 'b 'render (vector 'dtask -1 'a 'ignore (vector 'die) 0))
+        (rsend 'c 'render (vector 'dtask -1 'a 'ignore (vector 'die) 0))
         (let ((got (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'dpool-error))
                               (vector-ref e 1)))
                      (dpool-await pool t 15000)

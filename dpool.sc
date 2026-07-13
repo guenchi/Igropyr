@@ -60,6 +60,24 @@
     (set! coord-counter (+ coord-counter 1))
     (string->symbol (string-append "dpool-coord-" (number->string coord-counter))))
 
+  ;; Per-dispatch unforgeable attempt token. A result is only accepted
+  ;; if it echoes the token the coordinator sent with the task, which
+  ;; (a) stops any other authenticated node from forging a result for a
+  ;; task it wasn't given -- coord names are guessable, the token is not
+  ;; -- and (b) makes a stale reply from an at-least-once FIRST attempt
+  ;; harmless once the task has been re-dispatched with a fresh token.
+  ;; 64 bits from /dev/urandom; the read is guarded against preemption
+  ;; because several coordinators share this one port.
+  (define urandom-port #f)
+  (define (random-token!)
+    (with-interrupts-disabled
+      (unless urandom-port
+        (set! urandom-port (open-file-input-port "/dev/urandom")))
+      (let ((bv (get-bytevector-n urandom-port 8)))
+        (unless (and (bytevector? bv) (fx= (bytevector-length bv) 8))
+          (raise 'entropy))
+        (bytevector-uint-ref bv 0 (endianness big) 8))))
+
   (define (opt alist key default)
     (let ((p (assq key alist))) (if p (cdr p) default)))
 
@@ -73,30 +91,63 @@
 
   ;; ---- worker side (runs on each member node) ----------------------------
 
+  ;; concurrent tasks a single worker will run before it starts queuing;
+  ;; bounds the number of processes one node spawns under a task burst.
+  (define default-worker-concurrency 64)
+
   ;; Register a task runner under name. Each task runs in its own process
   ;; (Let It Crash: a crashing task is isolated and reported, never takes
-  ;; the worker down), so one node serves many tasks concurrently.
-  (define (dpool-worker-start name handler)
-    (register name
-      (spawn
-        (lambda ()
-          (let loop ()
-            (receive
-              (`#(dtask ,id ,rnode ,rname ,payload)
+  ;; the worker down), so one node serves many tasks concurrently -- up
+  ;; to `max-concurrency` (optional, default 64) at once; the rest wait
+  ;; in FIFO order and start as slots free.
+  (define (dpool-worker-start name handler . rest)
+    (let ((cap (if (pair? rest) (car rest) default-worker-concurrency)))
+      (unless (and (integer? cap) (exact? cap) (> cap 0))
+        (assertion-violation 'dpool-worker-start
+          "max-concurrency must be a positive integer" cap))
+      (register name
+        (spawn
+          (lambda ()
+            (let ((worker self)          ; tasks send #(slot-free) back here
+                  (running 0)
+                  (pf '()) (pb '()))     ; two-list FIFO of tasks over the cap
+              (define (penq! x) (set! pb (cons x pb)))
+              (define (pdeq!)            ; oldest queued task, or #f
+                (when (null? pf) (set! pf (reverse pb)) (set! pb '()))
+                (and (pair? pf) (let ((x (car pf))) (set! pf (cdr pf)) x)))
+              ;; Run one task in its own process, ship the result tagged
+              ;; with the SAME token the coordinator dispatched, then free
+              ;; the slot. Both a handler crash and a non-serializable
+              ;; reply are caught, so #(slot-free) is always sent -- a
+              ;; task can never leak a slot and wedge the worker.
+              (define (run! id rnode rname payload token)
                 (spawn
                   (lambda ()
                     (let ((result
                            (guard (e (#t (vector 'task-error (reason-of e))))
                              (vector 'ok (handler payload)))))
-                      ;; reply to the coordinator; if it or the link is
-                      ;; gone the result is simply dropped. A result that
-                      ;; won't serialize would crash rsend and strand the
-                      ;; task -- turn it into a task-error instead.
                       (guard (e (#t (rsend rnode rname
-                                      (vector 'dresult id
+                                      (vector 'dresult id token
                                         (vector 'task-error 'not-serializable)))))
-                        (rsend rnode rname (vector 'dresult id result))))))
-                (loop))))))))
+                        (rsend rnode rname (vector 'dresult id token result))))
+                    (send worker (vector 'slot-free)))))
+              (let loop ()
+                (receive
+                  (`#(dtask ,id ,rnode ,rname ,payload ,token)
+                    (if (< running cap)
+                        (begin (set! running (+ running 1))
+                               (run! id rnode rname payload token))
+                        (penq! (vector id rnode rname payload token)))
+                    (loop))
+                  (`#(slot-free)
+                    (set! running (- running 1))
+                    (let ((t (pdeq!)))
+                      (when t
+                        (set! running (+ running 1))
+                        (run! (vector-ref t 0) (vector-ref t 1) (vector-ref t 2)
+                              (vector-ref t 3) (vector-ref t 4))))
+                    (loop))
+                  (other (loop))))))))))            ; ignore stray messages
 
   ;; ---- coordinator (on the submitting node) ------------------------------
 
@@ -135,7 +186,10 @@
     (define stash-back '())
     (define stash-n 0)
     (define max-stashed 10000)
-    (define queue '())                         ; #(id payload mode), no live node
+    ;; tasks with no live node to run on, newest-first; reversed to FIFO
+    ;; on drain. A plain list appended per enqueue was O(n^2) under a
+    ;; large backlog.
+    (define queue-rev '())                     ; #(id payload mode)
     (define next-id 0)
 
     (define (stash-result! id result)
@@ -165,11 +219,11 @@
     (define (dispatch! id payload mode)
       (let ((node (pick-node!)))
         (if (not node)
-            (set! queue (append queue (list (vector id payload mode))))
-            (begin
-              (hashtable-set! inflight id (vector payload node mode))
+            (set! queue-rev (cons (vector id payload mode) queue-rev))
+            (let ((token (random-token!)))
+              (hashtable-set! inflight id (vector payload node mode token))
               (unless (rsend node worker-name
-                             (vector 'dtask id self-node coord-name payload))
+                             (vector 'dtask id self-node coord-name payload token))
                 ;; the link died between pick and send: drop the node and
                 ;; treat this task as hit by a node-down
                 (hashtable-delete! inflight id)
@@ -195,8 +249,8 @@
             (stash-result! id result))))
 
     (define (drain-queue!)
-      (let ((q queue))
-        (set! queue '())
+      (let ((q (reverse queue-rev)))
+        (set! queue-rev '())
         (for-each (lambda (t) (dispatch! (vector-ref t 0) (vector-ref t 1)
                                          (vector-ref t 2)))
                   q)))
@@ -229,10 +283,24 @@
                   (send from (vector 'dpool-result ref r)))
                 (hashtable-set! awaiters id
                   (cons (vector from ref) (hashtable-ref awaiters id '()))))))
-        (`#(dresult ,id ,result)
-          ;; a live node finished (ok or task-error): terminal, no retry
-          (when (hashtable-ref inflight id #f)
-            (complete! id result)))
+        (`#(await-cancel ,id ,from ,ref)
+          ;; the awaiting caller timed out: drop its slot so a never-
+          ;; completing id (or a repeatedly re-awaited one) cannot pile
+          ;; up awaiter entries forever
+          (let ((rest (filter (lambda (a)
+                                (not (and (eq? (vector-ref a 0) from)
+                                          (eqv? (vector-ref a 1) ref))))
+                              (hashtable-ref awaiters id '()))))
+            (if (null? rest)
+                (hashtable-delete! awaiters id)
+                (hashtable-set! awaiters id rest))))
+        (`#(dresult ,id ,token ,result)
+          ;; a live node finished (ok or task-error): terminal, no retry.
+          ;; Accept only if the token matches THIS attempt -- rejects a
+          ;; forged result and a stale reply from a superseded attempt.
+          (let ((e (hashtable-ref inflight id #f)))
+            (when (and e (eqv? (vector-ref e 3) token))
+              (complete! id result))))
         (`#(node-up ,node)
           (unless (memq node live) (set! live (cons node live)))
           (drain-queue!))
@@ -243,7 +311,7 @@
             (vector 'dpool-stats ref
               (list (cons 'live (length live))
                     (cons 'inflight (hashtable-size inflight))
-                    (cons 'queued (length queue))))))
+                    (cons 'queued (length queue-rev))))))
         (other (void)))                        ; ignore stray messages
       (loop)))
 
@@ -265,7 +333,9 @@
     (let ((timeout (if (pair? rest) (car rest) default-await-ms))
           (ref (next-ref!)))
       (send (dpool-pid pool) (vector 'await id self ref))
-      (receive (after timeout (raise (vector 'dpool-error 'await-timeout id)))
+      (receive (after timeout
+                  (send (dpool-pid pool) (vector 'await-cancel id self ref))
+                  (raise (vector 'dpool-error 'await-timeout id)))
         (`#(dpool-result ,@ref ,result)
           (if (eq? (vector-ref result 0) 'ok)
               (vector-ref result 1)

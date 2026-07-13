@@ -43,6 +43,38 @@
   (define (opt alist key default)
     (let ((p (assq key alist))) (if p (cdr p) default)))
 
+  ;; Discovery records come from a shared store (a Redis key any node can
+  ;; write); treat them as untrusted. These bound what one poisoned or
+  ;; runaway record can cost us: an unbounded name interned as a symbol,
+  ;; a garbage host string driving DNS, an out-of-range port, or a flood
+  ;; of members each spawning a connector.
+  (define max-node-name 64)
+  (define max-host-len 253)          ; DNS name ceiling
+  (define max-members 256)           ; dialed per discovery cycle
+
+  (define (valid-port? p)
+    (and (integer? p) (exact? p) (<= 1 p 65535)))
+
+  (define (valid-host? h)
+    (let ((n (string-length h)))
+      (and (fx> n 0) (fx<= n max-host-len)
+           (let lp ((i 0))
+             (or (fx= i n)
+                 (let ((c (string-ref h i)))
+                   (and (or (char<=? #\a c #\z) (char<=? #\A c #\Z)
+                            (char<=? #\0 c #\9) (memv c '(#\. #\- #\:)))
+                        (lp (fx+ i 1)))))))))
+
+  (define (valid-node-name? s)
+    (let ((n (string-length s)))
+      (and (fx> n 0) (fx<= n max-node-name)
+           (let lp ((i 0))
+             (or (fx= i n)
+                 (let ((c (string-ref s i)))
+                   (and (or (char<=? #\a c #\z) (char<=? #\A c #\Z)
+                            (char<=? #\0 c #\9) (memv c '(#\- #\_ #\.)))
+                        (lp (fx+ i 1)))))))))
+
   ;; ---- discovery strategies ---------------------------------------------
 
   (define (split-spaces s)
@@ -55,12 +87,16 @@
                  (if (> i start) (cons (substring s start i) acc) acc)))
           (else (loop (+ i 1) start acc))))))
 
-  ;; "name host port" -> (name host port), or #f if malformed
+  ;; "name host port" -> (name host port), or #f if malformed or if any
+  ;; field fails validation (bad name, host, or out-of-range port)
   (define (parse-member str)
     (let ((parts (split-spaces str)))
       (and (= (length parts) 3)
+           (valid-node-name? (car parts))
+           (valid-host? (cadr parts))
            (let ((port (string->number (caddr parts))))
-             (and port (list (string->symbol (car parts)) (cadr parts) port))))))
+             (and port (valid-port? port)
+                  (list (string->symbol (car parts)) (cadr parts) port))))))
 
   (define (redis-discover conn cluster-key self-name self-host self-port ttl-ms)
     ;; self-member is a stable string so a re-heartbeat updates the score
@@ -74,14 +110,17 @@
                  (number->string (- now 1)))          ; drop expired members
           (let ((members (redis conn "ZRANGEBYSCORE" cluster-key
                                 (number->string now) "+inf")))
-            ;; members is a list of strings; parse and dedupe by node name
-            (let dedupe ((ms (if (list? members) members '())) (seen '()) (acc '()))
-              (if (null? ms)
+            ;; members is a list of strings; parse and dedupe by node
+            ;; name, and stop at max-members so a flooded key cannot make
+            ;; us spawn an unbounded number of connectors
+            (let dedupe ((ms (if (list? members) members '()))
+                         (seen '()) (acc '()) (k 0))
+              (if (or (null? ms) (fx>= k max-members))
                   (reverse acc)
                   (let ((p (parse-member (car ms))))
                     (if (and p (not (memq (car p) seen)))
-                        (dedupe (cdr ms) (cons (car p) seen) (cons p acc))
-                        (dedupe (cdr ms) seen acc))))))))))
+                        (dedupe (cdr ms) (cons (car p) seen) (cons p acc) (fx+ k 1))
+                        (dedupe (cdr ms) seen acc k))))))))))
 
   (define (resolve-discover spec cluster-key ttl-ms)
     (cond
@@ -90,9 +129,10 @@
        (let ((peers (cdr spec)))
          (unless (for-all (lambda (p) (and (list? p) (= 3 (length p))
                                            (symbol? (car p)) (string? (cadr p))
-                                           (integer? (caddr p))))
+                                           (valid-host? (cadr p))
+                                           (valid-port? (caddr p))))
                           peers)
-           (assertion-violation 'cluster-start "static peers want (name host port)" peers))
+           (assertion-violation 'cluster-start "static peers want (name host valid-port)" peers))
          (lambda () peers)))
       ((and (pair? spec) (eq? (car spec) 'redis))
        (let ((conn (cadr spec)) (host (caddr spec)) (port (cadddr spec)))
@@ -101,21 +141,44 @@
 
   ;; ---- the maintainer process -------------------------------------------
 
+  ;; Bring the live mesh in line with a successful discovery result:
+  ;; dial members we have no link to, and DROP members this cluster
+  ;; previously maintained that have now vanished from discovery.
+  ;; `connected` is this handle's own responsibility set (the last
+  ;; desired set); returns the new one. Only names we introduced are
+  ;; ever disconnected, so a manual node-connect! or another cluster
+  ;; handle's peers are left alone.
+  (define (reconcile! connected peers)
+    (let ((desired (filter (lambda (nm) (not (eq? nm (node-self))))
+                           (map car peers))))
+      (for-each
+        (lambda (p)
+          (let ((name (car p)))
+            ;; node-connect! is idempotent and self-reconnecting, so we
+            ;; only dial names we have no live link to yet
+            (unless (or (eq? name (node-self)) (memq name (node-peers)))
+              (node-connect! name (cadr p) (caddr p)))))
+        peers)
+      ;; a member removed from discovery (Redis entry expired/deleted, or
+      ;; dropped from a static list) must actually lose its connector --
+      ;; otherwise revoking a node in the registry never revokes access
+      (for-each
+        (lambda (nm) (unless (memq nm desired) (node-disconnect! nm)))
+        connected)
+      desired))
+
   (define (cluster-loop discover interval-ms)
-    (let loop ()
-      ;; a discovery failure (Redis down, DNS blip) must not kill the
-      ;; mesh -- skip this round, keep the links already up, retry later
-      (let ((peers (guard (e (#t '())) (discover))))
-        (for-each
-          (lambda (p)
-            (let ((name (car p)))
-              ;; node-connect! is idempotent and self-reconnecting, so we
-              ;; only dial names we have no live link to yet
-              (unless (or (eq? name (node-self)) (memq name (node-peers)))
-                (node-connect! name (cadr p) (caddr p)))))
-          peers))
-      (receive (after interval-ms (loop))
-        (`#(cluster-stop) 'done))))
+    (let loop ((connected '()))
+      ;; A discovery FAILURE (Redis down, DNS blip) yields #f and we skip
+      ;; reconciling -- keep the links already up, retry next round. Only
+      ;; a successful result (a list, possibly empty) is authoritative
+      ;; enough to disconnect vanished members against.
+      (let* ((result (guard (e (#t #f)) (discover)))
+             (connected2 (if (list? result)
+                             (reconcile! connected result)
+                             connected)))
+        (receive (after interval-ms (loop connected2))
+          (`#(cluster-stop) 'done)))))
 
   ;; ---- public API --------------------------------------------------------
 
