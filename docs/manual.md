@@ -22,10 +22,11 @@ This manual covers the architecture, design patterns, and implementation details
 16. [Async File Reads](#async-file-reads)
 17. [JSON and gzip](#json-and-gzip)
 18. [S-Expression RPC](#s-expression-rpc)
-19. [Running and Building](#running-and-building)
-20. [Testing](#testing)
-21. [Code Style](#code-style)
-22. [Common Pitfalls](#common-pitfalls)
+19. [Distribution: Node Links](#distribution-node-links)
+20. [Running and Building](#running-and-building)
+21. [Testing](#testing)
+22. [Code Style](#code-style)
+23. [Common Pitfalls](#common-pitfalls)
 
 ---
 
@@ -2054,6 +2055,77 @@ the peer `read`s, structure and exactness preserved. `(igropyr sexpr)`
 adds exactly one thing to that picture: the safety a network boundary
 demands — a whitelist, a depth limit, no evaluation — so untrusted bytes
 can never become code.
+
+---
+
+## Distribution: Node Links
+
+`(igropyr node)` connects igropyr instances — other cores on the same
+machine via loopback, or other machines over the network — into a mesh
+where a process on one node can message a **registered name** on
+another. The semantics deliberately mirror Erlang distribution:
+
+```scheme
+(import (chezscheme) (igropyr http) (igropyr node))
+
+;; node "a" (listens for peers; 127.0.0.1 unless a host is given)
+(start-scheduler
+  (lambda ()
+    (node-start! 'a "shared-secret" 4100)
+    (register 'metrics self)
+    (let loop ()
+      (receive (`#(report ,from ,data) (record! from data) (loop))))))
+
+;; node "b" (dials a; reconnects automatically whenever the link drops)
+(start-scheduler
+  (lambda ()
+    (node-start! 'b "shared-secret")
+    (node-connect! 'a "10.0.0.1" 4100)
+    (monitor-node 'a)                 ; -> #(node-up a) / #(node-down a)
+    (rsend 'a 'metrics (vector 'report 'b stats))))
+```
+
+### API
+
+- `(node-start! name secret [port [host]])` — set this node's identity and shared secret; with a port, also accept peers (bound to 127.0.0.1 unless a host is given)
+- `(node-connect! peer host port)` — dial a peer and keep dialing whenever the link is down
+- `(node-disconnect! peer)` — stop dialing and drop the live link
+- `(rsend node reg-name msg)` → `#t`/`#f` — send `msg` to the process registered as `reg-name` on `node`; `#t` means handed to a live link (delivery still unconfirmed), `#f` means no link. The own node name is a plain local send.
+- `(monitor-node name)` / `(demonitor-node name)` — receive `#(node-up ,name)` and `#(node-down ,name)`
+- `(node-peers)` — connected peer names; `(node-self)` — own name
+
+### Semantics (Erlang's, on purpose)
+
+- Addressing is by **registered name**, never by raw pid — names survive
+  restarts, pids don't.
+- `rsend` is fire-and-forget. Between one pair of nodes messages arrive
+  in send order (one TCP connection per pair); on a dead link they are
+  silently dropped — use `monitor-node` and application-level replies.
+- Payloads cross in the **extended sexpr wire mode**: vectors,
+  bytevectors and finite flonums arrive bit-intact, exact
+  integers/ratios stay exact. Anything outside the whitelist (closures,
+  records, pids, conns) raises at the sender — loudly, at `rsend` time.
+- Both sides dialing at once resolves deterministically: the connection
+  dialed by the smaller node name survives on both ends.
+
+### Security
+
+The handshake is a mutual HMAC-SHA1 challenge/response on the shared
+secret: the secret never crosses the wire and a recorded proof cannot
+be replayed. But the dist port is **full control of the node** — anyone
+on it can message any registered process, including supervisors. It
+binds 127.0.0.1 by default, and there is no TLS: across machines, keep
+it on a private network (WireGuard, VPC). Never expose it publicly.
+
+### What this is for
+
+One igropyr process is one scheduler on one core. `SO_REUSEPORT` (or an
+upstream load balancer) already scales stateless HTTP across cores and
+machines — but each process is an island: its PubSub topics, registry
+and gen-servers are invisible to the others. Node links are the bridge:
+same-machine processes mesh over loopback, machines mesh over the
+network, and stateful coordination (chat fan-out, singleton services,
+work spraying with failover) becomes ordinary message passing again.
 
 ---
 

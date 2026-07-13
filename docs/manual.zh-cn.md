@@ -13,10 +13,11 @@
 7. [对话](#对话)
 8. [数据库客户端](#数据库客户端)
 9. [S 表达式 RPC](#s-表达式-rpc)
-10. [运行和构建](#运行和构建)
-11. [测试](#测试)
-12. [代码风格](#代码风格)
-13. [常见陷阱](#常见陷阱)
+10. [分布式：节点链路](#分布式节点链路)
+11. [运行和构建](#运行和构建)
+12. [测试](#测试)
+13. [代码风格](#代码风格)
+14. [常见陷阱](#常见陷阱)
 
 ---
 
@@ -1372,6 +1373,60 @@ JSON API 强加了一层阻抗失配：你的 Scheme 数据被序列化到 JSON 
 这些统统不发生——你 `write` 的值就是对端 `read` 到的值，结构与精确性都保留。
 `(igropyr sexpr)` 只往这幅图里加了一件事：网络边界所要求的安全——白名单、
 深度限制、不求值——于是不可信的字节永远无法变成代码。
+
+---
+
+## 分布式：节点链路
+
+`(igropyr node)` 把多个 igropyr 实例——同机其它核心走 loopback，其它机器
+走网络——连成 mesh：一个节点上的进程可以给另一个节点上的**注册名**发消息。
+语义刻意对齐 Erlang distribution：
+
+```scheme
+;; 节点 a（监听对端；不给 host 就绑 127.0.0.1）
+(node-start! 'a "shared-secret" 4100)
+(register 'metrics self)
+
+;; 节点 b（拨号 a；链路断了会自动重连）
+(node-start! 'b "shared-secret")
+(node-connect! 'a "10.0.0.1" 4100)
+(monitor-node 'a)                 ; -> #(node-up a) / #(node-down a)
+(rsend 'a 'metrics (vector 'report 'b stats))
+```
+
+### API
+
+- `(node-start! name secret [port [host]])` ——设置本节点身份与共享秘钥；给端口则同时监听（默认只绑 127.0.0.1）
+- `(node-connect! peer host port)` ——拨号并在断链后持续重拨
+- `(node-disconnect! peer)` ——停止重拨并断开现有链路
+- `(rsend node reg-name msg)` → `#t`/`#f` ——发给 node 上注册为 reg-name 的进程；`#t` 表示已交给活链路（送达仍不确认），`#f` 表示无链路。发给自己的节点名就是本地 send。
+- `(monitor-node name)` / `(demonitor-node name)` ——接收 `#(node-up ,name)` / `#(node-down ,name)`
+- `(node-peers)` ——已连接的对端名；`(node-self)` ——本节点名
+
+### 语义（有意照抄 Erlang）
+
+- 寻址只用**注册名**，从不用裸 pid——名字跨重启存活，pid 不行。
+- `rsend` 发后不理。同一对节点之间消息按发送顺序到达（每对一条 TCP）；
+  链路死了就静默丢弃——用 `monitor-node` 加应用层回执处理失败。
+- 载荷走**扩展 sexpr 线模式**：vector、bytevector、有限浮点逐位无损过线，
+  精确整数/分数保持精确。白名单之外的东西（闭包、record、pid、conn）
+  在**发送端**的 `rsend` 处立刻报错。
+- 双方同时互拨时确定性收敛：拨号方节点名较小的那条连接在两端同时胜出。
+
+### 安全
+
+握手是共享秘钥上的双向 HMAC-SHA1 挑战应答：秘钥不过线，录下来的证明无法
+重放。但 dist 端口等于**对整个节点的完全控制**——连上它就能给任何注册进程
+发消息，包括 supervisor。默认只绑 127.0.0.1，且没有 TLS：跨机器请放在私有
+网络（WireGuard、VPC）里，永远不要暴露到公网。
+
+### 它解决什么
+
+一个 igropyr 进程是一个核上的一个调度器。`SO_REUSEPORT`（或上游负载均衡）
+已经把无状态 HTTP 摊到多核多机——但每个进程是孤岛：它的 PubSub、注册表、
+gen-server 对其它进程不可见。节点链路就是桥：同机进程经 loopback 组网，
+机器之间经网络组网，有状态的协同（聊天室扇出、单例服务、带故障转移的任务
+喷洒）重新变回普通的消息传递。
 
 ---
 
