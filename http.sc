@@ -63,13 +63,20 @@
 
   (define empty-bv (make-bytevector 0))
 
+  ;; Appending onto an empty buffer returns the other side unchanged --
+  ;; the common first-chunk case costs nothing. Safe to alias: buffers
+  ;; are treated as immutable by every caller.
   (define (bv-append a b)
-    (let* ((la (bytevector-length a))
-           (lb (bytevector-length b))
-           (r (make-bytevector (+ la lb))))
-      (bytevector-copy! a 0 r 0 la)
-      (bytevector-copy! b 0 r la lb)
-      r))
+    (let ((la (bytevector-length a))
+          (lb (bytevector-length b)))
+      (cond
+        ((fx= la 0) b)
+        ((fx= lb 0) a)
+        (else
+         (let ((r (make-bytevector (fx+ la lb))))
+           (bytevector-copy! a 0 r 0 la)
+           (bytevector-copy! b 0 r la lb)
+           r)))))
 
   (define (bv-sub bv start end)
     (let ((r (make-bytevector (- end start))))
@@ -81,7 +88,7 @@
     (let ((n (bytevector-length bv)))
       (let loop ((i 0))
         (cond
-          ((> (+ i 3) (- n 1)) #f)
+          ((fx> (fx+ i 3) (fx- n 1)) #f)
           ((and (fx= (bytevector-u8-ref bv i) 13)
                 (fx= (bytevector-u8-ref bv (fx+ i 1)) 10)
                 (fx= (bytevector-u8-ref bv (fx+ i 2)) 13)
@@ -145,25 +152,37 @@
   ;; directly would mangle multi-byte sequences like %E4%B8%AD).
   ;; plus-as-space?: only in query strings does "+" mean a space; in a
   ;; path "+" is a literal plus, so the caller controls it.
+  ;; Fast path: no escape present means the string decodes to itself --
+  ;; return it unchanged, zero allocation (the overwhelmingly common
+  ;; case for paths and query parts).
   (define (percent-decode s plus-as-space?)
     (let ((n (string-length s)))
-      (let-values (((p get) (open-bytevector-output-port)))
-        (let loop ((i 0))
-          (when (< i n)
+      (define (plain? i)
+        (or (fx= i n)
             (let ((ch (string-ref s i)))
-              (cond
-                ((and (char=? ch #\%) (< (+ i 2) n))
-                 (let ((v (string->number (substring s (+ i 1) (+ i 3)) 16)))
-                   (if v
-                       (begin (put-u8 p v) (loop (+ i 3)))
-                       (begin (put-bytevector p (string->utf8 (string ch)))
-                              (loop (+ i 1))))))
-                ((and plus-as-space? (char=? ch #\+))
-                 (put-u8 p 32) (loop (+ i 1)))
-                (else
-                 (put-bytevector p (string->utf8 (string ch)))
-                 (loop (+ i 1)))))))
-        (utf8->string (get)))))
+              (and (not (char=? ch #\%))
+                   (not (and plus-as-space? (char=? ch #\+)))
+                   (plain? (fx+ i 1))))))
+      (if (plain? 0)
+          s
+          (let-values (((p get) (open-bytevector-output-port)))
+            (let loop ((i 0))
+              (when (fx< i n)
+                (let ((ch (string-ref s i)))
+                  (cond
+                    ((and (char=? ch #\%) (fx< (fx+ i 2) n))
+                     (let ((v (string->number (substring s (fx+ i 1) (fx+ i 3)) 16)))
+                       (if v
+                           (begin (put-u8 p v) (loop (fx+ i 3)))
+                           (begin (put-u8 p 37) (loop (fx+ i 1))))))  ; literal '%'
+                    ((and plus-as-space? (char=? ch #\+))
+                     (put-u8 p 32) (loop (fx+ i 1)))
+                    ((char<=? ch #\delete)          ; ASCII: one byte, direct
+                     (put-u8 p (char->integer ch)) (loop (fx+ i 1)))
+                    (else
+                     (put-bytevector p (string->utf8 (string ch)))
+                     (loop (fx+ i 1)))))))
+            (utf8->string (get))))))
 
   (define (parse-query s)
     (if (string=? s "")
@@ -177,11 +196,24 @@
                      (cons (percent-decode kv #t) ""))))
              (string-split s #\&))))
 
-  (define (strip-cr l)
-    (let ((n (string-length l)))
-      (if (and (> n 0) (char=? (string-ref l (- n 1)) #\return))
-          (substring l 0 (- n 1))
-          l)))
+  ;; Split the header text on \n with the trailing \r of each line
+  ;; dropped in the same pass -- one substring per line instead of the
+  ;; split-then-strip double copy.
+  (define (split-header-lines s)
+    (let ((n (string-length s)))
+      (define (line-end start end)
+        (if (and (fx> end start)
+                 (char=? (string-ref s (fx- end 1)) #\return))
+            (fx- end 1)
+            end))
+      (let loop ((i 0) (start 0) (acc '()))
+        (cond
+          ((fx= i n)
+           (reverse (cons (substring s start (line-end start n)) acc)))
+          ((char=? (string-ref s i) #\newline)
+           (loop (fx+ i 1) (fx+ i 1)
+                 (cons (substring s start (line-end start i)) acc)))
+          (else (loop (fx+ i 1) start acc))))))
 
   ;; "Content-Length: 42" -> (content-length . "42"), or #f
   (define (parse-header-line l)
@@ -219,7 +251,7 @@
   (define (parse-head bv hend)
     (guard (e (#t #f))
       (let* ((text (utf8->string (bv-sub bv 0 hend)))
-             (lines (map strip-cr (string-split text #\newline)))
+             (lines (split-header-lines text))
              (rl (string-split (car lines) #\space)))
         (and (= (length rl) 3)
              (let* ((method (string->symbol (car rl)))
@@ -299,12 +331,12 @@
           (k (assq 'sec-websocket-key headers)))
       (and u k (string-ci=? (cdr u) "websocket") (cdr k))))
 
+  ;; case-insensitive compare in place: no string-downcase copy per request
   (define (keep-alive? version headers)
-    (let* ((p (assq 'connection headers))
-           (cn (and p (string-downcase (cdr p)))))
+    (let ((p (assq 'connection headers)))
       (if (string=? version "HTTP/1.1")
-          (not (equal? cn "close"))
-          (equal? cn "keep-alive"))))
+          (not (and p (string-ci=? (cdr p) "close")))
+          (and p (string-ci=? (cdr p) "keep-alive")))))
 
   ;; ---- responses -------------------------------------------------------------
 
@@ -318,6 +350,27 @@
       ((500) "Internal Server Error") ((503) "Service Unavailable")
       (else "Unknown")))
 
+  ;; Complete status lines as compile-time constants: the common statuses
+  ;; cost one case dispatch instead of a 3-part string-append per response.
+  (define (status-line s)
+    (case s
+      ((200) "HTTP/1.1 200 OK\r\n")
+      ((201) "HTTP/1.1 201 Created\r\n")
+      ((204) "HTTP/1.1 204 No Content\r\n")
+      ((301) "HTTP/1.1 301 Moved Permanently\r\n")
+      ((302) "HTTP/1.1 302 Found\r\n")
+      ((304) "HTTP/1.1 304 Not Modified\r\n")
+      ((400) "HTTP/1.1 400 Bad Request\r\n")
+      ((403) "HTTP/1.1 403 Forbidden\r\n")
+      ((404) "HTTP/1.1 404 Not Found\r\n")
+      ((408) "HTTP/1.1 408 Request Timeout\r\n")
+      ((413) "HTTP/1.1 413 Payload Too Large\r\n")
+      ((431) "HTTP/1.1 431 Request Header Fields Too Large\r\n")
+      ((500) "HTTP/1.1 500 Internal Server Error\r\n")
+      ((503) "HTTP/1.1 503 Service Unavailable\r\n")
+      (else (string-append "HTTP/1.1 " (number->string s) " "
+                           (status-text s) "\r\n"))))
+
   ;; Per-request response token: a one-shot claim shared by every path
   ;; that might answer a single request (the handler, the streaming
   ;; helpers, and the supervisor's fallback 500). Claiming is atomic, so
@@ -327,24 +380,38 @@
   (define (claim! token) (and (not (unbox token)) (set-box! token #t) #t))
 
   ;; Framing headers are always emitted by the framework; drop any the
-  ;; user set so they cannot be duplicated or conflict.
-  (define framing-headers '("content-length" "connection" "transfer-encoding"))
+  ;; user set so they cannot be duplicated or conflict. Compared
+  ;; case-insensitively in place -- no per-header string-downcase copy.
   (define (framing-header? name)
-    (member (string-downcase name) framing-headers))
+    (or (string-ci=? name "content-length")
+        (string-ci=? name "connection")
+        (string-ci=? name "transfer-encoding")))
 
   ;; Reject header names/values carrying CR or LF (response splitting).
   (define (header-safe? s)
     (not (or (string-index s #\return) (string-index s #\newline))))
 
-  (define (render-headers headers)
+  ;; Assemble a whole response head -- status line, user headers, then
+  ;; the trailing framing pieces -- as ONE string-append: the pieces are
+  ;; collected into a list and copied once, with no per-header
+  ;; intermediate strings. Unsafe/framing headers are silently dropped.
+  (define (assemble-head status headers . tail-pieces)
     (apply string-append
-      (map (lambda (h)
-             (let ((k (car h)) (v (cdr h)))
-               (if (and (header-safe? k) (header-safe? v)
-                        (not (framing-header? k)))
-                   (string-append k ": " v "\r\n")
-                   "")))                 ; silently drop unsafe/framing
-           headers)))
+      (status-line status)
+      (fold-right
+        (lambda (h acc)
+          (let ((k (car h)) (v (cdr h)))
+            (if (and (header-safe? k) (header-safe? v)
+                     (not (framing-header? k)))
+                (cons* k ": " v "\r\n" acc)
+                acc)))
+        tail-pieces
+        headers)))
+
+  ;; Constant framing tails, chosen by keep-alive -- built once at load
+  ;; time instead of appended piecewise per response.
+  (define keep-alive-tail "\r\nConnection: keep-alive\r\n\r\n")
+  (define close-tail "\r\nConnection: close\r\n\r\n")
 
   ;; Write a full response, guarded by the request's token. The libuv
   ;; write callback (no yielding) tells the reader to continue
@@ -352,13 +419,9 @@
   (define (send-response! c token status headers body ka)
     (when (claim! token)
       (let* ((head
-              (string-append
-                "HTTP/1.1 " (number->string status) " " (status-text status)
-                "\r\n"
-                (render-headers headers)
+              (assemble-head status headers
                 "Content-Length: " (number->string (bytevector-length body))
-                "\r\nConnection: " (if ka "keep-alive" "close")
-                "\r\n\r\n"))
+                (if ka keep-alive-tail close-tail)))
              (owner (conn-owner c)))
         ;; head and body are written as two segments -- no bv-append copy
         (tcp-writev! c (list (string->utf8 head) body)
@@ -410,19 +473,19 @@
   ;; stays away) and tells the reader to wait for the stream to finish.
   ;; A long stream should be detached from the pool worker:
   ;;   (res-begin! r) (spawn (lambda () ... (res-write! r x) ... (res-end! r)))
+  (define chunked-keep-alive-tail
+    "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n")
+  (define chunked-close-tail
+    "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+
   (define (res-begin! r)
     (let ((c (res-conn r)))
       (when (claim! (res-token r))
         (res-mode-set! r 'streaming)
         (tcp-write! c
           (string->utf8
-            (string-append
-              "HTTP/1.1 " (number->string (res-status r)) " "
-              (status-text (res-status r)) "\r\n"
-              (render-headers (res-headers r))
-              "Transfer-Encoding: chunked\r\nConnection: "
-              (if (res-keep-alive? r) "keep-alive" "close")
-              "\r\n\r\n"))
+            (assemble-head (res-status r) (res-headers r)
+              (if (res-keep-alive? r) chunked-keep-alive-tail chunked-close-tail)))
           #f)
         (send (conn-owner c) (vector 'streaming)))))
 
@@ -445,14 +508,18 @@
              #f))))
 
   ;; Finish the stream: terminating chunk, then the usual keep-alive /
-  ;; close continuation.
+  ;; close continuation. The terminator is encoded once at load time;
+  ;; sharing the bytevector across writes is safe because tcp-writev!
+  ;; copies it out synchronously.
+  (define chunk-terminator (string->utf8 "0\r\n\r\n"))
+
   (define (res-end! r)
     (when (eq? (res-mode r) 'streaming)
       (res-mode-set! r 'done)
       (let* ((c (res-conn r))
              (owner (conn-owner c))
              (ka (res-keep-alive? r)))
-        (tcp-write! c (string->utf8 "0\r\n\r\n")
+        (tcp-write! c chunk-terminator
           (lambda (st)
             (if (and ka (>= st 0))
                 (send owner (vector 'next-request))
@@ -487,7 +554,9 @@
             (unless (unbox token)
               (set-status! r 404)
               (set-header! r "Content-Type" "text/plain; charset=utf-8")
-              (res-send! r (string->utf8 "Not Found")))))))
+              (res-send! r not-found-body))))))
+
+  (define not-found-body (string->utf8 "Not Found"))
 
   ;; The supervisor gave up on the task (crash retries exhausted, or a
   ;; stuck worker was killed -- killed FIRST, so by the time the client
@@ -515,23 +584,26 @@
     (let ((n (bytevector-length bv)))
       (let loop ((i start))
         (cond
-          ((>= (+ i 1) n) #f)
+          ((fx>= (fx+ i 1) n) #f)
           ((and (fx= (bytevector-u8-ref bv i) 13)
-                (fx= (bytevector-u8-ref bv (+ i 1)) 10))
+                (fx= (bytevector-u8-ref bv (fx+ i 1)) 10))
            i)
-          (else (loop (+ i 1)))))))
+          (else (loop (fx+ i 1)))))))
 
-  ;; hex chunk size, stopping at ';' (chunk extensions); #f if malformed
+  ;; hex chunk size, stopping at ';' (chunk extensions); #f if malformed.
+  ;; The size value keeps GENERIC arithmetic on purpose: an absurd hex
+  ;; size must overflow into a bignum and be rejected by the body-limit
+  ;; check, not crash on a fixnum overflow.
   (define (parse-chunk-size bv start end)
     (let loop ((i start) (v 0) (any #f))
-      (if (= i end)
+      (if (fx= i end)
           (and any v)
           (let ((b (bytevector-u8-ref bv i)))
             (cond
-              ((= b 59) (and any v))                                 ; ';'
-              ((and (>= b 48) (<= b 57)) (loop (+ i 1) (+ (* v 16) (- b 48)) #t))
-              ((and (>= b 97) (<= b 102)) (loop (+ i 1) (+ (* v 16) (- b 87)) #t))
-              ((and (>= b 65) (<= b 70)) (loop (+ i 1) (+ (* v 16) (- b 55)) #t))
+              ((fx= b 59) (and any v))                               ; ';'
+              ((and (fx>= b 48) (fx<= b 57)) (loop (fx+ i 1) (+ (* v 16) (- b 48)) #t))
+              ((and (fx>= b 97) (fx<= b 102)) (loop (fx+ i 1) (+ (* v 16) (- b 87)) #t))
+              ((and (fx>= b 65) (fx<= b 70)) (loop (fx+ i 1) (+ (* v 16) (- b 55)) #t))
               (else #f))))))
 
   (define forbidden-trailer-fields
@@ -746,14 +818,16 @@
   ;; 101 handshake, then hand the connection to the session procedure,
   ;; still inside this reader process (one process per ws connection).
   ;; A crashing session just closes its own connection.
+  (define ws-handshake-prefix
+    (string-append
+      "HTTP/1.1 101 Switching Protocols\r\n"
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+      "Sec-WebSocket-Accept: "))
+
   (define (run-ws-session c acc hend key req session)
     (tcp-write! c
       (string->utf8
-        (string-append
-          "HTTP/1.1 101 Switching Protocols\r\n"
-          "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-          "Sec-WebSocket-Accept: " (ws-accept-key key)
-          "\r\n\r\n"))
+        (string-append ws-handshake-prefix (ws-accept-key key) "\r\n\r\n"))
       #f)
     (let ((w (make-ws c (bv-sub acc (+ hend 4) (bytevector-length acc)))))
       (guard (e (#t (void)))
