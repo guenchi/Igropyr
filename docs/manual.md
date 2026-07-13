@@ -2108,7 +2108,7 @@ there are no loops or duplicates — the chat-room example works across
 nodes with no code change. With no node started, `publish` is exactly
 the single-node version.
 
-### Semantics (Erlang's, on purpose)
+### Semantics
 
 - Addressing is by **registered name**, never by raw pid — names survive
   restarts, pids don't.
