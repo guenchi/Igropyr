@@ -49,13 +49,9 @@ export function makeJsBridge(getExports) {
         cb_argc: () => cbStack[cbStack.length - 1].args.length,
         cb_arg: i => cbStack[cbStack.length - 1].args[i],
         cb_ret: v => { cbStack[cbStack.length - 1].ret = v; },
-        // suspend the whole wasm stack on a promise (JSPI); require BOTH
-        // halves of the API — some engines expose WebAssembly.Suspending
-        // without promising, and passing a Suspending object where a plain
-        // callable is expected fails instantiation ("must be callable").
-        // Without full support this is the identity and js-await is a no-op.
-        await: (typeof WebAssembly.Suspending === 'function'
-                && typeof WebAssembly.promising === 'function')
+        // suspend the whole wasm stack on a promise (JSPI); without
+        // engine support this is the identity and js-await is a no-op
+        await: (typeof WebAssembly.Suspending === 'function')
             ? new WebAssembly.Suspending(p => Promise.resolve(p))
             : p => p,
     };

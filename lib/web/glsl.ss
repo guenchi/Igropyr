@@ -21,6 +21,8 @@
 ;;   (set! lhs expr)       -> "lhs = expr;"
 ;;   (return expr) (return)
 ;;   (if c stmt ...)       / (if-else c (stmt ...) (stmt ...))
+;;   (for (T name init cond step) stmt ...)
+;;                         -> "for (T name = init; cond; name = step)"
 ;;   (discard)
 ;; Expressions:
 ;;   symbols pass through verbatim (p, gl_Position, v.xy);
@@ -32,7 +34,8 @@
 ;;
 ;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
 (library (web glsl)
-  (export glsl->string)
+  (export glsl->string glsl-attributes glsl-uniforms glsl-varyings
+          glsl300-vs->string glsl300-fs->string)
   (import (rnrs))
 
   (define (join parts sep)
@@ -67,6 +70,10 @@
          ;; unary minus
          ((and (eq? h '-) (null? (cddr e)))
           (string-append "(-" (expr->glsl (cadr e)) ")"))
+         ;; array indexing: (at u_joints i) -> u_joints[i]
+         ((eq? h 'at)
+          (string-append (expr->glsl (cadr e)) "["
+                         (expr->glsl (caddr e)) "]"))
          ;; infix operators, left-folded, parenthesized
          ((memq h '(+ - * /))
           (string-append "(" (join (map expr->glsl (cdr e))
@@ -105,6 +112,19 @@
                         "} else { "
                         (apply string-append (map stmt->glsl (cadddr s)))
                         "} "))
+        ((for)
+         ;; (for (T name init cond step) stmt ...) -- step is an
+         ;; expression assigned back to name each iteration
+         (let* ((h (cadr s))
+                (ty (car h)) (name (cadr h)) (init (caddr h))
+                (c (cadddr h)) (step (list-ref h 4)))
+           (string-append "for (" (symbol->string ty) " "
+                          (symbol->string name) " = " (expr->glsl init)
+                          "; " (expr->glsl c) "; "
+                          (symbol->string name) " = " (expr->glsl step)
+                          ") { "
+                          (apply string-append (map stmt->glsl (cddr s)))
+                          "} ")))
         (else (error 'glsl "bad statement" s)))))
 
   (define (param->glsl p)                 ; (T name)
@@ -113,9 +133,14 @@
   (define (form->glsl f)
     (case (car f)
       ((attribute uniform varying)
-       (string-append (symbol->string (car f)) " "
-                      (symbol->string (cadr f)) " "
-                      (symbol->string (caddr f)) "; "))
+       (if (pair? (cadr f))              ; (array T N) declarations
+           (string-append (symbol->string (car f)) " "
+                          (symbol->string (cadr (cadr f))) " "
+                          (symbol->string (caddr f))
+                          "[" (number->string (caddr (cadr f))) "]; ")
+           (string-append (symbol->string (car f)) " "
+                          (symbol->string (cadr f)) " "
+                          (symbol->string (caddr f)) "; ")))
       ((precision)
        (string-append "precision " (symbol->string (cadr f)) " "
                       (symbol->string (caddr f)) "; "))
@@ -133,4 +158,94 @@
       (else (error 'glsl "bad top-level form" f))))
 
   (define (glsl->string forms)
-    (apply string-append (map form->glsl forms))))
+    (apply string-append (map form->glsl forms)))
+
+  ;; ---- the ES 3.00 dialect: the same forms, respelled ----
+  ;; The form language is dialect-neutral; these render it as
+  ;; "#version 300 es" source: attribute -> in, varying -> out (VS)
+  ;; / in (FS), gl_FragColor -> a declared output, texture2D and
+  ;; textureCube -> the unified texture().  (uniform-block Name
+  ;; (T field) ...) becomes a std140 uniform block -- the syntax
+  ;; UBOs need, which 1.00 does not have.
+  (define ($glsl-subst x alist)
+    (cond
+     ((symbol? x) (let ((hit (assq x alist))) (if hit (cdr hit) x)))
+     ((pair? x) (cons ($glsl-subst (car x) alist)
+                      ($glsl-subst (cdr x) alist)))
+     (else x)))
+
+  (define $glsl300-renames
+    '((texture2D . texture) (textureCube . texture)
+      (gl_FragColor . goe_FragColor)))
+
+  (define ($form300->glsl f stage)
+    (case (car f)
+      ((attribute varying)
+       (let ((kw (if (eq? (car f) 'attribute)
+                     "in"
+                     (if (eq? stage 'vertex) "out" "in"))))
+         (if (pair? (cadr f))
+             (string-append kw " " (symbol->string (cadr (cadr f))) " "
+                            (symbol->string (caddr f))
+                            "[" (number->string (caddr (cadr f))) "]; ")
+             (string-append kw " " (symbol->string (cadr f)) " "
+                            (symbol->string (caddr f)) "; "))))
+      ((uniform-block)
+       ;; members carry explicit highp: the vertex default is highp,
+       ;; a mediump fragment default would otherwise disagree, and
+       ;; block layouts must match exactly across stages
+       (string-append
+        "layout(std140) uniform " (symbol->string (cadr f)) " { "
+        (apply string-append
+               (map (lambda (m)
+                      (string-append "highp "
+                                     (symbol->string (car m)) " "
+                                     (symbol->string (cadr m)) "; "))
+                    (cddr f)))
+        "}; "))
+      (else (form->glsl f))))
+
+  (define ($glsl300 forms stage head)
+    (string-append
+     "#version 300 es\n" head
+     (apply string-append
+            (map (lambda (f) ($form300->glsl f stage))
+                 ($glsl-subst forms $glsl300-renames)))))
+
+  (define (glsl300-vs->string forms)
+    ($glsl300 forms 'vertex ""))
+  (define (glsl300-fs->string forms)
+    ($glsl300 forms 'fragment "out highp vec4 goe_FragColor; "))
+
+  ;; the interface, extracted: shader forms are data, so the
+  ;; attribute/uniform declarations that (web fx) wires up come from
+  ;; the same list that rendered the source -- one source of truth
+  (define ($glsl-components t)          ; f32 components per attribute
+    (case t
+      ((float) 1) ((vec2) 2) ((vec3) 3) ((vec4) 4)
+      (else (error 'glsl "no component count for attribute type" t))))
+
+  (define (glsl-attributes forms)       ; ((name type count) ...) in order
+    (let loop ((fs forms))
+      (cond
+       ((null? fs) '())
+       ((eq? (caar fs) 'attribute)
+        (let ((ty (cadar fs)) (name (caddr (car fs))))
+          (cons (list name ty ($glsl-components ty)) (loop (cdr fs)))))
+       (else (loop (cdr fs))))))
+
+  (define (glsl-uniforms forms)         ; ((name type) ...) in order
+    (let loop ((fs forms))
+      (cond
+       ((null? fs) '())
+       ((eq? (caar fs) 'uniform)
+        (cons (list (caddr (car fs)) (cadar fs)) (loop (cdr fs))))
+       (else (loop (cdr fs))))))
+
+  (define (glsl-varyings forms)         ; names in order -- what a
+    (let loop ((fs forms))              ; transform feedback captures
+      (cond
+       ((null? fs) '())
+       ((eq? (caar fs) 'varying)
+        (cons (caddr (car fs)) (loop (cdr fs))))
+       (else (loop (cdr fs)))))))

@@ -1,4 +1,4 @@
-;; schwasm prelude: the runtime library, written in schwasm's own
+;; goeteia prelude: the runtime library, written in goeteia's own
 ;; Scheme and compiled into every module.
 ;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
 
@@ -294,11 +294,18 @@
       (when (= ($port-b p) -2) ($port-b! p (%fread ($port-a p))))
       ($port-b p))
      (else (errorf 'read "not an input port")))))
+;; line accounting for the console stream: the compiler reads its
+;; source here, and error context wants file:line
+(define $reader-line 1)
+(define $reader-datum-line 1)
+
 (define ($next-byte-port p)
   (let ((b ($peek-byte-port p)))
     (let ((k ($port-kind p)))
       (cond
-       ((eq? k 'console-in) ($port-a! p -2))
+       ((eq? k 'console-in)
+        ($port-a! p -2)
+        (when (= b 10) (set! $reader-line (+ $reader-line 1))))
        ((eq? k 'file-in) ($port-b! p -2))
        ((eq? k 'string-in)
         (when (< -1 b) ($port-b! p (+ ($port-b p) 1))))))
@@ -348,7 +355,11 @@
 
 (define (read . p)
   (if (null? p)
-      ($read)
+      ;; console = the compile stream: remember where this datum
+      ;; starts, for error context
+      (begin (%skip-blanks)
+             (set! $reader-datum-line $reader-line)
+             ($read))
       ($with-in (car p) (lambda () ($read)))))
 (define ($read)
   (%skip-blanks)
@@ -1498,7 +1509,13 @@
 ;; ---- complex numbers ----
 
 (define ($cx re im)                     ; collapse an exact zero imaginary
-  (if (and (exact? im) ($eq2 im 0)) re (%make-complex re im)))
+  (cond
+   ((and (exact? im) ($eq2 im 0)) re)
+   ;; inexactness is contagious across the parts (r6rs), so mixed
+   ;; literals read the same as under a host reader: 1.0+2i = 1.0+2.0i
+   ((and (flonum? re) (not (flonum? im))) (%make-complex re ($->fl im)))
+   ((and (flonum? im) (not (flonum? re))) (%make-complex ($->fl re) im))
+   (else (%make-complex re im))))
 (define (make-rectangular re im) ($cx re im))
 (define (real-part x) (if (%complex? x) (%cx-re x) x))
 (define (imag-part x) (if (%complex? x) (%cx-im x) 0))

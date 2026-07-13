@@ -13,8 +13,9 @@ const SOURCES = [
     'src/prelude.ss',
     'lib/web/js.ss',
     'lib/web/dom.ss',
-    'lib/web/gl.ss',
     'lib/web/glsl.ss',
+    'lib/web/gl.ss',
+    'lib/web/fx.ss',
     'site/hive-data.ss',
     'site/fire.ss',
 ];

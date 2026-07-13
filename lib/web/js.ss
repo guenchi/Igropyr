@@ -3,7 +3,8 @@
 (library (web js)
   (export js-ref? js-global js-undefined js-eq? js-truthy?
           js-get js-set! js-call js-method js-new js-index
-          string->js js->string number->js js->number ->js js-eval)
+          string->js js->string number->js js->number ->js js-eval
+          js-await)
   (import (rnrs))
 
   (define (js-ref? x) (%js-ref? x))
@@ -82,4 +83,10 @@
   (define (js-index obj i)
     (js-get obj (number->string i)))
   (define (js-eval code)
-    (js-call (js-get (js-global) "eval") (js-global) code)))
+    (js-call (js-get (js-global) "eval") (js-global) code))
+
+  ;; suspend the whole wasm stack on a promise and return its value
+  ;; (JSPI). Only legal on the main stack -- not inside a $jscb
+  ;; callback re-entered from JS. Without engine support (host fell
+  ;; back to the identity import) the promise comes back unawaited.
+  (define (js-await p) (%js-await p)))
