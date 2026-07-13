@@ -156,27 +156,44 @@
         v)))
 
   ;; ---- writer ------------------------------------------------------------
+  ;; Everything is emitted into ONE string output port: linear in the
+  ;; output size. (The previous string-append accumulation re-copied the
+  ;; accumulator for every element -- quadratic on large arrays/objects.)
 
-  (define (json-escape s)
-    (call-with-string-output-port
-      (lambda (p)
+  ;; does s need any escaping at all? If not it is emitted with a single
+  ;; put-string -- the common case for keys and plain values.
+  (define (json-clean? s)
+    (let ((n (string-length s)))
+      (let loop ((i 0))
+        (or (fx= i n)
+            (let ((ch (string-ref s i)))
+              (and (not (char=? ch #\"))
+                   (not (char=? ch #\\))
+                   (fx>= (char->integer ch) #x20)
+                   (loop (fx+ i 1))))))))
+
+  (define (write-json-string s p)
+    (put-char p #\")
+    (if (json-clean? s)
+        (put-string p s)
         (string-for-each
           (lambda (ch)
             (let ((code (char->integer ch)))
               (cond
-                ((char=? ch #\") (display "\\\"" p))
-                ((char=? ch #\\) (display "\\\\" p))
-                ((char=? ch #\newline) (display "\\n" p))
-                ((char=? ch #\return) (display "\\r" p))
-                ((char=? ch #\tab) (display "\\t" p))
-                ((< code #x20)
-                 (display "\\u" p)
+                ((char=? ch #\") (put-string p "\\\""))
+                ((char=? ch #\\) (put-string p "\\\\"))
+                ((char=? ch #\newline) (put-string p "\\n"))
+                ((char=? ch #\return) (put-string p "\\r"))
+                ((char=? ch #\tab) (put-string p "\\t"))
+                ((fx< code #x20)
+                 (put-string p "\\u")
                  (let ((h (number->string code 16)))
-                   (do ((i (string-length h) (+ i 1))) ((= i 4))
-                     (write-char #\0 p))
-                   (display h p)))
-                (else (write-char ch p)))))
-          s))))
+                   (do ((i (string-length h) (fx+ i 1))) ((fx= i 4))
+                     (put-char p #\0))
+                   (put-string p h)))
+                (else (put-char p ch)))))
+          s))
+    (put-char p #\"))
 
   (define (number->json v)
     (cond
@@ -189,51 +206,48 @@
       ((exact? v) (number->string (exact->inexact v)))
       (else (number->string v))))
 
-  (define (json->string x)
+  (define (write-json x p)
     (cond
-      ((eq? x #t) "true")
-      ((eq? x #f) "false")
-      ((eq? x 'null) "null")
-      ((number? x) (number->json x))
-      ((string? x) (string-append "\"" (json-escape x) "\""))
-      ((symbol? x) (string-append "\"" (json-escape (symbol->string x)) "\""))
+      ((eq? x #t) (put-string p "true"))
+      ((eq? x #f) (put-string p "false"))
+      ((eq? x 'null) (put-string p "null"))
+      ((number? x) (put-string p (number->json x)))
+      ((string? x) (write-json-string x p))
+      ((symbol? x) (write-json-string (symbol->string x) p))
       ((vector? x)
-       (string-append
-         "["
-         (let loop ((i 0) (acc ""))
-           (if (= i (vector-length x))
-               acc
-               (loop (+ i 1)
-                     (if (string=? acc "")
-                         (json->string (vector-ref x i))
-                         (string-append acc "," (json->string (vector-ref x i)))))))
-         "]"))
-      ((null? x) "{}")
+       (put-char p #\[)
+       (let ((n (vector-length x)))
+         (do ((i 0 (fx+ i 1))) ((fx= i n))
+           (when (fx> i 0) (put-char p #\,))
+           (write-json (vector-ref x i) p)))
+       (put-char p #\]))
+      ((null? x) (put-string p "{}"))
       ((and (list? x) (pair? (car x)))            ; alist -> object
-       (string-append
-         "{"
-         (fold-right
-           (lambda (kv acc)
-             (let ((entry (string-append
-                            "\"" (json-escape
-                                   (if (symbol? (car kv))
-                                       (symbol->string (car kv))
-                                       (car kv)))
-                            "\":" (json->string (cdr kv)))))
-               (if (string=? acc "") entry (string-append entry "," acc))))
-           "" x)
-         "}"))
+       (put-char p #\{)
+       (let loop ((l x) (first #t))
+         (unless (null? l)
+           (unless first (put-char p #\,))
+           (let ((kv (car l)))
+             (write-json-string
+               (if (symbol? (car kv)) (symbol->string (car kv)) (car kv))
+               p)
+             (put-char p #\:)
+             (write-json (cdr kv) p))
+           (loop (cdr l) #f)))
+       (put-char p #\}))
       ((list? x)                                   ; plain list -> array
-       (string-append
-         "["
-         (fold-right
-           (lambda (v acc)
-             (if (string=? acc "")
-                 (json->string v)
-                 (string-append (json->string v) "," acc)))
-           "" x)
-         "]"))
-      (else "null")))
+       (put-char p #\[)
+       (let loop ((l x) (first #t))
+         (unless (null? l)
+           (unless first (put-char p #\,))
+           (write-json (car l) p)
+           (loop (cdr l) #f)))
+       (put-char p #\]))
+      (else (put-string p "null"))))
+
+  (define (json->string x)
+    (call-with-string-output-port
+      (lambda (p) (write-json x p))))
 
   ;; ---- path access -------------------------------------------------------
 
