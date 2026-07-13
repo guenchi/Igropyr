@@ -168,8 +168,12 @@ demand:
 ;; mtime itself is re-checked at most once per second), so serving a hot
 ;; asset is a hashtable lookup -- no disk read, no stat syscall.
 ;; Responses carry a weak ETag and Cache-Control, and a matching
-;; If-None-Match gets 304 Not Modified. Files over 1 MiB are served but
-;; not cached.
+;; If-None-Match gets 304 Not Modified. Files over 1 MiB are never
+;; buffered whole: they stream as a fixed-length response in 64 KiB
+;; chunks with backpressure -- each chunk is read from disk only after
+;; the previous one drained to the client, so a 10 GB download to a
+;; slow peer costs one chunk of memory, and the pool worker is released
+;; immediately (the pump runs in its own process).
 (app-static app "/assets" "./public")
 
 ;; enter the scheduler and listen; never returns

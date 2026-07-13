@@ -389,19 +389,37 @@
     (string-append "W/\"" (number->string size 16) "-"
                    (number->string mtime 16) "\""))
 
-  ;; read a file on libuv's thread pool; the caller (a pool worker or
-  ;; reader process) parks until the read finishes, so a large or slow
-  ;; read never blocks the scheduler. Returns the bytevector or #f.
-  (define (read-file-async path)
-    (file-read-async! path self)
-    (receive (after 30000 #f)
-      (`#(file-read ,bv) bv)
-      (`#(file-error ,e) #f)))
+  (define (bv-concat lst total)
+    (let ((out (make-bytevector total)))
+      (let loop ((l lst) (off 0))
+        (if (null? l)
+            out
+            (let ((x (car l)))
+              (bytevector-copy! x 0 out off (bytevector-length x))
+              (loop (cdr l) (+ off (bytevector-length x))))))))
+
+  ;; pull a whole (small) stream into one bytevector; #f on error/short
+  (define (stream-read-all st size)
+    (let loop ((chunks '()) (got 0))
+      (file-stream-read! st)
+      (receive (after 30000 (begin (file-stream-close! st) #f))
+        (`#(file-chunk ,bv) (loop (cons bv chunks) (+ got (bytevector-length bv))))
+        (`#(file-eof) (and (= got size) (bv-concat (reverse chunks) got)))
+        (`#(file-error ,e) #f))))
 
   ;; return the cache entry for path (reading/refreshing as needed), or #f.
   ;; Within stat-window-ms of the last check the entry is trusted as-is;
   ;; past it the mtime is re-checked (and the window restamped), and the
   ;; file re-read only when the mtime actually changed.
+  ;;
+  ;; A cache miss opens the file as a stream so the size is known (from
+  ;; fstat) BEFORE any bytes are read: a small file is pulled whole,
+  ;; cached, and served from memory as before; a large one returns a
+  ;; live one-shot #(stream handle size etag ctype) descriptor -- the
+  ;; caller must either pump it (stream-file!) or close it. Large files
+  ;; are never buffered whole and never cached.
+  (define (stream-entry? e) (eq? (vector-ref e 0) 'stream))
+
   (define (static-entry path)
     (let ((cached (hashtable-ref static-cache path #f))
           (now (now-ms)))
@@ -411,25 +429,58 @@
             (and mt
                  (if (and cached (= (vector-ref cached 0) mt))
                      (begin (vector-set! cached 6 now) cached)
-                     (let ((body (read-file-async path)))
-                       (and body
-                            (let* ((size (bytevector-length body))
-                                   ;; gzip-box holds the lazily-built gzip body
-                                   (e (vector mt size (etag-of size mt)
-                                              (mime-type path) body (box #f) now)))
-                              (when (<= size max-cache-file)
-                                (hashtable-set! static-cache path e))
-                              e)))))))))
+                     (open-entry path mt now)))))))
+
+  (define (open-entry path mt now)
+    (file-stream-open! path self)
+    (receive (after 30000 #f)
+      (`#(file-stream ,st ,size)
+        (if (<= size max-cache-file)
+            (let ((body (stream-read-all st size)))
+              (and body
+                   ;; gzip-box holds the lazily-built gzip body
+                   (let ((e (vector mt size (etag-of size mt)
+                                    (mime-type path) body (box #f) now)))
+                     (hashtable-set! static-cache path e)
+                     e)))
+            (vector 'stream st size (etag-of size mt) (mime-type path))))
+      (`#(file-error ,e) #f)))
+
+  ;; Pump a large file through a fixed-length response from a detached
+  ;; process: the pool worker is released immediately, and each 64 KiB
+  ;; chunk is read only after the previous one drained to the client
+  ;; (res-write-file! waits) -- constant memory however slow the peer.
+  (define (stream-file! r st size ctype)
+    (set-header! r "Content-Type" ctype)
+    (res-begin-file! r size)
+    (spawn
+      (lambda ()
+        (file-stream-own! st self)
+        (let loop ()
+          (file-stream-read! st)
+          (receive (after 30000 (res-abort-file! r))
+            (`#(file-chunk ,bv)
+              (case (res-write-file! r bv)
+                ((more) (loop))
+                ((done) (void))
+                (else (res-abort-file! r))))
+            ;; eof before the promised length: file shrank underneath us
+            (`#(file-eof) (res-abort-file! r))
+            (`#(file-error ,e) (res-abort-file! r))))
+        (file-stream-close! st))))
 
   ;; Public helper: send a file (cached read; no conditional request
-  ;; since there is no req here). Path traversal is rejected.
+  ;; since there is no req here). Path traversal is rejected. Files
+  ;; over the cache cap are streamed with backpressure, not buffered.
   (define (send-file! r path)
     (if (path-has-dotdot? path)
         (begin (set-status! r 403) (send-text! r "Forbidden"))
         (let ((e (static-entry path)))
-          (if e
-              (finish! r (vector-ref e 3) (vector-ref e 4))
-              (begin (set-status! r 404) (send-text! r "Not Found"))))))
+          (cond
+            ((not e) (set-status! r 404) (send-text! r "Not Found"))
+            ((stream-entry? e)
+             (stream-file! r (vector-ref e 1) (vector-ref e 2) (vector-ref e 4)))
+            (else (finish! r (vector-ref e 3) (vector-ref e 4)))))))
 
   ;; Serve a static file with caching + conditional request. abs-path is
   ;; already inside the mount root; caller has done the boundary check.
@@ -442,9 +493,25 @@
     (if (path-has-dotdot? abs-path)
         (begin (set-status! r 403) (send-text! r "Forbidden"))
         (let ((e (static-entry abs-path)))
-          (if (not e)
-              (begin (set-status! r 404) (send-text! r "Not Found"))
-              (let* ((size (vector-ref e 1))
+          (cond
+            ((not e)
+             (set-status! r 404) (send-text! r "Not Found"))
+            ((stream-entry? e)
+             ;; large file: conditional request still answered from the
+             ;; etag; otherwise stream it (no gzip -- the body is never
+             ;; held in memory to compress)
+             (let ((st (vector-ref e 1)) (size (vector-ref e 2))
+                   (etag (vector-ref e 3)) (ctype (vector-ref e 4)))
+               (set-header! r "ETag" etag)
+               (set-header! r "Cache-Control" "public, max-age=3600")
+               (if (equal? (req-header req 'if-none-match) etag)
+                   (begin
+                     (file-stream-close! st)
+                     (set-status! r 304)
+                     (res-send! r (make-bytevector 0)))
+                   (stream-file! r st size ctype))))
+            (else
+             (let* ((size (vector-ref e 1))
                      (etag (vector-ref e 2))
                      (ctype (vector-ref e 3))
                      (body (vector-ref e 4))
@@ -470,7 +537,7 @@
                    (res-send! r gz))
                   (else
                    (set-header! r "Content-Type" ctype)
-                   (res-send! r body))))))))
+                   (res-send! r body)))))))))
 
   ;; ---- router -------------------------------------------------------------------
 

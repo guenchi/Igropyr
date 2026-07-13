@@ -14,6 +14,8 @@
   (export uv-init! uv-poll! now-ms uv-set-deliver!
           tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
           file-read-async!
+          file-stream-open! file-stream-read! file-stream-close!
+          file-stream-own!
           tcp-read-start! tcp-write! tcp-writev! tcp-close!
           conn? conn-handle conn-owner conn-set-owner!
           conn-state conn-count uv-strerror)
@@ -242,15 +244,24 @@
                   (number->string (foreign-ref 'unsigned-8 sa 7))))
               (loop (foreign-ref 'void* ai addrinfo-next-offset))))))
 
-  ;; Async whole-file read as an open -> fstat -> bounded read -> close
-  ;; chain, all on libuv's thread pool.
+  ;; Async file reads as an open -> fstat -> bounded read -> close
+  ;; chain, all on libuv's thread pool. Two modes share the machinery:
+  ;;   whole  -- accumulate every chunk, deliver #(file-read ,body) once
+  ;;             (file-read-async!)
+  ;;   stream -- deliver one #(file-chunk ,bv) per read and park until
+  ;;             the consumer pulls again (file-stream-read!): flow
+  ;;             control is the consumer's write pace, so a large file
+  ;;             is served in constant memory (one chunk in flight)
   (define file-read-chunk-size 65536)
 
   (define-record-type (fs-op make-fs-op fs-op?)
     (fields
-      (immutable owner fs-op-owner)
+      (mutable owner fs-op-owner fs-op-owner-set!)   ; delivery target pid
       (immutable path fs-op-path)
-      (mutable phase fs-op-phase fs-op-phase-set!)   ; open|fstat|read|close
+      (immutable mode fs-op-mode)                    ; whole | stream
+      (immutable req fs-op-req)                      ; uv_fs_t address
+      (mutable phase fs-op-phase fs-op-phase-set!)   ; open|fstat|idle|read|close
+      (mutable aborted? fs-op-aborted? fs-op-aborted?-set!)
       (mutable fd fs-op-fd fs-op-fd-set!)
       (mutable size fs-op-size fs-op-size-set!)
       (mutable offset fs-op-offset fs-op-offset-set!)
@@ -286,12 +297,45 @@
   (define (regular-file-mode? mode)
     (= (bitwise-and mode S-IFMT) S-IFREG))
 
-  ;; Deliver the accumulated data and release the op. Reached only after
+  ;; Deliver the completion and release the op. Reached only after
   ;; every read completed, so a close error (rare; e.g. NFS) must not
-  ;; discard the data -- success is reported regardless of how close went.
+  ;; discard the data -- success is reported regardless of how close
+  ;; went. whole mode reports the accumulated body; stream mode reports
+  ;; end-of-stream; an aborted stream reports nothing.
   (define (fs-finish! op req)
-    (deliver (fs-op-owner op) (vector 'file-read (fs-body op)))
+    (unless (fs-op-aborted? op)
+      (deliver (fs-op-owner op)
+        (if (eq? (fs-op-mode op) 'stream)
+            (vector 'file-eof)
+            (vector 'file-read (fs-body op)))))
     (fs-cleanup! op req))
+
+  ;; Release an aborted stream: close the fd (if open) reusing the op's
+  ;; req, then free everything. Nothing is delivered.
+  (define (fs-quiet-close! op req)
+    (if (< (fs-op-fd op) 0)
+        (fs-cleanup! op req)
+        (begin
+          (fs-op-phase-set! op 'close)
+          (let ((r (uv-fs-close uv-loop req (fs-op-fd op) on-fs-entry)))
+            (when (< r 0)
+              (uv-fs-req-cleanup req)
+              (let ((creq (foreign-alloc fs-req-size)))
+                (uv-fs-close uv-loop creq (fs-op-fd op) 0)   ; sync close
+                (uv-fs-req-cleanup creq)
+                (foreign-free creq))
+              (fs-cleanup! op req))))))
+
+  ;; A callback fired on a stream that was aborted while the op was in
+  ;; flight: unwind quietly whatever phase it was in.
+  (define (fs-abort-step! op req result)
+    (uv-fs-req-cleanup req)
+    (case (fs-op-phase op)
+      ((close) (fs-cleanup! op req))
+      ((open)
+       (when (>= result 0) (fs-op-fd-set! op result))
+       (fs-quiet-close! op req))
+      (else (fs-quiet-close! op req))))
 
   (define (start-fs-close! op req)
     (fs-op-phase-set! op 'close)
@@ -332,52 +376,75 @@
         (let ((op (hashtable-ref fs-table req #f))
               (result (uv-fs-get-result req)))
           (when op
-            (case (fs-op-phase op)
-              ((open)
-               (uv-fs-req-cleanup req)
-               (if (< result 0)
-                   (fs-fail! op req result)
-                   (begin
-                     (fs-op-fd-set! op result)
-                     (start-fs-fstat! op req))))
-              ((fstat)
-               (if (< result 0)
-                   (begin
-                     (uv-fs-req-cleanup req)
-                     (fs-fail! op req result))
-                   (let* ((st (uv-fs-get-statbuf req))
-                          (mode (foreign-ref 'unsigned-64 st uv-stat-mode-offset))
-                          (size (foreign-ref 'unsigned-64 st uv-stat-size-offset)))
-                     (uv-fs-req-cleanup req)
-                     (fs-op-size-set! op size)
-                     (if (not (regular-file-mode? mode))
-                         (fs-fail! op req UV-EINVAL)
-                         (if (= size 0)
-                             (start-fs-close! op req)
-                             (let* ((data (foreign-alloc file-read-chunk-size))
-                                    (buf (foreign-alloc 16)))
-                               (fs-op-data-set! op data)
-                               (fs-op-buf-set! op buf)
-                               (foreign-set! 'void* buf 0 data)
-                               (start-fs-read! op req)))))))
-              ((read)
-               (uv-fs-req-cleanup req)
-               (cond
-                 ((< result 0) (fs-fail! op req result))
-                 ((= result 0) (start-fs-close! op req))
-                 (else
-                  (let* ((remaining (- (fs-op-size op) (fs-op-offset op)))
-                         (n (min result remaining))
-                         (bv (make-bytevector n)))
-                    (memcpy-from-c bv (fs-op-data op) n)
-                    (fs-op-chunks-set! op (cons bv (fs-op-chunks op)))
-                    (fs-op-offset-set! op (+ (fs-op-offset op) n))
-                    (if (>= (fs-op-offset op) (fs-op-size op))
-                        (start-fs-close! op req)
-                        (start-fs-read! op req))))))
-              ((close)
-               (uv-fs-req-cleanup req)
-               (fs-finish! op req))))))
+            (if (fs-op-aborted? op)
+                (fs-abort-step! op req result)
+                (case (fs-op-phase op)
+                  ((open)
+                   (uv-fs-req-cleanup req)
+                   (if (< result 0)
+                       (fs-fail! op req result)
+                       (begin
+                         (fs-op-fd-set! op result)
+                         (start-fs-fstat! op req))))
+                  ((fstat)
+                   (if (< result 0)
+                       (begin
+                         (uv-fs-req-cleanup req)
+                         (fs-fail! op req result))
+                       (let* ((st (uv-fs-get-statbuf req))
+                              (mode (foreign-ref 'unsigned-64 st uv-stat-mode-offset))
+                              (size (foreign-ref 'unsigned-64 st uv-stat-size-offset)))
+                         (uv-fs-req-cleanup req)
+                         (fs-op-size-set! op size)
+                         (cond
+                           ((not (regular-file-mode? mode))
+                            (fs-fail! op req UV-EINVAL))
+                           ((eq? (fs-op-mode op) 'stream)
+                            ;; ready: report the size, then park until the
+                            ;; consumer pulls the first chunk
+                            (when (> size 0)
+                              (let* ((data (foreign-alloc file-read-chunk-size))
+                                     (buf (foreign-alloc 16)))
+                                (fs-op-data-set! op data)
+                                (fs-op-buf-set! op buf)
+                                (foreign-set! 'void* buf 0 data)))
+                            (fs-op-phase-set! op 'idle)
+                            (deliver (fs-op-owner op)
+                                     (vector 'file-stream op size)))
+                           ((= size 0)
+                            (start-fs-close! op req))
+                           (else
+                            (let* ((data (foreign-alloc file-read-chunk-size))
+                                   (buf (foreign-alloc 16)))
+                              (fs-op-data-set! op data)
+                              (fs-op-buf-set! op buf)
+                              (foreign-set! 'void* buf 0 data)
+                              (start-fs-read! op req)))))))
+                  ((read)
+                   (uv-fs-req-cleanup req)
+                   (cond
+                     ((< result 0) (fs-fail! op req result))
+                     ((= result 0) (start-fs-close! op req))   ; early EOF
+                     (else
+                      (let* ((remaining (- (fs-op-size op) (fs-op-offset op)))
+                             (n (min result remaining))
+                             (bv (make-bytevector n)))
+                        (memcpy-from-c bv (fs-op-data op) n)
+                        (fs-op-offset-set! op (+ (fs-op-offset op) n))
+                        (if (eq? (fs-op-mode op) 'stream)
+                            ;; hand over one chunk; the next read waits
+                            ;; for the consumer's file-stream-read!
+                            (begin
+                              (fs-op-phase-set! op 'idle)
+                              (deliver (fs-op-owner op) (vector 'file-chunk bv)))
+                            (begin
+                              (fs-op-chunks-set! op (cons bv (fs-op-chunks op)))
+                              (if (>= (fs-op-offset op) (fs-op-size op))
+                                  (start-fs-close! op req)
+                                  (start-fs-read! op req))))))))
+                  ((close)
+                   (uv-fs-req-cleanup req)
+                   (fs-finish! op req)))))))
       (void*)
       void))
 
@@ -502,17 +569,52 @@
         (stop! (car rest))
         (vector-for-each stop! (hashtable-keys listener-table))))
 
-  ;; Read a whole file on libuv's thread pool. The owner process later
-  ;; receives #(file-read ,bytevector) or #(file-error ,errno). Never
-  ;; blocks the scheduler, even for large files or slow filesystems.
-  (define (file-read-async! path owner)
-    (let ((req (foreign-alloc fs-req-size))
-          (op (make-fs-op owner path 'open -1 0 0 '() 0 0)))
+  (define (fs-start! path owner mode)
+    (let* ((req (foreign-alloc fs-req-size))
+           (op (make-fs-op owner path mode req 'open #f -1 0 0 '() 0 0)))
       (hashtable-set! fs-table req op)
       (let ((r (uv-fs-open uv-loop req path O-RDONLY 0 on-fs-entry)))
         (when (< r 0)
           (uv-fs-req-cleanup req)
-          (fs-fail! op req r)))))
+          (fs-fail! op req r)))
+      op))
+
+  ;; Read a whole file on libuv's thread pool. The owner process later
+  ;; receives #(file-read ,bytevector) or #(file-error ,errno). Never
+  ;; blocks the scheduler, even for large files or slow filesystems.
+  (define (file-read-async! path owner)
+    (fs-start! path owner 'whole)
+    (void))
+
+  ;; Open a file as a consumer-driven chunk stream. The owner later
+  ;; receives #(file-stream ,stream ,size) (ready; size from fstat) or
+  ;; #(file-error ,errno). Then each file-stream-read! yields exactly
+  ;; one of: #(file-chunk ,bv) (<= 64 KiB), #(file-eof) (all bytes
+  ;; delivered or the file shrank -- the fd is already closed), or
+  ;; #(file-error ,errno) (fd closed). One pull may be in flight at a
+  ;; time, so a slow consumer holds one chunk of memory, not the file.
+  (define (file-stream-open! path owner)
+    (fs-start! path owner 'stream)
+    (void))
+
+  ;; Transfer delivery of subsequent messages to another process (e.g.
+  ;; a pump spawned after the stream was opened). Call it before the
+  ;; new owner's first pull, with no pull in flight.
+  (define (file-stream-own! op pid)
+    (fs-op-owner-set! op pid))
+
+  (define (file-stream-read! op)
+    (when (and (not (fs-op-aborted? op)) (eq? (fs-op-phase op) 'idle))
+      (start-fs-read! op (fs-op-req op))))
+
+  ;; Abort/release a stream early (consumer done or gone). Idempotent;
+  ;; nothing further is delivered. With an op in flight the completion
+  ;; callback performs the close.
+  (define (file-stream-close! op)
+    (unless (fs-op-aborted? op)
+      (fs-op-aborted?-set! op #t)
+      (when (eq? (fs-op-phase op) 'idle)
+        (fs-quiet-close! op (fs-op-req op)))))
 
   ;; Async DNS. The owner process later receives #(dns-resolved ,ip-string)
   ;; or #(dns-failed ,errno). libuv resolves on its thread pool, so the

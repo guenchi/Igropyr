@@ -123,7 +123,9 @@ actor 接口（`start-scheduler`、`spawn`、`receive` 等）；express、websoc
 ;; 静态文件：/assets/style.css -> ./public/style.css。文件读取一次后缓存在内存中
 ;;（只有 mtime 变化时才重新读取，mtime 本身最多每秒复查一次），因此服务热资源
 ;; 是 hashtable lookup——没有磁盘读取，也没有 stat 系统调用。响应带 weak ETag 和 Cache-Control，匹配的 If-None-Match
-;; 会得到 304 Not Modified。超过 1 MiB 的文件会被服务，但不会缓存。
+;; 会得到 304 Not Modified。超过 1 MiB 的文件不会整体读入内存：以定长响应
+;; （Content-Length）按 64 KiB 分块流式发送，且带背压——上一块写完才读下一块，
+;; 慢客户端下载 10 GB 也只占一块内存；worker 立即释放（泵在独立进程里跑）。
 (app-static app "/assets" "./public")
 
 ;; 进入 scheduler 并监听；永不返回

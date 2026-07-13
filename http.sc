@@ -34,6 +34,7 @@
           req-local req-set-local!
           set-status! set-header! res-send!
           res-begin! res-write! res-end!
+          res-begin-file! res-write-file! res-abort-file!
           res-conn res-req res-status res-headers res-keep-alive?
           send-response! parse-query
           ;; Re-exported app-facing (igropyr actor) surface, so a core
@@ -449,8 +450,10 @@
       (mutable status res-status res-status-set!)
       (mutable headers res-headers res-headers-set!)
       (immutable keep-alive? res-keep-alive?)
-      ;; plain | streaming | done
-      (mutable mode res-mode res-mode-set!)))
+      ;; plain | streaming | raw | done
+      (mutable mode res-mode res-mode-set!)
+      ;; bytes still owed in a fixed-length (res-begin-file!) response
+      (mutable remaining res-remaining res-remaining-set!)))
 
   (define (set-status! r s) (res-status-set! r s))
 
@@ -527,6 +530,74 @@
                   (tcp-close! c)
                   (send owner (vector 'conn-closed)))))))))
 
+  ;; ---- fixed-length streaming (large files) --------------------------------
+
+  ;; Begin a response of known length: status + headers + Content-Length
+  ;; go out now, the body follows through res-write-file!. Claims the
+  ;; token, so call this from the pool worker, then spawn a pump process
+  ;; for the writes (as with res-begin!) -- a long download must not
+  ;; occupy a worker or it would be killed as stuck.
+  (define (res-begin-file! r len)
+    (let ((c (res-conn r)))
+      (when (claim! (res-token r))
+        (res-mode-set! r 'raw)
+        (res-remaining-set! r len)
+        (tcp-write! c
+          (string->utf8
+            (assemble-head (res-status r) (res-headers r)
+              "Content-Length: " (number->string len)
+              (if (res-keep-alive? r) keep-alive-tail close-tail)))
+          #f)
+        (send (conn-owner c) (vector 'streaming)))))
+
+  ;; Write one chunk and wait for it to drain before returning --
+  ;; backpressure: the producer runs exactly at the client's pace, one
+  ;; chunk in flight. The final chunk (the one reaching the declared
+  ;; length) instead carries the keep-alive/close continuation and is
+  ;; not waited for. Returns 'more (continue), 'done (response
+  ;; complete), or #f (connection gone -- call res-abort-file!).
+  (define (res-write-file! r data)
+    (let* ((bv (if (string? data) (string->utf8 data) data))
+           (c (res-conn r))
+           (n (bytevector-length bv))
+           (remaining (res-remaining r)))
+      (cond
+        ((not (and (eq? (res-mode r) 'raw) (eq? (conn-state c) 'open))) #f)
+        ((fx= n 0) 'more)
+        ((> n remaining)
+         (assertion-violation 'res-write-file!
+           "chunk exceeds the declared Content-Length" n remaining))
+        ((= n remaining)
+         (res-remaining-set! r 0)
+         (res-mode-set! r 'done)
+         (let ((owner (conn-owner c)) (ka (res-keep-alive? r)))
+           (tcp-write! c bv
+             (lambda (st)
+               (if (and ka (>= st 0))
+                   (send owner (vector 'next-request))
+                   (begin
+                     (tcp-close! c)
+                     (send owner (vector 'conn-closed))))))
+           'done))
+        (else
+         (res-remaining-set! r (- remaining n))
+         (let ((me self))
+           (tcp-write! c bv
+             (lambda (st) (send me (vector 'file-written st)))))
+         (receive
+           (`#(file-written ,st) (and (>= st 0) 'more)))))))
+
+  ;; A fixed-length response that cannot be completed (read error, file
+  ;; shrank, client stalled out) has one correct exit: close the
+  ;; connection -- the promised Content-Length can never be satisfied.
+  ;; No-op unless a res-begin-file! response is in progress.
+  (define (res-abort-file! r)
+    (when (eq? (res-mode r) 'raw)
+      (res-mode-set! r 'done)
+      (let ((c (res-conn r)))
+        (tcp-close! c)
+        (send (conn-owner c) (vector 'conn-closed)))))
+
   ;; ---- task execution (inside a pool worker) -----------------------------------
 
   ;; A crash here kills the worker (Let It Crash): the supervisor retries
@@ -537,7 +608,7 @@
     (let* ((c (vector-ref task 2))
            (req (vector-ref task 3))
            (token (vector-ref task 4))
-           (r (make-res c token req 200 '() (req-keep-alive? req) 'plain)))
+           (r (make-res c token req 200 '() (req-keep-alive? req) 'plain 0)))
       (if (eq? (vector-ref task 0) 'fail)
           ;; failure hook: one attempt by construction. A raise inside the
           ;; hook is caught (the worker survives, so the supervisor never
