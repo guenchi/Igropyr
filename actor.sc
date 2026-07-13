@@ -99,14 +99,19 @@
 
   ;; ---- global scheduler state ------------------------------------------
 
-  ;; The current pcb lives in a box so the exported `self` macro can read
-  ;; it from other libraries (R6RS forbids referencing an assigned library
-  ;; variable across library boundaries).
-  (define self-cell (box #f))
+  ;; The current pcb lives in Chez virtual register 0 (igropyr claims
+  ;; register 0 process-wide; Chez provides 16, see virtual-register-count).
+  ;; With a constant index the compiler turns (virtual-register 0) into a
+  ;; single load at a fixed thread-context offset -- the fastest mutable
+  ;; global there is, on the hottest path in the system (every send,
+  ;; receive and context switch reads or writes *self*). It also solves
+  ;; what a box solved before: the exported `self` macro expands to a
+  ;; primitive call, so other libraries need no reference to an assigned
+  ;; library variable (forbidden by R6RS) and pay no box indirection.
   (define-syntax *self*
     (identifier-syntax
-      (id (unbox self-cell))
-      ((set! id v) (set-box! self-cell v))))
+      (id (virtual-register 0))
+      ((set! id v) (set-virtual-register! 0 v))))
   (define-syntax self (identifier-syntax *self*))
   (define run-queue (make-queue))
   (define sleep-queue (make-queue))
