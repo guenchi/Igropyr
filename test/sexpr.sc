@@ -72,6 +72,63 @@
 (check "no-write-cycle"
        (write-fails? (let ((x (list 1 2))) (set-cdr! (cdr x) x) x)))
 
+;; ---- extended mode: vectors, bytevectors, finite flonums ---------------
+
+(define (ext-round-trips? x)
+  (equal? x (string->sexpr-extended (sexpr->string-extended x))))
+(define (ext-parse-fails? s)
+  (guard (e ((vector? e) (eq? (vector-ref e 0) 'sexpr-error)))
+    (string->sexpr-extended s)
+    #f))
+(define (ext-write-fails? x)
+  (guard (e ((vector? e) (eq? (vector-ref e 0) 'sexpr-error)))
+    (sexpr->string-extended x)
+    #f))
+
+(check "ext-vector" (ext-round-trips? '#(1 two "three" #t)))
+(check "ext-vector-empty" (ext-round-trips? '#()))
+(check "ext-vector-nested" (ext-round-trips? '#(#(1 2) (a . #(b)) #vu8(7))))
+(check "ext-bytevector" (ext-round-trips? (bytevector 0 127 255)))
+(check "ext-bytevector-empty" (ext-round-trips? (bytevector)))
+(check "ext-flonums"
+       (ext-round-trips?
+        '(0.5 -3.25 1e300 1.7976931348623157e308 5e-324 -0.0 100.0)))
+(check "ext-flonum-bit-exact"
+       (eqv? 0.1 (string->sexpr-extended (sexpr->string-extended 0.1))))
+(check "ext-actor-message" (ext-round-trips? '#(tcp-data #vu8(1 2 3))))
+(check "ext-strict-subset"
+       (ext-round-trips? '(user (id . 42) (name . "ada") 1/3 #t)))
+(check "ext-wire-text"
+       (string=? (sexpr->string-extended '#(1 #vu8(2 3) 4.5))
+                 "#(1 #vu8(2 3) 4.5)"))
+
+;; extended mode still rejects everything outside ITS whitelist
+(check "ext-no-inf-read" (ext-parse-fails? "1e999"))       ; reads as +inf.0
+(check "ext-no-inf-write" (ext-write-fails? +inf.0))
+(check "ext-no-nan-write" (ext-write-fails? +nan.0))
+(check "ext-no-char" (ext-parse-fails? "#\\a"))
+(check "ext-no-eval" (ext-parse-fails? "#;(walk in) 42"))
+(check "ext-no-dotted-vector" (ext-parse-fails? "#(1 . 2)"))
+(check "ext-vector-unterminated" (ext-parse-fails? "#(1 2"))
+(check "ext-bv-range" (ext-parse-fails? "#vu8(256)"))
+(check "ext-bv-negative" (ext-parse-fails? "#vu8(-1)"))
+(check "ext-bv-ratio" (ext-parse-fails? "#vu8(1/2)"))
+(check "ext-bv-float" (ext-parse-fails? "#vu8(1.5)"))
+(check "ext-bv-nested" (ext-parse-fails? "#vu8((1))"))
+(check "ext-bv-unterminated" (ext-parse-fails? "#vu8(1 2"))
+(check "ext-bv-bad-prefix" (ext-parse-fails? "#vu9(1)"))
+(check "ext-no-write-proc" (ext-write-fails? car))
+(check "ext-depth-bomb"
+       (ext-parse-fails?
+        (let loop ((i 0) (s "42"))
+          (if (= i 100) s (loop (+ i 1) (string-append "#(" s ")"))))))
+
+;; the extension must not leak into strict mode
+(check "strict-still-no-vector" (parse-fails? "#(1 2 3)"))
+(check "strict-still-no-bv" (parse-fails? "#vu8(1)"))
+(check "strict-still-no-float" (parse-fails? "1.5"))
+(check "strict-still-no-write-bv" (write-fails? (bytevector 1)))
+
 (if (zero? failures)
     (begin (display "sexpr: all tests passed") (newline))
     (begin (display failures) (display " failures") (newline) (exit 1)))
