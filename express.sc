@@ -111,14 +111,14 @@
     (guard (e (#t #f))
       (let ((body (req-body req)))
         (and (<= (bytevector-length body) (* 1024 1024))
-             (string->sexpr (utf8->string body))))))
+             (string->sexpr-extended (utf8->string body))))))
 
   ;; a bytevector is passed through as a pre-serialized datum
   (define (send-sexpr! r x)
     (finish! r "application/sexpr; charset=utf-8"
              (if (bytevector? x)
                  x
-                 (string->utf8 (sexpr->string x)))))
+                 (string->utf8 (sexpr->string-extended x)))))
 
   ;; ---- cookies --------------------------------------------------------------
 
@@ -682,14 +682,14 @@
   ;; the natural framing for pushed data.
 
   (define (ws-send-sexpr! ws x)
-    (ws-send-text! ws (sexpr->string x)))
+    (ws-send-text! ws (sexpr->string-extended x)))
 
   ;; -> datum | 'close (connection over) | #f (binary or bad datum)
   (define (ws-recv-sexpr ws)
     (let ((m (ws-recv ws)))
       (cond
         ((and (vector? m) (eq? (vector-ref m 0) 'text))
-         (guard (e (#t #f)) (string->sexpr (vector-ref m 1))))
+         (guard (e (#t #f)) (string->sexpr-extended (vector-ref m 1))))
         ((and (vector? m) (eq? (vector-ref m 0) 'close)) 'close)
         (else #f))))
 
@@ -697,7 +697,7 @@
   ;; datum splits into multiple data: lines; EventSource rejoins them
   ;; with \n on the client, so the datum survives intact.
   (define (sse-send-sexpr! res x)
-    (let* ((text (sexpr->string x))
+    (let* ((text (sexpr->string-extended x))
            (lines (string-split text #\newline)))
       (res-write! res
         (string-append
