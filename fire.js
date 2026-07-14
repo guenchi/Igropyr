@@ -13,10 +13,10 @@ const SOURCES = [
     'src/prelude.ss',
     'lib/web/js.ss',
     'lib/web/dom.ss',
-    'lib/web/glsl.ss',
-    'lib/web/gl.ss',
-    'lib/web/mat.ss',
-    'lib/web/fx.ss',
+    'lib/gfx/glsl.ss',
+    'lib/gfx/gl.ss',
+    'lib/gfx/mat.ss',
+    'lib/gfx/fx.ss',
     'site/hive-data.ss',
     'site/fire.ss',
 ];
@@ -68,7 +68,7 @@ const stubs = {
         ({ instance } = await WebAssembly.instantiate(fireWasm, { io, js }));
     }
     ex = instance.exports;
-    // expose the staging memory so (web gl) can build typed-array views
+    // expose the staging memory so (gfx gl) can build typed-array views
     if (ex.memory) globalThis.__goeteia_mem = ex.memory;
     ex.main();
 })();

@@ -14,7 +14,7 @@
 ;; assume flonums -- they are the per-frame hot path.
 ;;
 ;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
-(library (web mat)
+(library (gfx mat)
   (export flsin flcos fltan
           v3 v3-x v3-y v3-z
           v3-add v3-sub v3-scale v3-dot v3-cross v3-normalize
@@ -209,7 +209,7 @@
 
   ;; general 4x4 inverse by cofactor expansion; #f when singular.
   ;; the door to picking: invert the view-projection, unproject the
-  ;; cursor, raycast with (web collide)
+  ;; cursor, raycast with (gfx collide)
   (define (m4-inverse m)
     (define (a i) (vector-ref m i))
     (let* ((s0 (fl- (fl* (a 0) (a 5)) (fl* (a 4) (a 1))))

@@ -28,7 +28,7 @@
 ;; cmd-region!), vertex/user data wherever you put it.
 ;;
 ;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
-(library (web gl)
+(library (gfx gl)
   (export gl-attach! gl-program! gl-buffer! gl-uniform!
           gl-texture! gl-texture-upload! gl-texture-data! gl-cubemap!
           gl-cubemap-empty! gl-cube-face-fb! gl-slot-object!
@@ -464,7 +464,7 @@
   (define (gl-cubemap! slot base dim)
     (js-method $gl "cubemap" slot base dim))
   ;; an empty cube map with an explicit mip chain, and a framebuffer
-  ;; aimed at one face of one level -- the plumbing (web ibl) uses to
+  ;; aimed at one face of one level -- the plumbing (gfx ibl) uses to
   ;; bake prefiltered environments
   (define (gl-cubemap-empty! slot dim levels)
     (js-method $gl "cubemapEmpty" slot dim levels))
@@ -520,7 +520,7 @@
   (define (cmd-uniform2f! slot x y) (u! 13) (u! slot) (f! x) (f! y))
   (define (cmd-uniform3f! slot x y z)
     (u! 19) (u! slot) (f! x) (f! y) (f! z))
-  ;; m: a 16-element flonum vector, column-major ((web mat) makes them)
+  ;; m: a 16-element flonum vector, column-major ((gfx mat) makes them)
   (define (cmd-uniform-matrix4! slot m)
     (u! 14) (u! slot)
     (let loop ((i 0))

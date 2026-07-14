@@ -14,9 +14,9 @@
 ;; into an HDR (half-float) target where the tip runs past white; a
 ;; threshold + separable blur turns the excess into a radiant halo,
 ;; composited onto the transparent canvas. Everything renders through
-;; (web fx) over (web gl)'s command buffer: one bridge call per frame,
+;; (gfx fx) over (gfx gl)'s command buffer: one bridge call per frame,
 ;; GPU-resident particle state, zero per-frame Scheme physics.
-(import (rnrs) (web js) (web dom) (web gl) (web glsl) (web fx)
+(import (rnrs) (web js) (web dom) (gfx gl) (gfx glsl) (gfx fx)
         (hive-data))
 
 (define canvas (get-element-by-id "hive"))

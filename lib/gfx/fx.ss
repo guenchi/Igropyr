@@ -1,6 +1,6 @@
-;; The effects harness over (web gl): programs that wire themselves.
+;; The effects harness over (gfx gl): programs that wire themselves.
 ;;
-;; A shader authored as (web glsl) forms already declares its
+;; A shader authored as (gfx glsl) forms already declares its
 ;; interface; fx reads the attribute/uniform declarations back out of
 ;; the same forms and does the bookkeeping that gl-particles.ss does
 ;; by hand -- attribute locations and interleaved offsets, uniform
@@ -27,7 +27,7 @@
 ;; %mem-f32-set! traps on fixnums, so user code may pass either.
 ;;
 ;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
-(library (web fx)
+(library (gfx fx)
   (export fx-init! fx-slot! fx-alloc! fx-buffer! fx-texture!
           fx-width fx-height
           fx-target! fx-target-hdr! fx-target-msaa! fx-resolve!
@@ -45,7 +45,7 @@
           pointer-lock! pointer-locked? pointer-motion!
           fx-fullscreen! fx-quad-program
           fx-fullscreen-use! fx-fullscreen-draw!)
-  (import (rnrs) (web js) (web gl) (web glsl) (web mat))
+  (import (rnrs) (web js) (gfx gl) (gfx glsl) (gfx mat))
 
   (define ($fx-fl v) (if (flonum? v) v (exact->inexact v)))
 
@@ -313,7 +313,7 @@
                                   ($fx-fl (car vs)) ($fx-fl (cadr vs))
                                   ($fx-fl (caddr vs)) ($fx-fl (cadddr vs))))
           ((sampler2D samplerCube int) (cmd-uniform1i! slot (car vs)))
-          ((mat4) (cmd-uniform-matrix4! slot (car vs)))  ; (web mat) m4
+          ((mat4) (cmd-uniform-matrix4! slot (car vs)))  ; (gfx mat) m4
           (else (error 'fx-uniform! "unsupported uniform type" ty)))))))
 
   ;; ---- the timing pump and the frame loop ----

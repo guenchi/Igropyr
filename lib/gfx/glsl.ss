@@ -38,7 +38,7 @@
 ;;   anything else (vec4 sin dot mix ...) is a call.
 ;;
 ;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
-(library (web glsl)
+(library (gfx glsl)
   (export glsl->string glsl-attributes glsl-uniforms glsl-varyings
           glsl300-vs->string glsl300-fs->string)
   (import (rnrs))
@@ -255,7 +255,7 @@
                   "out highp vec4 goe_FragColor; ")))
 
   ;; the interface, extracted: shader forms are data, so the
-  ;; attribute/uniform declarations that (web fx) wires up come from
+  ;; attribute/uniform declarations that (gfx fx) wires up come from
   ;; the same list that rendered the source -- one source of truth
   (define ($glsl-components t)          ; f32 components per attribute
     (case t
