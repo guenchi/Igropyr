@@ -27,10 +27,15 @@
 ;;;                                ~1.33x on the wire and decoded in one
 ;;;                                pass, vs the ~4x text and O(n)-list
 ;;;                                blowup a #vu8(0 1 255 ...) form costs
-;;;   flonums      1.5, -2e10   -- FINITE only; inf/nan are rejected
-;;;                                on read AND write; Chez prints the
-;;;                                shortest form that reads back
-;;;                                bit-identically
+;;;   flonums      #f8"b64"     -- the 8 IEEE-754 bytes of the double,
+;;;                                little-endian, base64: bit-exact for
+;;;                                EVERY double, inf and nan included --
+;;;                                no decimal printing anywhere, so a
+;;;                                peer without exact float printing
+;;;                                (Goeteia) round-trips perfectly.
+;;;                                (-0.0 may read back as 0.0 on a peer
+;;;                                whose floats cannot carry a signed
+;;;                                zero; numerically equal.)
 ;;; The strict mode is untouched: it stays the HTTP-facing and
 ;;; Goeteia-compatible format, and still rejects all three.
 ;;;
@@ -125,9 +130,17 @@
         (let ((c (string-ref s i)))
           (case c
             ((#\t #\f)
-             (unless (or (>= (+ i 1) n) (delim? (string-ref s (+ i 1))))
-               (sfail "bad # literal" i))
-             (values (char=? c #\t) (+ i 1)))
+             ;; extended #f8"..." (a flonum) must be told apart from the
+             ;; #f boolean: the 8-and-quote lookahead decides
+             (if (and ext? (char=? c #\f)
+                      (< (+ i 2) n)
+                      (char=? (string-ref s (+ i 1)) #\8)
+                      (char=? (string-ref s (+ i 2)) #\"))
+                 (parse-flonum-b64 (+ i 3))
+                 (begin
+                   (unless (or (>= (+ i 1) n) (delim? (string-ref s (+ i 1))))
+                     (sfail "bad # literal" i))
+                   (values (char=? c #\t) (+ i 1)))))
             ((#\()                               ; extended: vector
              (unless ext? (sfail "bad # literal" i))
              (parse-vector (+ i 1) depth))
@@ -154,21 +167,29 @@
               (else
                (let-values (((v j) (parse-value i (+ depth 1))))
                  (loop j (cons v acc))))))))
-      ;; extended: the payload is base64 (RFC 4648); read to the closing
-      ;; quote and decode straight into a bytevector -- no per-element
-      ;; list, so no O(n) allocation blowup. The base64 alphabet has no
-      ;; " or \, so there is nothing to escape; a stray char fails loudly.
-      (define (parse-bytevector-b64 start)
+      ;; Scan a base64 payload to its closing quote and decode it in one
+      ;; pass -- no per-element list, so no O(n) allocation blowup. The
+      ;; base64 alphabet has no " or \, so there is nothing to escape; a
+      ;; stray char fails loudly. -> (values bytes next-i)
+      (define (parse-b64 start what)
         (let loop ((j start))
           (cond
-            ((>= j n) (sfail "unterminated bytevector" start))
+            ((>= j n) (sfail (string-append "unterminated " what) start))
             ((char=? (string-ref s j) #\")
              (values (base64-decode (substring s start j)) (+ j 1)))
             ((let ((c (string-ref s j)))
                (or (char<=? #\A c #\Z) (char<=? #\a c #\z) (char<=? #\0 c #\9)
                    (char=? c #\+) (char=? c #\/) (char=? c #\=)))
              (loop (+ j 1)))
-            (else (sfail "bad base64 in bytevector" j)))))
+            (else (sfail (string-append "bad base64 in " what) j)))))
+      (define (parse-bytevector-b64 start)
+        (parse-b64 start "bytevector"))
+      ;; extended: the 8 IEEE-754 bytes of a double, little-endian
+      (define (parse-flonum-b64 start)
+        (let-values (((bv j) (parse-b64 start "flonum")))
+          (unless (= (bytevector-length bv) 8)
+            (sfail "flonum wants exactly 8 bytes" start))
+          (values (bytevector-ieee-double-ref bv 0 (endianness little)) j)))
       (define (digits? str a b)
         (and (< a b)
              (let lp ((i a))
@@ -213,17 +234,9 @@
                  (or (char<=? #\0 c #\9)
                      (and (char=? c #\-) (> m 1)
                           (char<=? #\0 (string-ref tok 1) #\9)))))))
-      ;; extended: a numeric-shaped token carrying '.' or an exponent
-      ;; must parse to a FINITE flonum ("1e999" reads as +inf.0 in the
-      ;; host and is rejected here; so are nan and complex results)
-      (define (token->flonum tok)
-        (and (let ((m (string-length tok)))
-               (let lp ((i 0))
-                 (and (< i m)
-                      (or (memv (string-ref tok i) '(#\. #\e #\E))
-                          (lp (+ i 1))))))
-             (let ((v (string->number tok 10)))
-               (and (flonum? v) (not (nan? v)) (not (infinite? v)) v))))
+      ;; No decimal flonum text on the wire in EITHER mode: a flonum
+      ;; crosses only as #f8"<base64>" (extended), so a numeric-shaped
+      ;; token carrying '.' or an exponent is always a bad number.
       (define (parse-atom i)
         (let ((j (let lp ((j i))
                    (if (or (>= j n) (delim? (string-ref s j))) j (lp (+ j 1))))))
@@ -231,7 +244,6 @@
           (let ((tok (substring s i j)))
             (cond
               ((token->number tok) => (lambda (v) (values v j)))
-              ((and ext? (token->flonum tok)) => (lambda (v) (values v j)))
               ((numeric-shape? tok) (sfail "bad number" i))
               ((valid-symbol? tok) (values (string->symbol tok) j))
               (else (sfail "bad token" i))))))
@@ -301,10 +313,14 @@
        (put-string p "#vu8\"")
        (put-string p (base64-encode x))
        (put-char p #\"))
+      ;; the 8 IEEE bytes, little-endian: bit-exact for every double,
+      ;; inf and nan included -- decimal printing never touches the wire
       ((and ext? (flonum? x))
-       (when (or (nan? x) (infinite? x))
-         (sfail "non-finite flonum" 0))
-       (put-string p (number->string x)))
+       (put-string p "#f8\"")
+       (let ((bv (make-bytevector 8)))
+         (bytevector-ieee-double-set! bv 0 x (endianness little))
+         (put-string p (base64-encode bv)))
+       (put-char p #\"))
       (else (sfail "datum not in the wire whitelist" 0))))
 
   (define (wire-symbol? s)

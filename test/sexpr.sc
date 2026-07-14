@@ -100,12 +100,23 @@
        (ext-round-trips? '(user (id . 42) (name . "ada") 1/3 #t)))
 (check "ext-wire-text"
        (string=? (sexpr->string-extended '#(1 #vu8(2 3) 4.5))
-                 "#(1 #vu8\"AgM=\" 4.5)"))
+                 "#(1 #vu8\"AgM=\" #f8\"AAAAAAAAEkA=\")"))
+(check "ext-f8-decode"
+       (eqv? 4.5 (string->sexpr-extended "#f8\"AAAAAAAAEkA=\"")))
 
 ;; extended mode still rejects everything outside ITS whitelist
-(check "ext-no-inf-read" (ext-parse-fails? "1e999"))       ; reads as +inf.0
-(check "ext-no-inf-write" (ext-write-fails? +inf.0))
-(check "ext-no-nan-write" (ext-write-fails? +nan.0))
+(check "ext-no-decimal-float" (ext-parse-fails? "4.5"))  ; #f8 is the only form
+(check "ext-no-inf-read" (ext-parse-fails? "1e999"))
+;; inf and nan DO cross now -- they are ordinary IEEE bit patterns
+(check "ext-inf-round-trip"
+       (eqv? +inf.0 (string->sexpr-extended (sexpr->string-extended +inf.0))))
+(check "ext-nan-round-trip"
+       (let ((r (string->sexpr-extended (sexpr->string-extended +nan.0))))
+         (and (flonum? r) (nan? r))))
+(check "ext-f8-wrong-length" (ext-parse-fails? "#f8\"AgM=\""))   ; 3 bytes
+(check "ext-f8-unterminated" (ext-parse-fails? "#f8\"AAAAAAAAEkA="))
+(check "ext-false-still-false" (equal? '(#f #t) (string->sexpr-extended "(#f #t)")))
+(check "strict-no-f8" (parse-fails? "#f8\"AAAAAAAAEkA=\""))
 (check "ext-no-char" (ext-parse-fails? "#\\a"))
 (check "ext-no-eval" (ext-parse-fails? "#;(walk in) 42"))
 (check "ext-no-dotted-vector" (ext-parse-fails? "#(1 . 2)"))
