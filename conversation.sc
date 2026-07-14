@@ -43,16 +43,31 @@
 ;;;     raise #(conversation-failed reason) in the caller -- the worker
 ;;;     crashes, and the pool's normal retry handles it (nothing had
 ;;;     been answered yet, and the dead process rolled back).
+;;;
+;;; Clustered: a conversation is PINNED to the node that created it --
+;;; its continuation and open transaction cannot migrate. The id carries
+;;; that owner ("<node>~<hex>"), so conversation-resume! on ANY node
+;;; reaches the right one: a resume that lands elsewhere (round-robin LB,
+;;; a reconnect landing on a different node) is forwarded to the owner
+;;; over the node mesh, concurrently -- one process per forwarded resume,
+;;; never a serial router. The owner node being gone (link down, crash)
+;;; yields 'gone, and that is honest: the process died, so its
+;;; transaction rolled back. Forwarded req and reply cross a link, so
+;;; they must be extended-wire-safe (as with rsend / rcall). With one
+;;; node (node-start! never called) the id has no prefix and every
+;;; resume stays local -- no dependency on the distribution layer at
+;;; run time.
 
 (library (igropyr conversation)
   (export conversation-start! conversation-resume! conversation-gone?)
-  (import (chezscheme) (igropyr actor))
+  (import (chezscheme) (igropyr actor)
+          (only (igropyr node) node-self rsend monitor-node demonitor-node))
 
   (define default-ttl-ms 300000)      ; 5 minutes
 
   ;; CSPRNG conversation ids: resuming is authorization, so ids must be
   ;; unguessable (same reasoning as session sids)
-  (define (conversation-id!)
+  (define (conv-hex!)
     (let ((bv (make-bytevector 16)))
       (call-with-port (open-file-input-port "/dev/urandom")
         (lambda (p) (get-bytevector-n! p bv 0 16)))
@@ -61,6 +76,22 @@
                (let ((h (number->string (bytevector-u8-ref bv i) 16)))
                  (if (= (string-length h) 1) (string-append "0" h) h)))
              (iota 16)))))
+
+  ;; The id carries the owner node so a resume on any node reaches it:
+  ;; "<node>~<hex>" when clustered, bare "<hex>" on a single node. The
+  ;; hex stays unguessable either way; the node prefix is not a secret.
+  (define (conversation-id!)
+    (let ((hex (conv-hex!)) (n (node-self)))
+      (if n (string-append (symbol->string n) "~" hex) hex)))
+
+  ;; owner node of an id, or #f (bare id -> single node, always local)
+  (define (conv-owner id)
+    (let ((len (string-length id)))
+      (let loop ((i 0))
+        (cond ((= i len) #f)
+              ((char=? (string-ref id i) #\~)
+               (string->symbol (substring id 0 i)))
+              (else (loop (+ i 1)))))))
 
   (define (conversation-name id)
     (string->symbol (string-append "igropyr-conv-" id)))
@@ -71,6 +102,79 @@
     (receive (after 0 'ok)
       (`#(DOWN ,@p ,r) 'ok)))
 
+  ;; ---- cross-node forwarding (owner routing) -----------------------
+  ;;
+  ;; A resume that lands on a node other than the owner is forwarded over
+  ;; the mesh. The owner runs one router process (conv-router) that
+  ;; SPAWNS a worker per forwarded resume, so a slow flow never blocks
+  ;; other conversations -- there is no serial bottleneck. Correlation
+  ;; must survive the wire, so the reply name is an INTERNED symbol (a
+  ;; gensym is uninterned and would not round-trip via eq?) and the ref
+  ;; is an integer (equal?-matchable across the codec).
+
+  (define conv-router-name 'igropyr-conv-router)
+  (define conv-forward-ttl-ms 300000)   ; forwarding-layer safety timeout
+
+  (define reply-name-counter 0)
+  (define (fresh-reply-name!)
+    (with-interrupts-disabled
+      (set! reply-name-counter (+ reply-name-counter 1))
+      (string->symbol
+        (string-append "igropyr-conv-r-" (number->string reply-name-counter)))))
+
+  (define ref-counter 0)
+  (define (fresh-ref!)
+    (with-interrupts-disabled
+      (set! ref-counter (+ ref-counter 1))
+      ref-counter))
+
+  ;; The owner's router: for each forwarded resume, spawn a worker that
+  ;; runs the resume locally and sends the reply straight back to the
+  ;; requesting node's temporary reply name. The router itself only
+  ;; dispatches, so it is never the bottleneck.
+  (define (conv-router-loop)
+    (let loop ()
+      (receive
+        (`#(conv-resume ,from-node ,reply-name ,ref ,id ,req)
+          (spawn
+            (lambda ()
+              (rsend from-node reply-name
+                     (vector 'conv-forward-reply ref (local-resume id req)))))
+          (loop))
+        (,_ (loop)))))
+
+  ;; Start the owner-side router once per node. Idempotent and atomic:
+  ;; only meaningful when clustered (node-self set).
+  (define (ensure-router!)
+    (when (node-self)
+      (with-interrupts-disabled
+        (unless (whereis conv-router-name)
+          (register conv-router-name (spawn conv-router-loop))))))
+
+  ;; Forward a resume to the owner node and wait for its reply. Owner
+  ;; link down (monitor-node) or timeout both mean 'gone -- honest,
+  ;; because a dead owner process rolled its transaction back.
+  (define (forward-resume owner id req)
+    (let ((reply-name (fresh-reply-name!))
+          (ref (fresh-ref!)))
+      (register reply-name self)
+      (monitor-node owner)
+      (dynamic-wind
+        (lambda () (void))
+        (lambda ()
+          ;; rsend is #f when the owner link is already down -> 'gone at
+          ;; once (its process died, so its transaction rolled back);
+          ;; otherwise wait, and node-down mid-flight is the same 'gone.
+          (if (rsend owner conv-router-name
+                     (vector 'conv-resume (node-self) reply-name ref id req))
+              (receive (after conv-forward-ttl-ms 'gone)
+                (`#(conv-forward-reply ,@ref ,reply) reply)
+                (`#(node-down ,@owner) 'gone))
+              'gone))
+        (lambda ()
+          (demonitor-node owner)
+          (unregister reply-name)))))
+
   ;; Start a conversation. flow: (lambda (req suspend!) ... final-reply).
   ;; suspend! answers the current round and parks until the next resume,
   ;; returning the next request; on TTL expiry it raises
@@ -79,6 +183,7 @@
   ;; Returns (values id first-reply); the caller parks meanwhile.
   ;; Optional trailing argument: ttl-ms (default 300000).
   (define (conversation-start! flow req . opts)
+    (ensure-router!)
     (let* ((ttl (if (pair? opts) (car opts) default-ttl-ms))
            (id (conversation-id!))
            (name (conversation-name id))
@@ -113,6 +218,13 @@
   ;; expired, or crashed -- for a transactional flow that means the
   ;; database already rolled back.
   (define (conversation-resume! id req)
+    (let ((owner (conv-owner id)))
+      (if (or (not owner) (eq? owner (node-self)))
+          (local-resume id req)
+          (forward-resume owner id req))))
+
+  ;; Resume a conversation that lives on THIS node.
+  (define (local-resume id req)
     (let ((p (whereis (conversation-name id))))
       (if (not p)
           'gone
