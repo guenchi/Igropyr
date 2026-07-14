@@ -1230,15 +1230,18 @@ full path 在明文连接上默认被拒绝，因为 MITM 可能替换 server ke
 
 #### 扩展线模式
 
-`string->sexpr-extended` / `sexpr->string-extended` 为 igropyr 对 igropyr
-的链路（节点 mesh，对端就是同一份 codec）增加三种类型：
+`string->sexpr-extended` / `sexpr->string-extended` 增加三种类型，供
+节点间链路与浏览器客户端（[Goeteia](https://goeteia.dev)，其
+`(web sexpr)` 与这份 codec 逐字节相同）共用：
 
 - vector `#(...)` ——不允许 dotted tail，和列表一样受深度限制
-- bytevector `#vu8(...)` ——只接受裸的精确整数 0..255
-- 浮点数 `1.5`、`-2e10` ——**仅限有限值**：`inf`/`nan` 在读*和*写两侧都被
-  拒绝；Chez 打印能逐位读回的最短形式，浮点往返精确无损
+- bytevector `#vu8"<base64>"` ——原始字节的 base64，单遍解码（无 O(n) 中间链表）
+- 浮点数 `#f8"<base64>"` ——double 的 8 个 IEEE-754 字节，小端，base64：
+  **对每个 double 都逐位精确，含 `inf`/`nan`**。线上从不打印十进制，所以
+  即便对端浮点打印有损（Goeteia）也能无损往返每个 double（`-0.0` 在这类
+  对端读回 `0.0`，数值相等）。
 
-严格模式不受影响——它仍是面向 HTTP、与 Goeteia 兼容的格式，依旧拒绝这三种类型。
+严格模式不受影响——它仍是面向 HTTP 的最小子集，依旧拒绝这三种类型。
 
 #### 互操作说明
 

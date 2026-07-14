@@ -1900,18 +1900,23 @@ through as a symbol.
 
 #### Extended Wire Mode
 
-`string->sexpr-extended` / `sexpr->string-extended` add three types for
-igropyr-to-igropyr links (node meshes), where the peer is this same
-codec:
+`string->sexpr-extended` / `sexpr->string-extended` add three types,
+used by the node-to-node links and by browser clients
+([Goeteia](https://goeteia.dev), whose `(web sexpr)` is byte-for-byte
+the same codec):
 
 - vectors `#(...)` — no dotted tail, depth-limited like lists
-- bytevectors `#vu8(...)` — bare exact integers 0..255 only
-- flonums `1.5`, `-2e10` — **finite only**: `inf`/`nan` are rejected on
-  read *and* write; Chez prints the shortest form that reads back
-  bit-identically, so floats round-trip exactly
+- bytevectors `#vu8"<base64>"` — the raw bytes as base64, decoded in one
+  pass (no O(n) intermediate list)
+- flonums `#f8"<base64>"` — the 8 IEEE-754 bytes of the double,
+  little-endian, base64: **bit-exact for every double, `inf` and `nan`
+  included**. Nothing is ever printed as a decimal, so a peer whose
+  floats print lossily (Goeteia) still round-trips every double
+  perfectly (`-0.0` may read back as `0.0` on such a peer; numerically
+  equal).
 
-The strict mode is untouched — it remains the HTTP-facing,
-Goeteia-compatible format and still rejects all three.
+The strict mode is untouched — it stays the minimal HTTP-facing subset
+and still rejects all three.
 
 #### Interop Notes
 
