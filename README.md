@@ -78,9 +78,12 @@ conversations, and s-expression RPC.
   cluster)`, static or Redis)
 - **S-expression RPC** — when both ends are Scheme, `(igropyr sexpr)` is
   a safe whitelisted codec (no `read`, depth-limited); `app-rpc` /
-  `send-sexpr!` / `ws-send-sexpr!` carry one datum per message, with an
-  extended wire mode (vectors, bytevectors, finite flonums) for the
-  node-to-node links
+  `send-sexpr!` / `ws-send-sexpr!` carry one datum per message. Its
+  extended wire mode — used by the node-to-node links and by browser
+  clients ([Goeteia](https://goeteia.dev)) — carries vectors, bytevectors
+  (`#vu8"…"`, base64) and **every IEEE double bit-exact** (`#f8"…"`, the
+  8 IEEE-754 bytes; inf and nan included), so binary and floats cross
+  Chez ↔ WebAssembly with no loss and no decimal-printing rounding
 - **HTTP/1.1 keep-alive & pipelining** — persistent connections by default
   on 1.1; each connection's reader process loops over successive requests
 - **Fast** — ~35 k req/s at 500 concurrent connections on an Apple Silicon
