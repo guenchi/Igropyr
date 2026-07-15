@@ -28,6 +28,8 @@ export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm
 "$scheme_bin" --script igropyr/test/cluster.sc
 "$scheme_bin" --script igropyr/test/fault-hook.sc
 "$scheme_bin" --script igropyr/test/conversation.sc
+"$scheme_bin" --script igropyr/test/conv-cluster.sc
+"$scheme_bin" --script igropyr/test/tls.sc
 
 set +e
 boot_output=$("$scheme_bin" --script igropyr/test/smoke-boot-failure.sc 2>&1)

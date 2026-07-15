@@ -14,11 +14,19 @@
 ;;;
 ;;; Body arrives as a bytevector (utf8->string it if text). A transport
 ;;; failure or timeout raises #(http-client-error ,message).
+;;;
+;;; https:// works when the OPTIONAL (igropyr tls) library has been
+;;; enabled -- (import (igropyr tls)) then (tls-enable!) once at startup.
+;;; This library itself stays dependency-free: TLS plugs in through
+;;; set-https-connector! as a pure byte codec (encrypt out, decrypt in),
+;;; so the socket, timeout, and parsing paths here are identical for
+;;; both schemes. Without it, https:// fails with a clear message.
 
 (library (igropyr client)
   (export http-request http-get http-post
           response? response-status response-headers response-body
           response-header
+          set-https-connector!     ; internal: registered by (igropyr tls)
           ;; Re-exported app-facing (igropyr actor) surface: this library
           ;; can be the sole entry point of a client-only program (a
           ;; crawler, an API caller), which still needs the scheduler and
@@ -31,7 +39,21 @@
 
   (define default-timeout-ms 30000)
   (define default-port 80)
+  (define default-tls-port 443)
   (define max-response 33554432)      ; 32 MiB response cap (DoS guard)
+
+  ;; ---- TLS hook ---------------------------------------------------------
+  ;;
+  ;; (igropyr tls) registers a connector: (lambda (conn host timeout) codec)
+  ;; called inside the connection process right after tcp-read-start!, so
+  ;; it can drive the handshake with receive on the socket's messages.
+  ;; codec = #(encrypt decrypt close):
+  ;;   encrypt: plaintext bv -> ciphertext bv to write
+  ;;   decrypt: ciphertext bv -> plaintext bv (may be empty: pure TLS records)
+  ;;   close:   () -> free the session (no I/O)
+  ;; On failure the connector raises #(http-client-error ,message).
+  (define https-connector #f)
+  (define (set-https-connector! f) (set! https-connector f))
 
   ;; ---- bytevector helpers ---------------------------------------------
 
@@ -82,27 +104,29 @@
               ((char=? (string-ref s i) ch) i)
               (else (loop (+ i 1)))))))
 
-  ;; "http://host[:port][/path]" -> (values host port path-with-query)
+  ;; "http[s]://host[:port][/path]" -> (values host port path-with-query tls?)
   (define (parse-url url)
-    (let ((rest (cond
-                  ((and (>= (string-length url) 7)
-                        (string-ci=? (substring url 0 7) "http://"))
-                   (substring url 7 (string-length url)))
-                  ((and (>= (string-length url) 8)
-                        (string-ci=? (substring url 0 8) "https://"))
-                   (fail "https not supported; put TLS behind a proxy"))
-                  (else (fail "url must start with http://")))))
+    (let-values (((rest tls?)
+                  (cond
+                    ((and (>= (string-length url) 7)
+                          (string-ci=? (substring url 0 7) "http://"))
+                     (values (substring url 7 (string-length url)) #f))
+                    ((and (>= (string-length url) 8)
+                          (string-ci=? (substring url 0 8) "https://"))
+                     (values (substring url 8 (string-length url)) #t))
+                    (else (fail "url must start with http:// or https://")))))
       (let* ((slash (string-index rest #\/ 0))
              (authority (if slash (substring rest 0 slash) rest))
              (path (if slash (substring rest slash (string-length rest)) "/"))
-             (colon (string-index authority #\: 0)))
+             (colon (string-index authority #\: 0))
+             (dport (if tls? default-tls-port default-port)))
         (if colon
             (values (substring authority 0 colon)
                     (or (string->number (substring authority (+ colon 1)
                                                    (string-length authority)))
-                        default-port)
-                    path)
-            (values authority default-port path)))))
+                        dport)
+                    path tls?)
+            (values authority dport path tls?)))))
 
   ;; ---- request encoding ------------------------------------------------
 
@@ -226,25 +250,29 @@
   ;; cannot be mis-read by a later request from the same caller.
   ;; eof-mode is #f while parsing, or (status headers body-start) once the
   ;; headers are in and the body runs until the server closes.
-  (define (client-loop c caller ref buf eof-mode timeout)
-    (define (reply! r) (send caller (vector 'http-reply ref r)) (tcp-close! c))
-    (define (err! msg) (send caller (vector 'http-error ref msg)) (tcp-close! c))
+  (define (client-loop c caller ref buf eof-mode timeout codec)
+    (define (done!) (when codec ((vector-ref codec 2))) (tcp-close! c))
+    (define (reply! r) (send caller (vector 'http-reply ref r)) (done!))
+    (define (err! msg) (send caller (vector 'http-error ref msg)) (done!))
     (receive (after timeout (err! "response timeout"))
-      (`#(tcp-data ,bv)
-        (let ((buf (bv-append buf bv)))
-          (cond
-            ((> (bytevector-length buf) max-response) (err! "response too large"))
-            (eof-mode
-              (client-loop c caller ref buf eof-mode timeout))
-            (else
-              (let ((res (parse-response buf)))
-                (case (vector-ref res 0)
-                  ((done) (reply! (vector-ref res 1)))
-                  ((need-eof)
-                   (client-loop c caller ref buf
-                     (list (vector-ref res 1) (vector-ref res 2) (vector-ref res 3))
-                     timeout))
-                  (else (client-loop c caller ref buf #f timeout))))))))
+      (`#(tcp-data ,raw)
+        (let ((bv (if codec ((vector-ref codec 1) raw) raw)))
+          (if (zero? (bytevector-length bv))   ; pure TLS records, no app data
+              (client-loop c caller ref buf eof-mode timeout codec)
+              (let ((buf (bv-append buf bv)))
+                (cond
+                  ((> (bytevector-length buf) max-response) (err! "response too large"))
+                  (eof-mode
+                    (client-loop c caller ref buf eof-mode timeout codec))
+                  (else
+                    (let ((res (parse-response buf)))
+                      (case (vector-ref res 0)
+                        ((done) (reply! (vector-ref res 1)))
+                        ((need-eof)
+                         (client-loop c caller ref buf
+                           (list (vector-ref res 1) (vector-ref res 2) (vector-ref res 3))
+                           timeout codec))
+                        (else (client-loop c caller ref buf #f timeout codec))))))))))
       (`#(tcp-eof)
         (if eof-mode
             (reply! (make-response (car eof-mode) (cadr eof-mode)
@@ -267,10 +295,21 @@
            (timeout (let ((p (assq 'timeout opts))) (if p (cdr p) default-timeout-ms)))
            (caller self)
            (ref (gensym)))
-      (let-values (((host port path) (parse-url url)))
+      (let-values (((host port path tls?) (parse-url url)))
+        ;; fail fast, before any connection is attempted
+        (when (and tls? (not https-connector))
+          (fail "https not supported; import (igropyr tls) and call (tls-enable!)"))
         (spawn
           (lambda ()
-            (guard (e (#t (send caller (vector 'http-error ref "request failed"))))
+            (guard (e (#t (send caller
+                            (vector 'http-error ref
+                              ;; surface codec/parse errors (e.g. a TLS
+                              ;; certificate failure) instead of a blur
+                              (if (and (vector? e)
+                                       (eq? (vector-ref e 0) 'http-client-error)
+                                       (string? (vector-ref e 1)))
+                                  (vector-ref e 1)
+                                  "request failed")))))
               ;; resolve the host (a dotted IP resolves to itself), then
               ;; connect to the IP
               (dns-resolve! host self)
@@ -288,8 +327,17 @@
                                 (`#(tcp-connect-failed ,e) 'done)))
                     (`#(tcp-connected ,c)
                       (tcp-read-start! c)
-                      (tcp-write! c (build-request method host path headers body) #f)
-                      (client-loop c caller ref empty-bv #f timeout))
+                      ;; if TLS setup or a later codec step raises, free
+                      ;; the session and the socket before propagating
+                      (let ((codec #f))
+                        (guard (e (#t (when codec ((vector-ref codec 2)))
+                                      (tcp-close! c)
+                                      (raise e)))
+                          (when tls?
+                            (set! codec (https-connector c host timeout)))
+                          (let ((req (build-request method host path headers body)))
+                            (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f))
+                          (client-loop c caller ref empty-bv #f timeout codec))))
                     (`#(tcp-connect-failed ,e)
                       (send caller (vector 'http-error ref (uv-strerror e))))))
                 (`#(dns-failed ,e)
