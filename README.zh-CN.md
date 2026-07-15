@@ -702,9 +702,7 @@ server {
   链有问题或主机名不匹配会让请求以 `#(http-client-error "tls: …")` 失败，而不是静默连上。
 
 需要系统装有 OpenSSL 3 或 1.1（或 LibreSSL）共享库——通过常见平台路径查找
-（含 Homebrew 的 `openssl@3`）。入站 HTTPS 仍应放在 proxy：server 侧 TLS 意味着
-自己承担证书续期和 TLS CVE surface，而 proxy 做得更好。`(igropyr tls)` 有意
-只提供**客户端校验**。
+（含 Homebrew 的 `openssl@3`）。入站 HTTPS 仍应放在 proxy。
 
 ## 架构
 

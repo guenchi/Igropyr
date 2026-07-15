@@ -823,9 +823,7 @@ Why a separate optional library, not the server:
 
 Requires OpenSSL 3 or 1.1 (or LibreSSL) as a shared library — found via
 the usual platform paths (including Homebrew's `openssl@3`). Inbound
-HTTPS still belongs at the proxy: server-side TLS means owning
-certificate renewal and the TLS CVE surface, which the proxy does
-better. `(igropyr tls)` deliberately ships **client verification only**.
+HTTPS still belongs at the proxy.
 
 ## Internals
 
