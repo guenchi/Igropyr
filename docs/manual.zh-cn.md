@@ -11,16 +11,17 @@
 5. [容错](#容错)
 6. [OTP 模式](#otp-模式)
 7. [对话](#对话)
-8. [数据库客户端](#数据库客户端)
-9. [S 表达式 RPC](#s-表达式-rpc)
-10. [分布式](#分布式)
+8. [出站 HTTP 客户端](#出站-http-客户端)
+9. [数据库客户端](#数据库客户端)
+10. [S 表达式 RPC](#s-表达式-rpc)
+11. [分布式](#分布式)
     - [节点链路、rsend / rcall、监视](#分布式)
     - [自动发现（静态、Redis）](#自动发现)
     - [分布式任务池](#分布式任务池)
-11. [运行和构建](#运行和构建)
-12. [测试](#测试)
-13. [代码风格](#代码风格)
-14. [常见陷阱](#常见陷阱)
+12. [运行和构建](#运行和构建)
+13. [测试](#测试)
+14. [代码风格](#代码风格)
+15. [常见陷阱](#常见陷阱)
 
 ---
 
@@ -1044,6 +1045,89 @@ API：`(conversation-start! flow req [ttl-ms])` 生成 flow 进程，返回
 局部状态，`after` 就是它的 TTL）、严格顺序的协议对话。**不用在哪**——
 普通无状态请求（应保持归零 + 客户端带状态重试）；以及任何持有行锁等待
 **人**思考的步骤：人的停顿用应用级预留跨越，活事务只跨机器节奏的轮次。
+
+---
+
+## 出站 HTTP 客户端
+
+从 handler 或后台进程发起出站 HTTP/1.1 请求。客户端运行在调用者自己的绿色进程中，暂停直到响应到达，其间 OS 线程可以继续处理其它工作。
+
+### API
+
+- `(http-get url)` → response —— 抓取一个 URL（GET）
+- `(http-post url body [options])` → response —— POST 一个 body（string 或 bytevector）
+- `(http-request method url [options])` → response —— 通用请求
+
+Response 访问器：
+- `(response-status resp)` → 整数（200、404 等）
+- `(response-headers resp)` → (string . string) 的 alist
+- `(response-header resp "Name")` → 值或 #f
+- `(response-body resp)` → bytevector（chunked 会被解码）
+
+选项：
+- `(body . ,bytevector)` 或 `(body . ,string)` —— 请求 body
+- `(headers . ((("Header" . "value") ...)))` —— 自定义 header
+- `(timeout . ,ms)` —— 默认 30000 ms
+
+### 错误处理
+
+Transport 错误或 timeout 会 raise `#(http-client-error ,message)`。
+
+```scheme
+(guard (e ((and (vector? e) (eq? (vector-ref e 0) 'http-client-error))
+            (let ((msg (vector-ref e 1)))
+              (display (string-append "HTTP error: " msg "\n")))))
+  (http-get "http://example.com/"))
+```
+
+### Async DNS
+
+客户端在 libuv 线程池上异步做 DNS 解析，所以 scheduler 永远不会被慢 DNS server 阻塞。
+
+### 示例
+
+```scheme
+(app-get app "/proxy"
+  (lambda (req res)
+    (let* ((target (req-param req "url"))
+           (resp (http-get target)))
+      (if (= (response-status resp) 200)
+          (begin
+            (set-header! res "Content-Type" (response-header resp "Content-Type"))
+            (res-send! res (response-body resp)))
+          (begin
+            (set-status! res (response-status resp))
+            (send-text! res "upstream error"))))))
+```
+
+### 出站 TLS
+
+启用可选库 `(igropyr tls)` 后，`https://`（以及 `ws-client` 的 `wss://`）即可用。import 它并在启动时调用一次 `(tls-enable!)`——在首个 `https` 请求之前——之后每个 `http-get` / `http-request` 都能访问 TLS endpoint：
+
+```scheme
+(import (igropyr client) (igropyr tls))
+(tls-enable!)                                 ; 启动时一次
+
+(let ((r (http-get "https://api.github.com/zen"
+                   '((headers . (("User-Agent" . "igropyr")))))))
+  (response-status r)                          ; -> 200
+  (utf8->string (response-body r)))
+```
+
+**为什么做成独立可选库。** 本体保持零依赖：只有 `(igropyr tls)` 触碰 OpenSSL，从不 import 它的程序永不加载它，无论系统是否装了 OpenSSL，构建都不受影响。
+
+**工作原理。** TLS 以 OpenSSL 的 memory-BIO 模式作为纯字节 codec 运行：libuv 仍然拥有 socket、event loop 和 timeout，OpenSSL 只做字节变换。握手由请求自己绿色进程内的普通 `receive` 驱动——无线程、无回调、不阻塞其它进程。这和普通请求是同一个 actor 模型，只是插入了一步加密/解密。
+
+**证书校验默认开启且不可绕过：**
+
+- `SSL_VERIFY_PEER` —— 链无法校验时握手失败
+- 主机名（或 IP 字面量）与证书 SAN 匹配
+- TLS 1.2 起步
+- 系统信任根（可用标准的 `SSL_CERT_FILE` / `SSL_CERT_DIR` 覆盖）
+
+链有问题或主机名不匹配会让请求以 `#(http-client-error "tls: …")` 失败，而不是静默连上。
+
+**依赖要求。** 系统需装有 OpenSSL 3 或 1.1（或 LibreSSL）共享库，通过常见平台路径查找（含 Homebrew 的 `openssl@3`）。这只是 TLS *客户端*；入站 HTTPS 仍应放在 reverse proxy。
 
 ---
 
