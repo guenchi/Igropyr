@@ -711,7 +711,7 @@ Connect to a remote WebSocket server with the same session object. Outbound fram
 - `(ws-send-text! ws string)`, `(ws-send-binary! ws bv)`, `(ws-close! ws)` — same as server-side
 - `(ws-recv ws)` — same as server-side
 
-Note: `wss://` (TLS) is not supported; put a TLS proxy in front of the server.
+Note: `wss://` works once the optional `(igropyr tls)` library is enabled — `(import (igropyr tls))` then `(tls-enable!)` once at startup. See [Outbound TLS](#outbound-tls) under the HTTP client section. Without it, `wss://` is refused.
 
 #### Example: Client
 
@@ -1564,6 +1564,35 @@ The client performs DNS resolution asynchronously on libuv's thread pool, so the
             (set-status! res (response-status resp))
             (send-text! res "upstream error"))))))
 ```
+
+### Outbound TLS
+
+`https://` (and `ws-client`'s `wss://`) work once you enable the optional `(igropyr tls)` library. Import it and call `(tls-enable!)` once at startup — before the first `https` request — and every `http-get` / `http-request` can reach TLS endpoints:
+
+```scheme
+(import (igropyr client) (igropyr tls))
+(tls-enable!)                                 ; once, at startup
+
+(let ((r (http-get "https://api.github.com/zen"
+                   '((headers . (("User-Agent" . "igropyr")))))))
+  (response-status r)                          ; -> 200
+  (utf8->string (response-body r)))
+```
+
+**Why a separate optional library.** The core stays dependency-free: only `(igropyr tls)` touches OpenSSL, so a program that never imports it never loads it, and the build is unchanged whether or not OpenSSL is installed.
+
+**How it works.** TLS runs as a pure byte codec in OpenSSL's memory-BIO mode: libuv keeps owning the socket, the event loop, and timeouts, while OpenSSL only transforms bytes. The handshake is driven by ordinary `receive` inside the request's own green process — no threads, no callbacks, no blocking of other processes. It is the same actor model as a plain request, with an encrypt/decrypt step spliced in.
+
+**Certificate verification is on by default and non-negotiable:**
+
+- `SSL_VERIFY_PEER` — the handshake fails on an unverifiable chain
+- hostname (or IP-literal) matching against the certificate's SANs
+- TLS 1.2 minimum
+- system trust roots (override with the standard `SSL_CERT_FILE` / `SSL_CERT_DIR`)
+
+A bad chain or a wrong hostname fails the request with `#(http-client-error "tls: …")` rather than silently connecting.
+
+**Requirements.** OpenSSL 3 or 1.1 (or LibreSSL) present as a shared library, found via the usual platform paths (including Homebrew's `openssl@3`). This is a TLS *client* only; inbound HTTPS still belongs at a reverse proxy.
 
 ---
 
