@@ -55,7 +55,9 @@ conversations, and s-expression RPC.
   serving; MySQL comes with a self-healing connection pool
 - **Non-blocking HTTP & WebSocket clients** — outbound `http-get` /
   `http-post` and `ws-connect`, both with async DNS (libuv thread pool)
-  and the same park-the-caller model
+  and the same park-the-caller model; `https://` / `wss://` via the
+  optional `(igropyr tls)` library (OpenSSL as a byte codec, certificates
+  verified — the core stays dependency-free)
 - **Static file serving** — hot files come from an in-memory cache (a
   hashtable lookup: no disk read, no `stat` syscall; mtime re-checked at
   most once a second). A cache miss reads once on libuv's thread pool, so
@@ -518,8 +520,32 @@ inside a handler.
 ```
 
 One connection per request (no pooling); a transport failure or timeout
-raises `#(http-client-error msg)`. https is not supported directly —
-reach TLS-only endpoints through a proxy (see HTTPS below).
+raises `#(http-client-error msg)`.
+
+**`https://`** works once you enable the optional `(igropyr tls)`
+library — one import plus one call at startup, and every `http-get` /
+`http-request` (and `ws-client`'s `wss://`) can reach TLS endpoints:
+
+```scheme
+(import (igropyr client) (igropyr tls))
+(tls-enable!)                                 ; once, before the first https request
+
+(let ((r (http-get "https://api.github.com/zen"
+                   '((headers . (("User-Agent" . "igropyr")))))))
+  (response-status r)                          ; -> 200
+  (utf8->string (response-body r)))
+```
+
+TLS lives in its own library so the core stays dependency-free: nothing
+loads OpenSSL unless you import it. It runs as a pure byte codec in
+memory-BIO mode — libuv keeps owning the socket, the event loop, and
+timeouts; OpenSSL only transforms bytes, and the handshake is driven
+inside the request's own green process, so nothing blocks. Certificates
+are **verified by default** (peer chain, hostname/IP SANs, TLS ≥ 1.2,
+system trust roots — `SSL_CERT_FILE` / `SSL_CERT_DIR` honored); a
+verification failure raises `#(http-client-error "tls: …")`. Needs
+OpenSSL 3 or 1.1 (or LibreSSL) present as a shared library. See
+**Outbound TLS** below.
 
 ## Middleware suite
 
@@ -706,10 +732,18 @@ no central bookkeeping.
 
 ## HTTPS / TLS
 
-Igropyr speaks plain HTTP; terminate TLS in a reverse proxy in front of
-it. This is the standard deployment and gets you automatic certificates,
-HTTP/2 to the browser, and OCSP stapling for free, without the server
-owning TLS or its CVE surface.
+Two directions, handled differently. **Inbound** (browsers reaching your
+server) is terminated by a reverse proxy — covered here. **Outbound**
+(your code calling `https://` APIs) is the optional `(igropyr tls)`
+library — see [Outbound TLS](#outbound-tls) at the end of this section
+and the `https://` example under [Outbound HTTP](#outbound-http).
+
+### Inbound: terminate at a reverse proxy
+
+Igropyr's server speaks plain HTTP; terminate inbound TLS in a reverse
+proxy in front of it. This is the standard deployment and gets you
+automatic certificates, HTTP/2 to the browser, and OCSP stapling for
+free, without the server owning TLS or its CVE surface.
 
 **Caddy** (automatic Let's Encrypt certificates, one line per host):
 
@@ -756,6 +790,43 @@ one `upstream` entry suffices; otherwise give each process its own port
 and list them all. Read the client's real IP from `X-Forwarded-For` and
 the original scheme from `X-Forwarded-Proto`.
 
+### Outbound TLS
+
+For the other direction — calling `https://` services from your own code
+— import `(igropyr tls)` and call `(tls-enable!)` once at startup; then
+the HTTP client and `ws-client` speak `https://` / `wss://`. Unlike the
+inbound side, this is a real TLS client *in* the process, so it verifies
+certificates itself.
+
+```scheme
+(import (igropyr client) (igropyr tls))
+(tls-enable!)
+(http-get "https://example.com/")
+```
+
+Why a separate optional library, not the server:
+
+- **The core stays dependency-free.** Only `(igropyr tls)` touches
+  OpenSSL; a program that never imports it never loads it, and the build
+  and every other library are unchanged whether or not OpenSSL is
+  installed.
+- **TLS is a codec, not an I/O owner.** OpenSSL runs in memory-BIO mode:
+  libuv still owns the socket, the event loop, and timeouts, and the
+  handshake is driven by ordinary `receive` inside the request's own
+  green process. No threads, no callbacks, no blocking of other
+  processes — the same actor model as a plain request.
+- **Client verification is non-negotiable and on by default:**
+  `SSL_VERIFY_PEER`, hostname (or IP-literal) SAN matching, TLS ≥ 1.2,
+  and the system trust store (override with the standard `SSL_CERT_FILE`
+  / `SSL_CERT_DIR`). A bad chain or wrong hostname fails the request with
+  `#(http-client-error "tls: …")` rather than silently connecting.
+
+Requires OpenSSL 3 or 1.1 (or LibreSSL) as a shared library — found via
+the usual platform paths (including Homebrew's `openssl@3`). Inbound
+HTTPS still belongs at the proxy: server-side TLS means owning
+certificate renewal and the TLS CVE surface, which the proxy does
+better. `(igropyr tls)` deliberately ships **client verification only**.
+
 ## Internals
 
 ```
@@ -781,6 +852,7 @@ session.sc     cookie sessions on a gen-server store
 middleware.sc  cors / security-headers / logger / rate-limit / error-handler
 metrics.sc     Prometheus /metrics endpoint
 client.sc  non-blocking outbound HTTP client (async DNS)
+tls.sc     optional outbound TLS (OpenSSL memory-BIO codec) for https/wss
 redis.sc   non-blocking Redis client (RESP2), pipelined
 mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
 ```
