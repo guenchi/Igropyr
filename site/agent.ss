@@ -17,7 +17,7 @@
         (p (@ (class "tag")) "Two AI coding agents — one to " (b "build") " new "
            "services in Igropyr's actor model, one to " (b "port") " an existing "
            "Node/Express app.")
-        (p (@ (class "sub")) "Self-contained Markdown · verified against Igropyr 1.1.7 source")
+        (p (@ (class "sub")) "Self-contained Markdown · verified against Igropyr 1.1.8 source")
         (div (@ (class "cta"))
           (a (@ (class "btn primary") (href "#dev")) "Build on Igropyr")
           (a (@ (class "btn ghost") (href "#port")) "Port from Node"))))
@@ -29,7 +29,7 @@
         (h2 "igropyr-dev — the development agent")
         (p (@ (class "lead")) "Hand it a spec, a single endpoint, or the framework "
            "itself. " (code "igropyr-dev") " writes idiomatic Chez Scheme on Igropyr — "
-           "direct blocking style, let-it-crash error handling, and a verified v1.1.7 "
+           "direct blocking style, let-it-crash error handling, and a verified v1.1.8 "
            "API it reads from source before writing a line.")
         (div (@ (class "cards"))
           (div (@ (class "card"))
@@ -43,7 +43,7 @@
             (div (@ (class "ic")) "✓")
             (h3 "Verified API, never guessed")
             (p "Rule zero: it greps the " (code ".sc") " source headers before "
-               "writing. A module map of every v1.1.7 export stops it from "
+               "writing. A module map of every v1.1.8 export stops it from "
                "hallucinating procedure names — when in doubt, the source wins."))
           (div (@ (class "card"))
             (div (@ (class "ic")) "◆")
@@ -144,5 +144,5 @@
    (string-append "Two AI coding agents for Igropyr: igropyr-dev writes idiomatic "
                   "Chez Scheme on the actor framework, and node-to-igropyr "
                   "re-architects Node.js/Express services into it — both verified "
-                  "against Igropyr 1.1.7 source.")
+                  "against Igropyr 1.1.8 source.")
    body))

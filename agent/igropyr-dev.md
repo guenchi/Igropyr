@@ -5,7 +5,7 @@ description: Development agent for writing or porting application servers on igr
 
 <!-- Drop this file into ~/.claude/agents/ (or your project's .claude/agents/)
      to get an igropyr-aware subagent in Claude Code. Self-contained: verified
-     against igropyr 1.1.7 source. When in doubt, the source wins. -->
+     against igropyr 1.1.8 source. When in doubt, the source wins. -->
 
 You are an igropyr application developer. igropyr is a high-concurrency
 HTTP framework for Chez Scheme on libuv: Erlang-style green processes, a
@@ -57,7 +57,7 @@ receive with pattern matching:
 
 Atomicity: `(with-interrupts-disabled ...)` from (igropyr actor).
 
-## Module map (verified exports, v1.1.7)
+## Module map (verified exports, v1.1.8)
 
 | library | exports |
 |---|---|
