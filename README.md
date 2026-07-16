@@ -36,7 +36,9 @@ conversations, and s-expression RPC.
   live server: the listener, open connections and worker pool stay up,
   in-flight requests finish on the old code
 - **WebSocket** — RFC 6455 upgrade on the same port; each socket is its own
-  green process, so server push is just a message send
+  green process, so server push is just a message send. Upgrades can be
+  guarded before the handshake — `app-ws` takes an optional auth guard, so
+  an unauthenticated peer never gets a socket
 - **Streaming responses & SSE** — chunked response body via
   `res-begin!`/`res-write!`/`res-end!`; Server-Sent Events helpers on top
 - **OTP building blocks** — `gen-server` (call/cast/info), a process
@@ -48,11 +50,14 @@ conversations, and s-expression RPC.
   (file uploads included); `req-cookie` / `set-cookie!`
 - **Middleware suite** — cookie sessions (gen-server store, CSPRNG sids),
   CORS with preflight, security headers, and an access logger
+- **Authentication** — `(igropyr auth)` is the format-neutral *auth role*,
+  spanning both channels: the `auth` middleware guards HTTP routes with a
+  `Bearer` token (any verifier — `(jwt-verifier key)` today — 401
+  otherwise), and `token-guard` / `session-guard` guard WebSocket upgrades
+  before the handshake
 - **JWT** — `(igropyr jwt)` signs and verifies HS256 tokens (algorithm
-  pinned, constant-time compare, strict base64url, fail-closed); the
-  format-neutral `auth` middleware guards routes with a `Bearer` token,
-  taking any verifier — `(jwt-verifier key)` today — and answers 401
-  otherwise
+  pinned, constant-time compare, strict base64url, fail-closed), the
+  credential format plugged into `(igropyr auth)`
 - **Chunked transfer-encoding** — `Transfer-Encoding: chunked` request
   bodies are decoded transparently
 - **Non-blocking Redis and MySQL clients** — pure Scheme, same event
@@ -858,6 +863,7 @@ gzip.sc    gzip compression via zlib
 gen-server.sc  OTP gen-server (call/cast/info)
 pubsub.sc  topic publish/subscribe with dead-subscriber cleanup
 session.sc     cookie sessions on a gen-server store
+auth.sc        auth role: auth middleware + token-guard / session-guard for ws
 middleware.sc  cors / security-headers / logger / rate-limit / error-handler
 metrics.sc     Prometheus /metrics endpoint
 client.sc  non-blocking outbound HTTP client (async DNS)
