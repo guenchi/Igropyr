@@ -7,7 +7,7 @@
         (igropyr json) (igropyr gzip) (igropyr gen-server)
         (igropyr conversation)
         (igropyr pubsub) (igropyr express) (igropyr session)
-        (igropyr middleware) (igropyr metrics) (igropyr client)
+        (igropyr middleware) (igropyr jwt) (igropyr metrics) (igropyr client)
         (igropyr tls)
         (igropyr redis) (igropyr mysql) (igropyr node) (igropyr dpool) (igropyr cluster))
 (display "ALL LIBRARIES IMPORTED\n")
