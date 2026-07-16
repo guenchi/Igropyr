@@ -194,5 +194,30 @@
       '("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         "3\r" "\nab" "c\r\n" "3\r\ndef\r\n" "0\r\n" "\r\n")
       "200" "abcdef")
+    ;; ---- configurable body-limit -----------------------------------
+    ;; PROCESS-GLOBAL (last http-listen wins), so these run LAST: the
+    ;; second listen lowers the limit for every server in this process.
+    (unless (guard (e ((assertion-violation? e) #t) (#t #f))
+              (http-listen 18082 handler '((body-limit . "big")))
+              #f)
+      (error 'http-protocol "bad body-limit accepted" "no assertion"))
+    (display "bad body-limit rejected at boot ok\n")
+    (http-listen 18081 handler '((workers . 2) (body-limit . 100)))
+    (set! port 18081)
+    (expect "body under configured limit"
+      (string-append
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\nConnection: close\r\n\r\n"
+        (make-string 50 #\a))
+      "200")
+    (expect "body over configured limit"
+      (string-append
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 200\r\nConnection: close\r\n\r\n"
+        (make-string 200 #\a))
+      "413")
+    (expect "chunked over configured limit"
+      (string-append
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        "40\r\n" (make-string 64 #\a) "\r\n40\r\n" (make-string 64 #\a) "\r\n0\r\n\r\n")
+      "413")
     (display "ALL HTTP PROTOCOL TESTS PASSED\n")
     (exit 0)))

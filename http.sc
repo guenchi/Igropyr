@@ -1177,9 +1177,13 @@
   ;;                             ;        (id . task-id) (attempts . n)
   ;;                             ;        (elapsed-ms . t)).
   ;;                             ; Unset: plain 500 as always.
-  ;;       (reuseport . #t)))    ; SO_REUSEPORT bind: run N OS processes
+  ;;       (reuseport . #t)      ; SO_REUSEPORT bind: run N OS processes
   ;;                             ; on the same port, kernel-balanced
   ;;                             ; (Linux; not macOS)
+  ;;       (body-limit . N)))    ; request body cap in bytes (default 1 MiB,
+  ;;                             ; 413 beyond it). PROCESS-GLOBAL: the last
+  ;;                             ; http-listen wins across all servers in
+  ;;                             ; this process; pipeline-limit follows.
   (define (http-listen port handler . rest)
     (define opts
       (cond
@@ -1191,9 +1195,16 @@
       (let ((p (assq key opts)))
         (if p (cdr p) default)))
     ;; Configurable body-limit (process-global): also unblocks cp0 constant
-    ;; inlining so parser reads see the new value. Keep pipeline-limit in step.
+    ;; inlining so parser reads see the new value. Keep pipeline-limit in
+    ;; step. A bad value must crash HERE, at boot -- deferred to request
+    ;; time it raises inside the reader and the connection just drops.
     (let ((bl (opt 'body-limit #f)))
-      (when bl (set! body-limit bl) (set! pipeline-limit (+ header-limit bl))))
+      (when bl
+        (unless (and (fixnum? bl) (fx> bl 0))
+          (assertion-violation 'http-listen
+            "body-limit must be a positive fixnum" bl))
+        (set! body-limit bl)
+        (set! pipeline-limit (+ header-limit bl))))
     (let* ((hbox (box handler))
            (wsbox (box #f))
            (obox (box (opt 'on-failure #f)))
