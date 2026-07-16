@@ -56,6 +56,10 @@
           (igropyr websocket))
 
   (define header-limit 8192)
+  ;; body-limit / pipeline-limit are configurable at http-listen time via the
+  ;; 'body-limit option (default 1 MiB). They are set! by http-listen, which
+  ;; also keeps cp0 from inlining them as constants, so every parser read sees
+  ;; the configured value. Process-global: the last http-listen wins.
   (define body-limit 1048576)
   (define trailer-limit 8192)
   ;; Bytes a client may pipeline while the current handler is still
@@ -1186,6 +1190,10 @@
     (define (opt key default)
       (let ((p (assq key opts)))
         (if p (cdr p) default)))
+    ;; Configurable body-limit (process-global): also unblocks cp0 constant
+    ;; inlining so parser reads see the new value. Keep pipeline-limit in step.
+    (let ((bl (opt 'body-limit #f)))
+      (when bl (set! body-limit bl) (set! pipeline-limit (+ header-limit bl))))
     (let* ((hbox (box handler))
            (wsbox (box #f))
            (obox (box (opt 'on-failure #f)))
