@@ -48,6 +48,10 @@ conversations, and s-expression RPC.
   (file uploads included); `req-cookie` / `set-cookie!`
 - **Middleware suite** — cookie sessions (gen-server store, CSPRNG sids),
   CORS with preflight, security headers, and an access logger
+- **JWT** — `(igropyr jwt)` signs and verifies HS256 tokens (algorithm
+  pinned, constant-time compare, strict base64url, fail-closed); a
+  `jwt-middleware` guards routes with a `Bearer` token and answers 401
+  otherwise
 - **Chunked transfer-encoding** — `Transfer-Encoding: chunked` request
   bodies are decoded transparently
 - **Non-blocking Redis and MySQL clients** — pure Scheme, same event
@@ -88,6 +92,12 @@ conversations, and s-expression RPC.
   Chez ↔ WebAssembly with no loss and no decimal-printing rounding
 - **HTTP/1.1 keep-alive & pipelining** — persistent connections by default
   on 1.1; each connection's reader process loops over successive requests
+- **Dev-time contracts** — `(igropyr checked)` adds `define-checked` /
+  `define-checked-record` for internal invariants, gated on
+  `IGROPYR_CONTRACTS` at compile time: `off` (the default) compiles to
+  nothing with zero residue, `full` injects checks that blame the
+  offending procedure/argument. The bundled libraries carry boundary
+  contracts on their exports under a debug build
 - **Fast** — ~35 k req/s at 500 concurrent connections on an Apple Silicon
   laptop (`ab -n 50000 -c 500`, zero failed requests)
 
