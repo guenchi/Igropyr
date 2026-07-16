@@ -4,7 +4,7 @@
 ;;; parsing, and the express middleware end to end over real HTTP.
 
 (import (chezscheme) (igropyr http) (igropyr express) (igropyr jwt)
-        (igropyr json) (igropyr crypto) (igropyr libuv))
+        (igropyr middleware) (igropyr json) (igropyr crypto) (igropyr libuv))
 
 (define port 18086)
 (define empty-bv (make-bytevector 0))
@@ -73,6 +73,15 @@
 (check "bad-key-type-crashes"
   (guard (c ((assertion-violation? c) #t) (#t #f))
     (jwt-verify tok 'not-a-key)
+    #f))
+;; misconfiguration crashes at boot, not per request
+(check "jwt-verifier-bad-key-crashes"
+  (guard (c ((assertion-violation? c) #t) (#t #f))
+    (jwt-verifier 'not-a-key)
+    #f))
+(check "auth-non-procedure-crashes"
+  (guard (c ((assertion-violation? c) #t) (#t #f))
+    (auth "not-a-verifier")
     #f))
 
 ;; ---- algorithm pinning ---------------------------------------------------
@@ -222,17 +231,17 @@
 
 ;; the middleware is app-wide, so optional mode gets its own app + port
 (define app (create-app))
-(app-use app (jwt-middleware key))
+(app-use app (auth (jwt-verifier key)))
 (app-get app "/me"
   (lambda (req res)
-    (send-json! res (list (cons 'sub (json-ref (req-jwt req) "sub"))))))
+    (send-json! res (list (cons 'sub (json-ref (req-claims req) "sub"))))))
 
 (define port2 18087)
 (define app2 (create-app))
-(app-use app2 (jwt-middleware key '((optional . #t))))
+(app-use app2 (auth (jwt-verifier key) '((optional . #t))))
 (app-get app2 "/who"
   (lambda (req res)
-    (let ((c (req-jwt req)))
+    (let ((c (req-claims req)))
       (send-json! res (list (cons 'sub (if c (json-ref c "sub") "anon")))))))
 
 (define (get2 path . headers) (get-on port2 path headers))

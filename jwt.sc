@@ -5,8 +5,14 @@
 ;;;             '((expires-in . 3600)))            ; -> token string
 ;;;   (jwt-verify token key)                       ; -> claims alist | #f
 ;;;   (jwt-verify token key '((leeway . 30) (iss . "api.example.com")))
-;;;   (app-use app (jwt-middleware key))           ; 401 unless valid
-;;;   (req-jwt req)                                ; claims in a handler
+;;;   (app-use app (auth (jwt-verifier key)))      ; (igropyr middleware)
+;;;   (req-claims req)                             ; claims in a handler
+;;;
+;;; This library is the CREDENTIAL FORMAT only (the J is JSON). The
+;;; HTTP-side middleware lives in (igropyr middleware) under the
+;;; format-neutral name auth -- it guards s-expression RPC endpoints
+;;; just as well, taking any (lambda (token) claims-or-#f) verifier.
+;;; jwt-verifier packages a key (+ options) into that shape.
 ;;;
 ;;; A token is EXTERNAL INPUT, so everything here is always-on business
 ;;; code -- none of it is behind IGROPYR_CONTRACTS (contracts on the
@@ -46,10 +52,9 @@
 ;;; lockstep; the verifier must stay pinned to an explicit list.
 
 (library (igropyr jwt)
-  (export jwt-sign jwt-verify jwt-decode jwt-middleware req-jwt)
+  (export jwt-sign jwt-verify jwt-verifier jwt-decode)
   (import (chezscheme) (igropyr checked)
-          (igropyr crypto) (igropyr json)
-          (igropyr http) (igropyr express))
+          (igropyr crypto) (igropyr json))
 
   (define (opt alist key default)
     (let ((p (assq key alist))) (if p (cdr p) default)))
@@ -222,38 +227,13 @@
              (cons (string->json (utf8->string (base64url-decode (car parts))))
                    (string->json (utf8->string (base64url-decode (cadr parts)))))))))
 
-  ;; ---- express middleware -----------------------------------------------------
+  ;; ---- verifier factory ------------------------------------------------------
 
-  (define (bearer-token req)
-    (let ((h (req-header req 'authorization)))
-      (and (string? h)
-           (fx>= (string-length h) 7)
-           (string-ci=? (substring h 0 7) "Bearer ")
-           (let ((t (substring h 7 (string-length h))))
-             (and (fx> (string-length t) 0) t)))))
-
-  ;; claims land on the request's layer-owned slot, like sessions do
-  (define-checked (req-jwt (req request?))
-    (req-local req 'jwt))
-
-  ;; rest: one options alist. leeway/iss/aud go to jwt-verify;
-  ;; (optional . #t) lets a request WITHOUT a token through (req-jwt
-  ;; stays #f) -- a present-but-invalid token still answers 401.
-  (define (jwt-middleware key . rest)
-    (let* ((o (if (pair? rest) (car rest) '()))
-           (optional (opt o 'optional #f)))
-      (key->bv key)                     ; reject a bad key at boot, not per request
-      (lambda (req res next)
-        (let* ((tok (bearer-token req))
-               (claims (and tok (jwt-verify tok key o))))
-          (cond
-            (claims
-             (req-set-local! req 'jwt claims)
-             (next))
-            ((and optional (not tok))
-             (next))
-            (else
-             (set-status! res 401)
-             (set-header! res "WWW-Authenticate" "Bearer")
-             (send-json! res '((error . "unauthorized")))))))))
+  ;; Package a key (+ verification options: leeway/iss/aud) into the
+  ;; (lambda (token) claims-or-#f) shape that (igropyr middleware)'s
+  ;; auth takes. The key is checked here, at boot, not per request.
+  (define (jwt-verifier key . rest)
+    (let ((kbv (key->bv key))
+          (o (if (pair? rest) (car rest) '())))
+      (lambda (token) (jwt-verify token kbv o))))
 )
