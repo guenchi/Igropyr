@@ -178,92 +178,218 @@
                      (cons (percent-decode kv #t) ""))))
              (string-split s #\&))))
 
-  ;; Split the header text on \n with the trailing \r of each line
-  ;; dropped in the same pass -- one substring per line instead of the
-  ;; split-then-strip double copy.
-  (define (split-header-lines s)
-    (let ((n (string-length s)))
-      (define (line-end start end)
-        (if (and (fx> end start)
-                 (char=? (string-ref s (fx- end 1)) #\return))
-            (fx- end 1)
-            end))
-      (let loop ((i 0) (start 0) (acc '()))
-        (cond
-          ((fx= i n)
-           (reverse (cons (substring s start (line-end start n)) acc)))
-          ((char=? (string-ref s i) #\newline)
-           (loop (fx+ i 1) (fx+ i 1)
-                 (cons (substring s start (line-end start i)) acc)))
-          (else (loop (fx+ i 1) start acc))))))
+  ;; ---- head parsing ----------------------------------------------------------
+  ;; Hybrid strategy: ONE utf8->string over the whole header block
+  ;; (which doubles as UTF-8 validation), then index scanning inside
+  ;; that string -- no per-line substrings, no method interning, no
+  ;; name substring+downcase+intern for the names every request
+  ;; carries. Values get exactly one substring each, OWS-trimmed via
+  ;; in-place bounds. (Pure byte-level parsing buys nothing here: Chez
+  ;; has no ranged utf8->string, so per-value decoding would cost
+  ;; bv-sub + utf8->string, two allocations against substring's one.)
 
-  ;; "Content-Length: 42" -> (content-length . "42"), or #f.
-  ;; The value is trimmed of SP and TAB on BOTH ends (RFC 7230 OWS):
-  ;; "Connection: close " must not read as keep-alive, and
+  ;; 128-entry table: token char -> its lowercase, else #f. One lookup
+  ;; answers validity and lowercasing together (fast-http's +tokens+).
+  (define token-lc
+    (let ((v (make-vector 128 #f)))
+      (do ((i (char->integer #\a) (fx+ i 1))) ((fx> i (char->integer #\z)))
+        (vector-set! v i (integer->char i)))
+      (do ((i (char->integer #\0) (fx+ i 1))) ((fx> i (char->integer #\9)))
+        (vector-set! v i (integer->char i)))
+      (do ((i (char->integer #\A) (fx+ i 1))) ((fx> i (char->integer #\Z)))
+        (vector-set! v i (integer->char (fx+ i 32))))
+      (for-each (lambda (c) (vector-set! v (char->integer c) c))
+                '(#\! #\# #\$ #\% #\& #\' #\* #\+ #\- #\. #\^ #\_ #\` #\| #\~))
+      v))
+
+  ;; lowercased token char, or #f when ch is not a legal field-name char
+  (define (lc-token-char ch)
+    (let ((i (char->integer ch)))
+      (and (fx< i 128) (vector-ref token-lc i))))
+
+  ;; the request methods this server routes; anything else answers 400
+  ;; at parse time, so arbitrary method strings are never interned
+  (define (match-method text end)     ; text[0, end)
+    (define (is? s sym)
+      (and (fx= end (string-length s))
+           (let loop ((i 0))
+             (if (fx= i end)
+                 sym
+                 (and (char=? (string-ref text i) (string-ref s i))
+                      (loop (fx+ i 1)))))))
+    (case end
+      ((3) (or (is? "GET" 'GET) (is? "PUT" 'PUT)))
+      ((4) (or (is? "POST" 'POST) (is? "HEAD" 'HEAD)))
+      ((5) (or (is? "PATCH" 'PATCH) (is? "TRACE" 'TRACE)))
+      ((6) (is? "DELETE" 'DELETE))
+      ((7) (or (is? "OPTIONS" 'OPTIONS) (is? "CONNECT" 'CONNECT)))
+      (else #f)))
+
+  ;; supported versions come back as shared constants (no per-request
+  ;; substring); a well-formed but unknown one yields 'unsupported so
+  ;; the caller can answer 505 rather than 400
+  (define (match-version text start end)
+    (define (is? s)
+      (and (fx= (fx- end start) (string-length s))
+           (let loop ((i 0))
+             (or (fx= i (string-length s))
+                 (and (char=? (string-ref text (fx+ start i)) (string-ref s i))
+                      (loop (fx+ i 1)))))))
+    (cond
+      ((is? "HTTP/1.1") "HTTP/1.1")
+      ((is? "HTTP/1.0") "HTTP/1.0")
+      (else 'unsupported)))
+
+  ;; The names on virtually every request or upgrade, matched in place
+  ;; (case-insensitively, via the token table) to pre-interned symbols:
+  ;; the hot path allocates no name string and touches no oblist.
+  ;; Bucketed by length so each name is compared against at most three.
+  (define (common-header-name text start len)
+    (define (at? name sym)
+      (let loop ((i 0))
+        (if (fx= i len)
+            sym
+            (let ((lc (lc-token-char (string-ref text (fx+ start i)))))
+              (and lc (char=? lc (string-ref name i))
+                   (loop (fx+ i 1)))))))
+    (case len
+      ((2) (at? "te" 'te))
+      ((4) (or (at? "host" 'host) (at? "date" 'date)))
+      ((6) (or (at? "cookie" 'cookie) (at? "accept" 'accept)
+               (at? "expect" 'expect) (at? "origin" 'origin)
+               (at? "pragma" 'pragma)))
+      ((7) (or (at? "upgrade" 'upgrade) (at? "referer" 'referer)
+               (at? "trailer" 'trailer)))
+      ((10) (or (at? "connection" 'connection) (at? "user-agent" 'user-agent)))
+      ((12) (at? "content-type" 'content-type))
+      ((13) (or (at? "authorization" 'authorization)
+                (at? "cache-control" 'cache-control)
+                (at? "if-none-match" 'if-none-match)))
+      ((14) (or (at? "content-length" 'content-length)
+                (at? "accept-charset" 'accept-charset)))
+      ((15) (or (at? "accept-encoding" 'accept-encoding)
+                (at? "accept-language" 'accept-language)
+                (at? "x-forwarded-for" 'x-forwarded-for)))
+      ((16) (at? "content-encoding" 'content-encoding))
+      ((17) (or (at? "transfer-encoding" 'transfer-encoding)
+                (at? "sec-websocket-key" 'sec-websocket-key)
+                (at? "if-modified-since" 'if-modified-since)))
+      ((21) (at? "sec-websocket-version" 'sec-websocket-version))
+      (else #f)))
+
+  ;; rare name: validate and lowercase in ONE pass, then intern; an
+  ;; illegal field-name char rejects the head (-> 400). Chez's oblist
+  ;; holds symbols weakly, so these do not accumulate forever -- the
+  ;; point of the common table is the allocation + hash, not a leak.
+  (define (rare-header-name text start end)
+    (let ((out (make-string (fx- end start))))
+      (let loop ((i start))
+        (if (fx= i end)
+            (string->symbol out)
+            (let ((lc (lc-token-char (string-ref text i))))
+              (and lc
+                   (begin
+                     (string-set! out (fx- i start) lc)
+                     (loop (fx+ i 1)))))))))
+
+  ;; Header block scan. Repeated fields are coalesced into one
+  ;; comma-joined value in wire order (RFC 7230); this lets
+  ;; content-length see "5,6" and reject the conflict, and keeps
+  ;; request accessors single-valued. A continuation line (obs-fold,
+  ;; leading SP/TAB) or a line without a colon rejects the WHOLE head
+  ;; (-> 400): silently dropping a line a fronting proxy may have
+  ;; honored is request-smuggling room. Values are OWS-trimmed on both
+  ;; ends: "Connection: close " must not read as keep-alive, and
   ;; "Content-Length:<tab>42" is legal.
-  (define (parse-header-line l)
-    (let ((colon (string-index l #\:)))
-      (and colon
-           ;; trim bounds computed in place: one substring per value,
-           ;; not cut-then-trim twice
-           (let* ((n (string-length l))
-                  (vs (let lp ((j (+ colon 1)))
-                        (if (and (< j n)
-                                 (memv (string-ref l j) '(#\space #\tab)))
-                            (lp (+ j 1)) j)))
-                  (ve (let lp ((j n))
-                        (if (and (> j vs)
-                                 (memv (string-ref l (- j 1)) '(#\space #\tab)))
-                            (lp (- j 1)) j))))
-             (cons (string->symbol (string-downcase (substring l 0 colon)))
-                   (substring l vs ve))))))
-
-  ;; Repeated header fields are coalesced into one comma-joined value in
-  ;; wire order (RFC 7230); this lets content-length see "5,6" and
-  ;; reject the conflict, and keeps request accessors single-valued.
-  ;; A continuation line (obs-fold, leading SP/TAB) or any line without
-  ;; a colon rejects the WHOLE head (-> 400): silently dropping a line
-  ;; a proxy in front may have honored is request-smuggling room.
-  (define (parse-header-lines lines)
-    (let loop ((ls lines) (acc '()))
-      (cond
-        ((null? ls) (reverse! acc))     ; wire order, no fresh list
-        ((string=? (car ls) "") (loop (cdr ls) acc))
-        ((memv (string-ref (car ls) 0) '(#\space #\tab)) #f)   ; obs-fold
-        (else
-         (let ((kv (parse-header-line (car ls))))
-           (and kv
-                (let ((prev (assq (car kv) acc)))
-                  (if prev
-                      (begin
-                        (set-cdr! prev
-                          (string-append (cdr prev) "," (cdr kv)))
-                        (loop (cdr ls) acc))
-                      (loop (cdr ls) (cons kv acc))))))))))
+  (define (parse-headers text start)
+    (let ((n (string-length text)))
+      (let loop ((i start) (acc '()))
+        (if (fx>= i n)
+            (reverse! acc)                       ; wire order
+            (let* ((nl (let scan ((j i))
+                         (cond ((fx>= j n) n)
+                               ((char=? (string-ref text j) #\newline) j)
+                               (else (scan (fx+ j 1))))))
+                   (e (if (and (fx> nl i)
+                               (char=? (string-ref text (fx- nl 1)) #\return))
+                          (fx- nl 1)
+                          nl)))
+              (cond
+                ((fx= e i) (loop (fx+ nl 1) acc))                  ; blank line
+                ((memv (string-ref text i) '(#\space #\tab)) #f)   ; obs-fold
+                (else
+                 (let ((colon (let scan ((j i))
+                                (cond ((fx>= j e) #f)
+                                      ((char=? (string-ref text j) #\:) j)
+                                      (else (scan (fx+ j 1)))))))
+                   (and colon (fx> colon i)
+                        (let ((name (or (common-header-name text i (fx- colon i))
+                                        (rare-header-name text i colon))))
+                          (and name
+                               (let* ((vs (let lp ((j (fx+ colon 1)))
+                                            (if (and (fx< j e)
+                                                     (memv (string-ref text j)
+                                                           '(#\space #\tab)))
+                                                (lp (fx+ j 1)) j)))
+                                      (ve (let lp ((j e))
+                                            (if (and (fx> j vs)
+                                                     (memv (string-ref text (fx- j 1))
+                                                           '(#\space #\tab)))
+                                                (lp (fx- j 1)) j)))
+                                      (val (substring text vs ve))
+                                      (prev (assq name acc)))
+                                 (if prev
+                                     (begin
+                                       (set-cdr! prev
+                                         (string-append (cdr prev) "," val))
+                                       (loop (fx+ nl 1) acc))
+                                     (loop (fx+ nl 1)
+                                           (cons (cons name val) acc)))))))))))))))
 
   ;; Parse request line + headers from bv[from, to).
-  ;; Returns #(method path query version headers) or #f on malformed input.
+  ;; Returns #(method path query version headers), or #f on malformed
+  ;; input; a well-formed unknown version parses with 'unsupported in
+  ;; the version slot (505, not 400).
   (define (parse-head bv from to)
     (guard (e (#t #f))
       (let* ((text (utf8->string (bv-sub bv from to)))
-             (lines (split-header-lines text))
-             (rl (string-split (car lines) #\space)))
-        (and (= (length rl) 3)
-             (let* ((method (string->symbol (car rl)))
-                    (target (cadr rl))
-                    (version (caddr rl))
-                    (qpos (string-index target #\?))
-                    (path (percent-decode
-                            (if qpos (substring target 0 qpos) target)
-                            #f))                     ; "+" is literal in a path
-                    (query (if qpos
-                               (parse-query
-                                 (substring target (+ qpos 1)
-                                            (string-length target)))
-                               '()))
-                    (headers (parse-header-lines (cdr lines))))
-               (and headers
-                    (vector method path query version headers)))))))
+             (n (string-length text))
+             (nl1 (let scan ((j 0))
+                    (cond ((fx>= j n) n)
+                          ((char=? (string-ref text j) #\newline) j)
+                          (else (scan (fx+ j 1))))))
+             (rl-end (if (and (fx> nl1 0)
+                              (char=? (string-ref text (fx- nl1 1)) #\return))
+                         (fx- nl1 1)
+                         nl1)))
+        (define (find-sp from)
+          (let loop ((i from))
+            (cond ((fx>= i rl-end) #f)
+                  ((char=? (string-ref text i) #\space) i)
+                  (else (loop (fx+ i 1))))))
+        (let* ((sp1 (find-sp 0))
+               (sp2 (and sp1 (find-sp (fx+ sp1 1)))))
+          (and sp1 sp2
+               (fx> sp2 (fx+ sp1 1))               ; non-empty target
+               (fx> rl-end (fx+ sp2 1))            ; non-empty version
+               (not (find-sp (fx+ sp2 1)))         ; exactly three tokens
+               (let ((method (match-method text sp1)))
+                 (and method
+                      (let* ((version (match-version text (fx+ sp2 1) rl-end))
+                             (qpos (let loop ((i (fx+ sp1 1)))
+                                     (cond ((fx>= i sp2) #f)
+                                           ((char=? (string-ref text i) #\?) i)
+                                           (else (loop (fx+ i 1))))))
+                             (path (percent-decode
+                                     (substring text (fx+ sp1 1) (or qpos sp2))
+                                     #f))          ; "+" is literal in a path
+                             (query (if qpos
+                                        (parse-query
+                                          (substring text (fx+ qpos 1) sp2))
+                                        '()))
+                             (headers (parse-headers text (fx+ nl1 1))))
+                        (and headers
+                             (vector method path query version headers))))))))))
 
   ;; a valid Content-Length is one or more identical strings of ASCII
   ;; digits (parse-header-lines coalesces repeats into one comma-joined
@@ -691,25 +817,20 @@
   (define forbidden-trailer-fields
     '(transfer-encoding content-length host connection trailer upgrade))
 
-  (define (header-token-char? ch)
-    (or (char<=? #\a ch #\z) (char<=? #\A ch #\Z)
-        (char<=? #\0 ch #\9)
-        (memv ch '(#\! #\# #\$ #\% #\& #\' #\* #\+ #\- #\. #\^
-                   #\_ #\` #\| #\~))))
-
-  (define (valid-header-name? name)
-    (and (> (string-length name) 0)
-         (let loop ((i 0))
-           (or (= i (string-length name))
-               (and (header-token-char? (string-ref name i))
-                    (loop (+ i 1)))))))
-
+  ;; a trailer line must carry a token-valid name that is not on the
+  ;; forbidden list; matching goes through the common-name table, so
+  ;; attacker-chosen trailer names are never interned
   (define (valid-trailer-line? bv start end)
     (guard (e (#t #f))
-      (let ((kv (parse-header-line (utf8->string (bv-sub bv start end)))))
-        (and kv
-             (valid-header-name? (symbol->string (car kv)))
-             (not (memq (car kv) forbidden-trailer-fields))))))
+      (let* ((line (utf8->string (bv-sub bv start end)))
+             (colon (string-index line #\:)))
+        (and colon (fx> colon 0)
+             (let loop ((i 0))
+               (or (fx= i colon)
+                   (and (lc-token-char (string-ref line i))
+                        (loop (fx+ i 1)))))
+             (not (memq (common-header-name line 0 colon)
+                        forbidden-trailer-fields))))))
 
   (define (bv-concat lst total)
     (let ((out (make-bytevector total)))
@@ -819,9 +940,6 @@
            (`#(tcp-eof) (tcp-close! c))
            (`#(tcp-error ,e) (tcp-close! c)))))))
 
-  (define http-version-ok?
-    (lambda (v) (or (string=? v "HTTP/1.1") (string=? v "HTTP/1.0"))))
-
   ;; client sent Expect: 100-continue and is waiting for the interim
   ;; response before transmitting the body (curl stalls ~1s without it)
   (define (expect-100? headers)
@@ -841,7 +959,9 @@
                  (te (transfer-encoding headers))
                  (clen (content-length headers)))
             (cond
-              ((not (http-version-ok? (vector-ref parsed 3)))
+              ;; parse-head yields 'unsupported for a well-formed version
+              ;; it does not speak (garbage is a plain 400 there)
+              ((eq? (vector-ref parsed 3) 'unsupported)
                (quick-response! c 505 "HTTP Version Not Supported"))
               ((or (eq? clen 'bad) (eq? te 'bad))
                (quick-response! c 400 "Bad Request"))
