@@ -1195,6 +1195,8 @@ resolver 在 101 握手**之前**运行：
 HTTP 侧相同的槽（ws session 里用 `(req-claims req)` 读取），升级继续；返回
 `#f` 时，以纯 **HTTP 401** 拒绝升级、不握手——未鉴权的对端拿不到 socket。
 未知路由仍然是 **404**，只有*匹配到*但守卫拒绝的路由才回 401。
+三个信道——HTTP 路由、ws 升级、sexpr RPC 端点（`app-rpc`）——共用同一套
+request-guard 协议 `(lambda (req) claims-or-#f)`，因此一个守卫处处通用。
 `(igropyr auth)` 导出两种守卫。
 
 **`(token-guard verify [options])`** 把一个 token 校验器提升为请求守卫：先读
@@ -1584,6 +1586,23 @@ full path 在明文连接上默认被拒绝，因为 MITM 可能替换 server ke
 每个应答都被包裹：成功 `(ok <结果>)`；失败
 `(error unknown-tag <tag>)`、`(error handler-failed)` 或
 `(error bad-payload)`。
+
+与 `app-ws` 一样，`app-rpc` 接受可选的第 4 个参数——一个鉴权守卫
+`(lambda (req) claims-or-#f)`，与 `app-ws` 相同的 request-guard 协议，因此
+`(igropyr auth)` 的 `token-guard` 在这里同样适用。拒绝时以 **HTTP 401** 应答
+sexpr 数据 `(error unauthorized)`——这是 sexpr 信道，拒绝仍属于
+`(error bad-payload)` 那一族的 `(error ...)` 数据，而非 JSON。真值 claims 存进
+常规请求槽，用 `(req-claims req)` 读回。
+
+能接受**两个**参数的 handler 以 `(args req)` 调用，因此可读 claims 做按 tag
+授权；单参数 handler `(lambda (args) ...)` 完全不变。
+
+```scheme
+(app-rpc app "/rpc"
+  `((whoami . ,(lambda (args req) (json-ref (req-claims req) "sub")))
+    (add    . ,(lambda (args) (apply + args))))
+  (token-guard (jwt-verifier key)))
+```
 
 浏览器侧——Goeteia 的 `(web rpc)`：
 

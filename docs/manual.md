@@ -1444,9 +1444,12 @@ Authentication lives in its own library, `(igropyr auth)`. It is the *authentica
 (import (igropyr auth) (igropyr jwt))
 ```
 
-Both channels leave verified claims on a request-local slot, read the same way:
+All three channels — HTTP routes, WebSocket upgrades, and sexpr RPC
+endpoints (`app-rpc`) — share the same request-guard protocol
+`(lambda (req) claims-or-#f)`, so one guard works everywhere. Each leaves
+verified claims on a request-local slot, read the same way:
 
-- `(req-claims req)` → claims or `#f` — the claims left by `auth` or an `app-ws` guard.
+- `(req-claims req)` → claims or `#f` — the claims left by `auth`, an `app-ws` guard, or an `app-rpc` guard.
 
 ### HTTP Middleware
 
@@ -2267,6 +2270,25 @@ an evaluation.
 Every reply is wrapped: `(ok <result>)` on success;
 `(error unknown-tag <tag>)`, `(error handler-failed)`, or
 `(error bad-payload)` on failure.
+
+Like `app-ws`, `app-rpc` takes an optional 4th argument — an auth guard
+`(lambda (req) claims-or-#f)`, the same request-guard protocol, so
+`(igropyr auth)`'s `token-guard` works here too. A refusal answers
+**HTTP 401** with the sexpr datum `(error unauthorized)` — this is a
+sexpr channel, so the refusal stays in the same `(error ...)` data
+family as `(error bad-payload)`, never JSON. Truthy claims are stashed on
+the request and read back with `(req-claims req)`.
+
+A handler that can take **two** arguments is called with `(args req)`, so
+it can read the claims for per-tag authorization; one-argument handlers
+`(lambda (args) ...)` are unchanged.
+
+```scheme
+(app-rpc app "/rpc"
+  `((whoami . ,(lambda (args req) (json-ref (req-claims req) "sub")))
+    (add    . ,(lambda (args) (apply + args))))
+  (token-guard (jwt-verifier key)))
+```
 
 Browser side — Goeteia's `(web rpc)`:
 
