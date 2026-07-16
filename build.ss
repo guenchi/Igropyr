@@ -15,7 +15,8 @@
 ;; (source . optimize-level), in dependency order so each library's
 ;; already-compiled dependencies are picked up as .so.
 (define units
-  '(("igropyr/platform.sc" . 2)
+  '(("igropyr/checked.sc" . 2)
+    ("igropyr/platform.sc" . 2)
     ("igropyr/crypto.sc" . 2)
     ("igropyr/libuv.sc" . 2)
     ("igropyr/actor.sc" . 2)

@@ -1,5 +1,6 @@
 #!chezscheme
 (import (chezscheme)
+        (igropyr checked)
         (igropyr platform) (igropyr crypto)
         (igropyr libuv) (igropyr actor) (igropyr otp)
         (igropyr http) (igropyr websocket) (igropyr ws-client)

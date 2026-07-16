@@ -16,6 +16,8 @@ export CHEZSCHEMELIBDIRS=.
 export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
 
 "$scheme_bin" --script igropyr/test/import-all.sc
+IGROPYR_CONTRACTS=full "$scheme_bin" --script igropyr/test/checked-full.sc
+env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/smoke-actor.sc
 "$scheme_bin" --script igropyr/test/file-read.sc
 "$scheme_bin" --script igropyr/test/sexpr.sc
@@ -30,6 +32,17 @@ export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm
 "$scheme_bin" --script igropyr/test/conversation.sc
 "$scheme_bin" --script igropyr/test/conv-cluster.sc
 "$scheme_bin" --script igropyr/test/tls.sc
+
+set +e
+badenv_output=$(IGROPYR_CONTRACTS=on "$scheme_bin" --script igropyr/test/checked-badenv.sc 2>&1)
+badenv_status=$?
+set -e
+if [[ $badenv_status -eq 0 || "$badenv_output" != *"IGROPYR_CONTRACTS"* ]]; then
+  printf '%s\n' "$badenv_output"
+  echo "checked bad-env rejection test failed" >&2
+  exit 1
+fi
+echo "CHECKED BAD-ENV REJECTION PASSED"
 
 set +e
 boot_output=$("$scheme_bin" --script igropyr/test/smoke-boot-failure.sc 2>&1)
