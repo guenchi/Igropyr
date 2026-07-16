@@ -58,8 +58,8 @@
           (a (@ (class "btn ghost") (href "agent/igropyr-dev.md")) "View raw"))
         (p (@ (class "backlink")) "Covers the actor model, the whole module map, "
            "records & contracts, the build/test incantation (" (code ".sc")
-           " extension mapping and all), and every gotcha — one Markdown file you "
-           "drop into " (code "~/.claude/agents/") ".")))
+           " extension mapping and all), and every gotcha — one Markdown file, "
+           "fed to any AI coding agent as its instructions.")))
 
    ;; ---- agent 2: node-to-igropyr ----
    `(section (@ (id "port"))
