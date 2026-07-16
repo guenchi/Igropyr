@@ -105,7 +105,9 @@ Callers use `(gen-server-call pid msg)` (blocks for a reply, like `await service
 - Body size in a handler is `(bytevector-length (req-body req))` — O(1)
   and exact, the body is fully buffered before dispatch. `content-length`
   is the client's declared value (a string). There is no per-route early
-  rejection; the global body-limit (default 1MB) is the only gate.
+  rejection; the body-limit is the only gate — default 1 MiB, raisable
+  via `(app-listen app port '((body-limit . N)))` (process-global, the
+  last listen wins).
 - `app-listen` prints `igropyr contracts: full|off` at startup — that is
   the dev-contract build-mode canary, not an error (production says off).
 - Workers stuck for 30s are killed: long tasks must `spawn` a separate

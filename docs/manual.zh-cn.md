@@ -635,6 +635,12 @@ Middleware 会按添加顺序调用，并位于匹配 route handler 之前。
 - `max-retries`：crash 时最大 task retry 次数（默认 3，因此总共执行 4 次）
 - `stuck-ms`：判断 worker stuck 的时间阈值（默认 30000 = 30s）
 - `check-ms`：检查 stuck worker 的 ticker 间隔（默认 5000 = 5s）
+- `body-limit`：请求体上限（字节，默认 1 MiB，超限答 413）。boot 期校验
+  （必须是正 fixnum）。**进程全局**：本进程内最后一次 `http-listen`/`app-listen`
+  生效，作用于所有服务器
+- `reuseport`：SO_REUSEPORT 绑定——同端口跑 N 个 OS 进程，内核负载均衡（仅 Linux）
+- `on-failure`：重试耗尽或 stuck worker 被杀后的失败钩子 `(lambda (req res info))`
+  （见 fault handler 一节）
 
 启动时，`app-listen` 会打印一行，标明构建时烘焙进去的契约级别：
 

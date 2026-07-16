@@ -629,6 +629,13 @@ Configuration options:
 - `max-retries`: Maximum task retries on crash (default 3, so 4 executions total)
 - `stuck-ms`: Time threshold to consider a worker stuck (default 30000 = 30s)
 - `check-ms`: Ticker interval to check for stuck workers (default 5000 = 5s)
+- `body-limit`: Request body cap in bytes (default 1 MiB; 413 beyond it).
+  Validated at boot (must be a positive fixnum). PROCESS-GLOBAL: the last
+  `http-listen`/`app-listen` in the process wins, across all servers
+- `reuseport`: SO_REUSEPORT bind — run N OS processes on the same port,
+  kernel-balanced (Linux only)
+- `on-failure`: failure hook `(lambda (req res info))` when retries are
+  exhausted or a stuck worker was killed (see the fault handler section)
 
 On startup, `app-listen` prints one line naming the contract level baked
 into the build:
