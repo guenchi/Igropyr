@@ -49,8 +49,9 @@ conversations, and s-expression RPC.
 - **Middleware suite** — cookie sessions (gen-server store, CSPRNG sids),
   CORS with preflight, security headers, and an access logger
 - **JWT** — `(igropyr jwt)` signs and verifies HS256 tokens (algorithm
-  pinned, constant-time compare, strict base64url, fail-closed); a
-  `jwt-middleware` guards routes with a `Bearer` token and answers 401
+  pinned, constant-time compare, strict base64url, fail-closed); the
+  format-neutral `auth` middleware guards routes with a `Bearer` token,
+  taking any verifier — `(jwt-verifier key)` today — and answers 401
   otherwise
 - **Chunked transfer-encoding** — `Transfer-Encoding: chunked` request
   bodies are decoded transparently
