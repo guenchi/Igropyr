@@ -14,7 +14,7 @@
 (generate-wpo-files #t)
 
 (define libs
-  '("igropyr/checked.sc" "igropyr/platform.sc" "igropyr/libuv.sc" "igropyr/actor.sc" "igropyr/json.sc"
+  '("igropyr/checked.sc" "igropyr/buffer.sc" "igropyr/platform.sc" "igropyr/libuv.sc" "igropyr/actor.sc" "igropyr/json.sc"
     "igropyr/gzip.sc" "igropyr/sexpr.sc" "igropyr/otp.sc" "igropyr/websocket.sc" "igropyr/ws-client.sc"
     "igropyr/gen-server.sc" "igropyr/conversation.sc" "igropyr/http.sc" "igropyr/pubsub.sc"
     "igropyr/express.sc" "igropyr/session.sc" "igropyr/auth.sc" "igropyr/middleware.sc" "igropyr/jwt.sc" "igropyr/metrics.sc" "igropyr/client.sc"

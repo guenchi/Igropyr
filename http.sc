@@ -51,7 +51,8 @@
           ;; never conflicts.
           start-scheduler spawn send receive self
           sleep-ms kill register whereis process-id)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr otp)
+  (import (chezscheme) (igropyr buffer)
+          (igropyr actor) (igropyr libuv) (igropyr otp)
           (igropyr websocket))
 
   (define header-limit 8192)
@@ -68,38 +69,14 @@
 
   (define empty-bv (make-bytevector 0))
 
-  ;; Appending onto an empty buffer returns the other side unchanged --
-  ;; the common first-chunk case costs nothing. Safe to alias: buffers
-  ;; are treated as immutable by every caller.
-  (define (bv-append a b)
-    (let ((la (bytevector-length a))
-          (lb (bytevector-length b)))
-      (cond
-        ((fx= la 0) b)
-        ((fx= lb 0) a)
-        (else
-         (let ((r (make-bytevector (fx+ la lb))))
-           (bytevector-copy! a 0 r 0 la)
-           (bytevector-copy! b 0 r la lb)
-           r)))))
-
+  ;; empty range: no allocation (every bodyless request used to pay
+  ;; two empty bytevectors, body and leftover)
   (define (bv-sub bv start end)
-    (let ((r (make-bytevector (- end start))))
-      (bytevector-copy! bv start r 0 (- end start))
-      r))
-
-  ;; index of the \r\n\r\n terminating the header block, or #f
-  (define (find-header-end bv)
-    (let ((n (bytevector-length bv)))
-      (let loop ((i 0))
-        (cond
-          ((fx> (fx+ i 3) (fx- n 1)) #f)
-          ((and (fx= (bytevector-u8-ref bv i) 13)
-                (fx= (bytevector-u8-ref bv (fx+ i 1)) 10)
-                (fx= (bytevector-u8-ref bv (fx+ i 2)) 13)
-                (fx= (bytevector-u8-ref bv (fx+ i 3)) 10))
-           i)
-          (else (loop (fx+ i 1)))))))
+    (if (fx>= start end)
+        empty-bv
+        (let ((r (make-bytevector (fx- end start))))
+          (bytevector-copy! bv start r 0 (fx- end start))
+          r)))
 
   ;; ---- request record ------------------------------------------------------
 
@@ -220,42 +197,55 @@
                  (cons (substring s start (line-end start i)) acc)))
           (else (loop (fx+ i 1) start acc))))))
 
-  ;; "Content-Length: 42" -> (content-length . "42"), or #f
+  ;; "Content-Length: 42" -> (content-length . "42"), or #f.
+  ;; The value is trimmed of SP and TAB on BOTH ends (RFC 7230 OWS):
+  ;; "Connection: close " must not read as keep-alive, and
+  ;; "Content-Length:<tab>42" is legal.
   (define (parse-header-line l)
     (let ((colon (string-index l #\:)))
       (and colon
-           (let ((k (string->symbol (string-downcase (substring l 0 colon))))
-                 (v (let trim ((j (+ colon 1)))
-                      (if (and (< j (string-length l))
-                               (char=? (string-ref l j) #\space))
-                          (trim (+ j 1))
-                          (substring l j (string-length l))))))
-             (cons k v)))))
+           ;; trim bounds computed in place: one substring per value,
+           ;; not cut-then-trim twice
+           (let* ((n (string-length l))
+                  (vs (let lp ((j (+ colon 1)))
+                        (if (and (< j n)
+                                 (memv (string-ref l j) '(#\space #\tab)))
+                            (lp (+ j 1)) j)))
+                  (ve (let lp ((j n))
+                        (if (and (> j vs)
+                                 (memv (string-ref l (- j 1)) '(#\space #\tab)))
+                            (lp (- j 1)) j))))
+             (cons (string->symbol (string-downcase (substring l 0 colon)))
+                   (substring l vs ve))))))
 
-  ;; Repeated header fields are coalesced into one comma-joined value
-  ;; (RFC 7230); this lets content-length see "5,6" and reject the
-  ;; conflict, and keeps request accessors single-valued.
+  ;; Repeated header fields are coalesced into one comma-joined value in
+  ;; wire order (RFC 7230); this lets content-length see "5,6" and
+  ;; reject the conflict, and keeps request accessors single-valued.
+  ;; A continuation line (obs-fold, leading SP/TAB) or any line without
+  ;; a colon rejects the WHOLE head (-> 400): silently dropping a line
+  ;; a proxy in front may have honored is request-smuggling room.
   (define (parse-header-lines lines)
-    (let ((acc (fold-right
-                 (lambda (l a)
-                   (let ((kv (and (not (string=? l "")) (parse-header-line l))))
-                     (if (not kv)
-                         a
-                         (let ((prev (assq (car kv) a)))
-                           (if prev
-                               (begin
-                                 (set-cdr! prev
-                                   (string-append (cdr prev) "," (cdr kv)))
-                                 a)
-                               (cons kv a))))))
-                 '() lines)))
-      acc))
+    (let loop ((ls lines) (acc '()))
+      (cond
+        ((null? ls) (reverse! acc))     ; wire order, no fresh list
+        ((string=? (car ls) "") (loop (cdr ls) acc))
+        ((memv (string-ref (car ls) 0) '(#\space #\tab)) #f)   ; obs-fold
+        (else
+         (let ((kv (parse-header-line (car ls))))
+           (and kv
+                (let ((prev (assq (car kv) acc)))
+                  (if prev
+                      (begin
+                        (set-cdr! prev
+                          (string-append (cdr prev) "," (cdr kv)))
+                        (loop (cdr ls) acc))
+                      (loop (cdr ls) (cons kv acc))))))))))
 
-  ;; Parse request line + headers from the header block.
+  ;; Parse request line + headers from bv[from, to).
   ;; Returns #(method path query version headers) or #f on malformed input.
-  (define (parse-head bv hend)
+  (define (parse-head bv from to)
     (guard (e (#t #f))
-      (let* ((text (utf8->string (bv-sub bv 0 hend)))
+      (let* ((text (utf8->string (bv-sub bv from to)))
              (lines (split-header-lines text))
              (rl (string-split (car lines) #\space)))
         (and (= (length rl) 3)
@@ -272,7 +262,8 @@
                                             (string-length target)))
                                '()))
                     (headers (parse-header-lines (cdr lines))))
-               (vector method path query version headers))))))
+               (and headers
+                    (vector method path query version headers)))))))
 
   ;; a valid Content-Length is one or more identical strings of ASCII
   ;; digits (parse-header-lines coalesces repeats into one comma-joined
@@ -353,6 +344,7 @@
       ((408) "Request Timeout") ((413) "Payload Too Large")
       ((431) "Request Header Fields Too Large")
       ((500) "Internal Server Error") ((503) "Service Unavailable")
+      ((505) "HTTP Version Not Supported")
       (else "Unknown")))
 
   ;; Complete status lines as compile-time constants: the common statuses
@@ -680,16 +672,6 @@
 
   ;; ---- chunked transfer-encoding (request side) ----------------------------------
 
-  (define (find-crlf bv start)
-    (let ((n (bytevector-length bv)))
-      (let loop ((i start))
-        (cond
-          ((fx>= (fx+ i 1) n) #f)
-          ((and (fx= (bytevector-u8-ref bv i) 13)
-                (fx= (bytevector-u8-ref bv (fx+ i 1)) 10))
-           i)
-          (else (loop (fx+ i 1)))))))
-
   ;; hex chunk size, stopping at ';' (chunk extensions); #f if malformed.
   ;; The size value keeps GENERIC arithmetic on purpose: an absurd hex
   ;; size must overflow into a bignum and be rejected by the body-limit
@@ -738,47 +720,75 @@
               (bytevector-copy! x 0 out off (bytevector-length x))
               (loop (cdr l) (+ off (bytevector-length x))))))))
 
-  ;; Try to parse a complete chunked body starting at `start`.
-  ;; -> (values 'done body end-index) | (values 'more #f #f)
+  ;; Try to parse a complete chunked body from the inbuf, body-start and
+  ;; all other positions RELATIVE to the buffer's start. st is #f for a
+  ;; fresh parse or the resume state from a previous 'more -- already
+  ;; extracted chunks are never re-parsed and never re-copied, so a body
+  ;; drip-fed in tiny segments costs each byte once, not O(segments)
+  ;; rescans (which a 1-byte-segment peer could otherwise run up to
+  ;; GB-level wasted CPU inside the 30s window).
+  ;; -> (values 'done body end-index) | (values 'more resume-state #f)
   ;;  | (values 'too-large #f #f) | (values 'bad #f #f)
-  (define (parse-chunked-body bv start)
-    (let loop ((pos start) (chunks '()) (len 0))
-      (let ((eol (find-crlf bv pos)))
-        (if (not eol)
-            (if (> (- (bytevector-length bv) start) (+ body-limit 1024))
-                (values 'too-large #f #f)
-                (values 'more #f #f))
-            (let ((size (parse-chunk-size bv pos eol)))
-              (cond
-                ((not size) (values 'bad #f #f))
-                ((> (+ len size) body-limit) (values 'too-large #f #f))
-                ((= size 0)
-                 ;; Validate and cap optional trailers; a blank line ends
-                 ;; the body. Trailer fields are currently ignored.
-                 (let ((trailer-start (+ eol 2)))
-                   (let scan ((p trailer-start))
-                     (let ((e2 (find-crlf bv p)))
-                       (cond
-                         ((not e2)
-                          (if (> (- (bytevector-length bv) trailer-start) trailer-limit)
-                              (values 'trailers-too-large #f #f)
-                              (values 'more #f #f)))
-                         ((> (- (+ e2 2) trailer-start) trailer-limit)
-                          (values 'trailers-too-large #f #f))
-                         ((= e2 p)
-                          (values 'done (bv-concat (reverse chunks) len) (+ p 2)))
-                         ((valid-trailer-line? bv p e2) (scan (+ e2 2)))
-                         (else (values 'bad #f #f)))))))
-                (else
-                 (let ((dstart (+ eol 2)))
-                   (if (< (bytevector-length bv) (+ dstart size 2))
-                       (values 'more #f #f)
-                       (if (not (and (= (bytevector-u8-ref bv (+ dstart size)) 13)
-                                     (= (bytevector-u8-ref bv (+ dstart size 1)) 10)))
-                           (values 'bad #f #f)
-                           (loop (+ dstart size 2)
-                                 (cons (bv-sub bv dstart (+ dstart size)) chunks)
-                                 (+ len size))))))))))))
+  ;;  | (values 'trailers-too-large #f #f)
+  (define (parse-chunked-body buf body-start st)
+    (let* ((bv (inbuf-bv buf)) (base (inbuf-start buf))
+           (blen (inbuf-length buf)))
+      ;; find-crlf over the window, relative positions
+      (define (crlf-at pos)
+        (let loop ((i pos))
+          (cond
+            ((fx>= (fx+ i 1) blen) #f)
+            ((and (fx= (bytevector-u8-ref bv (fx+ base i)) 13)
+                  (fx= (bytevector-u8-ref bv (fx+ base (fx+ i 1))) 10))
+             i)
+            (else (loop (fx+ i 1))))))
+      (define (u8 i) (bytevector-u8-ref bv (fx+ base i)))
+      (let loop ((pos (if st (vector-ref st 0) body-start))
+                 (chunks (if st (vector-ref st 1) '()))
+                 (len (if st (vector-ref st 2) 0)))
+        (let ((eol (crlf-at pos)))
+          (if (not eol)
+              (if (> (- blen pos) (+ body-limit 1024))
+                  (values 'too-large #f #f)
+                  (values 'more (vector pos chunks len) #f))
+              (let ((size (parse-chunk-size bv (fx+ base pos) (fx+ base eol))))
+                (cond
+                  ((not size) (values 'bad #f #f))
+                  ((> (+ len size) body-limit) (values 'too-large #f #f))
+                  ((= size 0)
+                   ;; Validate and cap optional trailers; a blank line ends
+                   ;; the body. Trailer fields are currently ignored. The
+                   ;; trailer block re-scans from here on each segment --
+                   ;; bounded by trailer-limit, so no quadratic exposure.
+                   (let ((trailer-start (+ eol 2)))
+                     (let scan ((p trailer-start))
+                       (let ((e2 (crlf-at p)))
+                         (cond
+                           ((not e2)
+                            (if (> (- blen trailer-start) trailer-limit)
+                                (values 'trailers-too-large #f #f)
+                                ;; resume at the zero-size line so the
+                                ;; trailer phase re-enters here
+                                (values 'more (vector pos chunks len) #f)))
+                           ((> (- (+ e2 2) trailer-start) trailer-limit)
+                            (values 'trailers-too-large #f #f))
+                           ((= e2 p)
+                            (values 'done (bv-concat (reverse chunks) len) (+ p 2)))
+                           ((valid-trailer-line? bv (fx+ base p) (fx+ base e2))
+                            (scan (+ e2 2)))
+                           (else (values 'bad #f #f)))))))
+                  (else
+                   (let ((dstart (+ eol 2)))
+                     (if (< blen (+ dstart size 2))
+                         (values 'more (vector pos chunks len) #f)
+                         (if (not (and (= (u8 (+ dstart size)) 13)
+                                       (= (u8 (+ dstart size 1)) 10)))
+                             (values 'bad #f #f)
+                             (loop (+ dstart size 2)
+                                   (cons (bv-sub bv (fx+ base dstart)
+                                                 (fx+ base (+ dstart size)))
+                                         chunks)
+                                   (+ len size)))))))))))))
 
   ;; ---- reader process ----------------------------------------------------------
 
@@ -788,25 +798,41 @@
     task-counter)
 
   (define (make-reader c srv)
-    (lambda () (reader-loop c srv empty-bv)))
+    (lambda () (reader-loop c srv (make-inbuf))))
 
-  (define (reader-loop c srv acc)
-    (let ((hend (find-header-end acc)))
+  ;; The connection's inbuf is the reader's single accumulation state:
+  ;; appends are amortized O(1)/byte, the header-end scan resumes where
+  ;; it left off, and consuming a request is an offset bump -- none of
+  ;; the append-and-rescan-from-zero / recopy-the-remainder patterns.
+  (define (reader-loop c srv buf)
+    (let ((hend (inbuf-find-header-end buf)))
       (cond
-        (hend (have-header c srv acc hend))
-        ((> (bytevector-length acc) header-limit)
+        (hend (have-header c srv buf hend))
+        ((> (inbuf-length buf) header-limit)
          (quick-response! c 431 "Header Too Large"))
         (else
          (receive (after read-timeout-ms
-                     (if (> (bytevector-length acc) 0)
+                     (if (> (inbuf-length buf) 0)
                          (quick-response! c 408 "Request Timeout")
                          (tcp-close! c)))   ; idle connection: just close
-           (`#(tcp-data ,bv) (reader-loop c srv (bv-append acc bv)))
+           (`#(tcp-data ,bv) (inbuf-append! buf bv) (reader-loop c srv buf))
            (`#(tcp-eof) (tcp-close! c))
            (`#(tcp-error ,e) (tcp-close! c)))))))
 
-  (define (have-header c srv acc hend)
-    (let ((parsed (parse-head acc hend)))
+  (define http-version-ok?
+    (lambda (v) (or (string=? v "HTTP/1.1") (string=? v "HTTP/1.0"))))
+
+  ;; client sent Expect: 100-continue and is waiting for the interim
+  ;; response before transmitting the body (curl stalls ~1s without it)
+  (define (expect-100? headers)
+    (let ((p (assq 'expect headers)))
+      (and p (string-ci=? (cdr p) "100-continue"))))
+
+  (define continue-100 (string->utf8 "HTTP/1.1 100 Continue\r\n\r\n"))
+
+  (define (have-header c srv buf hend)
+    (let* ((base (inbuf-start buf))
+           (parsed (parse-head (inbuf-bv buf) base (fx+ base hend))))
       (if (not parsed)
           (quick-response! c 400 "Bad Request")
           (let* ((headers (vector-ref parsed 4))
@@ -815,6 +841,8 @@
                  (te (transfer-encoding headers))
                  (clen (content-length headers)))
             (cond
+              ((not (http-version-ok? (vector-ref parsed 3)))
+               (quick-response! c 505 "HTTP Version Not Supported"))
               ((or (eq? clen 'bad) (eq? te 'bad))
                (quick-response! c 400 "Bad Request"))
               ((and (eq? te 'chunked) (not (eq? clen 'absent)))
@@ -829,7 +857,9 @@
                       (session (resolver req)))
                  (cond
                    ((procedure? session)
-                    (run-ws-session c acc hend wskey req session))
+                    (run-ws-session c
+                      (inbuf-sub buf (fx+ hend 4) (inbuf-length buf))
+                      wskey req session))
                    ;; #(ws-reject status text): an auth guard refused the
                    ;; upgrade -- answered before any handshake, so an
                    ;; unauthenticated peer never gets a socket
@@ -840,17 +870,25 @@
                                      (vector-ref session 2)))
                    (else (quick-response! c 404 "Not Found")))))
               ((eq? te 'chunked)
-               (collect-chunked c srv acc parsed (+ hend 4)))
+               (when (expect-100? headers) (tcp-write! c continue-100 #f))
+               (collect-chunked c srv buf parsed (fx+ hend 4) #f))
               (else
                (let ((n (if (eq? clen 'absent) 0 clen)))
-                 (if (> n body-limit)
-                     (quick-response! c 413 "Payload Too Large")
-                     (collect-body c srv acc parsed n (+ hend 4 n))))))))))
+                 (cond
+                   ((> n body-limit)
+                    (quick-response! c 413 "Payload Too Large"))
+                   (else
+                    (when (and (> n 0) (expect-100? headers))
+                      (tcp-write! c continue-100 #f))
+                    (collect-body c srv buf parsed n (+ hend 4 n)))))))))))
 
   ;; Dispatch the parsed request to the worker pool, then await the
   ;; response. Every request goes through the pool, so every handler gets
   ;; the same fault tolerance (crash retry, stuck-worker kill).
-  (define (dispatch-request! c srv parsed body leftover)
+  ;; The request's bytes are already consumed from buf; whatever remains
+  ;; is pipelined data, carried as-is (no per-request remainder copy --
+  ;; that was O(k^2) over a k-request pipeline).
+  (define (dispatch-request! c srv parsed body buf)
     (let* ((headers (vector-ref parsed 4))
            (req (make-request (vector-ref parsed 0)
                               (vector-ref parsed 1)
@@ -864,27 +902,32 @@
            (token (make-token)))
       (send (http-server-sup srv)
         (vector 'submit-task (vector 'task id c req token)))
-      (await-response c srv leftover #f)))
+      (await-response c srv buf #f)))
 
-  (define (collect-body c srv acc parsed clen total)
-    (if (>= (bytevector-length acc) total)
-        (dispatch-request! c srv parsed
-          (bv-sub acc (- total clen) total)
-          (bv-sub acc total (bytevector-length acc)))
+  ;; total = header block + body length, RELATIVE to the buffer start
+  (define (collect-body c srv buf parsed clen total)
+    (if (>= (inbuf-length buf) total)
+        (let ((body (inbuf-sub buf (- total clen) total)))
+          (inbuf-consume! buf total)
+          (dispatch-request! c srv parsed body buf))
         (receive (after read-timeout-ms (quick-response! c 408 "Request Timeout"))
-          (`#(tcp-data ,bv) (collect-body c srv (bv-append acc bv) parsed clen total))
+          (`#(tcp-data ,bv)
+            (inbuf-append! buf bv)
+            (collect-body c srv buf parsed clen total))
           (`#(tcp-eof) (tcp-close! c))
           (`#(tcp-error ,e) (tcp-close! c)))))
 
-  (define (collect-chunked c srv acc parsed body-start)
-    (let-values (((st body end) (parse-chunked-body acc body-start)))
-      (case st
+  (define (collect-chunked c srv buf parsed body-start st)
+    (let-values (((status a b) (parse-chunked-body buf body-start st)))
+      (case status
         ((done)
-         (dispatch-request! c srv parsed body
-           (bv-sub acc end (bytevector-length acc))))
+         (inbuf-consume! buf b)
+         (dispatch-request! c srv parsed a buf))
         ((more)
          (receive (after read-timeout-ms (quick-response! c 408 "Request Timeout"))
-           (`#(tcp-data ,bv) (collect-chunked c srv (bv-append acc bv) parsed body-start))
+           (`#(tcp-data ,bv)
+             (inbuf-append! buf bv)
+             (collect-chunked c srv buf parsed body-start a))
            (`#(tcp-eof) (tcp-close! c))
            (`#(tcp-error ,e) (tcp-close! c))))
         ((too-large) (quick-response! c 413 "Payload Too Large"))
@@ -893,32 +936,32 @@
 
   ;; Wait for the worker's response to complete. Data arriving meanwhile
   ;; (pipelining) is buffered; EOF is remembered so we stop after replying.
-  (define (await-response c srv leftover eof?)
+  (define (await-response c srv buf eof?)
     (receive (after await-timeout-ms (tcp-close! c))
       (`#(next-request)
-        (if eof? (tcp-close! c) (reader-loop c srv leftover)))
+        (if eof? (tcp-close! c) (reader-loop c srv buf)))
       (`#(conn-closed) 'done)
-      (`#(streaming) (await-streaming c srv leftover))
+      (`#(streaming) (await-streaming c srv buf))
       (`#(tcp-data ,bv)
-        (let ((buf (bv-append leftover bv)))
-          (if (> (bytevector-length buf) pipeline-limit)
-              (tcp-close! c)                        ; peer over-pipelining
-              (await-response c srv buf eof?))))
-      (`#(tcp-eof) (await-response c srv leftover #t))
-      (`#(tcp-error ,e) (await-response c srv leftover #t))))
+        (inbuf-append! buf bv)
+        (if (> (inbuf-length buf) pipeline-limit)
+            (tcp-close! c)                          ; peer over-pipelining
+            (await-response c srv buf eof?)))
+      (`#(tcp-eof) (await-response c srv buf #t))
+      (`#(tcp-error ,e) (await-response c srv buf #t))))
 
   ;; A streamed (chunked/SSE) response is in progress: wait without a
   ;; deadline. On client disconnect the reader closes and exits; the
   ;; producer notices through res-write! returning #f.
-  (define (await-streaming c srv leftover)
+  (define (await-streaming c srv buf)
     (receive (after 'infinity #f)
-      (`#(next-request) (reader-loop c srv leftover))
+      (`#(next-request) (reader-loop c srv buf))
       (`#(conn-closed) 'done)
       (`#(tcp-data ,bv)
-        (let ((buf (bv-append leftover bv)))
-          (if (> (bytevector-length buf) pipeline-limit)
-              (begin (tcp-close! c) 'done)
-              (await-streaming c srv buf))))
+        (inbuf-append! buf bv)
+        (if (> (inbuf-length buf) pipeline-limit)
+            (begin (tcp-close! c) 'done)
+            (await-streaming c srv buf)))
       (`#(tcp-eof) (tcp-close! c) 'done)
       (`#(tcp-error ,e) (tcp-close! c) 'done)))
 
@@ -933,12 +976,14 @@
       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
       "Sec-WebSocket-Accept: "))
 
-  (define (run-ws-session c acc hend key req session)
+  ;; leftover: bytes already read past the upgrade request's header
+  ;; block -- they belong to the ws stream
+  (define (run-ws-session c leftover key req session)
     (tcp-write! c
       (string->utf8
         (string-append ws-handshake-prefix (ws-accept-key key) "\r\n\r\n"))
       #f)
-    (let ((w (make-ws c (bv-sub acc (+ hend 4) (bytevector-length acc)))))
+    (let ((w (make-ws c leftover)))
       (guard (e (#t (void)))
         (session w req))
       (ws-close! w)))
