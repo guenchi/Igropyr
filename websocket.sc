@@ -18,26 +18,14 @@
   (export ws-accept-key
           make-ws make-ws-client ws? ws-conn
           ws-recv ws-send-text! ws-send-binary! ws-close!)
-  (import (chezscheme) (igropyr actor) (igropyr libuv)
+  (import (chezscheme) (igropyr buffer)
+          (igropyr actor) (igropyr libuv)
           (only (igropyr crypto) sha1 base64-encode))
 
   (define max-frame 1048576)          ; single frame payload cap
   (define max-message 8388608)        ; reassembled multi-frame message cap
 
   ;; ---- bytevector helpers -------------------------------------------------
-
-  ;; empty side returns the other unchanged (buffers are read-only here)
-  (define (bv-append a b)
-    (let ((la (bytevector-length a))
-          (lb (bytevector-length b)))
-      (cond
-        ((fx= la 0) b)
-        ((fx= lb 0) a)
-        (else
-         (let ((r (make-bytevector (fx+ la lb))))
-           (bytevector-copy! a 0 r 0 la)
-           (bytevector-copy! b 0 r la lb)
-           r)))))
 
   (define (bv-sub bv start end)
     (let ((r (make-bytevector (- end start))))
@@ -98,12 +86,12 @@
           (bytevector-copy! payload 0 bv hlen n))
       bv))
 
-  ;; decode one frame at `start`; unmasks a masked payload.
+  ;; decode one frame from bv[start, limit); unmasks a masked payload.
   ;; expect-masked?: server role requires client frames masked; client
   ;; role requires server frames unmasked. -> #(fin? op payload end) |
-  ;; 'more | 'bad | 'too-large
-  (define (decode-frame bv start expect-masked?)
-    (let ((have (- (bytevector-length bv) start)))
+  ;; 'more | 'bad | 'too-large  (end is absolute, like start)
+  (define (decode-frame bv start limit expect-masked?)
+    (let ((have (- limit start)))
       (if (< have 2)
           'more
           (let* ((b0 (bytevector-u8-ref bv start))
@@ -158,7 +146,7 @@
                  (let* ((mask-off (+ start 2 lenbytes))
                         (data-off (+ mask-off (if masked? 4 0)))
                         (end (+ data-off plen)))
-                   (if (< (bytevector-length bv) end)
+                   (if (< limit end)
                        'more
                        (let ((payload (bv-sub bv data-off end)))
                          (when masked?
@@ -176,17 +164,22 @@
   (define-record-type (ws make-ws-record ws?)
     (fields
       (immutable conn ws-conn)
-      (immutable bufbox ws-bufbox)       ; box of unconsumed bytes
+      (immutable buf ws-buf)             ; inbuf of unconsumed stream bytes
       (immutable closedbox ws-closedbox)
       (immutable client? ws-client?)))    ; client role masks outbound frames
 
+  (define (leftover->inbuf leftover)
+    (let ((b (make-inbuf)))
+      (inbuf-append! b leftover)
+      b))
+
   ;; server-side session (frames it sends are unmasked; incoming masked)
   (define (make-ws conn leftover)
-    (make-ws-record conn (box leftover) (box #f) #f))
+    (make-ws-record conn (leftover->inbuf leftover) (box #f) #f))
 
   ;; client-side session (frames it sends are masked; incoming unmasked)
   (define (make-ws-client conn leftover)
-    (make-ws-record conn (box leftover) (box #f) #t))
+    (make-ws-record conn (leftover->inbuf leftover) (box #f) #t))
 
   (define (ws-send-frame! w op payload)
     (and (not (unbox (ws-closedbox w)))
@@ -218,24 +211,24 @@
   ;; process). -> a #(fin op payload end) frame, or a reason symbol:
   ;; 'protocol-error | 'message-too-large | 'close
   (define (next-frame! w)
-    (let loop ()
-      (let* ((buf (unbox (ws-bufbox w)))
-             ;; server expects masked frames; client expects unmasked
-             (r (decode-frame buf 0 (not (ws-client? w)))))
-        (cond
-          ((vector? r)
-           (set-box! (ws-bufbox w)
-                     (bv-sub buf (vector-ref r 3) (bytevector-length buf)))
-           r)
-          ((eq? r 'bad) 'protocol-error)
-          ((eq? r 'too-large) 'message-too-large)
-          (else
-           (receive
-             (`#(tcp-data ,bv)
-               (set-box! (ws-bufbox w) (bv-append (unbox (ws-bufbox w)) bv))
-               (loop))
-             (`#(tcp-eof) 'close)
-             (`#(tcp-error ,e) 'close)))))))
+    (let ((buf (ws-buf w)))
+      (let loop ()
+        ;; server expects masked frames; client expects unmasked
+        (let ((r (decode-frame (inbuf-bv buf) (inbuf-start buf) (inbuf-end buf)
+                               (not (ws-client? w)))))
+          (cond
+            ((vector? r)
+             ;; consuming the frame is an offset bump, not a copy of
+             ;; everything behind it (that was O(n^2) per burst)
+             (inbuf-consume! buf (fx- (vector-ref r 3) (inbuf-start buf)))
+             r)
+            ((eq? r 'bad) 'protocol-error)
+            ((eq? r 'too-large) 'message-too-large)
+            (else
+             (receive
+               (`#(tcp-data ,bv) (inbuf-append! buf bv) (loop))
+               (`#(tcp-eof) 'close)
+               (`#(tcp-error ,e) 'close))))))))
 
   ;; Strict UTF-8 validation (RFC 3629): rejects overlong encodings,
   ;; surrogates (ED A0..BF), and code points above U+10FFFF. Chez's

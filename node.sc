@@ -47,7 +47,8 @@
   (export node-start! node-connect! node-disconnect! node-self
           rsend rcall monitor-node demonitor-node node-peers
           monitor-remote demonitor-remote node-set-limits!)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sexpr)
+  (import (chezscheme) (igropyr buffer)
+          (igropyr actor) (igropyr libuv) (igropyr sexpr)
           (igropyr gen-server)
           (only (igropyr crypto) hmac-sha256 bytevector->hex))
 
@@ -177,23 +178,6 @@
 
   ;; ---- framing ----------------------------------------------------------
 
-  (define empty-bv (make-bytevector 0))
-
-  (define (bv-append a b)
-    (let ((la (bytevector-length a)) (lb (bytevector-length b)))
-      (cond
-        ((fx= la 0) b)
-        ((fx= lb 0) a)
-        (else (let ((r (make-bytevector (fx+ la lb))))
-                (bytevector-copy! a 0 r 0 la)
-                (bytevector-copy! b 0 r la lb)
-                r)))))
-
-  (define (bv-sub bv start end)
-    (let ((r (make-bytevector (fx- end start))))
-      (bytevector-copy! bv start r 0 (fx- end start))
-      r))
-
   ;; one frame: decimal length, newline, body. Serialized here, written
   ;; as one writev, so frames from different processes never interleave.
   (define (write-frame! c datum)
@@ -203,41 +187,49 @@
                                   "\n"))))
       (tcp-writev! c (list head body) #f)))
 
-  ;; Try to split one frame off buf. `limit` bounds the body length --
-  ;; handshake-max-frame during the handshake, max-frame once the link
-  ;; is authenticated.
-  ;; -> (values datum rest) | (values 'more #f) ; raises 'protocol on junk
+  ;; unique incomplete marker: a peer legitimately sending the DATUM
+  ;; `more` must not read as an incomplete frame (the old (eq? d 'more)
+  ;; contract had exactly that confusion)
+  (define incomplete (list 'more))
+
+  ;; Try to split one frame off the inbuf. `limit` bounds the body
+  ;; length -- handshake-max-frame during the handshake, max-frame once
+  ;; the link is authenticated. A complete frame is consumed from the
+  ;; buffer (an offset bump, not a copy of everything behind it).
+  ;; -> datum | incomplete ; raises 'protocol on junk
   (define (parse-frame buf limit)
-    (let ((n (bytevector-length buf)))
+    (let ((bv (inbuf-bv buf)) (base (inbuf-start buf)) (n (inbuf-length buf)))
       (let scan ((i 0) (len 0))
         (cond
           ((fx> i 8) (raise 'protocol))            ; length header too long
-          ((fx>= i n) (values 'more #f))
-          ((fx= (bytevector-u8-ref buf i) 10)      ; newline
+          ((fx>= i n) incomplete)
+          ((fx= (bytevector-u8-ref bv (fx+ base i)) 10)   ; newline
            (when (or (fx= i 0) (> len limit)) (raise 'protocol))
            (let ((total (fx+ i 1 len)))
              (if (< n total)
-                 (values 'more #f)
-                 (values (string->sexpr-extended
-                           (utf8->string (bv-sub buf (fx+ i 1) total)))
-                         (bv-sub buf total n)))))
+                 incomplete
+                 (let ((text (utf8->string (inbuf-sub buf (fx+ i 1) total))))
+                   (inbuf-consume! buf total)
+                   (string->sexpr-extended text)))))
           (else
-           (let ((b (bytevector-u8-ref buf i)))
+           (let ((b (bytevector-u8-ref bv (fx+ base i))))
              (unless (and (fx>= b 48) (fx<= b 57)) (raise 'protocol))
              (scan (fx+ i 1) (+ (* len 10) (fx- b 48)))))))))
 
   ;; Block (in the calling process) until one whole frame arrives.
-  ;; -> (values datum rest) ; raises 'closed / 'timeout / 'protocol /
+  ;; -> datum ; raises 'closed / 'timeout / 'protocol /
   ;; the sexpr-error vector on a malformed datum
   (define (read-frame c buf timeout limit)
-    (let-values (((d rest) (parse-frame buf limit)))
-      (if (eq? d 'more)
+    (let ((d (parse-frame buf limit)))
+      (if (eq? d incomplete)
           (receive (after timeout (raise 'timeout))
-            (`#(tcp-data ,bv) (read-frame c (bv-append buf bv) timeout limit))
+            (`#(tcp-data ,bv)
+              (inbuf-append! buf bv)
+              (read-frame c buf timeout limit))
             (`#(tcp-eof) (raise 'closed))
             (`#(tcp-error ,e) (raise 'closed))
             (`#(node-stop) (raise 'stop)))
-          (values d rest))))
+          d)))
 
   ;; ---- HMAC-SHA256 handshake proofs --------------------------------------
   ;; hmac-sha256 and bytevector->hex come from (igropyr crypto).
@@ -478,20 +470,21 @@
         mrefs entries)))
 
   (define (link-loop c peer buf last-seen)
-    (let drain ((buf buf))
-      (let-values (((d rest) (parse-frame buf max-frame)))
-        (if (eq? d 'more)
+    (let drain ()
+      (let ((d (parse-frame buf max-frame)))
+        (if (eq? d incomplete)
             (receive (after tick-ms
                         (if (> (- (now-ms) last-seen) dead-ms)
                             (raise 'closed)
                             (begin (write-frame! c '(ping))
                                    (link-loop c peer buf last-seen))))
               (`#(tcp-data ,bv)
-                (link-loop c peer (bv-append buf bv) (now-ms)))
+                (inbuf-append! buf bv)
+                (link-loop c peer buf (now-ms)))
               (`#(tcp-eof) (raise 'closed))
               (`#(tcp-error ,e) (raise 'closed))
               (`#(node-stop) (raise 'stop)))
-            (begin (dispatch! c peer d) (drain rest))))))
+            (begin (dispatch! c peer d) (drain))))))
 
   ;; run the link until it drops, then clean up; never raises
   (define (run-link c peer buf)
@@ -502,10 +495,11 @@
 
   (define (acceptor c)
     (guard (e (#t (tcp-close! c)))              ; failed handshake: just close
-      (let ((nonce (random-hex 16)))
+      (let ((nonce (random-hex 16))
+            (buf (make-inbuf)))
         (write-frame! c (list 'challenge nonce))
-        (let-values (((d buf) (read-frame c empty-bv handshake-timeout-ms
-                                          handshake-max-frame)))
+        (let ((d (read-frame c buf handshake-timeout-ms
+                             handshake-max-frame)))
           (unless (and (pair? d) (eq? (car d) 'hello)
                        (= (length d) 4)
                        (symbol? (cadr d))
@@ -531,23 +525,24 @@
           (guard (e ((eq? e 'stop) (tcp-close! c) (raise 'stop))
                     (#t (tcp-close! c)))
             (tcp-read-start! c)
-            (let-values (((d buf) (read-frame c empty-bv handshake-timeout-ms
-                                              handshake-max-frame)))
+            (let* ((buf (make-inbuf))
+                   (d (read-frame c buf handshake-timeout-ms
+                                  handshake-max-frame)))
               (unless (and (pair? d) (eq? (car d) 'challenge)
                            (= (length d) 2) (string? (cadr d)))
                 (raise 'auth))
               (let ((nonce-b (random-hex 16)))
                 (write-frame! c
                   (list 'hello self-name (proof (cadr d) self-name) nonce-b))
-                (let-values (((d2 buf2) (read-frame c buf handshake-timeout-ms
-                                                    handshake-max-frame)))
+                (let ((d2 (read-frame c buf handshake-timeout-ms
+                                      handshake-max-frame)))
                   (unless (and (pair? d2) (eq? (car d2) 'welcome)
                                (= (length d2) 3)
                                (eq? (cadr d2) peer)   ; it must BE who we dialed
                                (proof=? (caddr d2) (proof nonce-b peer)))
                     (raise 'auth))
                   (if (install-peer! peer c self-name)
-                      (run-link c peer buf2)
+                      (run-link c peer buf)
                       (tcp-close! c)))))))
         (`#(tcp-connect-failed ,e) (void))
         (`#(node-stop) (raise 'stop)))))

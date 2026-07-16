@@ -28,41 +28,14 @@
           ;; never conflicts.
           start-scheduler spawn send receive self
           sleep-ms kill register whereis process-id)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr websocket)
+  (import (chezscheme) (igropyr buffer)
+          (igropyr actor) (igropyr libuv) (igropyr websocket)
           (only (igropyr crypto) base64-encode))
 
   (define connect-timeout-ms 10000)
   (define default-port 80)
 
   (define (fail msg) (raise (vector 'ws-client-error msg)))
-
-  ;; ---- bytevector helpers ---------------------------------------------
-
-  (define empty-bv (make-bytevector 0))
-
-  (define (bv-append a b)
-    (let* ((la (bytevector-length a)) (lb (bytevector-length b))
-           (r (make-bytevector (+ la lb))))
-      (bytevector-copy! a 0 r 0 la)
-      (bytevector-copy! b 0 r la lb)
-      r))
-
-  (define (bv-sub bv start end)
-    (let ((r (make-bytevector (- end start))))
-      (bytevector-copy! bv start r 0 (- end start))
-      r))
-
-  (define (find-header-end bv)
-    (let ((n (bytevector-length bv)))
-      (let loop ((i 0))
-        (cond
-          ((> (+ i 3) (- n 1)) #f)
-          ((and (fx= (bytevector-u8-ref bv i) 13)
-                (fx= (bytevector-u8-ref bv (fx+ i 1)) 10)
-                (fx= (bytevector-u8-ref bv (fx+ i 2)) 13)
-                (fx= (bytevector-u8-ref bv (fx+ i 3)) 10))
-           i)
-          (else (loop (fx+ i 1)))))))
 
   ;; ---- URL parsing (ws://host[:port][/path]) --------------------------
 
@@ -118,8 +91,9 @@
         "\r\n")))
 
   ;; verify the 101 response: status 101 and a correct Accept header
-  (define (verify-response buf hend key)
-    (let* ((text (utf8->string (bv-sub buf 0 hend)))
+  ;; head-bv: the response's status line + headers, already extracted
+  (define (verify-response head-bv key)
+    (let* ((text (utf8->string head-bv))
            (lower (string-downcase text))
            (expected (string-downcase (ws-accept-key key))))
       (and (let ((sp (string-index text #\space 0)))
@@ -135,21 +109,24 @@
 
   (define max-handshake-header 16384)   ; cap on the 101 response headers
 
-  ;; read until the response headers are complete, then verify
+  ;; read until the response headers are complete (resumable scan --
+  ;; no rescans-from-zero as segments arrive), then verify
   (define (await-handshake c key buf)
-    (let ((hend (find-header-end buf)))
+    (let ((hend (inbuf-find-header-end buf)))
       (cond
         (hend
-         (if (verify-response buf (+ hend 2) key)
+         (if (verify-response (inbuf-sub buf 0 (fx+ hend 2)) key)
              ;; leftover bytes after \r\n\r\n belong to the ws stream
-             (make-ws-client c (bv-sub buf (+ hend 4) (bytevector-length buf)))
+             (make-ws-client c (inbuf-sub buf (fx+ hend 4) (inbuf-length buf)))
              (begin (tcp-close! c) (fail "handshake rejected"))))
-        ((> (bytevector-length buf) max-handshake-header)
+        ((> (inbuf-length buf) max-handshake-header)
          (tcp-close! c) (fail "handshake header too large"))
         (else
          (receive (after connect-timeout-ms
                      (tcp-close! c) (fail "handshake timeout"))
-           (`#(tcp-data ,bv) (await-handshake c key (bv-append buf bv)))
+           (`#(tcp-data ,bv)
+             (inbuf-append! buf bv)
+             (await-handshake c key buf))
            (`#(tcp-eof) (tcp-close! c) (fail "connection closed during handshake"))
            (`#(tcp-error ,e) (tcp-close! c) (fail "connection error")))))))
 
@@ -172,7 +149,7 @@
                 (tcp-read-start! c)
                 (let ((key (make-ws-key)))
                   (tcp-write! c (handshake-request host path key extra-headers) #f)
-                  (await-handshake c key empty-bv)))
+                  (await-handshake c key (make-inbuf))))
               (`#(tcp-connect-failed ,e) (fail (uv-strerror e)))))
           (`#(dns-failed ,e) (fail "dns resolution failed"))))))
 )
