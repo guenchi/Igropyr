@@ -15,23 +15,24 @@ This manual covers the architecture, design patterns, and implementation details
 9. [OTP Patterns](#otp-patterns)
 10. [Conversations](#conversations)
 11. [Middleware Suite](#middleware-suite)
-12. [Sessions](#sessions)
-13. [JSON Web Tokens (JWT)](#json-web-tokens-jwt)
-14. [Metrics](#metrics)
-15. [Outbound HTTP Client](#outbound-http-client)
-16. [Database Clients](#database-clients)
-17. [Async File Reads](#async-file-reads)
-18. [JSON and gzip](#json-and-gzip)
-19. [S-Expression RPC](#s-expression-rpc)
-20. [Distribution](#distribution)
+12. [Authentication](#authentication)
+13. [Sessions](#sessions)
+14. [JSON Web Tokens (JWT)](#json-web-tokens-jwt)
+15. [Metrics](#metrics)
+16. [Outbound HTTP Client](#outbound-http-client)
+17. [Database Clients](#database-clients)
+18. [Async File Reads](#async-file-reads)
+19. [JSON and gzip](#json-and-gzip)
+20. [S-Expression RPC](#s-expression-rpc)
+21. [Distribution](#distribution)
     - [Node links, rsend / rcall, monitors](#distribution)
     - [Automatic discovery (static, Redis)](#automatic-discovery)
     - [Distributed task pool](#distributed-task-pool)
-21. [Running and Building](#running-and-building)
-22. [Testing](#testing)
-23. [Development Contracts](#development-contracts)
-24. [Code Style](#code-style)
-25. [Common Pitfalls](#common-pitfalls)
+22. [Running and Building](#running-and-building)
+23. [Testing](#testing)
+24. [Development Contracts](#development-contracts)
+25. [Code Style](#code-style)
+26. [Common Pitfalls](#common-pitfalls)
 
 ---
 
@@ -685,7 +686,7 @@ A WebSocket route is registered with `app-ws` and runs in its own process per co
 
 #### API
 
-- `(app-ws app pattern (lambda (ws req) ...))` — register a WebSocket route with a session handler
+- `(app-ws app pattern (lambda (ws req) ...) [guard])` — register a WebSocket route with a session handler; the optional `guard` authenticates the upgrade (see below)
 - `(ws-recv ws)` → `#(text ,string) | #(binary ,bytevector) | #(close)` — block until a complete message arrives (handles fragmentation, ping/pong, UTF-8 validation)
 - `(ws-send-text! ws string)` → boolean — send a text message; #f if closed
 - `(ws-send-binary! ws bytevector)` → boolean — send binary data
@@ -719,13 +720,28 @@ Each WebSocket connection runs in its own spawned green process. When the handle
           ((close) (ws-close! ws)))))))
 ```
 
+#### Authenticating the Upgrade
+
+The upgrade request never runs the middleware chain, so `app-ws` takes an optional 4th argument — a guard `(lambda (req) claims-or-#f)` from `(igropyr auth)`, run **before** the 101 handshake. Truthy claims proceed and are stashed on the request (`(req-claims req)` inside the session); `#f` refuses the upgrade with a plain **HTTP 401** and no socket. An unknown route is still a **404**.
+
+```scheme
+(app-ws app "/chat" chat-session (token-guard (jwt-verifier key)))
+(app-ws app "/feed" feed-session (session-guard store))
+```
+
+See the [Authentication](#authentication) chapter for `token-guard` (Bearer header with a `?token=` query fallback for browsers) and `session-guard` (cookie session).
+
 ### WebSocket Client
 
 Connect to a remote WebSocket server with the same session object. Outbound frames are masked per RFC 6455 (client role); the server-side role is automatic.
 
 #### API
 
-- `(ws-connect "ws://host:port/path")` → ws session (blocks until handshake completes) or raises `#(ws-client-error ,message)`
+- `(ws-connect "ws://host:port/path" [extra-headers])` → ws session (blocks until handshake completes) or raises `#(ws-client-error ,message)`. The optional `extra-headers` is an alist of additional handshake headers — e.g. the credential for a guarded route:
+
+  ```scheme
+  (ws-connect url `(("Authorization" . ,(string-append "Bearer " tok))))
+  ```
 - `(ws-send-text! ws string)`, `(ws-send-binary! ws bv)`, `(ws-close! ws)` — same as server-side
 - `(ws-recv ws)` — same as server-side
 
@@ -1391,32 +1407,7 @@ When a handler raises an exception that the middleware chain doesn't catch, the 
 
 ### Auth
 
-Guard routes with a `Bearer` token. `auth` is **credential-format neutral**: it takes any verifier `(lambda (token) claims-or-#f)` — a good token yields a claims value, a bad one yields `#f`. The middleware itself knows nothing about JWTs; it plays the *authentication role*, and the token format is the verifier's business. Today that verifier is `(jwt-verifier key)` from `(igropyr jwt)`; tomorrow it could be an s-expression token verifier plugged into the same `auth`.
-
-```scheme
-(import (igropyr middleware) (igropyr jwt))
-
-;; verify every request against a JWT key
-(app-use app (auth (jwt-verifier key)))
-
-;; pass verification options through the verifier; make auth optional
-(app-use app (auth (jwt-verifier key '((leeway . 30)))
-                   '((optional . #t))))
-```
-
-Claims land on a request-local slot; read them in a handler with `(req-claims req)`:
-
-```scheme
-(app-get app "/me"
-  (lambda (req res)
-    (let ((claims (req-claims req)))         ; guaranteed present here
-      (send-json! res (list (cons 'sub (json-ref claims "sub")))))))
-```
-
-A missing or invalid token answers **401** with a `WWW-Authenticate: Bearer` header and a `{"error":"unauthorized"}` JSON body. Options:
-
-- `(optional . #t)` — let a request **without** a token through (`req-claims` stays `#f`); a present-but-invalid token still answers 401.
-- `(on-fail . (lambda (req res) ...))` — override the refusal. Handy for an s-expression RPC endpoint that would rather answer a sexpr body than JSON.
+Authentication lives in its own library, `(igropyr auth)`, because it spans both HTTP middleware and WebSocket upgrade guards — beyond this suite's request-decorator scope. See the [Authentication](#authentication) chapter.
 
 ### Request-Local Storage
 
@@ -1441,6 +1432,103 @@ Middleware can pass data to downstream handlers via `req-local` and `req-set-loc
           (send-json! res (list (cons 'name (car user))))
           (begin (set-status! res 403)
                  (send-text! res "Forbidden"))))))
+```
+
+---
+
+## Authentication
+
+Authentication lives in its own library, `(igropyr auth)`. It is the *authentication role* layer — credential-format neutral — and it spans **both channels**: HTTP routes (via middleware) and WebSocket routes (via an upgrade guard checked before the handshake). Token *formats* live elsewhere; `(igropyr jwt)` is one such format today.
+
+```scheme
+(import (igropyr auth) (igropyr jwt))
+```
+
+Both channels leave verified claims on a request-local slot, read the same way:
+
+- `(req-claims req)` → claims or `#f` — the claims left by `auth` or an `app-ws` guard.
+
+### HTTP Middleware
+
+`auth` guards HTTP routes. It takes any verifier `(lambda (token) claims-or-#f)` — a good token yields a claims value, a bad one yields `#f`. The middleware itself knows nothing about JWTs; the token format is the verifier's business. Today that verifier is `(jwt-verifier key)` from `(igropyr jwt)`; tomorrow it could be an s-expression token verifier plugged into the same `auth`.
+
+```scheme
+;; verify every request against a JWT key
+(app-use app (auth (jwt-verifier key)))
+
+;; pass verification options through the verifier; make auth optional
+(app-use app (auth (jwt-verifier key '((leeway . 30)))
+                   '((optional . #t))))
+```
+
+Claims land on a request-local slot; read them in a handler with `(req-claims req)`:
+
+```scheme
+(app-get app "/me"
+  (lambda (req res)
+    (let ((claims (req-claims req)))         ; guaranteed present here
+      (send-json! res (list (cons 'sub (json-ref claims "sub")))))))
+```
+
+A missing or invalid token answers **401** with a `WWW-Authenticate: Bearer` header and a `{"error":"unauthorized"}` JSON body. Options:
+
+- `(optional . #t)` — let a request **without** a token through (`req-claims` stays `#f`); a present-but-invalid token still answers 401.
+- `(on-fail . (lambda (req res) ...))` — override the refusal. Handy for an s-expression RPC endpoint that would rather answer a sexpr body than JSON.
+
+### WebSocket Upgrade Guards
+
+A WebSocket upgrade request never runs the middleware chain — it is intercepted before the worker pool. So `app-ws` takes the guard **directly**, as an optional 4th argument:
+
+```scheme
+(app-ws app "/chat" chat-session (token-guard (jwt-verifier key)))
+(app-ws app "/feed" feed-session (session-guard store))
+```
+
+A guard is `(lambda (req) claims-or-#f)`, run by the resolver **before** the 101 handshake:
+
+- truthy claims → stashed on the request (read via `(req-claims req)` inside the session) and the upgrade proceeds;
+- `#f` → the upgrade is refused with a plain **HTTP 401**, no handshake — an unauthenticated peer never gets a socket.
+
+An unknown route is still a **404**; only a *matched* route with a refusing guard answers 401. `(igropyr auth)` exports two guards.
+
+#### `(token-guard verify [options])`
+
+Lifts a token verifier into a request guard. It reads `Authorization: Bearer` first, then falls back to a `?token=` query parameter — because the browser WebSocket API cannot set request headers.
+
+```scheme
+(app-ws app "/chat" chat-session (token-guard (jwt-verifier key)))
+
+;; rename the query parameter, or disable the fallback entirely
+(app-ws app "/chat" chat-session (token-guard verify '((query . "access_token"))))
+(app-ws app "/chat" chat-session (token-guard verify '((query . #f))))
+```
+
+- `(query . "name")` — rename the fallback parameter (default `"token"`).
+- `(query . #f)` — disable the query fallback for header-capable clients.
+
+> **Caveat:** query-string tokens can end up in proxy and access logs. Prefer the `Authorization` header wherever the client can set one, and keep query-string tokens short-lived.
+
+#### `(session-guard store [options])`
+
+A request guard on the cookie session: the `sid` cookie must name a live session in the store, and that session's `data` alist becomes the claims.
+
+```scheme
+(app-ws app "/feed" feed-session (session-guard store))
+
+;; match a session-middleware configured with a custom cookie name
+(app-ws app "/feed" feed-session (session-guard store '((cookie . "session"))))
+```
+
+- `(cookie . "name")` — match a `session-middleware` using a custom cookie name (default `"sid"` on both sides).
+
+The claims are a **read-only snapshot** taken at upgrade time. A long-lived WebSocket session does not see later mutations of that session (nor does it persist anything back).
+
+### Authenticating an Outbound Client
+
+For a guarded route, a non-browser client passes the credential as a handshake header via `ws-connect`'s optional extra-headers alist (see [WebSocket Client](#websocket)):
+
+```scheme
+(ws-connect url `(("Authorization" . ,(string-append "Bearer " tok))))
 ```
 
 ---
@@ -1470,6 +1558,7 @@ At boot, create a session store and register the middleware:
 - `(session-get session key)` → value or #f — read a key from the session
 - `(session-set! session key value)` → void — write a key to the session
 - `(session-clear! session)` → void — clear all data and send a Set-Cookie with empty value
+- `(session-peek store sid)` → data alist or `#f` — read-only store lookup by sid: the `data` alist of a live session, or `#f`. Unlike `req-session`, it touches no request and persists nothing; it is the channel `(igropyr auth)`'s `session-guard` uses to authenticate a WebSocket upgrade, where the middleware never runs.
 
 ### Implementation Details
 
@@ -1592,12 +1681,12 @@ accepts symbols.
 ### Guarding Routes
 
 To protect routes with JWTs, hand a `jwt-verifier` to the `auth`
-middleware from [`(igropyr middleware)`](#auth). `auth` reads the `Bearer`
+middleware from [`(igropyr auth)`](#authentication). `auth` reads the `Bearer`
 token from the `Authorization` header, runs the verifier, and puts the
 claims on a request-local slot for `req-claims`:
 
 ```scheme
-(import (igropyr middleware) (igropyr jwt))
+(import (igropyr auth) (igropyr jwt))
 
 (app-use app (auth (jwt-verifier key)))
 
@@ -1615,9 +1704,10 @@ Verification options ride along inside the verifier; `auth`'s own options
                    '((optional . #t))))
 ```
 
-See the [`auth`](#auth) section for the full refusal behavior. Because the
-verifier is just a procedure, the same route guard works for any future
-token format — JWT is only today's credential.
+See the [Authentication](#authentication) chapter for the full refusal
+behavior — and for guarding WebSocket upgrades with the same verifier via
+`token-guard`. Because the verifier is just a procedure, the same route
+guard works for any future token format — JWT is only today's credential.
 
 ### Not Implemented
 
