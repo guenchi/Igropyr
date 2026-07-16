@@ -602,10 +602,19 @@
           (else (loop (fx+ i 1) start acc))))))
 
   ;; match pattern segments against path segments; alist of params or #f
+  ;; ":name" captures one segment; a trailing "*" (Express splat) captures all
+  ;; remaining segments joined with "/" under the param name "0".
   (define (match-segments psegs segs)
     (let loop ((ps psegs) (ss segs) (params '()))
       (cond
         ((and (null? ps) (null? ss)) params)
+        ((and (pair? ps) (string=? (car ps) "*"))
+         (cons (cons "0"
+                     (let join ((l ss) (acc ""))
+                       (cond ((null? l) acc)
+                             ((string=? acc "") (join (cdr l) (car l)))
+                             (else (join (cdr l) (string-append acc "/" (car l)))))))
+               params))
         ((or (null? ps) (null? ss)) #f)
         ((and (> (string-length (car ps)) 0)
               (char=? (string-ref (car ps) 0) #\:))
