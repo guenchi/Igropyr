@@ -29,6 +29,10 @@
 (library (igropyr http)
   (export http-listen http-swap! http-set-ws!
           http-stats http-shutdown!
+          ;; record predicates, exported for boundary contracts
+          ;; ((igropyr checked) in the framework layers) and any
+          ;; user code that wants to type-test req/res values
+          request? res?
           req-method req-path req-query req-headers req-header req-body
           req-keep-alive? req-params req-params-set!
           req-local req-set-local!

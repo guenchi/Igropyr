@@ -24,9 +24,10 @@
           ws-send-sexpr! ws-recv-sexpr sse-send-sexpr!
           send-text! send-html! send-json! send-file!
           sse-start! sse-send! make-fault-handler)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+  (import (chezscheme) (igropyr checked)
+          (igropyr actor) (igropyr libuv) (igropyr http)
           (igropyr json) (igropyr gzip) (igropyr sexpr)
-          (only (igropyr websocket) ws-recv ws-send-text!))
+          (only (igropyr websocket) ws-recv ws-send-text! ws?))
 
   ;; ---- string helpers -----------------------------------------------------
 
@@ -85,19 +86,25 @@
   ;;   (app-get app "/" (lambda (req res) (send-html! res home)))
   (define (as-utf8 s) (if (string? s) (string->utf8 s) s))
 
-  (define (send-text! r s) (finish! r "text/plain; charset=utf-8" (as-utf8 s)))
-  (define (send-html! r s) (finish! r "text/html; charset=utf-8" (as-utf8 s)))
+  ;; body data accepted by every encoder: a string, or a bytevector
+  ;; taken as the body already encoded
+  (define (body-data? x) (or (string? x) (bytevector? x)))
+
+  (define-checked (send-text! (r res?) (s body-data?))
+    (finish! r "text/plain; charset=utf-8" (as-utf8 s)))
+  (define-checked (send-html! (r res?) (s body-data?))
+    (finish! r "text/html; charset=utf-8" (as-utf8 s)))
   ;; serialization comes from (igropyr json): alist -> object,
   ;; vector or list -> array, 'null -> null. A bytevector is passed
   ;; through as pre-serialized JSON (define it once at startup).
-  (define (send-json! r obj)
+  (define-checked (send-json! (r res?) obj)
     (finish! r "application/json; charset=utf-8"
              (if (bytevector? obj)
                  obj
                  (string->utf8 (json->string obj)))))
 
   ;; parse a JSON request body; #f when the body is not valid JSON
-  (define (req-json req)
+  (define-checked (req-json (req request?))
     (guard (e (#t #f))
       (string->json (utf8->string (req-body req)))))
 
@@ -107,14 +114,14 @@
   ;; tag, never evaluate.
 
   ;; parse an s-expression body; #f when invalid (or over 1 MiB)
-  (define (req-sexpr req)
+  (define-checked (req-sexpr (req request?))
     (guard (e (#t #f))
       (let ((body (req-body req)))
         (and (<= (bytevector-length body) (* 1024 1024))
              (string->sexpr-extended (utf8->string body))))))
 
   ;; a bytevector is passed through as a pre-serialized datum
-  (define (send-sexpr! r x)
+  (define-checked (send-sexpr! (r res?) x)
     (finish! r "application/sexpr; charset=utf-8"
              (if (bytevector? x)
                  x
@@ -138,7 +145,7 @@
               (else (lp (+ i 1)))))))
 
   ;; value of a cookie sent by the client, or #f
-  (define (req-cookie req name)
+  (define-checked (req-cookie (req request?) (name string?))
     (let ((h (req-header req 'cookie)))
       (and h
            (let lp ((parts (string-split h #\;)))
@@ -276,7 +283,7 @@
   ;; Parse a form body. urlencoded -> alist of strings; multipart ->
   ;; alist where text fields are strings and uploads are
   ;; #(file ,filename ,content-type ,bytevector). '() otherwise.
-  (define (req-form req)
+  (define-checked (req-form (req request?))
     (let ((ct (or (req-header req 'content-type) "")))
       (cond
         ((and (>= (string-length ct) 33)
@@ -294,13 +301,13 @@
   ;;   (sse-start! res)
   ;;   (spawn (lambda () ... (sse-send! res data) ... (res-end! res)))
 
-  (define (sse-start! res)
+  (define-checked (sse-start! (res res?))
     (set-header! res "Content-Type" "text/event-stream")
     (set-header! res "Cache-Control" "no-cache")
     (res-begin! res))
 
   ;; returns #f when the client is gone -- stop the producer loop then
-  (define (sse-send! res data)
+  (define-checked (sse-send! (res res?) (data string?))
     (res-write! res (string-append "data: " data "\n\n")))
 
   ;; ---- pool failure hook template -----------------------------------------------
@@ -498,7 +505,7 @@
   ;; Public helper: send a file (cached read; no conditional request
   ;; since there is no req here). Path traversal is rejected. Files
   ;; over the cache cap are streamed with backpressure, not buffered.
-  (define (send-file! r path)
+  (define-checked (send-file! (r res?) (path string?))
     (if (path-has-dotdot? path)
         (begin (set-status! r 403) (send-text! r "Forbidden"))
         (let ((e (static-entry path)))
@@ -611,21 +618,22 @@
         (else #f))))
 
   ;; router params are stored in the core request's layer-owned slot
-  (define (req-param req name)
+  (define-checked (req-param (req request?) (name string?))
     (let ((p (assoc name (req-params req))))
       (and p (cdr p))))
 
   ;; ---- app ------------------------------------------------------------------------
 
-  (define-record-type (app make-app-record app?)
-    (fields
-      (mutable routes app-routes app-routes-set!)       ; list of #(method segs handler)
-      (mutable middlewares app-middlewares app-middlewares-set!)
-      ;; the middleware list composed into one callable, rebuilt by
-      ;; app-use -- so a request pays no fold/list walk
-      (mutable mw-chain app-mw-chain app-mw-chain-set!)
-      (mutable statics app-statics app-statics-set!)    ; list of (prefix . root)
-      (mutable ws-routes app-ws-routes app-ws-routes-set!))) ; list of (segs . session)
+  ;; routes: list of #(method segs handler); mw-chain: the middleware
+  ;; list composed into one callable, rebuilt by app-use -- so a request
+  ;; pays no fold/list walk; statics: list of (prefix . root);
+  ;; ws-routes: list of (segs . session)
+  (define-checked-record app
+    (mutable routes list?)
+    (mutable middlewares list?)
+    (mutable mw-chain procedure?)
+    (mutable statics list?)
+    (mutable ws-routes list?))
 
   ;; chain shape: (lambda (req r tail) ...); tail runs the router
   (define empty-chain (lambda (req r tail) (tail)))
@@ -637,7 +645,7 @@
       empty-chain
       mws))
 
-  (define (create-app) (make-app-record '() '() empty-chain '() '()))
+  (define-checked (create-app) (make-app '() '() empty-chain '() '()))
 
   ;; Registering a route that already exists (same method + pattern)
   ;; REPLACES it -- this is what makes hot reloading work: re-evaluating
@@ -652,10 +660,14 @@
                   (app-routes a))
           (list (vector method segs handler))))))
 
-  (define (app-get a pattern handler) (add-route! a 'GET pattern handler))
-  (define (app-post a pattern handler) (add-route! a 'POST pattern handler))
-  (define (app-put a pattern handler) (add-route! a 'PUT pattern handler))
-  (define (app-delete a pattern handler) (add-route! a 'DELETE pattern handler))
+  (define-checked (app-get (a app?) (pattern string?) (handler procedure?))
+    (add-route! a 'GET pattern handler))
+  (define-checked (app-post (a app?) (pattern string?) (handler procedure?))
+    (add-route! a 'POST pattern handler))
+  (define-checked (app-put (a app?) (pattern string?) (handler procedure?))
+    (add-route! a 'PUT pattern handler))
+  (define-checked (app-delete (a app?) (pattern string?) (handler procedure?))
+    (add-route! a 'DELETE pattern handler))
 
   ;; RPC endpoint sugar: requests are (tag arg ...); the tag picks a
   ;; handler from the alist, which receives the argument list and
@@ -664,7 +676,7 @@
   ;;   (app-rpc app "/rpc"
   ;;     `((get-user . ,(lambda (args) ...))
   ;;       (add      . ,(lambda (args) (apply + args)))))
-  (define (app-rpc app path handlers)
+  (define-checked (app-rpc (app app?) (path string?) (handlers list?))
     (app-post app path
       (lambda (req res)
         (let ((msg (req-sexpr req)))
@@ -681,11 +693,11 @@
   ;; a message is one datum: write to send, safe-parse on receive --
   ;; the natural framing for pushed data.
 
-  (define (ws-send-sexpr! ws x)
+  (define-checked (ws-send-sexpr! (ws ws?) x)
     (ws-send-text! ws (sexpr->string-extended x)))
 
   ;; -> datum | 'close (connection over) | #f (binary or bad datum)
-  (define (ws-recv-sexpr ws)
+  (define-checked (ws-recv-sexpr (ws ws?))
     (let ((m (ws-recv ws)))
       (cond
         ((and (vector? m) (eq? (vector-ref m 0) 'text))
@@ -696,7 +708,7 @@
   ;; one event, data = one datum. A literal newline inside a string
   ;; datum splits into multiple data: lines; EventSource rejoins them
   ;; with \n on the client, so the datum survives intact.
-  (define (sse-send-sexpr! res x)
+  (define-checked (sse-send-sexpr! (res res?) x)
     (let* ((text (sexpr->string-extended x))
            (lines (string-split text #\newline)))
       (res-write! res
@@ -708,11 +720,14 @@
   ;; middleware: (lambda (req res next) ...); call (next) to continue.
   ;; The composed chain is rebuilt here, at registration time, so
   ;; mutation stays live while requests just call the prebuilt chain.
-  (define (app-use a mw)
+  (define-checked (app-use (a app?) (mw procedure?))
     (app-middlewares-set! a (append (app-middlewares a) (list mw)))
     (app-mw-chain-set! a (compose-chain (app-middlewares a))))
 
-  (define (app-static a prefix root)
+  ;; prefix/root get always-on semantic validation below (they shape
+  ;; what the filesystem is asked for) -- that is business code, not a
+  ;; dev-only contract, so only the app argument is contracted here
+  (define-checked (app-static (a app?) prefix root)
     (unless (and (string? prefix) (> (string-length prefix) 0)
                  (char=? (string-ref prefix 0) #\/))
       (assertion-violation 'app-static
@@ -732,7 +747,7 @@
 
   ;; websocket route: session is (lambda (ws req) ...), run in the
   ;; connection's own process; :param segments work as in app-get
-  (define (app-ws a pattern session)
+  (define-checked (app-ws (a app?) (pattern string?) (session procedure?))
     (let ((segs (split-segments pattern)))
       (app-ws-routes-set! a
         (append
@@ -826,14 +841,18 @@
   ;; expects: middlewares wrap the router, first-registered outermost.
   ;; The chain was composed when the middleware was registered; a request
   ;; only reads the chain slot (so app-use stays live) and runs it.
-  (define (app->handler a)
+  (define-checked (app->handler (a app?))
     (lambda (req r)
       ((app-mw-chain a) req r (lambda () (route-dispatch a req r)))))
 
   ;; Returns the http-server, so callers can http-swap! the whole
   ;; handler later. Route/middleware mutations on the app are live
   ;; anyway (app->handler reads the app on every request).
+  ;; Rest args, so plain define ((igropyr checked) is fixed-arity only).
+  ;; The contracts line is the mixed-build canary: it reports the level
+  ;; baked into THIS module at compile time (see checked.sc).
   (define (app-listen a port . opts)
+    (printf "igropyr contracts: ~a\n" (contract-level))
     (let ((srv (apply http-listen port (app->handler a) opts)))
       (http-set-ws! srv (ws-resolver a))
       srv))

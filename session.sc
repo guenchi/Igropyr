@@ -19,7 +19,8 @@
 (library (igropyr session)
   (export make-session-store session-middleware
           req-session session-get session-set! session-clear!)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr gen-server)
+  (import (chezscheme) (igropyr checked)
+          (igropyr actor) (igropyr libuv) (igropyr gen-server)
           (igropyr http) (igropyr express))
 
   (define default-ttl-ms (* 30 60 1000))    ; 30 minutes
@@ -86,35 +87,34 @@
 
   ;; ---- session object (lives on the request) --------------------------
 
-  ;; sid, mutable data alist, mutable dirty? flag
-  (define-record-type (session make-session session?)
-    (fields
-      (immutable sid session-sid)
-      (mutable data session-data session-data-set!)
-      (mutable dirty session-dirty? session-dirty-set!)
-      (mutable new? session-new? session-new-set!)))
+  ;; sid, mutable data alist, mutable dirty?/new? flags
+  (define-checked-record session
+    (sid string?)
+    (mutable data list?)
+    (mutable dirty? boolean?)
+    (mutable new? boolean?))
 
-  (define (session-get s key)
+  (define-checked (session-get (s session?) (key symbol?))
     (let ((p (assq key (session-data s)))) (and p (cdr p))))
 
-  (define (session-set! s key val)
+  (define-checked (session-set! (s session?) (key symbol?) val)
     (let ((p (assq key (session-data s))))
       (if p (set-cdr! p val)
           (session-data-set! s (cons (cons key val) (session-data s)))))
-    (session-dirty-set! s #t))
+    (session-dirty?-set! s #t))
 
-  (define (session-clear! s)
+  (define-checked (session-clear! (s session?))
     (session-data-set! s '())
-    (session-dirty-set! s #t))
+    (session-dirty?-set! s #t))
 
   ;; handler-facing accessor
-  (define (req-session req) (req-local req 'session))
+  (define-checked (req-session (req request?)) (req-local req 'session))
 
   ;; ---- middleware ------------------------------------------------------
 
   (define cookie-name "sid")
 
-  (define (session-middleware store)
+  (define-checked (session-middleware (store vector?))
     (lambda (req res next)
       (let* ((sid (req-cookie req cookie-name))
              (data (and sid (gen-server-call (store-pid store)
