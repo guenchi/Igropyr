@@ -102,7 +102,7 @@
       (call-with-port (open-file-input-port "/dev/urandom")
         (lambda (p) (get-bytevector-n p 16)))))
 
-  (define (handshake-request host path key)
+  (define (handshake-request host path key extra-headers)
     (string->utf8
       (string-append
         "GET " path " HTTP/1.1\r\n"
@@ -110,7 +110,12 @@
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Key: " key "\r\n"
-        "Sec-WebSocket-Version: 13\r\n\r\n")))
+        "Sec-WebSocket-Version: 13\r\n"
+        (apply string-append
+               (map (lambda (h)
+                      (string-append (car h) ": " (cdr h) "\r\n"))
+                    extra-headers))
+        "\r\n")))
 
   ;; verify the 101 response: status 101 and a correct Accept header
   (define (verify-response buf hend key)
@@ -151,19 +156,23 @@
   ;; ---- public API ------------------------------------------------------
 
   ;; Connect to a ws:// URL and complete the handshake; returns a ws
-  ;; session. Runs in the caller's process.
-  (define (ws-connect url)
-    (let-values (((host port path) (parse-ws-url url)))
-      (dns-resolve! host self)
-      (receive (after connect-timeout-ms (fail "dns timeout"))
-        (`#(dns-resolved ,ip)
-          (tcp-connect! ip port self)
-          (receive (after connect-timeout-ms (fail "connect timeout"))
-            (`#(tcp-connected ,c)
-              (tcp-read-start! c)
-              (let ((key (make-ws-key)))
-                (tcp-write! c (handshake-request host path key) #f)
-                (await-handshake c key empty-bv)))
-            (`#(tcp-connect-failed ,e) (fail (uv-strerror e)))))
-        (`#(dns-failed ,e) (fail "dns resolution failed")))))
+  ;; session. Runs in the caller's process. Optional rest argument: an
+  ;; alist of extra handshake headers, e.g. the credential for a
+  ;; guarded route ((igropyr auth)):
+  ;;   (ws-connect url `(("Authorization" . ,(string-append "Bearer " tok))))
+  (define (ws-connect url . rest)
+    (let ((extra-headers (if (pair? rest) (car rest) '())))
+      (let-values (((host port path) (parse-ws-url url)))
+        (dns-resolve! host self)
+        (receive (after connect-timeout-ms (fail "dns timeout"))
+          (`#(dns-resolved ,ip)
+            (tcp-connect! ip port self)
+            (receive (after connect-timeout-ms (fail "connect timeout"))
+              (`#(tcp-connected ,c)
+                (tcp-read-start! c)
+                (let ((key (make-ws-key)))
+                  (tcp-write! c (handshake-request host path key extra-headers) #f)
+                  (await-handshake c key empty-bv)))
+              (`#(tcp-connect-failed ,e) (fail (uv-strerror e)))))
+          (`#(dns-failed ,e) (fail "dns resolution failed"))))))
 )

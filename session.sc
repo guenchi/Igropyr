@@ -18,7 +18,8 @@
 
 (library (igropyr session)
   (export make-session-store session-middleware
-          req-session session-get session-set! session-clear!)
+          req-session session-get session-set! session-clear!
+          session-peek)
   (import (chezscheme) (igropyr checked)
           (igropyr actor) (igropyr libuv) (igropyr gen-server)
           (igropyr http) (igropyr express))
@@ -84,6 +85,13 @@
 
   (define (store-pid store) (vector-ref store 0))
   (define (store-ttl store) (vector-ref store 1))
+
+  ;; Read-only store lookup: the data alist of a live session, or #f.
+  ;; This is (igropyr auth)'s session-guard channel for authenticating
+  ;; WebSocket upgrades, where the middleware never runs -- a snapshot,
+  ;; not a live session object, and nothing is persisted back.
+  (define-checked (session-peek (store vector?) (sid string?))
+    (gen-server-call (store-pid store) (vector 'get sid)))
 
   ;; ---- session object (lives on the request) --------------------------
 

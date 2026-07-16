@@ -827,9 +827,18 @@
                                          (vector-ref parsed 2)
                                          '() headers empty-bv #f '()))
                       (session (resolver req)))
-                 (if session
-                     (run-ws-session c acc hend wskey req session)
-                     (quick-response! c 404 "Not Found"))))
+                 (cond
+                   ((procedure? session)
+                    (run-ws-session c acc hend wskey req session))
+                   ;; #(ws-reject status text): an auth guard refused the
+                   ;; upgrade -- answered before any handshake, so an
+                   ;; unauthenticated peer never gets a socket
+                   ((and (vector? session)
+                         (fx= (vector-length session) 3)
+                         (eq? (vector-ref session 0) 'ws-reject))
+                    (quick-response! c (vector-ref session 1)
+                                     (vector-ref session 2)))
+                   (else (quick-response! c 404 "Not Found")))))
               ((eq? te 'chunked)
                (collect-chunked c srv acc parsed (+ hend 4)))
               (else

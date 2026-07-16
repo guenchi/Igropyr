@@ -627,7 +627,7 @@
   ;; routes: list of #(method segs handler); mw-chain: the middleware
   ;; list composed into one callable, rebuilt by app-use -- so a request
   ;; pays no fold/list walk; statics: list of (prefix . root);
-  ;; ws-routes: list of (segs . session)
+  ;; ws-routes: list of #(segs session guard-or-#f)
   (define-checked-record app
     (mutable routes list?)
     (mutable middlewares list?)
@@ -746,16 +746,27 @@
       (app-statics-set! a (append (app-statics a) (list (cons p root))))))
 
   ;; websocket route: session is (lambda (ws req) ...), run in the
-  ;; connection's own process; :param segments work as in app-get
-  (define-checked (app-ws (a app?) (pattern string?) (session procedure?))
-    (let ((segs (split-segments pattern)))
+  ;; connection's own process; :param segments work as in app-get.
+  ;; Optional 4th argument: an auth guard (lambda (req) claims-or-#f),
+  ;; run by the resolver BEFORE the 101 handshake -- truthy claims are
+  ;; stashed on the request (read via (igropyr auth)'s req-claims) and
+  ;; the upgrade proceeds; #f answers 401 with no handshake. Rest arg,
+  ;; so plain define ((igropyr checked) is fixed-arity only).
+  (define (app-ws a pattern session . rest)
+    (let ((segs (split-segments pattern))
+          (guard (and (pair? rest) (car rest))))
+      (when guard
+        (unless (procedure? guard)
+          (assertion-violation 'app-ws "guard must be a procedure" guard)))
       (app-ws-routes-set! a
         (append
-          (filter (lambda (r) (not (equal? (car r) segs)))
+          (filter (lambda (r) (not (equal? (vector-ref r 0) segs)))
                   (app-ws-routes a))
-          (list (cons segs session))))))
+          (list (vector segs session guard))))))
 
-  ;; resolver handed to the core: request -> session procedure or #f
+  ;; resolver handed to the core: request -> session procedure,
+  ;; #f (no route: 404), or #(ws-reject status text) (guard refused:
+  ;; answered before any handshake)
   (define (ws-resolver a)
     (lambda (req)
       (let ((segs (split-segments (req-path req))))
@@ -763,9 +774,19 @@
           (cond
             ((null? rs) #f)
             (else
-             (let ((params (match-segments (caar rs) segs)))
+             (let* ((r (car rs))
+                    (params (match-segments (vector-ref r 0) segs)))
                (if params
-                   (begin (req-params-set! req params) (cdar rs))
+                   (begin
+                     (req-params-set! req params)
+                     (let ((guard (vector-ref r 2)))
+                       (if guard
+                           (let ((claims (guard req)))
+                             (if claims
+                                 (begin (req-set-local! req 'claims claims)
+                                        (vector-ref r 1))
+                                 '#(ws-reject 401 "Unauthorized")))
+                           (vector-ref r 1))))
                    (loop (cdr rs))))))))))
 
   ;; The request path relative to a mount prefix, or #f if it does not

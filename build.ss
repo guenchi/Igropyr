@@ -38,6 +38,7 @@
     ("igropyr/dpool.sc" . 2)
     ("igropyr/express.sc" . 2)
     ("igropyr/session.sc" . 2)
+    ("igropyr/auth.sc" . 2)
     ("igropyr/middleware.sc" . 2)
     ("igropyr/jwt.sc" . 2)
     ("igropyr/metrics.sc" . 2)

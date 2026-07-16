@@ -17,7 +17,7 @@
   '("igropyr/checked.sc" "igropyr/platform.sc" "igropyr/libuv.sc" "igropyr/actor.sc" "igropyr/json.sc"
     "igropyr/gzip.sc" "igropyr/sexpr.sc" "igropyr/otp.sc" "igropyr/websocket.sc" "igropyr/ws-client.sc"
     "igropyr/gen-server.sc" "igropyr/conversation.sc" "igropyr/http.sc" "igropyr/pubsub.sc"
-    "igropyr/express.sc" "igropyr/session.sc" "igropyr/middleware.sc" "igropyr/jwt.sc" "igropyr/metrics.sc" "igropyr/client.sc"
+    "igropyr/express.sc" "igropyr/session.sc" "igropyr/auth.sc" "igropyr/middleware.sc" "igropyr/jwt.sc" "igropyr/metrics.sc" "igropyr/client.sc"
     "igropyr/redis.sc" "igropyr/mysql.sc"))
 
 (parameterize ((optimize-level 2)

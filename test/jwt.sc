@@ -4,7 +4,7 @@
 ;;; parsing, and the express middleware end to end over real HTTP.
 
 (import (chezscheme) (igropyr http) (igropyr express) (igropyr jwt)
-        (igropyr middleware) (igropyr json) (igropyr crypto) (igropyr libuv))
+        (igropyr auth) (igropyr json) (igropyr crypto) (igropyr libuv))
 
 (define port 18086)
 (define empty-bv (make-bytevector 0))
