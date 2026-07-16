@@ -676,18 +676,45 @@
   ;;   (app-rpc app "/rpc"
   ;;     `((get-user . ,(lambda (args) ...))
   ;;       (add      . ,(lambda (args) (apply + args)))))
-  (define-checked (app-rpc (app app?) (path string?) (handlers list?))
-    (app-post app path
-      (lambda (req res)
-        (let ((msg (req-sexpr req)))
-          (if (and (pair? msg) (symbol? (car msg)))
-              (let ((h (assq (car msg) handlers)))
-                (if h
-                    (send-sexpr! res
-                      (guard (e (#t (list 'error 'handler-failed)))
-                        (list 'ok ((cdr h) (cdr msg)))))
-                    (send-sexpr! res (list 'error 'unknown-tag (car msg)))))
-              (send-sexpr! res (list 'error 'bad-payload)))))))
+  ;;
+  ;; Optional 4th argument: an auth guard (lambda (req) claims-or-#f),
+  ;; the same request-guard protocol app-ws takes ((igropyr auth)'s
+  ;; token-guard works for both). A refusal answers 401 with the sexpr
+  ;; datum (error unauthorized) -- this is a sexpr channel, not JSON.
+  ;; Claims land on the request's layer-owned slot (req-claims). A
+  ;; handler that can take TWO arguments is called with (args req), so
+  ;; it can read claims/params for per-tag authorization; one-argument
+  ;; handlers work as before. Rest args, so plain define.
+  ;;   (app-rpc app "/rpc"
+  ;;     `((whoami . ,(lambda (args req) (json-ref (req-claims req) "sub"))))
+  ;;     (token-guard (jwt-verifier key)))
+  (define (app-rpc app path handlers . rest)
+    (let ((auth-guard (and (pair? rest) (car rest))))
+      (when auth-guard
+        (unless (procedure? auth-guard)
+          (assertion-violation 'app-rpc "guard must be a procedure" auth-guard)))
+      (app-post app path
+        (lambda (req res)
+          (let ((claims (if auth-guard (auth-guard req) #t)))
+            (cond
+              ((not claims)
+               (set-status! res 401)
+               (send-sexpr! res '(error unauthorized)))
+              (else
+               (when auth-guard (req-set-local! req 'claims claims))
+               (let ((msg (req-sexpr req)))
+                 (if (and (pair? msg) (symbol? (car msg)))
+                     (let ((h (assq (car msg) handlers)))
+                       (if h
+                           (send-sexpr! res
+                             (guard (e (#t (list 'error 'handler-failed)))
+                               (let ((proc (cdr h)))
+                                 (list 'ok
+                                   (if (logbit? 2 (procedure-arity-mask proc))
+                                       (proc (cdr msg) req)
+                                       (proc (cdr msg)))))))
+                           (send-sexpr! res (list 'error 'unknown-tag (car msg)))))
+                     (send-sexpr! res (list 'error 'bad-payload)))))))))))
 
   ;; ---- s-expressions over WebSocket and SSE ---------------------------------
   ;; a message is one datum: write to send, safe-parse on receive --

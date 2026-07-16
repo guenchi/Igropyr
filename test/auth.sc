@@ -7,7 +7,7 @@
 
 (import (chezscheme) (igropyr http) (igropyr express) (igropyr session)
         (igropyr auth) (igropyr jwt) (igropyr ws-client)
-        (igropyr json) (igropyr libuv))
+        (igropyr json) (igropyr sexpr) (igropyr libuv))
 
 (define port 18088)
 (define empty-bv (make-bytevector 0))
@@ -125,7 +125,30 @@
     (ws-recv ws))
   (session-guard store))
 
+;; token-guarded sexpr RPC: refusal is sexpr data; two-argument
+;; handlers see the request (claims), one-argument ones work as before
+(app-rpc app "/rpc"
+  `((whoami . ,(lambda (args req) (json-ref (req-claims req) "sub")))
+    (add    . ,(lambda (args) (apply + args))))
+  (token-guard (jwt-verifier key)))
+
 (define good-tok (jwt-sign '(("sub" . "42")) key '((expires-in . 300))))
+
+;; sexpr RPC over raw HTTP; returns (status . reply-datum)
+(define (rpc-post datum . headers)
+  (let* ((body (sexpr->string datum))
+         (resp (http-req
+                 (string-append
+                   "POST /rpc HTTP/1.1\r\nHost: x\r\nContent-Length: "
+                   (number->string (string-length body))
+                   "\r\n"
+                   (apply string-append
+                          (map (lambda (h) (string-append h "\r\n")) headers))
+                   "Connection: close\r\n\r\n" body)))
+         (bend (find-substr resp "\r\n\r\n")))
+    (unless bend (fail "rpc-post" resp))
+    (cons (status-of resp)
+          (string->sexpr (substring resp (+ bend 4) (string-length resp))))))
 
 (start-scheduler
   (lambda ()
@@ -180,6 +203,20 @@
                 "401"))
       (check "ws-session-missing-401"
         (equal? (status-of (upgrade-req "/feed")) "401")))
+
+    ;; guarded sexpr RPC: refusal is 401 + sexpr data, not JSON
+    (check "rpc-no-token"
+      (equal? (rpc-post '(add 1 2)) '("401" . (error unauthorized))))
+    (check "rpc-bad-token"
+      (equal? (rpc-post '(add 1 2) "Authorization: Bearer bad.bad.bad")
+              '("401" . (error unauthorized))))
+    (let ((auth-h (string-append "Authorization: Bearer " good-tok)))
+      ;; one-argument handler unchanged under a guard
+      (check "rpc-one-arg-handler"
+        (equal? (rpc-post '(add 1 2 39) auth-h) '("200" . (ok 42))))
+      ;; two-argument handler reads the claims off the request
+      (check "rpc-claims-in-handler"
+        (equal? (rpc-post '(whoami) auth-h) '("200" . (ok "42")))))
 
     (if (zero? failures)
         (begin (display "auth: all tests passed") (newline) (exit 0))
