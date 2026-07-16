@@ -1389,6 +1389,35 @@ Catch unhandled exceptions and respond with a nice error page:
 
 When a handler raises an exception that the middleware chain doesn't catch, the error handler responds with HTTP 500 and a JSON error body. If `show-details` is true, includes the exception message (useful for development).
 
+### Auth
+
+Guard routes with a `Bearer` token. `auth` is **credential-format neutral**: it takes any verifier `(lambda (token) claims-or-#f)` — a good token yields a claims value, a bad one yields `#f`. The middleware itself knows nothing about JWTs; it plays the *authentication role*, and the token format is the verifier's business. Today that verifier is `(jwt-verifier key)` from `(igropyr jwt)`; tomorrow it could be an s-expression token verifier plugged into the same `auth`.
+
+```scheme
+(import (igropyr middleware) (igropyr jwt))
+
+;; verify every request against a JWT key
+(app-use app (auth (jwt-verifier key)))
+
+;; pass verification options through the verifier; make auth optional
+(app-use app (auth (jwt-verifier key '((leeway . 30)))
+                   '((optional . #t))))
+```
+
+Claims land on a request-local slot; read them in a handler with `(req-claims req)`:
+
+```scheme
+(app-get app "/me"
+  (lambda (req res)
+    (let ((claims (req-claims req)))         ; guaranteed present here
+      (send-json! res (list (cons 'sub (json-ref claims "sub")))))))
+```
+
+A missing or invalid token answers **401** with a `WWW-Authenticate: Bearer` header and a `{"error":"unauthorized"}` JSON body. Options:
+
+- `(optional . #t)` — let a request **without** a token through (`req-claims` stays `#f`); a present-but-invalid token still answers 401.
+- `(on-fail . (lambda (req res) ...))` — override the refusal. Handy for an s-expression RPC endpoint that would rather answer a sexpr body than JSON.
+
 ### Request-Local Storage
 
 Middleware can pass data to downstream handlers via `req-local` and `req-set-local!`:
@@ -1485,6 +1514,14 @@ compact serialization (`header.payload.signature`). It is a stateless
 alternative to cookie sessions: the claims travel in the token, so no
 server-side store is needed.
 
+This library is the **credential format** layer only (the J is JSON). The
+HTTP-side guard is the format-neutral `auth` middleware from
+[`(igropyr middleware)`](#middleware-suite) — the *role* layer, which
+protects s-expression RPC endpoints just as well as JSON ones.
+`jwt-verifier` bridges the two: it packages a key (plus verification
+options) into the `(lambda (token) claims-or-#f)` verifier that `auth`
+expects.
+
 A token is **external input**, so everything in this library is
 always-on business code — none of it is gated on `IGROPYR_CONTRACTS`. The
 contracts on the exported procedures only guard your own callers' argument
@@ -1520,8 +1557,10 @@ These are deliberate and non-configurable:
   (list/vector) of strings.
 - `(jwt-decode token)` → `(header . claims)` or `#f`. Parses **without
   verifying** — logging and debugging only, never authorization.
-- `(jwt-middleware key [options])` → middleware (see below).
-- `(req-jwt req)` → the verified claims alist, or `#f`.
+- `(jwt-verifier key [options])` → a `(lambda (token) claims-or-#f)`
+  verifier for the `auth` middleware (see below). `options` are the same
+  `leeway`/`iss`/`aud` alist that `jwt-verify` takes. A bad key type is
+  rejected once, at boot, not per request.
 
 The `key` is a string (taken as UTF-8) or a bytevector. Use **at least 32
 random bytes**; the `/dev/urandom` pattern in `(igropyr session)`'s sid
@@ -1550,30 +1589,35 @@ accepts symbols.
       'invalid))
 ```
 
-### Middleware
+### Guarding Routes
 
-`jwt-middleware` reads a `Bearer` token from the `Authorization` header,
-verifies it, and puts the claims on a request-local slot for `req-jwt`. A
-missing or invalid token answers **401** with a `WWW-Authenticate: Bearer`
-header and a `{"error":"unauthorized"}` body. `options` are passed through
-to `jwt-verify` (`leeway`/`iss`/`aud`); a bad key type is rejected once at
-boot, not per request.
+To protect routes with JWTs, hand a `jwt-verifier` to the `auth`
+middleware from [`(igropyr middleware)`](#auth). `auth` reads the `Bearer`
+token from the `Authorization` header, runs the verifier, and puts the
+claims on a request-local slot for `req-claims`:
 
 ```scheme
-(app-use app (jwt-middleware key))
+(import (igropyr middleware) (igropyr jwt))
+
+(app-use app (auth (jwt-verifier key)))
 
 (app-get app "/me"
   (lambda (req res)
-    (let ((claims (req-jwt req)))          ; guaranteed present here
+    (let ((claims (req-claims req)))        ; guaranteed present here
       (send-json! res (list (cons 'sub (json-ref claims "sub")))))))
 ```
 
-With `(optional . #t)`, a request **without** a token is let through
-(`req-jwt` stays `#f`), but a present-but-invalid token still answers 401:
+Verification options ride along inside the verifier; `auth`'s own options
+(such as `(optional . #t)` and `(on-fail . proc)`) come after it:
 
 ```scheme
-(app-use app (jwt-middleware key '((optional . #t))))
+(app-use app (auth (jwt-verifier key '((leeway . 30)))
+                   '((optional . #t))))
 ```
+
+See the [`auth`](#auth) section for the full refusal behavior. Because the
+verifier is just a procedure, the same route guard works for any future
+token format — JWT is only today's credential.
 
 ### Not Implemented
 
