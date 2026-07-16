@@ -1,4 +1,6 @@
-;; The node-to-igropyr agent page, in Scheme. Static (web html) SXML.
+;; The Igropyr agents page, in Scheme. Static (web html) SXML. Two AI
+;; coding agents: igropyr-dev (build on Igropyr) and node-to-igropyr
+;; (port an existing Node/Express app).
 (import (rnrs) (web html) (chrome))
 
 ;; one mapping-table row: left cell (Node/Express), right cell (Igropyr)
@@ -10,36 +12,74 @@
    (nav)
    `(header
       (div (@ (class "wrap"))
-        (div (@ (class "lam")
-                (style "display:flex;align-items:center;justify-content:center;gap:18px"))
-          (img (@ (src "nodejs-icon.svg") (alt "Node.js") (width "46") (height "46")))
-          (span (@ (style "color:var(--dim);font-weight:300")) "→")
-          (span "λ"))
-        (h1 "node-to-igropyr")
-        (p (@ (class "tag")) "Hand it a Node.js route, a middleware, or a whole "
-           "small Express app — get back the " (b "Igropyr port") ".")
-        (p (@ (class "sub")) "An AI coding agent · re-architecture, not transliteration")
+        (div (@ (class "lam")) "λ")
+        (h1 "Agents for Igropyr")
+        (p (@ (class "tag")) "Two AI coding agents — one to " (b "build") " new "
+           "services in Igropyr's actor model, one to " (b "port") " an existing "
+           "Node/Express app.")
+        (p (@ (class "sub")) "Self-contained Markdown · verified against Igropyr 1.1.7 source")
         (div (@ (class "cta"))
-          (a (@ (class "btn primary") (href "agent/node-to-igropyr.md")) "Get the agent")
-          (a (@ (class "btn ghost") (href "index.html")) "Back to Igropyr"))))
+          (a (@ (class "btn primary") (href "#dev")) "Build on Igropyr")
+          (a (@ (class "btn ghost") (href "#port")) "Port from Node"))))
 
-   `(section (@ (id "what"))
+   ;; ---- agent 1: igropyr-dev ----
+   `(section (@ (id "dev"))
       (div (@ (class "wrap"))
-        (div (@ (class "kicker")) "What it does")
-        (h2 "Re-architecture, not transliteration")
-        (p (@ (class "lead")) "Node's single-threaded event loop with Promises, "
-           (code "async/await") " and defensive " (code "try/catch") " becomes "
-           "Igropyr's Erlang-style actor model with " (code "spawn") "/" (code "send")
-           "/" (code "receive") ", a supervised worker pool, and Let It Crash. The "
-           "agent produces Scheme a maintainer of the repo would have written — not "
-           "JavaScript wearing parentheses.")
+        (div (@ (class "kicker")) "Build on Igropyr")
+        (h2 "igropyr-dev — the development agent")
+        (p (@ (class "lead")) "Hand it a spec, a single endpoint, or the framework "
+           "itself. " (code "igropyr-dev") " writes idiomatic Chez Scheme on Igropyr — "
+           "direct blocking style, let-it-crash error handling, and a verified v1.1.7 "
+           "API it reads from source before writing a line.")
+        (div (@ (class "cards"))
+          (div (@ (class "card"))
+            (div (@ (class "ic")) "≡")
+            (h3 "Direct blocking style")
+            (p "No async/await, no callbacks. " (code "mysql-query") ", "
+               (code "http-get") " and " (code "receive") " park only the calling "
+               "green process — Node's " (code "await") " chains flatten into "
+               "ordinary sequential lines."))
+          (div (@ (class "card"))
+            (div (@ (class "ic")) "✓")
+            (h3 "Verified API, never guessed")
+            (p "Rule zero: it greps the " (code ".sc") " source headers before "
+               "writing. A module map of every v1.1.7 export stops it from "
+               "hallucinating procedure names — when in doubt, the source wins."))
+          (div (@ (class "card"))
+            (div (@ (class "ic")) "◆")
+            (h3 "Records first, contracts at the edges")
+            (p (code "define-checked-record") " for structured data, "
+               (code "define-checked") " at module boundaries — the type discipline "
+               "that replaces TS interfaces, and that knows never to break a tail "
+               "call.")))
+        (div (@ (class "cta") (style "justify-content:flex-start;margin-top:38px"))
+          (a (@ (class "btn primary") (href "agent/igropyr-dev.md") (download #t))
+             "Download igropyr-dev.md")
+          (a (@ (class "btn ghost") (href "agent/igropyr-dev.md")) "View raw"))
+        (p (@ (class "backlink")) "Covers the actor model, the whole module map, "
+           "records & contracts, the build/test incantation (" (code ".sc")
+           " extension mapping and all), and every gotcha — one Markdown file you "
+           "drop into " (code "~/.claude/agents/") ".")))
+
+   ;; ---- agent 2: node-to-igropyr ----
+   `(section (@ (id "port"))
+      (div (@ (class "wrap"))
+        (div (@ (class "kicker")) "Port from Node")
+        (h2 "node-to-igropyr — the porting agent")
+        (p (@ (class "lead")) "Hand it a Node.js route, a middleware, or a whole small "
+           "Express app — get back the " (b "Igropyr port") ". Node's single-threaded "
+           "event loop with Promises, " (code "async/await") " and defensive "
+           (code "try/catch") " becomes Igropyr's actor model with " (code "spawn")
+           "/" (code "send") "/" (code "receive") ", a supervised worker pool, and Let "
+           "It Crash — Scheme a maintainer would have written, not JavaScript wearing "
+           "parentheses.")
         (div (@ (class "cards"))
           (div (@ (class "card"))
             (div (@ (class "ic")) "⟶")
             (h3 "async/await → straight-line")
             (p "The scheduler yields for you. I/O calls already block only the "
-               "calling process, so promise chains flatten into ordinary "
-               "sequential code — no promise type invented."))
+               "calling process, so promise chains flatten into ordinary sequential "
+               "code — no promise type invented."))
           (div (@ (class "card"))
             (div (@ (class "ic")) "✦")
             (h3 "try/catch → Let It Crash")
@@ -51,14 +91,7 @@
             (h3 "shared state → gen-server")
             (p "A module-level " (code "Map") " shared across requests becomes a "
                "process (gen-server), because workers never share mutable state "
-               "except through a process.")))))
-
-   `(section (@ (id "mapping"))
-      (div (@ (class "wrap"))
-        (div (@ (class "kicker")) "The mapping")
-        (h2 "How Node constructs land in Igropyr")
-        (p (@ (class "lead")) "A selection from the agent's conversion table. It "
-           "reads the real library source before writing, since the API evolves.")
+               "except through a process.")))
         (table (@ (class "maptable"))
           (thead (tr (th "Node.js / Express") (th "Igropyr")))
           (tbody
@@ -89,17 +122,8 @@
            ,(row '("stateful singleton")
                  '("a " (code "gen-server") " (" (code "(igropyr gen-server)") ")"))
            ,(row '((code "JSON.parse") " / " (code "stringify"))
-                 '((code "(string->json s)") " / " (code "(json->string v)")))))))
-
-   `(section (@ (id "use"))
-      (div (@ (class "wrap"))
-        (div (@ (class "kicker")) "Get it")
-        (h2 "The agent, in one file")
-        (p (@ (class "lead")) "It is a single Markdown agent definition — house "
-           "rules, the full conversion table, the invariants, the workflow, and "
-           "the current public API surface. Feed it to any AI coding agent as its "
-           "instructions and point it at the Node code to port.")
-        (div (@ (class "cta") (style "justify-content:flex-start"))
+                 '((code "(string->json s)") " / " (code "(json->string v)")))))
+        (div (@ (class "cta") (style "justify-content:flex-start;margin-top:38px"))
           (a (@ (class "btn primary") (href "agent/node-to-igropyr.md") (download #t))
              "Download node-to-igropyr.md")
           (a (@ (class "btn ghost") (href "agent/node-to-igropyr.md")) "View raw"))
@@ -111,12 +135,14 @@
    (foot (list `(a (@ (href "index.html")) "Igropyr")
                `(a (@ (href "manual.html")) "Manual")
                `(a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub"))
-         "node-to-igropyr — an AI agent for porting Node.js/Express to Igropyr.")))
+         "Two AI agents for Igropyr — build new services in the actor model, "
+         "or port an existing Node/Express app.")))
 
 (write-file "agent.html"
   (render-page
-   "node-to-igropyr — an AI agent that ports Node.js to Igropyr"
-   (string-append "node-to-igropyr: an AI coding agent that re-architects "
-                  "Node.js/Express services into Igropyr's actor model — "
-                  "async/await to straight-line, try/catch to Let It Crash.")
+   "Agents for Igropyr — AI coding agents that build and port"
+   (string-append "Two AI coding agents for Igropyr: igropyr-dev writes idiomatic "
+                  "Chez Scheme on the actor framework, and node-to-igropyr "
+                  "re-architects Node.js/Express services into it — both verified "
+                  "against Igropyr 1.1.7 source.")
    body))
