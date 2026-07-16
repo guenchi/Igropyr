@@ -22,6 +22,11 @@
     ("igropyr/actor.sc" . 2)
     ("igropyr/json.sc" . 2)
     ("igropyr/gzip.sc" . 2)
+    ;; sexpr must be compiled too: a source-only library gets a fresh
+    ;; UID per process, which invalidates every dependent .so ("reloading
+    ;; because a dependency has changed") -- node/express/dpool would be
+    ;; silently re-expanded from source on every start
+    ("igropyr/sexpr.sc" . 2)
     ("igropyr/otp.sc" . 2)
     ("igropyr/websocket.sc" . 2)
     ("igropyr/ws-client.sc" . 2)
