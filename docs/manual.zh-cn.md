@@ -11,17 +11,19 @@
 5. [容错](#容错)
 6. [OTP 模式](#otp-模式)
 7. [对话](#对话)
-8. [出站 HTTP 客户端](#出站-http-客户端)
-9. [数据库客户端](#数据库客户端)
-10. [S 表达式 RPC](#s-表达式-rpc)
-11. [分布式](#分布式)
+8. [JSON Web Token (JWT)](#json-web-token-jwt)
+9. [出站 HTTP 客户端](#出站-http-客户端)
+10. [数据库客户端](#数据库客户端)
+11. [S 表达式 RPC](#s-表达式-rpc)
+12. [分布式](#分布式)
     - [节点链路、rsend / rcall、监视](#分布式)
     - [自动发现（静态、Redis）](#自动发现)
     - [分布式任务池](#分布式任务池)
-12. [运行和构建](#运行和构建)
-13. [测试](#测试)
-14. [代码风格](#代码风格)
-15. [常见陷阱](#常见陷阱)
+13. [运行和构建](#运行和构建)
+14. [测试](#测试)
+15. [开发期契约](#开发期契约)
+16. [代码风格](#代码风格)
+17. [常见陷阱](#常见陷阱)
 
 ---
 
@@ -448,6 +450,7 @@ route 中的 pattern `:name` 会捕获一个 path segment。用 `(req-param req 
 - `(req-header req 'name)` → string 或 #f
 - `(req-body req)` → bytevector（已解码，chunked encoding 已 decompressed）
 - `(req-keep-alive? req)` → boolean（HTTP/1.1 默认 keep-alive）
+- `(request? x)` → boolean —— `x` 是否为 request 对象？（由 `(igropyr http)` 导出，可用于你自己的契约）
 
 #### Request Body Parsing
 
@@ -468,6 +471,7 @@ route 中的 pattern `:name` 会捕获一个 path segment。用 `(req-param req 
 - `(set-status! res code)` → 设置 HTTP status（默认 200）
 - `(set-header! res "Name" "value")` → 添加 / 替换 response header
 - `(set-cookie! res "name" "value" "Path=/" "HttpOnly")` → 添加 Set-Cookie header
+- `(res? x)` → boolean —— `x` 是否为 response 对象？（由 `(igropyr http)` 与 `request?` 一并导出）
 
 每个 encoder 也接受 **bytevector**，视为已编码好的响应体。对于内容不变的
 响应，应当在**启动时用 `define` 编码一次**，而不是每个请求重复编码同一个
@@ -621,6 +625,17 @@ Middleware 会按添加顺序调用，并位于匹配 route handler 之前。
 - `max-retries`：crash 时最大 task retry 次数（默认 3，因此总共执行 4 次）
 - `stuck-ms`：判断 worker stuck 的时间阈值（默认 30000 = 30s）
 - `check-ms`：检查 stuck worker 的 ticker 间隔（默认 5000 = 5s）
+
+启动时，`app-listen` 会打印一行，标明构建时烘焙进去的契约级别：
+
+```
+igropyr contracts: off
+```
+
+它取 `full` 或 `off` —— 即编译时 `(contract-level)` 的值（见
+[开发期契约](#开发期契约)）。把它当作构建金丝雀：生产进程应打印 `off`，
+若这里出现 `full`，说明某个 debug `.so` 混进了部署。混合构建下各 library
+若不一致，这行只反映入口点自身编译时的级别。
 
 ### 直接使用 HTTP Core
 
@@ -1045,6 +1060,101 @@ API：`(conversation-start! flow req [ttl-ms])` 生成 flow 进程，返回
 局部状态，`after` 就是它的 TTL）、严格顺序的协议对话。**不用在哪**——
 普通无状态请求（应保持归零 + 客户端带状态重试）；以及任何持有行锁等待
 **人**思考的步骤：人的停顿用应用级预留跨越，活事务只跨机器节奏的轮次。
+
+---
+
+## JSON Web Token (JWT)
+
+`(igropyr jwt)` 使用 HS256 JWS 紧凑序列化（`header.payload.signature`）
+签发和验证 JSON Web Token。它是 cookie session 的无状态替代：claims 随
+token 一起传递，无需服务端存储。
+
+token 是**外部输入**，因此本库的一切都是常开业务代码——不受
+`IGROPYR_CONTRACTS` 门控。导出过程上的契约只保护你自己调用方的参数类型。
+
+### 安全决策
+
+以下决策刻意固定、不可配置：
+
+- **算法钉死。** token 要么以 HS256 验证通过，要么完全不通过。header 的
+  `alg` 必须字面为 `"HS256"`；`"none"` 及其他一切都被拒绝，因此算法混淆
+  降级不可表达。
+- **签名恒定时间比较**（无提前退出），逐字节的计时预言无法伪造签名。
+- **base64url 解码严格**——任何 url 字母表以外的字符都会拒绝该 token
+  （fail closed，不静默跳过）。
+- **`exp`/`nbf` 出现时必须为数**；畸形的时间 claim 会拒绝 token，而不是
+  跳过检查。
+- **每次验证失败都返回同一个 `#f`**——不给攻击者可探测的原因预言。
+
+### API
+
+- `(jwt-sign claims key [options])` → token 字符串。`claims` 是键为
+  symbol 或 string 的 alist。`options` 是 alist；`(expires-in . N)` 会在
+  调用方未提供时盖上 `iat = now` 与 `exp = now + N` 秒。其余注册 claim
+  由调用方负责。
+- `(jwt-verify token key [options])` → claims alist（键为 **string**）或
+  `#f`。`options` 可带 `(leeway . 秒)`、`(iss . string)`、`(aud . string)`。
+  `aud` claim 匹配一个 string，或 string 的数组（list/vector）。
+- `(jwt-decode token)` → `(header . claims)` 或 `#f`。**不验证**地解析
+  ——仅用于日志和调试，绝不用于授权。
+- `(jwt-middleware key [options])` → middleware（见下）。
+- `(req-jwt req)` → 已验证的 claims alist，或 `#f`。
+
+`key` 是 string（按 UTF-8 处理）或 bytevector。请使用**至少 32 个随机
+字节**；`(igropyr session)` 的 sid 生成器所用的 `/dev/urandom` 模式是个
+好来源。验证后的 claims 键为 string（`(igropyr json)` 的 object 约定），
+用 `json-ref` 读取，它也接受 symbol。
+
+### 签发与验证
+
+```scheme
+(import (igropyr jwt) (igropyr json))
+
+;; 32 个随机字节，例如启动时从 /dev/urandom 读取；务必保密
+(define key
+  (call-with-port (open-file-input-port "/dev/urandom")
+    (lambda (p) (get-bytevector-n p 32))))
+
+(define token
+  (jwt-sign '(("sub" . "42") ("role" . "admin")) key
+            '((expires-in . 3600))))       ; 盖上 iat/exp，有效期一小时
+
+(let ((claims (jwt-verify token key '((leeway . 30)
+                                      (iss . "api.example.com")))))
+  (if claims
+      (json-ref claims "role")             ; -> "admin"
+      'invalid))
+```
+
+### Middleware
+
+`jwt-middleware` 从 `Authorization` header 读取 `Bearer` token，验证它，
+把 claims 放到 request-local 槽供 `req-jwt` 取用。缺失或无效的 token 以
+**401** 响应，带 `WWW-Authenticate: Bearer` header 和
+`{"error":"unauthorized"}` body。`options`（`leeway`/`iss`/`aud`）会透传
+给 `jwt-verify`；错误的 key 类型在启动时被拒绝一次，而非每请求。
+
+```scheme
+(app-use app (jwt-middleware key))
+
+(app-get app "/me"
+  (lambda (req res)
+    (let ((claims (req-jwt req)))          ; 此处 claims 必然存在
+      (send-json! res (list (cons 'sub (json-ref claims "sub")))))))
+```
+
+带 `(optional . #t)` 时，**没有** token 的请求被放行（`req-jwt` 仍为
+`#f`），但存在但无效的 token 仍以 401 响应：
+
+```scheme
+(app-use app (jwt-middleware key '((optional . #t))))
+```
+
+### 尚未实现
+
+RS256/ES256（`(igropyr crypto)` 无 RSA/EC）、HS384/HS512（无
+SHA-384/512）、JWE、多签名 JWS JSON 序列化均不在范围内。新增算法意味着
+sign 与 verify 需同步扩展，且 verifier 必须始终钉死在一个显式列表上。
 
 ---
 
@@ -1633,6 +1743,12 @@ export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm
 
 Igropyr 对所有 source file 使用 `.sc` 扩展名。library search 会找到 `igropyr/libuv.sc`、`igropyr/actor.sc` 等。
 
+另有一个可选变量控制开发期契约：
+
+- **IGROPYR_CONTRACTS**：由 `(igropyr checked)` 在**编译期**读取。未设置
+  或 `off`（生产默认）把契约编译为空；`full` 注入契约；其他任何值都是
+  编译期报错。改动后须做**干净重建**。见[开发期契约](#开发期契约)。
+
 ### 目录大小写
 
 在大小写敏感文件系统（Linux）上，目录名必须精确匹配 library 名。Igropyr 的 library 是小写 `igropyr.*`，因此目录必须命名为 `igropyr`，不能是 `Igropyr`。
@@ -1796,6 +1912,91 @@ wrk -t 4 -c 500 -d 30s http://localhost:8080/
 ```bash
 watch -n 1 'curl -s localhost:8080/stats | jq'
 ```
+
+---
+
+## 开发期契约
+
+`(igropyr checked)` 提供开发期契约宏，用于**内部不变量**——你自己代码里
+的 bug，在模块边界处捕获。默认情况下它们被编译掉：`IGROPYR_CONTRACTS`
+未设置（或 `off`）时，`define-checked` 退化为普通 `define`，
+`define-checked-record` 退化为普通 `define-record-type`，**零残留、对本库
+零运行时依赖**。
+
+> **绝不要为任何生产硬需求依赖本库。** 契约默认 OFF，因此它们检查的一切
+> 在生产中都可能不运行。外部输入的校验——请求的取值范围、长度、路径、
+> 权限——是常开的普通业务代码，绝不能放进契约。
+
+> **绝不要在尾递归或循环过程上加返回值契约（`-> pred`）。** 返回检查必须
+> 捕获返回值，这在结构上破坏尾调用：循环会随深度增长内存。**参数契约是
+> TCO 安全的**——它们只在进入时运行一次，从不触碰返回路径。
+
+### 各类检查归属何处
+
+| 种类 | 归属 |
+| --- | --- |
+| 外部输入，语义（范围 / 长度 / 路径 / 权限） | 普通代码——你的职责，常开 |
+| 外部输入，形状（json/form/wire → 值） | 普通代码，或手写 `parse-x` |
+| 内部不变量（我们自己的 bug） | `define-checked` / `define-checked-record` |
+| 最后手段 | Chez safe primitive + let-it-crash |
+
+### API
+
+```scheme
+(import (igropyr checked))
+
+;; 仅参数契约（TCO 安全）：
+(define-checked (find-route (table route-table?) (path string?))
+  (let loop ((segs (split path)))   ; 内部 named let：不检查、免费
+    ...))
+
+;; 带返回值契约（绝不用在循环上）：
+(define-checked (canonical-host (h string?)) -> string?
+  (string-downcase h))
+```
+
+- `(define-checked (name (arg pred) ...) body ...)`——每个 `pred` 是一个
+  单参谓词表达式；优先用**具名**谓词（`route-table?`）而非内联 lambda，
+  因为 blame 会打印谓词的源文本。允许无谓词的裸参数，此时不检查。仅固定
+  arity：无 optional/rest 参数，无 `case-lambda`。
+- `(define-checked (name (arg pred) ...) -> ret-pred body ...)`——增加一个
+  单值返回契约。返回多值的过程可用参数契约，但不能用 `->`。
+- `(define-checked-record name (field pred) (mutable field pred) ...)`——
+  展开为 `define-record-type`，命名照常（`make-name`、`name?`、
+  `name-field`、`name-field-set!`）。构造器和 setter 检查契约；谓词和
+  accessor 是裸 record 的，因此**读取免费**。只生成 `make-name`（无
+  `parse-x`、parent、protocol、nongenerative——需要这些的 record 用普通
+  写法）。
+- `(contract-level)`——展开为在展开点烘焙的字面量 `'full` 或 `'off`。
+  `app-listen` 在启动时打印它；在测试套件顶部断言它。
+
+违规会 raise `&assertion`，指明过程、参数 / 字段和期望的谓词，并以违规值
+作为 irritant：
+
+```
+Exception in find-route: argument 'path' violated contract string?
+  with irritant 42
+```
+
+### 开关
+
+`IGROPYR_CONTRACTS` 在**每个编译进程中于展开期读取一次**——不是运行时：
+
+- 未设置或 `off` → **off**（生产默认，零残留）
+- `full` → 注入检查
+- 其他任何值 → **展开期报错**，因此拼错的值永远不会静默关闭检查
+
+级别在每个 `.so` 编译时被烘焙进该 `.so`。**改动 flag 后必须做 CLEAN
+rebuild**——否则各 library 会不一致，且只有 `app-listen` 的启动行会告诉
+你入口点是按什么编译的。
+
+### 内建库中的边界契约
+
+`(igropyr express)`（以及 `(igropyr session)`、`(igropyr jwt)`）的导出
+过程在 debug 构建下带参数契约。传错类型——例如该传 request 对象却传了
+string——会得到 blame，指明过程、参数、期望的谓词，以及你实际传入的值。
+生产构建（`IGROPYR_CONTRACTS` 未设置）把这一切编译掉，因此请求路径上
+**零开销**。
 
 ---
 

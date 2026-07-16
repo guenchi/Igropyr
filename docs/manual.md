@@ -16,20 +16,22 @@ This manual covers the architecture, design patterns, and implementation details
 10. [Conversations](#conversations)
 11. [Middleware Suite](#middleware-suite)
 12. [Sessions](#sessions)
-13. [Metrics](#metrics)
-14. [Outbound HTTP Client](#outbound-http-client)
-15. [Database Clients](#database-clients)
-16. [Async File Reads](#async-file-reads)
-17. [JSON and gzip](#json-and-gzip)
-18. [S-Expression RPC](#s-expression-rpc)
-19. [Distribution](#distribution)
+13. [JSON Web Tokens (JWT)](#json-web-tokens-jwt)
+14. [Metrics](#metrics)
+15. [Outbound HTTP Client](#outbound-http-client)
+16. [Database Clients](#database-clients)
+17. [Async File Reads](#async-file-reads)
+18. [JSON and gzip](#json-and-gzip)
+19. [S-Expression RPC](#s-expression-rpc)
+20. [Distribution](#distribution)
     - [Node links, rsend / rcall, monitors](#distribution)
     - [Automatic discovery (static, Redis)](#automatic-discovery)
     - [Distributed task pool](#distributed-task-pool)
-20. [Running and Building](#running-and-building)
-21. [Testing](#testing)
-22. [Code Style](#code-style)
-23. [Common Pitfalls](#common-pitfalls)
+21. [Running and Building](#running-and-building)
+22. [Testing](#testing)
+23. [Development Contracts](#development-contracts)
+24. [Code Style](#code-style)
+25. [Common Pitfalls](#common-pitfalls)
 
 ---
 
@@ -456,6 +458,7 @@ The pattern `:name` in a route captures a path segment. Extract with `(req-param
 - `(req-header req 'name)` → string or #f
 - `(req-body req)` → bytevector (decoded, with chunked encoding decompressed)
 - `(req-keep-alive? req)` → boolean (HTTP/1.1 default keep-alive)
+- `(request? x)` → boolean — is `x` a request object? (exported by `(igropyr http)`; useful in your own contracts)
 
 #### Request Body Parsing
 
@@ -476,6 +479,7 @@ The pattern `:name` in a route captures a path segment. Extract with `(req-param
 - `(set-status! res code)` → set HTTP status (default 200)
 - `(set-header! res "Name" "value")` → add/replace a response header
 - `(set-cookie! res "name" "value" "Path=/" "HttpOnly")` → add Set-Cookie header
+- `(res? x)` → boolean — is `x` a response object? (exported by `(igropyr http)`, alongside `request?`)
 
 Every encoder also accepts a **bytevector**, taken as the already-encoded
 body. When a response never changes, encode it **once at startup with
@@ -624,6 +628,20 @@ Configuration options:
 - `max-retries`: Maximum task retries on crash (default 3, so 4 executions total)
 - `stuck-ms`: Time threshold to consider a worker stuck (default 30000 = 30s)
 - `check-ms`: Ticker interval to check for stuck workers (default 5000 = 5s)
+
+On startup, `app-listen` prints one line naming the contract level baked
+into the build:
+
+```
+igropyr contracts: off
+```
+
+It reads `full` or `off` — the value of `(contract-level)` at compile
+time (see [Development Contracts](#development-contracts)). Treat it as a
+build canary: a production process should log `off`, and seeing `full`
+there means a debug `.so` slipped into the deployment. If a mixed build
+disagrees between libraries, this line reports only what the entry point
+was compiled with.
 
 ### Using the HTTP Core Directly
 
@@ -1457,6 +1475,112 @@ If the same client makes two concurrent requests with the same session ID, both 
             (begin (set-status! res 403)
                    (send-text! res "Not logged in")))))))
 ```
+
+---
+
+## JSON Web Tokens (JWT)
+
+`(igropyr jwt)` signs and verifies JSON Web Tokens using the HS256 JWS
+compact serialization (`header.payload.signature`). It is a stateless
+alternative to cookie sessions: the claims travel in the token, so no
+server-side store is needed.
+
+A token is **external input**, so everything in this library is
+always-on business code — none of it is gated on `IGROPYR_CONTRACTS`. The
+contracts on the exported procedures only guard your own callers' argument
+types.
+
+### Security Decisions
+
+These are deliberate and non-configurable:
+
+- **The algorithm is pinned.** A token verifies as HS256 or not at all.
+  The header's `alg` must literally be `"HS256"`; `"none"` and everything
+  else is rejected, so algorithm-confusion downgrades are
+  unrepresentable.
+- **Signatures compare in constant time** (no early exit), so a
+  byte-at-a-time timing oracle cannot forge one.
+- **base64url decoding is strict** — any character outside the url
+  alphabet rejects the token (fail closed, no silent skipping).
+- **`exp`/`nbf` must be numbers when present**; a malformed time claim
+  rejects the token rather than skipping the check.
+- **Every verification failure returns the same `#f`** — no reason oracle
+  for an attacker to probe.
+
+### API
+
+- `(jwt-sign claims key [options])` → token string. `claims` is an alist
+  with symbol or string keys. `options` is an alist; `(expires-in . N)`
+  stamps `iat = now` and `exp = now + N` seconds unless the caller already
+  supplied them. All other registered claims are the caller's
+  responsibility.
+- `(jwt-verify token key [options])` → claims alist (with **string** keys)
+  or `#f`. `options` may carry `(leeway . secs)`, `(iss . string)`, and
+  `(aud . string)`. The `aud` claim matches a string or an array
+  (list/vector) of strings.
+- `(jwt-decode token)` → `(header . claims)` or `#f`. Parses **without
+  verifying** — logging and debugging only, never authorization.
+- `(jwt-middleware key [options])` → middleware (see below).
+- `(req-jwt req)` → the verified claims alist, or `#f`.
+
+The `key` is a string (taken as UTF-8) or a bytevector. Use **at least 32
+random bytes**; the `/dev/urandom` pattern in `(igropyr session)`'s sid
+generator is a good source. Because verified claims have string keys (the
+`(igropyr json)` object convention), read them with `json-ref`, which also
+accepts symbols.
+
+### Signing and Verifying
+
+```scheme
+(import (igropyr jwt) (igropyr json))
+
+;; 32 random bytes, e.g. read from /dev/urandom at boot; keep it secret
+(define key
+  (call-with-port (open-file-input-port "/dev/urandom")
+    (lambda (p) (get-bytevector-n p 32))))
+
+(define token
+  (jwt-sign '(("sub" . "42") ("role" . "admin")) key
+            '((expires-in . 3600))))       ; iat/exp stamped for one hour
+
+(let ((claims (jwt-verify token key '((leeway . 30)
+                                      (iss . "api.example.com")))))
+  (if claims
+      (json-ref claims "role")             ; -> "admin"
+      'invalid))
+```
+
+### Middleware
+
+`jwt-middleware` reads a `Bearer` token from the `Authorization` header,
+verifies it, and puts the claims on a request-local slot for `req-jwt`. A
+missing or invalid token answers **401** with a `WWW-Authenticate: Bearer`
+header and a `{"error":"unauthorized"}` body. `options` are passed through
+to `jwt-verify` (`leeway`/`iss`/`aud`); a bad key type is rejected once at
+boot, not per request.
+
+```scheme
+(app-use app (jwt-middleware key))
+
+(app-get app "/me"
+  (lambda (req res)
+    (let ((claims (req-jwt req)))          ; guaranteed present here
+      (send-json! res (list (cons 'sub (json-ref claims "sub")))))))
+```
+
+With `(optional . #t)`, a request **without** a token is let through
+(`req-jwt` stays `#f`), but a present-but-invalid token still answers 401:
+
+```scheme
+(app-use app (jwt-middleware key '((optional . #t))))
+```
+
+### Not Implemented
+
+RS256/ES256 (no RSA/EC in `(igropyr crypto)`), HS384/HS512 (no
+SHA-384/512), JWE, and multi-signature JWS JSON serialization are out of
+scope. Adding an algorithm means extending sign and verify in lockstep,
+with the verifier staying pinned to an explicit list.
 
 ---
 
@@ -2301,6 +2425,14 @@ export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm
 
 Igropyr uses the `.sc` extension for all source files. The library search will find `igropyr/libuv.sc`, `igropyr/actor.sc`, etc.
 
+One optional variable controls dev-time contracts:
+
+- **IGROPYR_CONTRACTS**: read at **compile time** by `(igropyr checked)`.
+  Unset or `off` (the production default) compiles contracts to nothing;
+  `full` injects them; any other value is a compile-time error. After
+  changing it, do a **clean rebuild**. See
+  [Development Contracts](#development-contracts).
+
 ### Directory Case Sensitivity
 
 On case-sensitive file systems (Linux), the directory name must match the library name exactly. Igropyr's libraries are lowercase `igropyr.*`, so the directory must be named `igropyr`, not `Igropyr`.
@@ -2470,6 +2602,104 @@ Watch the supervisor's pool state via the `/stats` endpoint:
 ```bash
 watch -n 1 'curl -s localhost:8080/stats | jq'
 ```
+
+---
+
+## Development Contracts
+
+`(igropyr checked)` provides dev-time contract macros for **internal
+invariants** — bugs in your own code, caught at module boundaries. They
+are compiled away by default: with `IGROPYR_CONTRACTS` unset (or `off`),
+`define-checked` becomes a plain `define` and `define-checked-record`
+becomes a plain `define-record-type`, with **zero residue and zero runtime
+dependency** on the library.
+
+> **Never rely on this library for a production requirement.** Contracts
+> default to OFF, so anything they check may not run in production.
+> Validation of external input — request ranges, lengths, paths,
+> permissions — is ordinary always-on business code and must not live in a
+> contract.
+
+> **Never put a return contract (`-> pred`) on a tail-recursive or looping
+> procedure.** The return check must capture the return value, which
+> structurally destroys tail calls: the loop grows memory with depth.
+> **Argument contracts are TCO-safe** — they run once on entry and never
+> touch the return path.
+
+### Where Each Kind of Checking Belongs
+
+| Kind | Where |
+| --- | --- |
+| External input, semantics (range/length/path/permission) | ordinary code — your duty, always on |
+| External input, shape (json/form/wire → values) | ordinary code, or a hand-written `parse-x` |
+| Internal invariants (our own bugs) | `define-checked` / `define-checked-record` |
+| Last resort | Chez safe primitives + let-it-crash |
+
+### API
+
+```scheme
+(import (igropyr checked))
+
+;; argument contracts only (TCO-safe):
+(define-checked (find-route (table route-table?) (path string?))
+  (let loop ((segs (split path)))   ; internal named let: unchecked, free
+    ...))
+
+;; with a return contract (never on a loop):
+(define-checked (canonical-host (h string?)) -> string?
+  (string-downcase h))
+```
+
+- `(define-checked (name (arg pred) ...) body ...)` — each `pred` is a
+  one-place predicate expression; prefer **named** predicates
+  (`route-table?`) over inline lambdas, since blame prints the predicate's
+  source text. A bare argument with no predicate is allowed and unchecked.
+  Fixed arity only: no optional/rest args, no `case-lambda`.
+- `(define-checked (name (arg pred) ...) -> ret-pred body ...)` — adds a
+  single-value return contract. Procedures returning multiple values may
+  use argument contracts but no `->`.
+- `(define-checked-record name (field pred) (mutable field pred) ...)` —
+  expands to `define-record-type` with the usual names (`make-name`,
+  `name?`, `name-field`, `name-field-set!`). The constructor and setters
+  check contracts; the predicate and accessors are the raw record ones, so
+  **reads are free**. Only `make-name` is generated (no `parse-x`, parent,
+  protocol, or nongenerative clause — records needing those use the plain
+  form).
+- `(contract-level)` — expands to the literal `'full` or `'off` baked at
+  the expansion site. `app-listen` prints it at startup; assert it at the
+  top of a test suite.
+
+A violation raises `&assertion` naming the procedure, the argument/field,
+and the expected predicate, with the offending value as the irritant:
+
+```
+Exception in find-route: argument 'path' violated contract string?
+  with irritant 42
+```
+
+### The Switch
+
+`IGROPYR_CONTRACTS` is read **once per compiling process, at expansion
+time** — not at run time:
+
+- unset or `off` → **off** (production default, zero residue)
+- `full` → checks are injected
+- any other value → an **expansion-time error**, so a misspelled value can
+  never silently disable checking
+
+The level is baked into each compiled `.so` at that `.so`'s compile time.
+**After changing the flag, do a CLEAN rebuild** — otherwise different
+libraries disagree, and only `app-listen`'s startup line tells you what
+the entry point was compiled with.
+
+### Boundary Contracts in the Built-in Libraries
+
+The exported procedures of `(igropyr express)` (and `(igropyr session)`,
+`(igropyr jwt)`) carry argument contracts under a debug build. Pass the
+wrong type — a string where a request object is expected — and you get
+blame naming the procedure, the parameter, the expected predicate, and the
+value you actually passed. A production build (`IGROPYR_CONTRACTS` unset)
+compiles all of it away, so there is **zero overhead** on the request path.
 
 ---
 
