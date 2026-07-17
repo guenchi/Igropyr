@@ -603,7 +603,9 @@
 
   ;; match pattern segments against path segments; alist of params or #f
   ;; ":name" captures one segment; a trailing "*" (Express splat) captures all
-  ;; remaining segments joined with "/" under the param name "0".
+  ;; remaining segments joined with "/" under the param name "0". A
+  ;; non-trailing "*" never reaches here: registration rejects it
+  ;; (check-splat!), so the swallow-everything arm is safe.
   (define (match-segments psegs segs)
     (let loop ((ps psegs) (ss segs) (params '()))
       (cond
@@ -659,8 +661,21 @@
   ;; Registering a route that already exists (same method + pattern)
   ;; REPLACES it -- this is what makes hot reloading work: re-evaluating
   ;; a routes file against a live app swaps the handlers in place.
+  ;; A splat '*' is only meaningful as the LAST pattern segment --
+  ;; anywhere else it swallows the rest of the path and the segments
+  ;; after it silently never match. That is a route-table typo, so it
+  ;; fails HERE, at registration, not as a mystery 200 in production.
+  (define (check-splat! who pattern segs)
+    (let loop ((ss segs))
+      (when (pair? ss)
+        (when (and (string=? (car ss) "*") (pair? (cdr ss)))
+          (assertion-violation who
+            "splat '*' must be the last pattern segment" pattern))
+        (loop (cdr ss)))))
+
   (define (add-route! a method pattern handler)
     (let ((segs (split-segments pattern)))
+      (check-splat! 'add-route! pattern segs)
       (app-routes-set! a
         (append
           (filter (lambda (r)
@@ -791,6 +806,7 @@
   (define (app-ws a pattern session . rest)
     (let ((segs (split-segments pattern))
           (guard (and (pair? rest) (car rest))))
+      (check-splat! 'app-ws pattern segs)
       (when guard
         (unless (procedure? guard)
           (assertion-violation 'app-ws "guard must be a procedure" guard)))

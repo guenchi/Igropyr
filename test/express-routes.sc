@@ -64,6 +64,21 @@
 (app-get app "/files/:id"
   (lambda (req res) (send-text! res (string-append "id=" (req-param req "id")))))
 
+;; a non-trailing splat is a registration-time error (it would swallow
+;; the rest of the path and silently disable the segments after it),
+;; on both the HTTP and the ws registration paths
+(check "mid-splat-rejected"
+  (guard (c ((assertion-violation? c) #t) (#t #f))
+    (app-get app "/bad/*/tail" (lambda (req res) res))
+    #f))
+(check "ws-mid-splat-rejected"
+  (guard (c ((assertion-violation? c) #t) (#t #f))
+    (app-ws app "/bad/*/tail" (lambda (ws req) req))
+    #f))
+;; trailing splat still registers fine on the ws path too
+(check "ws-trailing-splat-ok"
+  (begin (app-ws app "/wsplat/*" (lambda (ws req) req)) #t))
+
 (start-scheduler
   (lambda ()
     (app-listen app port '((workers . 2)))
