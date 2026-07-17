@@ -406,7 +406,12 @@
   ;; (http-request method url opts) where opts is an alist:
   ;;   (headers . ((name . value) ...))   extra request headers
   ;;   (body    . string-or-bytevector)   request body
-  ;;   (timeout . milliseconds)           default 30000
+  ;;   (timeout . milliseconds)           default 30000; a nonnegative
+  ;;                                      exact integer. 0 (= no idle
+  ;;                                      limit) is only legal together
+  ;;                                      with on-chunk -- a plain
+  ;;                                      request with no deadline could
+  ;;                                      only ever hang.
   ;;   (on-chunk . proc)                  streaming: body bytevectors are
   ;;                                      handed to proc as they decode;
   ;;                                      the reply's body is empty. With
@@ -418,76 +423,92 @@
            (headers (let ((p (assq 'headers opts))) (if p (cdr p) '())))
            (body (let ((p (assq 'body opts))) (and p (cdr p))))
            (timeout (let ((p (assq 'timeout opts))) (if p (cdr p) default-timeout-ms)))
-           (on-chunk (let ((p (assq 'on-chunk opts))) (and p (cdr p))))
-           ;; connection setup (dns/connect) always keeps a finite bound;
-           ;; timeout 0 only lifts the response-side idle limit
-           (setup-timeout (if (and (integer? timeout) (> timeout 0))
-                              timeout
-                              default-timeout-ms))
-           (idle (if (and (integer? timeout) (> timeout 0)) timeout 'infinity))
-           (caller self)
-           (ref (gensym)))
+           (on-chunk (let ((p (assq 'on-chunk opts))) (and p (cdr p)))))
       (when on-chunk
         (unless (procedure? on-chunk)
           (fail "on-chunk must be a procedure")))
-      (let-values (((host port path tls?) (parse-url url)))
-        ;; fail fast, before any connection is attempted
-        (when (and tls? (not https-connector))
-          (fail "https not supported; import (igropyr tls) and call (tls-enable!)"))
-        (spawn
-          (lambda ()
-            (guard (e (#t (send caller
-                            (vector 'http-error ref
-                              ;; surface codec/parse errors (e.g. a TLS
-                              ;; certificate failure) instead of a blur
-                              (if (and (vector? e)
-                                       (eq? (vector-ref e 0) 'http-client-error)
-                                       (string? (vector-ref e 1)))
-                                  (vector-ref e 1)
-                                  "request failed")))))
-              ;; resolve the host (a dotted IP resolves to itself), then
-              ;; connect to the IP
-              (dns-resolve! host self)
-              (receive (after setup-timeout
-                          (send caller (vector 'http-error ref "dns timeout")))
-                (`#(dns-resolved ,ip)
-                  (tcp-connect! ip port self)
-                  (receive (after setup-timeout
-                              (send caller (vector 'http-error ref "connect timeout"))
-                              ;; the connect is still in flight; if it
-                              ;; lands after we gave up, close it so the
-                              ;; conn/fd is not leaked
-                              (receive (after 5000 'done)
-                                (`#(tcp-connected ,c) (tcp-close! c))
-                                (`#(tcp-connect-failed ,e) 'done)))
-                    (`#(tcp-connected ,c)
-                      (tcp-read-start! c)
-                      ;; if TLS setup or a later codec step raises, free
-                      ;; the session and the socket before propagating
-                      (let ((codec #f))
-                        (guard (e (#t (when codec ((vector-ref codec 2)))
-                                      (tcp-close! c)
-                                      (raise e)))
-                          (when tls?
-                            (set! codec (https-connector c host setup-timeout)))
-                          (let ((req (build-request method host path headers body)))
-                            (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f))
-                          (client-loop c caller ref (make-inbuf) 'head idle codec
-                                       on-chunk))))
-                    (`#(tcp-connect-failed ,e)
-                      (send caller (vector 'http-error ref (uv-strerror e))))))
-                (`#(dns-failed ,e)
-                  (send caller (vector 'http-error ref "dns resolution failed")))))))
-        ;; Non-streaming keeps the historical total deadline. A stream
-        ;; has no total: the caller parks until the connection process
-        ;; reports -- and IT is bounded by the idle timeout (or, with
-        ;; idle 0, by its own guards), so every path still answers.
-        (receive (after (if (or on-chunk (eq? idle 'infinity))
-                            'infinity
-                            (+ timeout 2000))
-                    (raise (vector 'http-client-error "request timeout")))
-          (`#(http-reply ,@ref ,resp) resp)
-          (`#(http-error ,@ref ,msg) (raise (vector 'http-client-error msg)))))))
+      (unless (and (integer? timeout) (exact? timeout) (>= timeout 0))
+        (fail "timeout must be a nonnegative exact integer (milliseconds)"))
+      (unless (or on-chunk (> timeout 0))
+        (fail "timeout 0 (no idle limit) requires on-chunk streaming"))
+      (let (;; connection setup (dns/connect) always keeps a finite bound;
+            ;; timeout 0 only lifts the response-side idle limit
+            (setup-timeout (if (> timeout 0) timeout default-timeout-ms))
+            (idle (if (> timeout 0) timeout 'infinity))
+            (caller self)
+            (ref (gensym)))
+        (let-values (((host port path tls?) (parse-url url)))
+          ;; fail fast, before any connection is attempted
+          (when (and tls? (not https-connector))
+            (fail "https not supported; import (igropyr tls) and call (tls-enable!)"))
+          (let* ((pid (spawn
+                        (lambda ()
+                          (guard (e (#t (send caller
+                                          (vector 'http-error ref
+                                            ;; surface codec/parse errors (e.g. a TLS
+                                            ;; certificate failure) instead of a blur
+                                            (if (and (vector? e)
+                                                     (eq? (vector-ref e 0) 'http-client-error)
+                                                     (string? (vector-ref e 1)))
+                                                (vector-ref e 1)
+                                                "request failed")))))
+                            ;; resolve the host (a dotted IP resolves to itself), then
+                            ;; connect to the IP
+                            (dns-resolve! host self)
+                            (receive (after setup-timeout
+                                        (send caller (vector 'http-error ref "dns timeout")))
+                              (`#(dns-resolved ,ip)
+                                (tcp-connect! ip port self)
+                                (receive (after setup-timeout
+                                            (send caller (vector 'http-error ref "connect timeout"))
+                                            ;; the connect is still in flight; if it
+                                            ;; lands after we gave up, close it so the
+                                            ;; conn/fd is not leaked
+                                            (receive (after 5000 'done)
+                                              (`#(tcp-connected ,c) (tcp-close! c))
+                                              (`#(tcp-connect-failed ,e) 'done)))
+                                  (`#(tcp-connected ,c)
+                                    (tcp-read-start! c)
+                                    ;; if TLS setup or a later codec step raises, free
+                                    ;; the session and the socket before propagating
+                                    (let ((codec #f))
+                                      (guard (e (#t (when codec ((vector-ref codec 2)))
+                                                    (tcp-close! c)
+                                                    (raise e)))
+                                        (when tls?
+                                          (set! codec (https-connector c host setup-timeout)))
+                                        (let ((req (build-request method host path headers body)))
+                                          (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f))
+                                        (client-loop c caller ref (make-inbuf) 'head idle codec
+                                                     on-chunk))))
+                                  (`#(tcp-connect-failed ,e)
+                                    (send caller (vector 'http-error ref (uv-strerror e))))))
+                              (`#(dns-failed ,e)
+                                (send caller (vector 'http-error ref "dns resolution failed"))))))))
+                 ;; A stream has no total deadline, so the caller must not
+                 ;; outlive the connection process unprotected: if it dies
+                 ;; without reporting (killed by a supervisor, or a raise
+                 ;; inside its own guard handler), the DOWN below answers
+                 ;; instead of leaving the caller parked forever.
+                 (mon (monitor pid)))
+            ;; consume the monitor on every exit: a DOWN must not linger
+            ;; in the caller's mailbox to confuse an unrelated receive
+            (define (release!)
+              (demonitor mon)
+              (receive (after 0 #f) (`#(DOWN ,@pid ,_) #t)))
+            ;; Non-streaming keeps the historical total deadline. A stream
+            ;; parks until the connection process reports -- and IT is
+            ;; bounded by the idle timeout (or, with idle 0, by its own
+            ;; guards plus the monitor), so every path still answers.
+            (receive (after (if on-chunk 'infinity (+ timeout 2000))
+                        (release!)
+                        (raise (vector 'http-client-error "request timeout")))
+              (`#(http-reply ,@ref ,resp) (release!) resp)
+              (`#(http-error ,@ref ,msg)
+                (release!)
+                (raise (vector 'http-client-error msg)))
+              (`#(DOWN ,@pid ,reason)
+                (raise (vector 'http-client-error "connection process died")))))))))
 
   (define (http-get url . rest)
     (apply http-request 'GET url rest))

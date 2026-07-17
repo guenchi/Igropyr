@@ -162,6 +162,21 @@
                   (http-get (string-append "http://127.0.0.1:" (number->string port) "/sse")
                             '((on-chunk . not-a-procedure)))))
               "on-chunk must be a procedure"))
+    ;; timeout 0 means "no idle limit" and only streams may ask for it:
+    ;; a plain request with no deadline could only hang, so it is
+    ;; rejected loudly (it used to be a silent forever-park)
+    (check "plain-timeout-0-rejected"
+      (equal? (client-error-message
+                (lambda ()
+                  (http-get (string-append "http://127.0.0.1:" (number->string port) "/sse")
+                            '((timeout . 0)))))
+              "timeout 0 (no idle limit) requires on-chunk streaming"))
+    (check "non-integer-timeout-rejected"
+      (equal? (client-error-message
+                (lambda ()
+                  (http-get (string-append "http://127.0.0.1:" (number->string port) "/sse")
+                            '((timeout . 1500.5)))))
+              "timeout must be a nonnegative exact integer (milliseconds)"))
 
     ;; a crashing handler surfaces as a typed client error, not a hang
     (check "handler-crash"
