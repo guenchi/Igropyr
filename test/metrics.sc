@@ -40,7 +40,24 @@
       (metrics-count! m "iter_lookup_outcome_total" '(("outcome" . "miss")))
       (metrics-count! m "jobs_done_total" '() 5)
       (metrics-count! m "odd_labels_total" '(("q" . "say \"hi\"\\x")))
+      ;; the same label SET in two alist orders must be one series
+      (metrics-count! m "order_total" '(("a" . "1") ("b" . "2")))
+      (metrics-count! m "order_total" '(("b" . "2") ("a" . "1")))
       (sleep-ms 100)                     ; casts are async; let them land
+
+      ;; malformed input fails the CALLER; the collector stays alive
+      ;; (the scrape checks below double as its liveness probe)
+      (let ((rejects? (lambda (thunk) (guard (e (#t #t)) (thunk) #f))))
+        (check "bad-n-rejected"
+          (rejects? (lambda () (metrics-count! m "x_total" '() "5"))))
+        (check "bad-name-rejected"
+          (rejects? (lambda () (metrics-count! m "bad-name" '()))))
+        (check "reserved-name-rejected"
+          (rejects? (lambda () (metrics-count! m "igropyr_requests_total" '()))))
+        (check "bad-label-rejected"
+          (rejects? (lambda () (metrics-count! m "y_total" '(("ok" . "1") ("bad-key" . "2"))))))
+        (check "dup-label-rejected"
+          (rejects? (lambda () (metrics-count! m "z_total" '(("a" . "1") ("a" . "2")))))))
 
       (let* ((r (http-get (string-append "http://127.0.0.1:" (number->string port)
                                          "/metrics")))
@@ -52,7 +69,9 @@
         (check "custom-labelled-hit" (contains? body "iter_lookup_outcome_total{outcome=\"hit\"} 2"))
         (check "custom-labelled-miss" (contains? body "iter_lookup_outcome_total{outcome=\"miss\"} 1"))
         (check "custom-unlabelled-n" (contains? body "jobs_done_total 5"))
-        (check "label-escaping" (contains? body "odd_labels_total{q=\"say \\\"hi\\\"\\\\x\"} 1")))
+        (check "label-escaping" (contains? body "odd_labels_total{q=\"say \\\"hi\\\"\\\\x\"} 1"))
+        (check "label-order-one-series" (contains? body "order_total{a=\"1\",b=\"2\"} 2"))
+        (check "label-order-no-dup" (not (contains? body "order_total{b="))))
 
       (if (zero? failures)
           (begin (display "metrics: all tests passed") (newline) (exit 0))

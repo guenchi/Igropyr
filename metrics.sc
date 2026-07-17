@@ -82,29 +82,86 @@
             ((#\newline) (put-string p "\\n"))
             (else (put-char p c)))))))
 
-  ;; labels alist -> "{k=\"v\",...}" or "" -- built once, off the collector
+  ;; Prometheus name rules: metric [a-zA-Z_:][a-zA-Z0-9_:]*, label name
+  ;; the same minus the colon
+  (define (valid-name? s colon-ok?)
+    (and (string? s) (> (string-length s) 0)
+         (let loop ((i 0))
+           (or (= i (string-length s))
+               (let ((c (string-ref s i)))
+                 (and (or (char<=? #\a c #\z) (char<=? #\A c #\Z)
+                          (char=? c #\_)
+                          (and colon-ok? (char=? c #\:))
+                          (and (> i 0) (char<=? #\0 c #\9)))
+                      (loop (+ i 1))))))))
+
+  ;; labels alist -> "{k=\"v\",...}" or "" -- validated and SORTED by
+  ;; label name: Prometheus treats label order as insignificant, so two
+  ;; orderings of one set must map to ONE series -- unsorted they would
+  ;; render as duplicate samples and fail the whole scrape. Cached per
+  ;; distinct label set (label sets on the request path are near-
+  ;; constant), so sort/escape work runs per series, not per increment;
+  ;; the cache grows exactly as the collector's own series table does.
+  (define label-cache (make-hashtable equal-hash equal?))
+
+  (define (build-label-string labels)
+    (for-each
+      (lambda (kv)
+        (unless (and (pair? kv) (valid-name? (car kv) #f) (string? (cdr kv)))
+          (assertion-violation 'metrics-count! "bad label (name . value)" kv)))
+      labels)
+    (let ((sorted (sort (lambda (a b) (string<? (car a) (car b))) labels)))
+      (let dup ((l sorted))
+        (when (and (pair? l) (pair? (cdr l)))
+          (when (string=? (caar l) (caadr l))
+            (assertion-violation 'metrics-count! "duplicate label name" (caar l)))
+          (dup (cdr l))))
+      (if (null? sorted)
+          ""
+          (let-values (((p get) (open-string-output-port)))
+            (put-char p #\{)
+            (let loop ((l sorted) (first #t))
+              (unless (null? l)
+                (unless first (put-char p #\,))
+                (put-string p (caar l))
+                (put-string p "=\"")
+                (put-string p (escape-label-value (cdar l)))
+                (put-string p "\"")
+                (loop (cdr l) #f)))
+            (put-char p #\})
+            (get)))))
+
   (define (label-string labels)
-    (if (null? labels)
-        ""
-        (let-values (((p get) (open-string-output-port)))
-          (put-char p #\{)
-          (let loop ((l labels) (first #t))
-            (unless (null? l)
-              (unless first (put-char p #\,))
-              (put-string p (caar l))
-              (put-string p "=\"")
-              (put-string p (escape-label-value (cdar l)))
-              (put-string p "\"")
-              (loop (cdr l) #f)))
-          (put-char p #\})
-          (get))))
+    (or (hashtable-ref label-cache labels #f)
+        (let ((s (build-label-string labels)))
+          (hashtable-set! label-cache labels s)
+          s)))
 
   ;; count a business event: name is the Prometheus family, labels an
-  ;; alist of (name . value) strings, n the increment (default 1)
+  ;; alist of (name . value) strings, n the increment (default 1).
+  ;; Validated HERE, in the caller: gen-server-cast is fire-and-forget,
+  ;; so bad input must fail the call site loudly instead of raising
+  ;; inside the shared collector and silently killing every metric.
+  ;; igropyr_* is reserved -- a custom family colliding with a built-in
+  ;; one would render a duplicate # TYPE block and invalidate the scrape.
+  (define reserved-prefix "igropyr_")
+
+  (define (reserved-name? name)
+    (let ((n (string-length reserved-prefix)))
+      (and (>= (string-length name) n)
+           (string=? (substring name 0 n) reserved-prefix))))
+
   (define metrics-count!
     (case-lambda
       ((m name labels) (metrics-count! m name labels 1))
       ((m name labels n)
+       (unless (valid-name? name #t)
+         (assertion-violation 'metrics-count! "bad metric name" name))
+       (when (reserved-name? name)
+         (assertion-violation 'metrics-count!
+           "igropyr_ names are reserved for built-in families" name))
+       (unless (and (real? n) (not (nan? n)))
+         (assertion-violation 'metrics-count! "increment must be a real number" n))
        (gen-server-cast m (vector 'count name (label-string labels) n)))))
 
   ;; record each request's final status and wall-clock duration
