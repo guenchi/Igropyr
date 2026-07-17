@@ -46,7 +46,7 @@
 (library (igropyr dpool)
   (export dpool-start dpool-submit dpool-await dpool-worker-start
           dpool-stats)
-  (import (chezscheme) (igropyr actor) (igropyr node))
+  (import (chezscheme) (igropyr util) (igropyr actor) (igropyr node))
 
   (define default-await-ms 30000)
 
@@ -77,9 +77,6 @@
         (unless (and (bytevector? bv) (fx= (bytevector-length bv) 8))
           (raise 'entropy))
         (bytevector-uint-ref bv 0 (endianness big) 8))))
-
-  (define (opt alist key default)
-    (let ((p (assq key alist))) (if p (cdr p) default)))
 
   ;; a wire-safe reason symbol out of whatever was raised
   (define (reason-of e)

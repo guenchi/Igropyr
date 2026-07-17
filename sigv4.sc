@@ -36,19 +36,11 @@
           sigv4-uri-encode sigv4-canonical-query sigv4-canonical-request
           sigv4-signing-key sigv4-string-to-sign sigv4-authorization
           sigv4-datetime sha256-hex)
-  (import (chezscheme) (igropyr crypto))
+  (import (chezscheme) (igropyr util) (igropyr crypto))
 
   ;; ---- small helpers ---------------------------------------------------
 
   (define (sha256-hex bv) (bytevector->hex (sha256 bv)))
-
-  (define (opt opts key default)
-    (let ((p (assq key opts))) (if p (cdr p) default)))
-
-  (define (need opts key)
-    (let ((p (assq key opts)))
-      (unless p (assertion-violation 'sigv4-sign-headers "missing option" key))
-      (cdr p)))
 
   ;; current UTC time as YYYYMMDDThhmmssZ
   (define (sigv4-datetime)
@@ -178,11 +170,11 @@
   (define (sigv4-sign-headers method path query headers payload-hash opts)
     (let* ((method (string-upcase
                      (if (symbol? method) (symbol->string method) method)))
-           (host (need opts 'host))
-           (access-key (need opts 'access-key))
-           (secret (need opts 'secret))
-           (region (need opts 'region))
-           (service (need opts 'service))
+           (host (need 'sigv4-sign-headers opts 'host))
+           (access-key (need 'sigv4-sign-headers opts 'access-key))
+           (secret (need 'sigv4-sign-headers opts 'secret))
+           (region (need 'sigv4-sign-headers opts 'region))
+           (service (need 'sigv4-sign-headers opts 'service))
            (datetime (opt opts 'datetime (sigv4-datetime)))
            (date (substring datetime 0 8))
            (with-sha (opt opts 'content-sha256 #t))

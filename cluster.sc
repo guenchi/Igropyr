@@ -37,11 +37,9 @@
 
 (library (igropyr cluster)
   (export cluster-start cluster-stop)
-  (import (chezscheme) (igropyr actor) (igropyr node) (igropyr redis)
+  (import (chezscheme) (igropyr util) (igropyr actor) (igropyr node)
+          (igropyr redis)
           (only (igropyr libuv) now-ms))
-
-  (define (opt alist key default)
-    (let ((p (assq key alist))) (if p (cdr p) default)))
 
   ;; Discovery records come from a shared store (a Redis key any node can
   ;; write); treat them as untrusted. These bound what one poisoned or

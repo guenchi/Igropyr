@@ -10,7 +10,8 @@
 ;;; Server B (18082): on-failure raises -> falls back to the plain 500.
 ;;; Server C (18083): no on-failure -> plain 500 (default unchanged).
 
-(import (chezscheme) (igropyr http) (igropyr express) (igropyr libuv))
+(import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
+        (igropyr libuv))
 
 (define empty-bv (make-bytevector 0))
 
@@ -20,13 +21,6 @@
     (bytevector-copy! a 0 out 0 na)
     (bytevector-copy! b 0 out na nb)
     out))
-
-(define (contains? s needle)
-  (let ((n (string-length s)) (m (string-length needle)))
-    (let loop ((i 0))
-      (cond ((> (+ i m) n) #f)
-            ((string=? (substring s i (+ i m)) needle) #t)
-            (else (loop (+ i 1)))))))
 
 (define (fail label detail)
   (display "FAIL: ") (display label) (display " ") (write detail) (newline)
@@ -47,14 +41,14 @@
             (let loop ((buf empty-bv) (stage 1))
               (let ((s (utf8->string buf)))
                 (cond
-                  ((and (= stage 1) (contains? s marker))
+                  ((and (= stage 1) (string-contains? s marker))
                    (if text2
                        (begin
                          (tcp-write! c (string->utf8 text2) #f)
                          (loop buf 2))
                        (begin (tcp-close! c)
                               (send caller (vector 'ring-reply ref s)))))
-                  ((and (= stage 2) (contains? s marker2))
+                  ((and (= stage 2) (string-contains? s marker2))
                    (tcp-close! c)
                    (send caller (vector 'ring-reply ref s)))
                   (else
@@ -73,7 +67,7 @@
 (define (expect-contains label response . needles)
   (for-each
     (lambda (needle)
-      (unless (contains? response needle)
+      (unless (string-contains? response needle)
         (fail label (list 'missing needle 'in response))))
     needles)
   (display label) (display " ok\n"))

@@ -39,12 +39,9 @@
 
 (library (igropyr auth)
   (export auth req-claims token-guard session-guard)
-  (import (chezscheme) (igropyr checked)
+  (import (chezscheme) (igropyr checked) (igropyr util)
           (igropyr http) (igropyr express)
           (only (igropyr session) session-peek))
-
-  (define (opt alist key default)
-    (let ((p (assq key alist))) (if p (cdr p) default)))
 
   (define (bearer-token req)
     (let ((h (req-header req 'authorization)))

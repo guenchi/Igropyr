@@ -3,8 +3,8 @@
 ;;; families, business counters via metrics-count! (labelled, +n, and
 ;;; label-value escaping), all scraped through a real /metrics endpoint.
 
-(import (chezscheme) (igropyr http) (igropyr express) (igropyr client)
-        (igropyr metrics) (igropyr gen-server))
+(import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
+        (igropyr client) (igropyr metrics) (igropyr gen-server))
 
 (define port 18096)
 
@@ -13,13 +13,6 @@
   (unless ok
     (set! failures (+ failures 1))
     (display "FAIL ") (display label) (newline)))
-
-(define (contains? hay needle)
-  (let ((hn (string-length hay)) (nn (string-length needle)))
-    (let loop ((i 0))
-      (cond ((> (+ i nn) hn) #f)
-            ((string=? (substring hay i (+ i nn)) needle) #t)
-            (else (loop (+ i 1)))))))
 
 (define m (make-metrics))
 (define app (create-app))
@@ -63,15 +56,15 @@
                                          "/metrics")))
              (body (utf8->string (response-body r))))
         (check "scrape-200" (= (response-status r) 200))
-        (check "requests-family" (contains? body "igropyr_requests_total{status=\"200\"} 2"))
-        (check "duration-count" (contains? body "igropyr_request_duration_ms_count 2"))
-        (check "custom-type-line" (contains? body "# TYPE iter_lookup_outcome_total counter"))
-        (check "custom-labelled-hit" (contains? body "iter_lookup_outcome_total{outcome=\"hit\"} 2"))
-        (check "custom-labelled-miss" (contains? body "iter_lookup_outcome_total{outcome=\"miss\"} 1"))
-        (check "custom-unlabelled-n" (contains? body "jobs_done_total 5"))
-        (check "label-escaping" (contains? body "odd_labels_total{q=\"say \\\"hi\\\"\\\\x\"} 1"))
-        (check "label-order-one-series" (contains? body "order_total{a=\"1\",b=\"2\"} 2"))
-        (check "label-order-no-dup" (not (contains? body "order_total{b="))))
+        (check "requests-family" (string-contains? body "igropyr_requests_total{status=\"200\"} 2"))
+        (check "duration-count" (string-contains? body "igropyr_request_duration_ms_count 2"))
+        (check "custom-type-line" (string-contains? body "# TYPE iter_lookup_outcome_total counter"))
+        (check "custom-labelled-hit" (string-contains? body "iter_lookup_outcome_total{outcome=\"hit\"} 2"))
+        (check "custom-labelled-miss" (string-contains? body "iter_lookup_outcome_total{outcome=\"miss\"} 1"))
+        (check "custom-unlabelled-n" (string-contains? body "jobs_done_total 5"))
+        (check "label-escaping" (string-contains? body "odd_labels_total{q=\"say \\\"hi\\\"\\\\x\"} 1"))
+        (check "label-order-one-series" (string-contains? body "order_total{a=\"1\",b=\"2\"} 2"))
+        (check "label-order-no-dup" (not (string-contains? body "order_total{b="))))
 
       (if (zero? failures)
           (begin (display "metrics: all tests passed") (newline) (exit 0))

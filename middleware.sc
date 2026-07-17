@@ -15,11 +15,8 @@
 
 (library (igropyr middleware)
   (export cors security-headers logger rate-limit error-handler)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr gen-server)
-          (igropyr http) (igropyr express))
-
-  (define (opt alist key default)
-    (let ((p (assq key alist))) (if p (cdr p) default)))
+  (import (chezscheme) (igropyr util) (igropyr actor) (igropyr libuv)
+          (igropyr gen-server) (igropyr http) (igropyr express))
 
   ;; ---- CORS ------------------------------------------------------------
   ;; Adds Access-Control-* headers; answers OPTIONS preflight with 204.

@@ -7,7 +7,7 @@
 ;;;   - expiry: abandoning the dialogue rolls the hold back (guard ran)
 ;;;   - crash inside a step -> resume answers gone, hold rolled back
 
-(import (chezscheme) (igropyr http) (igropyr express)
+(import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
         (igropyr json) (igropyr conversation) (igropyr libuv))
 
 (define port 18084)
@@ -19,13 +19,6 @@
     (bytevector-copy! a 0 out 0 na)
     (bytevector-copy! b 0 out na nb)
     out))
-
-(define (contains? s needle)
-  (let ((n (string-length s)) (m (string-length needle)))
-    (let loop ((i 0))
-      (cond ((> (+ i m) n) #f)
-            ((string=? (substring s i (+ i m)) needle) #t)
-            (else (loop (+ i 1)))))))
 
 (define (fail label detail)
   (display "FAIL: ") (display label) (display " ") (write detail) (newline)
@@ -141,7 +134,7 @@
         (json-ref (json-of (get "/balance")) "balance") 900)
       ;; the conversation is over: a further resume is gone
       (let ((r3 (post (string-append "/t/" id) "confirm")))
-        (unless (contains? r3 "HTTP/1.1 410 ") (fail "resume after end" r3))
+        (unless (string-contains? r3 "HTTP/1.1 410 ") (fail "resume after end" r3))
         (display "resume after end ok\n")))
 
     ;; cancel path rolls the hold back
@@ -153,7 +146,7 @@
 
     ;; unknown id
     (let ((r (post "/t/deadbeef" "confirm")))
-      (unless (contains? r "HTTP/1.1 410 ") (fail "unknown id" r))
+      (unless (string-contains? r "HTTP/1.1 410 ") (fail "unknown id" r))
       (display "unknown id ok\n"))
 
     ;; expiry: abandon the dialogue; the guard restores the hold
@@ -164,14 +157,14 @@
       (expect "expiry rolls back"
         (json-ref (json-of (get "/balance")) "balance") 900)
       (let ((r (post (string-append "/t/" id) "confirm")))
-        (unless (contains? r "HTTP/1.1 410 ") (fail "resume after expiry" r))
+        (unless (string-contains? r "HTTP/1.1 410 ") (fail "resume after expiry" r))
         (display "resume after expiry ok\n")))
 
     ;; crash inside a step: resume answers gone, hold rolled back
     (let* ((r1 (json-of (post "/t?crash=1" "100")))
            (id (json-ref r1 "conv")))
       (let ((r (post (string-append "/t/" id) "confirm")))
-        (unless (contains? r "HTTP/1.1 410 ") (fail "crash in step" r))
+        (unless (string-contains? r "HTTP/1.1 410 ") (fail "crash in step" r))
         (display "crash in step ok\n"))
       (expect "crash rolls back"
         (json-ref (json-of (get "/balance")) "balance") 900))

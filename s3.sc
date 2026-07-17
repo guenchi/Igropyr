@@ -41,7 +41,8 @@
 (library (igropyr s3)
   (export make-s3 s3?
           s3-put! s3-get s3-copy! s3-delete! s3-delete-prefix! s3-list)
-  (import (chezscheme) (igropyr crypto) (igropyr sigv4) (igropyr client))
+  (import (chezscheme) (igropyr util) (igropyr crypto) (igropyr sigv4)
+          (igropyr client))
 
   ;; make-s3 (exported below) takes an opts alist; raw-s3 is internal
   (define-record-type (s3 raw-s3 s3?)
@@ -50,14 +51,6 @@
                         ; what (igropyr client) puts in Host, because
                         ; SigV4 signs the Host header
             bucket access-key secret region timeout max-response))
-
-  (define (opt opts key default)
-    (let ((p (assq key opts))) (if p (cdr p) default)))
-
-  (define (need opts key)
-    (let ((p (assq key opts)))
-      (unless p (assertion-violation 'make-s3 "missing option" key))
-      (cdr p)))
 
   ;; endpoint -> (values base host). Accepts http[s]://host[:port] ONLY:
   ;; a path here would make the signed canonical URI ("/bucket/key") and
@@ -107,10 +100,10 @@
   ;; opts: endpoint bucket access-key secret [region "auto"]
   ;; [timeout 30000] [max-response -- client's 32 MiB default]
   (define (make-s3 opts)
-    (let-values (((base host) (parse-endpoint (need opts 'endpoint))))
+    (let-values (((base host) (parse-endpoint (need 'make-s3 opts 'endpoint))))
       (raw-s3 base host
-              (need opts 'bucket)
-              (need opts 'access-key) (need opts 'secret)
+              (need 'make-s3 opts 'bucket)
+              (need 'make-s3 opts 'access-key) (need 'make-s3 opts 'secret)
               (opt opts 'region "auto")
               (opt opts 'timeout 30000)
               (opt opts 'max-response #f))))
@@ -224,17 +217,6 @@
           v)))
 
   ;; ---- minimal flat-XML extraction (S3 list responses) ---------------------
-
-  (define (string-search hay needle start)
-    (let ((hn (string-length hay)) (nn (string-length needle)))
-      (let loop ((i start))
-        (cond ((> (+ i nn) hn) #f)
-              ((let check ((j 0))
-                 (or (= j nn)
-                     (and (char=? (string-ref hay (+ i j)) (string-ref needle j))
-                          (check (+ j 1)))))
-               i)
-              (else (loop (+ i 1)))))))
 
   (define (prefix-at? s pre i)
     (let ((pn (string-length pre)) (sn (string-length s)))

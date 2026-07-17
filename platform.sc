@@ -6,21 +6,9 @@
           load-first-shared-object!
           addrinfo-address-offset addrinfo-next-offset
           uv-stat-mode-offset uv-stat-size-offset)
-  (import (chezscheme))
+  (import (chezscheme) (igropyr util))
 
   (define machine-name (symbol->string (machine-type)))
-
-  (define (string-contains? s needle)
-    (let ((n (string-length s)) (m (string-length needle)))
-      (let loop ((i 0))
-        (cond
-          ((> (+ i m) n) #f)
-          ((string=? (substring s i (+ i m)) needle) #t)
-          (else (loop (+ i 1)))))))
-
-  (define (string-suffix? suffix s)
-    (let ((n (string-length s)) (m (string-length suffix)))
-      (and (>= n m) (string=? suffix (substring s (- n m) n)))))
 
   (define platform-os
     (cond

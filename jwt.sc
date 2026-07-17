@@ -53,11 +53,8 @@
 
 (library (igropyr jwt)
   (export jwt-sign jwt-verify jwt-verifier jwt-decode)
-  (import (chezscheme) (igropyr checked)
+  (import (chezscheme) (igropyr checked) (igropyr util)
           (igropyr crypto) (igropyr json))
-
-  (define (opt alist key default)
-    (let ((p (assq key alist))) (if p (cdr p) default)))
 
   (define (jwt-fail msg)
     (raise (vector 'jwt-error msg)))

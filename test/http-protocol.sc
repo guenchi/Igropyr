@@ -1,5 +1,6 @@
 #!chezscheme
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http))
+(import (chezscheme) (igropyr util) (igropyr actor) (igropyr libuv)
+        (igropyr http))
 
 (define port 18080)
 (define empty-bv (make-bytevector 0))
@@ -63,28 +64,21 @@
       (`#(raw-reply ,@ref ,bv) (utf8->string bv))
       (`#(raw-error ,@ref ,e) (raise (vector 'raw-request-error e))))))
 
-(define (contains? s needle)
-  (let ((n (string-length s)) (m (string-length needle)))
-    (let loop ((i 0))
-      (cond ((> (+ i m) n) #f)
-            ((string=? (substring s i (+ i m)) needle) #t)
-            (else (loop (+ i 1)))))))
-
 (define (expect-dripped label pieces status . body)
   (let ((response (raw-request-dripped pieces)))
-    (unless (contains? response (string-append "HTTP/1.1 " status " "))
+    (unless (string-contains? response (string-append "HTTP/1.1 " status " "))
       (error 'http-protocol label "wrong status" response))
     (when (pair? body)
-      (unless (contains? response (car body))
+      (unless (string-contains? response (car body))
         (error 'http-protocol label "missing response body" response)))
     (display label) (display " ok\n")))
 
 (define (expect label request status . body)
   (let ((response (raw-request request)))
-    (unless (contains? response (string-append "HTTP/1.1 " status " "))
+    (unless (string-contains? response (string-append "HTTP/1.1 " status " "))
       (error 'http-protocol label "wrong status" response))
     (when (pair? body)
-      (unless (contains? response (car body))
+      (unless (string-contains? response (car body))
         (error 'http-protocol label "missing response body" response)))
     (display label) (display " ok\n")))
 
@@ -98,9 +92,9 @@
                (number->string (string-length body))
                "\r\nConnection: close\r\n\r\n"
                body))))
-    (unless (contains? response "HTTP/1.1 200 ")
+    (unless (string-contains? response "HTTP/1.1 200 ")
       (error 'http-protocol "pipelined empty trailer" "missing first 200" response))
-    (when (contains? response "HTTP/1.1 431 ")
+    (when (string-contains? response "HTTP/1.1 431 ")
       (error 'http-protocol "pipelined empty trailer" "unexpected 431" response))
     (display "pipelined empty trailer ok\n")))
 
