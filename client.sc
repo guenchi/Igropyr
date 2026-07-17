@@ -58,7 +58,9 @@
   (define default-timeout-ms 30000)
   (define default-port 80)
   (define default-tls-port 443)
-  (define max-response 33554432)      ; 32 MiB response cap (DoS guard)
+  (define max-response 33554432)      ; default response cap, 32 MiB (DoS
+                                      ; guard); per-request override via
+                                      ; the (max-response . bytes) opt
 
   ;; ---- TLS hook ---------------------------------------------------------
   ;;
@@ -154,9 +156,21 @@
         (for-each
           (lambda (h) (line (string-append (car h) ": " (cdr h))))
           headers)
-        (when (> (bytevector-length body-bv) 0)
-          (line (string-append "Content-Length: "
-                               (number->string (bytevector-length body-bv)))))
+        ;; Content-Length is ours unless the caller supplied one (never
+        ;; write it twice -- servers reject duplicates): the body's
+        ;; length when there is a body, and an explicit 0 on bodyless
+        ;; body-carrying methods -- some servers (S3 among them) answer
+        ;; 411 Length Required without it
+        (unless (let scan ((h headers))
+                  (and (pair? h)
+                       (or (string-ci=? (caar h) "content-length")
+                           (scan (cdr h)))))
+          (cond
+            ((> (bytevector-length body-bv) 0)
+             (line (string-append "Content-Length: "
+                                  (number->string (bytevector-length body-bv)))))
+            ((memq method '(PUT POST PATCH))
+             (line "Content-Length: 0"))))
         (put-bytevector p crlf)                    ; end of headers
         (put-bytevector p body-bv)
         (get))))
@@ -286,7 +300,7 @@
   ;;   #(sclen status headers remaining)
   ;;   #(schunked status headers)
   ;;   #(seof status headers)
-  (define (client-loop c caller ref buf state timeout codec emit)
+  (define (client-loop c caller ref buf state timeout codec emit max-resp)
     (define (done!) (when codec ((vector-ref codec 2))) (tcp-close! c))
     (define (reply! r) (send caller (vector 'http-reply ref r)) (done!))
     (define (err! msg) (send caller (vector 'http-error ref msg)) (done!))
@@ -386,14 +400,14 @@
           (`#(tcp-data ,raw)
             (let ((bv (if codec ((vector-ref codec 1) raw) raw)))
               (if (zero? (bytevector-length bv))   ; pure TLS records, no app data
-                  (client-loop c caller ref buf state timeout codec emit)
+                  (client-loop c caller ref buf state timeout codec emit max-resp)
                   (begin
                     (inbuf-append! buf bv)
                     ;; with streaming consumption this caps the UNPARSED
                     ;; tail (e.g. one oversized chunk), not the stream total
-                    (if (> (inbuf-length buf) max-response)
+                    (if (> (inbuf-length buf) max-resp)
                         (err! "response too large")
-                        (client-loop c caller ref buf state timeout codec emit))))))
+                        (client-loop c caller ref buf state timeout codec emit max-resp))))))
           (`#(tcp-eof)
             (cond
               ((and (vector? state) (eq? (vector-ref state 0) 'eof))
@@ -424,12 +438,18 @@
   ;;                                      on-chunk, timeout bounds the idle
   ;;                                      gap between chunks (0 = none) and
   ;;                                      there is no total deadline.
+  ;;   (max-response . bytes)             cap on buffered response bytes
+  ;;                                      (default 32 MiB); with on-chunk
+  ;;                                      it bounds the unparsed tail, not
+  ;;                                      the stream total
   (define (http-request method url . rest)
     (let* ((opts (if (pair? rest) (car rest) '()))
            (headers (let ((p (assq 'headers opts))) (if p (cdr p) '())))
            (body (let ((p (assq 'body opts))) (and p (cdr p))))
            (timeout (let ((p (assq 'timeout opts))) (if p (cdr p) default-timeout-ms)))
-           (on-chunk (let ((p (assq 'on-chunk opts))) (and p (cdr p)))))
+           (on-chunk (let ((p (assq 'on-chunk opts))) (and p (cdr p))))
+           (max-resp (let ((p (assq 'max-response opts)))
+                       (if p (cdr p) max-response))))
       (when on-chunk
         (unless (procedure? on-chunk)
           (fail "on-chunk must be a procedure")))
@@ -437,6 +457,8 @@
         (fail "timeout must be a nonnegative exact integer (milliseconds)"))
       (unless (or on-chunk (> timeout 0))
         (fail "timeout 0 (no idle limit) requires on-chunk streaming"))
+      (unless (and (integer? max-resp) (exact? max-resp) (> max-resp 0))
+        (fail "max-response must be a positive exact integer (bytes)"))
       (let (;; connection setup (dns/connect) always keeps a finite bound;
             ;; timeout 0 only lifts the response-side idle limit
             (setup-timeout (if (> timeout 0) timeout default-timeout-ms))
@@ -491,7 +513,7 @@
                                         (let ((req (build-request method host-header path headers body)))
                                           (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f))
                                         (client-loop c caller ref (make-inbuf) 'head idle codec
-                                                     on-chunk))))
+                                                     on-chunk max-resp))))
                                   (`#(tcp-connect-failed ,e)
                                     (send caller (vector 'http-error ref (uv-strerror e))))))
                               (`#(dns-failed ,e)

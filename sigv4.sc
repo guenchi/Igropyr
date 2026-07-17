@@ -169,7 +169,10 @@
   ;; decoded params alist. headers: to sign AND send (host NOT among
   ;; them). payload-hash: lowercase hex sha256 of the body ("UNSIGNED-
   ;; PAYLOAD" is also legal). opts: host access-key secret region
-  ;; service [datetime] [content-sha256].
+  ;; service [datetime] [content-sha256] [canonical-query] -- pass the
+  ;; already-computed (sigv4-canonical-query query) string when the
+  ;; caller also needs it for the URL, so it is built once and the
+  ;; signature and the wire share one value by construction.
   ;; -> headers alist to pass to (igropyr client): input headers plus
   ;;    x-amz-date [x-amz-content-sha256] authorization.
   (define (sigv4-sign-headers method path query headers payload-hash opts)
@@ -189,7 +192,8 @@
                                      `(("x-amz-content-sha256" . ,payload-hash))
                                      '())))
            (all-headers (cons (cons "host" host) sent-headers))
-           (canonical-query (sigv4-canonical-query query))
+           (canonical-query (or (opt opts 'canonical-query #f)
+                                (sigv4-canonical-query query)))
            (scope (string-append date "/" region "/" service "/aws4_request")))
       (let-values (((canonical signed)
                     (sigv4-canonical-request method path canonical-query

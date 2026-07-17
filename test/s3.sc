@@ -97,6 +97,9 @@
                 "<?xml version=\"1.0\"?><ListBucketResult>"
                 "<IsTruncated>false</IsTruncated>"
                 "<Contents><Key>sandbox/s1/L3_en.wav</Key></Contents>"
+                ;; numeric character references, decimal and hex -- how
+                ;; S3 emits characters XML 1.0 cannot carry literally
+                "<Contents><Key>sandbox/s1/c&#38;d&#x21;.wav</Key></Contents>"
                 "</ListBucketResult>")))
           (send-text! res
             (string-append
@@ -138,11 +141,28 @@
       (check "delete-ok" (eq? (s3-delete! s "audio/L1_en.wav") #t))
       (check "delete-404-ok" (eq? (s3-delete! s "ghost.wav") #t))
 
-      ;; list: paginates through the continuation token, unescapes entities
+      ;; list: paginates through the continuation token, unescapes both
+      ;; named entities and numeric character references
       (let ((keys (s3-list s "sandbox/s1/")))
         (check "list-keys"
-          (equal? keys '("sandbox/s1/L1_en.wav" "sandbox/s1/a&b.wav" "sandbox/s1/L3_en.wav")))
+          (equal? keys '("sandbox/s1/L1_en.wav" "sandbox/s1/a&b.wav"
+                         "sandbox/s1/L3_en.wav" "sandbox/s1/c&d!.wav")))
         (check "list-two-pages" (= (unbox list-calls) 2)))
+
+      ;; the response cap is per-config: a tiny max-response surfaces as
+      ;; the client's typed transport error, not a mangled body
+      (let ((s4 (make-s3 `((endpoint . ,(string-append "http://127.0.0.1:"
+                                                       (number->string port)))
+                           (bucket . "iter")
+                           (access-key . "AKtest") (secret . "SecretTest")
+                           (max-response . 16)))))
+        (check "max-response-cap"
+          (equal? (guard (e ((and (vector? e)
+                                  (eq? (vector-ref e 0) 'http-client-error))
+                             (vector-ref e 1)))
+                    (s3-get s4 "audio/L1_en.wav")
+                    'no-error)
+                  "response too large")))
 
       ;; a path in the endpoint would silently break signing: rejected
       (check "endpoint-path-rejected"

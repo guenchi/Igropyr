@@ -21,10 +21,16 @@
 ;;;
 ;;; One request = one connection, inherited from (igropyr client) -- the
 ;;; deliberate no-pool decision lives there, not here. https needs
-;;; (igropyr tls) enabled once at boot. Failures raise
+;;; (igropyr tls) enabled once at boot. HTTP-level failures raise
 ;;; #(s3-error status message) apart from the two soft spots a caller
 ;;; always branches on anyway: s3-get returns #f on 404 and s3-delete!
-;;; treats 404 as success (idempotent GC).
+;;; treats 404 as success (idempotent GC). TRANSPORT-level failures
+;;; (timeout, refused connection, response over the cap) pass through
+;;; as the client's #(http-client-error message) -- they have no status
+;;; and are usually retryable where an s3-error is not. The client caps
+;;; buffered responses at 32 MiB; objects bigger than that need
+;;; (max-response . bytes) in the make-s3 opts or they can be put but
+;;; never fetched.
 ;;;
 ;;; DeleteObjects (the XML batch call) is deliberately absent: it
 ;;; requires Content-MD5, and MD5 is not in (igropyr crypto) -- GC-scale
@@ -43,7 +49,7 @@
             host        ; host[:port when non-default] -- byte-for-byte
                         ; what (igropyr client) puts in Host, because
                         ; SigV4 signs the Host header
-            bucket access-key secret region timeout))
+            bucket access-key secret region timeout max-response))
 
   (define (opt opts key default)
     (let ((p (assq key opts))) (if p (cdr p) default)))
@@ -98,14 +104,16 @@
                     authority                          ; host:port as sent
                     (if colon (substring authority 0 colon) authority))))))
 
-  ;; opts: endpoint bucket access-key secret [region "auto"] [timeout 30000]
+  ;; opts: endpoint bucket access-key secret [region "auto"]
+  ;; [timeout 30000] [max-response -- client's 32 MiB default]
   (define (make-s3 opts)
     (let-values (((base host) (parse-endpoint (need opts 'endpoint))))
       (raw-s3 base host
               (need opts 'bucket)
               (need opts 'access-key) (need opts 'secret)
               (opt opts 'region "auto")
-              (opt opts 'timeout 30000))))
+              (opt opts 'timeout 30000)
+              (opt opts 'max-response #f))))
 
   (define empty-bv (make-bytevector 0))
   (define empty-payload-hash (sha256-hex empty-bv))
@@ -122,42 +130,47 @@
                      (if (> (string-length s) 300) (substring s 0 300) s)))))
 
   ;; sign + send. query: decoded params alist. Returns the response;
-  ;; caller decides which statuses are acceptable.
+  ;; caller decides which statuses are acceptable. The canonical query
+  ;; is computed ONCE and both signed and sent -- signature and wire
+  ;; share the value by construction, not by recomputation. Bodyless
+  ;; PUT/POST needs no special casing here: (igropyr client) writes the
+  ;; explicit Content-Length: 0 itself (unsigned, which SigV4 permits).
   (define (request s method path query headers body)
     (let* ((body-bv (or body empty-bv))
            (payload-hash (if (= (bytevector-length body-bv) 0)
                              empty-payload-hash
                              (sha256-hex body-bv)))
-           ;; bodyless PUT (CopyObject): (igropyr client) only writes
-           ;; Content-Length for non-empty bodies, and some S3 servers
-           ;; answer 411 without it -- send (and sign) an explicit zero
-           (headers (if (and (memq method '(PUT POST))
-                             (= (bytevector-length body-bv) 0))
-                        (cons '("content-length" . "0") headers)
-                        headers))
+           (qs (sigv4-canonical-query query))
            (signed (sigv4-sign-headers method path query headers payload-hash
                      `((host . ,(s3-host s))
                        (access-key . ,(s3-access-key s))
                        (secret . ,(s3-secret s))
                        (region . ,(s3-region s))
-                       (service . "s3"))))
-           (qs (sigv4-canonical-query query))
+                       (service . "s3")
+                       (canonical-query . ,qs))))
            (url (string-append (s3-base s) path
                                (if (string=? qs "") "" (string-append "?" qs)))))
       (http-request method url
         `((headers . ,signed)
           (body . ,body-bv)
-          (timeout . ,(s3-timeout s))))))
+          (timeout . ,(s3-timeout s))
+          . ,(let ((mr (s3-max-response s)))
+               (if mr `((max-response . ,mr)) '()))))))
 
   (define (ok? status) (and (>= status 200) (< status 300)))
+
+  ;; raise a typed s3-error unless the status is 2xx; returns r
+  (define (check! r)
+    (unless (ok? (response-status r))
+      (s3-fail (response-status r) (response-body r)))
+    r)
 
   ;; ---- operations --------------------------------------------------------
 
   ;; -> etag string (quotes stripped) or #t when the server sent none
   (define (s3-put! s key data content-type)
-    (let ((r (request s 'PUT (object-path s key) '()
-                      `(("content-type" . ,content-type)) data)))
-      (unless (ok? (response-status r)) (s3-fail (response-status r) (response-body r)))
+    (let ((r (check! (request s 'PUT (object-path s key) '()
+                              `(("content-type" . ,content-type)) data))))
       (let ((etag (response-header r 'etag)))
         (if etag (strip-quotes etag) #t))))
 
@@ -170,13 +183,10 @@
 
   ;; server-side copy within the bucket (promotion: sandbox/… -> items/…)
   (define (s3-copy! s src-key dst-key)
-    (let ((r (request s 'PUT (object-path s dst-key) '()
-                      `(("x-amz-copy-source"
-                         . ,(string-append "/" (s3-bucket s) "/"
-                                           (sigv4-uri-encode src-key #t))))
-                      #f)))
-      (unless (ok? (response-status r)) (s3-fail (response-status r) (response-body r)))
-      #t))
+    (check! (request s 'PUT (object-path s dst-key) '()
+                     `(("x-amz-copy-source" . ,(object-path s src-key)))
+                     #f))
+    #t)
 
   ;; idempotent: 404 counts as deleted
   (define (s3-delete! s key)
@@ -187,17 +197,18 @@
 
   ;; all keys under prefix, following continuation tokens
   (define (s3-list s prefix)
-    (let loop ((token #f) (acc '()))
+    (let loop ((token #f) (pages '()))
       (let* ((query (append `(("list-type" . "2") ("prefix" . ,prefix))
                             (if token `(("continuation-token" . ,token)) '())))
-             (r (request s 'GET (bucket-path s) query '() #f)))
-        (unless (ok? (response-status r)) (s3-fail (response-status r) (response-body r)))
-        (let* ((xml (utf8->string (response-body r)))
-               (keys (append acc (xml-all xml "Key")))
-               (next (and (xml-one xml "IsTruncated")
-                          (string=? (xml-one xml "IsTruncated") "true")
-                          (xml-one xml "NextContinuationToken"))))
-          (if next (loop next keys) keys)))))
+             (r (check! (request s 'GET (bucket-path s) query '() #f)))
+             (xml (utf8->string (response-body r)))
+             (pages (cons (xml-all xml "Key") pages))
+             (truncated (xml-one xml "IsTruncated"))
+             (next (and truncated (string=? truncated "true")
+                        (xml-one xml "NextContinuationToken"))))
+        (if next
+            (loop next pages)
+            (apply append (reverse pages))))))
 
   (define (s3-delete-prefix! s prefix)
     (for-each (lambda (k) (s3-delete! s k)) (s3-list s prefix))
@@ -225,6 +236,42 @@
                i)
               (else (loop (+ i 1)))))))
 
+  (define (prefix-at? s pre i)
+    (let ((pn (string-length pre)) (sn (string-length s)))
+      (and (<= (+ i pn) sn)
+           (let check ((j 0))
+             (or (= j pn)
+                 (and (char=? (string-ref s (+ i j)) (string-ref pre j))
+                      (check (+ j 1))))))))
+
+  ;; "&#13;" / "&#xD;" at i -> emit the character, return the index
+  ;; after ';' -- S3 emits control characters in object keys as numeric
+  ;; references (they cannot appear literally in XML 1.0), and a key
+  ;; read back wrong is a key that can never be deleted. #f when not a
+  ;; well-formed reference to a valid scalar value.
+  (define (numeric-ref s i p)
+    (and (prefix-at? s "&#" i)
+         (let* ((n (string-length s))
+                (hex? (and (< (+ i 2) n)
+                           (memv (string-ref s (+ i 2)) '(#\x #\X))))
+                (radix (if hex? 16 10)))
+           (define (digit c)
+             (let ((v (cond ((char<=? #\0 c #\9) (- (char->integer c) 48))
+                            ((char<=? #\a c #\f) (- (char->integer c) 87))
+                            ((char<=? #\A c #\F) (- (char->integer c) 55))
+                            (else #f))))
+               (and v (< v radix) v)))
+           (let loop ((j (+ i (if hex? 3 2))) (v 0) (any #f))
+             (and (< j n)
+                  (let ((c (string-ref s j)))
+                    (cond
+                      ((char=? c #\;)
+                       (and any (< v #x110000)
+                            (not (and (>= v #xD800) (<= v #xDFFF)))
+                            (begin (put-char p (integer->char v)) (+ j 1))))
+                      ((digit c) => (lambda (d) (loop (+ j 1) (+ (* v radix) d) #t)))
+                      (else #f))))))))
+
   (define (xml-unescape s)
     (let-values (((p get) (open-string-output-port)))
       (let loop ((i 0))
@@ -232,12 +279,12 @@
             (get)
             (if (char=? (string-ref s i) #\&)
                 (let ((try (lambda (ent ch)
-                             (and (string-search s ent i)
-                                  (= (string-search s ent i) i)
+                             (and (prefix-at? s ent i)
                                   (begin (put-char p ch)
                                          (+ i (string-length ent)))))))
                   (loop (or (try "&amp;" #\&) (try "&lt;" #\<) (try "&gt;" #\>)
                             (try "&quot;" #\") (try "&apos;" #\')
+                            (numeric-ref s i p)
                             (begin (put-char p #\&) (+ i 1)))))
                 (begin (put-char p (string-ref s i)) (loop (+ i 1))))))))
 
@@ -256,7 +303,12 @@
                     (loop (+ c (string-length close))
                           (cons (xml-unescape (substring xml b c)) acc)))))))))
 
+  ;; first <tag>…</tag> text only -- no full-document collection
   (define (xml-one xml tag)
-    (let ((r (xml-all xml tag)))
-      (and (pair? r) (car r))))
+    (let* ((open (string-append "<" tag ">"))
+           (a (string-search xml open 0)))
+      (and a
+           (let* ((b (+ a (string-length open)))
+                  (c (string-search xml (string-append "</" tag ">") b)))
+             (and c (xml-unescape (substring xml b c)))))))
 )
