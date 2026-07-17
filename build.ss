@@ -44,6 +44,8 @@
     ("igropyr/jwt.sc" . 2)
     ("igropyr/metrics.sc" . 2)
     ("igropyr/client.sc" . 2)
+    ("igropyr/sigv4.sc" . 2)
+    ("igropyr/s3.sc" . 2)
     ("igropyr/tls.sc" . 2)
     ("igropyr/redis.sc" . 2)
     ("igropyr/mysql.sc" . 2)

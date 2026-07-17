@@ -1,0 +1,235 @@
+#!chezscheme
+;;; (igropyr s3) -- S3-compatible object storage over (igropyr client):
+;;; AWS S3, Cloudflare R2, MinIO... anything speaking the S3 REST API.
+;;;
+;;;   (define r2 (make-s3 '((endpoint . "https://ACCT.r2.cloudflarestorage.com")
+;;;                         (bucket . "iter")
+;;;                         (access-key . "...") (secret . "...")
+;;;                         (region . "auto"))))          ; R2 region is "auto"
+;;;   (s3-put! r2 "items/x/L1_en.wav" wav-bytes "audio/wav")  ; -> etag | #t
+;;;   (s3-get r2 "items/x/L1_en.wav")                     ; -> bytevector | #f (404)
+;;;   (s3-copy! r2 "sandbox/s1/L1_en.wav" "items/x/L1_en.wav")
+;;;   (s3-delete! r2 "sandbox/s1/L1_en.wav")              ; 404 counts as done
+;;;   (s3-list r2 "sandbox/s1/")                          ; -> keys, paginates inside
+;;;   (s3-delete-prefix! r2 "sandbox/s1/")                ; list + delete each
+;;;
+;;; Path-style addressing (endpoint/bucket/key) -- what R2 and MinIO
+;;; use; virtual-host buckets work too by baking the bucket into the
+;;; endpoint host and passing (bucket . "") if ever needed. Object keys
+;;; go in DECODED; slashes stay literal, everything else is
+;;; percent-encoded once and the same string is signed and sent.
+;;;
+;;; One request = one connection, inherited from (igropyr client) -- the
+;;; deliberate no-pool decision lives there, not here. https needs
+;;; (igropyr tls) enabled once at boot. Failures raise
+;;; #(s3-error status message) apart from the two soft spots a caller
+;;; always branches on anyway: s3-get returns #f on 404 and s3-delete!
+;;; treats 404 as success (idempotent GC).
+;;;
+;;; DeleteObjects (the XML batch call) is deliberately absent: it
+;;; requires Content-MD5, and MD5 is not in (igropyr crypto) -- GC-scale
+;;; workloads do fine with list + per-key DELETE (s3-delete-prefix!).
+;;; The ListObjectsV2 XML is parsed with a minimal tag scanner (S3
+;;; responses are machine-generated and flat), entities unescaped.
+
+(library (igropyr s3)
+  (export make-s3 s3?
+          s3-put! s3-get s3-copy! s3-delete! s3-delete-prefix! s3-list)
+  (import (chezscheme) (igropyr crypto) (igropyr sigv4) (igropyr client))
+
+  ;; make-s3 (exported below) takes an opts alist; raw-s3 is internal
+  (define-record-type (s3 raw-s3 s3?)
+    (fields base        ; "https://host[:port]" with no trailing slash
+            host        ; hostname only -- what (igropyr client) puts in Host
+            bucket access-key secret region timeout))
+
+  (define (opt opts key default)
+    (let ((p (assq key opts))) (if p (cdr p) default)))
+
+  (define (need opts key)
+    (let ((p (assq key opts)))
+      (unless p (assertion-violation 'make-s3 "missing option" key))
+      (cdr p)))
+
+  ;; endpoint -> (values base host); accepts http:// and https://
+  (define (parse-endpoint ep)
+    (let* ((ep (if (char=? (string-ref ep (- (string-length ep) 1)) #\/)
+                   (substring ep 0 (- (string-length ep) 1))
+                   ep))
+           (scheme-end (let loop ((i 0))
+                         (cond ((>= (+ i 2) (string-length ep))
+                                (assertion-violation 'make-s3 "bad endpoint" ep))
+                               ((and (char=? (string-ref ep i) #\:)
+                                     (char=? (string-ref ep (+ i 1)) #\/)
+                                     (char=? (string-ref ep (+ i 2)) #\/))
+                                (+ i 3))
+                               (else (loop (+ i 1))))))
+           (rest (substring ep scheme-end (string-length ep)))
+           (colon (let loop ((i 0))
+                    (cond ((= i (string-length rest)) #f)
+                          ((char=? (string-ref rest i) #\:) i)
+                          (else (loop (+ i 1)))))))
+      (values ep (if colon (substring rest 0 colon) rest))))
+
+  ;; opts: endpoint bucket access-key secret [region "auto"] [timeout 30000]
+  (define (make-s3 opts)
+    (let-values (((base host) (parse-endpoint (need opts 'endpoint))))
+      (raw-s3 base host
+              (need opts 'bucket)
+              (need opts 'access-key) (need opts 'secret)
+              (opt opts 'region "auto")
+              (opt opts 'timeout 30000))))
+
+  (define empty-bv (make-bytevector 0))
+  (define empty-payload-hash (sha256-hex empty-bv))
+
+  (define (object-path s key)
+    (string-append "/" (s3-bucket s) "/" (sigv4-uri-encode key #t)))
+
+  (define (bucket-path s)
+    (string-append "/" (s3-bucket s)))
+
+  (define (s3-fail status body)
+    (raise (vector 's3-error status
+                   (let ((s (if (bytevector? body) (utf8->string body) "")))
+                     (if (> (string-length s) 300) (substring s 0 300) s)))))
+
+  ;; sign + send. query: decoded params alist. Returns the response;
+  ;; caller decides which statuses are acceptable.
+  (define (request s method path query headers body)
+    (let* ((body-bv (or body empty-bv))
+           (payload-hash (if (= (bytevector-length body-bv) 0)
+                             empty-payload-hash
+                             (sha256-hex body-bv)))
+           ;; bodyless PUT (CopyObject): (igropyr client) only writes
+           ;; Content-Length for non-empty bodies, and some S3 servers
+           ;; answer 411 without it -- send (and sign) an explicit zero
+           (headers (if (and (memq method '(PUT POST))
+                             (= (bytevector-length body-bv) 0))
+                        (cons '("content-length" . "0") headers)
+                        headers))
+           (signed (sigv4-sign-headers method path query headers payload-hash
+                     `((host . ,(s3-host s))
+                       (access-key . ,(s3-access-key s))
+                       (secret . ,(s3-secret s))
+                       (region . ,(s3-region s))
+                       (service . "s3"))))
+           (qs (sigv4-canonical-query query))
+           (url (string-append (s3-base s) path
+                               (if (string=? qs "") "" (string-append "?" qs)))))
+      (http-request method url
+        `((headers . ,signed)
+          (body . ,body-bv)
+          (timeout . ,(s3-timeout s))))))
+
+  (define (ok? status) (and (>= status 200) (< status 300)))
+
+  ;; ---- operations --------------------------------------------------------
+
+  ;; -> etag string (quotes stripped) or #t when the server sent none
+  (define (s3-put! s key data content-type)
+    (let ((r (request s 'PUT (object-path s key) '()
+                      `(("content-type" . ,content-type)) data)))
+      (unless (ok? (response-status r)) (s3-fail (response-status r) (response-body r)))
+      (let ((etag (response-header r 'etag)))
+        (if etag (strip-quotes etag) #t))))
+
+  ;; -> bytevector | #f on 404
+  (define (s3-get s key)
+    (let ((r (request s 'GET (object-path s key) '() '() #f)))
+      (cond ((ok? (response-status r)) (response-body r))
+            ((= (response-status r) 404) #f)
+            (else (s3-fail (response-status r) (response-body r))))))
+
+  ;; server-side copy within the bucket (promotion: sandbox/… -> items/…)
+  (define (s3-copy! s src-key dst-key)
+    (let ((r (request s 'PUT (object-path s dst-key) '()
+                      `(("x-amz-copy-source"
+                         . ,(string-append "/" (s3-bucket s) "/"
+                                           (sigv4-uri-encode src-key #t))))
+                      #f)))
+      (unless (ok? (response-status r)) (s3-fail (response-status r) (response-body r)))
+      #t))
+
+  ;; idempotent: 404 counts as deleted
+  (define (s3-delete! s key)
+    (let ((r (request s 'DELETE (object-path s key) '() '() #f)))
+      (unless (or (ok? (response-status r)) (= (response-status r) 404))
+        (s3-fail (response-status r) (response-body r)))
+      #t))
+
+  ;; all keys under prefix, following continuation tokens
+  (define (s3-list s prefix)
+    (let loop ((token #f) (acc '()))
+      (let* ((query (append `(("list-type" . "2") ("prefix" . ,prefix))
+                            (if token `(("continuation-token" . ,token)) '())))
+             (r (request s 'GET (bucket-path s) query '() #f)))
+        (unless (ok? (response-status r)) (s3-fail (response-status r) (response-body r)))
+        (let* ((xml (utf8->string (response-body r)))
+               (keys (append acc (xml-all xml "Key")))
+               (next (and (xml-one xml "IsTruncated")
+                          (string=? (xml-one xml "IsTruncated") "true")
+                          (xml-one xml "NextContinuationToken"))))
+          (if next (loop next keys) keys)))))
+
+  (define (s3-delete-prefix! s prefix)
+    (for-each (lambda (k) (s3-delete! s k)) (s3-list s prefix))
+    #t)
+
+  ;; ---- tiny helpers --------------------------------------------------------
+
+  (define (strip-quotes v)
+    (let ((n (string-length v)))
+      (if (and (>= n 2) (char=? (string-ref v 0) #\")
+               (char=? (string-ref v (- n 1)) #\"))
+          (substring v 1 (- n 1))
+          v)))
+
+  ;; ---- minimal flat-XML extraction (S3 list responses) ---------------------
+
+  (define (string-search hay needle start)
+    (let ((hn (string-length hay)) (nn (string-length needle)))
+      (let loop ((i start))
+        (cond ((> (+ i nn) hn) #f)
+              ((let check ((j 0))
+                 (or (= j nn)
+                     (and (char=? (string-ref hay (+ i j)) (string-ref needle j))
+                          (check (+ j 1)))))
+               i)
+              (else (loop (+ i 1)))))))
+
+  (define (xml-unescape s)
+    (let-values (((p get) (open-string-output-port)))
+      (let loop ((i 0))
+        (if (= i (string-length s))
+            (get)
+            (if (char=? (string-ref s i) #\&)
+                (let ((try (lambda (ent ch)
+                             (and (string-search s ent i)
+                                  (= (string-search s ent i) i)
+                                  (begin (put-char p ch)
+                                         (+ i (string-length ent)))))))
+                  (loop (or (try "&amp;" #\&) (try "&lt;" #\<) (try "&gt;" #\>)
+                            (try "&quot;" #\") (try "&apos;" #\')
+                            (begin (put-char p #\&) (+ i 1)))))
+                (begin (put-char p (string-ref s i)) (loop (+ i 1))))))))
+
+  ;; every <tag>…</tag> text, unescaped, in document order
+  (define (xml-all xml tag)
+    (let ((open (string-append "<" tag ">"))
+          (close (string-append "</" tag ">")))
+      (let loop ((i 0) (acc '()))
+        (let ((a (string-search xml open i)))
+          (if (not a)
+              (reverse acc)
+              (let* ((b (+ a (string-length open)))
+                     (c (string-search xml close b)))
+                (if (not c)
+                    (reverse acc)
+                    (loop (+ c (string-length close))
+                          (cons (xml-unescape (substring xml b c)) acc)))))))))
+
+  (define (xml-one xml tag)
+    (let ((r (xml-all xml tag)))
+      (and (pair? r) (car r))))
+)

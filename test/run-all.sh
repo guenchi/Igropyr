@@ -24,6 +24,8 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/sexpr-http.sc
 "$scheme_bin" --script igropyr/test/sexpr-ws.sc
 "$scheme_bin" --script igropyr/test/jwt.sc
+"$scheme_bin" --script igropyr/test/sigv4.sc
+"$scheme_bin" --script igropyr/test/s3.sc
 "$scheme_bin" --script igropyr/test/auth.sc
 "$scheme_bin" --script igropyr/test/express-routes.sc
 "$scheme_bin" --script igropyr/test/client-stream.sc

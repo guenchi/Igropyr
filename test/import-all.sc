@@ -9,6 +9,7 @@
         (igropyr pubsub) (igropyr express) (igropyr session)
         (igropyr auth) (igropyr middleware) (igropyr jwt)
         (igropyr metrics) (igropyr client)
+        (igropyr sigv4) (igropyr s3)
         (igropyr tls)
         (igropyr redis) (igropyr mysql) (igropyr node) (igropyr dpool) (igropyr cluster))
 (display "ALL LIBRARIES IMPORTED\n")

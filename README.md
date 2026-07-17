@@ -75,6 +75,11 @@ conversations, and s-expression RPC.
   bounded chunks with backpressure, never read whole
 - **gzip compression** — responses negotiated via `Accept-Encoding`;
   static files cache their compressed form
+- **S3-compatible object storage** — `(igropyr sigv4)` signs requests
+  (AWS Signature V4, pinned by the AWS documented test vectors) and
+  `(igropyr s3)` speaks the S3 REST API over the HTTP client: put / get /
+  server-side copy / delete / paginated list — AWS S3, Cloudflare R2,
+  MinIO
 - **Ops-ready** — rate limiting, a global error handler, and a
   Prometheus `/metrics` endpoint
 - **Runtime introspection & graceful shutdown** — `http-stats` (live
@@ -867,6 +872,8 @@ auth.sc        auth role: auth middleware + token-guard / session-guard for ws
 middleware.sc  cors / security-headers / logger / rate-limit / error-handler
 metrics.sc     Prometheus /metrics endpoint
 client.sc  non-blocking outbound HTTP client (async DNS)
+sigv4.sc   AWS Signature V4 request signing (pure)
+s3.sc      S3-compatible object storage (AWS S3 / R2 / MinIO)
 tls.sc     optional outbound TLS (OpenSSL memory-BIO codec) for https/wss
 redis.sc   non-blocking Redis client (RESP2), pipelined
 mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
