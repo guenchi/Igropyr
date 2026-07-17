@@ -10,6 +10,7 @@
 
 (define port 18091)
 (define raw-port 18092)
+(define bad-port 18093)
 
 (define failures 0)
 (define (check label ok)
@@ -96,12 +97,35 @@
         (tcp-read-start! c)))
     0))
 
+;; raw server answering with a NEGATIVE chunk size: both decoders must
+;; reject it as a bad chunked response, not misframe the stream or spin
+(define (start-badchunk-server!)
+  (tcp-listen! "0.0.0.0" bad-port 16
+    (lambda (c)
+      (let ((pid (spawn
+                   (lambda ()
+                     (receive
+                       (`#(tcp-data ,bv)
+                         (tcp-write! c (string->utf8
+                                         (string-append
+                                           "HTTP/1.1 200 OK\r\n"
+                                           "Transfer-Encoding: chunked\r\n\r\n"
+                                           "-2\r\nxx\r\n0\r\n\r\n")) #f)
+                         (sleep-ms 200)
+                         (tcp-close! c))
+                       (`#(tcp-eof) (tcp-close! c))
+                       (`#(tcp-error ,e) (tcp-close! c)))))))
+        (conn-set-owner! c pid)
+        (tcp-read-start! c)))
+    0))
+
 ;; ---- tests -----------------------------------------------------------------
 
 (start-scheduler
   (lambda ()
     (app-listen app port '((workers . 2)))
     (start-eof-server!)
+    (start-badchunk-server!)
     (sleep-ms 100)
 
     ;; chunked (SSE) streaming: one emit per wire chunk, in order,
@@ -177,6 +201,20 @@
                   (http-get (string-append "http://127.0.0.1:" (number->string port) "/sse")
                             '((timeout . 1500.5)))))
               "timeout must be a nonnegative exact integer (milliseconds)"))
+
+    ;; a negative chunk size is rejected by BOTH decoders (shared
+    ;; chunk-size parser), streaming and accumulating alike
+    (check "neg-chunk-stream"
+      (equal? (client-error-message
+                (lambda ()
+                  (http-get (string-append "http://127.0.0.1:" (number->string bad-port) "/")
+                            `((on-chunk . ,(lambda (bv) bv))))))
+              "bad chunked response"))
+    (check "neg-chunk-plain"
+      (equal? (client-error-message
+                (lambda ()
+                  (http-get (string-append "http://127.0.0.1:" (number->string bad-port) "/"))))
+              "bad chunked response"))
 
     ;; a crashing handler surfaces as a typed client error, not a hang
     (check "handler-crash"

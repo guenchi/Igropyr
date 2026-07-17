@@ -200,6 +200,31 @@
                       (loop (+ eol 2) (cons (cons k v) acc)))
                     (loop (+ eol 2) acc))))))))
 
+  ;; Parse the chunk-size line at offset pos (relative to the buffer
+  ;; start): scan for CRLF, strip any ";ext", read the hex size. The
+  ;; ONE copy of the chunked-transfer grammar -- both the accumulating
+  ;; and the streaming decoder below drive it. Anything but an unsigned
+  ;; exact integer is 'bad: a negative size from a broken server would
+  ;; otherwise misframe the stream (and a size of -4 makes the consumed
+  ;; length exactly zero -- a busy spin).
+  ;; -> (size . eol) | #f (need more bytes) | 'bad
+  (define (chunk-size-at buf pos)
+    (let ((bv (inbuf-bv buf)) (base (inbuf-start buf)) (n (inbuf-length buf)))
+      (let scan ((i pos))
+        (cond
+          ((fx>= (fx+ i 1) n) #f)
+          ((and (fx= (bytevector-u8-ref bv (fx+ base i)) 13)
+                (fx= (bytevector-u8-ref bv (fx+ base (fx+ i 1))) 10))
+           (let ((size (string->number
+                         (let ((line (utf8->string (inbuf-sub buf pos i))))
+                           (let ((semi (string-index line #\; 0)))
+                             (if semi (substring line 0 semi) line)))
+                         16)))
+             (if (and (integer? size) (exact? size) (>= size 0))
+                 (cons size i)
+                 'bad)))
+          (else (scan (fx+ i 1)))))))
+
   ;; Resume chunked decoding over the inbuf; pos/chunks/got RELATIVE to
   ;; the buffer start. Chunks already extracted are never re-parsed and
   ;; never re-copied -- the old decode-chunked re-read every chunk into
@@ -207,31 +232,21 @@
   ;; the 32MB response cap in the worst case.
   ;; -> #(done body) | #(more pos chunks got) | 'bad
   (define (chunked-step buf pos chunks got)
-    (let ((bv (inbuf-bv buf)) (base (inbuf-start buf)) (n (inbuf-length buf)))
-      (define (crlf-at p)
-        (let loop ((i p))
-          (cond ((fx>= (fx+ i 1) n) #f)
-                ((and (fx= (bytevector-u8-ref bv (fx+ base i)) 13)
-                      (fx= (bytevector-u8-ref bv (fx+ base (fx+ i 1))) 10))
-                 i)
-                (else (loop (fx+ i 1))))))
-      (let loop ((pos pos) (chunks chunks) (got got))
-        (let ((eol (crlf-at pos)))
-          (if (not eol)
-              (vector 'more pos chunks got)
-              (let ((size (string->number
-                            (let ((line (utf8->string (inbuf-sub buf pos eol))))
-                              (let ((semi (string-index line #\; 0)))
-                                (if semi (substring line 0 semi) line)))
-                            16)))
-                (cond
-                  ((not size) 'bad)
-                  ((= size 0) (vector 'done (bv-concat (reverse chunks) got)))
-                  ((< n (+ eol 2 size 2)) (vector 'more pos chunks got))
-                  (else
-                   (loop (+ eol 2 size 2)
-                         (cons (inbuf-sub buf (+ eol 2) (+ eol 2 size)) chunks)
-                         (+ got size))))))))))
+    (let loop ((pos pos) (chunks chunks) (got got))
+      (let ((r (chunk-size-at buf pos)))
+        (cond
+          ((not r) (vector 'more pos chunks got))
+          ((eq? r 'bad) 'bad)
+          (else
+           (let ((size (car r)) (eol (cdr r)))
+             (cond
+               ((= size 0) (vector 'done (bv-concat (reverse chunks) got)))
+               ((< (inbuf-length buf) (+ eol 2 size 2))
+                (vector 'more pos chunks got))
+               (else
+                (loop (+ eol 2 size 2)
+                      (cons (inbuf-sub buf (+ eol 2) (+ eol 2 size)) chunks)
+                      (+ got size))))))))))
 
   ;; ---- connection process ----------------------------------------------
 
@@ -241,30 +256,19 @@
   ;; is always at the buffer start. -> 'done | 'more | 'bad
   (define (chunked-stream-step! buf emit!)
     (let loop ()
-      (let ((bv (inbuf-bv buf)) (base (inbuf-start buf)) (n (inbuf-length buf)))
-        (define (crlf-at p)
-          (let scan ((i p))
-            (cond ((fx>= (fx+ i 1) n) #f)
-                  ((and (fx= (bytevector-u8-ref bv (fx+ base i)) 13)
-                        (fx= (bytevector-u8-ref bv (fx+ base (fx+ i 1))) 10))
-                   i)
-                  (else (scan (fx+ i 1))))))
-        (let ((eol (crlf-at 0)))
-          (if (not eol)
-              'more
-              (let ((size (string->number
-                            (let ((line (utf8->string (inbuf-sub buf 0 eol))))
-                              (let ((semi (string-index line #\; 0)))
-                                (if semi (substring line 0 semi) line)))
-                            16)))
-                (cond
-                  ((not size) 'bad)
-                  ((= size 0) 'done)              ; final chunk; trailers ignored
-                  ((< n (+ eol 2 size 2)) 'more)
-                  (else
-                   (emit! (inbuf-sub buf (+ eol 2) (+ eol 2 size)))
-                   (inbuf-consume! buf (+ eol 2 size 2))
-                   (loop)))))))))
+      (let ((r (chunk-size-at buf 0)))
+        (cond
+          ((not r) 'more)
+          ((eq? r 'bad) 'bad)
+          (else
+           (let ((size (car r)) (eol (cdr r)))
+             (cond
+               ((= size 0) 'done)               ; final chunk; trailers ignored
+               ((< (inbuf-length buf) (+ eol 2 size 2)) 'more)
+               (else
+                (emit! (inbuf-sub buf (+ eol 2) (+ eol 2 size)))
+                (inbuf-consume! buf (+ eol 2 size 2))
+                (loop)))))))))
 
   ;; ref tags each reply so a late reply (after the caller timed out)
   ;; cannot be mis-read by a later request from the same caller.
