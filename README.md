@@ -81,7 +81,8 @@ conversations, and s-expression RPC.
   server-side copy / delete / paginated list — AWS S3, Cloudflare R2,
   MinIO
 - **Ops-ready** — rate limiting, a global error handler, and a
-  Prometheus `/metrics` endpoint
+  Prometheus `/metrics` endpoint with app-defined business counters
+  (`metrics-count!`)
 - **Runtime introspection & graceful shutdown** — `http-stats` (live
   connection/request/pool counters), `http-shutdown!` (drain in-flight
   requests, refuse new connections)
