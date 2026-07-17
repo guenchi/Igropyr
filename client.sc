@@ -15,6 +15,24 @@
 ;;; Body arrives as a bytevector (utf8->string it if text). A transport
 ;;; failure or timeout raises #(http-client-error ,message).
 ;;;
+;;; Streaming responses: pass (on-chunk . proc) and the body is
+;;; delivered INCREMENTALLY instead of accumulated -- proc receives one
+;;; bytevector per decoded chunk (chunked transfer), per arriving
+;;; segment (counted or read-until-close bodies). The final response's
+;;; body is empty; status/headers are real. The buffer is consumed as
+;;; chunks are emitted, so an hours-long stream holds only the current
+;;; unparsed tail in memory. Timeout semantics change with on-chunk:
+;;; it bounds the IDLE GAP between chunks (0 = no idle timeout), and
+;;; there is no total-request deadline -- a healthy slow stream runs
+;;; forever. proc runs in the connection's green process (actor ops are
+;;; fine there); if it raises, the socket is closed and the caller gets
+;;; #(http-client-error "on-chunk handler raised").
+;;;
+;;;   (http-request 'POST url
+;;;     `((body . ,payload)
+;;;       (on-chunk . ,(lambda (bv) (publish 'tts-audio bv)))
+;;;       (timeout . 15000)))   ; kill the stream after a 15s silence
+;;;
 ;;; https:// works when the OPTIONAL (igropyr tls) library has been
 ;;; enabled -- (import (igropyr tls)) then (tls-enable!) once at startup.
 ;;; This library itself stays dependency-free: TLS plugs in through
@@ -217,6 +235,37 @@
 
   ;; ---- connection process ----------------------------------------------
 
+  ;; Streaming chunked decode: emit each complete chunk and consume it
+  ;; from the buffer immediately -- the buffer holds only the current
+  ;; unparsed tail however long the stream runs. The next chunk header
+  ;; is always at the buffer start. -> 'done | 'more | 'bad
+  (define (chunked-stream-step! buf emit!)
+    (let loop ()
+      (let ((bv (inbuf-bv buf)) (base (inbuf-start buf)) (n (inbuf-length buf)))
+        (define (crlf-at p)
+          (let scan ((i p))
+            (cond ((fx>= (fx+ i 1) n) #f)
+                  ((and (fx= (bytevector-u8-ref bv (fx+ base i)) 13)
+                        (fx= (bytevector-u8-ref bv (fx+ base (fx+ i 1))) 10))
+                   i)
+                  (else (scan (fx+ i 1))))))
+        (let ((eol (crlf-at 0)))
+          (if (not eol)
+              'more
+              (let ((size (string->number
+                            (let ((line (utf8->string (inbuf-sub buf 0 eol))))
+                              (let ((semi (string-index line #\; 0)))
+                                (if semi (substring line 0 semi) line)))
+                            16)))
+                (cond
+                  ((not size) 'bad)
+                  ((= size 0) 'done)              ; final chunk; trailers ignored
+                  ((< n (+ eol 2 size 2)) 'more)
+                  (else
+                   (emit! (inbuf-sub buf (+ eol 2) (+ eol 2 size)))
+                   (inbuf-consume! buf (+ eol 2 size 2))
+                   (loop)))))))))
+
   ;; ref tags each reply so a late reply (after the caller timed out)
   ;; cannot be mis-read by a later request from the same caller.
   ;; The parse advances INCREMENTALLY as segments arrive -- header scan,
@@ -226,10 +275,21 @@
   ;;   #(clen status headers body-start len)    counted body
   ;;   #(chunked status headers pos chunks got) chunked body, resumable
   ;;   #(eof status headers body-start)         body runs until close
-  (define (client-loop c caller ref buf state timeout codec)
+  ;; and, with an on-chunk handler (emit), the streaming variants whose
+  ;; body bytes are handed out and consumed instead of retained:
+  ;;   #(sclen status headers remaining)
+  ;;   #(schunked status headers)
+  ;;   #(seof status headers)
+  (define (client-loop c caller ref buf state timeout codec emit)
     (define (done!) (when codec ((vector-ref codec 2))) (tcp-close! c))
     (define (reply! r) (send caller (vector 'http-reply ref r)) (done!))
     (define (err! msg) (send caller (vector 'http-error ref msg)) (done!))
+    ;; a crashing on-chunk handler must not rot in this loop: the typed
+    ;; raise propagates to the process guards, which free the codec,
+    ;; close the socket, and answer the caller with the message
+    (define (emit! bv)
+      (guard (e (#t (fail "on-chunk handler raised")))
+        (emit bv)))
     ;; drive the parser as far as the buffered bytes allow; replies (or
     ;; errors) and returns #f, or returns the state to keep waiting in
     (define (step state)
@@ -246,15 +306,27 @@
                       (headers (parse-headers head (+ sl-end 2) hend)))
                  (cond
                    ((not status) (err! "malformed status line") #f)
-                   ((assq 'content-length headers)
-                    (step (vector 'clen status headers (+ hend 4)
-                                  (or (string->number
+                   (else
+                    ;; streaming: the head is consumed so body handling
+                    ;; works from the buffer start and stays flat
+                    (when emit (inbuf-consume! buf (+ hend 4)))
+                    (cond
+                      ((assq 'content-length headers)
+                       (let ((len (or (string->number
                                         (cdr (assq 'content-length headers)))
-                                      0))))
-                   ((let ((te (assq 'transfer-encoding headers)))
-                      (and te (string-ci=? (cdr te) "chunked")))
-                    (step (vector 'chunked status headers (+ hend 4) '() 0)))
-                   (else (vector 'eof status headers (+ hend 4))))))))
+                                      0)))
+                         (step (if emit
+                                   (vector 'sclen status headers len)
+                                   (vector 'clen status headers (+ hend 4) len)))))
+                      ((let ((te (assq 'transfer-encoding headers)))
+                         (and te (string-ci=? (cdr te) "chunked")))
+                       (step (if emit
+                                 (vector 'schunked status headers)
+                                 (vector 'chunked status headers (+ hend 4) '() 0))))
+                      (else
+                       (if emit
+                           (step (vector 'seof status headers))
+                           (vector 'eof status headers (+ hend 4)))))))))))
         ((eq? (vector-ref state 0) 'clen)
          (let ((body-start (vector-ref state 3)) (len (vector-ref state 4)))
            (if (>= (- (inbuf-length buf) body-start) len)
@@ -274,6 +346,33 @@
               #f)
              (else (vector 'chunked (vector-ref state 1) (vector-ref state 2)
                            (vector-ref r 1) (vector-ref r 2) (vector-ref r 3))))))
+        ((eq? (vector-ref state 0) 'sclen)
+         (let* ((remaining (vector-ref state 3))
+                (take (min (inbuf-length buf) remaining)))
+           (when (> take 0)
+             (emit! (inbuf-sub buf 0 take))
+             (inbuf-consume! buf take))
+           (if (= take remaining)
+               (begin
+                 (reply! (make-response (vector-ref state 1) (vector-ref state 2)
+                           empty-bv))
+                 #f)
+               (vector 'sclen (vector-ref state 1) (vector-ref state 2)
+                       (- remaining take)))))
+        ((eq? (vector-ref state 0) 'schunked)
+         (case (chunked-stream-step! buf emit!)
+           ((bad) (err! "bad chunked response") #f)
+           ((done)
+            (reply! (make-response (vector-ref state 1) (vector-ref state 2)
+                      empty-bv))
+            #f)
+           (else state)))
+        ((eq? (vector-ref state 0) 'seof)
+         (let ((n (inbuf-length buf)))
+           (when (> n 0)
+             (emit! (inbuf-sub buf 0 n))
+             (inbuf-consume! buf n))
+           state))
         (else state)))                          ; 'eof mode: wait for close
     (let ((state (step state)))
       (when state
@@ -281,17 +380,23 @@
           (`#(tcp-data ,raw)
             (let ((bv (if codec ((vector-ref codec 1) raw) raw)))
               (if (zero? (bytevector-length bv))   ; pure TLS records, no app data
-                  (client-loop c caller ref buf state timeout codec)
+                  (client-loop c caller ref buf state timeout codec emit)
                   (begin
                     (inbuf-append! buf bv)
+                    ;; with streaming consumption this caps the UNPARSED
+                    ;; tail (e.g. one oversized chunk), not the stream total
                     (if (> (inbuf-length buf) max-response)
                         (err! "response too large")
-                        (client-loop c caller ref buf state timeout codec))))))
+                        (client-loop c caller ref buf state timeout codec emit))))))
           (`#(tcp-eof)
-            (if (and (vector? state) (eq? (vector-ref state 0) 'eof))
-                (reply! (make-response (vector-ref state 1) (vector-ref state 2)
-                          (inbuf-sub buf (vector-ref state 3) (inbuf-length buf))))
-                (err! "connection closed early")))
+            (cond
+              ((and (vector? state) (eq? (vector-ref state 0) 'eof))
+               (reply! (make-response (vector-ref state 1) (vector-ref state 2)
+                         (inbuf-sub buf (vector-ref state 3) (inbuf-length buf)))))
+              ((and (vector? state) (eq? (vector-ref state 0) 'seof))
+               (reply! (make-response (vector-ref state 1) (vector-ref state 2)
+                         empty-bv)))
+              (else (err! "connection closed early"))))
           (`#(tcp-error ,e) (err! "connection error"))))))
 
   ;; ---- public API ------------------------------------------------------
@@ -302,13 +407,29 @@
   ;;   (headers . ((name . value) ...))   extra request headers
   ;;   (body    . string-or-bytevector)   request body
   ;;   (timeout . milliseconds)           default 30000
+  ;;   (on-chunk . proc)                  streaming: body bytevectors are
+  ;;                                      handed to proc as they decode;
+  ;;                                      the reply's body is empty. With
+  ;;                                      on-chunk, timeout bounds the idle
+  ;;                                      gap between chunks (0 = none) and
+  ;;                                      there is no total deadline.
   (define (http-request method url . rest)
     (let* ((opts (if (pair? rest) (car rest) '()))
            (headers (let ((p (assq 'headers opts))) (if p (cdr p) '())))
            (body (let ((p (assq 'body opts))) (and p (cdr p))))
            (timeout (let ((p (assq 'timeout opts))) (if p (cdr p) default-timeout-ms)))
+           (on-chunk (let ((p (assq 'on-chunk opts))) (and p (cdr p))))
+           ;; connection setup (dns/connect) always keeps a finite bound;
+           ;; timeout 0 only lifts the response-side idle limit
+           (setup-timeout (if (and (integer? timeout) (> timeout 0))
+                              timeout
+                              default-timeout-ms))
+           (idle (if (and (integer? timeout) (> timeout 0)) timeout 'infinity))
            (caller self)
            (ref (gensym)))
+      (when on-chunk
+        (unless (procedure? on-chunk)
+          (fail "on-chunk must be a procedure")))
       (let-values (((host port path tls?) (parse-url url)))
         ;; fail fast, before any connection is attempted
         (when (and tls? (not https-connector))
@@ -327,11 +448,11 @@
               ;; resolve the host (a dotted IP resolves to itself), then
               ;; connect to the IP
               (dns-resolve! host self)
-              (receive (after timeout
+              (receive (after setup-timeout
                           (send caller (vector 'http-error ref "dns timeout")))
                 (`#(dns-resolved ,ip)
                   (tcp-connect! ip port self)
-                  (receive (after timeout
+                  (receive (after setup-timeout
                               (send caller (vector 'http-error ref "connect timeout"))
                               ;; the connect is still in flight; if it
                               ;; lands after we gave up, close it so the
@@ -348,15 +469,22 @@
                                       (tcp-close! c)
                                       (raise e)))
                           (when tls?
-                            (set! codec (https-connector c host timeout)))
+                            (set! codec (https-connector c host setup-timeout)))
                           (let ((req (build-request method host path headers body)))
                             (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f))
-                          (client-loop c caller ref (make-inbuf) 'head timeout codec))))
+                          (client-loop c caller ref (make-inbuf) 'head idle codec
+                                       on-chunk))))
                     (`#(tcp-connect-failed ,e)
                       (send caller (vector 'http-error ref (uv-strerror e))))))
                 (`#(dns-failed ,e)
                   (send caller (vector 'http-error ref "dns resolution failed")))))))
-        (receive (after (+ timeout 2000)
+        ;; Non-streaming keeps the historical total deadline. A stream
+        ;; has no total: the caller parks until the connection process
+        ;; reports -- and IT is bounded by the idle timeout (or, with
+        ;; idle 0, by its own guards), so every path still answers.
+        (receive (after (if (or on-chunk (eq? idle 'infinity))
+                            'infinity
+                            (+ timeout 2000))
                     (raise (vector 'http-client-error "request timeout")))
           (`#(http-reply ,@ref ,resp) resp)
           (`#(http-error ,@ref ,msg) (raise (vector 'http-client-error msg)))))))
