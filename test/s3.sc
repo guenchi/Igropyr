@@ -49,6 +49,11 @@
         (sfail! 'put-payload-hash))
       (unless (equal? (req-header req 'content-type) "audio/wav")
         (sfail! 'put-content-type))
+      ;; non-default port: Host must carry it (it is signed, so client
+      ;; and sigv4 must agree byte for byte)
+      (unless (equal? (req-header req 'host)
+                      (string-append "127.0.0.1:" (number->string port)))
+        (sfail! 'put-host-port))
       (set-box! put-body-sha sha)
       (set-header! res "ETag" "\"etag-123\"")
       (res-send! res empty-bv))))
@@ -138,6 +143,13 @@
         (check "list-keys"
           (equal? keys '("sandbox/s1/L1_en.wav" "sandbox/s1/a&b.wav" "sandbox/s1/L3_en.wav")))
         (check "list-two-pages" (= (unbox list-calls) 2)))
+
+      ;; a path in the endpoint would silently break signing: rejected
+      (check "endpoint-path-rejected"
+        (guard (e ((assertion-violation? e) #t) (#t #f))
+          (make-s3 '((endpoint . "http://127.0.0.1:9000/minio") (bucket . "b")
+                     (access-key . "a") (secret . "s")))
+          #f))
 
       ;; unknown bucket path -> typed s3-error with the status
       (check "error-typed"

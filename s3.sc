@@ -40,7 +40,9 @@
   ;; make-s3 (exported below) takes an opts alist; raw-s3 is internal
   (define-record-type (s3 raw-s3 s3?)
     (fields base        ; "https://host[:port]" with no trailing slash
-            host        ; hostname only -- what (igropyr client) puts in Host
+            host        ; host[:port when non-default] -- byte-for-byte
+                        ; what (igropyr client) puts in Host, because
+                        ; SigV4 signs the Host header
             bucket access-key secret region timeout))
 
   (define (opt opts key default)
@@ -51,25 +53,50 @@
       (unless p (assertion-violation 'make-s3 "missing option" key))
       (cdr p)))
 
-  ;; endpoint -> (values base host); accepts http:// and https://
+  ;; endpoint -> (values base host). Accepts http[s]://host[:port] ONLY:
+  ;; a path here would make the signed canonical URI ("/bucket/key") and
+  ;; the path on the wire (base + path) disagree -- every request 403s
+  ;; with SignatureDoesNotMatch and no hint -- so it is rejected loudly.
+  ;; host mirrors the client's Host header exactly, port included when
+  ;; non-default, since that header is part of the signature.
   (define (parse-endpoint ep)
-    (let* ((ep (if (char=? (string-ref ep (- (string-length ep) 1)) #\/)
-                   (substring ep 0 (- (string-length ep) 1))
-                   ep))
-           (scheme-end (let loop ((i 0))
-                         (cond ((>= (+ i 2) (string-length ep))
-                                (assertion-violation 'make-s3 "bad endpoint" ep))
-                               ((and (char=? (string-ref ep i) #\:)
-                                     (char=? (string-ref ep (+ i 1)) #\/)
-                                     (char=? (string-ref ep (+ i 2)) #\/))
-                                (+ i 3))
-                               (else (loop (+ i 1))))))
-           (rest (substring ep scheme-end (string-length ep)))
-           (colon (let loop ((i 0))
-                    (cond ((= i (string-length rest)) #f)
-                          ((char=? (string-ref rest i) #\:) i)
-                          (else (loop (+ i 1)))))))
-      (values ep (if colon (substring rest 0 colon) rest))))
+    (let*-values
+        (((ep) (values
+                 (if (and (> (string-length ep) 0)
+                          (char=? (string-ref ep (- (string-length ep) 1)) #\/))
+                     (substring ep 0 (- (string-length ep) 1))
+                     ep)))
+         ((authority dport)
+          (cond
+            ((and (>= (string-length ep) 7)
+                  (string-ci=? (substring ep 0 7) "http://"))
+             (values (substring ep 7 (string-length ep)) 80))
+            ((and (>= (string-length ep) 8)
+                  (string-ci=? (substring ep 0 8) "https://"))
+             (values (substring ep 8 (string-length ep)) 443))
+            (else (assertion-violation 'make-s3
+                    "endpoint must be http[s]://host[:port]" ep)))))
+      (when (or (string=? authority "")
+                (let loop ((i 0))
+                  (and (< i (string-length authority))
+                       (or (char=? (string-ref authority i) #\/)
+                           (loop (+ i 1))))))
+        (assertion-violation 'make-s3
+          "endpoint must be http[s]://host[:port] with no path" ep))
+      (let* ((colon (let loop ((i 0))
+                      (cond ((= i (string-length authority)) #f)
+                            ((char=? (string-ref authority i) #\:) i)
+                            (else (loop (+ i 1))))))
+             (port (and colon
+                        (string->number
+                          (substring authority (+ colon 1)
+                                     (string-length authority))))))
+        (when (and colon (not (and (integer? port) (exact? port) (> port 0))))
+          (assertion-violation 'make-s3 "bad endpoint port" ep))
+        (values ep
+                (if (and colon (not (= port dport)))
+                    authority                          ; host:port as sent
+                    (if colon (substring authority 0 colon) authority))))))
 
   ;; opts: endpoint bucket access-key secret [region "auto"] [timeout 30000]
   (define (make-s3 opts)

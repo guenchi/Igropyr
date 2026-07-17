@@ -140,14 +140,16 @@
 
   (define crlf (string->utf8 "\r\n"))
 
-  (define (build-request method host path headers body)
+  ;; host-header is host[:port] -- RFC 7230 wants the port whenever it
+  ;; is not the scheme default (the caller computes it from parse-url)
+  (define (build-request method host-header path headers body)
     (let ((body-bv (cond ((not body) empty-bv)
                          ((string? body) (string->utf8 body))
                          (else body))))
       (let-values (((p get) (open-bytevector-output-port)))
         (define (line s) (put-bytevector p (string->utf8 s)) (put-bytevector p crlf))
         (line (string-append (symbol->string method) " " path " HTTP/1.1"))
-        (line (string-append "Host: " host))
+        (line (string-append "Host: " host-header))
         (line "Connection: close")
         (for-each
           (lambda (h) (line (string-append (car h) ": " (cdr h))))
@@ -445,7 +447,12 @@
           ;; fail fast, before any connection is attempted
           (when (and tls? (not https-connector))
             (fail "https not supported; import (igropyr tls) and call (tls-enable!)"))
-          (let* ((pid (spawn
+          (let* (;; Host carries the port when it is not the scheme
+                 ;; default (RFC 7230); TLS keeps the bare host for SNI
+                 (host-header (if (= port (if tls? default-tls-port default-port))
+                                  host
+                                  (string-append host ":" (number->string port))))
+                 (pid (spawn
                         (lambda ()
                           (guard (e (#t (send caller
                                           (vector 'http-error ref
@@ -481,7 +488,7 @@
                                                     (raise e)))
                                         (when tls?
                                           (set! codec (https-connector c host setup-timeout)))
-                                        (let ((req (build-request method host path headers body)))
+                                        (let ((req (build-request method host-header path headers body)))
                                           (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f))
                                         (client-loop c caller ref (make-inbuf) 'head idle codec
                                                      on-chunk))))
