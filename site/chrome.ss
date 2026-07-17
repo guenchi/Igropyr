@@ -92,6 +92,12 @@
       (".feature p b, .feature li b" (color (var fg)) (font-weight 600))
       (".feature ul" (color (var dim)) (padding-left (px 20)))
       (".feature li" (margin (px 6) 0))
+      ;; inline code in feature prose: the same chip every other prose
+      ;; context wears -- full-size mono loose in 16px sans reads as
+      ;; broken letter-spacing
+      (".feature p code, .feature li code"
+       (color (var acc)) (font-size (em 0 82)) (background (var bg2))
+       (padding (px 1) (px 5)) (border-radius (px 4)))
       (pre (background (var bg2)) (border (px 1) solid (var line))
            (border-radius (px 10)) (padding (px 20)) (overflow-x auto)
            (font-size (px 13 50)) (line-height (dec 1 6)))
