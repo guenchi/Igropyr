@@ -617,6 +617,20 @@ renders per-status counts, request-duration, and connection/pool gauges:
 ;;   igropyr_connections 12  ... igropyr_pool_busy 3
 ```
 
+A browser dashboard rides the same collector — one self-contained page
+(inline CSS/JS, no external assets, works air-gapped) polling a JSON
+snapshot route: requests/s and latency sparklines, connection and
+worker-pool gauges, per-status counts, and every `metrics-count!`
+family, refreshed every 2 s:
+
+```scheme
+(app-get app "/dash/data" (metrics-json m srv))
+(app-get app "/dash"      (metrics-dashboard "/dash/data"))
+```
+
+Both routes expose operational detail: guard them like `/metrics`
+itself (auth middleware, network policy).
+
 ## Outbound WebSocket
 
 `ws-connect` dials a `ws://` URL, does the upgrade handshake, and returns

@@ -4,7 +4,8 @@
 ;;; label-value escaping), all scraped through a real /metrics endpoint.
 
 (import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
-        (igropyr client) (igropyr metrics) (igropyr gen-server))
+        (igropyr client) (igropyr metrics) (igropyr gen-server)
+        (igropyr json))
 
 (define port 18096)
 
@@ -65,6 +66,40 @@
         (check "label-escaping" (string-contains? body "odd_labels_total{q=\"say \\\"hi\\\"\\\\x\"} 1"))
         (check "label-order-one-series" (string-contains? body "order_total{a=\"1\",b=\"2\"} 2"))
         (check "label-order-no-dup" (not (string-contains? body "order_total{b="))))
+
+      ;; browser dashboard: the page and its JSON snapshot ride the
+      ;; same collector as the Prometheus endpoint
+      (app-get app "/dash/data" (metrics-json m srv))
+      (app-get app "/dash" (metrics-dashboard "/dash/data"))
+
+      (let* ((r (http-get (string-append "http://127.0.0.1:" (number->string port)
+                                         "/dash")))
+             (page (utf8->string (response-body r))))
+        (check "dash-200" (= (response-status r) 200))
+        (check "dash-html" (string-contains? page "<!doctype html>"))
+        (check "dash-data-path" (string-contains? page "const DATA='/dash/data'")))
+
+      (let* ((r (http-get (string-append "http://127.0.0.1:" (number->string port)
+                                         "/dash/data")))
+             (d (string->json (utf8->string (response-body r)))))
+        (check "data-200" (= (response-status r) 200))
+        (check "data-uptime" (number? (json-ref d "uptime_ms")))
+        (check "data-requests-200"
+          (let ((n (json-ref d "requests" "200"))) (and (number? n) (>= n 2))))
+        (check "data-duration" (>= (json-ref d "duration_count") 2))
+        (check "data-pool" (number? (json-ref d "pool" "idle")))
+        (check "data-custom-jobs"
+          (let loop ((l (vector->list (json-ref d "custom"))))
+            (cond ((null? l) #f)
+                  ((equal? (json-ref (car l) "name") "jobs_done_total")
+                   (equal? 5 (json-ref (car l) "series" 0 "value")))
+                  (else (loop (cdr l)))))))
+
+      ;; a quote in the data path would break out of the JS string
+      (check "dash-bad-path-rejected"
+        (guard (e ((assertion-violation? e) #t) (#t #f))
+          (metrics-dashboard "/x'y")
+          #f))
 
       (if (zero? failures)
           (begin (display "metrics: all tests passed") (newline) (exit 0))

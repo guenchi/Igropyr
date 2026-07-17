@@ -526,6 +526,19 @@ request-duration 和 connection/pool gauge：
 ;;   igropyr_connections 12  ... igropyr_pool_busy 3
 ```
 
+浏览器监控页复用同一个 collector——单个自包含页面（内联 CSS/JS、
+无外部资源、离线可用），轮询一个 JSON 快照路由：requests/s 与延迟
+sparkline、连接数与 worker pool 仪表、每状态码计数，以及所有
+`metrics-count!` 计数族，每 2 秒刷新：
+
+```scheme
+(app-get app "/dash/data" (metrics-json m srv))
+(app-get app "/dash"      (metrics-dashboard "/dash/data"))
+```
+
+这两个路由和 `/metrics` 一样暴露运维细节：请同样加以保护
+（auth middleware、网络策略）。
+
 ## 出站 WebSocket
 
 `ws-connect` 拨号到 `ws://` URL，执行 upgrade handshake，并返回 client-role session；
