@@ -80,6 +80,10 @@ conversations, and s-expression RPC.
   `(igropyr s3)` speaks the S3 REST API over the HTTP client: put / get /
   server-side copy / delete / paginated list — AWS S3, Cloudflare R2,
   MinIO
+- **Vector scoring for embedding search** — `(igropyr blas)`: one call
+  scores a query against a row-major float32 matrix at memory bandwidth
+  (Accelerate / OpenBLAS via FFI), with a pure-Scheme fallback so it
+  runs — slower but correct — on hosts with no BLAS at all
 - **Ops-ready** — rate limiting, a global error handler, metrics as
   Prometheus / JSON / sexpr with app-defined business counters
   (`metrics-count!`), and a self-contained browser dashboard with a
@@ -570,6 +574,29 @@ verification failure raises `#(http-client-error "tls: …")`. Needs
 OpenSSL 3 or 1.1 (or LibreSSL) present as a shared library. See
 **Outbound TLS** below.
 
+## Vector scoring
+
+`(igropyr blas)` is the compute kernel for embedding search: one call
+fills `scores[i] = row_i · query` over a flat row-major float32 matrix,
+via `cblas_sgemv` when a native BLAS loads (Accelerate on macOS,
+OpenBLAS on Linux/FreeBSD) and via a pure-Scheme loop otherwise —
+`blas-available?` tells you which, correctness never depends on it.
+Top-k, thresholds and storage stay yours; this is the scan, at memory
+bandwidth.
+
+```scheme
+(import (igropyr blas))
+(blas-scores! base n dim query scores)   ; base [n x dim] f32, scores [n] f32
+```
+
+One scheduling note: an FFI call cannot be preempted, so a full scan
+stalls the calling scheduler for its duration (~0.2 ms at 5k×512 f32,
+~5 ms at 100k). Spread those stalls — every process scanning its own
+replica inline keeps the per-process stall duty cycle `q·s/N`
+negligible; don't funnel searches into a few dedicated processes. If
+that duty cycle ever grows, tile the scan and yield between tiles, or
+shard the corpus and scatter-gather — spread out, never centralize.
+
 ## Middleware suite
 
 Ready-made middleware for common needs. Register them with `app-use`;
@@ -921,6 +948,7 @@ dashboard.sc   metrics dashboard + turnkey admin listener (loopback default)
 client.sc  non-blocking outbound HTTP client (async DNS)
 sigv4.sc   AWS Signature V4 request signing (pure)
 s3.sc      S3-compatible object storage (AWS S3 / R2 / MinIO)
+blas.sc    vector scoring kernel: optional CBLAS sgemv, pure fallback
 tls.sc     optional outbound TLS (OpenSSL memory-BIO codec) for https/wss
 redis.sc   non-blocking Redis client (RESP2), pipelined
 mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool

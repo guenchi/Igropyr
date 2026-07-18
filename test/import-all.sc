@@ -1,6 +1,6 @@
 #!chezscheme
 (import (chezscheme)
-        (igropyr util)
+        (igropyr util) (igropyr blas)
         (igropyr checked) (igropyr buffer)
         (igropyr platform) (igropyr crypto)
         (igropyr libuv) (igropyr actor) (igropyr otp)
