@@ -606,6 +606,11 @@
   ;; remaining segments joined with "/" under the param name "0". A
   ;; non-trailing "*" never reaches here: registration rejects it
   ;; (check-splat!), so the swallow-everything arm is safe.
+  ;; index of the first #\: in s, or #f
+  (define (seg-colon-index s)
+    (let ((n (string-length s)))
+      (let lp ((i 0)) (cond ((fx= i n) #f) ((char=? (string-ref s i) #\:) i) (else (lp (fx+ i 1)))))))
+
   (define (match-segments psegs segs)
     (let loop ((ps psegs) (ss segs) (params '()))
       (cond
@@ -624,6 +629,15 @@
                (cons (cons (substring (car ps) 1 (string-length (car ps)))
                            (car ss))
                      params)))
+        ;; literal-prefix param (express syntax, e.g. "@:username"): the URL
+        ;; segment must start with the literal prefix, the rest is the param.
+        ((let ((ci (seg-colon-index (car ps)))) (and ci (fx> ci 0)))
+         (let* ((p (car ps)) (ci (seg-colon-index p))
+                (prefix (substring p 0 ci)) (name (substring p (fx+ ci 1) (string-length p)))
+                (seg (car ss)) (pl (string-length prefix)))
+           (if (and (fx> (string-length seg) pl) (string=? (substring seg 0 pl) prefix))
+               (loop (cdr ps) (cdr ss) (cons (cons name (substring seg pl (string-length seg))) params))
+               #f)))
         ((string=? (car ps) (car ss))
          (loop (cdr ps) (cdr ss) params))
         (else #f))))
