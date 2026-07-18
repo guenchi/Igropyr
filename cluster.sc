@@ -22,14 +22,9 @@
 ;;;
 ;;; A discover strategy is either a thunk returning ((name host port)...)
 ;;; or one of the three built-ins:
-;;;   (static (name host port) ...) -- a fixed list (self may be included;
-;;;                                    it is skipped)
-;;;   (redis conn host port)        -- each cycle the node heartbeats its
-;;;     own (name host port) into a per-cluster sorted set keyed by an
-;;;     expiry timestamp, prunes entries whose time has passed, and reads
-;;;     the live set. A node that stops heartbeating (crash, shutdown)
-;;;     falls out after ttl-ms with no central bookkeeping.
-;;;   (gossip (advertise host port)          -- fully decentralized: no
+;;;   1. (static (name host port) ...) -- a fixed list (self may be
+;;;                                    included; it is skipped)
+;;;   2. (gossip (advertise host port)       -- fully decentralized: no
 ;;;           [(seeds (name host port) ...)]    shared store at all. Each
 ;;;           [(fanout . 3)])                   node keeps a replicated
 ;;;     member table and once per cycle PUSH-PULLs it with up to fanout
@@ -42,12 +37,19 @@
 ;;;     OWNER advances the heartbeat (incarnation = the owner's boot
 ;;;     stamp, so a restarted node outranks every record its old life
 ;;;     gossiped); a record whose (incarnation . heartbeat) has not
-;;;     advanced for ttl-ms of LOCAL time is dropped. That is the redis
-;;;     strategy's expiry semantics, decentralized: a stale echo can
-;;;     never refresh a dead record, so removed nodes age out everywhere
-;;;     within ~2 ttl, zombie-free. All members of one cluster must use
-;;;     the same (name . ...) option -- the membership server registers
-;;;     as igropyr-gossip:<name> and peers rcall it by that name.
+;;;     advanced for ttl-ms of LOCAL time is dropped -- expiry semantics
+;;;     with no central store: a stale echo can never refresh a dead
+;;;     record, so removed nodes age out everywhere within ~2 ttl,
+;;;     zombie-free. All members of one cluster must use the same
+;;;     (name . ...) option -- the membership server registers as
+;;;     igropyr-gossip:<name> and peers rcall it by that name.
+;;;   3. (redis conn host port)        -- each cycle the node heartbeats
+;;;     its own (name host port) into a per-cluster sorted set keyed by an
+;;;     expiry timestamp, prunes entries whose time has passed, and reads
+;;;     the live set. A node that stops heartbeating (crash, shutdown)
+;;;     falls out after ttl-ms with no central bookkeeping. Same expiry
+;;;     model as gossip, but arbitrated by a shared Redis instead of
+;;;     peer-to-peer -- reach for it when you already run Redis.
 ;;;
 ;;; Options: (name . "default") namespaces the Redis key / the gossip
 ;;; service; (interval-ms . 5000) how often to discover + heartbeat;
@@ -257,9 +259,6 @@
                           peers)
            (assertion-violation 'cluster-start "static peers want (name host valid-port)" peers))
          (lambda () peers)))
-      ((and (pair? spec) (eq? (car spec) 'redis))
-       (let ((conn (cadr spec)) (host (caddr spec)) (port (cadddr spec)))
-         (redis-discover conn cluster-key (node-self) host port ttl-ms)))
       ((and (pair? spec) (eq? (car spec) 'gossip))
        (let* ((gopts (cdr spec))
               (adv (opt gopts 'advertise #f))
@@ -301,6 +300,9 @@
                  (append view
                          (filter (lambda (s) (not (assq (car s) view)))
                                  seeds))))))))
+      ((and (pair? spec) (eq? (car spec) 'redis))
+       (let ((conn (cadr spec)) (host (caddr spec)) (port (cadddr spec)))
+         (redis-discover conn cluster-key (node-self) host port ttl-ms)))
       (else (assertion-violation 'cluster-start "bad discover strategy" spec))))
 
   ;; ---- the maintainer process -------------------------------------------
