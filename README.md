@@ -84,6 +84,9 @@ conversations, and s-expression RPC.
   scores a query against a row-major float32 matrix at memory bandwidth
   (Accelerate / OpenBLAS via FFI), with a pure-Scheme fallback so it
   runs — slower but correct — on hosts with no BLAS at all
+- **Embedded JavaScript** — `(igropyr quickjs)` runs a fixed JS bundle
+  in-process via QuickJS (memory/stack/time capped, crash-only rebuild);
+  user input is data, never code
 - **Ops-ready** — rate limiting, a global error handler, metrics as
   Prometheus / JSON / sexpr with app-defined business counters
   (`metrics-count!`), and a self-contained browser dashboard with a
@@ -597,6 +600,31 @@ negligible; don't funnel searches into a few dedicated processes. If
 that duty cycle ever grows, tile the scan and yield between tiles, or
 shard the corpus and scatter-gather — spread out, never centralize.
 
+## Embedded JavaScript
+
+`(igropyr quickjs)` embeds a JavaScript engine (QuickJS) in-process for
+running a **fixed** JS bundle baked at build time — a reference
+implementation you must match byte-for-byte, a sandboxed expression
+evaluator, a JS template. User input is the string **argument**, never
+code:
+
+```scheme
+(import (igropyr quickjs))
+(qjs-boot! "function slugify(s){ return s.toLowerCase().replace(/\\s+/g,'-') }")
+(qjs-call! "slugify" "Hello World")   ; -> "hello-world"
+```
+
+It is hardened in the C shim (`quickjs-shim.c`): a memory cap, a stack
+cap, a wall-clock interrupt deadline, and **crash-only rebuild** — a
+throwing or runaway call discards the whole JS heap and reboots it from
+the bundle (`qjs-generation` counts rebuilds), so one bad call can't
+poison the next. The engine is mutex-serialized and each call runs with
+interrupts disabled, so a call blocks its OS thread for its duration
+(sub-millisecond typically, `timeout-ms` worst case) — cap input size on
+latency-sensitive paths. The native shim is a build artifact
+(`build-quickjs-shim.sh`, needs QuickJS installed); without it the
+library imports fine and `qjs-boot!` reports the missing shim.
+
 ## Middleware suite
 
 Ready-made middleware for common needs. Register them with `app-use`;
@@ -949,6 +977,7 @@ client.sc  non-blocking outbound HTTP client (async DNS)
 sigv4.sc   AWS Signature V4 request signing (pure)
 s3.sc      S3-compatible object storage (AWS S3 / R2 / MinIO)
 blas.sc    vector scoring kernel: optional CBLAS sgemv, pure fallback
+quickjs.sc embed a JS engine in-process (QuickJS via a C shim)
 tls.sc     optional outbound TLS (OpenSSL memory-BIO codec) for https/wss
 redis.sc   non-blocking Redis client (RESP2), pipelined
 mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
