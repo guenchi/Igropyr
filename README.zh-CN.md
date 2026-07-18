@@ -536,6 +536,15 @@ sparkline、连接数与 worker pool 仪表、每状态码计数，以及所有
 (app-get app "/dash"      (metrics-dashboard "/dash/data"))
 ```
 
+节点上（`node-start!` 之后）宣告一次本机摘要，所有同样宣告过的
+peer 就会出现在监控页的集群表里（uptime、连接数、req/s、延迟、
+5xx、pool）——数据经由已有的 node 链路 `rcall` 聚合，peer 无需
+额外暴露 HTTP：
+
+```scheme
+(metrics-announce! m srv)
+```
+
 这两个路由和 `/metrics` 一样暴露运维细节：请同样加以保护
 （auth middleware、网络策略）。
 

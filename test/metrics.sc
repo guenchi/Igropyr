@@ -5,7 +5,7 @@
 
 (import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
         (igropyr client) (igropyr metrics) (igropyr gen-server)
-        (igropyr json))
+        (igropyr json) (igropyr node))
 
 (define port 18096)
 
@@ -93,7 +93,33 @@
             (cond ((null? l) #f)
                   ((equal? (json-ref (car l) "name") "jobs_done_total")
                    (equal? 5 (json-ref (car l) "series" 0 "value")))
-                  (else (loop (cdr l)))))))
+                  (else (loop (cdr l))))))
+        ;; not a node yet: the cluster member is JSON null
+        (check "data-cluster-null" (eq? (json-ref d "cluster") 'null)))
+
+      ;; cluster view: become a (single-node) mesh member, announce,
+      ;; and the snapshot grows a cluster table with the self row
+      (node-start! 'm1 "metrics-secret" 18097 "127.0.0.1")
+      (metrics-announce! m srv)
+      (let* ((r (http-get (string-append "http://127.0.0.1:" (number->string port)
+                                         "/dash/data")))
+             (d (string->json (utf8->string (response-body r))))
+             (cl (json-ref d "cluster")))
+        (check "cluster-self" (equal? (json-ref cl "self") "m1"))
+        (let ((n0 (json-ref cl "nodes" 0)))
+          (check "cluster-node-name" (equal? (json-ref n0 "name") "m1"))
+          (check "cluster-node-self" (eq? (json-ref n0 "self") #t))
+          (check "cluster-node-uptime" (number? (json-ref n0 "uptime_ms")))
+          (check "cluster-node-requests"
+            (let ((n (json-ref n0 "requests"))) (and (number? n) (>= n 2))))
+          (check "cluster-node-5xx" (equal? 0 (json-ref n0 "err_5xx")))))
+
+      ;; the announced summary answers rcall under the well-known name
+      ;; (own-node rcall = the same path a peer's dashboard would take)
+      (check "announce-rcall"
+        (let ((s (rcall 'm1 'igropyr-metrics 'summary)))
+          (and (pair? (assq 'requests s))
+               (number? (cdr (assq 'requests s))))))
 
       ;; a quote in the data path would break out of the JS string
       (check "dash-bad-path-rejected"

@@ -26,12 +26,24 @@
 ;;;
 ;;; Both routes expose operational detail: guard them the same way as
 ;;; /metrics itself (auth middleware, network policy).
+;;;
+;;; Cluster view: on a node (after node-start!), announce the local
+;;; summary once --
+;;;
+;;;   (metrics-announce! m srv)
+;;;
+;;; -- and every peer that did the same shows up in this dashboard's
+;;; cluster table (uptime, connections, req/s, latency, 5xx, pool),
+;;; fetched over the existing node links by rcall; no extra HTTP
+;;; exposure, no cross-origin fetches. Without node-start! the JSON's
+;;; "cluster" is null and the section stays hidden.
 
 (library (igropyr metrics)
   (export make-metrics metrics-middleware metrics-endpoint metrics-count!
-          metrics-json metrics-dashboard)
+          metrics-json metrics-dashboard metrics-announce!)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr gen-server)
-          (igropyr http) (igropyr express))
+          (igropyr http) (igropyr express)
+          (only (igropyr node) node-self node-peers rcall))
 
   ;; state: #(status-count-ht duration-sum-box duration-count-box
   ;;          custom-ht)  where custom-ht: name -> (label-string -> count)
@@ -234,6 +246,81 @@
         (set-header! res "Content-Type" "text/plain; version=0.0.4")
         (res-send! res (string->utf8 (render dump stats))))))
 
+  ;; ---- cluster view -------------------------------------------------------
+
+  ;; the registered name peers rcall for a node's summary
+  (define node-service 'igropyr-metrics)
+  (define peer-timeout-ms 1000)
+
+  ;; compact summary of this node, wire-safe (symbols/numbers only in
+  ;; the alist -- it crosses node links)
+  (define (node-summary m srv)
+    (let ((dump (gen-server-call m (vector 'dump)))
+          (stats (http-stats srv)))
+      (define (stat k) (cdr (assq k stats)))
+      (let loop ((l (vector-ref dump 0)) (total 0) (err5 0))
+        (if (pair? l)
+            (loop (cdr l) (+ total (cdar l))
+                  (if (>= (caar l) 500) (+ err5 (cdar l)) err5))
+            `((uptime-ms . ,(stat 'uptime-ms))
+              (connections . ,(stat 'connections))
+              (busy . ,(stat 'busy))
+              (idle . ,(stat 'idle))
+              (pending . ,(stat 'pending))
+              (requests . ,total)
+              (err5xx . ,err5)
+              (duration-sum . ,(vector-ref dump 1))
+              (duration-count . ,(vector-ref dump 2)))))))
+
+  ;; Serve this node's summary to the mesh under the well-known name.
+  ;; Call once after node-start! and app-listen; every peer that did
+  ;; the same appears in each other's dashboard cluster table.
+  (define (metrics-announce! m srv)
+    (gen-server-start-named node-service
+      (lambda () #f)
+      (lambda (msg from st) (values (node-summary m srv) st))
+      (lambda (msg st) st)))
+
+  ;; summary alist -> JSON fields; anything missing or garbled in a
+  ;; peer's reply becomes null -- a broken peer must not take the local
+  ;; endpoint down
+  (define summary-fields
+    '((uptime-ms . "uptime_ms") (connections . "connections")
+      (busy . "pool_busy") (idle . "pool_idle") (pending . "pool_pending")
+      (requests . "requests") (err5xx . "err_5xx")
+      (duration-sum . "duration_sum_ms") (duration-count . "duration_count")))
+
+  (define (summary-json summary)
+    (map (lambda (f)
+           (cons (cdr f)
+                 (let ((p (guard (e (#t #f)) (assq (car f) summary))))
+                   (if (and (pair? p) (number? (cdr p))) (cdr p) 'null))))
+         summary-fields))
+
+  ;; the "cluster" JSON member: self plus one rcall per connected peer
+  ;; (each bounded by peer-timeout-ms; a peer without metrics-announce!
+  ;; renders up=false with null data). 'null when node-start! never ran.
+  (define (cluster-json m srv)
+    (if (not (node-self))
+        'null
+        `(("self" . ,(symbol->string (node-self)))
+          ("nodes"
+           . ,(list->vector
+                (cons
+                  (append
+                    `(("name" . ,(symbol->string (node-self)))
+                      ("self" . #t) ("up" . #t))
+                    (summary-json (node-summary m srv)))
+                  (map (lambda (peer)
+                         (let ((s (guard (e (#t #f))
+                                    (rcall peer node-service 'summary
+                                           peer-timeout-ms))))
+                           (append
+                             `(("name" . ,(symbol->string peer))
+                               ("self" . #f) ("up" . ,(and s #t)))
+                             (summary-json (or s '())))))
+                       (node-peers))))))))
+
   ;; ---- browser dashboard ------------------------------------------------
 
   ;; machine-readable snapshot of everything /metrics renders; the
@@ -264,7 +351,8 @@
                                         `(("labels" . ,(car lv))
                                           ("value" . ,(cdr lv))))
                                       (cdr fam))))))
-                       (vector-ref dump 3)))))))))
+                       (vector-ref dump 3))))
+            ("cluster" . ,(cluster-json m srv)))))))
 
   ;; The page: requests/s and latency sparklines (computed client-side
   ;; from snapshot deltas), connection/pool gauges, per-status counts,
@@ -306,6 +394,7 @@ td.ok{color:var(--ok)}td.warn{color:var(--warn)}td.bad{color:var(--bad)}
 <div class='card'><h2>connections</h2><div class='v' id='conn'>&ndash;</div><canvas id='c-conn'></canvas></div>
 <div class='card'><h2>requests total</h2><div class='v' id='total'>&ndash;</div><div class='dim'>avg <span id='avg'>&ndash;</span> lifetime</div></div>
 </div>
+<section id='cluster-sec' style='display:none'><h2>cluster</h2><table><tbody id='cluster'></tbody></table></section>
 <section><h2>worker pool</h2><table><tbody id='pool'></tbody></table></section>
 <section><h2>status codes</h2><table><tbody id='codes'></tbody></table></section>
 <section><h2>business counters</h2><div id='custom'></div></section>
@@ -339,13 +428,46 @@ function spark(id,arr){
 function fmtUp(ms){
   const s=Math.floor(ms/1000),d=Math.floor(s/86400),
         h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
-  return 'up '+(d?d+'d ':'')+h+'h '+m+'m '+(s%60)+'s';
+  return (d?d+'d ':'')+h+'h '+m+'m '+(s%60)+'s';
 }
 function bar(pct){return '<div class=bar><i style=width:'+Math.min(100,pct)+'%></i></div>';}
+const num=v=>typeof v==='number';
+const nodesPrev={};
+function clusterRow(n,t){
+  let rps='&mdash;',lat='&mdash;';
+  if(num(n.requests)){
+    const p=nodesPrev[n.name];
+    if(p){
+      const dt=Math.max(0.001,(t-p.t)/1000);
+      rps=fmt(Math.max(0,(n.requests-p.req)/dt));
+      const dc=n.duration_count-p.dc;
+      if(dc>0)lat=fmt(Math.max(0,(n.duration_sum_ms-p.ds)/dc))+' ms';
+    }
+    nodesPrev[n.name]={t:t,req:n.requests,dc:n.duration_count,ds:n.duration_sum_ms};
+  }
+  const live=num(n.uptime_ms);
+  const st=n.self?'self':live?'live':'no data';
+  return '<tr><td>'+esc(n.name)+'</td><td class='+(live?'ok':'warn')+'>'+st+
+    '</td><td class=n>'+(live?fmtUp(n.uptime_ms):'&mdash;')+
+    '</td><td class=n>'+(num(n.connections)?n.connections:'&mdash;')+
+    '</td><td class=n>'+rps+'</td><td class=n>'+lat+
+    '</td><td class=n>'+(num(n.err_5xx)?n.err_5xx.toLocaleString():'&mdash;')+
+    '</td><td class=n>'+(num(n.pool_busy)?n.pool_busy+'/'+(n.pool_busy+n.pool_idle):'&mdash;')+
+    '</td></tr>';
+}
+function renderCluster(cl,t){
+  if(!cl)return;
+  $('cluster-sec').style.display='';
+  $('cluster').innerHTML=
+    '<tr class=dim><td>node</td><td>status</td><td class=n>uptime</td>'+
+    '<td class=n>conns</td><td class=n>req/s</td><td class=n>latency</td>'+
+    '<td class=n>5xx</td><td class=n>busy/pool</td></tr>'+
+    Array.from(cl.nodes||[]).map(n=>clusterRow(n,t)).join('');
+}
 function render(d){
   const reqs=d.requests||{},codes=Object.keys(reqs).sort();
   const total=codes.reduce((a,k)=>a+reqs[k],0);
-  $('uptime').textContent=fmtUp(d.uptime_ms);
+  $('uptime').textContent='up '+fmtUp(d.uptime_ms);
   $('conn').textContent=d.connections;
   $('total').textContent=total.toLocaleString();
   $('avg').textContent=fmt(d.duration_count?d.duration_sum_ms/d.duration_count:0)+' ms';
@@ -364,6 +486,7 @@ function render(d){
       '<tr><td>'+(esc(s.labels)||'&mdash;')+'</td><td class=n>'+
       s.value.toLocaleString()+'</td></tr>').join('')+'</tbody></table>').join('')
     :'<p class=dim>none yet &mdash; count with metrics-count!</p>';
+  renderCluster(d.cluster,Date.now());
   return total;
 }
 async function tick(){

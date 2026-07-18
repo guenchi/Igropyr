@@ -628,6 +628,15 @@ family, refreshed every 2 s:
 (app-get app "/dash"      (metrics-dashboard "/dash/data"))
 ```
 
+On a node (after `node-start!`), announce the local summary once and
+every peer that did the same appears in the dashboard's cluster table
+(uptime, connections, req/s, latency, 5xx, pool) — gathered over the
+existing node links by `rcall`, so no peer needs to expose HTTP:
+
+```scheme
+(metrics-announce! m srv)
+```
+
 Both routes expose operational detail: guard them like `/metrics`
 itself (auth middleware, network policy).
 
