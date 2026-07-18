@@ -6,9 +6,14 @@
 ;;;     a Redis sorted set (skipped cleanly if no server on 6379)
 ;;;   - redis registration format + expiry pruning, verified against the
 ;;;     live server
+;;;   - gossip strategy: two children know ONLY the seed (a) yet must
+;;;     find and dial EACH OTHER (addresses travel inside the records);
+;;;     a killed member's record ages out of the seed's view within ttl
+;;;     (not just its link dying); a fresh member rejoins through the
+;;;     seed with a new incarnation
 
 (import (chezscheme) (igropyr actor) (igropyr node)
-        (igropyr redis) (igropyr cluster))
+        (igropyr redis) (igropyr cluster) (igropyr gen-server))
 
 (define a-port 18093)
 (define secret "cluster-secret")
@@ -33,6 +38,12 @@
           (receive (after 500 (wait (+ tries 1)))
             (`#(pong ,@who) 'ok)))
         (begin (sleep-ms 250) (wait (+ tries 1))))))
+
+;; ask a child for ITS peer list (via its 'ping process); #f on timeout
+(define (peers-of who)
+  (rsend who 'ping (vector 'peers? 'a))
+  (receive (after 1000 #f)
+    (`#(peers ,@who ,ps) ps)))
 
 (define (redis-up?)
   (guard (e (#t #f))
@@ -94,6 +105,52 @@
           (system "pkill -f 'cluster-child.sc c ' 2>/dev/null")
           (redis r "DEL" key)
           (redis-close! r)))
+
+    ;; ---- gossip strategy ----
+    ;; a runs seedless (it IS the seed); d and e are configured with a
+    ;; as their only contact. e's address must reach d THROUGH gossip.
+    (cluster-start `((name . "gossip-cluster")
+                     (interval-ms . 400) (ttl-ms . 2000)
+                     (discover . (gossip (advertise "127.0.0.1" ,a-port)))))
+    (spawn-child! "d" 18098 "gossip")
+    (spawn-child! "e" 18099 "gossip")
+    (confirm-link! 'd)
+    (confirm-link! 'e)
+
+    ;; the transitive edge: d was never told about e, yet holds a live
+    ;; link to it -- e's (name host port) travelled inside gossip records
+    (let poll ((tries 0))
+      (let ((ps (peers-of 'd)))
+        (cond ((and (list? ps) (memq 'e ps))
+               (display "gossip transitive mesh ok\n"))
+              ((> tries 40) (fail! "gossip-transitive" ps))
+              (else (sleep-ms 250) (poll (+ tries 1))))))
+
+    ;; kill e: its record stops advancing, so it must age OUT OF THE
+    ;; VIEW within ttl -- stale echoes between a and d must not keep the
+    ;; zombie alive (the record-level assertion, not just link death)
+    (system "pkill -f 'cluster-child.sc e ' 2>/dev/null")
+    (let poll ((tries 0))
+      (let ((view (gen-server-call 'igropyr-gossip:gossip-cluster 'members)))
+        (cond ((not (assq 'e view))
+               (display "gossip record expiry ok\n"))
+              ((> tries 40) (fail! "gossip-record-expiry" view))
+              (else (sleep-ms 250) (poll (+ tries 1))))))
+    (let poll ((tries 0))
+      (let ((ps (peers-of 'd)))
+        (cond ((and (list? ps) (not (memq 'e ps)))
+               (display "gossip peer drop ok\n"))
+              ((> tries 40) (fail! "gossip-peer-drop" ps))
+              (else (sleep-ms 250) (poll (+ tries 1))))))
+
+    ;; rejoin through the seed: a fresh e (new incarnation outranks
+    ;; anything the old life gossiped) comes back via a alone
+    (spawn-child! "e" 18099 "gossip")
+    (confirm-link! 'e)
+    (display "gossip seed rejoin ok\n")
+
+    (system "pkill -f 'cluster-child.sc d ' 2>/dev/null")
+    (system "pkill -f 'cluster-child.sc e ' 2>/dev/null")
 
     (display "ALL CLUSTER TESTS PASSED\n")
     (exit 0)))

@@ -101,7 +101,9 @@ conversations, and s-expression RPC.
   `rsend`/`rcall` to a process registered on another node,
   `monitor-node`/`monitor-remote`, cluster-wide PubSub, a distributed
   task pool (`(igropyr dpool)`), and automatic discovery (`(igropyr
-  cluster)`, static or Redis)
+  cluster)`, static, Redis, or gossip — decentralized membership over
+  the node links themselves: configure a few seed addresses and every
+  other member's address arrives inside the gossip records)
 - **S-expression RPC** — when both ends are Scheme, `(igropyr sexpr)` is
   a safe whitelisted codec (no `read`, depth-limited); `app-rpc` /
   `send-sexpr!` / `ws-send-sexpr!` carry one datum per message. Its
@@ -837,11 +839,28 @@ dials new ones:
 (import (igropyr cluster))
 (cluster-start `((discover . (static (b "10.0.0.2" 4100) (c "10.0.0.3" 4100)))))
 (cluster-start `((name . "myapp") (discover . (redis ,conn "10.0.0.1" 4100))))
+(cluster-start `((name . "myapp")                     ; no shared store at all
+                 (discover . (gossip (advertise "10.0.0.1" 4100)
+                                     (seeds (b "10.0.0.2" 4100))))))
 ```
 
 The **redis** strategy heartbeats each node into a per-cluster sorted set
 scored by an expiry timestamp; a crashed node falls out on its own, with
 no central bookkeeping.
+
+The **gossip** strategy is the same expiry semantics decentralized: each
+node keeps a replicated member table and push-pulls it with a few random
+peers per cycle, over the authenticated node links themselves. Member
+addresses travel inside the records, so one configured seed contact is
+enough to learn (and be learned by) everyone — a seed node runs with no
+seeds at all. Records carry an incarnation (the owner's boot stamp; a
+restart outranks the old life) and an owner-advanced heartbeat; a record
+that stops advancing ages out on every node's own clock within `ttl-ms`
+(~2× worst case), so stale echoes cannot resurrect a removed member.
+There is no from-zero discovery anywhere: like every membership system,
+the first contact — Redis's address there, the seeds here — is
+configuration, not magic; gossip just shrinks it to a few peer addresses
+and removes the external service.
 
 > **Security:** the dist port is full control of the node — anyone on it
 > can message any registered process, including supervisors. The
