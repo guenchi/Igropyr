@@ -1027,6 +1027,16 @@ scheme --program igropyr/app.so
 Re-run the build after editing any source. Interrupt traps stay enabled
 (preemptive scheduling needs them).
 
+Native FFI shims are separate build artifacts, not folded into `app.so`
+— compiling a library only compiles its Scheme, and the shared library
+is `dlopen`ed at runtime. So if the app uses `(igropyr quickjs)`, ship
+the shim (`build-quickjs-shim.sh` → `libigropyr-quickjs.{dylib,so}`)
+alongside the binary on a path it resolves, or point `IGROPYR_QUICKJS_SO`
+at it; likewise a native BLAS for `(igropyr blas)`'s fast lane and
+OpenSSL for `(igropyr tls)`. Each degrades without its library — blas
+to the pure loop, tls/quickjs to a clear error — so this only bites the
+capability that needs it.
+
 Profile-guided optimization (`build-profile.ss` to instrument,
 `/admin/profdump` to collect after driving load, `build-pgo.ss` to
 recompile with the profile) is available but **measured no improvement

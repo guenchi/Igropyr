@@ -876,6 +876,14 @@ scheme --program igropyr/app.so
 
 编辑任何源码后都要重新构建。Interrupt trap 保持启用（抢占式调度需要它）。
 
+原生 FFI shim 是独立构建产物，不会折进 `app.so`——编译一个库只编它的
+Scheme 部分，共享库在运行时 `dlopen`。所以 app 若用了 `(igropyr quickjs)`，
+要把 shim（`build-quickjs-shim.sh` → `libigropyr-quickjs.{dylib,so}`）随二进制
+一起部署到可解析路径上，或用 `IGROPYR_QUICKJS_SO` 指过去；同理
+`(igropyr blas)` 的快速道需要原生 BLAS、`(igropyr tls)` 需要 OpenSSL。三者
+缺库时都会降级——blas 退纯循环，tls/quickjs 报清晰错误——所以只影响那个
+具体能力，不拖累整体。
+
 Profile-guided optimization（`build-profile.ss` 做 instrumentation，
 压测后通过 `/admin/profdump` 收集，`build-pgo.ss` 用 profile 重新编译）可用，
 但**这里测得没有提升** — 对于 I/O-bound server，每请求成本是 syscall、message passing 和 scheduling，
