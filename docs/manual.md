@@ -2579,7 +2579,7 @@ igropyr.
 Before running Igropyr, set these two environment variables:
 
 ```bash
-export CHEZSCHEMELIBDIRS=.:lib:/Users/guenchi/Scheme/lib
+export CHEZSCHEMELIBDIRS=.:lib
 export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
 ```
 
