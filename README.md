@@ -80,9 +80,10 @@ conversations, and s-expression RPC.
   `(igropyr s3)` speaks the S3 REST API over the HTTP client: put / get /
   server-side copy / delete / paginated list — AWS S3, Cloudflare R2,
   MinIO
-- **Ops-ready** — rate limiting, a global error handler, and a
-  Prometheus `/metrics` endpoint with app-defined business counters
-  (`metrics-count!`)
+- **Ops-ready** — rate limiting, a global error handler, metrics as
+  Prometheus / JSON / sexpr with app-defined business counters
+  (`metrics-count!`), and a self-contained browser dashboard with a
+  cluster view on a loopback-by-default admin port
 - **Runtime introspection & graceful shutdown** — `http-stats` (live
   connection/request/pool counters), `http-shutdown!` (drain in-flight
   requests, refuse new connections)
@@ -603,42 +604,63 @@ handlers with `req-set-local!` / `req-local` (this is how sessions ride
 along). Writing your own is just `(lambda (req res next) ...)` — call
 `(next)` to continue, or respond and return to short-circuit.
 
-Prometheus metrics: a middleware records every request, and an endpoint
-renders per-status counts, request-duration, and connection/pool gauges:
+Metrics: a middleware records every request into one collector, which
+`(igropyr metrics)` then renders three ways off the same numbers — the
+signal is format-agnostic and does not care whether the reader is
+Prometheus, a browser, or a Scheme program:
 
 ```scheme
 (import (igropyr metrics))
 (define m (make-metrics))                   ; at boot
 (app-use app (metrics-middleware m))
 ;; after app-listen returns the server:
-(app-get app "/metrics" (metrics-endpoint m srv))
+(app-get app "/metrics"     (metrics-endpoint m srv))  ; Prometheus text
+(app-get app "/stats.json"  (metrics-json m srv))      ; JSON snapshot
+(app-get app "/stats.sexpr" (metrics-sexpr m srv))     ; sexpr snapshot
 ;;   igropyr_requests_total{status="200"} 1234
-;;   igropyr_request_duration_ms_sum 45210
-;;   igropyr_connections 12  ... igropyr_pool_busy 3
+;;   igropyr_request_duration_ms_sum 45210  ...  igropyr_pool_busy 3
 ```
 
-A browser dashboard rides the same collector — one self-contained page
-(inline CSS/JS, no external assets, works air-gapped) polling a JSON
-snapshot route: requests/s and latency sparklines, connection and
-worker-pool gauges, per-status counts, and every `metrics-count!`
-family, refreshed every 2 s:
+`metrics-snapshot` returns that same datum as a Scheme value for
+in-process callers. Business counters ride the collector too — register
+nothing, just `(metrics-count! m "jobs_done_total" '() 5)`.
+
+The presentation layer is a separate library, `(igropyr dashboard)`,
+so the page never couples to the signal. It ships a self-contained
+browser dashboard (inline CSS/JS, no external assets, works air-gapped:
+requests/s and latency sparklines, connection/pool gauges, per-status
+counts, every counter family, refreshed every 2 s) and — since the
+monitoring surface exposes operational detail — a turnkey admin
+listener that binds **loopback by default**:
 
 ```scheme
-(app-get app "/dash/data" (metrics-json m srv))
-(app-get app "/dash"      (metrics-dashboard "/dash/data"))
+(import (igropyr dashboard))
+;; mount onto an app you already have (guard it yourself):
+(mount-dashboard! app m srv)                 ; GET /dash , /dash/data[.sexpr]
+;; or a dedicated admin port, 127.0.0.1 by default, with a guard:
+(admin-listen m srv `((port . 9090) (auth . ,(token-guard verify))))
 ```
 
+The front-end is swappable: pass `(html . <string|procedure>)` to serve
+your own page — a file kept outside the web root via `send-file!`, or a
+[Goeteia](https://github.com/guenchi/Goeteia) app reading the sexpr
+endpoint — decoupled from the data routes, so its source can live
+anywhere and render however you like.
+
 On a node (after `node-start!`), announce the local summary once and
-every peer that did the same appears in the dashboard's cluster table
-(uptime, connections, req/s, latency, 5xx, pool) — gathered over the
-existing node links by `rcall`, so no peer needs to expose HTTP:
+every peer that did the same appears in the snapshot's `cluster` member
+(uptime, connections, requests, 5xx, pool) — gathered over the existing
+node links by `rcall`, so no peer needs to expose HTTP:
 
 ```scheme
 (metrics-announce! m srv)
 ```
 
-Both routes expose operational detail: guard them like `/metrics`
-itself (auth middleware, network policy).
+The data routes expose operational detail. `admin-listen` defaults to
+loopback for that reason; mounting onto a public app instead, guard the
+routes like `/metrics` (an `(auth . …)`, a reverse proxy, or network
+policy). Any listener's bind interface is now configurable —
+`(app-listen app port '((host . "127.0.0.1")))` keeps it off-box.
 
 ## Outbound WebSocket
 
@@ -894,7 +916,8 @@ pubsub.sc  topic publish/subscribe with dead-subscriber cleanup
 session.sc     cookie sessions on a gen-server store
 auth.sc        auth role: auth middleware + token-guard / session-guard for ws
 middleware.sc  cors / security-headers / logger / rate-limit / error-handler
-metrics.sc     Prometheus /metrics endpoint
+metrics.sc     metrics signal: Prometheus / JSON / sexpr, cluster snapshot
+dashboard.sc   metrics dashboard + turnkey admin listener (loopback default)
 client.sc  non-blocking outbound HTTP client (async DNS)
 sigv4.sc   AWS Signature V4 request signing (pure)
 s3.sc      S3-compatible object storage (AWS S3 / R2 / MinIO)

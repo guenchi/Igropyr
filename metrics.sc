@@ -18,29 +18,32 @@
 ;;;   (metrics-count! m "jobs_done_total" '() 5)    ; labels optional, +n form
 ;;;   ;; -> iter_lookup_outcome_total{outcome="hit"} 1
 ;;;
-;;; A browser dashboard rides the same collector: one self-contained
-;;; page (inline CSS/JS, no external assets) polling a JSON snapshot --
+;;; This library is the SIGNAL side only: it collects and it serializes,
+;;; and it does not care whether the reader is curl, Prometheus, a
+;;; browser, or a Goeteia app. The same collector renders three ways --
 ;;;
-;;;   (app-get app "/dash/data" (metrics-json m srv))
-;;;   (app-get app "/dash"      (metrics-dashboard "/dash/data"))
+;;;   (app-get app "/metrics"     (metrics-endpoint m srv))  ; Prometheus
+;;;   (app-get app "/stats.json"  (metrics-json m srv))      ; JSON snapshot
+;;;   (app-get app "/stats.sexpr" (metrics-sexpr m srv))     ; sexpr snapshot
 ;;;
-;;; Both routes expose operational detail: guard them the same way as
-;;; /metrics itself (auth middleware, network policy).
+;;; -- and metrics-snapshot returns that same datum as a Scheme value
+;;; for in-process callers. The browser dashboard PAGE (and a batteries-
+;;; included admin listener) lives in (igropyr dashboard), which consumes
+;;; these signals; presentation is not this library's concern.
 ;;;
 ;;; Cluster view: on a node (after node-start!), announce the local
 ;;; summary once --
 ;;;
 ;;;   (metrics-announce! m srv)
 ;;;
-;;; -- and every peer that did the same shows up in this dashboard's
-;;; cluster table (uptime, connections, req/s, latency, 5xx, pool),
-;;; fetched over the existing node links by rcall; no extra HTTP
-;;; exposure, no cross-origin fetches. Without node-start! the JSON's
-;;; "cluster" is null and the section stays hidden.
+;;; -- and every peer that did the same shows up in the snapshot's
+;;; "cluster" member (uptime, connections, requests, 5xx, pool), fetched
+;;; over the existing node links by rcall; no extra HTTP exposure, no
+;;; cross-origin fetches. Without node-start! "cluster" is null.
 
 (library (igropyr metrics)
   (export make-metrics metrics-middleware metrics-endpoint metrics-count!
-          metrics-json metrics-dashboard metrics-announce!)
+          metrics-snapshot metrics-json metrics-sexpr metrics-announce!)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr gen-server)
           (igropyr http) (igropyr express)
           (only (igropyr node) node-self node-peers rcall))
@@ -321,209 +324,45 @@
                              (summary-json (or s '())))))
                        (node-peers))))))))
 
-  ;; ---- browser dashboard ------------------------------------------------
+  ;; ---- snapshot signal --------------------------------------------------
 
-  ;; machine-readable snapshot of everything /metrics renders; the
-  ;; dashboard polls it, and it doubles as a JSON metrics API
+  ;; Everything /metrics renders, as a Scheme value in the JSON data
+  ;; model (string-keyed alists = objects, vectors = arrays, 'null =
+  ;; null). One builder, so the JSON and sexpr encodings can never
+  ;; drift; in-process callers can consume it directly too.
+  (define (metrics-snapshot m srv)
+    (let ((dump (gen-server-call m (vector 'dump)))
+          (stats (http-stats srv)))
+      (define (stat key) (cdr (assq key stats)))
+      `(("uptime_ms" . ,(stat 'uptime-ms))
+        ("connections" . ,(stat 'connections))
+        ("pool" . (("busy" . ,(stat 'busy))
+                   ("idle" . ,(stat 'idle))
+                   ("pending" . ,(stat 'pending))))
+        ("requests" . ,(map (lambda (kv)
+                              (cons (number->string (car kv)) (cdr kv)))
+                            (vector-ref dump 0)))
+        ("duration_sum_ms" . ,(vector-ref dump 1))
+        ("duration_count" . ,(vector-ref dump 2))
+        ("custom"
+         . ,(list->vector
+              (map (lambda (fam)
+                     `(("name" . ,(car fam))
+                       ("series"
+                        . ,(list->vector
+                             (map (lambda (lv)
+                                    `(("labels" . ,(car lv))
+                                      ("value" . ,(cdr lv))))
+                                  (cdr fam))))))
+                   (vector-ref dump 3))))
+        ("cluster" . ,(cluster-json m srv)))))
+
+  ;; the snapshot as JSON (dashboard polls it; doubles as a JSON API)
   (define (metrics-json m srv)
-    (lambda (req res)
-      (let ((dump (gen-server-call m (vector 'dump)))
-            (stats (http-stats srv)))
-        (define (stat key) (cdr (assq key stats)))
-        (send-json! res
-          `(("uptime_ms" . ,(stat 'uptime-ms))
-            ("connections" . ,(stat 'connections))
-            ("pool" . (("busy" . ,(stat 'busy))
-                       ("idle" . ,(stat 'idle))
-                       ("pending" . ,(stat 'pending))))
-            ("requests" . ,(map (lambda (kv)
-                                  (cons (number->string (car kv)) (cdr kv)))
-                                (vector-ref dump 0)))
-            ("duration_sum_ms" . ,(vector-ref dump 1))
-            ("duration_count" . ,(vector-ref dump 2))
-            ("custom"
-             . ,(list->vector
-                  (map (lambda (fam)
-                         `(("name" . ,(car fam))
-                           ("series"
-                            . ,(list->vector
-                                 (map (lambda (lv)
-                                        `(("labels" . ,(car lv))
-                                          ("value" . ,(cdr lv))))
-                                      (cdr fam))))))
-                       (vector-ref dump 3))))
-            ("cluster" . ,(cluster-json m srv)))))))
+    (lambda (req res) (send-json! res (metrics-snapshot m srv))))
 
-  ;; The page: requests/s and latency sparklines (computed client-side
-  ;; from snapshot deltas), connection/pool gauges, per-status counts,
-  ;; every metrics-count! family; refreshes every 2s, keeps a rolling
-  ;; 3-minute window. Single-quoted HTML/JS so the whole page lives in
-  ;; one plain Scheme string, split where data-path is spliced in.
-  (define dashboard-head "<!doctype html>
-<html><head><meta charset='utf-8'>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>igropyr</title>
-<style>
-:root{--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#c9d1d9;--dim:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
-*{box-sizing:border-box;margin:0}
-body{background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:24px;max-width:1100px;margin:0 auto}
-h1{font-size:18px;display:flex;align-items:baseline;gap:12px}
-h1 small{color:var(--dim);font-weight:normal;font-size:12px}
-#state{margin-left:auto;font-size:12px;color:var(--ok)}
-#state.down{color:var(--bad)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:16px 0}
-.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px}
-.card h2{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em;font-weight:normal}
-.card .v{font-size:26px;margin:4px 0}
-.card canvas{width:100%;height:36px;display:block}
-.dim{color:var(--dim);font-size:12px}
-section{margin-top:20px}
-section h2{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;font-weight:normal}
-section h3{font-size:13px;margin:10px 0 4px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line)}
-td.n{text-align:right;white-space:nowrap}
-td.ok{color:var(--ok)}td.warn{color:var(--warn)}td.bad{color:var(--bad)}
-.bar{height:6px;border-radius:3px;background:var(--line);overflow:hidden}
-.bar i{display:block;height:100%;background:var(--acc)}
-</style></head><body>
-<h1>igropyr <small id='uptime'></small><span id='state'>&hellip;</span></h1>
-<div class='grid'>
-<div class='card'><h2>requests / s</h2><div class='v' id='rps'>&ndash;</div><canvas id='c-rps'></canvas></div>
-<div class='card'><h2>latency, 2s window</h2><div class='v' id='lat'>&ndash;</div><canvas id='c-lat'></canvas></div>
-<div class='card'><h2>connections</h2><div class='v' id='conn'>&ndash;</div><canvas id='c-conn'></canvas></div>
-<div class='card'><h2>requests total</h2><div class='v' id='total'>&ndash;</div><div class='dim'>avg <span id='avg'>&ndash;</span> lifetime</div></div>
-</div>
-<section id='cluster-sec' style='display:none'><h2>cluster</h2><table><tbody id='cluster'></tbody></table></section>
-<section><h2>worker pool</h2><table><tbody id='pool'></tbody></table></section>
-<section><h2>status codes</h2><table><tbody id='codes'></tbody></table></section>
-<section><h2>business counters</h2><div id='custom'></div></section>
-<script>
-const DATA='")
-
-  (define dashboard-tail "';
-const POLL=2000,KEEP=90;
-const hist={rps:[],lat:[],conn:[]};
-let prev=null,prevT=0;
-const $=id=>document.getElementById(id);
-const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-const fmt=n=>n>=100?Math.round(n).toLocaleString():String(Math.round(n*10)/10);
-function push(a,v){a.push(v);if(a.length>KEEP)a.shift();}
-function spark(id,arr){
-  const c=$(id),dpr=window.devicePixelRatio||1;
-  const w=Math.max(1,c.clientWidth*dpr),h=Math.max(1,c.clientHeight*dpr);
-  if(c.width!==w)c.width=w;
-  if(c.height!==h)c.height=h;
-  const g=c.getContext('2d');
-  g.clearRect(0,0,w,h);
-  if(arr.length<2)return;
-  const max=Math.max.apply(null,arr.concat([1e-9]));
-  g.beginPath();
-  for(let i=0;i<arr.length;i++){
-    const x=1+i*(w-2)/(KEEP-1),y=h-2-(arr[i]/max)*(h-6);
-    if(i)g.lineTo(x,y);else g.moveTo(x,y);
-  }
-  g.strokeStyle='#58a6ff';g.lineWidth=dpr;g.stroke();
-}
-function fmtUp(ms){
-  const s=Math.floor(ms/1000),d=Math.floor(s/86400),
-        h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
-  return (d?d+'d ':'')+h+'h '+m+'m '+(s%60)+'s';
-}
-function bar(pct){return '<div class=bar><i style=width:'+Math.min(100,pct)+'%></i></div>';}
-const num=v=>typeof v==='number';
-const nodesPrev={};
-function clusterRow(n,t){
-  let rps='&mdash;',lat='&mdash;';
-  if(num(n.requests)){
-    const p=nodesPrev[n.name];
-    if(p){
-      const dt=Math.max(0.001,(t-p.t)/1000);
-      rps=fmt(Math.max(0,(n.requests-p.req)/dt));
-      const dc=n.duration_count-p.dc;
-      if(dc>0)lat=fmt(Math.max(0,(n.duration_sum_ms-p.ds)/dc))+' ms';
-    }
-    nodesPrev[n.name]={t:t,req:n.requests,dc:n.duration_count,ds:n.duration_sum_ms};
-  }
-  const live=num(n.uptime_ms);
-  const st=n.self?'self':live?'live':'no data';
-  return '<tr><td>'+esc(n.name)+'</td><td class='+(live?'ok':'warn')+'>'+st+
-    '</td><td class=n>'+(live?fmtUp(n.uptime_ms):'&mdash;')+
-    '</td><td class=n>'+(num(n.connections)?n.connections:'&mdash;')+
-    '</td><td class=n>'+rps+'</td><td class=n>'+lat+
-    '</td><td class=n>'+(num(n.err_5xx)?n.err_5xx.toLocaleString():'&mdash;')+
-    '</td><td class=n>'+(num(n.pool_busy)?n.pool_busy+'/'+(n.pool_busy+n.pool_idle):'&mdash;')+
-    '</td></tr>';
-}
-function renderCluster(cl,t){
-  if(!cl)return;
-  $('cluster-sec').style.display='';
-  $('cluster').innerHTML=
-    '<tr class=dim><td>node</td><td>status</td><td class=n>uptime</td>'+
-    '<td class=n>conns</td><td class=n>req/s</td><td class=n>latency</td>'+
-    '<td class=n>5xx</td><td class=n>busy/pool</td></tr>'+
-    Array.from(cl.nodes||[]).map(n=>clusterRow(n,t)).join('');
-}
-function render(d){
-  const reqs=d.requests||{},codes=Object.keys(reqs).sort();
-  const total=codes.reduce((a,k)=>a+reqs[k],0);
-  $('uptime').textContent='up '+fmtUp(d.uptime_ms);
-  $('conn').textContent=d.connections;
-  $('total').textContent=total.toLocaleString();
-  $('avg').textContent=fmt(d.duration_count?d.duration_sum_ms/d.duration_count:0)+' ms';
-  const p=d.pool||{},pt=Math.max(1,(p.busy||0)+(p.idle||0)+(p.pending||0));
-  $('pool').innerHTML=['busy','idle','pending'].map(k=>
-    '<tr><td>'+k+'</td><td class=n>'+(p[k]||0)+
-    '</td><td style=width:60%>'+bar(100*(p[k]||0)/pt)+'</td></tr>').join('');
-  $('codes').innerHTML=codes.map(k=>{
-    const cls=k<'300'?'ok':k<'500'?'warn':'bad';
-    return '<tr><td class='+cls+'>'+esc(k)+'</td><td class=n>'+reqs[k].toLocaleString()+
-      '</td><td style=width:60%>'+bar(100*reqs[k]/Math.max(1,total))+'</td></tr>';
-  }).join('');
-  const fams=Array.from(d.custom||[]);
-  $('custom').innerHTML=fams.length?fams.map(f=>
-    '<h3>'+esc(f.name)+'</h3><table><tbody>'+Array.from(f.series).map(s=>
-      '<tr><td>'+(esc(s.labels)||'&mdash;')+'</td><td class=n>'+
-      s.value.toLocaleString()+'</td></tr>').join('')+'</tbody></table>').join('')
-    :'<p class=dim>none yet &mdash; count with metrics-count!</p>';
-  renderCluster(d.cluster,Date.now());
-  return total;
-}
-async function tick(){
-  try{
-    const r=await fetch(DATA);
-    if(!r.ok)throw 0;
-    const d=await r.json(),t=Date.now(),total=render(d);
-    if(prev){
-      const dt=Math.max(0.001,(t-prevT)/1000);
-      push(hist.rps,Math.max(0,(total-prev.total)/dt));
-      const dc=d.duration_count-prev.count;
-      push(hist.lat,dc>0?Math.max(0,(d.duration_sum_ms-prev.sum)/dc)
-                        :(hist.lat.length?hist.lat[hist.lat.length-1]:0));
-      push(hist.conn,d.connections);
-      $('rps').textContent=fmt(hist.rps[hist.rps.length-1]);
-      $('lat').textContent=fmt(hist.lat[hist.lat.length-1])+' ms';
-      spark('c-rps',hist.rps);spark('c-lat',hist.lat);spark('c-conn',hist.conn);
-    }
-    prev={total:total,sum:d.duration_sum_ms,count:d.duration_count};prevT=t;
-    $('state').textContent='live';$('state').className='';
-  }catch(e){
-    $('state').textContent='disconnected';$('state').className='down';
-  }
-}
-tick();setInterval(tick,POLL);
-</script></body></html>
-")
-
-  ;; dashboard page handler: fully self-contained (works air-gapped),
-  ;; assembled ONCE at registration. data-path is the URL where
-  ;; metrics-json is registered; it is spliced into a single-quoted JS
-  ;; string, so a quote in it must fail here, not XSS the page.
-  (define (metrics-dashboard data-path)
-    (do ((i 0 (+ i 1))) ((= i (string-length data-path)))
-      (when (char=? (string-ref data-path i) #\')
-        (assertion-violation 'metrics-dashboard
-          "data path must not contain a single quote" data-path)))
-    (let ((page (string-append dashboard-head data-path dashboard-tail)))
-      (lambda (req res) (send-html! res page))))
+  ;; the snapshot as sexpr -- same shape, for Scheme/Goeteia consumers
+  ;; and any reader that would rather read one datum than parse JSON
+  (define (metrics-sexpr m srv)
+    (lambda (req res) (send-sexpr! res (metrics-snapshot m srv))))
 )

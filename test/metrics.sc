@@ -5,7 +5,7 @@
 
 (import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
         (igropyr client) (igropyr metrics) (igropyr gen-server)
-        (igropyr json) (igropyr node))
+        (igropyr json) (igropyr sexpr) (igropyr node))
 
 (define port 18096)
 
@@ -67,42 +67,51 @@
         (check "label-order-one-series" (string-contains? body "order_total{a=\"1\",b=\"2\"} 2"))
         (check "label-order-no-dup" (not (string-contains? body "order_total{b="))))
 
-      ;; browser dashboard: the page and its JSON snapshot ride the
-      ;; same collector as the Prometheus endpoint
-      (app-get app "/dash/data" (metrics-json m srv))
-      (app-get app "/dash" (metrics-dashboard "/dash/data"))
+      ;; the snapshot signal, two encodings off the same collector: the
+      ;; JSON the dashboard polls, and the sexpr a Scheme/Goeteia reader
+      ;; would take. The page + its serving live in (igropyr dashboard),
+      ;; exercised in test/dashboard.sc -- here we pin the signal.
+      (app-get app "/stats.json" (metrics-json m srv))
+      (app-get app "/stats.sexpr" (metrics-sexpr m srv))
 
       (let* ((r (http-get (string-append "http://127.0.0.1:" (number->string port)
-                                         "/dash")))
-             (page (utf8->string (response-body r))))
-        (check "dash-200" (= (response-status r) 200))
-        (check "dash-html" (string-contains? page "<!doctype html>"))
-        (check "dash-data-path" (string-contains? page "const DATA='/dash/data'")))
-
-      (let* ((r (http-get (string-append "http://127.0.0.1:" (number->string port)
-                                         "/dash/data")))
+                                         "/stats.json")))
              (d (string->json (utf8->string (response-body r)))))
-        (check "data-200" (= (response-status r) 200))
-        (check "data-uptime" (number? (json-ref d "uptime_ms")))
-        (check "data-requests-200"
+        (check "json-200" (= (response-status r) 200))
+        (check "json-uptime" (number? (json-ref d "uptime_ms")))
+        (check "json-requests-200"
           (let ((n (json-ref d "requests" "200"))) (and (number? n) (>= n 2))))
-        (check "data-duration" (>= (json-ref d "duration_count") 2))
-        (check "data-pool" (number? (json-ref d "pool" "idle")))
-        (check "data-custom-jobs"
+        (check "json-duration" (>= (json-ref d "duration_count") 2))
+        (check "json-pool" (number? (json-ref d "pool" "idle")))
+        (check "json-custom-jobs"
           (let loop ((l (vector->list (json-ref d "custom"))))
             (cond ((null? l) #f)
                   ((equal? (json-ref (car l) "name") "jobs_done_total")
                    (equal? 5 (json-ref (car l) "series" 0 "value")))
                   (else (loop (cdr l))))))
-        ;; not a node yet: the cluster member is JSON null
-        (check "data-cluster-null" (eq? (json-ref d "cluster") 'null)))
+        ;; not a node yet: the cluster member is null
+        (check "json-cluster-null" (eq? (json-ref d "cluster") 'null)))
+
+      ;; the sexpr encoding mirrors the JSON shape (string keys), so the
+      ;; same fields resolve -- one snapshot, two serializers, no drift
+      (let* ((r (http-get (string-append "http://127.0.0.1:" (number->string port)
+                                         "/stats.sexpr")))
+             (ct (response-header r 'content-type))
+             (d (string->sexpr-extended (utf8->string (response-body r)))))
+        (check "sexpr-200" (= (response-status r) 200))
+        (check "sexpr-content-type"
+          (and ct (string-contains? ct "application/sexpr")))
+        (check "sexpr-uptime" (number? (cdr (assoc "uptime_ms" d))))
+        (check "sexpr-requests-200"
+          (let ((n (cdr (assoc "200" (cdr (assoc "requests" d))))))
+            (and (number? n) (>= n 2)))))
 
       ;; cluster view: become a (single-node) mesh member, announce,
-      ;; and the snapshot grows a cluster table with the self row
+      ;; and the snapshot grows a cluster member with the self row
       (node-start! 'm1 "metrics-secret" 18097 "127.0.0.1")
       (metrics-announce! m srv)
       (let* ((r (http-get (string-append "http://127.0.0.1:" (number->string port)
-                                         "/dash/data")))
+                                         "/stats.json")))
              (d (string->json (utf8->string (response-body r))))
              (cl (json-ref d "cluster")))
         (check "cluster-self" (equal? (json-ref cl "self") "m1"))
@@ -121,11 +130,9 @@
           (and (pair? (assq 'requests s))
                (number? (cdr (assq 'requests s))))))
 
-      ;; a quote in the data path would break out of the JS string
-      (check "dash-bad-path-rejected"
-        (guard (e ((assertion-violation? e) #t) (#t #f))
-          (metrics-dashboard "/x'y")
-          #f))
+      ;; in-process callers can read the snapshot directly
+      (check "snapshot-value"
+        (number? (cdr (assoc "uptime_ms" (metrics-snapshot m srv)))))
 
       (if (zero? failures)
           (begin (display "metrics: all tests passed") (newline) (exit 0))

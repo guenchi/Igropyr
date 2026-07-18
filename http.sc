@@ -1177,6 +1177,10 @@
   ;;                             ;        (id . task-id) (attempts . n)
   ;;                             ;        (elapsed-ms . t)).
   ;;                             ; Unset: plain 500 as always.
+  ;;       (host . "0.0.0.0")    ; interface to bind (default all). Set
+  ;;                             ; "127.0.0.1" to keep a listener local --
+  ;;                             ; e.g. an admin/metrics port that must not
+  ;;                             ; be reachable off-box.
   ;;       (reuseport . #t)      ; SO_REUSEPORT bind: run N OS processes
   ;;                             ; on the same port, kernel-balanced
   ;;                             ; (Linux; not macOS)
@@ -1216,17 +1220,20 @@
                   (opt 'max-retries 3)
                   (opt 'stuck-ms 30000)
                   (opt 'check-ms 5000)))
+           (host (opt 'host "0.0.0.0"))
            (srv (make-http-server sup hbox wsbox (now-ms) 0)))
+      (unless (and (string? host) (> (string-length host) 0))
+        (assertion-violation 'http-listen "host must be a non-empty string" host))
       (set-box! supbox sup)
       (http-server-listener-set! srv
-        (tcp-listen! "0.0.0.0" port 511
+        (tcp-listen! host port 511
           (lambda (c)
             ;; libuv callback context: spawn + register only, no yielding
             (let ((pid (spawn (make-reader c srv))))
               (conn-set-owner! c pid)
               (tcp-read-start! c)))
           (if (opt 'reuseport #f) 2 0)))  ; UV_TCP_REUSEPORT
-      (display (string-append "igropyr listening on http://0.0.0.0:"
+      (display (string-append "igropyr listening on http://" host ":"
                               (number->string port) "\n"))
       srv))
 )
