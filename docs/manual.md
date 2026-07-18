@@ -2579,11 +2579,11 @@ igropyr.
 Before running Igropyr, set these two environment variables:
 
 ```bash
-export CHEZSCHEMELIBDIRS=.:lib
+export CHEZSCHEMELIBDIRS=.:lib:/path/to/libs
 export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
 ```
 
-- **CHEZSCHEMELIBDIRS**: Colon-separated list of directories to search for R6RS libraries. Include `.` for the current directory.
+- **CHEZSCHEMELIBDIRS**: Colon-separated list of directories to search for R6RS libraries. Include `.` for the current directory, plus the directory that holds your `igropyr` checkout — replace `/path/to/libs` with it. Igropyr is itself a library, so Chez resolves `(igropyr ...)` by finding an `igropyr/` subdirectory in one of these paths. (When you run from inside the checkout's own parent, `.` alone already exposes it.)
 - **CHEZSCHEMELIBEXTS**: Colon-separated list of file extensions and their compiled forms (`.so`). Chez tries each extension in order.
 
 Igropyr uses the `.sc` extension for all source files. The library search will find `igropyr/libuv.sc`, `igropyr/actor.sc`, etc.
