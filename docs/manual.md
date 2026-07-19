@@ -26,13 +26,15 @@ This manual covers the architecture, design patterns, and implementation details
 20. [S-Expression RPC](#s-expression-rpc)
 21. [Distribution](#distribution)
     - [Node links, rsend / rcall, monitors](#distribution)
-    - [Automatic discovery (static, Redis)](#automatic-discovery)
+    - [Automatic discovery (static, gossip, Redis)](#automatic-discovery)
     - [Distributed task pool](#distributed-task-pool)
 22. [Running and Building](#running-and-building)
 23. [Testing](#testing)
 24. [Development Contracts](#development-contracts)
 25. [Code Style](#code-style)
 26. [Common Pitfalls](#common-pitfalls)
+27. [Vector Scoring](#vector-scoring)
+28. [Embedded JavaScript](#embedded-javascript)
 
 ---
 
@@ -1779,6 +1781,102 @@ igropyr_uptime_ms 3600000
 
 Scrape this endpoint every 10-15 seconds with Prometheus, Grafana, or similar.
 
+### Business Counters
+
+The same collector holds app-defined counters — register nothing, just count:
+
+```scheme
+(metrics-count! metrics "iter_lookup_outcome_total" '(("outcome" . "hit")))
+(metrics-count! metrics "jobs_done_total" '() 5)   ; labels optional, +n form
+;; -> iter_lookup_outcome_total{outcome="hit"} 1
+;;    jobs_done_total 5
+```
+
+Each name renders as its own `# TYPE ... counter` family. Input is validated
+at the call site (the cast is fire-and-forget, so a bad name or non-number
+increment must fail loudly here rather than crash the shared collector);
+labels are sorted so two orderings of one label set stay a single series;
+the `igropyr_` prefix is reserved for the built-in families.
+
+### JSON and S-Expression Snapshots
+
+The collector is format-agnostic — it collects, and it serializes three
+ways off the same numbers. The reader (Prometheus, a browser, a Scheme or
+Goeteia program) is not its concern:
+
+```scheme
+(app-get app "/metrics"     (metrics-endpoint metrics srv))  ; Prometheus text
+(app-get app "/stats.json"  (metrics-json metrics srv))      ; JSON snapshot
+(app-get app "/stats.sexpr" (metrics-sexpr metrics srv))     ; sexpr snapshot
+```
+
+- `(metrics-json collector server)` / `(metrics-sexpr collector server)` →
+  handler — the whole snapshot (uptime, connections, pool, per-status
+  counts, duration sum/count, every counter family, and the cluster view)
+  as JSON or as one s-expression datum.
+- `(metrics-snapshot collector server)` → the same datum as a Scheme value
+  for in-process callers.
+
+JSON and sexpr share one snapshot builder, so the two encodings can never
+drift.
+
+### Browser Dashboard
+
+`(igropyr dashboard)` is the presentation layer over the metrics signal —
+kept separate so the page never couples to the collector. It ships a
+self-contained browser dashboard (inline CSS/JS, no external assets, works
+air-gapped: requests/s and latency sparklines computed from snapshot
+deltas, connection and worker-pool gauges, per-status counts, every
+counter family, refreshed every 2 s) and a turnkey admin listener.
+
+```scheme
+(import (igropyr dashboard))
+
+;; mount onto an app you already have (guard it yourself):
+(mount-dashboard! app metrics srv)     ; GET /dash , /dash/data[.sexpr]
+
+;; or a DEDICATED admin port, 127.0.0.1 by DEFAULT so the monitoring
+;; surface is not reachable off-box unless you widen it:
+(define admin (admin-listen metrics srv `((port . 9090))))
+(admin-listen metrics srv `((host . "10.0.0.5") (port . 9090)
+                            (auth . ,(token-guard verify))))  ; internal + auth
+```
+
+- `(mount-dashboard! app collector server [opts])` — register the data
+  routes (JSON + sexpr) and the page onto `app`. `(prefix . "/dash")` sets
+  the route root; `(html . X)` makes the front-end swappable: the built-in
+  page (default), `#f` for data-only, an inline HTML string, or a
+  `(lambda (req res) ...)` handler (serve your own file via `send-file!`,
+  or a [Goeteia](https://goeteia.dev) app reading the sexpr endpoint).
+- `(admin-listen collector server [opts])` → server — a dedicated listener
+  carrying only the dashboard, **loopback by default**. `(host . ...)`,
+  `(port . 9090)`, `(auth . middleware)` applied first, `(prefix . "/")`,
+  `(html . X)`. `http-shutdown!` it to stop.
+- `(dashboard-html data-path)` → string — the built-in page pointed at a
+  JSON route (a single quote in the path is rejected, not spliced).
+
+The data routes expose operational detail; `admin-listen` defaults to
+loopback for that reason. Mounting onto a public app instead, guard the
+routes (an `(auth . …)`, a reverse proxy, or network policy) as you would
+`/metrics`.
+
+### Cluster View
+
+On a node (after `node-start!`), announce the local summary once and every
+peer that did the same appears in the snapshot's `cluster` member — uptime,
+connections, requests, 5xx, pool — gathered over the existing node links by
+`rcall`, so no peer needs to expose HTTP and there are no cross-origin
+fetches:
+
+```scheme
+(metrics-announce! metrics srv)   ; register the summary for peers to rcall
+```
+
+Each peer call is bounded (1 s); a peer without an announce, a timeout, or a
+garbled reply renders as `no data` with null fields rather than failing the
+endpoint. Without `node-start!` the `cluster` member is null and the
+dashboard's cluster table stays hidden.
+
 ---
 
 ## Outbound HTTP Client
@@ -2485,7 +2583,12 @@ member list each cycle and dials any peer it isn't linked to yet;
 (cluster-start `((discover . (static (b "10.0.0.2" 4100)
                                      (c "10.0.0.3" 4100)))))
 
-;; via Redis: no central bookkeeping, membership is self-maintaining
+;; gossip: no shared store at all, membership rides the node links
+(cluster-start `((name . "myapp")
+                 (discover . (gossip (advertise "10.0.0.1" 4100)
+                                     (seeds (b "10.0.0.2" 4100))))))
+
+;; via Redis: self-maintaining membership through one sorted set
 (cluster-start `((name . "myapp")
                  (discover . (redis ,conn "10.0.0.1" 4100))))  ; advertise self
 
@@ -2493,17 +2596,39 @@ member list each cycle and dials any peer it isn't linked to yet;
 (cluster-start `((discover . ,(lambda () (my-lookup)))))
 ```
 
-The **static** strategy is a fixed list. The **redis** strategy heartbeats
-each node's own `(name host port)` into a per-cluster sorted set scored by
-an expiry timestamp, prunes entries whose time has passed, and reads the
-live set — a crashed node falls out after `ttl-ms` on its own, with one
-key and no `SCAN`. A discovery failure (Redis down, a DNS blip) skips the
-round and keeps the links already up, so it never tears the mesh down.
+The **static** strategy is a fixed list.
 
-Options: `(name . "default")` namespaces the Redis key; `(interval-ms .
-5000)` the discovery period; `(ttl-ms . 15000)` how long a Redis
-registration lives without a heartbeat (keep it a few intervals).
-`(cluster-stop handle)` stops discovering; existing links stay up.
+The **gossip** strategy is fully decentralized. Each node keeps a
+replicated member table and once per cycle push-pulls it with a few random
+peers, over the authenticated node links themselves. Member addresses
+travel inside the records, so one configured seed contact is enough to
+learn (and be learned by) everyone — a seed node runs with no seeds at all.
+Records carry an incarnation (the owner's boot stamp; a restart outranks
+the old life) and an owner-advanced heartbeat; a record that stops
+advancing ages out on every node's own clock within `ttl-ms` (~2× worst
+case), so a stale echo can never resurrect a removed member.
+`(fanout . 3)` sets how many peers to exchange with per cycle. There is no
+from-zero discovery anywhere: like every membership system, the first
+contact — the seeds here, Redis's address below — is configuration, not
+magic; gossip just shrinks it to a few peer addresses and removes the
+external service.
+
+The **redis** strategy is the same expiry semantics arbitrated by a shared
+store instead of peer-to-peer: each node heartbeats its own `(name host
+port)` into a per-cluster sorted set scored by an expiry timestamp, prunes
+expired entries, and reads the live set — a crashed node falls out after
+`ttl-ms` on its own, with one key and no `SCAN`. Reach for it when you
+already run Redis, or when you need a central point external tooling can
+query or an operator can evict from; gossip can only age a node out.
+
+A discovery failure (Redis down, a partition, a DNS blip) skips the round
+and keeps the links already up, so it never tears the mesh down.
+
+Options: `(name . "default")` namespaces the Redis key / gossip service;
+`(interval-ms . 5000)` the discovery period; `(ttl-ms . 15000)` how long a
+registration (Redis) or a member record (gossip) lives without a heartbeat
+(keep it a few intervals). `(cluster-stop handle)` stops discovering;
+existing links stay up.
 
 For a singleton or leader across the cluster, this is still the wrong
 layer — see the note under the task pool below.
@@ -3019,6 +3144,83 @@ Use process-local state (e.g., gen-server) or a database if the side effect must
 
 ---
 
+## Vector Scoring
+
+`(igropyr blas)` is the compute kernel for embedding search: one call fills
+`scores[i] = row_i · query` over a flat row-major float32 matrix — the scan
+behind RAG lookups, semantic dedup, recommendations. It uses `cblas_sgemv`
+when a native BLAS loads (Accelerate on macOS, OpenBLAS on Linux/FreeBSD)
+and a pure-Scheme loop otherwise, so correctness never depends on the native
+library — `blas-available?` tells you which lane is active.
+
+```scheme
+(import (igropyr blas))
+
+;; base is [n x dim] float32, row-major; query is [dim]; scores is [n]
+(blas-scores! base n dim query scores)   ; scores[i] = row_i . query
+(blas-available?)                        ; #t when a native BLAS backs it
+```
+
+- `(blas-scores! base n dim query scores)` — total function; base/query/
+  scores are float32 bytevectors. Bounds are checked at entry (the native
+  call reads raw pointers, so a short buffer must fail as a Scheme error,
+  not a heap overrun).
+- `(blas-available?)` → boolean — decided once at load.
+
+Top-k, thresholds, and storage stay yours; this is the scan, at memory
+bandwidth (≈0.2 ms for 5k×512 float32, ≈5 ms at 100k).
+
+One scheduling note: an FFI call cannot be preempted, so a full scan stalls
+the calling scheduler for its duration. Spread those stalls — every process
+scanning its own replica inline keeps the per-process stall duty cycle
+`q·s/N` negligible; do not funnel searches into a few dedicated processes.
+If that duty cycle ever grows, tile the scan and yield between tiles, or
+shard the corpus and scatter-gather.
+
+The native BLAS is optional. Without one, the pure lane runs — slower but
+exact — so nothing breaks; on a build that uses whole-program compilation
+the BLAS is `dlopen`ed at runtime, not folded into `app.so`.
+
+---
+
+## Embedded JavaScript
+
+`(igropyr quickjs)` embeds a JavaScript engine (QuickJS) in-process for
+running a **fixed** JS bundle baked at build time — a reference
+implementation you must match byte-for-byte, a sandboxed expression
+evaluator, a JS template. User input is the string **argument**, never
+code.
+
+```scheme
+(import (igropyr quickjs))
+
+(qjs-boot! "function slugify(s){ return s.toLowerCase().replace(/\\s+/g,'-') }")
+(qjs-call! "slugify" "Hello World")   ; -> "hello-world"
+```
+
+- `(qjs-boot! source [opts])` — load (or reload) the bundle. opts:
+  `(mem-mb . 64)`, `(stack-kb . 1024)`, `(timeout-ms . 2000)`,
+  `(so-path . "...")`.
+- `(qjs-call fname arg)` → `(values ok? string)` — call a global function
+  with one string argument; result on `#t`, JS error text on `#f`.
+- `(qjs-call! fname arg)` → string — the raising variant.
+- `(qjs-healthy?)` / `(qjs-generation)` / `(qjs-shutdown!)`.
+
+It is hardened in the C shim: a memory cap, a stack cap, a wall-clock
+interrupt deadline, and **crash-only rebuild** — a throwing or runaway call
+discards the whole JS heap and reboots it from the bundle
+(`qjs-generation` counts rebuilds), so one bad call can't poison the next.
+The engine is mutex-serialized and each call runs with interrupts disabled,
+so a call blocks its OS thread for its duration (sub-millisecond typically,
+`timeout-ms` worst case) — cap input size on latency-sensitive paths.
+
+The native shim is a build artifact (`build-quickjs-shim.sh`, needs QuickJS
+installed); without it the library imports fine and `qjs-boot!` reports the
+missing shim. Ship the shim alongside the binary on a path it resolves, or
+point `IGROPYR_QUICKJS_SO` at it.
+
+---
+
 ## Appendix: Performance Tips
 
 ### Connection Pooling
@@ -3048,4 +3250,4 @@ Use `/stats` and process-level tools (`top`, `Activity Monitor`) to watch CPU, m
 
 ---
 
-*Last updated: 2026-07-10*
+*Last updated: 2026-07-19*
