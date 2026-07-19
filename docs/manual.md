@@ -3177,13 +3177,7 @@ igropyr nodes to share the work raises total responsiveness. With one igropyr
 node per CPU core, offloading the blas FFI to a separate thread does not lower
 total response time; it only adds thread-switch overhead.
 
-A scan holds its scheduler's OS thread until it returns, and every green
-process on that thread waits. Green processes share one OS thread, so moving a
-scan to another actor on the same scheduler changes nothing; the stall divides
-only
-across units with their own OS thread, meaning separate OS processes (a
-`SO_REUSEPORT` fleet, one per core) or separate nodes, each scanning its own
-replica. With N such units the per-thread stall duty cycle is `ρ = q·s/N`:
+The per-thread stall duty cycle is `ρ = q·s/N`:
 
 - `q` — blocking calls per second (the demand rate)
 - `s` — the duration of one call (the stall length)
