@@ -3172,20 +3172,20 @@ bandwidth (≈0.2 ms for 5k×512 float32, ≈5 ms at 100k).
 
 ### Distributing the Load Across Nodes
 
-A scan runs as an FFI call, which cannot be preempted. It holds the
-scheduler's OS thread until it returns, and every green process on that thread
-waits. Green processes share one OS thread, so running the scan in a different
-actor on the same scheduler changes nothing. The stall divides only across
-units that have their own OS thread: separate OS processes (a `SO_REUSEPORT`
-fleet, one per core) or separate nodes, each scanning its own replica. With N
-such units the per-thread duty cycle is `q·s/N` (query rate × scan time ÷ OS
-threads). Routing searches through a few dedicated processes does the opposite:
-it adds a network hop and a queue for no gain.
+A scan is a blocking FFI call: it holds its scheduler's OS thread until it
+returns, and every green process on that thread waits. Distributing that
+blocking across igropyr nodes spreads it out and raises the cluster's total
+responsiveness. Green processes share one OS thread, so moving a scan to
+another actor on the same scheduler changes nothing; the stall divides only
+across units with their own OS thread, meaning separate OS processes (a
+`SO_REUSEPORT` fleet, one per core) or separate nodes, each scanning its own
+replica. With N such units the per-thread duty cycle is `q·s/N` (query rate ×
+scan time ÷ OS threads).
 
-A scan is CPU work, not I/O, so throughput is bounded by physical CPU: total
-cores divided by CPU-seconds per scan. Offloading a scan to another thread on a
-saturated machine moves the work between busy cores without adding capacity, so
-it changes where the latency lands, not the throughput. More nodes raise
+A scan is CPU work, not I/O, so throughput is bounded by physical CPU. When you
+already run one node per core, offloading a scan to a separate thread does not
+lower total response time, because the cores are saturated and the work only
+shifts between them; it also adds context-switch overhead. More nodes raise
 throughput only when they add cores or machines. When a corpus grows past
 sub-millisecond scans, tile the scan and yield between tiles, or shard it and
 scatter-gather across nodes.
