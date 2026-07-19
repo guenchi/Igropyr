@@ -31,6 +31,8 @@
   "files": [
     "*.sc",
     "*.ss",
+    "*.c",
+    "build-quickjs-shim.sh",
     "test/",
     "README.md"
   ]
