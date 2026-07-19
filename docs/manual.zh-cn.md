@@ -3070,7 +3070,7 @@ scatter-gather 到各 node。
 ### BLAS 线程数
 
 OpenBLAS 会为每次 `sgemv` 开自己的线程。一核一 node 时,这些线程会和 node
-争抢同一批核,所以要把 BLAS 每进程钉成一线程。线程数来自共享库加载时读取的
+争抢同一批核,所以要把 BLAS 每进程设为单线程。线程数来自共享库加载时读取的
 环境变量,因此要在进程启动前设好;启动后再设无效。库里没有对应选项
 (Accelerate 本就没有运行时 setter)。
 
@@ -3081,7 +3081,7 @@ OMP_NUM_THREADS=1         # 编了 OpenMP 的 OpenBLAS
 VECLIB_MAXIMUM_THREADS=1  # macOS Accelerate
 ```
 
-只在一核一 node 时钉成 1。单 node 且有空闲核时可以让 BLAS 保持多线程,不过
+只在一核一 node 时设为 1。单 node 且有空闲核时可以让 BLAS 保持多线程,不过
 小矩阵通常抵不上线程开销。
 
 原生 BLAS 是可选的;没有时纯 Scheme 道运行——慢但精确,不会坏。whole-program
