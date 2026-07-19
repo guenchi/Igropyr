@@ -326,11 +326,19 @@
                       (headers (parse-headers head (+ sl-end 2) hend)))
                  (cond
                    ((not status) (err! "malformed status line") #f)
-                   ;; HEAD, and 204/304/1xx, carry no body whatever the
-                   ;; headers say (RFC 7230 3.3.3) -- reply now. Without this a
-                   ;; HEAD to S3 would block on a Content-Length body never sent.
+                   ;; a 1xx interim response (100 Continue, 103 Early Hints, ...)
+                   ;; is NOT the final reply -- RFC 9110 15.2: discard it and
+                   ;; keep reading for the real status. 101 Switching Protocols
+                   ;; is terminal (the connection leaves HTTP), so it is excluded
+                   ;; and falls through to the no-body reply below.
+                   ((and (fx>= status 100) (fx< status 200) (not (fx= status 101)))
+                    (inbuf-consume! buf (fx+ hend 4))
+                    (step 'head))
+                   ;; HEAD, and 204/304/101, carry no body whatever the headers
+                   ;; say (RFC 7230 3.3.3) -- reply now. Without this a HEAD to
+                   ;; S3 would block on a Content-Length body never sent.
                    ((or (eq? method 'HEAD) (fx= status 204) (fx= status 304)
-                        (and (fx>= status 100) (fx< status 200)))
+                        (fx= status 101))
                     (reply! (make-response status headers empty-bv))
                     #f)
                    (else

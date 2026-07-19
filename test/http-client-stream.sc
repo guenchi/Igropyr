@@ -12,6 +12,7 @@
 (define raw-port 18092)
 (define bad-port 18093)
 (define head-port 18094)
+(define interim-port 18095)
 
 (define failures 0)
 (define (check label ok)
@@ -157,6 +158,47 @@
         (tcp-read-start! c)))
     0))
 
+;; a raw server that emits 1xx interim response(s) before the real one: the
+;; client must SKIP the interim (100 Continue / 103 Early Hints) and return
+;; the final status, not hand the 1xx back as the reply.
+(define (start-interim-server!)
+  (tcp-listen! "0.0.0.0" interim-port 16
+    (lambda (c)
+      (let ((pid (spawn
+                   (lambda ()
+                     (receive
+                       (`#(tcp-data ,bv)
+                         (let ((req (guard (e (#t "")) (utf8->string bv))))
+                           (cond
+                             ;; 103 then 200, split across two writes so the
+                             ;; parser must resume from 'head after the interim
+                             ((str-has? req "early-hints")
+                              (tcp-write! c (string->utf8
+                                "HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n") #f)
+                              (sleep-ms 20)
+                              (tcp-write! c (string->utf8
+                                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello") #f))
+                             ;; 100 Continue then 201, one write
+                             ((str-has? req "continue")
+                              (tcp-write! c (string->utf8
+                                (string-append
+                                  "HTTP/1.1 100 Continue\r\n\r\n"
+                                  "HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")) #f))
+                             ;; two interims back to back, then the real 200
+                             (else
+                              (tcp-write! c (string->utf8
+                                (string-append
+                                  "HTTP/1.1 100 Continue\r\n\r\n"
+                                  "HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n"
+                                  "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nyay")) #f))))
+                         (sleep-ms 40)
+                         (tcp-close! c))
+                       (`#(tcp-eof) (tcp-close! c))
+                       (`#(tcp-error ,e) (tcp-close! c)))))))
+        (conn-set-owner! c pid)
+        (tcp-read-start! c)))
+    0))
+
 ;; ---- tests -----------------------------------------------------------------
 
 (start-scheduler
@@ -165,6 +207,7 @@
     (start-eof-server!)
     (start-badchunk-server!)
     (start-head-server!)
+    (start-interim-server!)
     (sleep-ms 100)
 
     ;; chunked (SSE) streaming: one emit per wire chunk, in order,
@@ -216,6 +259,18 @@
     (let ((r (http-request 'HEAD
                (string-append "http://127.0.0.1:" (number->string head-port) "/missing"))))
       (check "head-status-404" (= 404 (response-status r))))
+
+    ;; 1xx interim responses (100/103) must be skipped, not returned as the
+    ;; final reply -- the client keeps reading for the real status
+    (let ((r (http-get (string-append "http://127.0.0.1:" (number->string interim-port) "/early-hints"))))
+      (check "interim-103-status" (= 200 (response-status r)))
+      (check "interim-103-body" (equal? (utf8->string (response-body r)) "hello")))
+    (let ((r (http-get (string-append "http://127.0.0.1:" (number->string interim-port) "/continue"))))
+      (check "interim-100-status" (= 201 (response-status r)))
+      (check "interim-100-body" (equal? (utf8->string (response-body r)) "ok")))
+    (let ((r (http-get (string-append "http://127.0.0.1:" (number->string interim-port) "/multi"))))
+      (check "interim-multi-status" (= 200 (response-status r)))
+      (check "interim-multi-body" (equal? (utf8->string (response-body r)) "yay")))
 
     ;; timeout 0 = no idle limit: a slow drip still completes
     (let-values (((b collect) (collector)))
