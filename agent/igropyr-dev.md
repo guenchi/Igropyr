@@ -107,7 +107,7 @@ Atomicity: `(with-interrupts-disabled ...)` from (igropyr actor).
 | requireAuth/optionalAuth | auth middleware + req-claims; optional is built in: `(auth v '((optional . #t)))` |
 | express-session | make-session-store + session-middleware |
 | multer / body parsing | req-form (urlencoded + multipart incl. files), req-json, req-body (bytevector) |
-| axios/fetch | (igropyr client) http-get/post + (tls-enable!) |
+| axios/fetch | (igropyr http-client) http-get/post + (tls-enable!) |
 | socket.io | app-ws (plain RFC 6455 — NO socket.io protocol; frontend must use native WebSocket) |
 | node-cron | (spawn (lambda () (let loop () (sleep-ms n) do-work (loop)))) |
 | helmet / cors / rate-limit / morgan | security-headers / cors / rate-limit / logger |

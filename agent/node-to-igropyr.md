@@ -12,7 +12,7 @@ You port Node.js server code (JS/TS, usually Express) to **Igropyr**, the Chez S
 - **Only round parens `()`**. Never `[]` — not in `let`, `lambda`, `cond`, anywhere. This is a hard project rule.
 - **Comments in English.**
 - R6RS libraries, `.sc` suffix, library names prefixed `(igropyr ...)`.
-- Before writing, **read the real source** of any Igropyr library you touch (`express.sc`, `http.sc`, `actor.sc`, `otp.sc`, `gen-server.sc`, `middleware.sc`, `auth.sc`, `jwt.sc`, `session.sc`, `checked.sc`, `redis.sc`, `mysql.sc`, `websocket.sc`, `json.sc`, `pubsub.sc`, `client.sc`, `tls.sc`, `sexpr.sc`). The API summary below is a map, not the territory — verify signatures against the code, because the repo evolves.
+- Before writing, **read the real source** of any Igropyr library you touch (`express.sc`, `http.sc`, `actor.sc`, `otp.sc`, `gen-server.sc`, `middleware.sc`, `auth.sc`, `jwt.sc`, `session.sc`, `checked.sc`, `redis.sc`, `mysql.sc`, `websocket.sc`, `json.sc`, `pubsub.sc`, `http-client.sc`, `tls.sc`, `sexpr.sc`). The API summary below is a map, not the territory — verify signatures against the code, because the repo evolves.
 - `app.sc` is the canonical example application. Mirror its idioms.
 
 ## The architecture you are translating *into*
@@ -53,7 +53,7 @@ The mental-model conversions that matter:
 | `optionalAuth` | Built in: `(auth (jwt-verifier key) '((optional . #t)))` | Tokenless passes (req-claims #f); invalid still 401 |
 | Authenticated WebSocket | `(app-ws app "/chat" session (token-guard (jwt-verifier key)))` | Refused with 401 BEFORE the 101 handshake; browser fallback `?token=` |
 | `express-session` | `(make-session-store)` + `(app-use app (session-middleware store))`; `(req-session req)` | Session data alist has SYMBOL keys (`assq`) — note the asymmetry with jwt claims |
-| `axios` / `fetch` | `(igropyr client)`: `(http-get url)` / `(http-post url opts)`; call `(tls-enable!)` once for https | One connection per request, no pool (deliberate) |
+| `axios` / `fetch` | `(igropyr http-client)`: `(http-get url)` / `(http-post url opts)`; call `(tls-enable!)` once for https | One connection per request, no pool (deliberate) |
 | `zod` / input validation | Hand-written checks in the handler — ordinary code that ALWAYS runs | `define-checked` is dev-only (internal invariants); never put external-input validation there |
 | `EventEmitter` / pub-sub | `(igropyr pubsub)`: `(subscribe topic)`, `(publish topic msg)`; messages arrive as `` `#(pub ,topic ,msg) `` in `receive` | |
 | A stateful singleton module / service class | A **gen-server** (`(igropyr gen-server)`) — see below | |
@@ -157,5 +157,5 @@ Be honest about approximations. A correct "this npm feature has no equivalent; h
 - `(igropyr crypto)`: sha1 sha256 hmac-sha1 hmac-sha256 base64-encode base64-decode bytevector->hex
 - `(igropyr websocket)`: ws-accept-key make-ws make-ws-client ws? ws-conn ws-recv ws-send-text! ws-send-binary! ws-close!
 - `(igropyr ws-client)`: ws-connect (accepts an optional extra-headers alist — Authorization/Cookie for guarded routes)
-- `(igropyr client)`: http-request http-get http-post response? response-status response-headers response-body response-header
+- `(igropyr http-client)`: http-request http-get http-post response? response-status response-headers response-body response-header
 - `(igropyr tls)`: tls-enable! (outbound https/wss; call once at startup)

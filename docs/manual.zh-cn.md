@@ -1312,7 +1312,7 @@ Transport 错误或 timeout 会 raise `#(http-client-error ,message)`。
 启用可选库 `(igropyr tls)` 后，`https://`（以及 `ws-client` 的 `wss://`）即可用。import 它并在启动时调用一次 `(tls-enable!)`——在首个 `https` 请求之前——之后每个 `http-get` / `http-request` 都能访问 TLS endpoint：
 
 ```scheme
-(import (igropyr client) (igropyr tls))
+(import (igropyr http-client) (igropyr tls))
 (tls-enable!)                                 ; 启动时一次
 
 (let ((r (http-get "https://api.github.com/zen"

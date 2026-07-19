@@ -1838,7 +1838,7 @@ The client performs DNS resolution asynchronously on libuv's thread pool, so the
 `https://` (and `ws-client`'s `wss://`) work once you enable the optional `(igropyr tls)` library. Import it and call `(tls-enable!)` once at startup — before the first `https` request — and every `http-get` / `http-request` can reach TLS endpoints:
 
 ```scheme
-(import (igropyr client) (igropyr tls))
+(import (igropyr http-client) (igropyr tls))
 (tls-enable!)                                 ; once, at startup
 
 (let ((r (http-get "https://api.github.com/zen"
