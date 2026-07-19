@@ -16,12 +16,14 @@
       (load-first-shared-object! 'zlib
         (case platform-os
           ((macos) '("libz.1.dylib" "libz.dylib"))
-          ((freebsd) '("/lib/libz.so.6" "libz.so.6" "libz.so"))
+          ((freebsd) '("libz.so.6" "libz.so.5" "libz.so"))
           (else '("libz.so.1" "libz.so"))))
       (load-first-shared-object! 'libc
         (case platform-os
           ((macos) '("libSystem.B.dylib" "libSystem.dylib"))
-          ((freebsd) '("libc.so.7"))
+          ;; FreeBSD libc soname tracks the major release (8.0+ = .7,
+          ;; 7.x = .6); probe newest first, then the bare name.
+          ((freebsd) '("libc.so.7" "libc.so.6" "libc.so"))
           (else '("libc.so.6" "libc.so"))))))
 
   (define zlib-version   (foreign-procedure "zlibVersion" () string))

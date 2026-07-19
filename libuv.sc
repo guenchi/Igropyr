@@ -35,7 +35,10 @@
       (load-first-shared-object! 'libc
         (case platform-os
           ((macos) '("libSystem.B.dylib" "libSystem.dylib"))
-          ((freebsd) '("libc.so.7"))                 ; FreeBSD has no libc.so.6
+          ;; FreeBSD libc soname tracks the major release: 8.0+ is
+          ;; libc.so.7, 7.x is libc.so.6; try newest first, then the
+          ;; bare name. load-first-shared-object! probes each in order.
+          ((freebsd) '("libc.so.7" "libc.so.6" "libc.so"))
           (else '("libc.so.6" "libc.so"))))))
 
   ;; libuv enum constants (from uv.h, libuv 1.50)
