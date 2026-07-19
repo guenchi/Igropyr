@@ -3177,25 +3177,9 @@ igropyr nodes to share the work raises total responsiveness. With one igropyr
 node per CPU core, offloading the blas FFI to a separate thread does not lower
 total response time; it only adds thread-switch overhead.
 
-The per-thread stall duty cycle is `ρ = q·s/N`:
-
-- `q` — blocking calls per second (the demand rate)
-- `s` — the duration of one call (the stall length)
-- `N` — the schedulers (nodes / OS processes) sharing them
-
-The total demand `q·s` split across N schedulers leaves each carrying `1/N`,
-so the fraction of time a scheduler sits inside one of these calls drops from
-`q·s` to `q·s/N`. A request arriving at random meets a scheduler mid-scan with
-probability ≈ ρ, which falls the same way.
-
-Why the separate thread does not help: a scan is CPU work, not I/O, so
-throughput is bounded by physical CPU. When the cores are already saturated,
-moving a scan to another thread just runs it on another busy core, where it
-competes; it adds a context switch and a handoff and is more likely to fully
-occupy that core, so total throughput can even drop. More nodes raise
-throughput only when they add cores or machines. When a corpus grows past
-sub-millisecond scans, tile the scan and yield between tiles, or shard it and
-scatter-gather across nodes.
+Collecting the blas requests onto another thread just moves the call to
+another core: it adds a context switch and a handoff, is more likely to fully
+occupy that core, and total throughput can even drop.
 
 ### BLAS Thread Count
 
