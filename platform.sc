@@ -13,6 +13,7 @@
   (define platform-os
     (cond
       ((string-suffix? "osx" machine-name) 'macos)
+      ((string-suffix? "fb" machine-name) 'freebsd)   ; ta6fb / tarm64fb
       ((string-suffix? "le" machine-name) 'linux)
       (else 'unsupported)))
 
@@ -23,10 +24,10 @@
       (else 'unsupported)))
 
   (define (ensure-supported-platform!)
-    (unless (and (memq platform-os '(macos linux))
+    (unless (and (memq platform-os '(macos linux freebsd))
                  (memq platform-arch '(x86_64 arm64)))
       (assertion-violation 'igropyr
-        "unsupported platform; expected Chez Scheme 10 on macOS/Linux x86_64/arm64"
+        "unsupported platform; expected Chez Scheme 10 on macOS/Linux/FreeBSD x86_64/arm64"
         (machine-type))))
 
   ;; Try names in order and report every candidate when none can be loaded.
@@ -40,9 +41,11 @@
         (else (loop (cdr xs))))))
 
   ;; LP64 struct addrinfo layouts differ in the ordering of ai_addr and
-  ;; ai_canonname. ai_next is at offset 40 on both supported ABIs.
+  ;; ai_canonname. macOS and FreeBSD (BSD tradition -- verified against
+  ;; FreeBSD netdb.h) put ai_canonname first, so ai_addr sits at 32;
+  ;; Linux orders ai_addr first, at 24. ai_next is at 40 on all three.
   (define addrinfo-address-offset
-    (case platform-os ((macos) 32) ((linux) 24) (else 0)))
+    (case platform-os ((macos freebsd) 32) ((linux) 24) (else 0)))
   (define addrinfo-next-offset 40)
 
   ;; libuv's uv_stat_t is a platform-independent struct of uint64_t fields

@@ -14,13 +14,15 @@
     (begin
       (ensure-supported-platform!)
       (load-first-shared-object! 'zlib
-        (if (eq? platform-os 'macos)
-            '("libz.1.dylib" "libz.dylib")
-            '("libz.so.1" "libz.so")))
+        (case platform-os
+          ((macos) '("libz.1.dylib" "libz.dylib"))
+          ((freebsd) '("/lib/libz.so.6" "libz.so.6" "libz.so"))
+          (else '("libz.so.1" "libz.so"))))
       (load-first-shared-object! 'libc
-        (if (eq? platform-os 'macos)
-            '("libSystem.B.dylib" "libSystem.dylib")
-            '("libc.so.6" "libc.so")))))
+        (case platform-os
+          ((macos) '("libSystem.B.dylib" "libSystem.dylib"))
+          ((freebsd) '("libc.so.7"))
+          (else '("libc.so.6" "libc.so"))))))
 
   (define zlib-version   (foreign-procedure "zlibVersion" () string))
   (define deflate-init2  (foreign-procedure "deflateInit2_"

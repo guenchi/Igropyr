@@ -28,13 +28,15 @@
     (begin
       (ensure-supported-platform!)
       (load-first-shared-object! 'libuv
-        (if (eq? platform-os 'macos)
-            '("/opt/homebrew/lib/libuv.1.dylib" "libuv.1.dylib" "libuv.dylib")
-            '("libuv.so.1" "libuv.so")))
+        (case platform-os
+          ((macos) '("/opt/homebrew/lib/libuv.1.dylib" "libuv.1.dylib" "libuv.dylib"))
+          ((freebsd) '("/usr/local/lib/libuv.so.1" "libuv.so.1" "libuv.so"))
+          (else '("libuv.so.1" "libuv.so"))))
       (load-first-shared-object! 'libc
-        (if (eq? platform-os 'macos)
-            '("libSystem.B.dylib" "libSystem.dylib")
-            '("libc.so.6" "libc.so")))))
+        (case platform-os
+          ((macos) '("libSystem.B.dylib" "libSystem.dylib"))
+          ((freebsd) '("libc.so.7"))                 ; FreeBSD has no libc.so.6
+          (else '("libc.so.6" "libc.so"))))))
 
   ;; libuv enum constants (from uv.h, libuv 1.50)
   (define UV-RUN-NOWAIT 2)
