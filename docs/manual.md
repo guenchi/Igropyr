@@ -3179,8 +3179,16 @@ responsiveness. Green processes share one OS thread, so moving a scan to
 another actor on the same scheduler changes nothing; the stall divides only
 across units with their own OS thread, meaning separate OS processes (a
 `SO_REUSEPORT` fleet, one per core) or separate nodes, each scanning its own
-replica. With N such units the per-thread duty cycle is `q·s/N` (query rate ×
-scan time ÷ OS threads).
+replica. With N such units the per-thread stall duty cycle is `ρ = q·s/N`:
+
+- `q` — blocking calls per second (the demand rate)
+- `s` — the duration of one call (the stall length)
+- `N` — the schedulers (nodes / OS processes) sharing them
+
+The total demand `q·s` split across N schedulers leaves each carrying `1/N`,
+so the fraction of time a scheduler sits inside one of these calls drops from
+`q·s` to `q·s/N`. A request arriving at random meets a scheduler mid-scan with
+probability ≈ ρ, which falls the same way.
 
 A scan is CPU work, not I/O, so throughput is bounded by physical CPU. When you
 already run one node per core, offloading a scan to a separate thread does not
