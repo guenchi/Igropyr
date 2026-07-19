@@ -3273,7 +3273,7 @@ Use `/stats` and process-level tools (`top`, `Activity Monitor`) to watch CPU, m
 
 ## Further Reading
 
-- Chez Scheme documentation: https://cisco.github.io/ChezScheme/
+- Chez Scheme documentation: https://scheme.com/
 - libuv documentation: https://docs.libuv.org/
 - R6RS Scheme specification: https://r6rs.org/
 - Erlang/OTP documentation: https://erlang.org/doc/
