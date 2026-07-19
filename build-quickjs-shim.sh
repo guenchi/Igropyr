@@ -8,13 +8,13 @@ cd "$(dirname "$0")"
 
 if [ "$(uname)" = "Darwin" ]; then
   QJS_PREFIX="${QJS_PREFIX:-$(brew --prefix quickjs)}"
-  cc -O2 -shared -fPIC quickjs-shim.c \
+  cc -O2 -shared -fPIC c/quickjs-shim.c \
     -I"${QJS_PREFIX}/include" \
     -L"${QJS_PREFIX}/lib/quickjs" -lquickjs \
     -o libigropyr-quickjs.dylib
   echo "built libigropyr-quickjs.dylib"
 else
-  cc -O2 -shared -fPIC quickjs-shim.c \
+  cc -O2 -shared -fPIC c/quickjs-shim.c \
     ${QJS_CFLAGS:-} ${QJS_LDFLAGS:--lquickjs} -lpthread -lm \
     -o libigropyr-quickjs.so
   echo "built libigropyr-quickjs.so"

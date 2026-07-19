@@ -12,7 +12,7 @@
 ;;;   (qjs-call! "fname" "arg")    ; -> string, raises on JS error
 ;;;   (qjs-healthy?) (qjs-generation) (qjs-shutdown!)
 ;;;
-;;; Robustness (see quickjs-shim.c): memory limit / stack limit / wall-clock
+;;; Robustness (see c/quickjs-shim.c): memory limit / stack limit / wall-clock
 ;;; interrupt deadline / exception boundary / crash-only rebuild (a failed
 ;;; call discards the whole JS heap and reboots it from the bundle;
 ;;; qjs-generation counts rebuilds) / pthread-mutex serialized engine.

@@ -616,7 +616,7 @@ code:
 (qjs-call! "slugify" "Hello World")   ; -> "hello-world"
 ```
 
-It is hardened in the C shim (`quickjs-shim.c`): a memory cap, a stack
+It is hardened in the C shim (`c/quickjs-shim.c`): a memory cap, a stack
 cap, a wall-clock interrupt deadline, and **crash-only rebuild** — a
 throwing or runaway call discards the whole JS heap and reboots it from
 the bundle (`qjs-generation` counts rebuilds), so one bad call can't
