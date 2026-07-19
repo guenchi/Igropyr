@@ -14,17 +14,21 @@
 ;;; symbol so the caller can map it to an HTTP status (bad signature /
 ;;; chain / root / expiry are attacker-facing 401s; parse/internal are
 ;;; retryable 5xx):
-;;;   not-jws no-x5c cert-parse-failed invalid-root chain-failed
+;;;   not-jws bad-alg no-x5c cert-parse-failed invalid-root chain-failed
 ;;;   cert-expired sig-failed internal
 ;;;
-;;; Verification (mirrors Apple's documented steps):
-;;;   1. the x5c root's DER bytes must equal a pinned trusted root
-;;;      (verify-apple-jws pins Apple Root CA G3; verify-jws-x5c takes an
-;;;      explicit list of trusted root DERs for tests / future roots)
-;;;   2. each cert is issued by the next, whose CA bit is set, and its
+;;; Verification (mirrors Apple's own app-store-server-library):
+;;;   1. the header alg is ES256 (never trusted to pick the algorithm)
+;;;   2. the x5c root's DER bytes equal a pinned trusted root (verify-apple-jws
+;;;      pins Apple Root CA G3; verify-jws-x5c takes explicit roots)
+;;;   3. each cert is issued by the next, whose CA bit is set, and its
 ;;;      signature verifies under the issuer's public key
-;;;   3. every cert is inside its validity window
-;;;   4. the JWS signature (ES256) verifies under the leaf's public key
+;;;   4. the leaf carries Apple's App Store Server signing OID
+;;;      (1.2.840.113635.100.6.11.1) and the intermediate the WWDR OID
+;;;      (1.2.840.113635.100.6.2.1) -- so a cert that merely chains to the
+;;;      pinned root but is not the notification signer is rejected
+;;;   5. every cert is inside its validity window
+;;;   6. the JWS signature (ES256) verifies under the leaf's public key
 ;;;
 ;;; It is VERIFY-ONLY: no signing, so no App Store Server API JWT is
 ;;; produced here (ynthu talks to the legacy verifyReceipt endpoint for
@@ -79,6 +83,10 @@
     (foreign-procedure "EVP_DigestUpdate" (void* u8* size_t) int))
   (define EVP_DigestVerifyFinal
     (foreign-procedure "EVP_DigestVerifyFinal" (void* u8* size_t) int))
+  (define OBJ_txt2obj (foreign-procedure "OBJ_txt2obj" (string int) void*))
+  (define ASN1_OBJECT_free (foreign-procedure "ASN1_OBJECT_free" (void*) void))
+  (define X509_get_ext_by_OBJ
+    (foreign-procedure "X509_get_ext_by_OBJ" (void* void* int) int))
 
   ;; ---- errors ----------------------------------------------------------
 
@@ -97,17 +105,27 @@
       (bytevector-copy! bv s r 0 (- e s))
       r))
 
-  ;; base64url (the JWS parts) -> bytes, via (igropyr crypto) base64-decode
-  ;; which wants the standard alphabet and tolerates '=' padding.
+  (define (b64url-char? c)
+    (or (char<=? #\A c #\Z) (char<=? #\a c #\z) (char<=? #\0 c #\9)
+        (char=? c #\-) (char=? c #\_)))
+
+  ;; base64url (the JWS parts) -> bytes. A compact JWS part is UNPADDED
+  ;; base64url; a stray character (padding, whitespace, +/, smuggled byte)
+  ;; is a malformed token, refused here rather than silently normalised
+  ;; away by the lenient (igropyr crypto) base64-decode.
   (define (b64url->bytes s)
-    (let* ((n (string-length s)) (t (make-string n)))
+    (let ((n (string-length s)))
       (do ((i 0 (+ i 1))) ((= i n))
-        (let ((c (string-ref s i)))
-          (string-set! t i (cond ((char=? c #\-) #\+)
-                                 ((char=? c #\_) #\/)
-                                 (else c)))))
-      (base64-decode
-        (string-append t (make-string (mod (- 4 (mod n 4)) 4) #\=)))))
+        (unless (b64url-char? (string-ref s i))
+          (ajws-fail 'not-jws "invalid base64url character in token")))
+      (let ((t (make-string n)))
+        (do ((i 0 (+ i 1))) ((= i n))
+          (let ((c (string-ref s i)))
+            (string-set! t i (cond ((char=? c #\-) #\+)
+                                   ((char=? c #\_) #\/)
+                                   (else c)))))
+        (base64-decode
+          (string-append t (make-string (mod (- 4 (mod n 4)) 4) #\=))))))
 
   ;; ---- X.509 from DER --------------------------------------------------
 
@@ -180,6 +198,15 @@
                         (substring token (fx+ d1 1) d2)
                         (substring token (fx+ d2 1) (string-length token))))))))
 
+  ;; does the certificate carry an extension with this dotted OID? Apple's
+  ;; marker OIDs -- presence is what its own library checks, not the value.
+  (define (cert-has-oid? cert oid-text)
+    (let ((obj (OBJ_txt2obj oid-text 1)))
+      (and (not (zero? obj))
+           (let ((idx (X509_get_ext_by_OBJ cert obj -1)))
+             (ASN1_OBJECT_free obj)
+             (>= idx 0)))))
+
   ;; ---- core verification -----------------------------------------------
 
   ;; trusted-root-ders: a list of DER bytevectors; the x5c root must match
@@ -191,7 +218,12 @@
       (let* ((h-b64 (car parts)) (p-b64 (cadr parts)) (s-b64 (caddr parts))
              (header (guard (e (#t (ajws-fail 'not-jws "header is not valid JSON")))
                        (string->json (utf8->string (b64url->bytes h-b64)))))
+             (alg (and (pair? header) (json-ref header "alg")))
              (x5c (and (pair? header) (json-ref header "x5c"))))
+        ;; never let the header pick the algorithm: Apple signs ES256, so
+        ;; anything else (including "none") is refused fail-closed
+        (unless (equal? alg "ES256")
+          (ajws-fail 'bad-alg "unexpected JWS alg (want ES256)"))
         (unless (and (vector? x5c) (fx>= (vector-length x5c) 3))
           (ajws-fail 'no-x5c "x5c header missing or shorter than 3 certificates"))
         (let ((certs '()))
@@ -227,6 +259,15 @@
                         (EVP_PKEY_free pk)
                         (unless ok (ajws-fail 'chain-failed "certificate signature is invalid")))))
                   (loop (cdr cs))))
+              ;; 2b) Apple marker OIDs: the leaf must be the App Store Server
+              ;; signing cert and the intermediate the WWDR CA -- exactly what
+              ;; Apple's own app-store-server-library pins, so a certificate
+              ;; that merely chains to the pinned root but is not the
+              ;; notification signer is rejected.
+              (unless (cert-has-oid? (car certs) "1.2.840.113635.100.6.11.1")
+                (ajws-fail 'chain-failed "leaf is not an App Store Server signing certificate"))
+              (unless (cert-has-oid? (cadr certs) "1.2.840.113635.100.6.2.1")
+                (ajws-fail 'chain-failed "intermediate is not the Apple WWDR CA"))
               ;; 3) validity window (notBefore < now < notAfter) for every cert
               (for-each
                 (lambda (c)
