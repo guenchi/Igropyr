@@ -1,17 +1,17 @@
 #!chezscheme
-;;; (igropyr tls) -- OPTIONAL outbound TLS for (igropyr client).
+;;; (igropyr tls) -- OPTIONAL outbound TLS for (igropyr http-client).
 ;;;
 ;;; The core framework stays dependency-free: this library is the only
 ;;; place that touches OpenSSL/LibreSSL, and nothing loads it unless a
 ;;; program imports it and calls (tls-enable!) once at startup:
 ;;;
-;;;   (import (igropyr client) (igropyr tls))
+;;;   (import (igropyr http-client) (igropyr tls))
 ;;;   (tls-enable!)
 ;;;   (http-get "https://example.com/")
 ;;;
 ;;; Design: TLS as a pure byte codec, not an I/O owner. The socket, the
 ;;; event loop, timeouts, and the actor scheduling all stay in libuv /
-;;; (igropyr client); OpenSSL runs in memory-BIO mode and only ever
+;;; (igropyr http-client); OpenSSL runs in memory-BIO mode and only ever
 ;;; transforms bytes:
 ;;;
 ;;;   socket ciphertext --BIO_write--> rbio --SSL_read-->  plaintext up
@@ -40,7 +40,7 @@
   (export tls-enable!)
   (import (chezscheme) (igropyr actor) (igropyr platform)
           (only (igropyr libuv) tcp-write!)
-          (only (igropyr client) set-https-connector!))
+          (only (igropyr http-client) set-https-connector!))
 
   ;; ---- shared objects ---------------------------------------------------
   ;; libcrypto first and explicitly: BIO_* / ERR_* / X509_* live there,
@@ -176,7 +176,7 @@
   ;;
   ;; Runs inside the request's green process; the socket is read-started,
   ;; so ciphertext arrives here as #(tcp-data ...) messages. Returns the
-  ;; codec #(encrypt decrypt close) for (igropyr client); raises
+  ;; codec #(encrypt decrypt close) for (igropyr http-client); raises
   ;; #(http-client-error ...) after freeing the session on any failure.
 
   (define (establish! c host timeout)

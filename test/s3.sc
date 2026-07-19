@@ -6,7 +6,7 @@
 ;;; XML entity unescaping. Signature CORRECTNESS is pinned by the AWS
 ;;; vectors in test/sigv4.sc; this file pins the HTTP integration.
 
-(import (chezscheme) (igropyr http) (igropyr express) (igropyr client)
+(import (chezscheme) (igropyr http) (igropyr express) (igropyr http-client)
         (igropyr crypto) (igropyr s3))
 
 (define port 18095)

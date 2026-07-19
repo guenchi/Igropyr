@@ -1,5 +1,5 @@
 #!chezscheme
-;;; (igropyr client) -- non-blocking outbound HTTP/1.1 client.
+;;; (igropyr http-client) -- non-blocking outbound HTTP/1.1 client.
 ;;;
 ;;; Same actor model as the database clients: each request runs in its
 ;;; own green process that connects, sends, and reads the reply, while
@@ -40,7 +40,7 @@
 ;;; so the socket, timeout, and parsing paths here are identical for
 ;;; both schemes. Without it, https:// fails with a clear message.
 
-(library (igropyr client)
+(library (igropyr http-client)
   (export http-request http-get http-post
           response? response-status response-headers response-body
           response-header

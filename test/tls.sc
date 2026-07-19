@@ -11,7 +11,7 @@
 ;;;
 ;;; Requires the openssl CLI. Certs are ephemeral (test/tls-certs.sh).
 
-(import (chezscheme) (igropyr client) (igropyr tls) (igropyr http))
+(import (chezscheme) (igropyr http-client) (igropyr tls) (igropyr http))
 
 (define dir "/tmp/igropyr-tls-test")
 (define port-good 18441)

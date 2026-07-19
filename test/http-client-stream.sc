@@ -1,11 +1,11 @@
 #!chezscheme
-;;; (igropyr client) streaming responses: on-chunk delivery over the
+;;; (igropyr http-client) streaming responses: on-chunk delivery over the
 ;;; three body modes (chunked / content-length / read-until-close),
 ;;; idle-timeout semantics, and handler-crash surfacing. The chunked
 ;;; case is the acceptance shape for SSE-over-chunked upstreams
 ;;; (Gemini streamGenerateContent alt=sse).
 
-(import (chezscheme) (igropyr http) (igropyr express) (igropyr client)
+(import (chezscheme) (igropyr http) (igropyr express) (igropyr http-client)
         (igropyr libuv))
 
 (define port 18091)
@@ -225,5 +225,5 @@
               "on-chunk handler raised"))
 
     (if (zero? failures)
-        (begin (display "client-stream: all tests passed") (newline) (exit 0))
+        (begin (display "http-client-stream: all tests passed") (newline) (exit 0))
         (begin (display failures) (display " failures") (newline) (exit 1)))))

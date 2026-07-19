@@ -539,7 +539,7 @@ read) while the caller parks. Handy for calling other services from
 inside a handler.
 
 ```scheme
-(import (igropyr client))
+(import (igropyr http-client))
 
 (let ((r (http-get "http://api.internal/users/42")))
   (response-status r)                       ; -> 200
@@ -559,7 +559,7 @@ library — one import plus one call at startup, and every `http-get` /
 `http-request` (and `ws-client`'s `wss://`) can reach TLS endpoints:
 
 ```scheme
-(import (igropyr client) (igropyr tls))
+(import (igropyr http-client) (igropyr tls))
 (tls-enable!)                                 ; once, before the first https request
 
 (let ((r (http-get "https://api.github.com/zen"
@@ -941,7 +941,7 @@ inbound side, this is a real TLS client *in* the process, so it verifies
 certificates itself.
 
 ```scheme
-(import (igropyr client) (igropyr tls))
+(import (igropyr http-client) (igropyr tls))
 (tls-enable!)
 (http-get "https://example.com/")
 ```

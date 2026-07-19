@@ -4,7 +4,7 @@
 ;;; Pure functions from request parts to the Authorization header --
 ;;; no sockets here. The HTTP side lives in (igropyr s3) (or any other
 ;;; AWS-flavoured caller), which feeds the signed headers to
-;;; (igropyr client). Everything is deterministic given the datetime,
+;;; (igropyr http-client). Everything is deterministic given the datetime,
 ;;; so the AWS documented test vectors drive the test suite directly.
 ;;;
 ;;;   (sigv4-sign-headers 'PUT "/bucket/key" '()      ; decoded query params
@@ -14,7 +14,7 @@
 ;;;       (access-key . "AKIA...") (secret . "...")
 ;;;       (region . "auto") (service . "s3")))
 ;;;   ;; -> headers alist INCLUDING x-amz-date, x-amz-content-sha256 and
-;;;   ;;    authorization, EXCLUDING host: (igropyr client) writes the
+;;;   ;;    authorization, EXCLUDING host: (igropyr http-client) writes the
 ;;;   ;;    Host line itself, so host is signed here but never sent twice.
 ;;;
 ;;; Conventions baked in (S3 flavour, which R2 follows):
@@ -165,7 +165,7 @@
   ;; already-computed (sigv4-canonical-query query) string when the
   ;; caller also needs it for the URL, so it is built once and the
   ;; signature and the wire share one value by construction.
-  ;; -> headers alist to pass to (igropyr client): input headers plus
+  ;; -> headers alist to pass to (igropyr http-client): input headers plus
   ;;    x-amz-date [x-amz-content-sha256] authorization.
   (define (sigv4-sign-headers method path query headers payload-hash opts)
     (let* ((method (string-upcase

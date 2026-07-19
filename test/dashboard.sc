@@ -5,7 +5,7 @@
 ;;; injection guard. The signal itself is pinned in test/metrics.sc.
 
 (import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
-        (igropyr client) (igropyr metrics) (igropyr dashboard)
+        (igropyr http-client) (igropyr metrics) (igropyr dashboard)
         (igropyr json) (igropyr sexpr))
 
 (define main-port 18110)

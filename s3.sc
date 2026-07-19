@@ -1,5 +1,5 @@
 #!chezscheme
-;;; (igropyr s3) -- S3-compatible object storage over (igropyr client):
+;;; (igropyr s3) -- S3-compatible object storage over (igropyr http-client):
 ;;; AWS S3, Cloudflare R2, MinIO... anything speaking the S3 REST API.
 ;;;
 ;;;   (define r2 (make-s3 '((endpoint . "https://ACCT.r2.cloudflarestorage.com")
@@ -19,7 +19,7 @@
 ;;; go in DECODED; slashes stay literal, everything else is
 ;;; percent-encoded once and the same string is signed and sent.
 ;;;
-;;; One request = one connection, inherited from (igropyr client) -- the
+;;; One request = one connection, inherited from (igropyr http-client) -- the
 ;;; deliberate no-pool decision lives there, not here. https needs
 ;;; (igropyr tls) enabled once at boot. HTTP-level failures raise
 ;;; #(s3-error status message) apart from the two soft spots a caller
@@ -42,13 +42,13 @@
   (export make-s3 s3?
           s3-put! s3-get s3-copy! s3-delete! s3-delete-prefix! s3-list)
   (import (chezscheme) (igropyr util) (igropyr crypto) (igropyr sigv4)
-          (igropyr client))
+          (igropyr http-client))
 
   ;; make-s3 (exported below) takes an opts alist; raw-s3 is internal
   (define-record-type (s3 raw-s3 s3?)
     (fields base        ; "https://host[:port]" with no trailing slash
             host        ; host[:port when non-default] -- byte-for-byte
-                        ; what (igropyr client) puts in Host, because
+                        ; what (igropyr http-client) puts in Host, because
                         ; SigV4 signs the Host header
             bucket access-key secret region timeout max-response))
 
@@ -126,7 +126,7 @@
   ;; caller decides which statuses are acceptable. The canonical query
   ;; is computed ONCE and both signed and sent -- signature and wire
   ;; share the value by construction, not by recomputation. Bodyless
-  ;; PUT/POST needs no special casing here: (igropyr client) writes the
+  ;; PUT/POST needs no special casing here: (igropyr http-client) writes the
   ;; explicit Content-Length: 0 itself (unsigned, which SigV4 permits).
   (define (request s method path query headers body)
     (let* ((body-bv (or body empty-bv))

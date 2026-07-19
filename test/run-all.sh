@@ -32,7 +32,7 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/dashboard.sc
 "$scheme_bin" --script igropyr/test/auth.sc
 "$scheme_bin" --script igropyr/test/express-routes.sc
-"$scheme_bin" --script igropyr/test/client-stream.sc
+"$scheme_bin" --script igropyr/test/http-client-stream.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc
 "$scheme_bin" --script igropyr/test/node.sc

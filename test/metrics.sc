@@ -4,7 +4,7 @@
 ;;; label-value escaping), all scraped through a real /metrics endpoint.
 
 (import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
-        (igropyr client) (igropyr metrics) (igropyr gen-server)
+        (igropyr http-client) (igropyr metrics) (igropyr gen-server)
         (igropyr json) (igropyr sexpr) (igropyr node))
 
 (define port 18096)

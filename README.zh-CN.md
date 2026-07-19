@@ -452,7 +452,7 @@ HTTP *client* 使用同样的模型：每个请求运行在自己的绿色进程
 这适合在 handler 内调用其它服务。
 
 ```scheme
-(import (igropyr client))
+(import (igropyr http-client))
 
 (let ((r (http-get "http://api.internal/users/42")))
   (response-status r)                       ; -> 200
@@ -472,7 +472,7 @@ HTTP *client* 使用同样的模型：每个请求运行在自己的绿色进程
 访问 TLS endpoint：
 
 ```scheme
-(import (igropyr client) (igropyr tls))
+(import (igropyr http-client) (igropyr tls))
 (tls-enable!)                                 ; 首个 https 请求前调用一次
 
 (let ((r (http-get "https://api.github.com/zen"
@@ -796,7 +796,7 @@ server {
 与入站侧不同，这是进程*内*的真正 TLS 客户端，因此它自己校验证书。
 
 ```scheme
-(import (igropyr client) (igropyr tls))
+(import (igropyr http-client) (igropyr tls))
 (tls-enable!)
 (http-get "https://example.com/")
 ```
