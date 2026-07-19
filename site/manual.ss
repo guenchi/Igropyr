@@ -1,6 +1,6 @@
 ;; The Igropyr manual page, in Scheme. A thin shell: marked.js renders
-;; docs/manual.md (or the zh file) client-side; the loader script comes
-;; from (manual-js) verbatim. English/中文 toggle in the header.
+;; docs/manual.md client-side; the loader script comes from (manual-js)
+;; verbatim.
 (import (rnrs) (web html) (chrome) (manual-js))
 
 (define body
@@ -8,10 +8,7 @@
    (nav)
    `(div (@ (class "manualhead"))
       (div (@ (class "wrap"))
-        (h1 "Manual")
-        (div (@ (class "langtoggle"))
-          (button (@ (id "btn-en") (class "on") (onclick "loadManual('en')")) "English")
-          (button (@ (id "btn-zh") (onclick "loadManual('zh')")) "简体中文"))))
+        (h1 "Manual")))
    `(main (@ (id "md") (class "md-body"))
       (p (@ (class "md-loading")) "Loading the manual…"))
    (foot (list `(a (@ (href "index.html")) "Igropyr")

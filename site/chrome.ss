@@ -186,11 +186,6 @@
       (.manualhead (padding (px 40) 0 (px 8)))
       (".manualhead .wrap" (display flex) (align-items center) (gap (px 16)))
       (".manualhead h1" (font-size (px 34)) (letter-spacing "-.5px") (margin 0))
-      (.langtoggle (margin-left auto) (display flex) (gap (px 6)))
-      (".langtoggle button" (font inherit) (font-size (px 14)) (font-weight 600) (cursor pointer)
-                            (padding (px 6) (px 14)) (border (px 1) solid (var line))
-                            (border-radius (px 8)) (background (var bg)) (color (var dim)))
-      (".langtoggle button.on" (background (var acc)) (color "#fff") (border-color (var acc)))
       (.md-body (max-width (px 820)) (margin 0 auto) (padding (px 20) (px 24) (px 90))
                 (color "#2b303a") (font-size (px 16)) (line-height (dec 1 7)))
       (".md-body h1, .md-body h2, .md-body h3, .md-body h4"

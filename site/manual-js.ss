@@ -2,7 +2,7 @@
   (export manual-loader)
   (import (rnrs))
   (define manual-loader "
-  var SRC = { en: 'docs/manual.md', zh: 'docs/manual.zh-cn.md' };
+  var SRC = 'docs/manual.md';
 
   function slug(s) {
     return s.toLowerCase().trim()
@@ -10,13 +10,10 @@
       .replace(/\\s+/g, '-');
   }
 
-  function loadManual(lang) {
-    document.getElementById('btn-en').classList.toggle('on', lang === 'en');
-    document.getElementById('btn-zh').classList.toggle('on', lang === 'zh');
-    document.documentElement.lang = (lang === 'zh') ? 'zh' : 'en';
+  (function loadManual() {
     var el = document.getElementById('md');
     el.innerHTML = '<p class=\"md-loading\">Loading…</p>';
-    fetch(SRC[lang]).then(function (r) {
+    fetch(SRC).then(function (r) {
       if (!r.ok) throw new Error(r.status);
       return r.text();
     }).then(function (md) {
@@ -32,14 +29,9 @@
     }).catch(function (e) {
       el.innerHTML = '<p class=\"md-loading\">Could not render the manual ('
         + e.message + '). Read it on '
-        + '<a href=\"' + SRC[lang] + '\">the raw file</a> or on '
+        + '<a href=\"' + SRC + '\">the raw file</a> or on '
         + '<a href=\"https://github.com/guenchi/Igropyr/blob/website/'
-        + SRC[lang] + '\">GitHub</a>.</p>';
+        + SRC + '\">GitHub</a>.</p>';
     });
-  }
-
-  // language from ?lang=zh or #zh, else default English
-  var q = (location.search.match(/[?&]lang=(zh|en)/) || [])[1];
-  var initial = q || (/^#?zh/.test(location.hash) ? 'zh' : 'en');
-  loadManual(initial === 'zh' ? 'zh' : 'en');
+  })();
 "))
