@@ -81,10 +81,16 @@
   ;; Bounds are checked HERE, not left to the callee: the native call
   ;; reads raw pointers, so a short buffer would be a silent heap
   ;; overrun instead of a Scheme error.
+  (define int32-max #x7fffffff)
+
   (define (blas-scores! base n dim query scores)
-    (unless (and (fixnum? n) (fx>= n 0) (fixnum? dim) (fx>= dim 1))
+    ;; n and dim cross the FFI as C int (32-bit): a value above int32-max is
+    ;; silently truncated by Chez, so the native call would read a DIFFERENT
+    ;; shape than the buffer checks below validated -- reject here.
+    (unless (and (fixnum? n) (fx>= n 0) (fx<= n int32-max)
+                 (fixnum? dim) (fx>= dim 1) (fx<= dim int32-max))
       (assertion-violation 'blas-scores!
-        "want n >= 0 and dim >= 1" (list n dim)))
+        "want 0 <= n <= int32-max and 1 <= dim <= int32-max" (list n dim)))
     (unless (and (bytevector? base)
                  (>= (bytevector-length base) (* n dim 4)))
       (assertion-violation 'blas-scores!

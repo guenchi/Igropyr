@@ -687,9 +687,30 @@
             "splat '*' must be the last pattern segment" pattern))
         (loop (cdr ss)))))
 
+  ;; A ':' in a segment starts a param (":name" or "prefix:name"). The name
+  ;; (everything after the first ':') must be a non-empty identifier with no
+  ;; further ':' -- otherwise "/@:" registers an empty-named capture and
+  ;; "/@:a:b" folds the second colon into the name, both silent mystery-misses
+  ;; that req-param can never read. Reject them HERE, like check-splat!.
+  (define (check-params! who pattern segs)
+    (for-each
+      (lambda (seg)
+        (let ((ci (seg-colon-index seg)))
+          (when ci
+            (let ((name (substring seg (fx+ ci 1) (string-length seg))))
+              (when (fx= (string-length name) 0)
+                (assertion-violation who
+                  "route param name is empty (segment ends with ':')" pattern))
+              (when (seg-colon-index name)
+                (assertion-violation who
+                  "route segment has more than one ':' (one param per segment)"
+                  pattern))))))
+      segs))
+
   (define (add-route! a method pattern handler)
     (let ((segs (split-segments pattern)))
       (check-splat! 'add-route! pattern segs)
+      (check-params! 'add-route! pattern segs)
       (app-routes-set! a
         (append
           (filter (lambda (r)
@@ -821,6 +842,7 @@
     (let ((segs (split-segments pattern))
           (guard (and (pair? rest) (car rest))))
       (check-splat! 'app-ws pattern segs)
+      (check-params! 'app-ws pattern segs)
       (when guard
         (unless (procedure? guard)
           (assertion-violation 'app-ws "guard must be a procedure" guard)))

@@ -209,6 +209,13 @@
   ;; password and salt are bytevectors; dk-len is the wanted byte length.
   (define (pbkdf2-hmac-sha256 password salt iterations dk-len)
     (define h-len 32)
+    (define block-size 64)
+    ;; ipad/opad depend only on the password, so build them once and reuse the
+    ;; PRF across every block and iteration rather than rebuilding the HMAC key
+    ;; schedule on each of the (up to hundreds of thousands of) inner calls.
+    (define ipad (make-bytevector block-size))
+    (define opad (make-bytevector block-size))
+    (define (prf u) (sha256 (bv-append opad (sha256 (bv-append ipad u)))))
     (define (u32be i)
       (bytevector (fxand (fxsrl i 24) #xFF) (fxand (fxsrl i 16) #xFF)
                   (fxand (fxsrl i 8) #xFF) (fxand i #xFF)))
@@ -217,12 +224,29 @@
         (bytevector-u8-set! acc j
           (fxxor (bytevector-u8-ref acc j) (bytevector-u8-ref u j)))))
     (define (block i)                  ; T_i = U_1 xor U_2 xor ... xor U_c
-      (let ((u1 (hmac-sha256 password (bv-append salt (u32be i)))))
+      (let ((u1 (prf (bv-append salt (u32be i)))))
         (let loop ((c 1) (u u1) (acc (bytevector-copy u1)))
           (if (fx>= c iterations)
               acc
-              (let ((u* (hmac-sha256 password u)))
+              (let ((u* (prf u)))
                 (loop (fx+ c 1) u* (xor-into! acc u*)))))))
+    ;; iterations MUST be >= 1: with 0 (or a negative value from a config
+    ;; default / off-by-one) the loop below returns U_1 alone -- a single-round
+    ;; key -- silently and catastrophically weakening every derived hash. Fail
+    ;; loudly instead of degrading.
+    (unless (and (fixnum? iterations) (fx>= iterations 1))
+      (assertion-violation 'pbkdf2-hmac-sha256
+        "iterations must be a positive fixnum" iterations))
+    (unless (and (fixnum? dk-len) (fx>= dk-len 0))
+      (assertion-violation 'pbkdf2-hmac-sha256
+        "dk-len must be a nonnegative fixnum" dk-len))
+    ;; fill the PRF pads from the (possibly hashed-down) password key
+    (let ((k (if (fx> (bytevector-length password) block-size)
+                 (sha256 password) password)))
+      (do ((i 0 (fx+ i 1))) ((fx= i block-size))
+        (let ((b (if (fx< i (bytevector-length k)) (bytevector-u8-ref k i) 0)))
+          (bytevector-u8-set! ipad i (fxxor b #x36))
+          (bytevector-u8-set! opad i (fxxor b #x5c)))))
     (let* ((nblocks (fxdiv (fx+ dk-len (fx- h-len 1)) h-len))
            (out (make-bytevector (fx* nblocks h-len))))
       (do ((i 1 (fx+ i 1))) ((fx> i nblocks))

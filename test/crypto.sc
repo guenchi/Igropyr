@@ -30,6 +30,22 @@
   (pb "passwordPASSWORDpassword" "saltSALTsaltSALTsaltSALTsaltSALTsalt" 4096 40)
   "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9")
 
+;; iterations <= 0 (a config default or off-by-one) must fail loudly rather
+;; than silently fold to a single-round key; dk-len must be nonnegative.
+(define (rejects? thunk)
+  (guard (e ((assertion-violation? e) #t) (#t #f)) (thunk) #f))
+(define (check-reject label ok)
+  (if ok
+      (begin (display "  ok  ") (display label) (newline))
+      (begin (set! failures (+ failures 1))
+             (display "FAIL  ") (display label) (newline))))
+(check-reject "iters=0-rejected"
+  (rejects? (lambda () (pbkdf2-hmac-sha256 (string->utf8 "pw") (string->utf8 "salt") 0 32))))
+(check-reject "iters=-1-rejected"
+  (rejects? (lambda () (pbkdf2-hmac-sha256 (string->utf8 "pw") (string->utf8 "salt") -1 32))))
+(check-reject "neg-dklen-rejected"
+  (rejects? (lambda () (pbkdf2-hmac-sha256 (string->utf8 "pw") (string->utf8 "salt") 1 -1))))
+
 (if (zero? failures)
     (begin (display "crypto: all pbkdf2 tests passed\n") (exit 0))
     (begin (display failures) (display " failures\n") (exit 1)))

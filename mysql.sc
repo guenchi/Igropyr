@@ -628,6 +628,36 @@
             (hashtable-delete! lessee->mon from)
             (make-available! c))
           (loop))
+        (`#(mysql-checkin-broken ,from ,c)
+          ;; the lessee could not clean the connection (e.g. ROLLBACK failed):
+          ;; drop the lease and destroy+rebuild it rather than ever lending a
+          ;; possibly-open transaction to the next caller. Atomic here (single
+          ;; loop), so the connection is never made available in between.
+          (when (eq? (hashtable-ref leased c #f) from)
+            (hashtable-delete! leased c)
+            (hashtable-delete! lessee->conn from)
+            (let ((m (hashtable-ref lessee->mon from #f)))
+              (when m (demonitor m)))
+            (hashtable-delete! lessee->mon from)
+            (hashtable-set! dying c #t)
+            (send c (vector 'mysql-quit)))    ; -> DOWN -> rebuild (case 2)
+          (loop))
+        (`#(mysql-checkout-cancel ,ref ,from)
+          ;; a checkout timed out: drop its still-queued request so a freed
+          ;; connection is never leased to a borrower that has moved on. If the
+          ;; pool already leased one to it (raced the timeout), reclaim it --
+          ;; the borrower parked in the timeout branch never received/used it.
+          (set! co-front (filter (lambda (x) (not (eq? (car x) ref))) co-front))
+          (set! co-back  (filter (lambda (x) (not (eq? (car x) ref))) co-back))
+          (let ((c (hashtable-ref lessee->conn from #f)))
+            (when (and c (eq? (hashtable-ref leased c #f) from))
+              (hashtable-delete! leased c)
+              (hashtable-delete! lessee->conn from)
+              (let ((m (hashtable-ref lessee->mon from #f)))
+                (when m (demonitor m)))
+              (hashtable-delete! lessee->mon from)
+              (make-available! c)))
+          (loop))
         (`#(mysql-up ,pid ,status)
           (if (eq? status 'ok)
               (make-available! pid)
@@ -738,6 +768,10 @@
     (let ((ref (gensym)))
       (send pool (vector 'mysql-checkout ref self))
       (receive (after checkout-timeout-ms
+                  ;; tell the pool to drop (or reclaim) this request -- otherwise
+                  ;; a connection freed after the timeout is leased to us and
+                  ;; never checked in, bleeding the pool under saturation.
+                  (send pool (vector 'mysql-checkout-cancel ref self))
                   (raise (vector 'mysql-error -1 "checkout timeout")))
         (`#(mysql-checkout-reply ,@ref ,conn) conn))))
 
@@ -764,21 +798,33 @@
   ;; commit/rollback, the pool discards and rebuilds the connection, so a
   ;; half-open transaction is never handed to the next caller.
   (define (mysql-transaction pool proc)
-    (call-with-mysql-connection pool
-      (lambda (conn)
-        (mysql-query conn "START TRANSACTION")
-        (let ((done #f))
-          (dynamic-wind
-            (lambda () (void))
-            (lambda ()
-              (let ((r (proc conn)))
-                (mysql-query conn "COMMIT")
-                (set! done #t)
-                r))
-            (lambda ()
-              (unless done
-                (guard (e (#t #f))
-                  (mysql-query conn "ROLLBACK")))))))))
+    ;; self-manages the lease (rather than call-with-mysql-connection) so the
+    ;; single return message can be checkin OR checkin-broken -- no second
+    ;; checkin racing the discard. Kill-safety is unchanged: if the borrower is
+    ;; killed the winders are discarded, no message is sent, and the pool's
+    ;; monitor reclaims + rebuilds the connection.
+    (let ((conn (pool-checkout pool)))
+      (let ((committed #f) (broken #f))
+        (dynamic-wind
+          (lambda () (void))
+          (lambda ()
+            ;; inside the wind: if START TRANSACTION itself fails, the
+            ;; after-clause still runs, so the lease is always returned. A
+            ;; ROLLBACK with no started transaction is a harmless no-op; if the
+            ;; connection is dead it fails there too and gets discarded.
+            (mysql-query conn "START TRANSACTION")
+            (let ((r (proc conn)))
+              (mysql-query conn "COMMIT")
+              (set! committed #t)
+              r))
+          (lambda ()
+            (unless committed
+              ;; roll back; if ROLLBACK itself fails the transaction may still
+              ;; be open (query timeout, transient error), so flag the
+              ;; connection for discard instead of returning it dirty
+              (set! broken (guard (e (#t #t)) (mysql-query conn "ROLLBACK") #f)))
+            (send pool (vector (if broken 'mysql-checkin-broken 'mysql-checkin)
+                               self conn)))))))
 
   (define (mysql-close! mc)
     (send mc (vector 'mysql-quit)))

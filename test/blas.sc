@@ -69,6 +69,13 @@
   (rejects? (lambda () (blas-scores! base n dim query (make-bytevector 8)))))
 (check "bad-dim-rejected"
   (rejects? (lambda () (blas-scores! base n 0 query scores))))
+;; n or dim above int32-max is silently truncated crossing the FFI as C int,
+;; so the native call would read a different shape than the buffer checks
+;; validated -- reject before the call rather than trust the truncated value
+(check "n-over-int32-rejected"
+  (rejects? (lambda () (blas-scores! base #x80000000 dim query scores))))
+(check "dim-over-int32-rejected"
+  (rejects? (lambda () (blas-scores! base n #x80000000 query scores))))
 
 (if (zero? failures)
     (begin (display "blas: all tests passed") (newline) (exit 0))

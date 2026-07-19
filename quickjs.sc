@@ -76,15 +76,23 @@
     (let ((opts (if (pair? rest) (car rest) '())))
       (load-so! (opt opts 'so-path #f))
       (unless c-boot (bind!))
-      (let ((bv (string->utf8 source)))
-        (with-interrupts-disabled
-          (let ((r (c-boot bv (bytevector-length bv)
-                           (opt opts 'mem-mb 64)
-                           (opt opts 'stack-kb 1024)
-                           (opt opts 'timeout-ms 2000))))
-            (if (= r 0)
-                #t
-                (error 'qjs-boot! (fetch 4096))))))))
+      (let ((timeout-ms (opt opts 'timeout-ms 2000)))
+        ;; a non-positive timeout disables the shim's wall-clock deadline
+        ;; entirely (interrupt handler never fires), so a runaway call would
+        ;; hold the engine mutex forever and wedge every caller. Require a
+        ;; positive bound.
+        (unless (and (fixnum? timeout-ms) (fx> timeout-ms 0))
+          (assertion-violation 'qjs-boot! "timeout-ms must be a positive fixnum"
+                               timeout-ms))
+        (let ((bv (string->utf8 source)))
+          (with-interrupts-disabled
+            (let ((r (c-boot bv (bytevector-length bv)
+                             (opt opts 'mem-mb 64)
+                             (opt opts 'stack-kb 1024)
+                             timeout-ms)))
+              (if (= r 0)
+                  #t
+                  (error 'qjs-boot! (fetch 4096)))))))))
 
   ;; -> (values ok? string): result on #t, JS error text on #f.
   (define (qjs-call fname arg)

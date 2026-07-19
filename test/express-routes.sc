@@ -79,6 +79,29 @@
 (check "ws-trailing-splat-ok"
   (begin (app-ws app "/wsplat/*" (lambda (ws req) req)) #t))
 
+;; a literal-prefix param must name a non-empty capture with exactly one
+;; ':' -- "/@:" captures nothing and "/@:a:b" folds the 2nd colon into the
+;; name, both silent mystery-misses req-param can never read. Registration
+;; must reject them on the HTTP and ws paths, like the mid-splat guard.
+(check "empty-param-rejected"
+  (guard (c ((assertion-violation? c) #t) (#t #f))
+    (app-get app "/@:" (lambda (req res) res))
+    #f))
+(check "double-colon-rejected"
+  (guard (c ((assertion-violation? c) #t) (#t #f))
+    (app-get app "/@:a:b" (lambda (req res) res))
+    #f))
+(check "ws-empty-param-rejected"
+  (guard (c ((assertion-violation? c) #t) (#t #f))
+    (app-ws app "/@:" (lambda (ws req) req))
+    #f))
+;; a well-formed literal-prefix param still registers fine
+(check "prefix-param-ok"
+  (begin
+    (app-get app "/u/@:name"
+      (lambda (req res) (send-text! res (string-append "u=" (req-param req "name")))))
+    #t))
+
 (start-scheduler
   (lambda ()
     (app-listen app port '((workers . 2)))
@@ -96,6 +119,8 @@
     (check "param-one"     (equal? (get "/files/42")      '("200" . "id=42")))
     ;; :param does NOT swallow extra segments (that is the splat's job)
     (check "param-not-splat" (equal? (car (get "/files/42/extra")) "404"))
+    ;; a literal-prefix param captures the segment tail after the prefix
+    (check "prefix-param-capture" (equal? (get "/u/@alice") '("200" . "u=alice")))
     ;; unmatched path is a 404
     (check "miss-404"      (equal? (car (get "/nope"))     "404"))
 

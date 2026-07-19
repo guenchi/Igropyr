@@ -310,10 +310,14 @@
           ("nodes"
            . ,(list->vector
                 (cons
-                  (append
-                    `(("name" . ,(symbol->string (node-self)))
-                      ("self" . #t) ("up" . #t))
-                    (summary-json (node-summary m srv)))
+                  ;; guard the SELF summary too: if the local collector/pool
+                  ;; is unhealthy it renders up=#f + null, not a 500 (same as
+                  ;; a peer that failed to answer)
+                  (let ((self-sum (guard (e (#t #f)) (node-summary m srv))))
+                    (append
+                      `(("name" . ,(symbol->string (node-self)))
+                        ("self" . #t) ("up" . ,(and self-sum #t)))
+                      (summary-json (or self-sum '()))))
                   (map (lambda (peer)
                          (let ((s (guard (e (#t #f))
                                     (rcall peer node-service 'summary
@@ -331,9 +335,13 @@
   ;; null). One builder, so the JSON and sexpr encodings can never
   ;; drift; in-process callers can consume it directly too.
   (define (metrics-snapshot m srv)
-    (let ((dump (gen-server-call m (vector 'dump)))
-          (stats (http-stats srv)))
-      (define (stat key) (cdr (assq key stats)))
+    ;; degrade, don't 500: if the collector is overloaded (gen-server-call
+    ;; times out) or the pool supervisor is stuck (http-stats raises), the
+    ;; health endpoint must still answer -- with nulls/zeros, not an error.
+    (let ((dump (guard (e (#t (vector '() 0 0 '())))
+                  (gen-server-call m (vector 'dump))))
+          (stats (guard (e (#t '())) (http-stats srv))))
+      (define (stat key) (let ((p (assq key stats))) (if p (cdr p) 'null)))
       `(("uptime_ms" . ,(stat 'uptime-ms))
         ("connections" . ,(stat 'connections))
         ("pool" . (("busy" . ,(stat 'busy))
