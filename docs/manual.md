@@ -3170,12 +3170,53 @@ library — `blas-available?` tells you which lane is active.
 Top-k, thresholds, and storage stay yours; this is the scan, at memory
 bandwidth (≈0.2 ms for 5k×512 float32, ≈5 ms at 100k).
 
-One scheduling note: an FFI call cannot be preempted, so a full scan stalls
-the calling scheduler for its duration. Spread those stalls — every process
-scanning its own replica inline keeps the per-process stall duty cycle
-`q·s/N` negligible; do not funnel searches into a few dedicated processes.
-If that duty cycle ever grows, tile the scan and yield between tiles, or
-shard the corpus and scatter-gather.
+### Distributing the Load Across Nodes
+
+An FFI call cannot be preempted, so a full scan freezes the **one OS thread**
+its scheduler runs on for the scan's duration — every green process on that
+scheduler waits, not just the caller. The way to keep that from hurting is to
+spread the scans, but be precise about the unit: green processes (actors) all
+share one OS thread, so moving a scan to a different green process on the same
+scheduler does nothing. The stall is divided only across units that each own
+an OS thread — separate OS processes (a `SO_REUSEPORT` fleet, one per core) or
+separate nodes. With each such unit scanning its own replica inline, the
+per-thread stall duty cycle `q·s/N` (query rate × scan time ÷ number of OS
+threads) stays negligible. Do **not** funnel searches into a few dedicated
+processes: that adds a hop per search and one saturating queue for nothing.
+
+One honesty check on throughput: a scan is CPU-bound (it is computing, not
+waiting on I/O), so its throughput ceiling is total physical CPU ÷ CPU-seconds
+per scan — fixed by the hardware, no matter how you arrange threads on it.
+Offloading a scan to another thread on the **same, already-saturated** machine
+does not create CPU, so it does not raise throughput; it only reshuffles
+*when* the work runs (tail latency), and can cost a little in handoff. Spread
+across nodes raises throughput only when it means more physical cores or
+machines. If a single corpus outgrows sub-millisecond scans, tile the scan and
+yield between tiles, or shard the corpus and scatter-gather across nodes — the
+lever is more CPU, added as more independent nodes, not rearranged threads.
+
+### BLAS Thread Count
+
+A native BLAS (OpenBLAS especially) may spawn its **own** threads for one
+`sgemv`. If you also run one node per core, those internal threads oversubscribe
+the cores — the nodes and the BLAS threads fight for the same CPUs. Pin the BLAS
+to one thread per process in that layout. There is no library switch (and could
+only be a partial one — Accelerate has no runtime setter); the thread count is
+an **environment variable the BLAS reads when its shared library loads**, so it
+must be set **before the process starts** — setting it after launch has no
+effect. That ordering is the whole point:
+
+```sh
+# set in the launcher (rc.d/systemd unit, deploy script) BEFORE exec'ing scheme
+OPENBLAS_NUM_THREADS=1    # OpenBLAS (Linux/FreeBSD)
+OMP_NUM_THREADS=1         # OpenBLAS built with OpenMP, and other OpenMP BLAS
+VECLIB_MAXIMUM_THREADS=1  # macOS Accelerate / vecLib
+```
+
+Set the pair that matches your backend (both `OPENBLAS_*` and `OMP_*` is a safe
+belt-and-braces). Pin to 1 only in the one-node-per-core layout; on a single
+node with idle cores you may leave BLAS multi-threaded, though for small corpora
+the threading overhead usually outweighs the gain.
 
 The native BLAS is optional. Without one, the pure lane runs — slower but
 exact — so nothing breaks; on a build that uses whole-program compilation
