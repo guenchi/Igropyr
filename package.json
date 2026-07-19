@@ -31,7 +31,6 @@
   "files": [
     "*.sc",
     "*.ss",
-    "test/",
-    "README.zh-CN.md"
+    "test/"
   ]
 }
