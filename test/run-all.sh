@@ -42,6 +42,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/conversation.sc
 "$scheme_bin" --script igropyr/test/conv-cluster.sc
 "$scheme_bin" --script igropyr/test/tls.sc
+# opt-in (needs a live MySQL): runs for real only when IGROPYR_MYSQL_TEST is
+# set, otherwise self-skips, so this is a no-op on machines without a database.
+"$scheme_bin" --script igropyr/test/mysql.sc
 
 set +e
 badenv_output=$(IGROPYR_CONTRACTS=on "$scheme_bin" --script igropyr/test/checked-badenv.sc 2>&1)
