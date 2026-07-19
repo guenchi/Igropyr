@@ -20,6 +20,7 @@ IGROPYR_CONTRACTS=full "$scheme_bin" --script igropyr/test/checked-full.sc
 env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/smoke-actor.sc
 "$scheme_bin" --script igropyr/test/file-read.sc
+"$scheme_bin" --script igropyr/test/crypto.sc
 "$scheme_bin" --script igropyr/test/sexpr.sc
 "$scheme_bin" --script igropyr/test/sexpr-http.sc
 "$scheme_bin" --script igropyr/test/sexpr-ws.sc

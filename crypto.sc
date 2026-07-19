@@ -18,7 +18,7 @@
 ;;; (chezscheme), so this library sits at the bottom of the build.
 
 (library (igropyr crypto)
-  (export sha1 sha256 hmac-sha1 hmac-sha256
+  (export sha1 sha256 hmac-sha1 hmac-sha256 pbkdf2-hmac-sha256
           base64-encode base64-decode bytevector->hex)
   (import (chezscheme))
 
@@ -202,6 +202,36 @@
 
   (define (hmac-sha1 key msg) (hmac sha1 64 key msg))
   (define (hmac-sha256 key msg) (hmac sha256 64 key msg))
+
+  ;; ---- PBKDF2 (RFC 2898, PRF = HMAC-SHA256) ---------------------------
+  ;; Password hashing where there is no bcrypt/scrypt: pick a random
+  ;; per-user salt and a high iteration count, store salt+iterations+DK.
+  ;; password and salt are bytevectors; dk-len is the wanted byte length.
+  (define (pbkdf2-hmac-sha256 password salt iterations dk-len)
+    (define h-len 32)
+    (define (u32be i)
+      (bytevector (fxand (fxsrl i 24) #xFF) (fxand (fxsrl i 16) #xFF)
+                  (fxand (fxsrl i 8) #xFF) (fxand i #xFF)))
+    (define (xor-into! acc u)          ; acc ^= u over the first h-len bytes
+      (do ((j 0 (fx+ j 1))) ((fx= j h-len) acc)
+        (bytevector-u8-set! acc j
+          (fxxor (bytevector-u8-ref acc j) (bytevector-u8-ref u j)))))
+    (define (block i)                  ; T_i = U_1 xor U_2 xor ... xor U_c
+      (let ((u1 (hmac-sha256 password (bv-append salt (u32be i)))))
+        (let loop ((c 1) (u u1) (acc (bytevector-copy u1)))
+          (if (fx>= c iterations)
+              acc
+              (let ((u* (hmac-sha256 password u)))
+                (loop (fx+ c 1) u* (xor-into! acc u*)))))))
+    (let* ((nblocks (fxdiv (fx+ dk-len (fx- h-len 1)) h-len))
+           (out (make-bytevector (fx* nblocks h-len))))
+      (do ((i 1 (fx+ i 1))) ((fx> i nblocks))
+        (bytevector-copy! (block i) 0 out (fx* (fx- i 1) h-len) h-len))
+      (if (fx= (bytevector-length out) dk-len)
+          out
+          (let ((r (make-bytevector dk-len)))
+            (bytevector-copy! out 0 r 0 dk-len)
+            r))))
 
   ;; ---- base64 ---------------------------------------------------------
 
