@@ -51,6 +51,7 @@
     ("igropyr/sigv4.sc" . 2)
     ("igropyr/s3.sc" . 2)
     ("igropyr/tls.sc" . 2)
+    ("igropyr/apple-jws.sc" . 2)
     ("igropyr/redis.sc" . 2)
     ("igropyr/mysql.sc" . 2)
     ("igropyr/cluster.sc" . 2)))
