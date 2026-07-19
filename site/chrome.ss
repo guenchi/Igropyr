@@ -157,6 +157,9 @@
               (color (var dim)) (font-size (px 14)) (text-align center))
       ("footer .links" (margin-bottom (px 10)) (display flex) (gap (px 22))
                        (justify-content center))
+      ("footer .powered" (margin-top (px 12)) (font-size (px 13)))
+      ("footer .powered a" (color (var acc)))
+      ("footer .powered a:hover" (color (var acc2)))
       (@media "(max-width: 840px)"
         (h1 (font-size (px 40)))
         (.feature (grid-template-columns "1fr"))
@@ -230,7 +233,9 @@
   (define (foot links . tagline)
     `(footer
        (div (@ (class "links")) ,@links)
-       ,@(if (null? tagline) '() (list `(div ,@tagline)))))
+       ,@(if (null? tagline) '() (list `(div ,@tagline)))
+       (div (@ (class "powered"))
+         "Powered by " (a (@ (href "https://goeteia.dev")) "Goeteia"))))
 
   ;; ---- assemble a document ----
   ;; head-extra: extra nodes for <head>; body-nodes: the page body;
