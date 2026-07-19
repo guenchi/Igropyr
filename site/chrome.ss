@@ -157,9 +157,11 @@
               (color (var dim)) (font-size (px 14)) (text-align center))
       ("footer .links" (margin-bottom (px 10)) (display flex) (gap (px 22))
                        (justify-content center))
+      ;; footer links are understated (dim), only picking up the accent on
+      ;; hover -- the bright link blue looks loud down here
+      ("footer a" (color (var dim)))
+      ("footer a:hover" (color (var acc2)))
       ("footer .powered" (margin-top (px 12)) (font-size (px 13)))
-      ("footer .powered a" (color (var acc)))
-      ("footer .powered a:hover" (color (var acc2)))
       (@media "(max-width: 840px)"
         (h1 (font-size (px 40)))
         (.feature (grid-template-columns "1fr"))
