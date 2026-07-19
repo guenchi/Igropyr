@@ -300,7 +300,7 @@
   ;;   #(sclen status headers remaining)
   ;;   #(schunked status headers)
   ;;   #(seof status headers)
-  (define (client-loop c caller ref buf state timeout codec emit max-resp)
+  (define (client-loop c caller ref buf state timeout codec emit max-resp method)
     (define (done!) (when codec ((vector-ref codec 2))) (tcp-close! c))
     (define (reply! r) (send caller (vector 'http-reply ref r)) (done!))
     (define (err! msg) (send caller (vector 'http-error ref msg)) (done!))
@@ -326,6 +326,13 @@
                       (headers (parse-headers head (+ sl-end 2) hend)))
                  (cond
                    ((not status) (err! "malformed status line") #f)
+                   ;; HEAD, and 204/304/1xx, carry no body whatever the
+                   ;; headers say (RFC 7230 3.3.3) -- reply now. Without this a
+                   ;; HEAD to S3 would block on a Content-Length body never sent.
+                   ((or (eq? method 'HEAD) (fx= status 204) (fx= status 304)
+                        (and (fx>= status 100) (fx< status 200)))
+                    (reply! (make-response status headers empty-bv))
+                    #f)
                    (else
                     ;; streaming: the head is consumed so body handling
                     ;; works from the buffer start and stays flat
@@ -400,14 +407,14 @@
           (`#(tcp-data ,raw)
             (let ((bv (if codec ((vector-ref codec 1) raw) raw)))
               (if (zero? (bytevector-length bv))   ; pure TLS records, no app data
-                  (client-loop c caller ref buf state timeout codec emit max-resp)
+                  (client-loop c caller ref buf state timeout codec emit max-resp method)
                   (begin
                     (inbuf-append! buf bv)
                     ;; with streaming consumption this caps the UNPARSED
                     ;; tail (e.g. one oversized chunk), not the stream total
                     (if (> (inbuf-length buf) max-resp)
                         (err! "response too large")
-                        (client-loop c caller ref buf state timeout codec emit max-resp))))))
+                        (client-loop c caller ref buf state timeout codec emit max-resp method))))))
           (`#(tcp-eof)
             (cond
               ((and (vector? state) (eq? (vector-ref state 0) 'eof))
@@ -513,7 +520,7 @@
                                         (let ((req (build-request method host-header path headers body)))
                                           (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f))
                                         (client-loop c caller ref (make-inbuf) 'head idle codec
-                                                     on-chunk max-resp))))
+                                                     on-chunk max-resp method))))
                                   (`#(tcp-connect-failed ,e)
                                     (send caller (vector 'http-error ref (uv-strerror e))))))
                               (`#(dns-failed ,e)

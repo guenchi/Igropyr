@@ -110,6 +110,18 @@
               "<NextContinuationToken>tok-1</NextContinuationToken>"
               "</ListBucketResult>"))))))
 
+(app-post app "/iter/arch.wav"
+  (lambda (req res)
+    (unless (assoc "restore" (req-query req)) (sfail! 'restore-query))
+    (unless (equal? (req-header req 'content-type) "application/xml") (sfail! 'restore-ctype))
+    (unless (equal? (utf8->string (req-body req))
+                    (string-append "<RestoreRequest><Days>7</Days>"
+                                   "<GlacierJobParameters><Tier>Bulk</Tier></GlacierJobParameters>"
+                                   "</RestoreRequest>"))
+      (sfail! 'restore-body))
+    (set-status! res 202)
+    (res-send! res empty-bv)))
+
 ;; ---- tests -----------------------------------------------------------------
 
 (start-scheduler
@@ -175,6 +187,11 @@
       (check "error-typed"
         (= 404 (s3-error-status (lambda () (s3-put! s "nope/void.bin" (string->utf8 "x")
                                                     "application/octet-stream")))))
+
+      ;; restore: POST ?restore with the RestoreRequest XML -> 'accepted (202)
+      (check "restore-accepted" (eq? 'accepted (s3-restore! s "arch.wav" 7 "Bulk")))
+      ;; HEAD a missing key -> #f (exercises the HEAD request path end to end)
+      (check "head-missing-false" (eq? #f (s3-head s "no-such.bin")))
 
       (check "server-side" (null? (unbox server-fails)))
       (unless (null? (unbox server-fails))

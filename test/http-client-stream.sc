@@ -11,6 +11,7 @@
 (define port 18091)
 (define raw-port 18092)
 (define bad-port 18093)
+(define head-port 18094)
 
 (define failures 0)
 (define (check label ok)
@@ -42,6 +43,14 @@
     (values b (lambda (bv) (set-box! b (cons bv (unbox b)))))))
 
 (define (collected b) (reverse (unbox b)))
+
+;; naive substring test, for the raw HEAD server to branch on the path
+(define (str-has? hay needle)
+  (let ((hn (string-length hay)) (nn (string-length needle)))
+    (let loop ((i 0))
+      (cond ((> (+ i nn) hn) #f)
+            ((string=? (substring hay i (+ i nn)) needle) #t)
+            (else (loop (+ i 1)))))))
 
 ;; ---- the app -----------------------------------------------------------
 
@@ -119,6 +128,35 @@
         (tcp-read-start! c)))
     0))
 
+;; a raw server that answers HEAD with real headers -- Content-Length set --
+;; but NO body, exactly as S3 does. A client that is not HEAD-aware would
+;; block here waiting for a body that never comes.
+(define (start-head-server!)
+  (tcp-listen! "0.0.0.0" head-port 16
+    (lambda (c)
+      (let ((pid (spawn
+                   (lambda ()
+                     (receive
+                       (`#(tcp-data ,bv)
+                         (let ((req (guard (e (#t "")) (utf8->string bv))))
+                           (tcp-write! c
+                             (string->utf8
+                               (if (str-has? req "missing")
+                                   "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                   (string-append
+                                     "HTTP/1.1 200 OK\r\n"
+                                     "Content-Length: 42\r\n"    ; a body we never send
+                                     "x-amz-restore: ongoing-request=\"false\"\r\n"
+                                     "Connection: close\r\n\r\n")))
+                             #f))
+                         (sleep-ms 40)
+                         (tcp-close! c))
+                       (`#(tcp-eof) (tcp-close! c))
+                       (`#(tcp-error ,e) (tcp-close! c)))))))
+        (conn-set-owner! c pid)
+        (tcp-read-start! c)))
+    0))
+
 ;; ---- tests -----------------------------------------------------------------
 
 (start-scheduler
@@ -126,6 +164,7 @@
     (app-listen app port '((workers . 2)))
     (start-eof-server!)
     (start-badchunk-server!)
+    (start-head-server!)
     (sleep-ms 100)
 
     ;; chunked (SSE) streaming: one emit per wire chunk, in order,
@@ -165,6 +204,18 @@
         (check "eof-body-empty" (= 0 (bytevector-length (response-body r))))
         (check "eof-content"
           (equal? (utf8->string (bv-concat* (collected b))) "hello"))))
+
+    ;; HEAD: real headers + Content-Length but no body -- the client must
+    ;; return at once (not block) with an empty body and the headers intact
+    (let ((r (http-request 'HEAD
+               (string-append "http://127.0.0.1:" (number->string head-port) "/present"))))
+      (check "head-status-200" (= 200 (response-status r)))
+      (check "head-empty-body" (= 0 (bytevector-length (response-body r))))
+      (check "head-headers-intact"
+        (equal? (response-header r 'x-amz-restore) "ongoing-request=\"false\"")))
+    (let ((r (http-request 'HEAD
+               (string-append "http://127.0.0.1:" (number->string head-port) "/missing"))))
+      (check "head-status-404" (= 404 (response-status r))))
 
     ;; timeout 0 = no idle limit: a slow drip still completes
     (let-values (((b collect) (collector)))

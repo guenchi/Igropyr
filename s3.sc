@@ -40,7 +40,8 @@
 
 (library (igropyr s3)
   (export make-s3 s3?
-          s3-put! s3-get s3-copy! s3-delete! s3-delete-prefix! s3-list)
+          s3-put! s3-get s3-head s3-copy! s3-delete! s3-delete-prefix! s3-list
+          s3-restore!)
   (import (chezscheme) (igropyr util) (igropyr crypto) (igropyr sigv4)
           (igropyr http-client))
 
@@ -174,6 +175,16 @@
             ((= (response-status r) 404) #f)
             (else (s3-fail (response-status r) (response-body r))))))
 
+  ;; HEAD an object -> its response headers (lowercase-symbol alist; read
+  ;; e.g. x-amz-restore / x-amz-storage-class from it) or #f on 404. Needs
+  ;; the HEAD-aware (igropyr http-client): a HEAD response carries the
+  ;; object's Content-Length but no body.
+  (define (s3-head s key)
+    (let ((r (request s 'HEAD (object-path s key) '() '() #f)))
+      (cond ((ok? (response-status r)) (response-headers r))
+            ((= (response-status r) 404) #f)
+            (else (s3-fail (response-status r) (response-body r))))))
+
   ;; server-side copy within the bucket (promotion: sandbox/… -> items/…)
   (define (s3-copy! s src-key dst-key)
     (check! (request s 'PUT (object-path s dst-key) '()
@@ -206,6 +217,26 @@
   (define (s3-delete-prefix! s prefix)
     (for-each (lambda (k) (s3-delete! s k)) (s3-list s prefix))
     #t)
+
+  ;; Ask S3 to restore an archived (Glacier / Deep Archive) object for `days`
+  ;; days at retrieval `tier` ("Bulk" | "Standard" -- Deep Archive has no
+  ;; Expedited). -> 'accepted (202, newly initiated), 'in-progress (409, one
+  ;; already running), or 'ok (200, already restored). RestoreObject needs no
+  ;; Content-MD5 (only the DeleteObjects batch does), so a plain signed POST
+  ;; with the small XML body suffices.
+  (define (s3-restore! s key days tier)
+    (let* ((xml (string-append
+                  "<RestoreRequest><Days>" (number->string days) "</Days>"
+                  "<GlacierJobParameters><Tier>" tier "</Tier></GlacierJobParameters>"
+                  "</RestoreRequest>"))
+           (r (request s 'POST (object-path s key) '(("restore" . ""))
+                       '(("content-type" . "application/xml"))
+                       (string->utf8 xml))))
+      (let ((st (response-status r)))
+        (cond ((= st 202) 'accepted)
+              ((= st 409) 'in-progress)
+              ((ok? st) 'ok)
+              (else (s3-fail st (response-body r)))))))
 
   ;; ---- tiny helpers --------------------------------------------------------
 
