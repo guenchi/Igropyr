@@ -28,13 +28,15 @@ This manual covers the architecture, design patterns, and implementation details
     - [Node links, rsend / rcall, monitors](#distribution)
     - [Automatic discovery (static, gossip, Redis)](#automatic-discovery)
     - [Distributed task pool](#distributed-task-pool)
-22. [Running and Building](#running-and-building)
-23. [Testing](#testing)
-24. [Development Contracts](#development-contracts)
-25. [Code Style](#code-style)
-26. [Common Pitfalls](#common-pitfalls)
-27. [Vector Scoring](#vector-scoring)
-28. [Embedded JavaScript](#embedded-javascript)
+22. [Vector Scoring](#vector-scoring)
+23. [Embedded JavaScript](#embedded-javascript)
+24. [Running and Building](#running-and-building)
+25. [Testing](#testing)
+26. [Development Contracts](#development-contracts)
+27. [Code Style](#code-style)
+28. [Common Pitfalls](#common-pitfalls)
+29. [Appendix: Performance Tips](#appendix-performance-tips)
+30. [Further Reading](#further-reading)
 
 ---
 
@@ -2697,6 +2699,107 @@ igropyr.
 
 ---
 
+## Vector Scoring
+
+`(igropyr blas)` is the compute kernel for embedding search: one call fills
+`scores[i] = row_i · query` over a flat row-major float32 matrix — the scan
+behind RAG lookups, semantic dedup, recommendations. It uses `cblas_sgemv`
+when a native BLAS loads (Accelerate on macOS, OpenBLAS on Linux/FreeBSD)
+and a pure-Scheme loop otherwise, so correctness never depends on the native
+library — `blas-available?` tells you which lane is active.
+
+```scheme
+(import (igropyr blas))
+
+;; base is [n x dim] float32, row-major; query is [dim]; scores is [n]
+(blas-scores! base n dim query scores)   ; scores[i] = row_i . query
+(blas-available?)                        ; #t when a native BLAS backs it
+```
+
+- `(blas-scores! base n dim query scores)` — total function; base/query/
+  scores are float32 bytevectors. Bounds are checked at entry (the native
+  call reads raw pointers, so a short buffer must fail as a Scheme error,
+  not a heap overrun).
+- `(blas-available?)` → boolean — decided once at load.
+
+Top-k, thresholds, and storage stay yours; this is the scan, at memory
+bandwidth (≈0.2 ms for 5k×512 float32, ≈5 ms at 100k).
+
+### Distributing the Load Across Nodes
+
+A blas scan is a blocking FFI call, but distributing that blocking across
+igropyr nodes to share the work raises total responsiveness. With one igropyr
+node per CPU core, offloading the blas FFI to a separate thread does not lower
+total response time; it only adds thread-switch overhead.
+
+Collecting the blas requests onto another thread just moves the call to
+another core: it adds a context switch and a handoff, is more likely to fully
+occupy that core, and total throughput can even drop.
+
+### BLAS Thread Count
+
+OpenBLAS spawns its own threads per `sgemv`. With one node per core, those
+threads oversubscribe the cores against the nodes, so pin the BLAS to one
+thread per process. The count comes from an environment variable read when the
+shared library loads, so set it before the process starts; setting it afterward
+has no effect. There is no library option (Accelerate has no runtime setter in
+any case).
+
+```sh
+# in the launcher (rc.d/systemd unit, deploy script), before exec
+OPENBLAS_NUM_THREADS=1    # OpenBLAS (Linux/FreeBSD)
+OMP_NUM_THREADS=1         # OpenBLAS built with OpenMP
+VECLIB_MAXIMUM_THREADS=1  # macOS Accelerate
+```
+
+Pin to 1 only when running one node per core. On a single node with spare cores
+you can leave BLAS multi-threaded, though small matrices rarely repay the
+threading overhead.
+
+The native BLAS is optional. Without one, the pure lane runs — slower but
+exact — so nothing breaks; on a build that uses whole-program compilation
+the BLAS is `dlopen`ed at runtime, not folded into `app.so`.
+
+---
+
+## Embedded JavaScript
+
+`(igropyr quickjs)` embeds a JavaScript engine (QuickJS) in-process for
+running a **fixed** JS bundle baked at build time — a reference
+implementation you must match byte-for-byte, a sandboxed expression
+evaluator, a JS template. User input is the string **argument**, never
+code.
+
+```scheme
+(import (igropyr quickjs))
+
+(qjs-boot! "function slugify(s){ return s.toLowerCase().replace(/\\s+/g,'-') }")
+(qjs-call! "slugify" "Hello World")   ; -> "hello-world"
+```
+
+- `(qjs-boot! source [opts])` — load (or reload) the bundle. opts:
+  `(mem-mb . 64)`, `(stack-kb . 1024)`, `(timeout-ms . 2000)`,
+  `(so-path . "...")`.
+- `(qjs-call fname arg)` → `(values ok? string)` — call a global function
+  with one string argument; result on `#t`, JS error text on `#f`.
+- `(qjs-call! fname arg)` → string — the raising variant.
+- `(qjs-healthy?)` / `(qjs-generation)` / `(qjs-shutdown!)`.
+
+It is hardened in the C shim: a memory cap, a stack cap, a wall-clock
+interrupt deadline, and **crash-only rebuild** — a throwing or runaway call
+discards the whole JS heap and reboots it from the bundle
+(`qjs-generation` counts rebuilds), so one bad call can't poison the next.
+The engine is mutex-serialized and each call runs with interrupts disabled,
+so a call blocks its OS thread for its duration (sub-millisecond typically,
+`timeout-ms` worst case) — cap input size on latency-sensitive paths.
+
+The native shim is a build artifact (`build-quickjs-shim.sh`, needs QuickJS
+installed); without it the library imports fine and `qjs-boot!` reports the
+missing shim. Ship the shim alongside the binary on a path it resolves, or
+point `IGROPYR_QUICKJS_SO` at it.
+
+---
+
 ## Running and Building
 
 ### Environment Variables
@@ -3144,107 +3247,6 @@ Use process-local state (e.g., gen-server) or a database if the side effect must
 
 ---
 
-## Vector Scoring
-
-`(igropyr blas)` is the compute kernel for embedding search: one call fills
-`scores[i] = row_i · query` over a flat row-major float32 matrix — the scan
-behind RAG lookups, semantic dedup, recommendations. It uses `cblas_sgemv`
-when a native BLAS loads (Accelerate on macOS, OpenBLAS on Linux/FreeBSD)
-and a pure-Scheme loop otherwise, so correctness never depends on the native
-library — `blas-available?` tells you which lane is active.
-
-```scheme
-(import (igropyr blas))
-
-;; base is [n x dim] float32, row-major; query is [dim]; scores is [n]
-(blas-scores! base n dim query scores)   ; scores[i] = row_i . query
-(blas-available?)                        ; #t when a native BLAS backs it
-```
-
-- `(blas-scores! base n dim query scores)` — total function; base/query/
-  scores are float32 bytevectors. Bounds are checked at entry (the native
-  call reads raw pointers, so a short buffer must fail as a Scheme error,
-  not a heap overrun).
-- `(blas-available?)` → boolean — decided once at load.
-
-Top-k, thresholds, and storage stay yours; this is the scan, at memory
-bandwidth (≈0.2 ms for 5k×512 float32, ≈5 ms at 100k).
-
-### Distributing the Load Across Nodes
-
-A blas scan is a blocking FFI call, but distributing that blocking across
-igropyr nodes to share the work raises total responsiveness. With one igropyr
-node per CPU core, offloading the blas FFI to a separate thread does not lower
-total response time; it only adds thread-switch overhead.
-
-Collecting the blas requests onto another thread just moves the call to
-another core: it adds a context switch and a handoff, is more likely to fully
-occupy that core, and total throughput can even drop.
-
-### BLAS Thread Count
-
-OpenBLAS spawns its own threads per `sgemv`. With one node per core, those
-threads oversubscribe the cores against the nodes, so pin the BLAS to one
-thread per process. The count comes from an environment variable read when the
-shared library loads, so set it before the process starts; setting it afterward
-has no effect. There is no library option (Accelerate has no runtime setter in
-any case).
-
-```sh
-# in the launcher (rc.d/systemd unit, deploy script), before exec
-OPENBLAS_NUM_THREADS=1    # OpenBLAS (Linux/FreeBSD)
-OMP_NUM_THREADS=1         # OpenBLAS built with OpenMP
-VECLIB_MAXIMUM_THREADS=1  # macOS Accelerate
-```
-
-Pin to 1 only when running one node per core. On a single node with spare cores
-you can leave BLAS multi-threaded, though small matrices rarely repay the
-threading overhead.
-
-The native BLAS is optional. Without one, the pure lane runs — slower but
-exact — so nothing breaks; on a build that uses whole-program compilation
-the BLAS is `dlopen`ed at runtime, not folded into `app.so`.
-
----
-
-## Embedded JavaScript
-
-`(igropyr quickjs)` embeds a JavaScript engine (QuickJS) in-process for
-running a **fixed** JS bundle baked at build time — a reference
-implementation you must match byte-for-byte, a sandboxed expression
-evaluator, a JS template. User input is the string **argument**, never
-code.
-
-```scheme
-(import (igropyr quickjs))
-
-(qjs-boot! "function slugify(s){ return s.toLowerCase().replace(/\\s+/g,'-') }")
-(qjs-call! "slugify" "Hello World")   ; -> "hello-world"
-```
-
-- `(qjs-boot! source [opts])` — load (or reload) the bundle. opts:
-  `(mem-mb . 64)`, `(stack-kb . 1024)`, `(timeout-ms . 2000)`,
-  `(so-path . "...")`.
-- `(qjs-call fname arg)` → `(values ok? string)` — call a global function
-  with one string argument; result on `#t`, JS error text on `#f`.
-- `(qjs-call! fname arg)` → string — the raising variant.
-- `(qjs-healthy?)` / `(qjs-generation)` / `(qjs-shutdown!)`.
-
-It is hardened in the C shim: a memory cap, a stack cap, a wall-clock
-interrupt deadline, and **crash-only rebuild** — a throwing or runaway call
-discards the whole JS heap and reboots it from the bundle
-(`qjs-generation` counts rebuilds), so one bad call can't poison the next.
-The engine is mutex-serialized and each call runs with interrupts disabled,
-so a call blocks its OS thread for its duration (sub-millisecond typically,
-`timeout-ms` worst case) — cap input size on latency-sensitive paths.
-
-The native shim is a build artifact (`build-quickjs-shim.sh`, needs QuickJS
-installed); without it the library imports fine and `qjs-boot!` reports the
-missing shim. Ship the shim alongside the binary on a path it resolves, or
-point `IGROPYR_QUICKJS_SO` at it.
-
----
-
 ## Appendix: Performance Tips
 
 ### Connection Pooling
@@ -3254,6 +3256,10 @@ For database clients, use connection pools (MySQL supports this directly; for Re
 ### Worker Count
 
 The default 8 workers is tuned for a single CPU core. For multi-core systems, increase it (though Igropyr runs all workers on one OS thread, so the bottleneck is CPU, not I/O).
+
+### BLAS Threads
+
+If the app uses `(igropyr blas)` with a native BLAS, run one node per core and pin the BLAS to one thread per process — otherwise its internal threads oversubscribe the cores against the nodes. Set the environment variable before the process starts (the BLAS reads it when its shared library loads): `OPENBLAS_NUM_THREADS=1` / `OMP_NUM_THREADS=1` on Linux/FreeBSD, `VECLIB_MAXIMUM_THREADS=1` on macOS. See [Vector Scoring](#vector-scoring).
 
 ### Memory
 
