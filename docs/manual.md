@@ -3172,11 +3172,15 @@ bandwidth (≈0.2 ms for 5k×512 float32, ≈5 ms at 100k).
 
 ### Distributing the Load Across Nodes
 
-A scan is a blocking FFI call: it holds its scheduler's OS thread until it
-returns, and every green process on that thread waits. Distributing that
-blocking across igropyr nodes spreads it out and raises the cluster's total
-responsiveness. Green processes share one OS thread, so moving a scan to
-another actor on the same scheduler changes nothing; the stall divides only
+A blas scan is a blocking FFI call, but distributing that blocking across
+igropyr nodes to share the work raises total responsiveness. With one igropyr
+node per CPU core, offloading the blas FFI to a separate thread does not lower
+total response time; it only adds thread-switch overhead.
+
+A scan holds its scheduler's OS thread until it returns, and every green
+process on that thread waits. Green processes share one OS thread, so moving a
+scan to another actor on the same scheduler changes nothing; the stall divides
+only
 across units with their own OS thread, meaning separate OS processes (a
 `SO_REUSEPORT` fleet, one per core) or separate nodes, each scanning its own
 replica. With N such units the per-thread stall duty cycle is `ρ = q·s/N`:
@@ -3190,12 +3194,12 @@ so the fraction of time a scheduler sits inside one of these calls drops from
 `q·s` to `q·s/N`. A request arriving at random meets a scheduler mid-scan with
 probability ≈ ρ, which falls the same way.
 
-A scan is CPU work, not I/O, so throughput is bounded by physical CPU. When you
-already run one node per core, moving a scan to a separate thread does not lower
-total response time: the scan just runs on another core, and since the cores are
-already saturated it competes there instead. It adds a context switch and a
-handoff, and is more likely to fully occupy that core, so total throughput can
-even drop. More nodes raise throughput only when they add cores or machines. When a corpus grows past
+Why the separate thread does not help: a scan is CPU work, not I/O, so
+throughput is bounded by physical CPU. When the cores are already saturated,
+moving a scan to another thread just runs it on another busy core, where it
+competes; it adds a context switch and a handoff and is more likely to fully
+occupy that core, so total throughput can even drop. More nodes raise
+throughput only when they add cores or machines. When a corpus grows past
 sub-millisecond scans, tile the scan and yield between tiles, or shard it and
 scatter-gather across nodes.
 
