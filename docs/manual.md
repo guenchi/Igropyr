@@ -3191,10 +3191,11 @@ so the fraction of time a scheduler sits inside one of these calls drops from
 probability ≈ ρ, which falls the same way.
 
 A scan is CPU work, not I/O, so throughput is bounded by physical CPU. When you
-already run one node per core, offloading a scan to a separate thread does not
-lower total response time, because the cores are saturated and the work only
-shifts between them; it also adds context-switch overhead. More nodes raise
-throughput only when they add cores or machines. When a corpus grows past
+already run one node per core, moving a scan to a separate thread does not lower
+total response time: the scan just runs on another core, and since the cores are
+already saturated it competes there instead. It adds a context switch and a
+handoff, and is more likely to fully occupy that core, so total throughput can
+even drop. More nodes raise throughput only when they add cores or machines. When a corpus grows past
 sub-millisecond scans, tile the scan and yield between tiles, or shard it and
 scatter-gather across nodes.
 
