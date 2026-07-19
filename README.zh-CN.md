@@ -1,6 +1,6 @@
 # Igropyr
 
-Igropyr 是面向 [Chez Scheme](https://cisco.github.io/ChezScheme/) 的高并发 HTTP 服务器，
+Igropyr 是面向 [Chez Scheme](https://scheme.com/) 的高并发 HTTP 服务器，
 通过 Chez 的 FFI 直接构建在 [libuv](https://libuv.org/) 之上（没有 C shim），
 提供 Erlang 风格的消息传递并发模型和 Let-It-Crash 容错能力。
 
