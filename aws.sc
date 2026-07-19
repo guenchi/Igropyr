@@ -16,23 +16,38 @@
   (export aws-signed-post endpoint->host form-encode xml-first)
   (import (chezscheme) (igropyr sigv4) (igropyr http-client))
 
-  ;; "http[s]://host[:port][/...]" -> "host[:port]" -- exactly what
-  ;; (igropyr http-client) writes in the Host header, so SigV4 signs the
-  ;; same bytes that go on the wire.
+  ;; "http[s]://host[:port][/...]" -> "host[:port]", but an explicit port
+  ;; equal to the scheme default (443 for https, 80 for http) is dropped:
+  ;; (igropyr http-client) omits the default port from the Host header
+  ;; (RFC 7230), so SigV4 must sign the same host bytes that go on the wire.
   (define (endpoint->host endpoint)
     (let* ((n (string-length endpoint))
-           (start (let loop ((i 0))
-                    (cond ((> (+ i 3) n) 0)
-                          ((and (char=? (string-ref endpoint i) #\:)
-                                (char=? (string-ref endpoint (+ i 1)) #\/)
-                                (char=? (string-ref endpoint (+ i 2)) #\/))
-                           (+ i 3))
-                          (else (loop (+ i 1))))))
+           (mark (let loop ((i 0))
+                   (cond ((> (+ i 3) n) #f)
+                         ((and (char=? (string-ref endpoint i) #\:)
+                               (char=? (string-ref endpoint (+ i 1)) #\/)
+                               (char=? (string-ref endpoint (+ i 2)) #\/))
+                          (+ i 3))
+                         (else (loop (+ i 1))))))
+           (scheme (if mark (substring endpoint 0 (- mark 3)) ""))
+           (start (or mark 0))
            (end (let loop ((i start))
                   (cond ((>= i n) n)
                         ((char=? (string-ref endpoint i) #\/) i)
-                        (else (loop (+ i 1)))))))
-      (substring endpoint start end)))
+                        (else (loop (+ i 1))))))
+           (authority (substring endpoint start end))
+           ;; the last ':' splits host from an optional port
+           (colon (let loop ((i (- (string-length authority) 1)))
+                    (cond ((< i 0) #f)
+                          ((char=? (string-ref authority i) #\:) i)
+                          (else (loop (- i 1)))))))
+      (if colon
+          (let ((port (substring authority (+ colon 1) (string-length authority))))
+            (if (or (and (string-ci=? scheme "https") (string=? port "443"))
+                    (and (string-ci=? scheme "http")  (string=? port "80")))
+                (substring authority 0 colon)
+                authority))
+          authority)))
 
   ;; alist of (name . value) -> x-www-form-urlencoded body string, both
   ;; sides RFC 3986 percent-encoded (AWS query protocol: space is %20).

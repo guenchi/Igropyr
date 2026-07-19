@@ -55,6 +55,11 @@
                   (session-token . ,tok) (expiration . ,exp))
                 (raise (vector 'sts-error status
                          "malformed GetFederationToken response"))))
+          ;; clip an unrecognized error body (5xx/HTML page, no <Message>) so
+          ;; it cannot flood a log wholesale if it escapes up to a panic handler
           (raise (vector 'sts-error status
-                   (or (xml-first xml "Message") xml))))))
+                   (or (xml-first xml "Message")
+                       (if (> (string-length xml) 200)
+                           (string-append (substring xml 0 200) "...")
+                           xml)))))))
 )

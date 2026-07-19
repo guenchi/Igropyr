@@ -33,24 +33,75 @@
             ((< (char->integer (string-ref s i)) 128) (loop (+ i 1)))
             (else #f))))
 
-  ;; RFC 2047: =?UTF-8?B?base64?= for a non-ASCII display name
-  (define (encode-mime-word s)
-    (if (ascii? s)
-        s
-        (string-append "=?UTF-8?B?" (base64-encode (string->utf8 s)) "?=")))
+  ;; an ASCII display name outside RFC 5322 atom text (a comma, angle bracket,
+  ;; quote, ...) must be a quoted-string, else it mis-parses the address or a
+  ;; second angle-addr in the name spoofs the sender. '.' and space are left
+  ;; bare (a phrase is space-separated dot-atoms).
+  (define (atom-safe? c)
+    (or (char<=? #\a c #\z) (char<=? #\A c #\Z) (char<=? #\0 c #\9)
+        (and (memv c '(#\space #\! #\# #\$ #\% #\& #\' #\* #\+ #\-
+                       #\/ #\= #\? #\^ #\_ #\` #\{ #\| #\} #\~ #\.))
+             #t)))
+  (define (all-atom-safe? s)
+    (let loop ((i 0))
+      (or (= i (string-length s))
+          (and (atom-safe? (string-ref s i)) (loop (+ i 1))))))
+  (define (quote-string s)                 ; "..." with \ and " backslash-escaped
+    (call-with-string-output-port
+      (lambda (p)
+        (write-char #\" p)
+        (let loop ((i 0))
+          (when (< i (string-length s))
+            (let ((c (string-ref s i)))
+              (when (or (char=? c #\") (char=? c #\\)) (write-char #\\ p))
+              (write-char c p))
+            (loop (+ i 1))))
+        (write-char #\" p))))
 
-  ;; from-name may be #f (address only). to/subject/html are strings.
-  ;; -> MessageId string; raises #(ses-error status body).
+  ;; RFC 2047 B-encoding, split on UTF-8 codepoint boundaries so each
+  ;; =?UTF-8?B?...?= word stays within the 75-char limit (12 fixed + <=60
+  ;; base64 of <=45 payload bytes); adjacent words join with a space, which a
+  ;; compliant parser drops between encoded-words. Splitting matters because a
+  ;; long non-ASCII name is otherwise one over-length word strict MTAs reject.
+  (define (encode-mime-word s)
+    (let ((n (string-length s)))
+      (let loop ((i 0) (cs 0) (cb 0) (words '()))
+        (define (word end)
+          (string-append "=?UTF-8?B?"
+            (base64-encode (string->utf8 (substring s cs end))) "?="))
+        (cond
+          ((= i n)
+           (fold-left (lambda (a w) (if (string=? a "") w (string-append a " " w)))
+                      "" (reverse (if (> i cs) (cons (word i) words) words))))
+          (else
+           (let ((b (bytevector-length (string->utf8 (substring s i (+ i 1))))))
+             (if (and (> i cs) (> (+ cb b) 45))
+                 (loop i i 0 (cons (word i) words))
+                 (loop (+ i 1) cs (+ cb b) words))))))))
+
+  ;; From display name: pure-ASCII atom text as is; ASCII with a special ->
+  ;; quoted-string; non-ASCII -> RFC 2047 encoded word(s).
+  (define (format-display-name name)
+    (if (ascii? name)
+        (if (all-atom-safe? name) name (quote-string name))
+        (encode-mime-word name)))
+
+  ;; from-name may be #f or "" (address only). to is one address string OR a
+  ;; list of address strings. subject/html are strings. -> MessageId string
+  ;; (or #t when SES accepts but returns no parseable id); raises
+  ;; #(ses-error status body) on a non-2xx response.
   (define (ses-send-email s from-addr from-name to subject html)
-    (let* ((from (if from-name
-                     (string-append (encode-mime-word from-name) " <" from-addr ">")
+    (let* ((from (if (and from-name (> (string-length from-name) 0))
+                     (string-append (format-display-name from-name)
+                                    " <" from-addr ">")
                      from-addr))
            ;; ToAddresses is a vector so (igropyr json) writes it as a JSON
            ;; array unambiguously; every object is an alist.
            (body (string->utf8
                    (json->string
                      `(("FromEmailAddress" . ,from)
-                       ("Destination" . (("ToAddresses" . ,(vector to))))
+                       ("Destination" . (("ToAddresses" .
+                         ,(if (list? to) (list->vector to) (vector to)))))
                        ("Content" .
                         (("Simple" .
                           (("Subject" . (("Data" . ,subject) ("Charset" . "UTF-8")))
@@ -63,6 +114,9 @@
            (status (response-status r))
            (txt (utf8->string (response-body r))))
       (if (and (>= status 200) (< status 300))
-          (or (json-ref (string->json txt) "MessageId") #t)
+          ;; a 2xx with an empty/non-JSON body (LB, gzip, partial write) must
+          ;; not raise json-error past the ses-error-only contract
+          (let ((j (guard (e (#t #f)) (string->json txt))))
+            (or (and j (json-ref j "MessageId")) #t))
           (raise (vector 'ses-error status txt)))))
 )
