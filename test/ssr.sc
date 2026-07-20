@@ -75,7 +75,10 @@ function boom(j){ throw new Error('render failed'); }
         (check "mem-tryrender-fails" (not ok))
         (check "mem-tryrender-text"  (and (string? txt) (> (string-length txt) 0))))
       ;; engine recovers after the throw (crash-only rebuild)
-      (check "mem-recovers" (string=? (ssr-render r "render" '(("t" . "Z")) '((key . "/z"))) "<h1>Z</h1>")))
+      (check "mem-recovers" (string=? (ssr-render r "render" '(("t" . "Z")) '((key . "/z"))) "<h1>Z</h1>"))
+      ;; 2b: a pre-encoded JSON STRING props is passed RAW (the JS does JSON.parse)
+      (check "mem-string-props"
+        (string=? (ssr-render r "render" "{\"t\":\"S\"}" '((key . "/str"))) "<h1>S</h1>")))
 
     ;; ---- redis backend (only when a local Redis answers) ----
     (let ((conn (guard (e (#t #f)) (redis-connect "127.0.0.1" 6379))))
