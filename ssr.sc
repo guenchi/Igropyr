@@ -222,8 +222,11 @@
                  (hashtable-set! tbl key ws)))))))
     tbl)
 
-  ;; render (non-raising) + cache on success -> (ok . text)
-  (define (call+cache backend key fn json ttl)
+  ;; render (non-raising) + cache on success -> (ok . text). Each call is one
+  ;; actual engine render, so it bumps the render counter -- under single-flight
+  ;; `misses` (cache misses) can exceed `renders` (followers miss but don't render).
+  (define (call+cache renders backend key fn json ttl)
+    (set-box! renders (+ 1 (unbox renders)))
     (let ((res (guard (e (#t (cons #f (flight-error-text e))))
                  (let-values (((ok s) (qjs-call fn json))) (cons ok s)))))
       (when (car res) (b-put backend key (cdr res) ttl))
@@ -236,20 +239,21 @@
 
   ;; the miss path: single-flight around call+cache. -> (ok . text)
   (define (render-miss r fn json key)
-    (let ((flight (ssr-flight r)) (backend (ssr-backend r)) (ttl (ssr-ttl r)))
+    (let ((flight (ssr-flight r)) (backend (ssr-backend r)) (ttl (ssr-ttl r))
+          (rnd (ssr-renders r)))
       (if (not flight)
-          (call+cache backend key fn json ttl)
+          (call+cache rnd backend key fn json ttl)
           (let ((role (gen-server-call flight (vector 'claim key self))))
             (if (eq? role 'leader)
                 (let* ((again (b-get backend key))       ; double-check
                        (res (if again (cons #t again)
-                                (call+cache backend key fn json ttl))))
+                                (call+cache rnd backend key fn json ttl))))
                   (gen-server-cast flight (vector 'publish key res))
                   res)
                 (receive (after (ssr-flight-wait r)
                             ;; leader vanished -> render ourselves
                             (gen-server-cast flight (vector 'unclaim key self))
-                            (call+cache backend key fn json ttl))
+                            (call+cache rnd backend key fn json ttl))
                   (`#(ssr-flight ,@key ,res) res)))))))
 
   ;; ---- public ssr: #(backend ttl flight) -------------------------------
@@ -266,22 +270,26 @@
            (flight (and (opt-ref opts 'single-flight #t)
                         (gen-server-start flight-init flight-call flight-cast))))
       (qjs-boot! bundle qopts)          ; process-global engine; one per process
-      (vector backend ttl flight wait)))
+      (vector backend ttl flight wait (box 0))))
 
   (define (ssr-backend r)     (vector-ref r 0))
   (define (ssr-ttl r)         (vector-ref r 1))
   (define (ssr-flight r)      (vector-ref r 2))
   (define (ssr-flight-wait r) (vector-ref r 3))
+  (define (ssr-renders r)     (vector-ref r 4))
 
+  ;; a STRING props is the raw JSON arg (caller guarantees it is valid JSON);
+  ;; any other Scheme value is JSON-encoded
   (define (props->json props) (if (string? props) props (json->string props)))
   (define (render-key fn json)
     (string-append fn ":" (bytevector->hex (sha256 (string->utf8 json)))))
   (define (cache-key opts fn json)
     (or (opt-ref opts 'key #f) (render-key fn json)))
 
-  ;; Render fn(props) to HTML, cached. props: a Scheme value (JSON-encoded)
-  ;; or a pre-encoded JSON string. Raises a JS error like qjs-call! (on a
-  ;; miss only; failures are never cached).
+  ;; Render fn(props) to HTML, cached. props: any Scheme value -> json->string,
+  ;; OR a string, passed RAW as the JSON argument (you guarantee it is valid
+  ;; JSON; a non-JSON string makes the render's JSON.parse throw). Raises a JS
+  ;; error like qjs-call! (on a miss only; failures are never cached).
   (define (ssr-render r fn props . opt)
     (let* ((opts (if (pair? opt) (car opt) '()))
            (json (props->json props))
@@ -305,5 +313,6 @@
 
   (define (ssr-invalidate! r key) (b-drop (ssr-backend r) key))
   (define (ssr-clear! r)          (b-clear (ssr-backend r)))
-  (define (ssr-stats r)           (b-stats (ssr-backend r)))
+  (define (ssr-stats r)
+    (cons (cons 'renders (unbox (ssr-renders r))) (b-stats (ssr-backend r))))
 )

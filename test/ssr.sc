@@ -105,7 +105,10 @@ function boom(j){ throw new Error('render failed'); }
               (check "sf-all-equal" allok)
               (receive (`#(sf ,html)
                          (loop (+ got 1) (and allok (equal? html "<h1>H</h1>")))))))
-        (check "sf-rendered-once" (= 1 (N)))))   ; K callers, ONE actual render
+        (check "sf-rendered-once" (= 1 (N)))      ; K callers, ONE actual render
+        ;; ssr-stats: renders (1) < misses (>=4) proves single-flight dedup
+        (check "sf-renders-1"  (= 1 (cdr (assq 'renders (ssr-stats r)))))
+        (check "sf-misses->=4" (>= (cdr (assq 'misses (ssr-stats r))) 4))))
 
     ;; ---- TTL expiry: an entry past ttl-ms re-renders ----
     (let ((r (make-ssr bundle '((ttl-ms . 50)))))    ; reboots -> N=0
