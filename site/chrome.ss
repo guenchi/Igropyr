@@ -232,6 +232,7 @@
        (div (@ (class "links")) ,@links)
        ,@(if (null? tagline) '() (list `(div ,@tagline)))
        (div (@ (class "powered"))
+         "Built in pure " (a (@ (href "https://scheme.com")) "Scheme") (br)
          "Powered by " (a (@ (href "https://goeteia.dev")) "Goeteia"))))
 
   ;; ---- assemble a document ----
