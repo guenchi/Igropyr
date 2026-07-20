@@ -30,13 +30,16 @@ This manual covers the architecture, design patterns, and implementation details
     - [Distributed task pool](#distributed-task-pool)
 22. [Vector Scoring](#vector-scoring)
 23. [Embedded JavaScript](#embedded-javascript)
-24. [Running and Building](#running-and-building)
-25. [Testing](#testing)
-26. [Development Contracts](#development-contracts)
-27. [Code Style](#code-style)
-28. [Common Pitfalls](#common-pitfalls)
-29. [Appendix: Performance Tips](#appendix-performance-tips)
-30. [Further Reading](#further-reading)
+24. [Cached SSR](#cached-ssr)
+25. [Object Storage and AWS](#object-storage-and-aws)
+26. [Password Hashing](#password-hashing)
+27. [Running and Building](#running-and-building)
+28. [Testing](#testing)
+29. [Development Contracts](#development-contracts)
+30. [Code Style](#code-style)
+31. [Common Pitfalls](#common-pitfalls)
+32. [Appendix: Performance Tips](#appendix-performance-tips)
+33. [Further Reading](#further-reading)
 
 ---
 
@@ -2797,6 +2800,203 @@ The native shim is a build artifact (`build-quickjs-shim.sh`, needs QuickJS
 installed); without it the library imports fine and `qjs-boot!` reports the
 missing shim. Ship the shim alongside the binary on a path it resolves, or
 point `IGROPYR_QUICKJS_SO` at it.
+
+---
+
+## Cached SSR
+
+`(igropyr ssr)` puts a key/TTL cache in front of `(igropyr quickjs)` so
+server-side rendering runs the **blocking** render once per `(key, ttl)`
+instead of once per request. SSR helps SEO, but the content that needs
+SEO is public and slow-changing — so the right shape is a cache in *front*
+of the engine, not a render per request. A `qjs-call` blocks the calling
+scheduler for the render's duration (FFI is non-preemptible); with the
+cache it fires only on a miss, and hits are a lookup that never touches
+the engine.
+
+```scheme
+(import (igropyr ssr))
+
+;; at boot: ONE bundle per process (the QuickJS engine is process-global).
+;; Export as many render functions as you like and call them by name.
+(define r (make-ssr "
+  function renderPost(j){ var p = JSON.parse(j);
+    return '<article><h1>'+p.title+'</h1>'+p.body+'</article>'; }"))
+
+;; in a handler: props (any Scheme value) is JSON-encoded and handed to the
+;; JS function as one string; the string it returns is the HTML, cached.
+(send-html! res (ssr-render r "renderPost"
+                  '(("title" . "Hi") ("body" . "<p>…</p>"))
+                  '((key . "/blog/42"))))       ; explicit key = the URL
+```
+
+### API
+
+- `(make-ssr bundle [opts]) → ssr` — boot the engine on `bundle` and build
+  the cache. `opts` is an alist:
+  - `(cache . 'memory)` (default) or `(cache . (redis <conn> [prefix]))`
+  - `(ttl-ms . 60000)` — entry lifetime
+  - `(max-entries . 1024)` — memory-backend size cap
+  - `(single-flight . #t)` — collapse a cold-key herd (see below)
+  - `(quickjs . <opts>)` — passed to `qjs-boot!` (`timeout-ms`, `mem-mb`, …)
+- `(ssr-render r fn props [opts]) → html` — cached render; raises a JS
+  error on a **miss** (failures are never cached). `props` is any Scheme
+  value (JSON-encoded) or a string (passed raw as the JSON argument).
+  `opts`: `(key . "…")` — the cache key, typically the URL; defaults to
+  `sha256(fn+props)`.
+- `(ssr-try-render r fn props [opts]) → (values ok? text)` — non-raising:
+  a failing render is returned, never cached.
+- `(ssr-invalidate! r key)` — drop one entry (a content change).
+- `(ssr-clear! r)` — drop all (e.g. after a deploy).
+- `(ssr-stats r) → alist` — `((hits . N) (misses . M) (renders . K)
+  (size . S))`.
+
+### Cache backends
+
+The `memory` backend is an in-process gen-server (`key → html . expiry`)
+with a TTL ticker and a size cap that evicts the soonest-to-expire entry;
+it is shared across the process's workers and its stats are exact. The
+`redis` backend stores the HTML in Redis with `SET … PX` for server-side
+TTL, so a render on one **node** is a hit on the others; `<conn>` is an
+`(igropyr redis)` connection and `prefix` defaults to `"ssr:"`. Its
+hit/miss stats are per-node and approximate.
+
+### Single-flight
+
+On by default, `single-flight` makes N concurrent misses for the **same
+cold key** collapse to one render: the first claimant renders and the rest
+wait for its result. This dedups a process's workers, which all share the
+one mutex-serialized engine. A cross-node herd is still spread across
+nodes (each renders once), not globally locked. If the rendering worker is
+killed mid-render, waiters fall back to rendering themselves after a
+timeout — the stuck claim self-heals. Set `(single-flight . #f)` to have
+every concurrent miss render independently.
+
+The render function's contract is `(fn jsonString) → htmlString`, **pure**:
+props in, HTML out, no side effects (the JS heap is shared across calls, so
+do not accumulate per-request state in globals). A JS throw / timeout / OOM
+is handled by the shim (crash-only rebuild + wall-clock deadline);
+`ssr-render` re-raises it (let-it-crash) and does not cache the failure.
+
+---
+
+## Object Storage and AWS
+
+`(igropyr sigv4)` signs requests with AWS Signature V4 (pinned to the AWS
+documented test vectors). The service libraries build on it over the
+non-blocking `(igropyr http-client)`, so each call parks the calling
+process like any other outbound request and works against AWS or any
+compatible endpoint. `(igropyr aws)` is the small shared layer
+(`aws-signed-post`, `endpoint->host`, `form-encode`, `xml-first`) the
+service clients are written on.
+
+### S3 (and S3-compatible: R2, MinIO)
+
+```scheme
+(import (igropyr s3))
+
+(define bkt (make-s3 '((endpoint . "https://s3.us-east-1.amazonaws.com")
+                       (bucket . "assets") (region . "us-east-1")
+                       (access-key . "…") (secret . "…"))))
+```
+
+`make-s3` requires `endpoint` (an `http[s]://host[:port]` with **no** path
+— it is signed byte-for-byte, so a stray path 403s) and `bucket`,
+`access-key`, `secret`; `region` defaults to `"auto"` (fine for R2), and
+`timeout` / `max-response` are optional.
+
+- `(s3-put! s key data content-type) → etag`
+- `(s3-get s key) → bytevector | #f` (`#f` on 404)
+- `(s3-head s key) → headers-alist | #f` (read `x-amz-restore`,
+  `x-amz-storage-class`, …)
+- `(s3-copy! s src-key dst-key)` — server-side copy within the bucket
+- `(s3-delete! s key)` — idempotent (404 counts as deleted)
+- `(s3-list s prefix) → (key …)` — follows continuation tokens
+- `(s3-delete-prefix! s prefix)` — list + delete each
+- `(s3-restore! s key days tier) → 'accepted | 'in-progress | 'ok` —
+  restore a Glacier / Deep Archive object
+
+A non-2xx response raises `#(s3-error status body)`.
+
+### STS: scoped temporary credentials
+
+`(igropyr sts)` calls **GetFederationToken** to vend scoped, temporary AWS
+credentials to a client (e.g. narrow S3 access for a mobile app). The
+session policy that narrows the grant is the caller's; this signs the call
+and returns the credentials.
+
+```scheme
+(import (igropyr sts))
+(define sts (make-sts '((region . "us-east-1") (access-key . "…") (secret . "…"))))
+(sts-get-federation-token sts "u-abc" policy-json 3600)
+;;   -> ((access-key-id . "…") (secret-access-key . "…")
+;;       (session-token . "…") (expiration . "2026-…Z"))
+```
+
+Raises `#(sts-error status message)` on a non-2xx response.
+
+### SES: sending email
+
+`(igropyr ses)` sends one already-rendered message (subject + HTML) via
+SES v2 **SendEmail** (the JSON API). A non-ASCII From display name is RFC
+2047 mime-word encoded, or clients (Gmail) show only the address
+local-part.
+
+```scheme
+(import (igropyr ses))
+(define ses (make-ses '((region . "eu-west-3") (access-key . "…") (secret . "…"))))
+(ses-send-email ses "noreply@example.com" "Example" "u@x.com" subject html)
+;;   -> the MessageId string
+```
+
+Raises `#(ses-error status body)` on a non-2xx response.
+
+---
+
+## Password Hashing
+
+`(igropyr kdf)` derives and verifies passwords over the already-loaded
+libcrypto (the same OpenSSL `(igropyr tls)` and `(igropyr apple-jws)`
+use), offered as infrastructure so an app **chooses** its algorithm — and
+migrates between them without a flag day. There are two layers.
+
+Raw derivations (`bytevector → bytevector`; you pick the cost params):
+
+```scheme
+(import (igropyr kdf))
+(kdf-pbkdf2-sha256 pw salt iterations dk-len)   ; PKCS5_PBKDF2_HMAC
+(kdf-scrypt        pw salt N r p dk-len)         ; EVP_PBE_scrypt (memory-hard)
+(kdf-argon2id      pw salt t m p dk-len)         ; EVP_KDF argon2id
+```
+
+Self-describing password hashes — the algorithm and params live in the
+string, so `password-verify` dispatches on the prefix and an app can
+rehash-on-login to a stronger algorithm transparently:
+
+```scheme
+(password-hash "hunter2" 'scrypt   '())   ; -> "scrypt$32768$8$1$<salt>$<dk>"
+(password-hash "hunter2" 'pbkdf2   '())   ; -> "pbkdf2-sha256$600000$<salt>$<dk>"
+(password-hash "hunter2" 'argon2id '())   ; -> "argon2id$2$19456$1$<salt>$<dk>"
+(password-verify "hunter2" stored)         ; -> #t | #f  (constant-time compare)
+```
+
+The defaults follow OWASP minimums (scrypt N=32768; PBKDF2 600 000
+iterations; argon2id m=19 MiB, t=2, p=1). Override per call with the
+params alist, e.g. `(password-hash pw 'scrypt '((N . 65536)))`.
+
+### The cost ceiling
+
+A blocking KDF freezes Igropyr's single-threaded scheduler for its whole
+duration, so `password-verify` enforces a resource ceiling (≈ one 256 MiB
+fill of KDF work, ~0.1–0.2 s) **before** running the KDF. A **crafted**
+stored hash carrying an enormous cost — an attacker-controlled
+`argon2id$…$262144$…` — is rejected fast (`#f`) instead of turning a login
+into a multi-second stall. This is a ceiling, not the per-verify cost: a
+normal verify at the OWASP defaults is ~11–47 ms. Parameters are validated
+strictly; a non-string password or a malformed / unknown-algorithm hash
+returns `#f`, never a crash and never "matches anything". `(igropyr
+crypto)` keeps a pure-Scheme `pbkdf2-hmac-sha256` for hosts without
+libcrypto.
 
 ---
 
