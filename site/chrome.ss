@@ -162,6 +162,13 @@
       ("footer a" (color (var acc)))
       ("footer a:hover" (color (var acc2)))
       ("footer .powered" (margin-top (px 12)) (font-size (px 13)))
+      ;; credit stacks on phones; from the first wide breakpoint the "· "
+      ;; separator replaces the line break, so "Built in pure Scheme" and
+      ;; "Powered by Goeteia" share one line
+      (".powered .fsep" (display none))
+      (@media "(min-width: 30em)"
+        (".powered .fsep" (display inline))
+        (".powered .fbrk" (display none)))
       (@media "(max-width: 840px)"
         (h1 (font-size (px 40)))
         (.feature (grid-template-columns "1fr"))
@@ -232,7 +239,9 @@
        (div (@ (class "links")) ,@links)
        ,@(if (null? tagline) '() (list `(div ,@tagline)))
        (div (@ (class "powered"))
-         "Built in pure " (a (@ (href "https://scheme.com")) "Scheme") (br)
+         "Built in pure " (a (@ (href "https://scheme.com")) "Scheme")
+         (span (@ (class "fsep")) " · ")
+         (br (@ (class "fbrk")))
          "Powered by " (a (@ (href "https://goeteia.dev")) "Goeteia"))))
 
   ;; ---- assemble a document ----
