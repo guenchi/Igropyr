@@ -1,9 +1,6 @@
 # Igropyr
 
-A high-concurrency HTTP server framework for [Chez Scheme](https://scheme.com/),
-built on [libuv](https://libuv.org/) :
-Erlang-style green processes, a Let-It-Crash worker pool, process-per-dialogue
-conversations, and s-expression RPC.
+A distributed, fault-tolerant, high-concurrency backend framework with continuation-based web programming and a remote retry ring, built on [Chez Scheme](https://scheme.com/).
 
 **[igropyr.com](https://igropyr.com)** · **[Manual](https://igropyr.com/manual.html)**
 
