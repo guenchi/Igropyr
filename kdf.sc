@@ -63,6 +63,16 @@
   ;; The sane default (N=32768, r=8 -> 32 MiB working set) fits comfortably.
   (define scrypt-maxmem (* 256 1024 1024))
 
+  ;; Verify-time resource ceiling: no single password-verify may exceed ~one
+  ;; 256-MiB fill of KDF work (~0.1-0.2 s). A blocking KDF freezes igropyr's
+  ;; single-threaded scheduler, so a crafted stored hash must not be able to
+  ;; turn a login into a multi-second stall. Anchored to scrypt-maxmem; covers
+  ;; every OWASP server config with headroom. (The raw kdf-* exports are NOT
+  ;; capped -- they are primitives; this ceiling lives at the untrusted-input
+  ;; boundary, password-verify.)
+  (define kdf-max-passes-kib 262144)     ; argon2 t*m ceiling (= 256 MiB-passes)
+  (define pbkdf2-max-iters   2000000)    ; ~one fill of time; >3x OWASP's 600k
+
   ;; ---- raw derivations -------------------------------------------------
   (define (kdf-pbkdf2-sha256 password salt iterations dk-len)
     (unless (and (fixnum? iterations) (fx>= iterations 1))
@@ -77,6 +87,9 @@
   ;; N must be a power of two > 1; r, p >= 1. 128*N*r bytes is the working
   ;; set (bounded by scrypt-maxmem).
   (define (kdf-scrypt password salt N r p dk-len)
+    (unless (and (fixnum? N) (fx> N 1) (fixnum? r) (fx> r 0)
+                 (fixnum? p) (fx> p 0) (fixnum? dk-len) (fx> dk-len 0))
+      (assertion-violation 'kdf-scrypt "N>1 and r/p/dk-len>0, all fixnums" (list N r p dk-len)))
     (let ((out (make-bytevector dk-len)))
       (if (fx= 1 (_EVP_PBE_scrypt password (bytevector-length password)
                                   salt (bytevector-length salt)
@@ -119,31 +132,49 @@
       (foreign-set! 'unsigned-64 arr (+ o 32) 0)))
 
   ;; t = time cost (passes), m = memory in KiB, p = lanes (parallelism)
+  ;; t/m/p cross the OSSL_PARAM as uint32, so each must be a positive fixnum
+  ;; below 2^32 (a bignum/flonum would raise, a negative would wrap); validate
+  ;; BEFORE any allocation so a bad arg can neither crash nor leak. Cleanup is
+  ;; a dynamic-wind, so an OOM/raise mid-build still frees ctx and every buffer.
   (define (kdf-argon2id password salt t m p dk-len)
-    (let ((kdf (_EVP_KDF_fetch 0 "ARGON2ID" 0)))
+    (define u32-max #x100000000)
+    (unless (and (fixnum? t) (fx> t 0) (fx< t u32-max)
+                 (fixnum? m) (fx> m 0) (fx< m u32-max)
+                 (fixnum? p) (fx> p 0) (fx< p u32-max)
+                 (fixnum? dk-len) (fx> dk-len 0))
+      (assertion-violation 'kdf-argon2id
+        "t/m/p positive fixnums < 2^32 and dk-len > 0" (list t m p dk-len)))
+    (let ((out (make-bytevector dk-len))          ; Scheme heap first: an OOM
+          (kdf (_EVP_KDF_fetch 0 "ARGON2ID" 0)))  ; here frees nothing native
       (when (zero? kdf) (error 'kdf-argon2id "ARGON2ID unavailable (need OpenSSL 3.2+)"))
       (let ((ctx (_EVP_KDF_CTX_new kdf)))
         (_EVP_KDF_free kdf)
         (when (zero? ctx) (error 'kdf-argon2id "EVP_KDF_CTX_new failed"))
-        (let ((pass-p (c-bytes password)) (salt-p (c-bytes salt))
-              (iter-c (c-uint t)) (mem-c (c-uint m)) (lanes-c (c-uint p))
-              (params (foreign-alloc (* 6 param-size)))
-              (out (make-bytevector dk-len)))
-          (do ((i 0 (+ i 1))) ((= i (* 6 param-size))) (foreign-set! 'unsigned-8 params i 0))
-          (set-param! params 0 k-pass    type-octet pass-p (bytevector-length password))
-          (set-param! params 1 k-salt    type-octet salt-p (bytevector-length salt))
-          (set-param! params 2 k-iter    type-uint  iter-c 4)
-          (set-param! params 3 k-memcost type-uint  mem-c  4)
-          (set-param! params 4 k-lanes   type-uint  lanes-c 4)
-          ;; entry 5 stays zeroed == OSSL_PARAM_END
-          (let ((rc (_EVP_KDF_derive ctx out dk-len params)))
-            (foreign-free pass-p) (foreign-free salt-p)
-            (foreign-free iter-c) (foreign-free mem-c) (foreign-free lanes-c)
-            (foreign-free params)
-            (_EVP_KDF_CTX_free ctx)
-            (if (fx= rc 1)
-                out
-                (error 'kdf-argon2id "EVP_KDF_derive failed (bad params or over memory)")))))))
+        (let ((pass-p 0) (salt-p 0) (iter-c 0) (mem-c 0) (lanes-c 0) (params 0))
+          (dynamic-wind
+            (lambda () (void))
+            (lambda ()
+              (set! pass-p (c-bytes password)) (set! salt-p (c-bytes salt))
+              (set! iter-c (c-uint t)) (set! mem-c (c-uint m)) (set! lanes-c (c-uint p))
+              (set! params (foreign-alloc (* 6 param-size)))
+              (do ((i 0 (+ i 1))) ((= i (* 6 param-size))) (foreign-set! 'unsigned-8 params i 0))
+              (set-param! params 0 k-pass    type-octet pass-p (bytevector-length password))
+              (set-param! params 1 k-salt    type-octet salt-p (bytevector-length salt))
+              (set-param! params 2 k-iter    type-uint  iter-c 4)
+              (set-param! params 3 k-memcost type-uint  mem-c  4)
+              (set-param! params 4 k-lanes   type-uint  lanes-c 4)
+              ;; entry 5 stays zeroed == OSSL_PARAM_END
+              (if (fx= 1 (_EVP_KDF_derive ctx out dk-len params))
+                  out
+                  (error 'kdf-argon2id "EVP_KDF_derive failed (bad params or over memory)")))
+            (lambda ()
+              (unless (zero? pass-p)  (foreign-free pass-p))
+              (unless (zero? salt-p)  (foreign-free salt-p))
+              (unless (zero? iter-c)  (foreign-free iter-c))
+              (unless (zero? mem-c)   (foreign-free mem-c))
+              (unless (zero? lanes-c) (foreign-free lanes-c))
+              (unless (zero? params)  (foreign-free params))
+              (_EVP_KDF_CTX_free ctx)))))))
 
   ;; ---- self-describing password hashing --------------------------------
   (define salt-len 16)
@@ -209,42 +240,53 @@
   ;; "$@@@$@@@" would otherwise decode to an empty DK and match any
   ;; password), and cost params are sanity-capped so a crafted hash cannot
   ;; turn verify into a CPU/memory bomb.
+  ;; a positive fixnum from an untrusted numeric field -- rejects #f, flonums
+  ;; (1e9), ratios and bignums, so the TYPE/RANGE check is the gate, not an
+  ;; incidental FFI raise downstream.
+  (define (pos-fx? x) (and (fixnum? x) (fx> x 0)))
+
   (define (password-verify password stored)
-    (let ((parts (and (string? stored) (split-dollar stored))))
-      (and (pair? parts)
-           (let ((pw (string->utf8 password)))
-             (cond
-               ((and (string=? (car parts) "scrypt") (= (length parts) 6))
-                (let ((N (string->number (list-ref parts 1)))
-                      (r (string->number (list-ref parts 2)))
-                      (p (string->number (list-ref parts 3)))
-                      (salt (b64 (list-ref parts 4)))
-                      (dk (b64 (list-ref parts 5))))
-                  (and N r p (integer? N) (integer? r) (integer? p)
-                       salt (fx> (bytevector-length salt) 0)
-                       dk (fx= (bytevector-length dk) dk-len)
-                       (guard (e (#t #f))                     ; huge/bad N -> #f
-                         (ct=? dk (kdf-scrypt pw salt N r p dk-len))))))
-               ((and (string=? (car parts) "pbkdf2-sha256") (= (length parts) 4))
-                (let ((iters (string->number (list-ref parts 1)))
-                      (salt (b64 (list-ref parts 2)))
-                      (dk (b64 (list-ref parts 3))))
-                  (and iters (integer? iters) (> iters 0) (<= iters 10000000)
-                       salt (fx> (bytevector-length salt) 0)
-                       dk (fx= (bytevector-length dk) dk-len)
-                       (guard (e (#t #f))
-                         (ct=? dk (kdf-pbkdf2-sha256 pw salt iters dk-len))))))
-               ((and (string=? (car parts) "argon2id") (= (length parts) 6))
-                (let ((t (string->number (list-ref parts 1)))
-                      (m (string->number (list-ref parts 2)))
-                      (p (string->number (list-ref parts 3)))
-                      (salt (b64 (list-ref parts 4)))
-                      (dk (b64 (list-ref parts 5))))
-                  (and t m p (integer? t) (integer? m) (integer? p)
-                       (> t 0) (<= t 1000) (<= m 262144) (> p 0) (<= p 64)
-                       salt (fx> (bytevector-length salt) 0)
-                       dk (fx= (bytevector-length dk) dk-len)
-                       (guard (e (#t #f))
-                         (ct=? dk (kdf-argon2id pw salt t m p dk-len))))))
-               (else #f))))))
+    (and (string? password) (string? stored)
+         (let ((parts (split-dollar stored)))
+           (and (pair? parts)
+                (let ((pw (string->utf8 password)))
+                  (cond
+                    ((and (string=? (car parts) "scrypt") (= (length parts) 6))
+                     (let ((N (string->number (list-ref parts 1)))
+                           (r (string->number (list-ref parts 2)))
+                           (p (string->number (list-ref parts 3)))
+                           (salt (b64 (list-ref parts 4)))
+                           (dk (b64 (list-ref parts 5))))
+                       (and (pos-fx? N) (fx> N 1) (pos-fx? r) (pos-fx? p)
+                            salt (fx> (bytevector-length salt) 0)
+                            dk (fx= (bytevector-length dk) dk-len)
+                            (guard (e (#t #f))       ; scrypt-maxmem rejects huge N/r/p fast
+                              (ct=? dk (kdf-scrypt pw salt N r p dk-len))))))
+                    ((and (string=? (car parts) "pbkdf2-sha256") (= (length parts) 4))
+                     (let ((iters (string->number (list-ref parts 1)))
+                           (salt (b64 (list-ref parts 2)))
+                           (dk (b64 (list-ref parts 3))))
+                       (and (pos-fx? iters) (fx<= iters pbkdf2-max-iters)
+                            salt (fx> (bytevector-length salt) 0)
+                            dk (fx= (bytevector-length dk) dk-len)
+                            (guard (e (#t #f))
+                              (ct=? dk (kdf-pbkdf2-sha256 pw salt iters dk-len))))))
+                    ((and (string=? (car parts) "argon2id") (= (length parts) 6))
+                     (let ((t (string->number (list-ref parts 1)))
+                           (m (string->number (list-ref parts 2)))
+                           (p (string->number (list-ref parts 3)))
+                           (salt (b64 (list-ref parts 4)))
+                           (dk (b64 (list-ref parts 5))))
+                       ;; m<=256MiB AND t*m<=one fill bound BOTH memory and the
+                       ;; time-cost t (which no memory ceiling can bound); use
+                       ;; generic * so a huge t*m becomes a bignum -> #f, not a
+                       ;; fixnum-overflow raise.
+                       (and (pos-fx? t) (pos-fx? m) (pos-fx? p) (fx<= p 64)
+                            (fx<= m kdf-max-passes-kib)
+                            (<= (* t m) kdf-max-passes-kib)
+                            salt (fx> (bytevector-length salt) 0)
+                            dk (fx= (bytevector-length dk) dk-len)
+                            (guard (e (#t #f))
+                              (ct=? dk (kdf-argon2id pw salt t m p dk-len))))))
+                    (else #f)))))))
 )

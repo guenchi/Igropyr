@@ -70,6 +70,19 @@
 (check "malformed-unknown-algo"    (not (password-verify "x" "md5$abc$def")))
 (check "malformed-junk"            (not (password-verify "x" "not-a-hash")))
 
+;; a crafted HIGH-COST hash must be rejected FAST by the cost ceiling (before
+;; the KDF ever runs), not turned into a multi-second single-threaded freeze
+(let* ((t0 (real-time)) (r (password-verify "x" "argon2id$1000$262144$1$x$y")) (ms (- (real-time) t0)))
+  (check "argon2-cost-bomb-rejected" (not r))
+  (check "argon2-cost-bomb-fast"     (< ms 500)))
+(let* ((t0 (real-time)) (r (password-verify "x" "pbkdf2-sha256$10000000$x$y")) (ms (- (real-time) t0)))
+  (check "pbkdf2-cost-bomb-rejected" (not r))
+  (check "pbkdf2-cost-bomb-fast"     (< ms 500)))
+;; malformed cost params (flonum / negative) and a non-string password -> #f, no raise
+(check "verify-flonum-N"     (not (password-verify "x" "scrypt$1e9$8$1$x$y")))
+(check "verify-negative-m"   (not (password-verify "x" "argon2id$2$-100$1$x$y")))
+(check "verify-nonstring-pw" (not (password-verify 999 "not-a-hash")))
+
 ;; ---- perf probe: scrypt at the production default (N=32768) ----
 (let* ((t0 (real-time)) (_ (password-hash "measure" 'scrypt '())) (ms (- (real-time) t0)))
   (display "  [perf] scrypt N=32768 = ") (display ms)
