@@ -33,6 +33,8 @@
 (define bundle "
 var N = 0;
 function render(j){ N++; var p = JSON.parse(j); return '<h1>'+p.t+'</h1>'; }
+function slowRender(j){ N++; var s=0; for(var i=0;i<8000000;i++){s+=i;} if(s<0)return 'x';
+  var p = JSON.parse(j); return '<h1>'+p.t+'</h1>'; }
 function count(_){ return '' + N; }
 function boom(j){ throw new Error('render failed'); }
 ")
@@ -88,6 +90,21 @@ function boom(j){ throw new Error('render failed'); }
             (ssr-clear! r)                     ; cleanup + prove clear reaches Redis
             (check "redis-cleared" (not (redis conn "GET" "ssrtest:/x")))
             (redis-close! conn))))
+
+    ;; ---- single-flight: K concurrent misses on ONE cold key render once ----
+    (let ((r (make-ssr bundle)))            ; reboots engine -> N=0
+      (let ((k 4) (me self))
+        (do ((i 0 (+ i 1))) ((= i k))
+          (spawn (lambda ()
+                   (send me (vector 'sf
+                     (guard (e (#t 'err))
+                       (ssr-render r "slowRender" '(("t" . "H")) '((key . "/hot")))))))))
+        (let loop ((got 0) (allok #t))
+          (if (= got k)
+              (check "sf-all-equal" allok)
+              (receive (`#(sf ,html)
+                         (loop (+ got 1) (and allok (equal? html "<h1>H</h1>")))))))
+        (check "sf-rendered-once" (= 1 (N)))))   ; K callers, ONE actual render
 
     (if (zero? failures)
         (begin (display "ssr: all tests passed\n") (exit 0))

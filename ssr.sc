@@ -35,17 +35,23 @@
 ;;;             is an (igropyr redis) connection; prefix defaults to "ssr:".
 ;;;             Stats (hits/misses) are per-node and approximate.
 ;;;
-;;; Render function contract: (fn jsonString) -> htmlString, PURE -- props
-;;; in, HTML out, no side effects (the JS heap is shared across calls, so do
-;;; not accumulate per-request state in globals). A JS throw / timeout / OOM
-;;; is handled by the shim (crash-only rebuild + wall-clock deadline);
-;;; ssr-render re-raises it (let-it-crash) and does NOT cache a failure --
-;;; use ssr-try-render for a non-raising (values ok? text) result.
+;;; Single-flight (on by default; (single-flight . #f) to disable): N
+;;; concurrent misses for the SAME cold key collapse to ONE render -- the
+;;; first claimant renders, the rest wait for its result. This is per-process
+;;; (it dedups a process's workers, which all share the one mutex-serialized
+;;; engine); a cross-NODE herd is still spread across nodes, not locked. If
+;;; the rendering worker is killed mid-render, waiters fall back to rendering
+;;; themselves after a timeout (the stuck claim self-heals).
+;;;
+;;; Render function contract: (fn jsonString) -> htmlString, PURE -- props in,
+;;; HTML out, no side effects (the JS heap is shared across calls, so do not
+;;; accumulate per-request state in globals). A JS throw / timeout / OOM is
+;;; handled by the shim (crash-only rebuild + wall-clock deadline); ssr-render
+;;; re-raises it (let-it-crash) and does NOT cache a failure -- use
+;;; ssr-try-render for a non-raising (values ok? text) result.
 ;;;
 ;;; Keys default to sha256(fn+props); pass (key . "...") -- typically the URL
-;;; -- so hits skip prop hashing. NOT single-flight: N concurrent misses for
-;;; the same cold key each render once -- spread that load across cluster
-;;; nodes rather than funnel it. One ssr per process (make-ssr reboots the
+;;; -- so hits skip prop hashing. One ssr per process (make-ssr reboots the
 ;;; one engine; a second bundle would replace the first).
 
 (library (igropyr ssr)
@@ -61,6 +67,7 @@
   (define default-ttl-ms 60000)        ; 1 minute
   (define default-cap    1024)         ; max cached entries (memory backend)
   (define prune-interval-ms 30000)     ; TTL sweep cadence (memory backend)
+  (define flight-wait-ms   5000)       ; a follower's wait for the leader's render
 
   (define (opt-ref o k d) (let ((p (assq k o))) (if p (cdr p) d)))
 
@@ -143,8 +150,6 @@
         (lambda ()        (gen-server-call pid (vector 'stats))))))
 
   ;; ---- redis backend: cross-node, TTL server-side (SET ... PX) ----------
-  ;; get/put/drop are one round-trip each on the caller's green process (the
-  ;; connection pipelines across workers). Hits/misses are per-node counters.
   (define (bump-box! b) (set-box! b (+ 1 (unbox b))))
 
   (define (redis-clear! conn prefix)     ; SCAN + DEL over the prefix
@@ -178,18 +183,81 @@
       (else (assertion-violation 'make-ssr
               "cache must be 'memory or (redis conn [prefix])" spec))))
 
-  ;; ---- public ssr: #(backend ttl) --------------------------------------
+  ;; ---- single-flight coordinator: a gen-server, key -> waiter pids ------
+  (define (flight-init) (make-hashtable string-hash string=?))
+
+  (define (flight-call msg from tbl)      ; claim -> 'leader | 'follower
+    (case (vector-ref msg 0)
+      ((claim)
+       (let ((key (vector-ref msg 1)) (who (vector-ref msg 2)))
+         (if (hashtable-contains? tbl key)
+             (begin (hashtable-set! tbl key (cons who (hashtable-ref tbl key '())))
+                    (values 'follower tbl))
+             (begin (hashtable-set! tbl key '()) (values 'leader tbl)))))
+      (else (values 'bad-request tbl))))
+
+  (define (flight-cast msg tbl)
+    (case (vector-ref msg 0)
+      ((publish)                          ; leader done: wake waiters, drop key
+       (let ((key (vector-ref msg 1)) (res (vector-ref msg 2)))
+         (for-each (lambda (w) (send w (vector 'ssr-flight key res)))
+                   (hashtable-ref tbl key '()))
+         (hashtable-delete! tbl key)))
+      ((unclaim)                          ; a follower timed out (dead leader)
+       (let ((key (vector-ref msg 1)) (who (vector-ref msg 2)))
+         (when (hashtable-contains? tbl key)
+           (let ((ws (remq who (hashtable-ref tbl key '()))))
+             ;; last waiter gone with no publish -> the leader is stuck; drop
+             ;; the entry so the key isn't wedged in follower-forever mode
+             (if (null? ws) (hashtable-delete! tbl key)
+                 (hashtable-set! tbl key ws)))))))
+    tbl)
+
+  ;; render (non-raising) + cache on success -> (ok . text)
+  (define (call+cache backend key fn json ttl)
+    (let ((res (guard (e (#t (cons #f (flight-error-text e))))
+                 (let-values (((ok s) (qjs-call fn json))) (cons ok s)))))
+      (when (car res) (b-put backend key (cdr res) ttl))
+      res))
+
+  (define (flight-error-text e)
+    (cond ((string? e) e)
+          ((and (condition? e) (message-condition? e)) (condition-message e))
+          (else "ssr render error")))
+
+  ;; the miss path: single-flight around call+cache. -> (ok . text)
+  (define (render-miss r fn json key)
+    (let ((flight (ssr-flight r)) (backend (ssr-backend r)) (ttl (ssr-ttl r)))
+      (if (not flight)
+          (call+cache backend key fn json ttl)
+          (let ((role (gen-server-call flight (vector 'claim key self))))
+            (if (eq? role 'leader)
+                (let* ((again (b-get backend key))       ; double-check
+                       (res (if again (cons #t again)
+                                (call+cache backend key fn json ttl))))
+                  (gen-server-cast flight (vector 'publish key res))
+                  res)
+                (receive (after flight-wait-ms
+                            ;; leader vanished -> render ourselves
+                            (gen-server-cast flight (vector 'unclaim key self))
+                            (call+cache backend key fn json ttl))
+                  (`#(ssr-flight ,@key ,res) res)))))))
+
+  ;; ---- public ssr: #(backend ttl flight) -------------------------------
   (define (make-ssr bundle . opt)
     (let* ((opts (if (pair? opt) (car opt) '()))
            (ttl  (opt-ref opts 'ttl-ms default-ttl-ms))
            (cap  (opt-ref opts 'max-entries default-cap))
            (qopts (opt-ref opts 'quickjs '()))
-           (backend (make-backend (opt-ref opts 'cache 'memory) cap)))
+           (backend (make-backend (opt-ref opts 'cache 'memory) cap))
+           (flight (and (opt-ref opts 'single-flight #t)
+                        (gen-server-start flight-init flight-call flight-cast))))
       (qjs-boot! bundle qopts)          ; process-global engine; one per process
-      (vector backend ttl)))
+      (vector backend ttl flight)))
 
   (define (ssr-backend r) (vector-ref r 0))
-  (define (ssr-ttl r) (vector-ref r 1))
+  (define (ssr-ttl r)     (vector-ref r 1))
+  (define (ssr-flight r)  (vector-ref r 2))
 
   (define (props->json props) (if (string? props) props (json->string props)))
   (define (render-key fn json)
@@ -206,9 +274,8 @@
            (key  (cache-key opts fn json))
            (hit  (b-get (ssr-backend r) key)))
       (or hit
-          (let ((html (qjs-call! fn json)))       ; blocks this worker (rare)
-            (b-put (ssr-backend r) key html (ssr-ttl r))
-            html))))
+          (let ((res (render-miss r fn json key)))
+            (if (car res) (cdr res) (error 'ssr-render (cdr res) fn))))))
 
   ;; Non-raising: -> (values ok? html-or-error-text). A failing render is
   ;; returned, never cached.
@@ -219,9 +286,8 @@
            (hit  (b-get (ssr-backend r) key)))
       (if hit
           (values #t hit)
-          (let-values (((ok s) (qjs-call fn json)))
-            (when ok (b-put (ssr-backend r) key s (ssr-ttl r)))
-            (values ok s)))))
+          (let ((res (render-miss r fn json key)))
+            (values (car res) (cdr res))))))
 
   (define (ssr-invalidate! r key) (b-drop (ssr-backend r) key))
   (define (ssr-clear! r)          (b-clear (ssr-backend r)))
