@@ -21,7 +21,7 @@
 ;;; which is why it is the sensible default; argon2id joins this module next.
 
 (library (igropyr kdf)
-  (export kdf-pbkdf2-sha256 kdf-scrypt
+  (export kdf-pbkdf2-sha256 kdf-scrypt kdf-argon2id
           password-hash password-verify)
   (import (chezscheme) (igropyr platform)
           (only (igropyr crypto) base64-encode base64-decode))
@@ -49,6 +49,14 @@
     (foreign-procedure "EVP_PBE_scrypt"
       (u8* size_t u8* size_t unsigned-64 unsigned-64 unsigned-64 unsigned-64 u8* size_t)
       int))
+  ;; argon2id has no single-shot function -- it goes through the generic
+  ;; EVP_KDF interface with an OSSL_PARAM array (built in C memory below).
+  (define _EVP_KDF_fetch    (foreign-procedure "EVP_KDF_fetch" (void* string void*) void*))
+  (define _EVP_KDF_CTX_new  (foreign-procedure "EVP_KDF_CTX_new" (void*) void*))
+  (define _EVP_KDF_CTX_free (foreign-procedure "EVP_KDF_CTX_free" (void*) void))
+  (define _EVP_KDF_free     (foreign-procedure "EVP_KDF_free" (void*) void))
+  (define _EVP_KDF_derive
+    (foreign-procedure "EVP_KDF_derive" (void* u8* size_t void*) int))
 
   ;; memory ceiling for scrypt: caps a chosen (or crafted) N so a huge one
   ;; is rejected by libcrypto (return 0) rather than attempting the alloc.
@@ -75,6 +83,67 @@
                                   N r p scrypt-maxmem out dk-len))
           out
           (error 'kdf-scrypt "EVP_PBE_scrypt failed (bad N/r/p or over memory cap)"))))
+
+  ;; ---- argon2id via EVP_KDF --------------------------------------------
+  ;; The OSSL_PARAM array is assembled in foreign (C) memory: the key
+  ;; strings, the pass/salt copies and the uint cells all live outside the
+  ;; Scheme heap, so nothing the array points at can move between building
+  ;; it and EVP_KDF_derive.
+  (define param-size 40)     ; sizeof(OSSL_PARAM) on LP64
+  (define type-uint 2)       ; OSSL_PARAM_UNSIGNED_INTEGER
+  (define type-octet 5)      ; OSSL_PARAM_OCTET_STRING
+
+  (define (cstr s)           ; persistent NUL-terminated C string (module-lifetime)
+    (let* ((bv (string->utf8 s)) (n (bytevector-length bv)) (p (foreign-alloc (+ n 1))))
+      (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+      (foreign-set! 'unsigned-8 p n 0)
+      p))
+  (define k-pass (cstr "pass"))
+  (define k-salt (cstr "salt"))
+  (define k-iter (cstr "iter"))
+  (define k-memcost (cstr "memcost"))
+  (define k-lanes (cstr "lanes"))
+
+  (define (c-bytes bv)       ; copy bv into fresh C memory -> address
+    (let* ((n (bytevector-length bv)) (p (foreign-alloc (max 1 n))))
+      (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+      p))
+  (define (c-uint v) (let ((p (foreign-alloc 4))) (foreign-set! 'unsigned-32 p 0 v) p))
+
+  (define (set-param! arr idx key type data data-size)
+    (let ((o (* idx param-size)))
+      (foreign-set! 'void* arr (+ o 0) key)
+      (foreign-set! 'unsigned-32 arr (+ o 8) type)
+      (foreign-set! 'void* arr (+ o 16) data)
+      (foreign-set! 'unsigned-64 arr (+ o 24) data-size)
+      (foreign-set! 'unsigned-64 arr (+ o 32) 0)))
+
+  ;; t = time cost (passes), m = memory in KiB, p = lanes (parallelism)
+  (define (kdf-argon2id password salt t m p dk-len)
+    (let ((kdf (_EVP_KDF_fetch 0 "ARGON2ID" 0)))
+      (when (zero? kdf) (error 'kdf-argon2id "ARGON2ID unavailable (need OpenSSL 3.2+)"))
+      (let ((ctx (_EVP_KDF_CTX_new kdf)))
+        (_EVP_KDF_free kdf)
+        (when (zero? ctx) (error 'kdf-argon2id "EVP_KDF_CTX_new failed"))
+        (let ((pass-p (c-bytes password)) (salt-p (c-bytes salt))
+              (iter-c (c-uint t)) (mem-c (c-uint m)) (lanes-c (c-uint p))
+              (params (foreign-alloc (* 6 param-size)))
+              (out (make-bytevector dk-len)))
+          (do ((i 0 (+ i 1))) ((= i (* 6 param-size))) (foreign-set! 'unsigned-8 params i 0))
+          (set-param! params 0 k-pass    type-octet pass-p (bytevector-length password))
+          (set-param! params 1 k-salt    type-octet salt-p (bytevector-length salt))
+          (set-param! params 2 k-iter    type-uint  iter-c 4)
+          (set-param! params 3 k-memcost type-uint  mem-c  4)
+          (set-param! params 4 k-lanes   type-uint  lanes-c 4)
+          ;; entry 5 stays zeroed == OSSL_PARAM_END
+          (let ((rc (_EVP_KDF_derive ctx out dk-len params)))
+            (foreign-free pass-p) (foreign-free salt-p)
+            (foreign-free iter-c) (foreign-free mem-c) (foreign-free lanes-c)
+            (foreign-free params)
+            (_EVP_KDF_CTX_free ctx)
+            (if (fx= rc 1)
+                out
+                (error 'kdf-argon2id "EVP_KDF_derive failed (bad params or over memory)")))))))
 
   ;; ---- self-describing password hashing --------------------------------
   (define salt-len 16)
@@ -127,6 +196,12 @@
            (string-append "pbkdf2-sha256$" (number->string iters) "$"
                           (base64-encode salt) "$"
                           (base64-encode (kdf-pbkdf2-sha256 pw salt iters dk-len)))))
+        ((argon2id)
+         ;; defaults follow OWASP's minimum: m=19 MiB, t=2, p=1
+         (let ((t (opt params 't 2)) (m (opt params 'm 19456)) (p (opt params 'p 1)))
+           (string-append "argon2id$" (number->string t) "$" (number->string m)
+                          "$" (number->string p) "$" (base64-encode salt) "$"
+                          (base64-encode (kdf-argon2id pw salt t m p dk-len)))))
         (else (assertion-violation 'password-hash "unknown algo" algo)))))
 
   ;; verify dispatches on the algorithm prefix. A full-width DK is required
@@ -159,5 +234,17 @@
                        dk (fx= (bytevector-length dk) dk-len)
                        (guard (e (#t #f))
                          (ct=? dk (kdf-pbkdf2-sha256 pw salt iters dk-len))))))
+               ((and (string=? (car parts) "argon2id") (= (length parts) 6))
+                (let ((t (string->number (list-ref parts 1)))
+                      (m (string->number (list-ref parts 2)))
+                      (p (string->number (list-ref parts 3)))
+                      (salt (b64 (list-ref parts 4)))
+                      (dk (b64 (list-ref parts 5))))
+                  (and t m p (integer? t) (integer? m) (integer? p)
+                       (> t 0) (<= t 1000) (<= m 262144) (> p 0) (<= p 64)
+                       salt (fx> (bytevector-length salt) 0)
+                       dk (fx= (bytevector-length dk) dk-len)
+                       (guard (e (#t #f))
+                         (ct=? dk (kdf-argon2id pw salt t m p dk-len))))))
                (else #f))))))
 )
