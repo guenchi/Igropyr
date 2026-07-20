@@ -67,7 +67,7 @@
   (define default-ttl-ms 60000)        ; 1 minute
   (define default-cap    1024)         ; max cached entries (memory backend)
   (define prune-interval-ms 30000)     ; TTL sweep cadence (memory backend)
-  (define flight-wait-ms   5000)       ; a follower's wait for the leader's render
+  (define flight-wait-margin-ms 1000)  ; follower wait = the engine deadline + this
 
   (define (opt-ref o k d) (let ((p (assq k o))) (if p (cdr p) d)))
 
@@ -152,9 +152,16 @@
   ;; ---- redis backend: cross-node, TTL server-side (SET ... PX) ----------
   (define (bump-box! b) (set-box! b (+ 1 (unbox b))))
 
+  ;; escape Redis glob metachars so a prefix like "a*b:" matches literally
+  (define (glob-escape s)
+    (list->string
+      (fold-right (lambda (c acc)
+                    (if (memv c '(#\* #\? #\[ #\] #\\)) (cons #\\ (cons c acc)) (cons c acc)))
+                  '() (string->list s))))
+
   (define (redis-clear! conn prefix)     ; SCAN + DEL over the prefix
     (let loop ((cursor "0"))
-      (let* ((r (redis conn "SCAN" cursor "MATCH" (string-append prefix "*")
+      (let* ((r (redis conn "SCAN" cursor "MATCH" (string-append (glob-escape prefix) "*")
                        "COUNT" 200))
              (next (car r)) (keys (cadr r)))
         (unless (null? keys) (apply redis conn "DEL" keys))
@@ -166,8 +173,10 @@
       (vector
         (lambda (k)
           (let ((v (redis conn "GET" (k* k))))
-            (if v (begin (bump-box! hits) v) (begin (bump-box! misses) #f))))
-        (lambda (k h ttl) (redis conn "SET" (k* k) h "PX" ttl))   ; sync put
+            ;; a non-string reply (nil, or a non-UTF-8 binary value) = miss
+            (if (string? v) (begin (bump-box! hits) v) (begin (bump-box! misses) #f))))
+        (lambda (k h ttl)                                          ; sync put
+          (when (> ttl 0) (redis conn "SET" (k* k) h "PX" ttl)))   ; PX 0 -> redis -ERR
         (lambda (k) (redis conn "DEL" (k* k)))
         (lambda () (redis-clear! conn prefix))
         (lambda () (list (cons 'hits (unbox hits))
@@ -237,7 +246,7 @@
                                 (call+cache backend key fn json ttl))))
                   (gen-server-cast flight (vector 'publish key res))
                   res)
-                (receive (after flight-wait-ms
+                (receive (after (ssr-flight-wait r)
                             ;; leader vanished -> render ourselves
                             (gen-server-cast flight (vector 'unclaim key self))
                             (call+cache backend key fn json ttl))
@@ -249,15 +258,20 @@
            (ttl  (opt-ref opts 'ttl-ms default-ttl-ms))
            (cap  (opt-ref opts 'max-entries default-cap))
            (qopts (opt-ref opts 'quickjs '()))
+           ;; a follower must wait AT LEAST the leader's own render deadline,
+           ;; or it would time out mid-render and start the very herd that
+           ;; single-flight exists to prevent (quickjs timeout-ms default 2000)
+           (wait (+ (opt-ref qopts 'timeout-ms 2000) flight-wait-margin-ms))
            (backend (make-backend (opt-ref opts 'cache 'memory) cap))
            (flight (and (opt-ref opts 'single-flight #t)
                         (gen-server-start flight-init flight-call flight-cast))))
       (qjs-boot! bundle qopts)          ; process-global engine; one per process
-      (vector backend ttl flight)))
+      (vector backend ttl flight wait)))
 
-  (define (ssr-backend r) (vector-ref r 0))
-  (define (ssr-ttl r)     (vector-ref r 1))
-  (define (ssr-flight r)  (vector-ref r 2))
+  (define (ssr-backend r)     (vector-ref r 0))
+  (define (ssr-ttl r)         (vector-ref r 1))
+  (define (ssr-flight r)      (vector-ref r 2))
+  (define (ssr-flight-wait r) (vector-ref r 3))
 
   (define (props->json props) (if (string? props) props (json->string props)))
   (define (render-key fn json)

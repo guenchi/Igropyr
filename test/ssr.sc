@@ -92,7 +92,8 @@ function boom(j){ throw new Error('render failed'); }
             (redis-close! conn))))
 
     ;; ---- single-flight: K concurrent misses on ONE cold key render once ----
-    (let ((r (make-ssr bundle)))            ; reboots engine -> N=0
+    ;; timeout-ms >> the slowRender loop so a slow box can't trip the deadline
+    (let ((r (make-ssr bundle '((quickjs . ((timeout-ms . 20000)))))))   ; reboots -> N=0
       (let ((k 4) (me self))
         (do ((i 0 (+ i 1))) ((= i k))
           (spawn (lambda ()
@@ -105,6 +106,34 @@ function boom(j){ throw new Error('render failed'); }
               (receive (`#(sf ,html)
                          (loop (+ got 1) (and allok (equal? html "<h1>H</h1>")))))))
         (check "sf-rendered-once" (= 1 (N)))))   ; K callers, ONE actual render
+
+    ;; ---- TTL expiry: an entry past ttl-ms re-renders ----
+    (let ((r (make-ssr bundle '((ttl-ms . 50)))))    ; reboots -> N=0
+      (ssr-render r "render" '(("t" . "T")) '((key . "/ttl")))
+      (check "ttl-rendered-1" (= 1 (N)))
+      (ssr-render r "render" '(("t" . "T")) '((key . "/ttl")))     ; hit
+      (check "ttl-hit" (= 1 (N)))
+      (sleep-ms 200)                                               ; past ttl
+      (ssr-render r "render" '(("t" . "T")) '((key . "/ttl")))     ; expired -> re-render
+      (check "ttl-expired-rerender" (= 2 (N))))
+
+    ;; ---- size cap: over max-entries evicts the soonest-to-expire ----
+    (let ((r (make-ssr bundle '((max-entries . 2)))))   ; reboots -> N=0
+      (ssr-render r "render" '(("t" . "1")) '((key . "/e1"))) (sleep-ms 5)
+      (ssr-render r "render" '(("t" . "2")) '((key . "/e2"))) (sleep-ms 5)
+      (ssr-render r "render" '(("t" . "3")) '((key . "/e3")))
+      (check "evict-size-capped" (<= (cdr (assq 'size (ssr-stats r))) 2))
+      (ssr-render r "render" '(("t" . "1")) '((key . "/e1")))      ; /e1 evicted -> re-render
+      (check "evict-rerender" (= 4 (N))))
+
+    ;; ---- single-flight OFF: concurrent misses each render (no dedup) ----
+    (let ((r (make-ssr bundle '((single-flight . #f)))))   ; reboots -> N=0
+      (let ((k 4) (me self))
+        (do ((i 0 (+ i 1))) ((= i k))
+          (spawn (lambda ()
+                   (send me (vector 'nf (ssr-render r "render" '(("t" . "H")) '((key . "/nf"))))))))
+        (let loop ((got 0)) (when (< got k) (receive (`#(nf ,_) (loop (+ got 1))))))
+        (check "no-single-flight-each-renders" (= 4 (N)))))
 
     (if (zero? failures)
         (begin (display "ssr: all tests passed\n") (exit 0))
