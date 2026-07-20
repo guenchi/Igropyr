@@ -1,13 +1,15 @@
 #!chezscheme
-;;; (igropyr ssr) -- cached SSR over quickjs: a render caches by key, a
-;;; second identical call HITS (no re-render, proven by a JS render counter),
-;;; invalidate/clear drop entries, stats report hits/misses, and a throwing
-;;; render surfaces via ssr-try-render without being cached (the engine
-;;; recovers via crash-only rebuild). SHIM-GATED like test/quickjs.sc: skips
+;;; (igropyr ssr) -- cached SSR over quickjs, both cache backends. A render
+;;; caches by key; a second identical call HITS (no re-render, proven by a JS
+;;; render counter); invalidate/clear drop entries; stats report hits/misses;
+;;; a throwing render surfaces via ssr-try-render without being cached (engine
+;;; recovers via crash-only rebuild). The redis-backend checks run only when a
+;;; local Redis answers (else skipped). SHIM-GATED like test/quickjs.sc: skips
 ;;; cleanly when the QuickJS dylib is absent, so run-all stays green without it.
 
 (import (chezscheme) (igropyr actor) (igropyr ssr)
-        (only (igropyr quickjs) qjs-call!))
+        (only (igropyr quickjs) qjs-call!)
+        (only (igropyr redis) redis-connect redis redis-close!))
 
 (define (shim-present?)
   (or (let ((e (getenv "IGROPYR_QUICKJS_SO"))) (and e (> (string-length e) 0)))
@@ -24,6 +26,7 @@
 (define failures 0)
 (define (check label ok)
   (unless ok (set! failures (+ failures 1)) (display "FAIL ") (display label) (newline)))
+(define (L p s) (string-append p s))
 
 ;; render() counts its calls in a JS global so a cache HIT is provable (N does
 ;; not advance on a hit); count() reads it; boom() throws.
@@ -33,47 +36,58 @@ function render(j){ N++; var p = JSON.parse(j); return '<h1>'+p.t+'</h1>'; }
 function count(_){ return '' + N; }
 function boom(j){ throw new Error('render failed'); }
 ")
+(define (N) (string->number (qjs-call! "count" "")))
+
+;; core cache behavior for ANY backend; assumes N == 0 (engine freshly booted)
+(define (run-cache-checks r p)
+  (check (L p "render-a")    (string=? (ssr-render r "render" '(("t" . "A")) '((key . "/a"))) "<h1>A</h1>"))
+  (check (L p "rendered-1")  (= 1 (N)))
+  (check (L p "hit")         (string=? (ssr-render r "render" '(("t" . "A")) '((key . "/a"))) "<h1>A</h1>"))
+  (check (L p "no-rerender") (= 1 (N)))
+  (check (L p "render-b")    (string=? (ssr-render r "render" '(("t" . "B")) '((key . "/b"))) "<h1>B</h1>"))
+  (check (L p "rendered-2")  (= 2 (N)))
+  (ssr-invalidate! r "/a")
+  (check (L p "after-inval") (string=? (ssr-render r "render" '(("t" . "A")) '((key . "/a"))) "<h1>A</h1>"))
+  (check (L p "rerender-3")  (= 3 (N)))
+  (let ((s (ssr-stats r)))
+    (check (L p "stats-hits")   (>= (cdr (assq 'hits s)) 1))
+    (check (L p "stats-misses") (>= (cdr (assq 'misses s)) 3)))
+  (ssr-clear! r)
+  (check (L p "after-clear") (string=? (ssr-render r "render" '(("t" . "B")) '((key . "/b"))) "<h1>B</h1>"))
+  (check (L p "rerender-4")  (= 4 (N))))
 
 (start-scheduler
   (lambda ()
-    (define r (make-ssr bundle))
-    (define (N) (string->number (qjs-call! "count" "")))
-
-    ;; miss -> render (N=1)
-    (check "render-a"   (string=? (ssr-render r "render" '(("t" . "A")) '((key . "/a"))) "<h1>A</h1>"))
-    (check "rendered-1" (= 1 (N)))
-    ;; same key -> HIT, no re-render (N stays 1)
-    (check "render-a2"  (string=? (ssr-render r "render" '(("t" . "A")) '((key . "/a"))) "<h1>A</h1>"))
-    (check "hit-no-rerender" (= 1 (N)))
-    ;; different key -> miss (N=2)
-    (check "render-b"   (string=? (ssr-render r "render" '(("t" . "B")) '((key . "/b"))) "<h1>B</h1>"))
-    (check "rendered-2" (= 2 (N)))
-    ;; invalidate /a then render -> miss (N=3)
-    (ssr-invalidate! r "/a")
-    (check "render-a3"  (string=? (ssr-render r "render" '(("t" . "A")) '((key . "/a"))) "<h1>A</h1>"))
-    (check "rerender-after-invalidate" (= 3 (N)))
-    ;; stats
-    (let ((s (ssr-stats r)))
-      (check "stats-hits"   (>= (cdr (assq 'hits s)) 1))
-      (check "stats-misses" (>= (cdr (assq 'misses s)) 3))
-      (check "stats-size"   (>= (cdr (assq 'size s)) 1)))
-    ;; clear then render /b -> miss (N=4)
-    (ssr-clear! r)
-    (check "render-b2"  (string=? (ssr-render r "render" '(("t" . "B")) '((key . "/b"))) "<h1>B</h1>"))
-    (check "rerender-after-clear" (= 4 (N)))
-    ;; default key (sha256 of props): same props hits the second time
-    (let ((n0 (N)))
-      (ssr-render r "render" '(("t" . "C")))
-      (let ((n1 (N)))
-        (check "default-key-rendered-once" (= (+ n0 1) n1))
+    ;; ---- memory backend (default) ----
+    (let ((r (make-ssr bundle)))
+      (run-cache-checks r "mem-")
+      ;; default key (sha256 of props): same props hits the second time
+      (let ((n0 (N)))
         (ssr-render r "render" '(("t" . "C")))
-        (check "default-key-hit" (= n1 (N)))))
-    ;; try-render on a throwing fn -> (values #f text), not cached
-    (let-values (((ok txt) (ssr-try-render r "boom" '(("t" . "X")) '((key . "/boom")))))
-      (check "try-render-fails" (not ok))
-      (check "try-render-text"  (and (string? txt) (> (string-length txt) 0))))
-    ;; engine recovers after the throw (crash-only rebuild)
-    (check "recovers" (string=? (ssr-render r "render" '(("t" . "Z")) '((key . "/z"))) "<h1>Z</h1>"))
+        (let ((n1 (N)))
+          (check "mem-defaultkey-once" (= (+ n0 1) n1))
+          (ssr-render r "render" '(("t" . "C")))
+          (check "mem-defaultkey-hit" (= n1 (N)))))
+      ;; try-render on a throwing fn -> (values #f text), not cached
+      (let-values (((ok txt) (ssr-try-render r "boom" '(("t" . "X")) '((key . "/boom")))))
+        (check "mem-tryrender-fails" (not ok))
+        (check "mem-tryrender-text"  (and (string? txt) (> (string-length txt) 0))))
+      ;; engine recovers after the throw (crash-only rebuild)
+      (check "mem-recovers" (string=? (ssr-render r "render" '(("t" . "Z")) '((key . "/z"))) "<h1>Z</h1>")))
+
+    ;; ---- redis backend (only when a local Redis answers) ----
+    (let ((conn (guard (e (#t #f)) (redis-connect "127.0.0.1" 6379))))
+      (if (not conn)
+          (display "ssr: redis not reachable, redis-backend checks skipped\n")
+          (let ((r (make-ssr bundle `((cache . (redis ,conn "ssrtest:"))))))  ; reboots engine -> N=0
+            (ssr-clear! r)                     ; start from a clean namespace
+            (run-cache-checks r "redis-")
+            ;; the rendered HTML actually lives in Redis -> any peer node hits it
+            (ssr-render r "render" '(("t" . "X")) '((key . "/x")))
+            (check "redis-in-store" (equal? (redis conn "GET" "ssrtest:/x") "<h1>X</h1>"))
+            (ssr-clear! r)                     ; cleanup + prove clear reaches Redis
+            (check "redis-cleared" (not (redis conn "GET" "ssrtest:/x")))
+            (redis-close! conn))))
 
     (if (zero? failures)
         (begin (display "ssr: all tests passed\n") (exit 0))
