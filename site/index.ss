@@ -18,7 +18,7 @@
       (div (@ (class "wrap"))
         (div (@ (class "lam")) "λ")
         (h1 "Igropyr")
-        (p (@ (class "tag")) "A web server where " (b "crashes heal themselves")
+        (p (@ (class "tag")) "A distributed backend framework where " (b "crashes heal themselves")
            ", " (b "code hot-swaps") ", " (b "faults speak a protocol") ", and "
            (b "dialogues are processes") ".")
         (p (@ (class "sub"))
@@ -365,9 +365,9 @@
 
 (write-file "index.html"
   (render-page
-   "Igropyr — a fault-tolerant web server in pure Chez Scheme"
-   (string-append "Igropyr: crashes heal themselves, code hot-swaps, faults "
-                  "speak a protocol, and dialogues are processes. Erlang-style "
-                  "actors on libuv, written entirely in Chez Scheme.")
+   "Igropyr — a distributed backend framework in pure Chez Scheme"
+   (string-append "A distributed, fault-tolerant, high-concurrency backend "
+                  "framework with continuations, built on Chez Scheme. "
+                  "Erlang-style actors on libuv.")
    body
    (list `(script (@ (type "module") (src "fire.js"))))))
