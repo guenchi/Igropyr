@@ -28,6 +28,7 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/sigv4.sc
 "$scheme_bin" --script igropyr/test/blas.sc
 "$scheme_bin" --script igropyr/test/quickjs.sc
+"$scheme_bin" --script igropyr/test/ssr.sc
 "$scheme_bin" --script igropyr/test/s3.sc
 "$scheme_bin" --script igropyr/test/aws.sc
 "$scheme_bin" --script igropyr/test/metrics.sc
