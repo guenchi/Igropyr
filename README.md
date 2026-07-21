@@ -639,7 +639,7 @@ paths. `qjs-boot!` reports if no libquickjs is found; point it at one with
 
 A **C-shim binding with identical exports** — self-contained, with QuickJS
 statically linked and version-pinned — is a drop-in fallback at
-[guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs/tree/igropyr),
+[guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs),
 for when a stock libquickjs is awkward to obtain (e.g. Homebrew ships only a
 static archive).
 
@@ -1180,8 +1180,8 @@ BLAS for `(igropyr blas)`'s fast lane and OpenSSL for `(igropyr tls)`.
 Each degrades without its library — blas to the pure loop, tls/quickjs
 to a clear error — so this only bites the capability that needs it. When
 a stock libquickjs is awkward to obtain, the self-contained C-shim
-binding at [guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs/tree/igropyr)
-(branch `igropyr`) is a drop-in replacement.
+binding at [guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs)
+is a drop-in replacement.
 
 Profile-guided optimization (`build-profile.ss` to instrument,
 `/admin/profdump` to collect after driving load, `build-pgo.ss` to

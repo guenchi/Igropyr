@@ -6,7 +6,7 @@
 ;;; is data, never code.
 ;;;
 ;;; A C-shim binding with the SAME exports lives at
-;;;   https://github.com/guenchi/igropyr-quickjs (branch `igropyr`)
+;;;   https://github.com/guenchi/igropyr-quickjs
 ;;; -- a drop-in replacement to use when a stock libquickjs is awkward to
 ;;; obtain (e.g. Homebrew ships only a static archive) or when you want a
 ;;; self-contained, version-pinned artifact.
