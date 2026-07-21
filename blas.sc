@@ -18,7 +18,7 @@
 ;;; fused scan of their own (inline filtering, early exit) can keep it
 ;;; behind blas-available? and use this only for the big-scan lane.
 ;;;
-;;; Scheduling (from the iter design review this library grew out of):
+;;; Scheduling -- the constraint this binding is built around:
 ;;; an FFI call cannot be preempted, so one call stalls the calling
 ;;; scheduler for the scan's duration -- roughly 0.2 ms at 5k rows x
 ;;; 512 dims float32, ~5 ms at 100k (memory bandwidth). SPREAD those
