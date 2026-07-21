@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant, high-concurrency backend framework with continuation-based web programming and a remote retry ring, built on [Chez Scheme](https://scheme.com/).
 
-**[igropyr.com](https://igropyr.com)** · **[Manual](https://igropyr.com/manual.html)**
+**[igropyr.dev](https://igropyr.dev)** · **[Manual](https://igropyr.dev/manual.html)**
 
 - **Core / framework split, like Node and Express** — the core exposes one
   entry point, `(http-listen port (lambda (req res) ...))`; the bundled
@@ -155,7 +155,7 @@ process. `gen-server`, `link` / `monitor` and topic PubSub are the OTP
 building blocks — isolation is by process, not by locks.
 
 For the actor model, the libuv-callback invariant, and contribution
-guidelines, see [the manual](https://igropyr.com/manual.html).
+guidelines, see [the manual](https://igropyr.dev/manual.html).
 
 ## Requirements
 
@@ -1130,7 +1130,7 @@ mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
 
 The actor scheduler (`register`/`whereis`/`monitor`/`demonitor`) and the
 libuv-callback invariant that everything rests on are documented in
-[the manual](https://igropyr.com/manual.html).
+[the manual](https://igropyr.dev/manual.html).
 
 Message protocol between processes:
 
