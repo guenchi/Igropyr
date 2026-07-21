@@ -1224,27 +1224,6 @@ It checks library imports, actor scheduling, asynchronous file reads, strict
 HTTP framing/query behavior, and boot-failure propagation. The older echo and
 `run-otp.sc` programs remain available as interactive smoke/demo servers.
 
-## Standalone library mirrors
-
-Several of the lower-level libraries are also published as standalone
-repositories, each carrying its one source file (`*.sc`) at the root plus
-a README. **When you change one of these sources here, update its mirror
-in the same change so the two do not drift.**
-
-| Source | Standalone repository |
-| --- | --- |
-| `igropyr/util.sc` | [guenchi/igropyr-util](https://github.com/guenchi/igropyr-util) |
-| `igropyr/platform.sc` | [guenchi/igropyr-platform](https://github.com/guenchi/igropyr-platform) |
-| `igropyr/libuv.sc` | [guenchi/igropyr-libuv](https://github.com/guenchi/igropyr-libuv) |
-| `igropyr/crypto.sc` | [guenchi/igropyr-crypto](https://github.com/guenchi/igropyr-crypto) |
-| `igropyr/blas.sc` | [guenchi/igropyr-blas](https://github.com/guenchi/igropyr-blas) |
-| `igropyr/json.sc` | [guenchi/json](https://github.com/guenchi/json/tree/igropyr) (`igropyr` branch) |
-
-`igropyr/quickjs.sc` has a sibling at
-[guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs) — a
-C-shim binding with **identical exports** rather than a copy of the
-pure-Scheme source, so keep the two in step at the API level.
-
 ## License
 
 MIT
