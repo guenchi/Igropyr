@@ -626,16 +626,22 @@ code:
 (qjs-call! "slugify" "Hello World")   ; -> "hello-world"
 ```
 
-It is hardened in the C shim (`c/quickjs-shim.c`): a memory cap, a stack
-cap, a wall-clock interrupt deadline, and **crash-only rebuild** — a
-throwing or runaway call discards the whole JS heap and reboots it from
-the bundle (`qjs-generation` counts rebuilds), so one bad call can't
-poison the next. The engine is mutex-serialized and each call runs with
-interrupts disabled, so a call blocks its OS thread for its duration
-(sub-millisecond typically, `timeout-ms` worst case) — cap input size on
-latency-sensitive paths. The native shim is a build artifact
-(`build-quickjs-shim.sh`, needs QuickJS installed); without it the
-library imports fine and `qjs-boot!` reports the missing shim.
+It runs in **pure Scheme** over a stock shared `libquickjs`, bound directly
+through the FFI (no custom C): a memory cap, a stack cap, a wall-clock
+interrupt deadline, and **crash-only rebuild** — a throwing or runaway call
+discards the whole JS heap and reboots it from the bundle (`qjs-generation`
+counts rebuilds), so one bad call can't poison the next. The engine is
+serialized on the single OS thread and each call runs with interrupts
+disabled, so a call blocks the scheduler for its duration (sub-millisecond
+typically, `timeout-ms` worst case) — cap input size on latency-sensitive
+paths. `qjs-boot!` reports if no libquickjs is found; point it at one with
+`IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
+
+A **C-shim binding with identical exports** — self-contained, with QuickJS
+statically linked and version-pinned — is a drop-in fallback at
+[guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs/tree/igropyr),
+for when a stock libquickjs is awkward to obtain (e.g. Homebrew ships only a
+static archive).
 
 ## Cached SSR
 
@@ -1166,15 +1172,16 @@ scheme --program igropyr/app.so
 Re-run the build after editing any source. Interrupt traps stay enabled
 (preemptive scheduling needs them).
 
-Native FFI shims are separate build artifacts, not folded into `app.so`
-— compiling a library only compiles its Scheme, and the shared library
-is `dlopen`ed at runtime. So if the app uses `(igropyr quickjs)`, ship
-the shim (`build-quickjs-shim.sh` → `libigropyr-quickjs.{dylib,so}`)
-alongside the binary on a path it resolves, or point `IGROPYR_QUICKJS_SO`
-at it; likewise a native BLAS for `(igropyr blas)`'s fast lane and
-OpenSSL for `(igropyr tls)`. Each degrades without its library — blas
-to the pure loop, tls/quickjs to a clear error — so this only bites the
-capability that needs it.
+Native libraries are `dlopen`ed at runtime, not folded into `app.so` —
+compiling a library only compiles its Scheme. So if the app uses
+`(igropyr quickjs)`, make a stock `libquickjs` resolvable (or point
+`IGROPYR_LIBQUICKJS_SO` / `(so-path . "...")` at one); likewise a native
+BLAS for `(igropyr blas)`'s fast lane and OpenSSL for `(igropyr tls)`.
+Each degrades without its library — blas to the pure loop, tls/quickjs
+to a clear error — so this only bites the capability that needs it. When
+a stock libquickjs is awkward to obtain, the self-contained C-shim
+binding at [guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs/tree/igropyr)
+(branch `igropyr`) is a drop-in replacement.
 
 Profile-guided optimization (`build-profile.ss` to instrument,
 `/admin/profdump` to collect after driving load, `build-pgo.ss` to

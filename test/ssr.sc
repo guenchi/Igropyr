@@ -11,17 +11,17 @@
         (only (igropyr quickjs) qjs-call!)
         (only (igropyr redis) redis-connect redis redis-close!))
 
-(define (shim-present?)
-  (or (let ((e (getenv "IGROPYR_QUICKJS_SO"))) (and e (> (string-length e) 0)))
-      (file-exists? "igropyr/libigropyr-quickjs.dylib")
-      (file-exists? ".build-links/igropyr/libigropyr-quickjs.dylib")
-      (file-exists? "libigropyr-quickjs.dylib")
-      (file-exists? "igropyr/libigropyr-quickjs.so")
-      (file-exists? ".build-links/igropyr/libigropyr-quickjs.so")
-      (file-exists? "libigropyr-quickjs.so")))
+;; (igropyr quickjs) is the pure-Scheme binding: it needs a stock shared
+;; libquickjs. Gate on that so run-all stays green on hosts without QuickJS.
+(define (quickjs-present?)
+  (or (let ((e (getenv "IGROPYR_LIBQUICKJS_SO"))) (and e (> (string-length e) 0) (file-exists? e)))
+      (file-exists? "libquickjs.dylib") (file-exists? "libquickjs.so")
+      (file-exists? "/opt/homebrew/lib/quickjs/libquickjs.dylib")
+      (file-exists? "/usr/local/lib/quickjs/libquickjs.so")
+      (file-exists? "/usr/lib/quickjs/libquickjs.so")))
 
-(unless (shim-present?)
-  (display "ssr: shim not built, test skipped\n") (exit 0))
+(unless (quickjs-present?)
+  (display "ssr: no stock libquickjs found, test skipped\n") (exit 0))
 
 (define failures 0)
 (define (check label ok)
