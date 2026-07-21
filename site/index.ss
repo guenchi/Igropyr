@@ -147,7 +147,7 @@
                (a (@ (href "https://goeteia.dev")) "Goeteia") "."))
           (div (@ (class "rpccol"))
             (div (@ (class "rpcwire"))
-              (a (@ (class "wnode") (href "https://igropyr.com"))
+              (a (@ (class "wnode") (href "https://igropyr.dev"))
                 (img (@ (src "favicon.svg") (alt "Igropyr") (width "30") (height "30")))
                 "Igropyr")
               (span (@ (class "warrow")) "⇄")
