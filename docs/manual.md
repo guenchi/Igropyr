@@ -2785,18 +2785,34 @@ code.
 - `(qjs-call! fname arg)` → string — the raising variant.
 - `(qjs-healthy?)` / `(qjs-generation)` / `(qjs-shutdown!)`.
 
-It is hardened in the C shim: a memory cap, a stack cap, a wall-clock
-interrupt deadline, and **crash-only rebuild** — a throwing or runaway call
-discards the whole JS heap and reboots it from the bundle
-(`qjs-generation` counts rebuilds), so one bad call can't poison the next.
-The engine is mutex-serialized and each call runs with interrupts disabled,
-so a call blocks its OS thread for its duration (sub-millisecond typically,
-`timeout-ms` worst case) — cap input size on latency-sensitive paths.
+It runs in **pure Scheme** over a stock shared `libquickjs`, bound directly
+through the FFI — no custom C. A boot-time ABI probe reads the JSValue
+`ref_count` offset from the loaded library (so it adapts across QuickJS
+builds) and refuses an unknown layout rather than corrupting memory. The
+guards: a memory cap, a stack cap, a wall-clock interrupt deadline (a Chez
+`foreign-callable` the engine polls), an exception boundary, and
+**crash-only rebuild** — a throwing or runaway call discards the whole JS
+heap and reboots it from the bundle (`qjs-generation` counts rebuilds), so
+one bad call can't poison the next. The engine is serialized on the single
+OS thread and each call runs with interrupts disabled, so a call blocks the
+scheduler for its duration (sub-millisecond typically, `timeout-ms` worst
+case) — cap input size on latency-sensitive paths.
 
-The native shim is a build artifact (`build-quickjs-shim.sh`, needs QuickJS
-installed); without it the library imports fine and `qjs-boot!` reports the
-missing shim. Ship the shim alongside the binary on a path it resolves, or
-point `IGROPYR_QUICKJS_SO` at it.
+`qjs-boot!` reports if no `libquickjs` is found; point it at one with
+`IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
+
+### Fallback: the C-shim binding
+
+When a stock `libquickjs` is awkward to obtain — for example Homebrew ships
+only a static archive — a **C-shim binding with identical exports**,
+self-contained (QuickJS statically linked and version-pinned), is a drop-in
+replacement:
+
+- [guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs/tree/igropyr), branch `igropyr`
+
+Build its shim with `build-quickjs-shim.sh`; it resolves as the same
+`(igropyr quickjs)`, so the two are interchangeable and no application code
+changes.
 
 ---
 
