@@ -2808,7 +2808,7 @@ only a static archive — a **C-shim binding with identical exports**,
 self-contained (QuickJS statically linked and version-pinned), is a drop-in
 replacement:
 
-- [guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs/tree/igropyr), branch `igropyr`
+- [guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs)
 
 Build its shim with `build-quickjs-shim.sh`; it resolves as the same
 `(igropyr quickjs)`, so the two are interchangeable and no application code
