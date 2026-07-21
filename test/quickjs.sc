@@ -29,6 +29,13 @@
       (begin (display "  ok  ") (display label) (newline))
       (begin (set! failures (+ failures 1)) (display "FAIL  ") (display label) (newline))))
 
+(define (str-has? s sub)                       ; is sub a substring of s?
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i m) n) #f)
+            ((string=? sub (substring s i (+ i m))) #t)
+            (else (loop (+ i 1)))))))
+
 
 (define bundle "
 var N = 0;
@@ -36,7 +43,9 @@ function slugify(s){ N++; return s.toLowerCase().replace(/\\s+/g,'-'); }
 function greet(j){ N++; var p = JSON.parse(j); return '<h1>Hi '+p.name+'</h1>'; }
 function count(_){ return '' + N; }
 function boom(_){ throw new Error('render failed'); }
-function notstr(_){ return {a:1}; }          // not string-coercible in the useful sense
+function sym(_){ return Symbol('s'); }        // not string-coercible -> pending exception
+function thrower(_){ return { toString: function(){ throw new Error('toString boom'); } }; }
+Object.defineProperty(globalThis, 'badgetter', { get: function(){ throw new Error('getter boom'); } });
 function spin(_){ while(true){} }            // runaway loop -> interrupt deadline
 function eat(_){ var a=[]; while(true){ a.push(new Float64Array(100000)); } } // OOM bomb -> JS_SetMemoryLimit
 ")
@@ -60,6 +69,32 @@ function eat(_){ var a=[]; while(true){ a.push(new Float64Array(100000)); } } //
 (let-values (((ok s) (qjs-call "nope" "")))
   (check "no-such-fn-ok?" (not ok))
   (check "no-such-fn-msg" (and (string? s) (> (string-length s) 0))))
+
+;; ---- non-string-coercible result: -> (#f msg), pending exception DRAINED so
+;;      the next call is NOT poisoned (F1) ----
+(let-values (((ok s) (qjs-call "sym" "")))
+  (check "sym-not-ok" (not ok))
+  (check "sym-drained-msg" (and (string? s) (> (string-length s) 0))))
+(check "sym-next-clean" (equal? (qjs-call! "slugify" "A B") "a-b"))   ; not poisoned
+(let-values (((ok s) (qjs-call "thrower" "")))
+  (check "thrower-not-ok" (not ok)))
+(check "thrower-next-clean" (equal? (qjs-call! "slugify" "C D") "c-d"))
+
+;; ---- a throwing property getter on the name: reported accurately, not
+;;      "no such function", and the pending exception is drained (F4) ----
+(let-values (((ok s) (qjs-call "badgetter" "")))
+  (check "getter-not-ok" (not ok))
+  (check "getter-msg-accurate" (and (string? s) (not (string=? s "no such function")))))
+(check "getter-next-clean" (equal? (qjs-call! "slugify" "E F") "e-f"))
+
+;; ---- bad options are rejected (and a negative cap can't silently bypass the
+;;      memory limit) (B3) ----
+(check "reject-negative-mem"
+  (guard (e (#t #t)) (qjs-boot! "function f(x){return x;}" '((mem-mb . -1))) #f))
+(check "reject-bad-timeout"
+  (guard (e (#t #t)) (qjs-boot! "function f(x){return x;}" '((timeout-ms . 0))) #f))
+;; the rejected boots must not have torn down the live engine
+(check "engine-survives-bad-boot" (equal? (qjs-call! "slugify" "G H") "g-h"))
 
 ;; ---- JS throw -> (#f msg), NOT a raise; engine rebuilds (crash-only) ----
 (let ((gen0 (qjs-generation)))
@@ -102,6 +137,12 @@ function eat(_){ var a=[]; while(true){ a.push(new Float64Array(100000)); } } //
 
 (qjs-shutdown!)
 (check "shutdown-clears" (not (qjs-healthy?)))
+;; a call after shutdown reports cleanly ("qjs-boot! first"), not a raw
+;; bytevector-length error from bundle-bytes = #f inside boot-locked! (B1)
+(check "post-shutdown-clean-error"
+  (guard (e ((and (message-condition? e) (str-has? (condition-message e) "qjs-boot")) #t)
+            (#t #f))
+    (qjs-call "slugify" "z") #f))
 
 (if (zero? failures)
     (begin (display "quickjs: all tests passed\n") (exit 0))

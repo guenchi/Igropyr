@@ -256,51 +256,77 @@
     ;; than misread it. (igropyr's supported targets are all 64-bit anyway.)
     (unless (> (fixnum-width) 32)
       (error 'qjs-boot! "requires a 64-bit Chez (JSValue is bound as a 16-byte struct)"))
-    (let ((opts (if (pair? rest) (car rest) '())))
+    (let* ((opts (if (pair? rest) (car rest) '()))
+           (tmo (opt opts 'timeout-ms 2000))
+           (mem (opt opts 'mem-mb 64))
+           (stk (opt opts 'stack-kb 1024)))
+      ;; validate everything BEFORE any side effect (dlopen / FFI bind / alloc);
+      ;; reject negative caps -- a negative fixnum into a size_t arg wraps to a
+      ;; huge value and would silently disable the memory/stack guard.
+      (unless (string? source)
+        (assertion-violation 'qjs-boot! "source must be a string" source))
+      (unless (and (fixnum? tmo) (fx> tmo 0))
+        (assertion-violation 'qjs-boot! "timeout-ms must be a positive fixnum" tmo))
+      (unless (and (fixnum? mem) (fx>= mem 0))
+        (assertion-violation 'qjs-boot! "mem-mb must be a non-negative fixnum" mem))
+      (unless (and (fixnum? stk) (fx>= stk 0))
+        (assertion-violation 'qjs-boot! "stack-kb must be a non-negative fixnum" stk))
       (load-so! (opt opts 'so-path #f))
       (bind!)
       (ensure-scratch!)
-      (let ((tmo (opt opts 'timeout-ms 2000)))
-        (unless (and (fixnum? tmo) (fx> tmo 0))
-          (assertion-violation 'qjs-boot! "timeout-ms must be a positive fixnum" tmo))
-        (set! mem-mb (opt opts 'mem-mb 64))
-        (set! stack-kb (opt opts 'stack-kb 1024))
-        (set! timeout-ms tmo)
-        (set! bundle-bytes (utf8z source))
-        (with-interrupts-disabled (boot-locked!)))))
+      (set! mem-mb mem)
+      (set! stack-kb stk)
+      (set! timeout-ms tmo)
+      (set! bundle-bytes (utf8z source))
+      (with-interrupts-disabled (boot-locked!))))
 
   ;; -> (values ok? string): result on #t, JS error text on #f.
   (define (qjs-call fname arg)
     (unless bound (error 'qjs-call "qjs-boot! first"))
     (let ((abytes (string->utf8 arg)))
       (with-interrupts-disabled
-        (unless healthy (boot-locked!))
-        (_update-stack rt)
-        (arm-deadline! 1)
-        (_global g-buf ctx)
-        (_get-prop f-buf ctx g-buf fname)
-        (cond
-          ((fx= 0 (_is-function ctx f-buf))
-           (js-free! f-buf) (js-free! g-buf) (set! deadline 0)
-           (values #f "no such function"))
-          (else
-           (_new-string a-buf ctx abytes (bytevector-length abytes))
-           (ftype-set! JSValue (u)   argv-buf (ftype-ref JSValue (u) a-buf))
-           (ftype-set! JSValue (tag) argv-buf (ftype-ref JSValue (tag) a-buf))
-           (mkundef! this-buf)
-           (_call r-buf ctx f-buf this-buf 1 (ftype-pointer-address argv-buf))
-           (set! deadline 0)
-           (let ((exc? (= (ftype-ref JSValue (tag) r-buf) tag-exception)))
-             (js-free! a-buf) (js-free! f-buf) (js-free! g-buf)
-             (cond
-               (exc?
-                (let ((msg (read-exception)))
-                  (boot-locked!)               ; crash-only: discard + rebuild
-                  (values #f msg)))
-               (else
-                (let ((s (read-jsstring r-buf)))
-                  (js-free! r-buf)
-                  (if s (values #t s) (values #f "result not a string")))))))))))
+        ;; lazy re-boot if a previous rebuild failed; a failed re-boot must NOT
+        ;; escape as a raise -- honour the (values ok? string) contract.
+        (unless healthy (guard (e (#t #f)) (boot-locked!)))
+        (if (not healthy)
+            (values #f "quickjs engine unavailable")
+            (begin
+              (_update-stack rt)
+              (arm-deadline! 1)
+              (_global g-buf ctx)
+              (_get-prop f-buf ctx g-buf fname)
+              (cond
+                ((= (ftype-ref JSValue (tag) f-buf) tag-exception)
+                 ;; the property access itself threw (e.g. a throwing getter):
+                 ;; drain the pending exception (keeps the next call clean) and
+                 ;; report it, rather than the misleading "no such function"
+                 (js-free! g-buf) (set! deadline 0)
+                 (values #f (read-exception)))
+                ((fx= 0 (_is-function ctx f-buf))
+                 (js-free! f-buf) (js-free! g-buf) (set! deadline 0)
+                 (values #f "no such function"))
+                (else
+                 (_new-string a-buf ctx abytes (bytevector-length abytes))
+                 (ftype-set! JSValue (u)   argv-buf (ftype-ref JSValue (u) a-buf))
+                 (ftype-set! JSValue (tag) argv-buf (ftype-ref JSValue (tag) a-buf))
+                 (mkundef! this-buf)
+                 (_call r-buf ctx f-buf this-buf 1 (ftype-pointer-address argv-buf))
+                 (set! deadline 0)
+                 (let ((exc? (= (ftype-ref JSValue (tag) r-buf) tag-exception)))
+                   (js-free! a-buf) (js-free! f-buf) (js-free! g-buf)
+                   (cond
+                     (exc?
+                      (let ((msg (read-exception)))
+                        (guard (e (#t #f)) (boot-locked!))  ; crash-only, best-effort
+                        (values #f msg)))
+                     (else
+                      (let ((s (read-jsstring r-buf)))
+                        (js-free! r-buf)
+                        (if s
+                            (values #t s)
+                            ;; not string-coercible: JS_ToCStringLen2 left a
+                            ;; pending exception -> drain it and report
+                            (values #f (read-exception))))))))))))))
 
   (define (qjs-call! fname arg)
     (let-values (((ok s) (qjs-call fname arg)))
@@ -312,5 +338,8 @@
     (when bound
       (with-interrupts-disabled
         (teardown!)
-        (set! bundle-bytes #f))))
+        (set! bundle-bytes #f)
+        ;; clear bound so a later qjs-call cleanly reports "qjs-boot! first"
+        ;; instead of tripping over bundle-bytes = #f inside boot-locked!
+        (set! bound #f))))
 )
