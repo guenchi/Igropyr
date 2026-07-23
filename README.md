@@ -83,8 +83,11 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   `(igropyr s3)` speaks the S3 REST API over the HTTP client (put / get /
   head / server-side copy / delete / paginated list / restore — AWS S3,
   Cloudflare R2, MinIO); `(igropyr sts)` vends scoped temporary
-  credentials (GetFederationToken) and `(igropyr ses)` sends email
-  (SES v2), both over the same non-blocking signer
+  credentials (GetFederationToken), `(igropyr ses)` sends email
+  (SES v2), `(igropyr sns)` fans a message out to a topic's
+  subscribers (SNS Publish) and `(igropyr cloudwatch)` publishes a
+  custom metric data point (CloudWatch PutMetricData), all over the
+  same non-blocking signer
 - **Vector scoring for embedding search** — `(igropyr blas)`: one call
   scores a query against a row-major float32 matrix at memory bandwidth
   (Accelerate / OpenBLAS via FFI), with a pure-Scheme fallback so it
@@ -718,8 +721,31 @@ clients show it, not just the address):
 (ses-send-email ses "noreply@example.com" "Example" "u@x.com" subject html)  ; -> MessageId
 ```
 
+`(igropyr sns)` fans one message out to a topic's subscribers (SNS
+Publish — email / SMS / SQS / Lambda / HTTP; the topic and its
+subscriptions are provisioned out of band), returning the MessageId. The
+`subject` only reaches email delivery, so pass `#f` or `""` to omit it.
+`(igropyr cloudwatch)` publishes one custom metric data point (CloudWatch
+PutMetricData) — build it as a counter or gauge and alarm on it in
+CloudWatch; the unit defaults to `"Count"` and `dims` is an alist of
+`(name . value)`. PutMetricData answers a 2xx with an empty body, so it
+returns `#t` rather than an id:
+
+```scheme
+(import (igropyr sns) (igropyr cloudwatch))
+(define sns (make-sns '((region . "us-east-1") (access-key . "…") (secret . "…"))))
+(sns-publish sns "arn:aws:sns:us-east-1:123:alerts" "subject" "body")  ; -> MessageId
+(sns-publish sns "arn:aws:sns:us-east-1:123:alerts" #f "body")        ; no subject
+
+(define cw (make-cloudwatch '((region . "us-east-1") (access-key . "…") (secret . "…"))))
+(cloudwatch-put-metric cw "myapp" "requests" 1)                        ; -> #t, unit "Count"
+(cloudwatch-put-metric cw "myapp" "latency_ms" 42 "Milliseconds"
+                       '(("route" . "/checkout")))                     ; unit + a dimension
+```
+
 Each raises a structured `#(s3-error …)` / `#(sts-error …)` / `#(ses-error
-…)` on a non-2xx response, so a caller can catch and retry.
+…)` / `#(sns-error …)` / `#(cloudwatch-error …)` on a non-2xx response, so
+a caller can catch and retry.
 
 ## Password hashing
 
