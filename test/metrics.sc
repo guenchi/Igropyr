@@ -59,6 +59,15 @@
         (check "scrape-200" (= (response-status r) 200))
         (check "requests-family" (string-contains? body "igropyr_requests_total{status=\"200\"} 2"))
         (check "duration-count" (string-contains? body "igropyr_request_duration_ms_count 2"))
+        ;; histogram: type line + cumulative buckets. +Inf must equal _count
+        ;; (every request lands in exactly one bucket); le=5000 also covers
+        ;; both requests (localhost /ok is well under 5s) -> cumulative = 2.
+        (check "duration-histogram-type"
+          (string-contains? body "# TYPE igropyr_request_duration_ms histogram"))
+        (check "duration-bucket-inf"
+          (string-contains? body "igropyr_request_duration_ms_bucket{le=\"+Inf\"} 2"))
+        (check "duration-bucket-5s"
+          (string-contains? body "igropyr_request_duration_ms_bucket{le=\"5000\"} 2"))
         (check "custom-type-line" (string-contains? body "# TYPE iter_lookup_outcome_total counter"))
         (check "custom-labelled-hit" (string-contains? body "iter_lookup_outcome_total{outcome=\"hit\"} 2"))
         (check "custom-labelled-miss" (string-contains? body "iter_lookup_outcome_total{outcome=\"miss\"} 1"))

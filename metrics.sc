@@ -48,11 +48,24 @@
           (igropyr http) (igropyr express)
           (only (igropyr node) node-self node-peers rcall))
 
-  ;; state: #(status-count-ht duration-sum-box duration-count-box
-  ;;          custom-ht)  where custom-ht: name -> (label-string -> count)
+  ;; request-duration histogram buckets (ms upper bounds; +Inf implied).
+  ;; now-ms has ms resolution, so a sub-ms request lands in the <=1 bucket.
+  (define request-duration-buckets '(1 2 5 10 25 50 100 250 500 1000 2500 5000))
+  (define n-duration-buckets (length request-duration-buckets))
+  ;; index of the bucket a duration falls in (0..n; slot n = the +Inf overflow)
+  (define (duration-bucket-index dur)
+    (let loop ((bs request-duration-buckets) (i 0))
+      (cond ((null? bs) i)
+            ((<= dur (car bs)) i)
+            (else (loop (cdr bs) (+ i 1))))))
+
+  ;; state: #(status-count-ht duration-sum-box duration-count-box custom-ht
+  ;;          duration-bucket-vec)  where custom-ht: name -> (label-string -> count);
+  ;; duration-bucket-vec: length n+1, slot i = # requests in bucket i (non-cumulative)
   (define (metrics-init)
     (vector (make-eqv-hashtable) (box 0) (box 0)
-            (make-hashtable string-hash string=?)))
+            (make-hashtable string-hash string=?)
+            (make-vector (+ n-duration-buckets 1) 0)))
 
   (define (metrics-cast msg st)
     (case (vector-ref msg 0)
@@ -60,7 +73,9 @@
        (let ((status (vector-ref msg 1)) (dur (vector-ref msg 2)))
          (hashtable-update! (vector-ref st 0) status (lambda (n) (+ n 1)) 0)
          (set-box! (vector-ref st 1) (+ (unbox (vector-ref st 1)) dur))
-         (set-box! (vector-ref st 2) (+ (unbox (vector-ref st 2)) 1))))
+         (set-box! (vector-ref st 2) (+ (unbox (vector-ref st 2)) 1))
+         (let ((bv (vector-ref st 4)) (bi (duration-bucket-index dur)))
+           (vector-set! bv bi (+ 1 (vector-ref bv bi))))))
       ((count)
        (let* ((name (vector-ref msg 1))
               (labels (vector-ref msg 2))
@@ -80,8 +95,10 @@
             acc
             (loop (+ i 1) (cons (cons (vector-ref ks i) (vector-ref vs i)) acc))))))
 
-  ;; call 'dump -> #(status-alist duration-sum duration-count custom-alist)
-  ;; custom-alist: ((name . ((label-string . count) ...)) ...)
+  ;; call 'dump -> #(status-alist duration-sum duration-count custom-alist
+  ;;                 duration-bucket-vec)
+  ;; custom-alist: ((name . ((label-string . count) ...)) ...). The bucket
+  ;; vector is COPIED: the live one keeps mutating while render reads this.
   (define (metrics-call msg from st)
     (values
       (vector
@@ -89,7 +106,8 @@
         (unbox (vector-ref st 1))
         (unbox (vector-ref st 2))
         (map (lambda (kv) (cons (car kv) (hashtable->alist (cdr kv))))
-             (hashtable->alist (vector-ref st 3))))
+             (hashtable->alist (vector-ref st 3)))
+        (vector-copy (vector-ref st 4)))
       st))
 
   ;; a metrics collector is just the gen-server pid
@@ -212,11 +230,28 @@
                       (cdr family)))))
            custom)))
 
+  ;; cumulative le buckets for the request-duration histogram; the +Inf
+  ;; bucket equals _count (every request increments exactly one slot)
+  (define (render-duration-buckets bv)
+    (let loop ((bs request-duration-buckets) (i 0) (cum 0) (out '()))
+      (let ((cum* (+ cum (vector-ref bv i))))
+        (if (null? bs)
+            (apply string-append
+              (reverse (cons (line "igropyr_request_duration_ms_bucket{le=\"+Inf\"} "
+                                   (number->string cum*))
+                             out)))
+            (loop (cdr bs) (+ i 1) cum*
+                  (cons (line "igropyr_request_duration_ms_bucket{le=\""
+                              (number->string (car bs)) "\"} "
+                              (number->string cum*))
+                        out))))))
+
   (define (render dump stats)
     (let ((counts (vector-ref dump 0))
           (sum (vector-ref dump 1))
           (count (vector-ref dump 2))
-          (custom (vector-ref dump 3)))
+          (custom (vector-ref dump 3))
+          (buckets (vector-ref dump 4)))
       (define (stat key) (number->string (cdr (assq key stats))))
       (string-append
         (render-custom custom)
@@ -228,8 +263,9 @@
                        (number->string (car kv)) "\"} "
                        (number->string (cdr kv))))
                counts))
-        (line "# HELP igropyr_request_duration_ms Request duration summary")
-        (line "# TYPE igropyr_request_duration_ms summary")
+        (line "# HELP igropyr_request_duration_ms Request duration in ms")
+        (line "# TYPE igropyr_request_duration_ms histogram")
+        (render-duration-buckets buckets)
         (line "igropyr_request_duration_ms_sum " (number->string sum))
         (line "igropyr_request_duration_ms_count " (number->string count))
         (line "# TYPE igropyr_connections gauge")
