@@ -17,7 +17,7 @@
 ;;; send-text!, send-html!, send-json!, send-file!.
 
 (library (igropyr express)
-  (export create-app app-get app-post app-put app-delete
+  (export create-app app-get app-post app-put app-delete app-patch
           app-use app-static app-ws app-listen app->handler
           req-param req-json req-form req-cookie set-cookie!
           req-sexpr send-sexpr! app-rpc
@@ -727,6 +727,8 @@
     (add-route! a 'PUT pattern handler))
   (define-checked (app-delete (a app?) (pattern string?) (handler procedure?))
     (add-route! a 'DELETE pattern handler))
+  (define-checked (app-patch (a app?) (pattern string?) (handler procedure?))
+    (add-route! a 'PATCH pattern handler))
 
   ;; RPC endpoint sugar: requests are (tag arg ...); the tag picks a
   ;; handler from the alist, which receives the argument list and
