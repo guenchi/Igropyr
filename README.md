@@ -988,6 +988,18 @@ shared store instead of peer-to-peer: each node heartbeats into a
 per-cluster sorted set scored by an expiry timestamp, and a crashed node
 falls out on its own. Reach for it when you already run Redis.
 
+`(max-members . N)` (default 256) caps the gossip view size and the
+members dialed per redis cycle — also the anti-flood bound, so a flooded
+discovery source can't make a node open an unbounded number of
+connectors (`static` isn't capped; you list peers explicitly). The mesh
+is **full** — every node links every other — so connections grow O(N²)
+and each node holds ~N−1 links; the 256 default keeps that sane. Raise
+it (`(cluster-start `((discover . (gossip ...)) (max-members . 512)))`)
+if you genuinely need a few hundred nodes, but beyond that shard the
+actor keyspace across several ≤256 clusters rather than growing one flat
+mesh — `rcall` is direct with no multi-hop routing, so a single
+fully-addressable mesh caps out at a few hundred nodes by nature.
+
 > **Security:** the dist port is full control of the node — anyone on it
 > can message any registered process, including supervisors. The
 > handshake is a mutual HMAC-SHA1 challenge/response on the shared
