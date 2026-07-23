@@ -2632,6 +2632,34 @@ registration (Redis) or a member record (gossip) lives without a heartbeat
 (keep it a few intervals). `(cluster-stop handle)` stops discovering;
 existing links stay up.
 
+#### Cluster size — `(max-members . N)`
+
+`(max-members . N)` (default 256, validated as a positive fixnum) caps the
+gossip view size for the gossip strategy, and the number of members dialed
+per discovery cycle for the redis strategy. It doubles as the anti-flood
+bound: a poisoned or runaway discovery source — a Redis key any node can
+write, a gossip peer echoing a flood of records — cannot make a node open
+an unbounded number of connectors. The `static` strategy is not capped;
+there you list the peers explicitly.
+
+```scheme
+(cluster-start `((name . "myapp")
+                 (discover . (gossip (advertise "10.0.0.1" 4100)
+                                     (seeds (b "10.0.0.2" 4100))))
+                 (max-members . 512)))
+```
+
+Why the cap exists, and why 256: the cluster mesh is **full** — every node
+links every other node — so each node holds roughly N−1 persistent
+connections and the total number of links grows O(N²). The 256 default
+keeps per-node link counts sane while covering the vast majority of real
+deployments. Raise it if you genuinely need a few hundred nodes, but beyond
+that don't grow one flat mesh: shard the actor keyspace across several
+≤256 clusters instead. igropyr's `rcall` is direct — it addresses a
+process on a named node with no multi-hop routing — so a single
+fully-addressable mesh caps out at a few hundred nodes by nature, and
+sharding is the way past that ceiling.
+
 For a singleton or leader across the cluster, this is still the wrong
 layer — see the note under the task pool below.
 
