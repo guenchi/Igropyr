@@ -55,7 +55,14 @@
                          ("Version" . "2010-08-01")
                          ("Namespace" . ,namespace)
                          ("MetricData.member.1.MetricName" . ,name)
-                         ("MetricData.member.1.Value" . ,(number->string value))
+                         ;; AWS wants a decimal double; an exact non-integer
+                         ;; (e.g. from (/ a b)) would render as "1/3" and be
+                         ;; rejected -- coerce those to inexact. Integers and
+                         ;; flonums pass through unchanged.
+                         ("MetricData.member.1.Value"
+                          . ,(number->string
+                               (if (and (exact? value) (not (integer? value)))
+                                   (exact->inexact value) value)))
                          ("MetricData.member.1.Unit" . ,unit))
                        (dim-params dims)))))
            (r (aws-signed-post (cloudwatch-endpoint s) "monitoring"

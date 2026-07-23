@@ -87,12 +87,14 @@
          (unless (str-has? body "Version=2010-08-01") (sfail! 'cw-version))
          (unless (and auth (str-has? auth "/monitoring/aws4_request")) (sfail! 'cw-auth-scope))
          (cond
-           ((str-has? body "Namespace=myapp2")     ; the defaults call (no unit/dims)
+           ((str-has? body "Namespace=cwmin")       ; the defaults call (no unit/dims)
             (unless (str-has? body "MetricData.member.1.MetricName=hits2") (sfail! 'cw2-name))
             (unless (str-has? body "MetricData.member.1.Value=1") (sfail! 'cw2-value))
             (unless (str-has? body "MetricData.member.1.Unit=Count") (sfail! 'cw2-default-unit))
             (when   (str-has? body "Dimensions.member") (sfail! 'cw2-unexpected-dims)))
-           ((str-has? body "Namespace=myapp")       ; the full call (unit + one dim)
+           ((str-has? body "Namespace=cwratio")     ; an exact rational value -> decimal
+            (unless (str-has? body "MetricData.member.1.Value=0.25") (sfail! 'cw-rational)))
+           ((str-has? body "Namespace=cwfull")      ; the full call (unit + one dim)
             (unless (str-has? body "MetricData.member.1.MetricName=hits") (sfail! 'cw-name))
             (unless (str-has? body "MetricData.member.1.Value=5") (sfail! 'cw-value))
             (unless (str-has? body "MetricData.member.1.Unit=Milliseconds") (sfail! 'cw-unit))
@@ -186,10 +188,13 @@
       (let ((cw (make-cloudwatch `((region . "us-east-1") (access-key . "AKIA")
                                    (secret . "SEKRIT") (endpoint . ,ep)))))
         (check "cw-put-full"
-          (eq? #t (cloudwatch-put-metric cw "myapp" "hits" 5 "Milliseconds"
+          (eq? #t (cloudwatch-put-metric cw "cwfull" "hits" 5 "Milliseconds"
                                          '(("kind" . "alert")))))
         (check "cw-put-defaults"
-          (eq? #t (cloudwatch-put-metric cw "myapp2" "hits2" 1)))))
+          (eq? #t (cloudwatch-put-metric cw "cwmin" "hits2" 1)))
+        ;; an exact rational value renders as a decimal ("0.25"), not "1/4"
+        (check "cw-put-rational"
+          (eq? #t (cloudwatch-put-metric cw "cwratio" "ratio" (/ 1 4))))))
 
     (check "server-side" (null? (unbox server-fails)))
     (unless (null? (unbox server-fails))
