@@ -31,6 +31,7 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/ssr.sc
 "$scheme_bin" --script igropyr/test/s3.sc
 "$scheme_bin" --script igropyr/test/aws.sc
+"$scheme_bin" --script igropyr/test/s3-control.sc
 "$scheme_bin" --script igropyr/test/metrics.sc
 "$scheme_bin" --script igropyr/test/dashboard.sc
 "$scheme_bin" --script igropyr/test/auth.sc

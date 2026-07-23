@@ -54,6 +54,7 @@
     ("igropyr/aws.sc" . 2)
     ("igropyr/sts.sc" . 2)
     ("igropyr/ses.sc" . 2)
+    ("igropyr/s3-control.sc" . 2)
     ("igropyr/tls.sc" . 2)
     ("igropyr/apple-jws.sc" . 2)
     ("igropyr/kdf.sc" . 2)
