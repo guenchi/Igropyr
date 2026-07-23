@@ -55,6 +55,17 @@
     (node-start! 'a secret a-port "127.0.0.1")
     (register 'main self)
 
+    ;; ---- max-members option: bad value rejected, custom value accepted ----
+    (unless (guard (e (#t #t))
+              (cluster-start `((name . "mm-bad") (max-members . -1)
+                               (discover . (static)))) #f)
+      (fail! "max-members-reject-bad"))
+    (let ((h (cluster-start `((name . "mm-ok") (max-members . 512)
+                              (discover . (static))))))
+      (unless (process-alive? h) (fail! "max-members-accept"))
+      (cluster-stop h)
+      (display "max-members option ok\n"))
+
     ;; ---- static strategy: mesh forms with no node-connect! ----
     (cluster-start `((interval-ms . 1000)
                      (discover . (static (b "127.0.0.1" 18094)))))

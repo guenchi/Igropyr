@@ -55,7 +55,12 @@
 ;;; service; (interval-ms . 5000) how often to discover + heartbeat;
 ;;; (ttl-ms . 15000) how long a registration (Redis) or a member record
 ;;; (gossip) lives without a heartbeat (keep it a few intervals, so a
-;;; node doesn't expire between beats).
+;;; node doesn't expire between beats); (max-members . 256) caps the
+;;; gossip view / the members dialed per Redis cycle -- also the anti-flood
+;;; bound. The mesh is FULL (every node links every other), so connections
+;;; grow O(N^2); the 256 default keeps that ~sane. Raise it for a few
+;;; hundred nodes if you must, but beyond that shard the keyspace across
+;;; several <=256 clusters rather than growing one flat mesh.
 
 (library (igropyr cluster)
   (export cluster-start cluster-stop)
@@ -70,7 +75,8 @@
   ;; of members each spawning a connector.
   (define max-node-name 64)
   (define max-host-len 253)          ; DNS name ceiling
-  (define max-members 256)           ; dialed per discovery cycle
+  (define default-max-members 256)   ; per-cycle dial / gossip-view cap default;
+                                     ; override via cluster-start's (max-members . N)
 
   (define (valid-port? p)
     (and (integer? p) (exact? p) (<= 1 p 65535)))
@@ -118,7 +124,7 @@
              (and port (valid-port? port)
                   (list (string->symbol (car parts)) (cadr parts) port))))))
 
-  (define (redis-discover conn cluster-key self-name self-host self-port ttl-ms)
+  (define (redis-discover conn cluster-key self-name self-host self-port ttl-ms max-members)
     ;; self-member is a stable string so a re-heartbeat updates the score
     ;; rather than adding a duplicate
     (let ((self-member (string-append (symbol->string self-name) " "
@@ -162,7 +168,7 @@
   ;; out on every node's own clock. Records arrive over authenticated
   ;; links but are validated like any discovery input (bad name/host/
   ;; port dropped, view capped at max-members).
-  (define (start-gossip-server! svc self-host self-port ttl-ms)
+  (define (start-gossip-server! svc self-host self-port ttl-ms max-members)
     (let ((table (make-eq-hashtable))
           (inc (now-ms))       ; boot stamp: a restart outranks the old life
           (hb 0))
@@ -247,7 +253,7 @@
                 (for-each (lambda (r) (merge-one! r now)) (cdr msg))))
             st)))))
 
-  (define (resolve-discover spec cname cluster-key ttl-ms)
+  (define (resolve-discover spec cname cluster-key ttl-ms max-members)
     (cond
       ((procedure? spec) spec)
       ((and (pair? spec) (eq? (car spec) 'static))
@@ -280,7 +286,7 @@
            (assertion-violation 'cluster-start
              "gossip fanout wants a positive fixnum" fanout))
          (let ((svc (string->symbol (string-append "igropyr-gossip:" cname))))
-           (start-gossip-server! svc (car adv) (cadr adv) ttl-ms)
+           (start-gossip-server! svc (car adv) (cadr adv) ttl-ms max-members)
            (lambda ()
              ;; push-pull, but the fanout exchanges run CONCURRENTLY: one
              ;; spawned process per peer does the (bounded) rcall and casts its
@@ -306,7 +312,7 @@
                                  seeds))))))))
       ((and (pair? spec) (eq? (car spec) 'redis))
        (let ((conn (cadr spec)) (host (caddr spec)) (port (cadddr spec)))
-         (redis-discover conn cluster-key (node-self) host port ttl-ms)))
+         (redis-discover conn cluster-key (node-self) host port ttl-ms max-members)))
       (else (assertion-violation 'cluster-start "bad discover strategy" spec))))
 
   ;; ---- the maintainer process -------------------------------------------
@@ -360,11 +366,14 @@
     (let* ((cname (opt opts 'name "default"))
            (interval (opt opts 'interval-ms 5000))
            (ttl (opt opts 'ttl-ms 15000))
+           (mm (opt opts 'max-members default-max-members))
            (spec (opt opts 'discover #f))
            (cluster-key (string-append "igropyr:cluster:" cname)))
       (unless spec
         (assertion-violation 'cluster-start "no discover strategy" opts))
-      (let ((discover (resolve-discover spec cname cluster-key ttl)))
+      (unless (and (fixnum? mm) (fx> mm 0))
+        (assertion-violation 'cluster-start "max-members must be a positive fixnum" mm))
+      (let ((discover (resolve-discover spec cname cluster-key ttl mm)))
         (spawn (lambda () (cluster-loop discover interval))))))
 
   ;; Stop maintaining membership. Existing links stay up (and keep
