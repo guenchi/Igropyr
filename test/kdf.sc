@@ -78,6 +78,16 @@
 (let* ((t0 (real-time)) (r (password-verify "x" "pbkdf2-sha256$10000000$x$y")) (ms (- (real-time) t0)))
   (check "pbkdf2-cost-bomb-rejected" (not r))
   (check "pbkdf2-cost-bomb-fast"     (< ms 500)))
+;; scrypt: balanced big-N,p passes the MEMORY cap but time ~ N*p -> must be
+;; rejected fast by the N*r*p work bound (else it'd freeze verify for hours)
+(let* ((t0 (real-time)) (r (password-verify "x" "scrypt$1048576$1$1048576$x$y")) (ms (- (real-time) t0)))
+  (check "scrypt-cost-bomb-rejected" (not r))
+  (check "scrypt-cost-bomb-fast"     (< ms 500)))
+;; over-long password: hash raises, verify returns #f (bounded input, no DoS)
+(check "hash-long-pw-raises"
+  (guard (e (#t #t)) (password-hash (make-string 5000 #\a) 'pbkdf2 '((iterations . 1000))) #f))
+(check "verify-long-pw-false"
+  (not (password-verify (make-string 5000 #\a) "pbkdf2-sha256$1000$eA==$eA==")))
 ;; malformed cost params (flonum / negative) and a non-string password -> #f, no raise
 (check "verify-flonum-N"     (not (password-verify "x" "scrypt$1e9$8$1$x$y")))
 (check "verify-negative-m"   (not (password-verify "x" "argon2id$2$-100$1$x$y")))

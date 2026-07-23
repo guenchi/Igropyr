@@ -57,6 +57,7 @@
   (define _EVP_KDF_free     (foreign-procedure "EVP_KDF_free" (void*) void))
   (define _EVP_KDF_derive
     (foreign-procedure "EVP_KDF_derive" (void* u8* size_t void*) int))
+  (define _RAND_bytes (foreign-procedure "RAND_bytes" (u8* int) int))
 
   ;; memory ceiling for scrypt: caps a chosen (or crafted) N so a huge one
   ;; is rejected by libcrypto (return 0) rather than attempting the alloc.
@@ -72,6 +73,14 @@
   ;; boundary, password-verify.)
   (define kdf-max-passes-kib 262144)     ; argon2 t*m ceiling (= 256 MiB-passes)
   (define pbkdf2-max-iters   2000000)    ; ~one fill of time; >3x OWASP's 600k
+  ;; scrypt TIME ceiling. scrypt-maxmem bounds MEMORY (~128*r*(N+p)) but NOT
+  ;; time, which is ~N*r*p -- so a crafted balanced-N,p hash (memory fits, time
+  ;; = N*p) would freeze the scheduler for hours. Bound the work N*r*p to one
+  ;; 256 MiB pass (256MiB/128), the same budget scrypt-maxmem uses for memory.
+  (define scrypt-max-work    2097152)    ; N*r*p ceiling (= 256 MiB / 128)
+  ;; cap the untrusted password length: the KDF hashes it once (O(len)), so a
+  ;; multi-MB password is a cheap DoS. 1024 UTF-8 bytes fits any real passphrase.
+  (define max-password-bytes 1024)
 
   ;; ---- raw derivations -------------------------------------------------
   (define (kdf-pbkdf2-sha256 password salt iterations dk-len)
@@ -116,6 +125,7 @@
   (define k-iter (cstr "iter"))
   (define k-memcost (cstr "memcost"))
   (define k-lanes (cstr "lanes"))
+  (define k-threads (cstr "threads"))
 
   (define (c-bytes bv)       ; copy bv into fresh C memory -> address
     (let* ((n (bytevector-length bv)) (p (foreign-alloc (max 1 n))))
@@ -150,43 +160,50 @@
       (let ((ctx (_EVP_KDF_CTX_new kdf)))
         (_EVP_KDF_free kdf)
         (when (zero? ctx) (error 'kdf-argon2id "EVP_KDF_CTX_new failed"))
-        (let ((pass-p 0) (salt-p 0) (iter-c 0) (mem-c 0) (lanes-c 0) (params 0))
+        (let ((pass-p 0) (salt-p 0) (iter-c 0) (mem-c 0) (lanes-c 0) (threads-c 0) (params 0))
           (dynamic-wind
             (lambda () (void))
             (lambda ()
               (set! pass-p (c-bytes password)) (set! salt-p (c-bytes salt))
               (set! iter-c (c-uint t)) (set! mem-c (c-uint m)) (set! lanes-c (c-uint p))
-              (set! params (foreign-alloc (* 6 param-size)))
-              (do ((i 0 (+ i 1))) ((= i (* 6 param-size))) (foreign-set! 'unsigned-8 params i 0))
+              ;; threads=1: compute single-threaded regardless of lanes -- never
+              ;; spawn OS threads (igropyr is one OS thread). The output depends
+              ;; on lanes(=p), not on how many threads compute it, so this does
+              ;; not change the hash.
+              (set! threads-c (c-uint 1))
+              (set! params (foreign-alloc (* 7 param-size)))
+              (do ((i 0 (+ i 1))) ((= i (* 7 param-size))) (foreign-set! 'unsigned-8 params i 0))
               (set-param! params 0 k-pass    type-octet pass-p (bytevector-length password))
               (set-param! params 1 k-salt    type-octet salt-p (bytevector-length salt))
               (set-param! params 2 k-iter    type-uint  iter-c 4)
               (set-param! params 3 k-memcost type-uint  mem-c  4)
               (set-param! params 4 k-lanes   type-uint  lanes-c 4)
-              ;; entry 5 stays zeroed == OSSL_PARAM_END
+              (set-param! params 5 k-threads type-uint  threads-c 4)
+              ;; entry 6 stays zeroed == OSSL_PARAM_END
               (if (fx= 1 (_EVP_KDF_derive ctx out dk-len params))
                   out
                   (error 'kdf-argon2id "EVP_KDF_derive failed (bad params or over memory)")))
             (lambda ()
-              (unless (zero? pass-p)  (foreign-free pass-p))
-              (unless (zero? salt-p)  (foreign-free salt-p))
-              (unless (zero? iter-c)  (foreign-free iter-c))
-              (unless (zero? mem-c)   (foreign-free mem-c))
-              (unless (zero? lanes-c) (foreign-free lanes-c))
-              (unless (zero? params)  (foreign-free params))
+              (unless (zero? pass-p)   (foreign-free pass-p))
+              (unless (zero? salt-p)   (foreign-free salt-p))
+              (unless (zero? iter-c)   (foreign-free iter-c))
+              (unless (zero? mem-c)    (foreign-free mem-c))
+              (unless (zero? lanes-c)  (foreign-free lanes-c))
+              (unless (zero? threads-c)(foreign-free threads-c))
+              (unless (zero? params)   (foreign-free params))
               (_EVP_KDF_CTX_free ctx)))))))
 
   ;; ---- self-describing password hashing --------------------------------
   (define salt-len 16)
   (define dk-len 32)
 
+  ;; libcrypto's CSPRNG (already loaded, OS-seeded, fork-safe) -- no per-hash
+  ;; /dev/urandom open/read/close.
   (define (random-bytes n)
-    (call-with-port (open-file-input-port "/dev/urandom")
-      (lambda (p)
-        (let ((bv (get-bytevector-n p n)))
-          (if (and (bytevector? bv) (= (bytevector-length bv) n))
-              bv
-              (error 'random-bytes "short read from /dev/urandom"))))))
+    (let ((bv (make-bytevector n)))
+      (if (fx= 1 (_RAND_bytes bv n))
+          bv
+          (error 'random-bytes "RAND_bytes failed"))))
 
   ;; constant-time equality (fixed-width DKs); no early exit
   (define (ct=? a b)
@@ -216,6 +233,9 @@
   (define (password-hash password algo params)
     (let ((salt (random-bytes salt-len))
           (pw (string->utf8 password)))
+      (when (fx> (bytevector-length pw) max-password-bytes)
+        (assertion-violation 'password-hash "password too long (bytes)"
+                             (bytevector-length pw)))
       (case algo
         ((scrypt)
          (let ((N (opt params 'N 32768)) (r (opt params 'r 8)) (p (opt params 'p 1)))
@@ -250,17 +270,23 @@
          (let ((parts (split-dollar stored)))
            (and (pair? parts)
                 (let ((pw (string->utf8 password)))
-                  (cond
+                  (and (fx<= (bytevector-length pw) max-password-bytes)
+                   (cond
                     ((and (string=? (car parts) "scrypt") (= (length parts) 6))
                      (let ((N (string->number (list-ref parts 1)))
                            (r (string->number (list-ref parts 2)))
                            (p (string->number (list-ref parts 3)))
                            (salt (b64 (list-ref parts 4)))
                            (dk (b64 (list-ref parts 5))))
+                       ;; work ~ N*r*p bounds TIME; scrypt-maxmem only bounds
+                       ;; MEMORY (~N+p), so without this a balanced-N,p hash
+                       ;; (memory fits, time = N*p) would freeze verify for
+                       ;; hours. Generic * so a huge product -> bignum -> #f.
                        (and (pos-fx? N) (fx> N 1) (pos-fx? r) (pos-fx? p)
+                            (<= (* N r p) scrypt-max-work)
                             salt (fx> (bytevector-length salt) 0)
                             dk (fx= (bytevector-length dk) dk-len)
-                            (guard (e (#t #f))       ; scrypt-maxmem rejects huge N/r/p fast
+                            (guard (e (#t #f))
                               (ct=? dk (kdf-scrypt pw salt N r p dk-len))))))
                     ((and (string=? (car parts) "pbkdf2-sha256") (= (length parts) 4))
                      (let ((iters (string->number (list-ref parts 1)))
@@ -288,5 +314,5 @@
                             dk (fx= (bytevector-length dk) dk-len)
                             (guard (e (#t #f))
                               (ct=? dk (kdf-argon2id pw salt t m p dk-len))))))
-                    (else #f)))))))
+                    (else #f))))))))
 )
