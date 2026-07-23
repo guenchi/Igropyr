@@ -11,7 +11,7 @@
 ;;; frame and corrupt the process.
 
 (library (igropyr libuv)
-  (export uv-init! uv-poll! now-ms uv-set-deliver!
+  (export uv-init! uv-poll! now-ms now-ns uv-set-deliver!
           tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
           file-read-async!
           file-stream-open! file-stream-read! file-stream-close!
@@ -107,6 +107,11 @@
   ;; generic-arithmetic div on this hot path (called per receive
   ;; timeout and per event-loop pass).
   (define (now-ms) (fxdiv (uv-hrtime) 1000000))
+
+  ;; Monotonic nanoseconds (same clock as now-ms, undivided) -- for timing
+  ;; sub-millisecond spans where now-ms rounds to 0. A raw value is a fixnum
+  ;; (see now-ms), so a difference of two is exact and allocation-free.
+  (define (now-ns) (uv-hrtime))
 
   (define (check who r)
     (if (< r 0)
