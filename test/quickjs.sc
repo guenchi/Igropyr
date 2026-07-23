@@ -59,6 +59,11 @@ function eat(_){ var a=[]; while(true){ a.push(new Float64Array(100000)); } } //
   (check "slugify-ok" ok)
   (check "slugify-val" (equal? s "hello-world")))
 
+;; qjs-call/bytes returns the same result as raw UTF-8 bytes (no decode)
+(let-values (((ok b) (qjs-call/bytes "slugify" "Hello World")))
+  (check "slugify-bytes-ok" ok)
+  (check "slugify-bytes-val" (and (bytevector? b) (equal? (utf8->string b) "hello-world"))))
+
 (check "greet-json"
   (equal? (qjs-call! "greet" "{\"name\":\"Ann\"}") "<h1>Hi Ann</h1>"))
 

@@ -55,11 +55,11 @@
 ;;; one engine; a second bundle would replace the first).
 
 (library (igropyr ssr)
-  (export make-ssr ssr-render ssr-try-render
+  (export make-ssr ssr-render ssr-render/bytes ssr-try-render ssr-try-render/bytes
           ssr-invalidate! ssr-clear! ssr-stats)
   (import (chezscheme)
           (igropyr actor) (igropyr libuv) (igropyr gen-server)
-          (only (igropyr quickjs) qjs-boot! qjs-call qjs-call!)
+          (only (igropyr quickjs) qjs-boot! qjs-call/bytes)
           (only (igropyr json) json->string)
           (only (igropyr crypto) sha256 bytevector->hex)
           (only (igropyr redis) redis))
@@ -173,9 +173,14 @@
       (vector
         (lambda (k)
           (let ((v (redis conn "GET" (k* k))))
-            ;; a non-string reply (nil, or a non-UTF-8 binary value) = miss
-            (if (string? v) (begin (bump-box! hits) v) (begin (bump-box! misses) #f))))
-        (lambda (k h ttl)                                          ; sync put
+            ;; the cache currency is a bytevector, but the value is UTF-8
+            ;; HTML so the client decodes it to a string -- re-encode to
+            ;; bytes (the one conversion redis can't avoid; the socket send
+            ;; would encode anyway). A bytevector reply passes through; nil = miss
+            (cond ((string? v) (bump-box! hits) (string->utf8 v))
+                  ((bytevector? v) (bump-box! hits) v)
+                  (else (bump-box! misses) #f))))
+        (lambda (k h ttl)                                          ; sync put (h: bytevector)
           (when (> ttl 0) (redis conn "SET" (k* k) h "PX" ttl)))   ; PX 0 -> redis -ERR
         (lambda (k) (redis conn "DEL" (k* k)))
         (lambda () (redis-clear! conn prefix))
@@ -228,7 +233,10 @@
   (define (call+cache renders backend key fn json ttl)
     (set-box! renders (+ 1 (unbox renders)))
     (let ((res (guard (e (#t (cons #f (flight-error-text e))))
-                 (let-values (((ok s) (qjs-call fn json))) (cons ok s)))))
+                 ;; bytes are the cache currency: skips a utf8->string of the
+                 ;; render output on every miss, and lets a byte consumer send
+                 ;; the memory-cache hit straight through with no re-encode
+                 (let-values (((ok s) (qjs-call/bytes fn json))) (cons ok s)))))
       (when (car res) (b-put backend key (cdr res) ttl))
       res))
 
@@ -290,7 +298,10 @@
   ;; OR a string, passed RAW as the JSON argument (you guarantee it is valid
   ;; JSON; a non-JSON string makes the render's JSON.parse throw). Raises a JS
   ;; error like qjs-call! (on a miss only; failures are never cached).
-  (define (ssr-render r fn props . opt)
+  ;; The cache currency is a UTF-8 bytevector: ssr-render/bytes returns it
+  ;; raw (hand straight to a socket, no re-encode); ssr-render decodes to a
+  ;; Scheme string for back-compat.
+  (define (ssr-render/bytes r fn props . opt)
     (let* ((opts (if (pair? opt) (car opt) '()))
            (json (props->json props))
            (key  (cache-key opts fn json))
@@ -298,10 +309,13 @@
       (or hit
           (let ((res (render-miss r fn json key)))
             (if (car res) (cdr res) (error 'ssr-render (cdr res) fn))))))
+  (define (ssr-render r fn props . opt)
+    (utf8->string (apply ssr-render/bytes r fn props opt)))
 
   ;; Non-raising: -> (values ok? html-or-error-text). A failing render is
-  ;; returned, never cached.
-  (define (ssr-try-render r fn props . opt)
+  ;; returned, never cached. /bytes yields the HTML as UTF-8 bytes on ok;
+  ;; the error text is always a string.
+  (define (ssr-try-render/bytes r fn props . opt)
     (let* ((opts (if (pair? opt) (car opt) '()))
            (json (props->json props))
            (key  (cache-key opts fn json))
@@ -310,6 +324,9 @@
           (values #t hit)
           (let ((res (render-miss r fn json key)))
             (values (car res) (cdr res))))))
+  (define (ssr-try-render r fn props . opt)
+    (let-values (((ok v) (apply ssr-try-render/bytes r fn props opt)))
+      (if ok (values #t (utf8->string v)) (values #f v))))
 
   (define (ssr-invalidate! r key) (b-drop (ssr-backend r) key))
   (define (ssr-clear! r)          (b-clear (ssr-backend r)))

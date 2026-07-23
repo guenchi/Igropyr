@@ -45,7 +45,7 @@
 (library (igropyr quickjs)
   ;; Exports match the C-shim binding at guenchi/igropyr-quickjs exactly, so
   ;; the two are interchangeable.
-  (export qjs-boot! qjs-call qjs-call! qjs-healthy? qjs-generation qjs-shutdown!)
+  (export qjs-boot! qjs-call qjs-call/bytes qjs-call! qjs-healthy? qjs-generation qjs-shutdown!)
   (import (chezscheme) (igropyr platform))
 
   ;; ---- JSValue: a 16-byte struct { JSValueUnion u; int64_t tag; } --------
@@ -154,16 +154,21 @@
           (foreign-set! 'int rca 0 (- rc 1))
           (when (<= (- rc 1) 0) (__free-value ctx v))))))
 
-  ;; read a JS string value into a Scheme string (via one JS_ToCStringLen2 /
-  ;; JS_FreeCString pair) or #f if it is not string-coercible.
-  (define (read-jsstring v)
+  ;; read a JS string value's UTF-8 bytes into a fresh bytevector (via one
+  ;; JS_ToCStringLen2 / JS_FreeCString pair) or #f if not string-coercible.
+  ;; The memcpy runs while the C string is still ref-held, so the bytes are
+  ;; safe once copied; the caller that wants a Scheme string decodes them.
+  (define (read-jsbytes v)
     (let ((cstr (_tocstr ctx lenp v 0)))
       (if (eqv? cstr 0)
           #f
           (let* ((n (foreign-ref 'size_t lenp 0)) (bv (make-bytevector n)))
             (unless (= n 0) (_memcpy bv cstr n))
             (_free-cstr ctx cstr)
-            (utf8->string bv)))))
+            bv))))
+  (define (read-jsstring v)
+    (let ((bv (read-jsbytes v)))
+      (and bv (utf8->string bv))))
 
   (define (read-exception)
     (_get-exception ex-buf ctx)
@@ -280,8 +285,11 @@
       (set! bundle-bytes (utf8z source))
       (with-interrupts-disabled (boot-locked!))))
 
-  ;; -> (values ok? string): result on #t, JS error text on #f.
-  (define (qjs-call fname arg)
+  ;; core call, parameterized by how the JS result is read out (read-result
+  ;; is read-jsstring or read-jsbytes) -> (values ok? result): result on #t
+  ;; (string or bytevector per read-result), JS error TEXT (always a string)
+  ;; on #f.
+  (define (qjs-call* read-result fname arg)
     (unless bound (error 'qjs-call "qjs-boot! first"))
     (let ((abytes (string->utf8 arg)))
       (with-interrupts-disabled
@@ -320,13 +328,19 @@
                         (guard (e (#t #f)) (boot-locked!))  ; crash-only, best-effort
                         (values #f msg)))
                      (else
-                      (let ((s (read-jsstring r-buf)))
+                      (let ((s (read-result r-buf)))
                         (js-free! r-buf)
                         (if s
                             (values #t s)
                             ;; not string-coercible: JS_ToCStringLen2 left a
                             ;; pending exception -> drain it and report
                             (values #f (read-exception))))))))))))))
+
+  ;; -> (values ok? string):     result HTML/text as a Scheme string on #t.
+  (define (qjs-call fname arg) (qjs-call* read-jsstring fname arg))
+  ;; -> (values ok? bytevector): result as raw UTF-8 bytes on #t (skips the
+  ;; decode; hand straight to a socket / hash / byte cache), error text on #f.
+  (define (qjs-call/bytes fname arg) (qjs-call* read-jsbytes fname arg))
 
   (define (qjs-call! fname arg)
     (let-values (((ok s) (qjs-call fname arg)))
