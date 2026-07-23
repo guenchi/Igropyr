@@ -118,12 +118,13 @@
   (define g-buf #f) (define f-buf #f) (define a-buf #f)
   (define this-buf #f) (define r-buf #f) (define ex-buf #f)
   (define argv-buf #f) (define lenp #f)
+  (define g-cache #f)     ; the global object's BITS (borrowed), set per boot
   (define scratch-ready #f)
   (define (ensure-scratch!)
     (unless scratch-ready
       (set! g-buf (alloc-jsval)) (set! f-buf (alloc-jsval)) (set! a-buf (alloc-jsval))
       (set! this-buf (alloc-jsval)) (set! r-buf (alloc-jsval)) (set! ex-buf (alloc-jsval))
-      (set! argv-buf (alloc-jsval)) (set! lenp (foreign-alloc 8))
+      (set! argv-buf (alloc-jsval)) (set! g-cache (alloc-jsval)) (set! lenp (foreign-alloc 8))
       (set! scratch-ready #t)))
 
   (define (mkundef! v) (ftype-set! JSValue (u) v 0) (ftype-set! JSValue (tag) v tag-undefined))
@@ -243,6 +244,12 @@
     (if (= (ftype-ref JSValue (tag) r-buf) tag-exception)
         (let ((msg (read-exception))) (teardown!) (error 'qjs-boot! msg))
         (begin (js-free! r-buf)         ; eval result (undefined) -> no-op
+               ;; cache the global object's BITS (borrowed): take a ref, keep
+               ;; the bits, drop the ref. globalThis is owned by the context and
+               ;; is neither moved nor reassigned, so every call reuses these
+               ;; bits without a per-call JS_GetGlobalObject + free. Re-set here
+               ;; on every (re)boot, so it always points at the live context.
+               (_global g-cache ctx) (js-free! g-cache)
                (set! healthy #t)
                (set! generation (+ generation 1))
                #t)))
@@ -301,17 +308,16 @@
             (begin
               (_update-stack rt)
               (arm-deadline! 1)
-              (_global g-buf ctx)
-              (_get-prop f-buf ctx g-buf fname)
+              (_get-prop f-buf ctx g-cache fname)   ; g-cache = borrowed global
               (cond
                 ((= (ftype-ref JSValue (tag) f-buf) tag-exception)
                  ;; the property access itself threw (e.g. a throwing getter):
                  ;; drain the pending exception (keeps the next call clean) and
                  ;; report it, rather than the misleading "no such function"
-                 (js-free! g-buf) (set! deadline 0)
+                 (set! deadline 0)
                  (values #f (read-exception)))
                 ((fx= 0 (_is-function ctx f-buf))
-                 (js-free! f-buf) (js-free! g-buf) (set! deadline 0)
+                 (js-free! f-buf) (set! deadline 0)
                  (values #f "no such function"))
                 (else
                  (_new-string a-buf ctx abytes (bytevector-length abytes))
@@ -321,7 +327,7 @@
                  (_call r-buf ctx f-buf this-buf 1 (ftype-pointer-address argv-buf))
                  (set! deadline 0)
                  (let ((exc? (= (ftype-ref JSValue (tag) r-buf) tag-exception)))
-                   (js-free! a-buf) (js-free! f-buf) (js-free! g-buf)
+                   (js-free! a-buf) (js-free! f-buf)   ; g-cache is borrowed: no free
                    (cond
                      (exc?
                       (let ((msg (read-exception)))
