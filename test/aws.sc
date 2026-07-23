@@ -1,15 +1,15 @@
 #!chezscheme
-;;; (igropyr sts) / (igropyr ses) against a hermetic in-process fake AWS: it
-;;; pins the wire the two calls put on the socket (STS query-protocol form
-;;; body + SigV4 service scope; SES v2 JSON shape + RFC 2047 From) and that
-;;; each parses its canned response. Signature CORRECTNESS is pinned by the
-;;; AWS vectors in igropyr/test/sigv4.sc; this pins the request/response
-;;; construction. A live AWS round-trip needs real credentials.
+;;; (igropyr sts / ses / sns / cloudwatch) against a hermetic in-process fake
+;;; AWS: it pins the wire each call puts on the socket (STS/SNS/CloudWatch
+;;; query-protocol form bodies + SigV4 service scope; SES v2 JSON shape + RFC
+;;; 2047 From) and that each parses its canned response. Signature CORRECTNESS
+;;; is pinned by the AWS vectors in igropyr/test/sigv4.sc; this pins the
+;;; request/response construction. A live AWS round-trip needs real credentials.
 
 (import (chezscheme) (igropyr http) (igropyr express)
         (only (igropyr json) string->json json-ref)
         (only (igropyr aws) endpoint->host)
-        (igropyr sts) (igropyr ses))
+        (igropyr sts) (igropyr ses) (igropyr sns) (igropyr cloudwatch))
 
 (define port 18096)
 
@@ -52,24 +52,55 @@
 
 (define app (create-app))
 
-;; ---- fake STS (query protocol, XML response) -------------------------------
+;; ---- fake query-protocol services: STS / SNS / CloudWatch all POST "/",
+;;      so dispatch on the Action in the form body --------------------------
 (app-post app "/"
   (lambda (req res)
-    (let ((body (utf8->string (req-body req))))
-      (unless (str-has? body "Action=GetFederationToken") (sfail! 'sts-action))
-      (unless (str-has? body "Version=2011-06-15") (sfail! 'sts-version))
-      (unless (str-has? body "DurationSeconds=3600") (sfail! 'sts-duration))
-      (unless (str-has? body "Name=u-test") (sfail! 'sts-name))
-      (let ((auth (req-header req 'authorization)))
-        (unless (and auth (str-has? auth "/sts/aws4_request")) (sfail! 'sts-auth-scope))))
-    (send-text! res
-      (string-append
-        "<GetFederationTokenResponse><GetFederationTokenResult><Credentials>"
-        "<AccessKeyId>AKIATEST</AccessKeyId>"
-        "<SecretAccessKey>secret123</SecretAccessKey>"
-        "<SessionToken>token456==</SessionToken>"
-        "<Expiration>2026-07-19T18:00:00Z</Expiration>"
-        "</Credentials></GetFederationTokenResult></GetFederationTokenResponse>"))))
+    (let ((body (utf8->string (req-body req)))
+          (auth (req-header req 'authorization)))
+      (cond
+        ;; STS GetFederationToken -> XML credentials
+        ((str-has? body "Action=GetFederationToken")
+         (unless (str-has? body "Version=2011-06-15") (sfail! 'sts-version))
+         (unless (str-has? body "DurationSeconds=3600") (sfail! 'sts-duration))
+         (unless (str-has? body "Name=u-test") (sfail! 'sts-name))
+         (unless (and auth (str-has? auth "/sts/aws4_request")) (sfail! 'sts-auth-scope))
+         (send-text! res
+           (string-append
+             "<GetFederationTokenResponse><GetFederationTokenResult><Credentials>"
+             "<AccessKeyId>AKIATEST</AccessKeyId>"
+             "<SecretAccessKey>secret123</SecretAccessKey>"
+             "<SessionToken>token456==</SessionToken>"
+             "<Expiration>2026-07-19T18:00:00Z</Expiration>"
+             "</Credentials></GetFederationTokenResult></GetFederationTokenResponse>")))
+        ;; SNS Publish -> XML MessageId
+        ((str-has? body "Action=Publish")
+         (unless (str-has? body "Version=2010-03-31") (sfail! 'sns-version))
+         (unless (str-has? body "TopicArn=")   (sfail! 'sns-topic))   ; ARN is %-encoded
+         (unless (str-has? body "Subject=subj1") (sfail! 'sns-subject))
+         (unless (str-has? body "Message=hi")  (sfail! 'sns-message))
+         (unless (and auth (str-has? auth "/sns/aws4_request")) (sfail! 'sns-auth-scope))
+         (send-text! res
+           "<PublishResponse><PublishResult><MessageId>sns-msg-1</MessageId></PublishResult></PublishResponse>"))
+        ;; CloudWatch PutMetricData -> empty 2xx body
+        ((str-has? body "Action=PutMetricData")
+         (unless (str-has? body "Version=2010-08-01") (sfail! 'cw-version))
+         (unless (and auth (str-has? auth "/monitoring/aws4_request")) (sfail! 'cw-auth-scope))
+         (cond
+           ((str-has? body "Namespace=myapp2")     ; the defaults call (no unit/dims)
+            (unless (str-has? body "MetricData.member.1.MetricName=hits2") (sfail! 'cw2-name))
+            (unless (str-has? body "MetricData.member.1.Value=1") (sfail! 'cw2-value))
+            (unless (str-has? body "MetricData.member.1.Unit=Count") (sfail! 'cw2-default-unit))
+            (when   (str-has? body "Dimensions.member") (sfail! 'cw2-unexpected-dims)))
+           ((str-has? body "Namespace=myapp")       ; the full call (unit + one dim)
+            (unless (str-has? body "MetricData.member.1.MetricName=hits") (sfail! 'cw-name))
+            (unless (str-has? body "MetricData.member.1.Value=5") (sfail! 'cw-value))
+            (unless (str-has? body "MetricData.member.1.Unit=Milliseconds") (sfail! 'cw-unit))
+            (unless (str-has? body "MetricData.member.1.Dimensions.member.1.Name=kind") (sfail! 'cw-dim-name))
+            (unless (str-has? body "MetricData.member.1.Dimensions.member.1.Value=alert") (sfail! 'cw-dim-value)))
+           (else (sfail! 'cw-namespace)))
+         (send-text! res ""))                        ; PutMetricData: 2xx, empty body
+        (else (sfail! 'unknown-action) (send-text! res ""))))))
 
 ;; ---- fake SES v2 (JSON) ----------------------------------------------------
 (app-post app "/v2/email/outbound-emails"
@@ -141,12 +172,29 @@
         ;; the ses-error-only contract
         (check "ses-empty-2xx-ok"
           (eq? #t (ses-send-email ses "noreply@ynthu.com" #f "user@x.com"
-                                  "trigger-empty-200" "<p>x</p>")))))
+                                  "trigger-empty-200" "<p>x</p>"))))
+
+      ;; SNS: query body signed to service sns, MessageId parsed from XML
+      (let ((sns (make-sns `((region . "us-east-1") (access-key . "AKIA")
+                             (secret . "SEKRIT") (endpoint . ,ep)))))
+        (check "sns-message-id"
+          (equal? (sns-publish sns "arn:aws:sns:us-east-1:123:alerts" "subj1" "hi")
+                  "sns-msg-1")))
+
+      ;; CloudWatch: query body signed to service monitoring, empty 2xx -> #t;
+      ;; both the full (unit + dim) and the defaults (unit "Count", no dims) path
+      (let ((cw (make-cloudwatch `((region . "us-east-1") (access-key . "AKIA")
+                                   (secret . "SEKRIT") (endpoint . ,ep)))))
+        (check "cw-put-full"
+          (eq? #t (cloudwatch-put-metric cw "myapp" "hits" 5 "Milliseconds"
+                                         '(("kind" . "alert")))))
+        (check "cw-put-defaults"
+          (eq? #t (cloudwatch-put-metric cw "myapp2" "hits2" 1)))))
 
     (check "server-side" (null? (unbox server-fails)))
     (unless (null? (unbox server-fails))
       (display "  server-side failures: ") (write (unbox server-fails)) (newline))
 
     (if (zero? failures)
-        (begin (display "aws (sts/ses): all tests passed\n") (exit 0))
+        (begin (display "aws (sts/ses/sns/cloudwatch): all tests passed\n") (exit 0))
         (begin (display failures) (display " failures\n") (exit 1)))))
