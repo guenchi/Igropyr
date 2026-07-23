@@ -282,19 +282,23 @@
          (let ((svc (string->symbol (string-append "igropyr-gossip:" cname))))
            (start-gossip-server! svc (car adv) (cadr adv) ttl-ms)
            (lambda ()
-             ;; push-pull: bump our heartbeat, trade full tables with up
-             ;; to fanout random connected peers (each bounded; a peer
-             ;; without the service just skips), then answer with the
-             ;; merged view plus seed hints for names not in it -- the
-             ;; bootstrap AND the rejoin path ride those seeds.
+             ;; push-pull, but the fanout exchanges run CONCURRENTLY: one
+             ;; spawned process per peer does the (bounded) rcall and casts its
+             ;; reply back to merge. A dead/slow peer no longer serializes the
+             ;; cycle -- the loop returns at once; this round's merges land
+             ;; within one exchange timeout and show up in the next cycle's view
+             ;; (gossip is eventual anyway). Seeds not in the view are appended
+             ;; as hints, so the bootstrap AND the rejoin path ride them.
              (let ((mine (gen-server-call svc 'beat)))
                (for-each
                  (lambda (peer)
-                   (let ((theirs (guard (e (#t #f))
-                                   (rcall peer svc (cons 'exchange mine)
-                                          exchange-timeout-ms))))
-                     (when (list? theirs)
-                       (gen-server-cast svc (cons 'merge theirs)))))
+                   (spawn
+                     (lambda ()
+                       (let ((theirs (guard (e (#t #f))
+                                       (rcall peer svc (cons 'exchange mine)
+                                              exchange-timeout-ms))))
+                         (when (list? theirs)
+                           (gen-server-cast svc (cons 'merge theirs)))))))
                  (pick-random (node-peers) fanout))
                (let ((view (gen-server-call svc 'members)))
                  (append view
