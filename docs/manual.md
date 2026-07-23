@@ -2992,6 +2992,43 @@ local-part.
 
 Raises `#(ses-error status body)` on a non-2xx response.
 
+### SNS: topic fan-out
+
+`(igropyr sns)` calls **Publish** to fan one message out to a topic's
+subscribers — email, SMS, SQS, Lambda, HTTP. The topic and its
+subscriptions are provisioned out of band; this signs the call and returns
+the MessageId. `subject` only shows up in email delivery, so pass `#f` or
+`""` to omit it.
+
+```scheme
+(import (igropyr sns))
+(define sns (make-sns '((region . "us-east-1") (access-key . "…") (secret . "…"))))
+(sns-publish sns "arn:aws:sns:us-east-1:123:alerts" "subject" "body")
+;;   -> the MessageId string
+(sns-publish sns "arn:aws:sns:us-east-1:123:alerts" #f "body")   ; no subject
+```
+
+Raises `#(sns-error status message)` on a non-2xx response.
+
+### CloudWatch: custom metrics
+
+`(igropyr cloudwatch)` calls **PutMetricData** to publish one custom metric
+data point — a namespace, metric name and value, optionally a unit and
+dimensions. Build it as a counter or a gauge and alarm on it in CloudWatch.
+`unit` defaults to `"Count"`; `dims` is an alist of `(name . value)` (a
+metric carries up to 30 dimensions). PutMetricData answers a 2xx with an
+empty body, so there is no id to read back — the call returns `#t`.
+
+```scheme
+(import (igropyr cloudwatch))
+(define cw (make-cloudwatch '((region . "us-east-1") (access-key . "…") (secret . "…"))))
+(cloudwatch-put-metric cw "myapp" "requests" 1)                  ; -> #t, unit "Count"
+(cloudwatch-put-metric cw "myapp" "latency_ms" 42 "Milliseconds"
+                       '(("route" . "/checkout")))               ; unit + a dimension
+```
+
+Raises `#(cloudwatch-error status message)` on a non-2xx response.
+
 ---
 
 ## Password Hashing
