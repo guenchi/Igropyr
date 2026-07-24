@@ -37,7 +37,7 @@
 ;;; construction.
 
 (library (igropyr tls)
-  (export tls-enable!)
+  (export tls-enable! tls-establish!)
   (import (chezscheme) (igropyr actor) (igropyr platform)
           (only (igropyr libuv) tcp-write!)
           (only (igropyr http-client) set-https-connector!))
@@ -264,4 +264,16 @@
         (set-https-connector! establish!)
         (set! enabled #t)))
     'ok)
+
+  ;; The generic byte-codec connector, for protocols other than https
+  ;; that upgrade an established TCP connection to TLS (e.g. the
+  ;; PostgreSQL client after SSLRequest). Must run inside the green
+  ;; process that owns the read-started connection c; drives the
+  ;; handshake on #(tcp-data ...) messages and returns the codec
+  ;; #(encrypt decrypt close!) described above. Verification posture is
+  ;; identical to https: peer certificate + hostname (or IP) against the
+  ;; system trust store, TLS >= 1.2. Raises #(http-client-error "tls: ...")
+  ;; on failure, after freeing the session.
+  (define (tls-establish! c host timeout)
+    (establish! c host timeout))
 )

@@ -268,8 +268,15 @@
         (else (tcp-close! c)))))
 
   (guard (e (#t (tcp-close! c)))
-    ;; startup message (untyped): Int32 len + body
-    (let* ((len (ru32 (take! 4) 0))
+    ;; startup message (untyped): Int32 len + body. An 8-byte SSLRequest
+    ;; (magic 80877103) may arrive first: this server refuses TLS with the
+    ;; single raw byte 'N' -- a client that asked for TLS must then fail
+    ;; hard rather than continue in plaintext.
+    (let* ((len0 (ru32 (take! 4) 0))
+           (len (if (and (= len0 8) (= (ru32 (take! 4) 0) 80877103))
+                    (begin (write! (string->utf8 "N"))
+                           (ru32 (take! 4) 0))     ; next message, if any
+                    len0))
            (body (take! (- len 4)))
            (params (parse-params body))
            (db (cond ((assoc "database" params) => cdr) (else "")))
@@ -382,6 +389,15 @@
       (check "invalid-length-clean-error"
         (and e (eq? (vector-ref e 1) 'transport)
              (string-contains? (vector-ref e 2) "invalid message length"))))
+
+    ;; 9. server refusing TLS must fail the connection, never fall back to
+    ;;    plaintext (the connector must not even be called)
+    (let ((e (connect-error "127.0.0.1" port "user" "x" "scram"
+                            (list (cons 'tls (lambda args
+                                               (raise 'connector-called)))))))
+      (check "tls-refusal-fails-hard"
+        (and e (eq? (vector-ref e 1) 'transport)
+             (string-contains? (vector-ref e 2) "refused TLS"))))
 
     (tcp-stop-listen!)
     (sleep-ms 100)

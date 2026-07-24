@@ -55,9 +55,22 @@
 ;;; passwords the server stored un-normalized) work, but an NFKC-unstable
 ;;; password that logs in via libpq may fail here.
 ;;;
-;;; This client speaks plaintext; without TLS an on-path attacker can
-;;; read query text and results regardless of the auth method. Run it
-;;; over a trusted network or a local socket.
+;;; TLS: pass the byte-codec connector from (igropyr tls) as the 'tls
+;;; option and the connection is upgraded via SSLRequest before startup,
+;;; with certificate + hostname verification against the system trust
+;;; store (SSL_CERT_FILE / SSL_CERT_DIR apply):
+;;;
+;;;   (import (igropyr postgresql) (igropyr tls))
+;;;   (postgresql-connect host 5432 user pw "db"
+;;;                       (list (cons 'tls tls-establish!)))
+;;;
+;;; The connector travels through the options alist, so this library
+;;; never imports (igropyr tls) and stays free of the OpenSSL dependency
+;;; unless the application opts in. If the server refuses TLS the
+;;; connection FAILS -- no silent plaintext fallback. Without 'tls the
+;;; client speaks plaintext: an on-path attacker can read query text and
+;;; results regardless of the auth method, so run plaintext connections
+;;; only over a trusted network or a local socket.
 
 (library (igropyr postgresql)
   (export postgresql-connect postgresql-pool postgresql-query
@@ -154,7 +167,28 @@
       (bytevector-copy! payload 0 out 5 n)
       out))
 
-  (define (send-msg! c type payload) (tcp-write! c (msg type payload) #f))
+  ;; ---- transport ---------------------------------------------------------
+  ;; Everything above the socket goes through a transport: the raw libuv
+  ;; connection plus an optional TLS byte codec (from (igropyr tls)'s
+  ;; tls-establish!, injected via the 'tls option). enc/dec transform
+  ;; whole byte runs; closer frees the TLS session. A plain connection
+  ;; carries #f in all three at zero cost.
+
+  (define-record-type (tx make-tx tx?)
+    (fields c enc dec closer))
+
+  (define (tx-write! t bv)
+    (tcp-write! (tx-c t) (let ((e (tx-enc t))) (if e (e bv) bv)) #f))
+
+  (define (tx-decode t bv)
+    (let ((d (tx-dec t))) (if d (d bv) bv)))
+
+  (define (tx-close! t)
+    (let ((cl (tx-closer t))) (when cl (cl)))
+    (tcp-close! (tx-c t)))
+
+  ;; c below is always a tx.
+  (define (send-msg! c type payload) (tx-write! c (msg type payload)))
 
   (define MSG-QUERY     (char->integer #\Q))
   (define MSG-PASSWORD  (char->integer #\p))   ; password / SASL response
@@ -226,7 +260,7 @@
   (define (wait-data c buf k)
     (receive (after query-timeout-ms (postgresql-fail 'transport "server timeout"))
       (`#(tcp-data ,bv)
-        (inbuf-append! buf bv)
+        (inbuf-append! buf (tx-decode c bv))
         (k))
       (`#(tcp-eof) (postgresql-fail 'transport "connection closed by server"))
       (`#(tcp-error ,e) (postgresql-fail 'transport "connection error"))))
@@ -358,7 +392,7 @@
       (and p (cdr p))))
 
   (define (authenticate! c buf user password db opts)
-    (tcp-write! c (startup-msg user db) #f)
+    (tx-write! c (startup-msg user db))
     (let loop ()
       (let-values (((t p) (next-msg! c buf)))
         (case (integer->char t)
@@ -507,7 +541,7 @@
       (msg MSG-SYNC empty-bv)))
 
   (define (run-extended! c buf sql params)
-    (tcp-write! c (extended-msgs sql params) #f)
+    (tx-write! c (extended-msgs sql params))
     (read-response! c buf))
 
   ;; ---- connection process ------------------------------------------------
@@ -533,18 +567,18 @@
           (if (transport-dead? r)
               (begin
                 (when notify (send notify (vector 'db-conn-dead self)))
-                (tcp-close! c))                 ; exit -> DOWN -> rebuild
+                (tx-close! c))                  ; exit -> DOWN -> rebuild
               (begin
                 (when notify (send notify (vector 'db-idle self)))
                 (serve-loop c buf notify)))))
       (`#(db-quit)
         (send-msg! c MSG-TERMINATE empty-bv)     ; Terminate
-        (tcp-close! c))
+        (tx-close! c))
       (`#(tcp-data ,bv)                          ; stray data between queries
-        (inbuf-append! buf bv)
+        (inbuf-append! buf (tx-decode c bv))
         (serve-loop c buf notify))
-      (`#(tcp-eof) (tcp-close! c))
-      (`#(tcp-error ,e) (tcp-close! c))))
+      (`#(tcp-eof) (tx-close! c))
+      (`#(tcp-error ,e) (tx-close! c))))
 
   ;; After reporting up, wait to be adopted (the pool or the connecting
   ;; caller answers with db-adopt). If nobody adopts -- the caller timed
@@ -552,12 +586,58 @@
   ;; authenticating -- close the socket and exit instead of holding an
   ;; authenticated connection forever.
   (define (await-adoption c buf notify)
-    (receive (after connect-timeout-ms (tcp-close! c))
+    (receive (after connect-timeout-ms (tx-close! c))
       (`#(db-adopt) (serve-loop c buf notify))
-      (`#(db-quit) (send-msg! c MSG-TERMINATE empty-bv) (tcp-close! c))
-      (`#(tcp-data ,bv) (inbuf-append! buf bv) (await-adoption c buf notify))
-      (`#(tcp-eof) (tcp-close! c))
-      (`#(tcp-error ,e) (tcp-close! c))))
+      (`#(db-quit) (send-msg! c MSG-TERMINATE empty-bv) (tx-close! c))
+      (`#(tcp-data ,bv)
+        (inbuf-append! buf (tx-decode c bv))
+        (await-adoption c buf notify))
+      (`#(tcp-eof) (tx-close! c))
+      (`#(tcp-error ,e) (tx-close! c))))
+
+  ;; Upgrade a freshly connected socket to the negotiated transport. With
+  ;; no 'tls option this is just the plain wrapper. With one, send
+  ;; SSLRequest and read its answer -- a single RAW byte outside message
+  ;; framing -- then hand the socket to the injected connector, which
+  ;; drives the handshake and returns the #(encrypt decrypt close!) codec.
+  ;; 'N' (server refuses TLS) fails hard: the caller asked for TLS, so
+  ;; falling back to plaintext silently would defeat the point; trailing
+  ;; bytes after the answer are injected plaintext and also fail.
+  (define (setup-transport! raw host opts)
+    (let ((connector (assq-ref opts 'tls)))
+      (if (not connector)
+          (make-tx raw #f #f #f)
+          (begin
+            (tcp-write! raw (bv-append (u32 8) (u32 80877103)) #f) ; SSLRequest
+            (receive (after connect-timeout-ms
+                        (postgresql-fail 'transport "tls: no SSLRequest answer"))
+              (`#(tcp-data ,bv)
+                (cond
+                  ((and (= 1 (bytevector-length bv))
+                        (fx= (bytevector-u8-ref bv 0) (char->integer #\S)))
+                   (let ((codec
+                          (guard (e (#t (postgresql-fail 'transport
+                                          (tls-failure-reason e))))
+                            (connector raw host connect-timeout-ms))))
+                     (make-tx raw (vector-ref codec 0) (vector-ref codec 1)
+                              (vector-ref codec 2))))
+                  ((and (= 1 (bytevector-length bv))
+                        (fx= (bytevector-u8-ref bv 0) (char->integer #\N)))
+                   (postgresql-fail 'transport "server refused TLS"))
+                  (else
+                   (postgresql-fail 'transport
+                     "unexpected data after SSLRequest"))))
+              (`#(tcp-eof)
+                (postgresql-fail 'transport "connection closed by server"))
+              (`#(tcp-error ,e)
+                (postgresql-fail 'transport "connection error")))))))
+
+  ;; the connector raises #(http-client-error "tls: ...") -- keep the text
+  (define (tls-failure-reason e)
+    (if (and (vector? e) (eq? (vector-ref e 0) 'http-client-error)
+             (> (vector-length e) 1) (string? (vector-ref e 1)))
+        (vector-ref e 1)
+        (call-with-string-output-port (lambda (p) (write e p)))))
 
   ;; spawn a connection worker; reports #(db-up ,ref ,self status) to
   ;; report-to -- ref lets the receiver ignore a stale report from an
@@ -586,15 +666,20 @@
                             (`#(tcp-connect-failed ,e) 'ok)))
                 (`#(tcp-connect-failed ,e)
                   (report! (vector 'postgresql-error 'transport (uv-strerror e))))
-                (`#(tcp-connected ,c)
-                  (tcp-read-start! c)
-                  (let* ((buf (make-inbuf))
-                         (r (guard (e (#t (as-postgresql-error e "connect failed")))
-                              (authenticate! c buf user password db opts)
-                              'ok)))
-                    (if (eq? r 'ok)
-                        (begin (report! 'ok) (await-adoption c buf notify))
-                        (begin (tcp-close! c) (report! r)))))))))))
+                (`#(tcp-connected ,raw)
+                  (tcp-read-start! raw)
+                  (let ((t (guard (e (#t (as-postgresql-error e "connect failed")))
+                             (setup-transport! raw host opts))))
+                    (if (not (tx? t))
+                        (begin (tcp-close! raw) (report! t))
+                        (let* ((buf (make-inbuf))
+                               (r (guard (e (#t (as-postgresql-error
+                                                  e "connect failed")))
+                                    (authenticate! t buf user password db opts)
+                                    'ok)))
+                          (if (eq? r 'ok)
+                              (begin (report! 'ok) (await-adoption t buf notify))
+                              (begin (tx-close! t) (report! r)))))))))))))
 
   ;; ---- pool + public API ---------------------------------------------------
   ;; The pool, lease and transaction machinery is (igropyr sqlpool), shared
@@ -619,6 +704,9 @@
   ;; the user name (as PostgreSQL itself defaults). Optional args after the
   ;; password: db name, then an options alist:
   ;;   'allow-cleartext-auth  permit cleartext password auth (see header).
+  ;;   'tls                   a byte-codec connector -- pass tls-establish!
+  ;;                          from (igropyr tls) to upgrade via SSLRequest
+  ;;                          with full certificate verification.
   (define (postgresql-connect host port user password . rest)
     (let-values (((db opts) (conn-args rest user)))
       (let ((ref (gensym)))

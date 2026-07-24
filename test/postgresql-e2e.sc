@@ -18,7 +18,8 @@
 ;;; a connection, and reclaims + rebuilds a connection whose borrower is
 ;;; killed mid-transaction (dynamic-wind does NOT run then).
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr postgresql))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr postgresql)
+        (only (igropyr tls) tls-establish!))
 
 (define (env k d) (or (getenv k) d))
 
@@ -202,6 +203,28 @@
       (check "pool-alive-after-execute-error"
         (= 1 (scalar-num (postgresql-query pool "SELECT 1"))))
       (postgresql-query pool (string-append "DROP TABLE IF EXISTS " table "_ex")))
+
+    ;; ---- 7. TLS (extra opt-in: server needs ssl=on and SSL_CERT_FILE must
+    ;;         point at its certificate, self-signed being its own CA) -------
+    (when (getenv "PG_TLS")
+      (let ((topts (list (cons 'tls tls-establish!))))
+        (let ((conn (postgresql-connect host port user pass db topts)))
+          (check "tls-scram-connect"
+            (= 1 (scalar-num (postgresql-query conn "SELECT 1"))))
+          ;; the backend itself must see this session as SSL
+          (check "tls-backend-sees-ssl"
+            (equal? "true"
+                    (scalar (postgresql-query conn
+                      "SELECT ssl::text FROM pg_stat_ssl WHERE pid = pg_backend_pid()"))))
+          (check "tls-execute-params"
+            (let ((r (postgresql-execute conn "SELECT $1 || $2" "en" "crypted")))
+              (equal? (vector-ref r 2) '(("encrypted")))))
+          (postgresql-close! conn))
+        ;; pool over TLS: rebuild machinery composes with the codec
+        (let ((p2 (postgresql-pool 2 host port user pass db topts)))
+          (check "tls-pool-query"
+            (= 7 (scalar-num (postgresql-query p2 "SELECT 7"))))
+          (postgresql-close! p2))))
 
     ;; ---- done ---------------------------------------------------------------
     (postgresql-query pool (string-append "DROP TABLE IF EXISTS " table))
