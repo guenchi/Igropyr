@@ -54,6 +54,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # SCRAM-SHA-256 (igropyr postgresql) against the RFC 7677 vectors -- pure
 # crypto, no server needed, so it always runs.
 "$scheme_bin" --script igropyr/test/postgresql.sc
+# opt-in (needs a live PostgreSQL): runs for real only when IGROPYR_PG_TEST is
+# set, otherwise self-skips, so this is a no-op on machines without a database.
+"$scheme_bin" --script igropyr/test/postgresql-e2e.sc
 
 set +e
 badenv_output=$(IGROPYR_CONTRACTS=on "$scheme_bin" --script igropyr/test/checked-badenv.sc 2>&1)
