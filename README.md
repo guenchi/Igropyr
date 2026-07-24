@@ -63,9 +63,13 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   primitives underneath (SHA-1/256, HMAC, base64, hex)
 - **Chunked transfer-encoding** — `Transfer-Encoding: chunked` request
   bodies are decoded transparently
-- **Non-blocking Redis and MySQL clients** — pure Scheme, same event
-  loop; callers park their green process while the OS thread keeps
-  serving; MySQL comes with a self-healing connection pool
+- **Non-blocking Redis, MySQL and PostgreSQL clients** — pure Scheme,
+  same event loop; callers park their green process while the OS thread
+  keeps serving. MySQL and PostgreSQL share a self-healing connection
+  pool; the PostgreSQL client authenticates with SCRAM-SHA-256, upgrades
+  to optional TLS (`(igropyr tls)`, certificate verified), and offers
+  both the simple query protocol and the extended protocol with
+  server-side parameter binding (`$1..$n`, injection impossible)
 - **Non-blocking HTTP & WebSocket clients** — outbound `http-get` /
   `http-post` and `ws-connect`, both with async DNS (libuv thread pool)
   and the same park-the-caller model; `https://` / `wss://` via the
