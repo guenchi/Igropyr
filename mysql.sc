@@ -25,12 +25,11 @@
 (library (igropyr mysql)
   (export mysql-connect mysql-pool mysql-query mysql-close!
           mysql-transaction call-with-mysql-connection)
-  (import (chezscheme) (igropyr actor) (igropyr libuv)
+  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sqlpool)
           (only (igropyr crypto) sha1 sha256 base64-decode))
 
   (define connect-timeout-ms 10000)
   (define query-timeout-ms 60000)
-  (define checkout-timeout-ms 60000)   ; how long a caller parks for a free lease
 
   ;; ---- bytevector helpers ------------------------------------------------
 
@@ -480,7 +479,7 @@
     (and (vector? r) (eq? (vector-ref r 0) 'mysql-error)
          (< (vector-ref r 1) 0)))
 
-  ;; notify (a pid or #f): told #(mysql-idle ,self) after each finished
+  ;; notify (a pid or #f): told #(db-idle ,self) after each finished
   ;; query, so a pool can hand this connection its next task. Replies
   ;; carry the caller's ref so a late reply (after the caller timed out)
   ;; cannot be mis-read by that caller's next query. On a transport
@@ -491,18 +490,18 @@
   ;; idle set.
   (define (serve-loop c bufbox notify)
     (receive
-      (`#(mysql-query ,sql ,ref ,from)
+      (`#(db-query ,sql ,ref ,from)
         (let ((r (guard (e (#t (as-mysql-error e "query failed")))
                    (run-query! c bufbox sql))))
-          (send from (vector 'mysql-reply ref r))
+          (send from (vector 'db-reply ref r))
           (if (transport-dead? r)
               (begin
-                (when notify (send notify (vector 'mysql-conn-dead self)))
+                (when notify (send notify (vector 'db-conn-dead self)))
                 (tcp-close! c))                   ; exit -> DOWN -> rebuild
               (begin
-                (when notify (send notify (vector 'mysql-idle self)))
+                (when notify (send notify (vector 'db-idle self)))
                 (serve-loop c bufbox notify)))))
-      (`#(mysql-quit)
+      (`#(db-quit)
         (send-packet! c (bytevector 1) 0)          ; COM_QUIT
         (tcp-close! c))
       (`#(tcp-data ,bv)                            ; stray data between queries
@@ -512,21 +511,21 @@
       (`#(tcp-error ,e) (tcp-close! c))))
 
   ;; After reporting up, wait to be adopted (the pool or the connecting
-  ;; caller answers with mysql-adopt). If nobody adopts -- the caller
+  ;; caller answers with db-adopt). If nobody adopts -- the caller
   ;; timed out and moved on, or the pool was closed while we were still
   ;; authenticating -- close the socket and exit instead of holding an
   ;; authenticated connection forever.
   (define (await-adoption c bufbox notify)
     (receive (after connect-timeout-ms (tcp-close! c))
-      (`#(mysql-adopt) (serve-loop c bufbox notify))
-      (`#(mysql-quit) (send-packet! c (bytevector 1) 0) (tcp-close! c))
+      (`#(db-adopt) (serve-loop c bufbox notify))
+      (`#(db-quit) (send-packet! c (bytevector 1) 0) (tcp-close! c))
       (`#(tcp-data ,bv)
         (set-box! bufbox (bv-append (unbox bufbox) bv))
         (await-adoption c bufbox notify))
       (`#(tcp-eof) (tcp-close! c))
       (`#(tcp-error ,e) (tcp-close! c))))
 
-  ;; spawn a connection worker; reports #(mysql-up ,ref ,self status) to
+  ;; spawn a connection worker; reports #(db-up ,ref ,self status) to
   ;; report-to -- ref lets the receiver ignore a stale report from an
   ;; earlier, timed-out attempt -- then waits for adoption and serves
   ;; queries (notifying `notify` when idle). Every failure path closes
@@ -537,7 +536,7 @@
     (spawn
       (lambda ()
         (define (report! status)
-          (send report-to (vector 'mysql-up ref self status)))
+          (send report-to (vector 'db-up ref self status)))
         (let ((started (guard (e (#t (as-mysql-error e "connect failed")))
                          (tcp-connect! host port self)
                          'ok)))
@@ -562,231 +561,19 @@
                         (begin (report! 'ok) (await-adoption c bufbox notify))
                         (begin (tcp-close! c) (report! r)))))))))))
 
-  ;; ---- connection pool -----------------------------------------------------------------------
+  ;; ---- pool + public API ---------------------------------------------------
+  ;; The pool, lease and transaction machinery is (igropyr sqlpool), shared
+  ;; with (igropyr postgresql); this driver contributes the wire protocol
+  ;; above and its error shapes below.
 
-  ;; Fixed pool of n connections behind a dispatcher process. Queries go
-  ;; to an idle connection or wait in a FIFO; replies flow directly from
-  ;; the connection to the caller. Dead connections are replaced
-  ;; automatically (1s backoff on failed connects); a caller whose
-  ;; connection dies mid-query gets #(mysql-error -1 "connection lost").
-  (define (pool-loop n host port user password db opts)
-    (define me self)
-    (define idle '())
-    (define busy (make-eq-hashtable))   ; conn pid -> (caller-pid . ref)
-    ;; transaction leases: a whole connection handed to one borrower for
-    ;; the extent of a transaction, kept out of query rotation until it is
-    ;; checked back in (or its borrower dies). Each lease is its own record
-    ;; -- keyed by connection, carrying the borrower, its monitor and the
-    ;; checkout ref -- so one borrower holding several leases (nested
-    ;; checkouts) never clobbers its own bookkeeping.
-    (define leased (make-eq-hashtable))       ; conn pid -> #(borrower mon ref)
-    (define dying (make-eq-hashtable))        ; conn pid -> #t (being torn down)
-    (define pending-front '())
-    (define pending-back '())
-    (define (pending?) (or (pair? pending-front) (pair? pending-back)))
-    (define (pop-pending!)
-      (when (null? pending-front)
-        (set! pending-front (reverse pending-back))
-        (set! pending-back '()))
-      (let ((x (car pending-front)))
-        (set! pending-front (cdr pending-front))
-        x))
-    ;; checkout requests waiting for a free connection; each is (ref . from)
-    (define co-front '())
-    (define co-back '())
-    (define (co-pending?) (or (pair? co-front) (pair? co-back)))
-    (define (pop-co!)
-      (when (null? co-front)
-        (set! co-front (reverse co-back))
-        (set! co-back '()))
-      (let ((x (car co-front)))
-        (set! co-front (cdr co-front))
-        x))
-    (define (connect!)
-      (monitor (start-connection host port user password db opts me me (gensym))))
-    ;; a job is #(sql ref from)
-    (define (assign! c job)
-      (hashtable-set! busy c (cons (vector-ref job 2) (vector-ref job 1)))
-      (send c (vector 'mysql-query (vector-ref job 0)
-                      (vector-ref job 1) (vector-ref job 2))))
-    ;; hand connection c to a checkout request req = (ref . from), and
-    ;; monitor the borrower: the supervisor killing a stuck worker discards
-    ;; its dynamic-wind winders (see actor @kill), so the checkin never
-    ;; runs -- this monitor is the only thing that reclaims the connection.
-    (define (lease! c req)
-      (let ((ref (car req)) (from (cdr req)))
-        (hashtable-set! leased c (vector from (monitor from) ref))
-        (send from (vector 'mysql-checkout-reply ref c))))
-    (define (drop-lease! c entry)
-      (demonitor (vector-ref entry 1))
-      (hashtable-delete! leased c))
-    ;; all (conn . entry) leases held by borrower pid
-    (define (leases-of pid)
-      (let ((ks (hashtable-keys leased)) (acc '()))
-        (do ((i 0 (+ i 1))) ((= i (vector-length ks)) acc)
-          (let* ((c (vector-ref ks i)) (e (hashtable-ref leased c #f)))
-            (when (and e (eq? (vector-ref e 0) pid))
-              (set! acc (cons (cons c e) acc)))))))
-    ;; the lease created for checkout ref by borrower from, or #f
-    (define (lease-by-ref ref from)
-      (let ((ks (hashtable-keys leased)))
-        (let loop ((i 0))
-          (if (= i (vector-length ks))
-              #f
-              (let* ((c (vector-ref ks i)) (e (hashtable-ref leased c #f)))
-                (if (and e (eq? (vector-ref e 0) from) (eq? (vector-ref e 2) ref))
-                    (cons c e)
-                    (loop (+ i 1))))))))
-    ;; alternate between the single-query queue and checkout waiters when
-    ;; both are non-empty, so a sustained stream of one kind cannot starve
-    ;; the other past its timeout
-    (define co-turn #f)
-    (define (make-available! c)
-      (hashtable-delete! busy c)
-      (cond
-        ((and (pending?) (co-pending?))
-         (if co-turn
-             (begin (set! co-turn #f) (lease! c (pop-co!)))
-             (begin (set! co-turn #t) (assign! c (pop-pending!)))))
-        ((pending?) (assign! c (pop-pending!)))
-        ((co-pending?) (lease! c (pop-co!)))
-        (else (set! idle (cons c idle)))))
-    (do ((i 0 (+ i 1))) ((= i n)) (connect!))
-    (let loop ()
-      (receive
-        (`#(mysql-query ,sql ,ref ,from)
-          (let ((job (vector sql ref from)))
-            (if (pair? idle)
-                (let ((c (car idle)))
-                  (set! idle (cdr idle))
-                  (assign! c job))
-                (set! pending-back (cons job pending-back))))
-          (loop))
-        (`#(mysql-idle ,c)
-          ;; a leased connection pings idle after each of its transaction
-          ;; queries -- ignore those, it stays with its lessee; likewise skip
-          ;; a connection we are tearing down.
-          (unless (or (hashtable-ref leased c #f) (hashtable-ref dying c #f))
-            (make-available! c))
-          (loop))
-        (`#(mysql-conn-dead ,c)
-          ;; the connection already sent the transport-error reply to its
-          ;; caller and is about to exit: clear the busy entry so the DOWN
-          ;; below does not send a duplicate reply, and mark it dying so
-          ;; the DOWN still rebuilds it.
-          (hashtable-delete! busy c)
-          (hashtable-set! dying c #t)
-          (loop))
-        (`#(mysql-checkout ,ref ,from)
-          (if (pair? idle)
-              (let ((c (car idle)))
-                (set! idle (cdr idle))
-                (lease! c (cons ref from)))
-              (set! co-back (cons (cons ref from) co-back)))
-          (loop))
-        (`#(mysql-checkin ,from ,c)
-          ;; only when c really is leased to `from` -- guards a stale or double
-          ;; checkin (e.g. after the connection already died and was rebuilt).
-          (let ((e (hashtable-ref leased c #f)))
-            (when (and e (eq? (vector-ref e 0) from))
-              (drop-lease! c e)
-              (make-available! c)))
-          (loop))
-        (`#(mysql-checkin-broken ,from ,c)
-          ;; the lessee could not clean the connection (e.g. ROLLBACK failed):
-          ;; drop the lease and destroy+rebuild it rather than ever lending a
-          ;; possibly-open transaction to the next caller. Atomic here (single
-          ;; loop), so the connection is never made available in between.
-          (let ((e (hashtable-ref leased c #f)))
-            (when (and e (eq? (vector-ref e 0) from))
-              (drop-lease! c e)
-              (hashtable-set! dying c #t)
-              (send c (vector 'mysql-quit))))   ; -> DOWN -> rebuild (case 2)
-          (loop))
-        (`#(mysql-checkout-cancel ,ref ,from)
-          ;; a checkout timed out: drop its still-queued request so a freed
-          ;; connection is never leased to a borrower that has moved on. If the
-          ;; pool already leased one to it (raced the timeout), reclaim exactly
-          ;; that lease -- matched by ref, so other leases the same borrower
-          ;; holds are untouched.
-          (set! co-front (filter (lambda (x) (not (eq? (car x) ref))) co-front))
-          (set! co-back  (filter (lambda (x) (not (eq? (car x) ref))) co-back))
-          (let ((hit (lease-by-ref ref from)))
-            (when hit
-              (drop-lease! (car hit) (cdr hit))
-              (make-available! (car hit))))
-          (loop))
-        (`#(mysql-up ,ref ,pid ,status)
-          (if (eq? status 'ok)
-              (begin
-                (send pid (vector 'mysql-adopt))
-                (make-available! pid))
-              ;; failed connect: retry after a delay
-              (spawn (lambda ()
-                       (sleep-ms 1000)
-                       (send me (vector 'pool-reconnect)))))
-          (loop))
-        (`#(pool-reconnect)
-          (connect!)
-          (loop))
-        (`#(DOWN ,pid ,reason)
-          (cond
-            ;; (1) a transaction borrower died (a crash, or the supervisor
-            ;; killing a stuck worker -- winders discarded, so no checkin ran).
-            ;; Its connections may hold half-open transactions: destroy every
-            ;; one it held and let each connection's own DOWN below rebuild a
-            ;; clean replacement, rather than ever returning an open
-            ;; transaction to the pool.
-            ((pair? (leases-of pid))
-             (for-each
-               (lambda (hit)
-                 (drop-lease! (car hit) (cdr hit))
-                 (hashtable-set! dying (car hit) #t)
-                 (send (car hit) (vector 'mysql-quit)))
-               (leases-of pid)))
-            ;; (2) a connection died (idle, mid single-query, leased, or one we
-            ;; are already tearing down). Fail any waiting single-query caller,
-            ;; drop a lease if it held one, and rebuild. Failed connect workers
-            ;; already scheduled their own retry, so they fall through here.
-            ((or (memq pid idle) (hashtable-contains? busy pid)
-                 (hashtable-ref leased pid #f) (hashtable-ref dying pid #f))
-             (set! idle (remq pid idle))
-             (hashtable-delete! dying pid)
-             (let ((entry (hashtable-ref busy pid #f)))
-               (hashtable-delete! busy pid)
-               (when entry
-                 (send (car entry)
-                       (vector 'mysql-reply (cdr entry)
-                               (vector 'mysql-error -1 "connection lost")))))
-             (let ((e (hashtable-ref leased pid #f)))
-               (when e (drop-lease! pid e)))
-             (connect!)))
-          (loop))
-        (`#(mysql-quit)
-          (for-each (lambda (c) (send c (vector 'mysql-quit))) idle)
-          (vector-for-each
-            (lambda (c) (send c (vector 'mysql-quit)))
-            (hashtable-keys busy))
-          (vector-for-each
-            (lambda (c) (send c (vector 'mysql-quit)))
-            (hashtable-keys leased))
-          ;; connections still authenticating self-terminate: nobody adopts
-          ;; them once this process is gone. Queued callers get an error now
-          ;; instead of parking until their timeouts.
-          (let ((closed (vector 'mysql-error -1 "pool closed")))
-            (for-each
-              (lambda (job)
-                (send (vector-ref job 2)
-                      (vector 'mysql-reply (vector-ref job 1) closed)))
-              (append pending-front (reverse pending-back)))
-            (for-each
-              (lambda (req)
-                (send (cdr req)
-                      (vector 'mysql-checkout-failed (car req) closed)))
-              (append co-front (reverse co-back))))
-          'done))))
-
-  ;; ---- public API ----------------------------------------------------------------------------
+  (define cfg
+    (make-sql-cfg
+      (lambda (r) (and (vector? r) (eq? (vector-ref r 0) 'mysql-error)))
+      (vector 'mysql-error -1 "connection lost")
+      (vector 'mysql-error -1 "pool closed")
+      (vector 'mysql-error -1 "query timeout")
+      (vector 'mysql-error -1 "checkout timeout")
+      "START TRANSACTION"))
 
   ;; Connect + authenticate a single connection; returns the connection
   ;; process or raises #(mysql-error code msg). Optional args after the
@@ -805,9 +592,9 @@
                     ;; its socket by itself; the ref keeps its late up-report
                     ;; from ever being mistaken for another connect's.
                     (raise (vector 'mysql-error -1 "connect timeout")))
-          (`#(mysql-up ,@ref ,pid ,status)
+          (`#(db-up ,@ref ,pid ,status)
             (if (eq? status 'ok)
-                (begin (send pid (vector 'mysql-adopt)) pid)
+                (begin (send pid (vector 'db-adopt)) pid)
                 (raise status)))))))
 
   ;; Pool of n connections; returns the dispatcher, which mysql-query
@@ -817,110 +604,37 @@
   (define (mysql-pool n host port user password . rest)
     (let ((db (if (pair? rest) (car rest) #f))
           (opts (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) '())))
-      (spawn (lambda () (pool-loop n host port user password db opts)))))
+      (spawn
+        (lambda ()
+          (sql-pool-loop n
+            (lambda (notify report-to ref)
+              (start-connection host port user password db opts
+                                notify report-to ref))
+            cfg)))))
 
-  ;; Run one SQL statement; blocks only the calling green process. The
-  ;; per-call ref (a fresh gensym) is echoed in the reply, so if this
-  ;; call times out, a late reply carrying the old ref will not be
-  ;; matched by the caller's next query.
-  (define (mysql-query mc sql)
-    (let ((ref (gensym)))
-      (send mc (vector 'mysql-query sql ref self))
-      (receive (after query-timeout-ms
-                  (raise (vector 'mysql-error -1 "query timeout")))
-        (`#(mysql-reply ,@ref ,r)
-          (if (and (vector? r) (eq? (vector-ref r 0) 'mysql-error))
-              (raise r)
-              r)))))
-
-  ;; ---- transactions: borrow a whole pool connection ----------------------
-
-  ;; Ask the pool for a dedicated connection and park until one is free
-  ;; (or raise #(mysql-error -1 "checkout timeout")). Internal: callers use
-  ;; call-with-mysql-connection / mysql-transaction, which guarantee checkin.
-  (define (pool-checkout pool)
-    (let ((ref (gensym)))
-      (send pool (vector 'mysql-checkout ref self))
-      (receive (after checkout-timeout-ms
-                  ;; tell the pool to drop (or reclaim) this request -- otherwise
-                  ;; a connection freed after the timeout is leased to us and
-                  ;; never checked in, bleeding the pool under saturation.
-                  (send pool (vector 'mysql-checkout-cancel ref self))
-                  (raise (vector 'mysql-error -1 "checkout timeout")))
-        (`#(mysql-checkout-reply ,@ref ,conn) conn)
-        (`#(mysql-checkout-failed ,@ref ,err) (raise err)))))
+  ;; Run one SQL statement; blocks only the calling green process. A
+  ;; timed-out statement's outcome is UNKNOWN -- it may still execute on
+  ;; the server.
+  (define (mysql-query mc sql) (sql-query mc sql cfg))
 
   ;; Borrow one whole connection from a POOL for the extent of proc, then
   ;; return it -- even if proc raises or exits non-locally. proc receives
-  ;; the connection process; run mysql-query on THAT connection and no other
-  ;; caller's query can interleave, which is what makes a multi-statement
-  ;; transaction (BEGIN..COMMIT, SELECT..FOR UPDATE) correct. Requires a
-  ;; mysql-pool -- a lone mysql-connect connection has nothing to lease.
-  ;; Don't send queries to the pool itself while holding a connection (it can
-  ;; deadlock against an exhausted pool); use the borrowed connection.
+  ;; the connection process; run mysql-query on THAT connection and no
+  ;; other caller's query can interleave, which is what makes a
+  ;; multi-statement transaction correct. Requires a mysql-pool. Don't
+  ;; send queries (or a second checkout) to the pool itself while holding
+  ;; a connection.
   (define (call-with-mysql-connection pool proc)
-    (let ((conn (pool-checkout pool)))
-      (dynamic-wind
-        (lambda () (void))
-        (lambda () (proc conn))
-        (lambda () (send pool (vector 'mysql-checkin self conn))))))
-
-  ;; ROLLBACK on a borrowed connection without parking a full query timeout
-  ;; when the connection is already dead: monitor it, so a dead process
-  ;; answers with an immediate DOWN instead of 60 seconds of silence.
-  ;; -> #t when the connection cannot be returned clean.
-  (define (rollback! conn)
-    (let ((m (monitor conn)) (ref (gensym)))
-      (let ((broken
-             (guard (e (#t #t))
-               (send conn (vector 'mysql-query "ROLLBACK" ref self))
-               (receive (after query-timeout-ms #t)
-                 (`#(mysql-reply ,@ref ,r)
-                   (and (vector? r) (eq? (vector-ref r 0) 'mysql-error)))
-                 (`#(DOWN ,@conn ,reason) #t)))))
-        (when m
-          (demonitor m)
-          ;; a DOWN already queued between the reply and the demonitor
-          ;; would sit unmatched forever -- drain it
-          (receive (after 0 'ok) (`#(DOWN ,@conn ,reason) 'ok)))
-        broken)))
+    (sql-call-with-connection pool proc cfg))
 
   ;; Run proc inside a transaction on a borrowed pool connection: START
-  ;; TRANSACTION first, then COMMIT if proc returns normally, or ROLLBACK if
-  ;; it escapes (exception or non-local exit). Returns proc's value. proc
-  ;; receives the connection; issue every statement of the transaction on it.
-  ;; Requires a mysql-pool. If the borrower is killed before it can
-  ;; commit/rollback, the pool discards and rebuilds the connection, so a
-  ;; half-open transaction is never handed to the next caller.
+  ;; TRANSACTION, then COMMIT if proc returns normally, or ROLLBACK if it
+  ;; escapes. Returns proc's value. Requires a mysql-pool. If the borrower
+  ;; is killed before it can commit/rollback, the pool discards and
+  ;; rebuilds the connection, so a half-open transaction is never handed
+  ;; to the next caller.
   (define (mysql-transaction pool proc)
-    ;; self-manages the lease (rather than call-with-mysql-connection) so the
-    ;; single return message can be checkin OR checkin-broken -- no second
-    ;; checkin racing the discard. Kill-safety is unchanged: if the borrower is
-    ;; killed the winders are discarded, no message is sent, and the pool's
-    ;; monitor reclaims + rebuilds the connection.
-    (let ((conn (pool-checkout pool)))
-      (let ((committed #f) (broken #f))
-        (dynamic-wind
-          (lambda () (void))
-          (lambda ()
-            ;; inside the wind: if START TRANSACTION itself fails, the
-            ;; after-clause still runs, so the lease is always returned. A
-            ;; ROLLBACK with no started transaction is a harmless no-op; if the
-            ;; connection is dead it fails there too and gets discarded.
-            (mysql-query conn "START TRANSACTION")
-            (let ((r (proc conn)))
-              (mysql-query conn "COMMIT")
-              (set! committed #t)
-              r))
-          (lambda ()
-            (unless committed
-              ;; roll back; if ROLLBACK fails (or the connection is dead)
-              ;; the transaction may still be open, so flag the connection
-              ;; for discard instead of returning it dirty
-              (set! broken (rollback! conn)))
-            (send pool (vector (if broken 'mysql-checkin-broken 'mysql-checkin)
-                               self conn)))))))
+    (sql-transaction pool proc cfg))
 
-  (define (mysql-close! mc)
-    (send mc (vector 'mysql-quit)))
+  (define (mysql-close! mc) (sql-close! mc))
 )

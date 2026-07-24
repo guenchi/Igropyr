@@ -53,13 +53,13 @@
   (export postgresql-connect postgresql-pool postgresql-query postgresql-close!
           postgresql-transaction call-with-postgresql-connection)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr buffer)
+          (igropyr sqlpool)
           (only (igropyr crypto)
                 sha256 hmac-sha256 pbkdf2-hmac-sha256
                 base64-encode base64-decode))
 
   (define connect-timeout-ms 10000)
   (define query-timeout-ms 60000)
-  (define checkout-timeout-ms 60000)   ; how long a caller parks for a free lease
 
   ;; Upper bound on a single server message. PostgreSQL rows can be
   ;; large (bytea/text up to 1GB per field), but a length beyond this is
@@ -453,27 +453,28 @@
 
   ;; ---- connection process ------------------------------------------------
 
-  ;; notify (a pid or #f): told #(postgresql-idle ,self) after each finished
-  ;; query, so a pool can hand this connection its next task. Replies carry
-  ;; the caller's ref so a late reply cannot be mis-read by that caller's
-  ;; next query. On a transport error the connection replies to its caller,
-  ;; tells the pool it already did (so the pool's DOWN handler does not send
-  ;; a second, forever-unmatched reply), closes, and exits -- the pool's
-  ;; monitor then rebuilds it.
+  ;; notify (a pid or #f): told #(db-idle ,self) after each finished query,
+  ;; so a pool can hand this connection its next task (the db-* message
+  ;; contract is (igropyr sqlpool)'s). Replies carry the caller's ref so a
+  ;; late reply cannot be mis-read by that caller's next query. On a
+  ;; transport error the connection replies to its caller, tells the pool
+  ;; it already did (so the pool's DOWN handler does not send a second,
+  ;; forever-unmatched reply), closes, and exits -- the pool's monitor
+  ;; then rebuilds it.
   (define (serve-loop c buf notify)
     (receive
-      (`#(postgresql-query ,sql ,ref ,from)
+      (`#(db-query ,sql ,ref ,from)
         (let ((r (guard (e (#t (as-postgresql-error e "query failed")))
                    (run-query! c buf sql))))
-          (send from (vector 'postgresql-reply ref r))
+          (send from (vector 'db-reply ref r))
           (if (transport-dead? r)
               (begin
-                (when notify (send notify (vector 'postgresql-conn-dead self)))
+                (when notify (send notify (vector 'db-conn-dead self)))
                 (tcp-close! c))                 ; exit -> DOWN -> rebuild
               (begin
-                (when notify (send notify (vector 'postgresql-idle self)))
+                (when notify (send notify (vector 'db-idle self)))
                 (serve-loop c buf notify)))))
-      (`#(postgresql-quit)
+      (`#(db-quit)
         (send-msg! c MSG-TERMINATE empty-bv)     ; Terminate
         (tcp-close! c))
       (`#(tcp-data ,bv)                          ; stray data between queries
@@ -483,20 +484,20 @@
       (`#(tcp-error ,e) (tcp-close! c))))
 
   ;; After reporting up, wait to be adopted (the pool or the connecting
-  ;; caller answers with postgresql-adopt). If nobody adopts -- the caller
-  ;; timed out and moved on, or the pool was closed while we were still
+  ;; caller answers with db-adopt). If nobody adopts -- the caller timed
+  ;; out and moved on, or the pool was closed while we were still
   ;; authenticating -- close the socket and exit instead of holding an
   ;; authenticated connection forever.
   (define (await-adoption c buf notify)
     (receive (after connect-timeout-ms (tcp-close! c))
-      (`#(postgresql-adopt) (serve-loop c buf notify))
-      (`#(postgresql-quit) (send-msg! c MSG-TERMINATE empty-bv) (tcp-close! c))
+      (`#(db-adopt) (serve-loop c buf notify))
+      (`#(db-quit) (send-msg! c MSG-TERMINATE empty-bv) (tcp-close! c))
       (`#(tcp-data ,bv) (inbuf-append! buf bv) (await-adoption c buf notify))
       (`#(tcp-eof) (tcp-close! c))
       (`#(tcp-error ,e) (tcp-close! c))))
 
-  ;; spawn a connection worker; reports #(postgresql-up ,ref ,self status)
-  ;; to report-to -- ref lets the receiver ignore a stale report from an
+  ;; spawn a connection worker; reports #(db-up ,ref ,self status) to
+  ;; report-to -- ref lets the receiver ignore a stale report from an
   ;; earlier, timed-out attempt -- then waits for adoption and serves
   ;; queries (notifying `notify` when idle). Every failure path closes the
   ;; socket: the uv handle is freed only by tcp-close!, so skipping it
@@ -506,7 +507,7 @@
     (spawn
       (lambda ()
         (define (report! status)
-          (send report-to (vector 'postgresql-up ref self status)))
+          (send report-to (vector 'db-up ref self status)))
         (let ((started (guard (e (#t (as-postgresql-error e "connect failed")))
                          (tcp-connect! host port self)
                          'ok)))
@@ -532,229 +533,19 @@
                         (begin (report! 'ok) (await-adoption c buf notify))
                         (begin (tcp-close! c) (report! r)))))))))))
 
-  ;; ---- connection pool ---------------------------------------------------
+  ;; ---- pool + public API ---------------------------------------------------
+  ;; The pool, lease and transaction machinery is (igropyr sqlpool), shared
+  ;; with (igropyr mysql); this driver contributes the wire protocol above
+  ;; and its error shapes below.
 
-  ;; Fixed pool of n connections behind a dispatcher process. Queries go to
-  ;; an idle connection or wait in a FIFO; replies flow directly from the
-  ;; connection to the caller. Dead connections are replaced automatically
-  ;; (1s backoff on failed connects); a caller whose connection dies
-  ;; mid-query gets #(postgresql-error transport ...) exactly once.
-  (define (pool-loop n host port user password db opts)
-    (define me self)
-    (define idle '())
-    (define busy (make-eq-hashtable))   ; conn pid -> (caller-pid . ref)
-    ;; transaction leases: a whole connection handed to one borrower for the
-    ;; extent of a transaction, kept out of query rotation until checked back
-    ;; in (or its borrower dies). Each lease is its own record -- keyed by
-    ;; connection, carrying the borrower, its monitor and the checkout ref --
-    ;; so one borrower holding several leases (nested checkouts) never
-    ;; clobbers its own bookkeeping.
-    (define leased (make-eq-hashtable))       ; conn pid -> #(borrower mon ref)
-    (define dying (make-eq-hashtable))        ; conn pid -> #t (being torn down)
-    (define pending-front '())
-    (define pending-back '())
-    (define (pending?) (or (pair? pending-front) (pair? pending-back)))
-    (define (pop-pending!)
-      (when (null? pending-front)
-        (set! pending-front (reverse pending-back))
-        (set! pending-back '()))
-      (let ((x (car pending-front)))
-        (set! pending-front (cdr pending-front))
-        x))
-    ;; checkout requests waiting for a free connection; each is (ref . from)
-    (define co-front '())
-    (define co-back '())
-    (define (co-pending?) (or (pair? co-front) (pair? co-back)))
-    (define (pop-co!)
-      (when (null? co-front)
-        (set! co-front (reverse co-back))
-        (set! co-back '()))
-      (let ((x (car co-front)))
-        (set! co-front (cdr co-front))
-        x))
-    (define (connect!)
-      (monitor (start-connection host port user password db opts me me (gensym))))
-    ;; a job is #(sql ref from)
-    (define (assign! c job)
-      (hashtable-set! busy c (cons (vector-ref job 2) (vector-ref job 1)))
-      (send c (vector 'postgresql-query (vector-ref job 0)
-                      (vector-ref job 1) (vector-ref job 2))))
-    ;; hand connection c to a checkout request req = (ref . from), and
-    ;; monitor the borrower: the supervisor killing a stuck worker discards
-    ;; its dynamic-wind winders (see actor @kill), so the checkin never runs
-    ;; -- this monitor is the only thing that reclaims the connection.
-    (define (lease! c req)
-      (let ((ref (car req)) (from (cdr req)))
-        (hashtable-set! leased c (vector from (monitor from) ref))
-        (send from (vector 'postgresql-checkout-reply ref c))))
-    (define (drop-lease! c entry)
-      (demonitor (vector-ref entry 1))
-      (hashtable-delete! leased c))
-    ;; all (conn . entry) leases held by borrower pid
-    (define (leases-of pid)
-      (let ((ks (hashtable-keys leased)) (acc '()))
-        (do ((i 0 (+ i 1))) ((= i (vector-length ks)) acc)
-          (let* ((c (vector-ref ks i)) (e (hashtable-ref leased c #f)))
-            (when (and e (eq? (vector-ref e 0) pid))
-              (set! acc (cons (cons c e) acc)))))))
-    ;; the lease created for checkout ref by borrower from, or #f
-    (define (lease-by-ref ref from)
-      (let ((ks (hashtable-keys leased)))
-        (let loop ((i 0))
-          (if (= i (vector-length ks))
-              #f
-              (let* ((c (vector-ref ks i)) (e (hashtable-ref leased c #f)))
-                (if (and e (eq? (vector-ref e 0) from) (eq? (vector-ref e 2) ref))
-                    (cons c e)
-                    (loop (+ i 1))))))))
-    ;; alternate between the single-query queue and checkout waiters when
-    ;; both are non-empty, so a sustained stream of one kind cannot starve
-    ;; the other past its timeout
-    (define co-turn #f)
-    (define (make-available! c)
-      (hashtable-delete! busy c)
-      (cond
-        ((and (pending?) (co-pending?))
-         (if co-turn
-             (begin (set! co-turn #f) (lease! c (pop-co!)))
-             (begin (set! co-turn #t) (assign! c (pop-pending!)))))
-        ((pending?) (assign! c (pop-pending!)))
-        ((co-pending?) (lease! c (pop-co!)))
-        (else (set! idle (cons c idle)))))
-    (do ((i 0 (+ i 1))) ((= i n)) (connect!))
-    (let loop ()
-      (receive
-        (`#(postgresql-query ,sql ,ref ,from)
-          (let ((job (vector sql ref from)))
-            (if (pair? idle)
-                (let ((c (car idle)))
-                  (set! idle (cdr idle))
-                  (assign! c job))
-                (set! pending-back (cons job pending-back))))
-          (loop))
-        (`#(postgresql-idle ,c)
-          ;; a leased connection pings idle after each of its transaction
-          ;; queries -- ignore those, it stays with its lessee; likewise skip
-          ;; a connection we are tearing down.
-          (unless (or (hashtable-ref leased c #f) (hashtable-ref dying c #f))
-            (make-available! c))
-          (loop))
-        (`#(postgresql-conn-dead ,c)
-          ;; the connection already sent the transport-error reply to its
-          ;; caller and is about to exit: clear the busy entry so the DOWN
-          ;; below does not send a duplicate reply, and mark it dying so
-          ;; the DOWN still rebuilds it.
-          (hashtable-delete! busy c)
-          (hashtable-set! dying c #t)
-          (loop))
-        (`#(postgresql-checkout ,ref ,from)
-          (if (pair? idle)
-              (let ((c (car idle)))
-                (set! idle (cdr idle))
-                (lease! c (cons ref from)))
-              (set! co-back (cons (cons ref from) co-back)))
-          (loop))
-        (`#(postgresql-checkin ,from ,c)
-          ;; only when c really is leased to `from` -- guards a stale or double
-          ;; checkin (e.g. after the connection already died and was rebuilt).
-          (let ((e (hashtable-ref leased c #f)))
-            (when (and e (eq? (vector-ref e 0) from))
-              (drop-lease! c e)
-              (make-available! c)))
-          (loop))
-        (`#(postgresql-checkin-broken ,from ,c)
-          ;; the lessee could not clean the connection (e.g. ROLLBACK failed):
-          ;; drop the lease and destroy+rebuild it rather than ever lending a
-          ;; possibly-open transaction to the next caller.
-          (let ((e (hashtable-ref leased c #f)))
-            (when (and e (eq? (vector-ref e 0) from))
-              (drop-lease! c e)
-              (hashtable-set! dying c #t)
-              (send c (vector 'postgresql-quit))))   ; -> DOWN -> rebuild
-          (loop))
-        (`#(postgresql-checkout-cancel ,ref ,from)
-          ;; a checkout timed out: drop its still-queued request so a freed
-          ;; connection is never leased to a borrower that has moved on. If the
-          ;; pool already leased one to it (raced the timeout), reclaim exactly
-          ;; that lease -- matched by ref, so other leases the same borrower
-          ;; holds are untouched.
-          (set! co-front (filter (lambda (x) (not (eq? (car x) ref))) co-front))
-          (set! co-back  (filter (lambda (x) (not (eq? (car x) ref))) co-back))
-          (let ((hit (lease-by-ref ref from)))
-            (when hit
-              (drop-lease! (car hit) (cdr hit))
-              (make-available! (car hit))))
-          (loop))
-        (`#(postgresql-up ,ref ,pid ,status)
-          (if (eq? status 'ok)
-              (begin
-                (send pid (vector 'postgresql-adopt))
-                (make-available! pid))
-              ;; failed connect: retry after a delay
-              (spawn (lambda ()
-                       (sleep-ms 1000)
-                       (send me (vector 'pool-reconnect)))))
-          (loop))
-        (`#(pool-reconnect)
-          (connect!)
-          (loop))
-        (`#(DOWN ,pid ,reason)
-          (cond
-            ;; (1) a transaction borrower died (a crash, or the supervisor
-            ;; killing a stuck worker -- winders discarded, so no checkin ran).
-            ;; Its connections may hold half-open transactions: destroy every
-            ;; one it held and let each connection's own DOWN below rebuild a
-            ;; clean replacement.
-            ((pair? (leases-of pid))
-             (for-each
-               (lambda (hit)
-                 (drop-lease! (car hit) (cdr hit))
-                 (hashtable-set! dying (car hit) #t)
-                 (send (car hit) (vector 'postgresql-quit)))
-               (leases-of pid)))
-            ;; (2) a connection died (idle, mid single-query, leased, or one we
-            ;; are already tearing down). Fail any waiting single-query caller,
-            ;; drop a lease if it held one, and rebuild.
-            ((or (memq pid idle) (hashtable-contains? busy pid)
-                 (hashtable-ref leased pid #f) (hashtable-ref dying pid #f))
-             (set! idle (remq pid idle))
-             (hashtable-delete! dying pid)
-             (let ((entry (hashtable-ref busy pid #f)))
-               (hashtable-delete! busy pid)
-               (when entry
-                 (send (car entry)
-                       (vector 'postgresql-reply (cdr entry)
-                               (vector 'postgresql-error 'transport
-                                       "connection lost")))))
-             (let ((e (hashtable-ref leased pid #f)))
-               (when e (drop-lease! pid e)))
-             (connect!)))
-          (loop))
-        (`#(postgresql-quit)
-          (for-each (lambda (c) (send c (vector 'postgresql-quit))) idle)
-          (vector-for-each
-            (lambda (c) (send c (vector 'postgresql-quit)))
-            (hashtable-keys busy))
-          (vector-for-each
-            (lambda (c) (send c (vector 'postgresql-quit)))
-            (hashtable-keys leased))
-          ;; connections still authenticating self-terminate: nobody adopts
-          ;; them once this process is gone. Queued callers get an error now
-          ;; instead of parking until their timeouts.
-          (let ((closed (vector 'postgresql-error 'transport "pool closed")))
-            (for-each
-              (lambda (job)
-                (send (vector-ref job 2)
-                      (vector 'postgresql-reply (vector-ref job 1) closed)))
-              (append pending-front (reverse pending-back)))
-            (for-each
-              (lambda (req)
-                (send (cdr req)
-                      (vector 'postgresql-checkout-failed (car req) closed)))
-              (append co-front (reverse co-back))))
-          'done))))
-
-  ;; ---- public API --------------------------------------------------------
+  (define cfg
+    (make-sql-cfg
+      (lambda (r) (and (vector? r) (eq? (vector-ref r 0) 'postgresql-error)))
+      (vector 'postgresql-error 'transport "connection lost")
+      (vector 'postgresql-error 'transport "pool closed")
+      (vector 'postgresql-error 'timeout "query timeout")
+      (vector 'postgresql-error 'timeout "checkout timeout")
+      "BEGIN"))
 
   (define (conn-args rest user)
     (values (if (and (pair? rest) (car rest)) (car rest) user)
@@ -774,9 +565,9 @@
                     ;; its socket by itself; the ref keeps its late up-report
                     ;; from ever being mistaken for another connect's.
                     (raise (vector 'postgresql-error 'transport "connect timeout")))
-          (`#(postgresql-up ,@ref ,pid ,status)
+          (`#(db-up ,@ref ,pid ,status)
             (if (eq? status 'ok)
-                (begin (send pid (vector 'postgresql-adopt)) pid)
+                (begin (send pid (vector 'db-adopt)) pid)
                 (raise status)))))))
 
   ;; Pool of n connections; returns the dispatcher, which postgresql-query
@@ -785,100 +576,36 @@
   ;; db + options as postgresql-connect.
   (define (postgresql-pool n host port user password . rest)
     (let-values (((db opts) (conn-args rest user)))
-      (spawn (lambda () (pool-loop n host port user password db opts)))))
+      (spawn
+        (lambda ()
+          (sql-pool-loop n
+            (lambda (notify report-to ref)
+              (start-connection host port user password db opts
+                                notify report-to ref))
+            cfg)))))
 
-  ;; Run one SQL statement; blocks only the calling green process. The
-  ;; per-call ref (a fresh gensym) is echoed in the reply, so a late reply
-  ;; after a timeout will not be matched by the caller's next query. A
+  ;; Run one SQL statement; blocks only the calling green process. A
   ;; 'timeout error means the statement's outcome is UNKNOWN -- it may
   ;; still execute on the server.
-  (define (postgresql-query mc sql)
-    (let ((ref (gensym)))
-      (send mc (vector 'postgresql-query sql ref self))
-      (receive (after query-timeout-ms
-                  (raise (vector 'postgresql-error 'timeout "query timeout")))
-        (`#(postgresql-reply ,@ref ,r)
-          (if (and (vector? r) (eq? (vector-ref r 0) 'postgresql-error))
-              (raise r)
-              r)))))
-
-  ;; ---- transactions: borrow a whole pool connection ----------------------
-
-  ;; Ask the pool for a dedicated connection and park until one is free (or
-  ;; raise #(postgresql-error timeout "checkout timeout") -- the pool is
-  ;; saturated, nothing is broken). Internal: callers use
-  ;; call-with-postgresql-connection / postgresql-transaction, which
-  ;; guarantee checkin.
-  (define (pool-checkout pool)
-    (let ((ref (gensym)))
-      (send pool (vector 'postgresql-checkout ref self))
-      (receive (after checkout-timeout-ms
-                  (send pool (vector 'postgresql-checkout-cancel ref self))
-                  (raise (vector 'postgresql-error 'timeout "checkout timeout")))
-        (`#(postgresql-checkout-reply ,@ref ,conn) conn)
-        (`#(postgresql-checkout-failed ,@ref ,err) (raise err)))))
+  (define (postgresql-query mc sql) (sql-query mc sql cfg))
 
   ;; Borrow one whole connection from a POOL for the extent of proc, then
   ;; return it -- even if proc raises or exits non-locally. proc receives the
   ;; connection process; run postgresql-query on THAT connection and no other
   ;; caller's query can interleave. Requires a postgresql-pool. Don't send
   ;; queries (or a second checkout) to the pool itself while holding a
-  ;; connection: an exhausted pool deadlocks the former and delays the
-  ;; latter.
+  ;; connection.
   (define (call-with-postgresql-connection pool proc)
-    (let ((conn (pool-checkout pool)))
-      (dynamic-wind
-        (lambda () (void))
-        (lambda () (proc conn))
-        (lambda () (send pool (vector 'postgresql-checkin self conn))))))
+    (sql-call-with-connection pool proc cfg))
 
-  ;; ROLLBACK on a borrowed connection without parking a full query timeout
-  ;; when the connection is already dead: monitor it, so a dead process
-  ;; answers with an immediate DOWN instead of 60 seconds of silence.
-  ;; -> #t when the connection cannot be returned clean.
-  (define (rollback! conn)
-    (let ((m (monitor conn)) (ref (gensym)))
-      (let ((broken
-             (guard (e (#t #t))
-               (send conn (vector 'postgresql-query "ROLLBACK" ref self))
-               (receive (after query-timeout-ms #t)
-                 (`#(postgresql-reply ,@ref ,r)
-                   (and (vector? r) (eq? (vector-ref r 0) 'postgresql-error)))
-                 (`#(DOWN ,@conn ,reason) #t)))))
-        (when m
-          (demonitor m)
-          ;; a DOWN already queued between the reply and the demonitor
-          ;; would sit unmatched forever -- drain it
-          (receive (after 0 'ok) (`#(DOWN ,@conn ,reason) 'ok)))
-        broken)))
-
-  ;; Run proc inside a transaction on a borrowed pool connection: BEGIN
-  ;; first, then COMMIT if proc returns normally, or ROLLBACK if it escapes.
-  ;; Returns proc's value. proc receives the connection; issue every statement
-  ;; of the transaction on it. Requires a postgresql-pool. If the borrower is
-  ;; killed before it can commit/rollback, the pool discards and rebuilds the
-  ;; connection, so a half-open transaction is never handed to the next caller.
+  ;; Run proc inside a transaction on a borrowed pool connection: BEGIN,
+  ;; then COMMIT if proc returns normally, or ROLLBACK if it escapes.
+  ;; Returns proc's value. Requires a postgresql-pool. If the borrower is
+  ;; killed before it can commit/rollback, the pool discards and rebuilds
+  ;; the connection, so a half-open transaction is never handed to the
+  ;; next caller.
   (define (postgresql-transaction pool proc)
-    (let ((conn (pool-checkout pool)))
-      (let ((committed #f) (broken #f))
-        (dynamic-wind
-          (lambda () (void))
-          (lambda ()
-            (postgresql-query conn "BEGIN")
-            (let ((r (proc conn)))
-              (postgresql-query conn "COMMIT")
-              (set! committed #t)
-              r))
-          (lambda ()
-            (unless committed
-              ;; roll back; if ROLLBACK fails (or the connection is dead)
-              ;; the transaction may still be open, so flag the connection
-              ;; for discard instead of returning it dirty.
-              (set! broken (rollback! conn)))
-            (send pool (vector (if broken 'postgresql-checkin-broken
-                                   'postgresql-checkin)
-                               self conn)))))))
+    (sql-transaction pool proc cfg))
 
-  (define (postgresql-close! mc)
-    (send mc (vector 'postgresql-quit)))
+  (define (postgresql-close! mc) (sql-close! mc))
 )

@@ -61,6 +61,7 @@
     ("igropyr/apple-jws.sc" . 2)
     ("igropyr/kdf.sc" . 2)
     ("igropyr/redis.sc" . 2)
+    ("igropyr/sqlpool.sc" . 2)
     ("igropyr/mysql.sc" . 2)
     ("igropyr/postgresql.sc" . 2)
     ("igropyr/cluster.sc" . 2)))
