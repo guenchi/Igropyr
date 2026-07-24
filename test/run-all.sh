@@ -48,6 +48,8 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/tls.sc
 "$scheme_bin" --script igropyr/test/apple-jws.sc
 "$scheme_bin" --script igropyr/test/kdf.sc
+# mysql option validation (no server needed, always runs)
+"$scheme_bin" --script igropyr/test/mysql-opts.sc
 # opt-in (needs a live MySQL): runs for real only when IGROPYR_MYSQL_TEST is
 # set, otherwise self-skips, so this is a no-op on machines without a database.
 "$scheme_bin" --script igropyr/test/mysql.sc

@@ -353,6 +353,22 @@
         (check "execute-bind-echo"
           (equal? r (vector 'rows '("p1" "p2" "p3" "p4")
                             '(("a'b;--" "42" #f "2.5"))))))
+      ;; non-finite floats must be spelled PostgreSQL's way on the wire
+      (let ((r (postgresql-execute conn "SELECT $1, $2, $3"
+                                   +inf.0 -inf.0 +nan.0)))
+        (check "execute-nonfinite-spelling"
+          (equal? (vector-ref r 2) '(("Infinity" "-Infinity" "NaN")))))
+      ;; >65535 params: caller-side assertion, connection survives
+      (check "param-overflow-is-callers-error"
+        (guard (e ((not (and (vector? e)
+                             (eq? (vector-ref e 0) 'postgresql-error)))
+                   #t))
+          (apply postgresql-execute conn "SELECT 1"
+                 (vector->list (make-vector 65536 1)))
+          #f))
+      (let ((r (postgresql-query conn "SELECT after-overflow")))
+        (check "usable-after-param-overflow"
+          (equal? r (vector 'rows '("a" "b") '(("42" #f))))))
       (postgresql-close! conn))
 
     ;; 4. wrong password -> SQLSTATE 28P01 from the server verifier

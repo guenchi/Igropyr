@@ -18,6 +18,9 @@
 ;;; a connection, and reclaims + rebuilds a connection whose borrower is
 ;;; killed mid-transaction (dynamic-wind does NOT run then).
 
+;; NOTE: importing (igropyr tls) below loads OpenSSL at import time, so
+;; running THIS file needs OpenSSL installed even when the PG_TLS section
+;; is skipped (run-all.sh already requires OpenSSL via test/tls.sc).
 (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr postgresql)
         (only (igropyr tls) tls-establish!))
 
@@ -194,6 +197,24 @@
                    (string-append "SELECT name FROM " table "_ex WHERE id = $1")
                    2)))
           (equal? (vector-ref r 2) '((#f)))))
+      ;; non-finite floats round-trip: PostgreSQL spells them Infinity/NaN
+      (check "execute-infinity-roundtrip"
+        (equal? '(("Infinity" "NaN"))
+                (vector-ref (postgresql-execute pool
+                              "SELECT $1::float8::text, $2::float8::text"
+                              +inf.0 +nan.0)
+                            2)))
+      ;; >65535 parameters is a caller error caught CALLER-side: the pool
+      ;; connection must stay healthy
+      (check "execute-too-many-params-asserts"
+        (guard (e ((not (and (vector? e)
+                             (eq? (vector-ref e 0) 'postgresql-error)))
+                   #t))
+          (apply postgresql-execute pool "SELECT 1"
+                 (vector->list (make-vector 65536 1)))
+          #f))
+      (check "pool-alive-after-param-overflow"
+        (= 1 (scalar-num (postgresql-query pool "SELECT 1"))))
       ;; a server error over the extended flow keeps the connection framed
       (check "execute-error-sqlstate"
         (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'postgresql-error))

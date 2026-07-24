@@ -29,7 +29,7 @@
 
 (library (igropyr sqlpool)
   (export make-sql-cfg
-          sql-pool-loop sql-checkout sql-query sql-rollback!
+          sql-pool-loop sql-query
           sql-transaction sql-call-with-connection sql-close!)
   (import (chezscheme) (igropyr actor))
 
@@ -223,13 +223,14 @@
             ;; one it held and let each connection's own DOWN below rebuild a
             ;; clean replacement, rather than ever returning an open
             ;; transaction to the pool.
-            ((pair? (leases-of pid))
-             (for-each
-               (lambda (hit)
-                 (drop-lease! (car hit) (cdr hit))
-                 (hashtable-set! dying (car hit) #t)
-                 (send (car hit) (vector 'db-quit)))
-               (leases-of pid)))
+            ((let ((hits (leases-of pid))) (and (pair? hits) hits))
+             => (lambda (hits)
+                  (for-each
+                    (lambda (hit)
+                      (drop-lease! (car hit) (cdr hit))
+                      (hashtable-set! dying (car hit) #t)
+                      (send (car hit) (vector 'db-quit)))
+                    hits)))
             ;; (2) a connection died (idle, mid single-query, leased, or one we
             ;; are already tearing down). Fail any waiting single-query caller,
             ;; drop a lease if it held one, and rebuild. Failed connect workers
@@ -273,12 +274,28 @@
 
   ;; ---- caller-side operations ---------------------------------------------
 
+  ;; These operations are strictly synchronous within one green process,
+  ;; so any db-reply / db-checkout-reply / db-checkout-failed sitting in
+  ;; the mailbox at ENTRY is by construction stale -- the late answer to
+  ;; an earlier call that timed out (its gensym ref can never be matched
+  ;; again, and a stale checkout's lease was already reclaimed by the
+  ;; cancel). Drain them here, or a long-lived process that suffers
+  ;; timeouts accumulates immortal messages that slow every later
+  ;; selective-receive scan.
+  (define (drain-stale!)
+    (let loop ()
+      (receive (after 0 'done)
+        (`#(db-reply ,r ,v) (loop))
+        (`#(db-checkout-reply ,r ,conn) (loop))
+        (`#(db-checkout-failed ,r ,e) (loop)))))
+
   ;; Run one SQL statement on a connection or a pool; blocks only the
   ;; calling green process. The per-call ref (a fresh gensym) is echoed in
   ;; the reply, so a late reply after a timeout will not be matched by the
   ;; caller's next query. A timed-out statement's outcome is UNKNOWN -- it
   ;; may still execute on the server.
   (define (sql-query h sql cfg)
+    (drain-stale!)
     (let ((ref (gensym)))
       (send h (vector 'db-query sql ref self))
       (receive (after query-timeout-ms (raise (sql-cfg-query-timeout-err cfg)))
@@ -287,9 +304,10 @@
 
   ;; Ask the pool for a dedicated connection and park until one is free (or
   ;; raise cfg's checkout-timeout-err -- the pool is saturated, nothing is
-  ;; broken). Internal to the drivers: callers use the with-connection /
-  ;; transaction wrappers, which guarantee checkin.
+  ;; broken). Internal: callers use the with-connection / transaction
+  ;; wrappers, which guarantee checkin.
   (define (sql-checkout pool cfg)
+    (drain-stale!)
     (let ((ref (gensym)))
       (send pool (vector 'db-checkout ref self))
       (receive (after checkout-timeout-ms
@@ -363,6 +381,10 @@
             (send pool (vector (if broken 'db-checkin-broken 'db-checkin)
                                self conn)))))))
 
+  ;; Close a pool (or a lone connection). Leased connections are quit
+  ;; immediately: a transaction still in flight on one will time out on
+  ;; its next statement -- close the pool only after its borrowers are
+  ;; done.
   (define (sql-close! h)
     (send h (vector 'db-quit)))
 )

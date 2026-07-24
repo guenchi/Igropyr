@@ -196,8 +196,12 @@
                       (call-with-string-output-port
                         (lambda (p) (write e p))))))))
 
-  ;; blocking: returns (values payload seq); runs in the connection process
-  (define (next-packet! c bufbox)
+  ;; blocking: returns (values payload seq); runs in the connection
+  ;; process. timeout bounds each socket read: connect-timeout-ms during
+  ;; the auth handshake, query-timeout-ms while a query is in flight --
+  ;; a server that stalls mid-handshake holds a connect worker for the
+  ;; connect budget, not the query budget.
+  (define (next-packet! c bufbox timeout)
     (let loop ()
       (let ((buf (unbox bufbox)))
         (if (>= (bytevector-length buf) 4)
@@ -210,11 +214,11 @@
                   (begin
                     (set-box! bufbox (bv-sub buf total (bytevector-length buf)))
                     (values (bv-sub buf 4 total) seq))
-                  (wait-data c bufbox loop)))
-            (wait-data c bufbox loop)))))
+                  (wait-data c bufbox loop timeout)))
+            (wait-data c bufbox loop timeout)))))
 
-  (define (wait-data c bufbox k)
-    (receive (after query-timeout-ms (mysql-fail -1 "server timeout"))
+  (define (wait-data c bufbox k timeout)
+    (receive (after timeout (mysql-fail -1 "server timeout"))
       (`#(tcp-data ,bv)
         (set-box! bufbox (bv-append (unbox bufbox) bv))
         (k))
@@ -350,7 +354,7 @@
          (encrypt-with n e)))
       ((assq-ref opts 'allow-insecure-auth)
        (send-packet! c (bytevector 2) seq)          ; request public key
-       (let-values (((p sq) (next-packet! c bufbox)))
+       (let-values (((p sq) (next-packet! c bufbox connect-timeout-ms)))
          (unless (fx= (bytevector-u8-ref p 0) 1)
            (mysql-fail -1 "expected server public key"))
          (let-values (((n e) (parse-rsa-public-key
@@ -372,7 +376,7 @@
   ;; drive the auth conversation to an OK packet (or raise)
   (define (auth-loop! c bufbox user password nonce opts)
     (let loop ()
-      (let-values (((p seq) (next-packet! c bufbox)))
+      (let-values (((p seq) (next-packet! c bufbox connect-timeout-ms)))
         (let ((b0 (bytevector-u8-ref p 0)))
           (cond
             ((fx= b0 0) 'ok)
@@ -409,7 +413,7 @@
             (else (mysql-fail -1 "unexpected packet during auth")))))))
 
   (define (authenticate! c bufbox user password db opts)
-    (let-values (((p seq) (next-packet! c bufbox)))
+    (let-values (((p seq) (next-packet! c bufbox connect-timeout-ms)))
       (let-values (((nonce plugin) (parse-handshake p)))
         (let ((token (cond
                        ((string=? plugin "caching_sha2_password")
@@ -442,7 +446,7 @@
 
   (define (run-query! c bufbox sql)
     (send-packet! c (bv-append (bytevector 3) (string->utf8 sql)) 0)
-    (let-values (((p seq) (next-packet! c bufbox)))
+    (let-values (((p seq) (next-packet! c bufbox query-timeout-ms)))
       (let ((b0 (bytevector-u8-ref p 0)))
         (cond
           ((fx= b0 0) (parse-ok p))
@@ -452,16 +456,16 @@
              ;; column definitions
              (let cols ((i 0) (names '()))
                (if (< i ncols)
-                   (let-values (((cp cs) (next-packet! c bufbox)))
+                   (let-values (((cp cs) (next-packet! c bufbox query-timeout-ms)))
                      (cols (+ i 1) (cons (column-name cp) names)))
                    (let ((names (reverse names)))
                      ;; EOF after columns
-                     (let-values (((ep es) (next-packet! c bufbox)))
+                     (let-values (((ep es) (next-packet! c bufbox query-timeout-ms)))
                        (unless (eof-packet? ep)
                          (mysql-fail -1 "expected EOF after columns")))
                      ;; rows until EOF
                      (let rows ((acc '()))
-                       (let-values (((rp rs) (next-packet! c bufbox)))
+                       (let-values (((rp rs) (next-packet! c bufbox query-timeout-ms)))
                          (cond
                            ((eof-packet? rp)
                             (vector 'rows names (reverse acc)))
@@ -575,6 +579,15 @@
       (vector 'mysql-error -1 "checkout timeout")
       "START TRANSACTION"))
 
+  ;; A 'tls option is the postgresql client's idiom; this client does not
+  ;; speak TLS. Ignoring it silently would hand the caller a PLAINTEXT
+  ;; connection while they believe the traffic is encrypted -- the one
+  ;; downgrade that must never be silent -- so it is rejected loudly.
+  (define (reject-tls-opt! opts)
+    (when (and (pair? opts) (assq 'tls opts))
+      (raise (vector 'mysql-error -1
+               "the mysql client does not support the 'tls option"))))
+
   ;; Connect + authenticate a single connection; returns the connection
   ;; process or raises #(mysql-error code msg). Optional args after the
   ;; password: db name, then an options alist, e.g.
@@ -582,9 +595,12 @@
   ;;     '((server-public-key . "-----BEGIN PUBLIC KEY-----...")))
   ;; Options: 'server-public-key (pin the RSA key for full auth),
   ;;          'allow-insecure-auth (permit fetching it over plaintext).
+  ;; TLS is NOT supported; a 'tls option raises rather than silently
+  ;; producing a plaintext connection.
   (define (mysql-connect host port user password . rest)
     (let ((db (if (pair? rest) (car rest) #f))
           (opts (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) '())))
+      (reject-tls-opt! opts)
       (let ((ref (gensym)))
         (start-connection host port user password db opts #f self ref)
         (receive (after (+ connect-timeout-ms 2000)
@@ -604,6 +620,7 @@
   (define (mysql-pool n host port user password . rest)
     (let ((db (if (pair? rest) (car rest) #f))
           (opts (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) '())))
+      (reject-tls-opt! opts)
       (spawn
         (lambda ()
           (sql-pool-loop n

@@ -83,6 +83,11 @@
                 base64-encode base64-decode))
 
   (define connect-timeout-ms 10000)
+  ;; per-socket-read clock while a QUERY is in flight (the caller-facing
+  ;; query timeout is (igropyr sqlpool)'s own, same value); auth-phase
+  ;; reads use connect-timeout-ms instead, so a server that stalls
+  ;; mid-handshake holds a connect worker for the connect budget, not
+  ;; the query budget.
   (define query-timeout-ms 60000)
 
   ;; Upper bound on a single server message. PostgreSQL rows can be
@@ -187,7 +192,10 @@
     (let ((cl (tx-closer t))) (when cl (cl)))
     (tcp-close! (tx-c t)))
 
-  ;; c below is always a tx.
+  ;; In the framing/protocol functions below (send-msg!, next-msg!,
+  ;; wait-data, auth, queries, serve-loop) c is always a tx; only
+  ;; setup-transport! and start-connection's connect path handle the
+  ;; raw libuv connection.
   (define (send-msg! c type payload) (tx-write! c (msg type payload)))
 
   (define MSG-QUERY     (char->integer #\Q))
@@ -240,7 +248,9 @@
   ;; O(1) and consuming a message is O(1), so a result set of many
   ;; DataRow messages costs one copy per message, not one copy of the
   ;; whole remaining buffer per message.
-  (define (next-msg! c buf)
+  ;; timeout bounds each socket read: connect-timeout-ms during
+  ;; startup/auth, query-timeout-ms while a query is in flight.
+  (define (next-msg! c buf timeout)
     (let loop ()
       (if (>= (inbuf-length buf) 5)
           (let* ((bv (inbuf-bv buf))
@@ -254,11 +264,11 @@
                   (let ((payload (inbuf-sub buf 5 total)))
                     (inbuf-consume! buf total)
                     (values type payload))
-                  (wait-data c buf loop))))
-          (wait-data c buf loop))))
+                  (wait-data c buf loop timeout))))
+          (wait-data c buf loop timeout))))
 
-  (define (wait-data c buf k)
-    (receive (after query-timeout-ms (postgresql-fail 'transport "server timeout"))
+  (define (wait-data c buf k timeout)
+    (receive (after timeout (postgresql-fail 'transport "server timeout"))
       (`#(tcp-data ,bv)
         (inbuf-append! buf (tx-decode c bv))
         (k))
@@ -270,7 +280,7 @@
   ;; informational and must not fail the handshake.
   (define (next-msg!/skip-notices c buf)
     (let loop ()
-      (let-values (((t p) (next-msg! c buf)))
+      (let-values (((t p) (next-msg! c buf connect-timeout-ms)))
         (if (fx= t (char->integer #\N))
             (loop)
             (values t p)))))
@@ -394,7 +404,7 @@
   (define (authenticate! c buf user password db opts)
     (tx-write! c (startup-msg user db))
     (let loop ()
-      (let-values (((t p) (next-msg! c buf)))
+      (let-values (((t p) (next-msg! c buf connect-timeout-ms)))
         (case (integer->char t)
           ((#\R)
            (let ((code (read-u32-be p 0)))
@@ -431,7 +441,7 @@
   ;; and notices; consume through the first ReadyForQuery ('Z').
   (define (finish-startup! c buf)
     (let loop ()
-      (let-values (((t p) (next-msg! c buf)))
+      (let-values (((t p) (next-msg! c buf connect-timeout-ms)))
         (case (integer->char t)
           ((#\Z) 'ok)
           ((#\E) (raise (error-response->fail p)))
@@ -485,7 +495,7 @@
   ;; silently discarding the rows and reporting success.
   (define (read-response! c buf)
     (let loop ((names #f) (rows '()) (result #f) (err #f))
-      (let-values (((t p) (next-msg! c buf)))
+      (let-values (((t p) (next-msg! c buf query-timeout-ms)))
         (case (integer->char t)
           ((#\T) (loop (parse-row-desc p) '() result err))
           ((#\D) (loop names (cons (parse-data-row p) rows) result err))
@@ -517,28 +527,59 @@
   ;; Execute + Sync, pipelined in one write. On any error the server skips
   ;; to Sync and answers ReadyForQuery, so framing holds without special
   ;; casing.
-  (define (extended-msgs sql params)
+  ;;
+  ;; Describe (the unnamed portal) + Execute (no row limit) + Sync never
+  ;; change: 22 constant bytes, built once. Parse+Bind are written into
+  ;; one sized buffer -- this runs once per execute on the request path,
+  ;; so it should not shower the allocator with intermediates.
+  (define extended-tail
     (bv-append
-      (msg MSG-PARSE (bv-append (bytevector 0)      ; unnamed statement
-                                (cstr sql)
-                                (u16 0)))           ; no forced param types
-      (msg MSG-BIND
-        (apply bv-append
-          (bytevector 0)                            ; unnamed portal
-          (bytevector 0)                            ; unnamed statement
-          (u16 0)                                   ; param formats: all text
-          (u16 (length params))
-          (append
-            (map (lambda (v)
-                   (if v
-                       (bv-append (u32 (bytevector-length v)) v)
-                       (u32 #xFFFFFFFF)))           ; -1 == NULL
-                 params)
-            (list (u16 0)))))                       ; result formats: all text
-      (msg MSG-DESCRIBE (bv-append (bytevector (char->integer #\P))
-                                   (bytevector 0))) ; the unnamed portal
-      (msg MSG-EXECUTE (bv-append (bytevector 0) (u32 0)))  ; no row limit
+      (msg MSG-DESCRIBE (bytevector (char->integer #\P) 0))
+      (msg MSG-EXECUTE (bytevector 0 0 0 0 0))
       (msg MSG-SYNC empty-bv)))
+
+  (define (extended-msgs sql params)
+    (let* ((sqlbv (string->utf8 sql))
+           (sqln (bytevector-length sqlbv))
+           (parse-body (fx+ sqln 4))               ; NUL + sql NUL + Int16
+           ;; portal NUL + stmt NUL + Int16 fmts + Int16 nparams +
+           ;; per param Int32 [+ bytes] + Int16 result fmts
+           (bind-body
+            (fold-left (lambda (n p)
+                         (fx+ n 4 (if p (bytevector-length p) 0)))
+                       8 params))
+           (tail-n (bytevector-length extended-tail))
+           (out (make-bytevector (fx+ 10 parse-body bind-body tail-n))))
+      ;; Parse
+      (bytevector-u8-set! out 0 MSG-PARSE)
+      (bytevector-u32-set! out 1 (fx+ 4 parse-body) (endianness big))
+      (bytevector-u8-set! out 5 0)                 ; unnamed statement
+      (bytevector-copy! sqlbv 0 out 6 sqln)
+      (bytevector-u8-set! out (fx+ 6 sqln) 0)
+      (bytevector-u16-set! out (fx+ 7 sqln) 0 (endianness big)) ; no forced types
+      ;; Bind
+      (let ((b (fx+ 5 parse-body)))
+        (bytevector-u8-set! out b MSG-BIND)
+        (bytevector-u32-set! out (fx+ b 1) (fx+ 4 bind-body) (endianness big))
+        (bytevector-u8-set! out (fx+ b 5) 0)       ; unnamed portal
+        (bytevector-u8-set! out (fx+ b 6) 0)       ; unnamed statement
+        (bytevector-u16-set! out (fx+ b 7) 0 (endianness big))  ; all text
+        (bytevector-u16-set! out (fx+ b 9) (length params) (endianness big))
+        (let loop ((ps params) (pos (fx+ b 11)))
+          (if (null? ps)
+              (begin
+                (bytevector-u16-set! out pos 0 (endianness big)) ; all text
+                (bytevector-copy! extended-tail 0 out (fx+ pos 2) tail-n)
+                out)
+              (let ((p (car ps)))
+                (if p
+                    (let ((pl (bytevector-length p)))
+                      (bytevector-u32-set! out pos pl (endianness big))
+                      (bytevector-copy! p 0 out (fx+ pos 4) pl)
+                      (loop (cdr ps) (fx+ pos 4 pl)))
+                    (begin                          ; -1 == NULL
+                      (bytevector-u32-set! out pos #xFFFFFFFF (endianness big))
+                      (loop (cdr ps) (fx+ pos 4))))))))))
 
   (define (run-extended! c buf sql params)
     (tx-write! c (extended-msgs sql params))
@@ -572,11 +613,19 @@
                 (when notify (send notify (vector 'db-idle self)))
                 (serve-loop c buf notify)))))
       (`#(db-quit)
-        (send-msg! c MSG-TERMINATE empty-bv)     ; Terminate
+        ;; best-effort Terminate: over TLS the encrypt can fail when the
+        ;; session already saw close_notify -- the close must run anyway,
+        ;; or the fd and the SSL session leak
+        (guard (e (#t (void)))
+          (send-msg! c MSG-TERMINATE empty-bv))
         (tx-close! c))
       (`#(tcp-data ,bv)                          ; stray data between queries
-        (inbuf-append! buf (tx-decode c bv))
-        (serve-loop c buf notify))
+        ;; a codec raise here (corrupted TLS record while idle) must still
+        ;; free the session and the fd; the exit's DOWN makes a pool
+        ;; rebuild the connection
+        (if (guard (e (#t #f)) (inbuf-append! buf (tx-decode c bv)) #t)
+            (serve-loop c buf notify)
+            (tx-close! c)))
       (`#(tcp-eof) (tx-close! c))
       (`#(tcp-error ,e) (tx-close! c))))
 
@@ -588,10 +637,14 @@
   (define (await-adoption c buf notify)
     (receive (after connect-timeout-ms (tx-close! c))
       (`#(db-adopt) (serve-loop c buf notify))
-      (`#(db-quit) (send-msg! c MSG-TERMINATE empty-bv) (tx-close! c))
+      (`#(db-quit)
+        (guard (e (#t (void)))                   ; see serve-loop's db-quit
+          (send-msg! c MSG-TERMINATE empty-bv))
+        (tx-close! c))
       (`#(tcp-data ,bv)
-        (inbuf-append! buf (tx-decode c bv))
-        (await-adoption c buf notify))
+        (if (guard (e (#t #f)) (inbuf-append! buf (tx-decode c bv)) #t)
+            (await-adoption c buf notify)
+            (tx-close! c)))
       (`#(tcp-eof) (tx-close! c))
       (`#(tcp-error ,e) (tx-close! c))))
 
@@ -618,7 +671,14 @@
                    (let ((codec
                           (guard (e (#t (postgresql-fail 'transport
                                           (tls-failure-reason e))))
-                            (connector raw host connect-timeout-ms))))
+                            (let ((v (connector raw host connect-timeout-ms)))
+                              ;; validate the shape inside the guard, so a
+                              ;; misbehaving custom connector surfaces as a
+                              ;; clear tls-tagged error, not a raw assertion
+                              (unless (and (vector? v) (= 3 (vector-length v)))
+                                (error 'postgresql
+                                  "tls: connector returned an invalid codec"))
+                              v))))
                      (make-tx raw (vector-ref codec 0) (vector-ref codec 1)
                               (vector-ref codec 2))))
                   ((and (= 1 (bytevector-length bv))
@@ -632,9 +692,12 @@
               (`#(tcp-error ,e)
                 (postgresql-fail 'transport "connection error")))))))
 
-  ;; the connector raises #(http-client-error "tls: ...") -- keep the text
+  ;; (igropyr tls) raises the neutral #(tls-error "tls: ...") -- keep the
+  ;; text (the older http-client tag is accepted too, for any third-party
+  ;; connector still using it)
   (define (tls-failure-reason e)
-    (if (and (vector? e) (eq? (vector-ref e 0) 'http-client-error)
+    (if (and (vector? e)
+             (memq (vector-ref e 0) '(tls-error http-client-error))
              (> (vector-length e) 1) (string? (vector-ref e 1)))
         (vector-ref e 1)
         (call-with-string-output-port (lambda (p) (write e p)))))
@@ -750,10 +813,18 @@
       ((string? v) (string->utf8 v))
       ((bytevector? v) v)                          ; pre-encoded text bytes
       ((number? v)
-       ;; an exact non-integer would render as "1/3"; send a decimal
        (string->utf8
-         (number->string
-           (if (and (exact? v) (not (integer? v))) (exact->inexact v) v))))
+         (cond
+           ;; PostgreSQL spells non-finite floats its own way; the Scheme
+           ;; literals (+inf.0 etc.) would be rejected with 22P02 even
+           ;; though SELECT returns these values as "Infinity"/"NaN"
+           ((and (flonum? v) (nan? v)) "NaN")
+           ((and (flonum? v) (infinite? v))
+            (if (fl> v 0.0) "Infinity" "-Infinity"))
+           ;; an exact non-integer would render as "1/3"; send a decimal
+           ((and (exact? v) (not (integer? v)))
+            (number->string (exact->inexact v)))
+           (else (number->string v)))))
       (else (assertion-violation 'postgresql-execute
               "parameter must be a string, number, bytevector or #f" v))))
 
@@ -762,6 +833,14 @@
   ;; and cannot inject. Same result shapes and timeout semantics as
   ;; postgresql-query.
   (define (postgresql-execute mc sql . params)
+    ;; Bind carries the parameter count as an Int16: 65535 is the
+    ;; protocol's hard limit. Reject beyond it HERE -- inside the
+    ;; connection process it would surface as a transport error and
+    ;; tear down a healthy connection.
+    (when (> (length params) 65535)
+      (assertion-violation 'postgresql-execute
+        "too many parameters (PostgreSQL allows at most 65535)"
+        (length params)))
     (sql-query mc (cons sql (map param->wire params)) cfg))
 
   ;; Borrow one whole connection from a POOL for the extent of proc, then

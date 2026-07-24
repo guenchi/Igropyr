@@ -29,7 +29,10 @@
 ;;;   - TLS >= 1.2 only
 ;;;   - trust roots from the system store (SSL_CTX_set_default_verify_paths;
 ;;;     the standard SSL_CERT_FILE / SSL_CERT_DIR overrides apply)
-;;; A verification failure surfaces as #(http-client-error "tls: ...").
+;;; Failures raise the neutral #(tls-error "tls: ...") -- this library
+;;; serves any protocol, not just https. The https connector registered
+;;; by tls-enable! re-tags them as #(http-client-error "tls: ...") so
+;;; the http-client error contract is unchanged.
 ;;;
 ;;; Sessions are closed by freeing (no close_notify): the client speaks
 ;;; Connection: close and hard-closes the socket right after, and both
@@ -96,6 +99,8 @@
   (define ERR_get_error     (foreign-procedure "ERR_get_error" () unsigned-long))
   (define ERR_error_string_n
     (foreign-procedure "ERR_error_string_n" (unsigned-long u8* size_t) void))
+  (define SSL_CTX_free      (foreign-procedure "SSL_CTX_free" (void*) void))
+  (define BIO_free          (foreign-procedure "BIO_free" (void*) int))
 
   ;; OpenSSL constants (stable public ABI values)
   (define SSL_VERIFY_PEER 1)
@@ -127,7 +132,7 @@
             (let drain () (unless (zero? (ERR_get_error)) (drain)))
             (string-append "tls: " (bv-prefix->string buf))))))
 
-  (define (die msg) (raise (vector 'http-client-error msg)))
+  (define (die msg) (raise (vector 'tls-error msg)))
 
   ;; ---- context (one per program) ------------------------------------------
 
@@ -141,6 +146,10 @@
           (SSL_CTX_ctrl c SSL_CTRL_SET_MIN_PROTO_VERSION TLS1_2_VERSION 0)
           (SSL_CTX_set_verify c SSL_VERIFY_PEER 0)
           (when (zero? (SSL_CTX_set_default_verify_paths c))
+            ;; free before raising: a caller in a reconnect loop (e.g. a
+            ;; database pool retrying every second) would otherwise leak
+            ;; one SSL_CTX per attempt for the life of the misconfiguration
+            (SSL_CTX_free c)
             (die (tls-reason "tls: no system trust store")))
           (set! ctx c)))))
 
@@ -184,10 +193,16 @@
     (let ((rbio (BIO_new (BIO_s_mem)))
           (wbio (BIO_new (BIO_s_mem))))
       (when (or (zero? rbio) (zero? wbio))
+        ;; free whichever succeeded; ownership passes to the SSL only at
+        ;; SSL_set_bio below
+        (unless (zero? rbio) (BIO_free rbio))
+        (unless (zero? wbio) (BIO_free wbio))
         (die "tls: BIO_new failed"))
       (let ((ssl (SSL_new ctx)))
         (define (fail! msg) (SSL_free ssl) (die msg))   ; frees both BIOs too
-        (when (zero? ssl) (die (tls-reason "tls: SSL_new failed")))
+        (when (zero? ssl)
+          (BIO_free rbio) (BIO_free wbio)
+          (die (tls-reason "tls: SSL_new failed")))
         (SSL_set_bio ssl rbio wbio)
         (if (ip-literal? host)
             (when (zero? (X509_VERIFY_PARAM_set1_ip_asc (SSL_get0_param ssl) host))
@@ -257,11 +272,29 @@
   (define enabled #f)
 
   ;; Idempotent; call once at startup, before the first https request.
+  ;; The registered connector adapts the neutral #(tls-error ...) raises
+  ;; to http-client's own error tag -- for the handshake AND for the
+  ;; returned codec's encrypt/decrypt (a post-handshake failure must
+  ;; surface its "tls: ..." text, not http-client's generic fallback) --
+  ;; preserving http-client's documented contract exactly.
+  (define (retag f)
+    (lambda (bv)
+      (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'tls-error))
+                 (raise (vector 'http-client-error (vector-ref e 1)))))
+        (f bv))))
+
   (define (tls-enable!)
     (ensure-ctx!)
     (with-interrupts-disabled
       (unless enabled
-        (set-https-connector! establish!)
+        (set-https-connector!
+          (lambda (c host timeout)
+            (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'tls-error))
+                       (raise (vector 'http-client-error (vector-ref e 1)))))
+              (let ((codec (establish! c host timeout)))
+                (vector (retag (vector-ref codec 0))
+                        (retag (vector-ref codec 1))
+                        (vector-ref codec 2))))))
         (set! enabled #t)))
     'ok)
 
@@ -272,7 +305,7 @@
   ;; handshake on #(tcp-data ...) messages and returns the codec
   ;; #(encrypt decrypt close!) described above. Verification posture is
   ;; identical to https: peer certificate + hostname (or IP) against the
-  ;; system trust store, TLS >= 1.2. Raises #(http-client-error "tls: ...")
+  ;; system trust store, TLS >= 1.2. Raises #(tls-error "tls: ...")
   ;; on failure, after freeing the session.
   (define (tls-establish! c host timeout)
     (establish! c host timeout))
