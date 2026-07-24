@@ -12,6 +12,7 @@
         (igropyr metrics) (igropyr dashboard) (igropyr http-client)
         (igropyr sigv4) (igropyr s3)
         (igropyr tls)
-        (igropyr redis) (igropyr mysql) (igropyr node) (igropyr dpool) (igropyr cluster))
+        (igropyr redis) (igropyr mysql) (igropyr postgresql)
+        (igropyr node) (igropyr dpool) (igropyr cluster))
 (display "ALL LIBRARIES IMPORTED\n")
 

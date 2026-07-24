@@ -62,6 +62,7 @@
     ("igropyr/kdf.sc" . 2)
     ("igropyr/redis.sc" . 2)
     ("igropyr/mysql.sc" . 2)
+    ("igropyr/postgresql.sc" . 2)
     ("igropyr/cluster.sc" . 2)))
 
 (define (so-path src)
