@@ -51,9 +51,10 @@
 ;;; silently would let an active attacker downgrade past SCRAM and read
 ;;; the password. Pass '((allow-cleartext-auth . #t)) to permit it
 ;;; (appropriate over a trusted local socket). SASLprep normalization
-;;; of non-ASCII passwords is not applied; ASCII passwords (and
-;;; passwords the server stored un-normalized) work, but an NFKC-unstable
-;;; password that logs in via libpq may fail here.
+;;; is not implemented (its Unicode tables dwarf this driver), so
+;;; non-ASCII passwords are REJECTED with a clear error on the SCRAM
+;;; path rather than failing with a baffling 28P01; ASCII passwords are
+;;; exact (SASLprep is the identity on ASCII).
 ;;;
 ;;; TLS: pass the byte-codec connector from (igropyr tls) as the 'tls
 ;;; option and the connection is upgraded via SSLRequest before startup,
@@ -67,7 +68,12 @@
 ;;; The connector travels through the options alist, so this library
 ;;; never imports (igropyr tls) and stays free of the OpenSSL dependency
 ;;; unless the application opts in. If the server refuses TLS the
-;;; connection FAILS -- no silent plaintext fallback. Without 'tls the
+;;; connection FAILS -- no silent plaintext fallback. Over TLS, SCRAM
+;;; channel binding is automatic: when the server offers
+;;; SCRAM-SHA-256-PLUS the client selects it and binds the exchange to
+;;; this TLS channel's server certificate (RFC 5929
+;;; tls-server-end-point), so even a relay MITM with a trusted
+;;; certificate cannot forward the authentication. Without 'tls the
 ;;; client speaks plaintext: an on-path attacker can read query text and
 ;;; results regardless of the auth method, so run plaintext connections
 ;;; only over a trusted network or a local socket.
@@ -180,7 +186,7 @@
   ;; carries #f in all three at zero cost.
 
   (define-record-type (tx make-tx tx?)
-    (fields c enc dec closer))
+    (fields c enc dec closer cb))     ; cb: tls-server-end-point hash or #f
 
   (define (tx-write! t bv)
     (tcp-write! (tx-c t) (let ((e (tx-enc t))) (if e (e bv) bv)) #f))
@@ -347,19 +353,61 @@
       (values (bv-xor client-key client-sig)
               (hmac-sha256 server-key (string->utf8 auth-msg)))))
 
+  ;; SASLprep (RFC 4013) is a Unicode normalization the full tables of
+  ;; which dwarf this whole driver; without it a non-ASCII password can
+  ;; hash to different bytes than the server's stored verifier and fail
+  ;; with a baffling 28P01. ASCII is untouched by SASLprep, so it is
+  ;; exact; anything else is rejected loudly instead.
+  (define (ascii-string? s)
+    (let ((n (string-length s)))
+      (let loop ((i 0))
+        (or (= i n)
+            (and (char<=? (string-ref s i) #\delete)
+                 (loop (+ i 1)))))))
+
   ;; Drive the SASL exchange to AuthenticationSASLFinal (verifying the
   ;; server signature), then return -- the caller reads the trailing
   ;; AuthenticationOk.
+  ;;
+  ;; Channel binding (RFC 5929 tls-server-end-point): over TLS the
+  ;; transport carries the server certificate's hash; when the server
+  ;; also offers SCRAM-SHA-256-PLUS we take it and bind the exchange to
+  ;; this exact TLS channel -- a MITM relaying the SCRAM messages
+  ;; through its own TLS session presents a different certificate hash
+  ;; and the server rejects the proof. The gs2 flag is three-valued:
+  ;;   p=tls-server-end-point  binding in use (PLUS chosen)
+  ;;   y  we could bind but the server offered no PLUS -- if a server
+  ;;      that DID offer PLUS sees this, someone stripped it: rejected
+  ;;   n  no binding available (plaintext connection)
   (define (scram-auth! c buf user password sasl-payload)
-    (unless (member "SCRAM-SHA-256" (sasl-mechanisms sasl-payload))
-      (postgresql-fail 'transport "server offered no SCRAM-SHA-256 mechanism"))
-    (let* ((cnonce (make-client-nonce))
-           (client-first-bare (string-append "n=,r=" cnonce))
-           (client-first (string-append "n,," client-first-bare)))
-      (send-msg! c MSG-PASSWORD
-        (bv-append (cstr "SCRAM-SHA-256")
-                   (u32 (string-length client-first))
-                   (string->utf8 client-first)))
+    (unless (ascii-string? password)
+      (postgresql-fail 'transport
+        (string-append
+          "non-ASCII passwords require SASLprep normalization, which this "
+          "client does not implement; SCRAM authentication would fail "
+          "against a libpq-written verifier")))
+    (let* ((mechs (sasl-mechanisms sasl-payload))
+           (cb (tx-cb c))
+           (plus? (and cb (member "SCRAM-SHA-256-PLUS" mechs) #t)))
+      (unless (or plus? (member "SCRAM-SHA-256" mechs))
+        (postgresql-fail 'transport "server offered no SCRAM-SHA-256 mechanism"))
+      (let* ((mech (if plus? "SCRAM-SHA-256-PLUS" "SCRAM-SHA-256"))
+             (gs2 (cond (plus? "p=tls-server-end-point,,")
+                        (cb "y,,")
+                        (else "n,,")))
+             ;; c= carries base64(gs2-header [+ binding data]); with no
+             ;; binding this is base64("n,,") = the fixed "biws"
+             (cbind (base64-encode
+                      (if plus?
+                          (bv-append (string->utf8 gs2) cb)
+                          (string->utf8 gs2))))
+             (cnonce (make-client-nonce))
+             (client-first-bare (string-append "n=,r=" cnonce))
+             (client-first (string-append gs2 client-first-bare)))
+        (send-msg! c MSG-PASSWORD
+          (bv-append (cstr mech)
+                     (u32 (string-length client-first))
+                     (string->utf8 client-first)))
       (let-values (((t p) (next-msg!/skip-notices c buf)))
         (unless (and (fx= t (char->integer #\R)) (= (read-u32-be p 0) 11))
           (if (fx= t (char->integer #\E))
@@ -377,7 +425,7 @@
                        (string=? (substring snonce 0 (string-length cnonce)) cnonce))
             (postgresql-fail 'transport "malformed SCRAM server-first message"))
           (let* ((salt (base64-decode salt-b64))
-                 (final-noproof (string-append "c=biws,r=" snonce)) ; biws=base64("n,,")
+                 (final-noproof (string-append "c=" cbind ",r=" snonce))
                  (auth-msg (string-append client-first-bare "," server-first
                                           "," final-noproof)))
             (let-values (((proof server-sig) (scram-derive password salt iters auth-msg)))
@@ -393,7 +441,7 @@
                      (unless (and v (bytevector=? (base64-decode v) server-sig))
                        (postgresql-fail 'transport "server signature mismatch"))))
                   ((fx= t2 (char->integer #\E)) (raise (error-response->fail p2)))
-                  (else (postgresql-fail 'transport "expected SASLFinal"))))))))))
+                  (else (postgresql-fail 'transport "expected SASLFinal")))))))))))
 
   ;; ---- authentication ----------------------------------------------------
 
@@ -659,7 +707,7 @@
   (define (setup-transport! raw host opts)
     (let ((connector (assq-ref opts 'tls)))
       (if (not connector)
-          (make-tx raw #f #f #f)
+          (make-tx raw #f #f #f #f)
           (begin
             (tcp-write! raw (bv-append (u32 8) (u32 80877103)) #f) ; SSLRequest
             (receive (after connect-timeout-ms
@@ -675,12 +723,14 @@
                               ;; validate the shape inside the guard, so a
                               ;; misbehaving custom connector surfaces as a
                               ;; clear tls-tagged error, not a raw assertion
-                              (unless (and (vector? v) (= 3 (vector-length v)))
+                              (unless (and (vector? v) (>= (vector-length v) 3))
                                 (error 'postgresql
                                   "tls: connector returned an invalid codec"))
                               v))))
                      (make-tx raw (vector-ref codec 0) (vector-ref codec 1)
-                              (vector-ref codec 2))))
+                              (vector-ref codec 2)
+                              (and (> (vector-length codec) 3)
+                                   (vector-ref codec 3)))))
                   ((and (= 1 (bytevector-length bv))
                         (fx= (bytevector-u8-ref bv 0) (char->integer #\N)))
                    (postgresql-fail 'transport "server refused TLS"))

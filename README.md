@@ -67,7 +67,8 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   same event loop; callers park their green process while the OS thread
   keeps serving. MySQL and PostgreSQL share a self-healing connection
   pool; the PostgreSQL client authenticates with SCRAM-SHA-256, upgrades
-  to optional TLS (`(igropyr tls)`, certificate verified), and offers
+  to optional TLS (`(igropyr tls)`, certificate verified, automatic
+  channel binding via SCRAM-SHA-256-PLUS), and offers
   both the simple query protocol and the extended protocol with
   server-side parameter binding (`$1..$n`, injection impossible)
 - **Non-blocking HTTP & WebSocket clients** — outbound `http-get` /

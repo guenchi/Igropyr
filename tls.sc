@@ -102,6 +102,28 @@
   (define SSL_CTX_free      (foreign-procedure "SSL_CTX_free" (void*) void))
   (define BIO_free          (foreign-procedure "BIO_free" (void*) int))
 
+  ;; peer certificate hash for RFC 5929 tls-server-end-point channel
+  ;; binding (OpenSSL 3 renamed the accessor; 1.1 has only the old name)
+  (define SSL_get-peer-cert
+    (foreign-procedure
+      (if (foreign-entry? "SSL_get1_peer_certificate")
+          "SSL_get1_peer_certificate"
+          "SSL_get_peer_certificate")
+      (void*) void*))
+  (define X509_free (foreign-procedure "X509_free" (void*) void))
+  (define X509_get_signature_nid
+    (foreign-procedure "X509_get_signature_nid" (void*) int))
+  (define OBJ_find_sigid_algs
+    (foreign-procedure "OBJ_find_sigid_algs" (int u8* u8*) int))
+  ;; EVP_get_digestbynid is a macro in OpenSSL 3, not an exported symbol:
+  ;; go nid -> short name -> digest by name instead
+  (define OBJ_nid2sn (foreign-procedure "OBJ_nid2sn" (int) string))
+  (define EVP_get_digestbyname
+    (foreign-procedure "EVP_get_digestbyname" (string) void*))
+  (define EVP_sha256 (foreign-procedure "EVP_sha256" () void*))
+  (define X509_digest
+    (foreign-procedure "X509_digest" (void* void* u8* u8*) int))
+
   ;; OpenSSL constants (stable public ABI values)
   (define SSL_VERIFY_PEER 1)
   (define SSL_CTRL_SET_MIN_PROTO_VERSION 123)
@@ -180,6 +202,40 @@
       (when out (tcp-write! c out #f))))
 
   (define empty-bv (make-bytevector 0))
+
+  ;; RFC 5929 tls-server-end-point channel-binding data: the peer
+  ;; certificate hashed with its signature hash algorithm, MD5/SHA-1
+  ;; upgraded to SHA-256 -- the exact computation PostgreSQL performs
+  ;; server-side, so a SCRAM-SHA-256-PLUS client using this value
+  ;; interoperates. #f when the hash cannot be determined (no peer
+  ;; certificate, or a signature scheme with no retrievable digest).
+  (define NID-md5 4)
+  (define NID-sha1 64)
+  (define (peer-cb-hash ssl)
+    (let ((x (SSL_get-peer-cert ssl)))
+      (if (zero? x)
+          #f
+          (let ((dignid-bv (make-bytevector 4 0))
+                (pknid-bv (make-bytevector 4 0)))
+            (if (zero? (OBJ_find_sigid_algs (X509_get_signature_nid x)
+                                            dignid-bv pknid-bv))
+                (begin (X509_free x) #f)
+                (let* ((dignid (bytevector-s32-native-ref dignid-bv 0))
+                       (md (if (or (= dignid NID-md5) (= dignid NID-sha1))
+                               (EVP_sha256)
+                               (let ((sn (OBJ_nid2sn dignid)))
+                                 (if sn (EVP_get_digestbyname sn) 0)))))
+                  (if (zero? md)
+                      (begin (X509_free x) #f)
+                      (let ((buf (make-bytevector 64 0))
+                            (lenbv (make-bytevector 4 0)))
+                        (let ((r (X509_digest x md buf lenbv)))
+                          (X509_free x)
+                          (and (= r 1)
+                               (let* ((n (bytevector-u32-native-ref lenbv 0))
+                                      (out (make-bytevector n)))
+                                 (bytevector-copy! buf 0 out 0 n)
+                                 out)))))))))))
 
   ;; ---- the connector --------------------------------------------------------
   ;;
@@ -265,7 +321,10 @@
             (unless closed
               (set! closed #t)
               (SSL_free ssl)))
-          (vector encrypt decrypt close!)))))
+          ;; 4th slot: the tls-server-end-point hash for SCRAM channel
+          ;; binding (or #f); https ignores it, the postgresql client
+          ;; feeds it into SCRAM-SHA-256-PLUS.
+          (vector encrypt decrypt close! (peer-cb-hash ssl))))))
 
   ;; ---- public entry ---------------------------------------------------------
 
@@ -303,7 +362,9 @@
   ;; PostgreSQL client after SSLRequest). Must run inside the green
   ;; process that owns the read-started connection c; drives the
   ;; handshake on #(tcp-data ...) messages and returns the codec
-  ;; #(encrypt decrypt close!) described above. Verification posture is
+  ;; #(encrypt decrypt close! cb-hash) -- the first three as described
+  ;; above, cb-hash the RFC 5929 tls-server-end-point value for SCRAM
+  ;; channel binding (or #f when unavailable). Verification posture is
   ;; identical to https: peer certificate + hostname (or IP) against the
   ;; system trust store, TLS >= 1.2. Raises #(tls-error "tls: ...")
   ;; on failure, after freeing the session.

@@ -406,7 +406,16 @@
         (and e (eq? (vector-ref e 1) 'transport)
              (string-contains? (vector-ref e 2) "invalid message length"))))
 
-    ;; 9. server refusing TLS must fail the connection, never fall back to
+    ;; 9. non-ASCII password on the SCRAM path: rejected with a clear error
+    ;;    (SASLprep is not implemented), never a baffling auth failure
+    (let ((e (connect-error "127.0.0.1" port "user"
+                            (string-append "p" (string (integer->char #xE4)) "ss")
+                            "scram")))
+      (check "non-ascii-password-rejected"
+        (and e (eq? (vector-ref e 1) 'transport)
+             (string-contains? (vector-ref e 2) "SASLprep"))))
+
+    ;; 10. server refusing TLS must fail the connection, never fall back to
     ;;    plaintext (the connector must not even be called)
     (let ((e (connect-error "127.0.0.1" port "user" "x" "scram"
                             (list (cons 'tls (lambda args
