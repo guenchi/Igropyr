@@ -13,7 +13,17 @@
 ;;;     ;; -> #(rows ("id" "name") (("1" "Alice") ("2" "Bob")))
 ;;;   (postgresql-query db "INSERT INTO users (name) VALUES ('Eve')")
 ;;;     ;; -> #(ok 1)                          ; affected rows
+;;;   (postgresql-execute db "SELECT name FROM users WHERE id = $1" 2)
+;;;     ;; -> #(rows ("name") (("Bob")))       ; server-side parameter binding
 ;;;   (postgresql-close! db)
+;;;
+;;; postgresql-execute runs one statement over the extended query protocol
+;;; (Parse/Bind/Execute): parameters are sent out-of-band as $1..$n values,
+;;; never spliced into the SQL text, so no quoting or escaping is needed and
+;;; injection through a value is impossible -- prefer it over string
+;;; concatenation whenever a statement takes runtime values. Parameters may
+;;; be strings, numbers, #f (SQL NULL) or bytevectors (raw text-format
+;;; bytes). Unlike postgresql-query it accepts exactly one statement.
 ;;;
 ;;; Values arrive as strings (the wire text format); NULL is #f. The
 ;;; connection asks for client_encoding UTF8 at startup, so text is
@@ -50,7 +60,8 @@
 ;;; over a trusted network or a local socket.
 
 (library (igropyr postgresql)
-  (export postgresql-connect postgresql-pool postgresql-query postgresql-close!
+  (export postgresql-connect postgresql-pool postgresql-query
+          postgresql-execute postgresql-close!
           postgresql-transaction call-with-postgresql-connection)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr buffer)
           (igropyr sqlpool)
@@ -107,6 +118,11 @@
       (bytevector-u32-set! bv 0 v (endianness big))
       bv))
 
+  (define (u16 v)
+    (let ((bv (make-bytevector 2)))
+      (bytevector-u16-set! bv 0 v (endianness big))
+      bv))
+
   (define (read-u32-be bv pos) (bytevector-u32-ref bv pos (endianness big)))
   ;; DataRow column lengths are a signed Int32 (-1 marks SQL NULL).
   (define (read-i32-be bv pos) (bytevector-s32-ref bv pos (endianness big)))
@@ -144,6 +160,11 @@
   (define MSG-PASSWORD  (char->integer #\p))   ; password / SASL response
   (define MSG-COPY-FAIL (char->integer #\f))
   (define MSG-TERMINATE (char->integer #\X))
+  (define MSG-PARSE     (char->integer #\P))   ; extended query protocol
+  (define MSG-BIND      (char->integer #\B))
+  (define MSG-DESCRIBE  (char->integer #\D))
+  (define MSG-EXECUTE   (char->integer #\E))
+  (define MSG-SYNC      (char->integer #\S))
 
   ;; StartupMessage has no type byte: Int32 length + Int32 protocol(3.0) +
   ;; a run of key\0value\0 pairs + a final \0. client_encoding pins the
@@ -418,15 +439,17 @@
            (toks (split-on tag #\space)))
       (or (string->number (car (last-pair toks))) 0)))
 
-  ;; Run one simple-query string. A server SQL error ('E') is remembered and
-  ;; raised only after ReadyForQuery ('Z'), so the connection stays framed
-  ;; and usable. With multiple statements the last result is returned.
+  ;; Read messages through ReadyForQuery ('Z') and build the result. Shared
+  ;; by the simple and extended flows: the extended flow's extra messages
+  ;; (ParseComplete '1', BindComplete '2', NoData 'n') fall into the ignore
+  ;; clause. A server SQL error ('E') is remembered and raised only after
+  ;; 'Z', so the connection stays framed and usable. With multiple simple
+  ;; statements the last result is returned.
   ;; COPY: FROM STDIN is refused with CopyFail (the server then reports a
   ;; normal SQL error); TO STDOUT is not supported -- its data stream is
   ;; consumed and a feature-not-supported error is raised, rather than
   ;; silently discarding the rows and reporting success.
-  (define (run-query! c buf sql)
-    (send-msg! c MSG-QUERY (cstr sql))
+  (define (read-response! c buf)
     (let loop ((names #f) (rows '()) (result #f) (err #f))
       (let-values (((t p) (next-msg! c buf)))
         (case (integer->char t)
@@ -449,7 +472,43 @@
                                  "COPY TO STDOUT is not supported by this client"))))
           ((#\E) (loop names rows result (error-response->fail p)))
           ((#\Z) (if err (raise err) (or result (vector 'ok 0))))
-          (else (loop names rows result err))))))          ; S, N, K, d, c ...
+          (else (loop names rows result err))))))     ; S, N, K, 1, 2, n, d, c
+
+  (define (run-query! c buf sql)
+    (send-msg! c MSG-QUERY (cstr sql))
+    (read-response! c buf))
+
+  ;; The extended flow: Parse (unnamed statement) + Bind (params as text,
+  ;; already converted to bytevector-or-#f by the caller) + Describe +
+  ;; Execute + Sync, pipelined in one write. On any error the server skips
+  ;; to Sync and answers ReadyForQuery, so framing holds without special
+  ;; casing.
+  (define (extended-msgs sql params)
+    (bv-append
+      (msg MSG-PARSE (bv-append (bytevector 0)      ; unnamed statement
+                                (cstr sql)
+                                (u16 0)))           ; no forced param types
+      (msg MSG-BIND
+        (apply bv-append
+          (bytevector 0)                            ; unnamed portal
+          (bytevector 0)                            ; unnamed statement
+          (u16 0)                                   ; param formats: all text
+          (u16 (length params))
+          (append
+            (map (lambda (v)
+                   (if v
+                       (bv-append (u32 (bytevector-length v)) v)
+                       (u32 #xFFFFFFFF)))           ; -1 == NULL
+                 params)
+            (list (u16 0)))))                       ; result formats: all text
+      (msg MSG-DESCRIBE (bv-append (bytevector (char->integer #\P))
+                                   (bytevector 0))) ; the unnamed portal
+      (msg MSG-EXECUTE (bv-append (bytevector 0) (u32 0)))  ; no row limit
+      (msg MSG-SYNC empty-bv)))
+
+  (define (run-extended! c buf sql params)
+    (tcp-write! c (extended-msgs sql params) #f)
+    (read-response! c buf))
 
   ;; ---- connection process ------------------------------------------------
 
@@ -463,9 +522,13 @@
   ;; then rebuilds it.
   (define (serve-loop c buf notify)
     (receive
-      (`#(db-query ,sql ,ref ,from)
+      (`#(db-query ,q ,ref ,from)
+        ;; q is a plain SQL string (simple protocol) or (sql . params)
+        ;; with params pre-converted by postgresql-execute (extended).
         (let ((r (guard (e (#t (as-postgresql-error e "query failed")))
-                   (run-query! c buf sql))))
+                   (if (pair? q)
+                       (run-extended! c buf (car q) (cdr q))
+                       (run-query! c buf q)))))
           (send from (vector 'db-reply ref r))
           (if (transport-dead? r)
               (begin
@@ -588,6 +651,30 @@
   ;; 'timeout error means the statement's outcome is UNKNOWN -- it may
   ;; still execute on the server.
   (define (postgresql-query mc sql) (sql-query mc sql cfg))
+
+  ;; Convert one parameter to its wire form (text-format bytes, or #f for
+  ;; NULL). Runs in the CALLER, before anything reaches the connection
+  ;; process: an unsupported argument is an assertion here, not a transport
+  ;; error that tears down a healthy connection.
+  (define (param->wire v)
+    (cond
+      ((eq? v #f) #f)                              ; SQL NULL
+      ((string? v) (string->utf8 v))
+      ((bytevector? v) v)                          ; pre-encoded text bytes
+      ((number? v)
+       ;; an exact non-integer would render as "1/3"; send a decimal
+       (string->utf8
+         (number->string
+           (if (and (exact? v) (not (integer? v))) (exact->inexact v) v))))
+      (else (assertion-violation 'postgresql-execute
+              "parameter must be a string, number, bytevector or #f" v))))
+
+  ;; Run ONE statement with $1..$n parameters over the extended query
+  ;; protocol. Values never touch the SQL text, so they need no quoting
+  ;; and cannot inject. Same result shapes and timeout semantics as
+  ;; postgresql-query.
+  (define (postgresql-execute mc sql . params)
+    (sql-query mc (cons sql (map param->wire params)) cfg))
 
   ;; Borrow one whole connection from a POOL for the extent of proc, then
   ;; return it -- even if proc raises or exits non-locally. proc receives the

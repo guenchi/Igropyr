@@ -163,6 +163,46 @@
                 (lambda (c) (scalar-num (postgresql-query c "SELECT 42"))))))))
       (postgresql-close! p1))
 
+    ;; ---- 6. extended query protocol: postgresql-execute ---------------------
+    (let ((evil "Robert'); DROP TABLE students;--"))
+      ;; values travel out-of-band: quoting characters are data, not SQL
+      (postgresql-query pool
+        (string-append "DROP TABLE IF EXISTS " table "_ex"))
+      (postgresql-query pool
+        (string-append "CREATE TABLE " table
+                       "_ex (id INT PRIMARY KEY, name TEXT, score REAL)"))
+      (check "execute-insert-params"
+        (equal? (vector 'ok 1)
+                (postgresql-execute pool
+                  (string-append "INSERT INTO " table
+                                 "_ex (id, name, score) VALUES ($1, $2, $3)")
+                  1 evil 2.5)))
+      (check "execute-select-param"
+        (let ((r (postgresql-execute pool
+                   (string-append "SELECT name FROM " table "_ex WHERE id = $1")
+                   1)))
+          (equal? (vector-ref r 2) (list (list evil)))))   ; injection stayed data
+      (check "execute-null-param"
+        (equal? (vector 'ok 1)
+                (postgresql-execute pool
+                  (string-append "INSERT INTO " table
+                                 "_ex (id, name) VALUES ($1, $2)")
+                  2 #f)))
+      (check "execute-null-roundtrip"
+        (let ((r (postgresql-execute pool
+                   (string-append "SELECT name FROM " table "_ex WHERE id = $1")
+                   2)))
+          (equal? (vector-ref r 2) '((#f)))))
+      ;; a server error over the extended flow keeps the connection framed
+      (check "execute-error-sqlstate"
+        (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'postgresql-error))
+                   (string? (vector-ref e 1))))
+          (postgresql-execute pool "SELECT * FROM no_such_table_xyz WHERE a = $1" 1)
+          #f))
+      (check "pool-alive-after-execute-error"
+        (= 1 (scalar-num (postgresql-query pool "SELECT 1"))))
+      (postgresql-query pool (string-append "DROP TABLE IF EXISTS " table "_ex")))
+
     ;; ---- done ---------------------------------------------------------------
     (postgresql-query pool (string-append "DROP TABLE IF EXISTS " table))
     (postgresql-close! pool)

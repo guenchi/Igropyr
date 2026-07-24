@@ -181,11 +181,64 @@
                   (tcp-close! c)
                   #f)))))))
 
+  ;; Bind payload -> list of param values (#f for NULL, else string).
+  ;; portal cstr + stmt cstr + Int16 nfmt + fmts + Int16 nparams +
+  ;; (Int32 len + bytes)* + Int16 nresfmt ...
+  (define (parse-bind-params p)
+    (let* ((z1 (find-u8 p 0 0))
+           (z2 (find-u8 p (+ z1 1) 0))
+           (nfmt (bytevector-u16-ref p (+ z2 1) (endianness big)))
+           (pos (+ z2 3 (* 2 nfmt)))
+           (n (bytevector-u16-ref p pos (endianness big))))
+      (let loop ((i 0) (pos (+ pos 2)) (acc '()))
+        (if (= i n)
+            (reverse acc)
+            (let ((len (bytevector-s32-ref p pos (endianness big))))
+              (if (= len -1)
+                  (loop (+ i 1) (+ pos 4) (cons #f acc))
+                  (loop (+ i 1) (+ pos 4 len)
+                        (cons (utf8->string (bv-sub p (+ pos 4) (+ pos 4 len)))
+                              acc))))))))
+
+  ;; extended-flow server: consume Parse..Sync, then echo the Bind
+  ;; parameters back as one row (NULL stays NULL) -- this pins the
+  ;; client's Parse/Bind encoding end to end.
+  (define (extended-flow! bind-payload)
+    (let ((params (parse-bind-params bind-payload)))
+      (let drain ()                       ; Describe, Execute, then Sync
+        (let-values (((t p) (read-msg!)))
+          (unless (char=? t #\S) (drain))))
+      (write! (smsg #\1 (make-bytevector 0)))          ; ParseComplete
+      (write! (smsg #\2 (make-bytevector 0)))          ; BindComplete
+      (write! (smsg #\T (apply bv-append (u16 (length params))
+                          (let loop ((i 1) (acc '()))
+                            (if (> i (length params))
+                                (reverse acc)
+                                (loop (+ i 1)
+                                      (cons (bv-append
+                                              (cstr (string-append
+                                                      "p" (number->string i)))
+                                              (make-bytevector 18 0))
+                                            acc)))))))
+      (write! (smsg #\D (apply bv-append (u16 (length params))
+                          (map (lambda (v)
+                                 (if v
+                                     (let ((bv (string->utf8 v)))
+                                       (bv-append (u32 (bytevector-length bv)) bv))
+                                     (u32 #xFFFFFFFF)))
+                               params))))
+      (write! (smsg #\C (cstr "SELECT 1")))
+      (write! ready)))
+
   ;; simple-query server: "SELECT ..." -> fragmented T/D/C/Z with a NULL
   ;; column; "COPY ..." -> CopyInResponse, expect CopyFail, then E+Z.
   (define (query-loop!)
     (let-values (((t p) (read-msg!)))
       (case t
+        ((#\P)                            ; extended flow: next is Bind
+         (let-values (((tb pb) (read-msg!)))
+           (extended-flow! pb))
+         (query-loop!))
         ((#\Q)
          (let ((sql (utf8->string (bv-sub p 0 (find-u8 p 0 0)))))
            (if (and (>= (string-length sql) 4)
@@ -285,6 +338,14 @@
       (let ((r (postgresql-query conn "SELECT again")))
         (check "usable-after-copy-error"
           (equal? r (vector 'rows '("a" "b") '(("42" #f))))))
+      ;; extended protocol: the server echoes the Bind parameters back,
+      ;; pinning Parse/Bind encoding (text values, NULL as -1, quoting
+      ;; characters as plain data)
+      (let ((r (postgresql-execute conn "SELECT $1, $2, $3, $4"
+                                   "a'b;--" 42 #f 2.5)))
+        (check "execute-bind-echo"
+          (equal? r (vector 'rows '("p1" "p2" "p3" "p4")
+                            '(("a'b;--" "42" #f "2.5"))))))
       (postgresql-close! conn))
 
     ;; 4. wrong password -> SQLSTATE 28P01 from the server verifier
