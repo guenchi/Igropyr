@@ -2184,7 +2184,7 @@ The client authenticates with **SCRAM-SHA-256** (RFC 7677, the PostgreSQL defaul
   '((allow-cleartext-auth . #t)))
 ```
 
-SASLprep normalization of non-ASCII passwords is not applied. ASCII passwords (and passwords the server stored un-normalized) work; an NFKC-unstable non-ASCII password that logs in via libpq may fail here.
+SASLprep normalization is not implemented (its Unicode tables would dwarf the driver), so non-ASCII passwords are **rejected with a clear error** on the SCRAM path instead of failing with a baffling `28P01`. ASCII passwords are exact — SASLprep is the identity on ASCII.
 
 #### TLS
 
@@ -2197,7 +2197,7 @@ Pass the byte-codec connector from `(igropyr tls)` as the `'tls` option and the 
                     (list (cons 'tls tls-establish!)))
 ```
 
-The connector travels through the options alist, so this library never imports `(igropyr tls)` and stays free of the OpenSSL dependency unless the application opts in. If the server refuses TLS the connection **fails** — there is no silent plaintext fallback. Without `'tls` the client speaks plaintext: an on-path attacker can read query text and results regardless of the auth method, so run plaintext connections only over a trusted network or a local socket.
+The connector travels through the options alist, so this library never imports `(igropyr tls)` and stays free of the OpenSSL dependency unless the application opts in. If the server refuses TLS the connection **fails** — there is no silent plaintext fallback. Over TLS, SCRAM **channel binding** is automatic: when the server offers `SCRAM-SHA-256-PLUS` the client selects it and binds the authentication to this TLS channel's server certificate (RFC 5929 `tls-server-end-point`), so even a relay MITM holding a trusted certificate cannot forward the exchange. Without `'tls` the client speaks plaintext: an on-path attacker can read query text and results regardless of the auth method, so run plaintext connections only over a trusted network or a local socket.
 
 #### Connection Pool and Transactions
 
