@@ -68,6 +68,7 @@ Independent libraries:
   • pubsub (topic-based pub/sub)
   • Redis client
   • MySQL client
+  • PostgreSQL client
 ```
 
 ### Each Layer's Responsibility
@@ -84,7 +85,7 @@ Independent libraries:
 
 - **WebSocket (websocket.sc)**: RFC 6455 codec, handshake, frame masking, fragmentation, ping/pong. Each socket is a green process that calls a user session handler.
 
-- **JSON, gen-server, pubsub, Redis, MySQL**: Standalone libraries with no interdependencies (except JSON uses Scheme primitives, gen-server uses actor, pubsub uses gen-server+actor, redis/mysql use actor+uv).
+- **JSON, gen-server, pubsub, Redis, MySQL, PostgreSQL**: Standalone libraries with no interdependencies (except JSON uses Scheme primitives, gen-server uses actor, pubsub uses gen-server+actor, redis/mysql/postgresql use actor+uv; MySQL and PostgreSQL share the `(igropyr sqlpool)` connection-pool engine).
 
 ### Data Flow: An HTTP Request
 
@@ -1962,6 +1963,8 @@ A bad chain or a wrong hostname fails the request with `#(http-client-error "tls
 
 **Requirements.** OpenSSL 3 or 1.1 (or LibreSSL) present as a shared library, found via the usual platform paths (including Homebrew's `openssl@3`). This is a TLS *client* only; inbound HTTPS still belongs at a reverse proxy.
 
+**A generic connector for other protocols.** `(igropyr tls)` also exports `tls-establish!`, the same handshake as a bare byte-codec connector, not tied to HTTP. It performs the same verification (peer chain, hostname/IP, TLS 1.2 minimum, system trust store) and raises the neutral `#(tls-error "tls: …")` on failure — the https connector that `tls-enable!` installs is a thin re-tag of it. Other clients accept it directly: the PostgreSQL client takes it as its `'tls` option (see [PostgreSQL](#postgresql)). The MySQL client, by contrast, has no TLS support yet and **rejects** a `'tls` option loudly rather than silently sending plaintext.
+
 ---
 
 ## Database Clients
@@ -2114,6 +2117,146 @@ For applications with many concurrent workers, instead of one connection, use `m
 ```
 
 From the HTTP perspective, the database query is non-blocking: the worker's process parks in `receive`, but the OS thread keeps serving other requests via other workers and connections.
+
+### PostgreSQL
+
+The PostgreSQL client speaks protocol 3.0 and follows the same design as MySQL: one green process per connection, queries synchronous (the caller parks until the reply), the PostgreSQL request-response protocol serialized through the connection's mailbox. It shares the same `(igropyr sqlpool)` connection-pool engine, so pooling, transactions and self-healing behave identically.
+
+#### Basic Usage
+
+```scheme
+(import (igropyr postgresql))
+
+(define db (postgresql-connect "127.0.0.1" 5432 "user" "password" "mydb"))
+
+(postgresql-query db "SELECT id, name FROM users")
+;; -> #(rows ("id" "name") (("1" "Alice") ("2" "Bob")))
+
+(postgresql-query db "INSERT INTO users (name) VALUES ('Eve')")
+;; -> #(ok 1)    ; affected rows
+
+(postgresql-close! db)
+```
+
+Return values:
+
+- **SELECT**: `#(rows ,column-names ,rows)` where `rows` is a list of lists.
+- **INSERT/UPDATE/DELETE**: `#(ok ,affected)`.
+- **Values**: Strings (the wire text format). `NULL` → `#f`. The connection pins `client_encoding` to `UTF8` at startup, so text is always UTF-8 on the wire regardless of the database encoding.
+
+The database name defaults to the user name when omitted. An options alist (`'((tls . ...) (allow-cleartext-auth . #t))`) may follow the database argument.
+
+#### Parameterized Queries
+
+`postgresql-execute` runs one statement over the extended query protocol (Parse/Bind/Execute). Parameters are sent out-of-band as `$1..$n` values, never spliced into the SQL text, so no quoting or escaping is needed and **injection through a value is impossible** — prefer it over string concatenation whenever a statement takes runtime values:
+
+```scheme
+(postgresql-execute db "SELECT name FROM users WHERE id = $1" 2)
+;; -> #(rows ("name") (("Bob")))
+
+(postgresql-execute db "INSERT INTO users (name, note) VALUES ($1, $2)"
+                    "Eve" #f)
+;; -> #(ok 1)      ; #f binds SQL NULL
+```
+
+- Parameters may be strings, numbers, `#f` (SQL `NULL`) or bytevectors (raw text-format bytes).
+- Unlike `postgresql-query`, it accepts **exactly one** statement, and at most **65535** parameters.
+- Non-finite floats are sent as `Infinity` / `-Infinity` / `NaN`.
+
+The result shapes are the same as `postgresql-query` (`#(rows ...)` / `#(ok ...)`).
+
+#### Errors
+
+Errors raise `#(postgresql-error ,tag ,message)` in the caller, where `tag` is one of exactly three shapes:
+
+- **a 5-character SQLSTATE string** — a server-side SQL error (constraint violation, syntax error, …). The connection stays usable.
+- **`'transport`** — a connection or framing failure. The connection is torn down (and rebuilt by a pool).
+- **`'timeout`** — the caller stopped waiting (query timeout or pool checkout timeout). A timed-out **statement may still execute** on the server: its outcome is unknown, so do **not** blindly retry a non-idempotent statement.
+
+A lone `postgresql-connect` handle does **not** survive a transport failure: the handle is dead and later queries time out. Use `postgresql-pool` for automatic rebuild and reconnection.
+
+#### Authentication
+
+The client authenticates with **SCRAM-SHA-256** (RFC 7677, the PostgreSQL default since v10). MD5 is not implemented. Cleartext password auth is **refused by default**: the method is chosen by the server — i.e. by anyone who can intercept a plaintext socket — so honoring it silently would let an active attacker downgrade past SCRAM and read the password. Opt in only over a trusted local socket:
+
+```scheme
+(postgresql-connect host port user password database
+  '((allow-cleartext-auth . #t)))
+```
+
+SASLprep normalization of non-ASCII passwords is not applied. ASCII passwords (and passwords the server stored un-normalized) work; an NFKC-unstable non-ASCII password that logs in via libpq may fail here.
+
+#### TLS
+
+Pass the byte-codec connector from `(igropyr tls)` as the `'tls` option and the connection is upgraded via `SSLRequest` before the startup message, with full certificate + hostname/IP verification against the system trust store (`SSL_CERT_FILE` / `SSL_CERT_DIR` apply):
+
+```scheme
+(import (igropyr postgresql) (igropyr tls))
+
+(postgresql-connect host 5432 user password "mydb"
+                    (list (cons 'tls tls-establish!)))
+```
+
+The connector travels through the options alist, so this library never imports `(igropyr tls)` and stays free of the OpenSSL dependency unless the application opts in. If the server refuses TLS the connection **fails** — there is no silent plaintext fallback. Without `'tls` the client speaks plaintext: an on-path attacker can read query text and results regardless of the auth method, so run plaintext connections only over a trusted network or a local socket.
+
+#### Connection Pool and Transactions
+
+For applications with many concurrent workers, use `postgresql-pool` instead of a single connection:
+
+```scheme
+(define pool (postgresql-pool 8 "127.0.0.1" 5432 "user" "password" "mydb"))
+;; Creates a pool of 8 connections; queries and executes route to an
+;; idle one, replies flow straight back to the caller, dead connections
+;; are replaced automatically.
+
+(postgresql-query pool "SELECT * FROM users")
+```
+
+`postgresql-transaction` borrows one whole connection from the pool for the extent of a procedure: `BEGIN` first, then `COMMIT` if the procedure returns, or `ROLLBACK` if it escapes. `call-with-postgresql-connection` borrows a connection without opening a transaction. Both guarantee the connection is returned — even if the body raises or the worker is killed mid-transaction, the pool's monitor reclaims and rebuilds it, so a half-open transaction is never handed to the next caller:
+
+```scheme
+(postgresql-transaction pool
+  (lambda (db)
+    (postgresql-execute db "UPDATE accounts SET bal = bal - $1 WHERE id = $2"
+                        100 from-id)
+    (postgresql-execute db "UPDATE accounts SET bal = bal + $1 WHERE id = $2"
+                        100 to-id)))
+;; COMMIT on normal return, ROLLBACK on any escape
+
+(call-with-postgresql-connection pool
+  (lambda (db)
+    (postgresql-query db "SET application_name = 'report'")
+    (postgresql-query db "SELECT * FROM big_report")))
+```
+
+#### Limitations
+
+- `client_encoding` is pinned to `UTF8` and cannot be changed.
+- `COPY FROM STDIN` is refused via `CopyFail` (it surfaces as a server error); `COPY TO STDOUT` raises `0A000`.
+
+### The `(igropyr sqlpool)` Engine
+
+This subsection is for authors building a **third** SQL driver; applications never touch it directly.
+
+`(igropyr mysql)` and `(igropyr postgresql)` sit on one shared engine, `(igropyr sqlpool)`. It owns the whole pool architecture — a fixed pool of connections behind a dispatcher, whole-connection leases for transactions, and monitor-based crash reclaim — while staying **protocol-blind**: the wire protocol, authentication and result parsing stay in each driver. Keeping it a single copy means a fix to a subtle race (checkout-cancel, reclaim of a borrower killed mid-transaction, adoption of a worker that finished connecting after its pool is gone) can never land in one driver but not the other.
+
+Exports:
+
+- `make-sql-cfg` — build the per-driver config record (once per driver): the driver's error *values* for lost / closed / query-timeout / checkout-timeout events, a predicate that recognizes an error reply, and the `BEGIN` statement (`"BEGIN"` / `"START TRANSACTION"`).
+- `sql-pool-loop` — the dispatcher loop: `(sql-pool-loop n spawn-conn! cfg)`, a fixed pool of `n` connection workers.
+- `sql-query` — run one statement on a connection or a pool.
+- `sql-transaction` / `sql-call-with-connection` — borrow a whole connection (with or without a transaction), with guaranteed return.
+- `sql-close!` — close a pool or a lone connection.
+
+Each driver's connection process must speak a small message contract:
+
+- `#(db-query ,sql ,ref ,from)` — run `sql`, then reply `#(db-reply ,ref ,r)` to `from`.
+- `#(db-adopt)` / `#(db-quit)` — adoption handshake / shutdown.
+- `#(db-idle ,self)` — sent to its pool after each finished query.
+- `#(db-conn-dead ,self)` — sent to its pool when it has replied a transport error and is about to exit.
+- `#(db-up ,ref ,self ,status)` — reported by a connecting worker.
+
+Query and checkout both time out at 60 s. Leases are per-checkout records (keyed by connection, carrying the borrower, its monitor and the checkout ref), so one borrower holding several leases never clobbers its own bookkeeping; a borrower killed mid-transaction is reclaimed by the pool's monitor (the actor's `@kill` discards `dynamic-wind` winders, so no checkin ever runs). Closing a pool quits leased connections immediately — a transaction still in flight on one times out on its next statement, so close a pool only after its borrowers are done.
 
 ---
 
