@@ -54,6 +54,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # SCRAM-SHA-256 (igropyr postgresql) against the RFC 7677 vectors -- pure
 # crypto, no server needed, so it always runs.
 "$scheme_bin" --script igropyr/test/postgresql.sc
+# wire-level tests against an in-process fake server (loopback only, always
+# runs): SCRAM verified server-side, auth failure fd-leak regression,
+# cleartext opt-in gate, framing hardening, COPY refusal.
+"$scheme_bin" --script igropyr/test/postgresql-wire.sc
 # opt-in (needs a live PostgreSQL): runs for real only when IGROPYR_PG_TEST is
 # set, otherwise self-skips, so this is a no-op on machines without a database.
 "$scheme_bin" --script igropyr/test/postgresql-e2e.sc
