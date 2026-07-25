@@ -874,16 +874,36 @@
   ;; fail-fast retry loop on one connection. Without a hook -- or when
   ;; the hook's own task fails, or a partial response already went out
   ;; -- the last-resort 500 (which closes) is used.
+  ;; A handler that already claimed the token has begun writing a response
+  ;; (res-begin! / res-begin-file!), and the reader is parked in
+  ;; await-streaming with no deadline waiting for it to finish. If that
+  ;; handler then crashes -- or is killed as stuck -- no status line can be
+  ;; sent any more: send-response! is a no-op on a claimed token, so the
+  ;; 500 below would vanish silently, leaving the connection open, the fd
+  ;; allocated and the reader parked forever. A client could accumulate
+  ;; leaked connections on demand by hitting such a handler.
+  ;;
+  ;; The only correct signal at that point is to CLOSE: a chunked response
+  ;; without its terminating chunk, or a fixed-length one short of its
+  ;; Content-Length, is exactly how HTTP says "this response is truncated",
+  ;; and both framings the client accepts detect it by construction. The
+  ;; reader is told so it can stop waiting.
+  (define (abort-response! c)
+    (tcp-close! c)
+    (let ((owner (conn-owner c)))
+      (when owner (send owner (vector 'conn-closed)))))
+
   (define (fail-task sup on-failure task info)
     (let ((c (vector-ref task 2))
           (req (vector-ref task 3))
           (token (vector-ref task 4)))
-      (if (and on-failure
-               (eq? (vector-ref task 0) 'task)
-               (not (unbox token)))
-          (send sup (vector 'submit-urgent
-                      (vector 'fail (vector-ref task 1) c req token info)))
-          (quick-response! c 500 "Internal Server Error" token))))
+      (cond
+        ;; the response has already started: nothing can be sent, close
+        ((unbox token) (abort-response! c))
+        ((and on-failure (eq? (vector-ref task 0) 'task))
+         (send sup (vector 'submit-urgent
+                     (vector 'fail (vector-ref task 1) c req token info))))
+        (else (quick-response! c 500 "Internal Server Error" token)))))
 
   ;; ---- chunked transfer-encoding (request side) ----------------------------------
 

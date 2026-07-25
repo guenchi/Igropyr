@@ -41,6 +41,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # path normalization: middleware guards and the router must agree on the
 # path, or an extra slash routes to a handler while skipping its guard
 "$scheme_bin" --script igropyr/test/path-normalization.sc
+# a handler crashing after it began streaming must close the connection,
+# not leave the reader parked forever on a leaked fd
+"$scheme_bin" --script igropyr/test/stream-crash.sc
 "$scheme_bin" --script igropyr/test/http-client-stream.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc
