@@ -124,8 +124,15 @@
             (string-set! t i (cond ((char=? c #\-) #\+)
                                    ((char=? c #\_) #\/)
                                    (else c)))))
-        (base64-decode
-          (string-append t (make-string (mod (- 4 (mod n 4)) 4) #\=))))))
+        ;; base64-decode raises &assertion when the last character's unused
+        ;; bits are set (a non-canonical encoding). This input is an
+        ;; attacker's, so that assertion would escape the documented
+        ;; #(apple-jws-error CODE MSG) contract -- a caller guarding on that
+        ;; tag would let it through and take down its request process, and
+        ;; a webhook would turn a 401 into a retryable 5xx.
+        (guard (e (#t (ajws-fail 'not-jws "malformed base64url in token")))
+          (base64-decode
+            (string-append t (make-string (mod (- 4 (mod n 4)) 4) #\=)))))))
 
   ;; ---- X.509 from DER --------------------------------------------------
 

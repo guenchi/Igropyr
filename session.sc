@@ -52,7 +52,16 @@
       ((get)
        (let ((entry (hashtable-ref tbl (vector-ref msg 1) #f)))
          (if (and entry (> (cdr entry) (now-ms)))
-             (values (car entry) tbl)            ; data alist
+             ;; COPY the pairs out. Handing back the store's own alist made
+             ;; session-set!'s set-cdr! mutate the stored session directly:
+             ;; a concurrent request on the same sid saw the write before it
+             ;; was committed (and still saw it if the writing request then
+             ;; failed), and session-peek -- documented as a snapshot, and
+             ;; the credential session-guard authenticates a WebSocket with
+             ;; -- observed it too. The per-key merge in 'put is what
+             ;; actually commits a change.
+             (values (map (lambda (kv) (cons (car kv) (cdr kv))) (car entry))
+                     tbl)
              (values #f tbl))))
       (else (values 'bad-request tbl))))
 

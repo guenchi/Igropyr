@@ -1,0 +1,61 @@
+#!chezscheme
+;;; QuickJS engine benchmark -- a MEASUREMENT, not a pass/fail test, so it
+;;; is not part of run-all.sh. It backs the per-call-overhead numbers the
+;;; manual quotes when recommending quickjs-ng, and exists so those numbers
+;;; can be re-checked on any machine or engine build.
+;;;
+;;; It separates two effects a single end-to-end figure conflates:
+;;;   (a) per-CALL overhead -- the FFI round trip and the JSValue release
+;;;       path, which is where the two upstreams genuinely differ
+;;;       (ng exports a real JS_FreeValue; bellard's is a header inline
+;;;       whose replica must read and write the ref_count itself)
+;;;   (b) interpreter speed -- the engine executing JS, where they are
+;;;       within a couple of percent
+;;; A near-empty function is almost all (a); a heavy loop is almost all (b).
+;;;
+;;; Run against a specific engine:
+;;;   IGROPYR_LIBQUICKJS_SO=/usr/local/lib/libqjs.so \
+;;;     scheme --script igropyr/test/quickjs-bench.sc
+;;;
+;;; Measured on FreeBSD 15/amd64 (best of three, 20000 calls each):
+;;;   near-empty  ng 0.50 us/call   bellard 0.70 us/call
+;;;   arg+result  ng 0.65 us/call   bellard 0.80 us/call
+;;;   200k loop   ng 5.05 ms/call   bellard 4.96 ms/call
+;;;   regexp      ng 5.15 us/call   bellard 2.35 us/call   <- engine, not FFI
+
+(import (chezscheme) (igropyr quickjs))
+
+(qjs-boot! "
+globalThis.noop  = function(a){ return ''; };
+globalThis.echo  = function(a){ return a; };
+globalThis.slug  = function(a){ return a.toLowerCase().replace(/[^a-z0-9]+/g,'-'); };
+globalThis.heavy = function(a){ var s=0; for(var i=0;i<200000;i++){ s+=i%7; } return ''+s; };
+" '((timeout-ms . 20000)))
+
+(define (bench label fn arg iters)
+  ;; warm up, then take the best of 3 to damp scheduler noise
+  (do ((i 0 (+ i 1))) ((= i 200)) (qjs-call! fn arg))
+  (let loop ((run 0) (best #f))
+    (if (= run 3)
+        (begin
+          (display "  ") (display label)
+          (display "  ") (display best) (display " ms / ") (display iters)
+          (display " calls = ")
+          (display (exact->inexact (/ best iters))) (display " ms/call\n")
+          best)
+        (let ((t0 (real-time)))
+          (do ((i 0 (+ i 1))) ((= i iters)) (qjs-call! fn arg))
+          (let ((ms (- (real-time) t0)))
+            (loop (+ run 1) (if (or (not best) (< ms best)) ms best)))))))
+
+(display "engine: ")
+(display (or (getenv "IGROPYR_LIBQUICKJS_SO") "(default)"))
+(newline)
+(define n-call (bench "noop  (call overhead)" "noop" "x" 20000))
+(bench "echo  (+ arg/result)  " "echo" "hello world" 20000)
+(bench "slug  (light JS)      " "slug" "Hello World Example" 20000)
+(define n-heavy (bench "heavy (200k-iter loop)" "heavy" "x" 200))
+(display "  ---\n")
+(display "  per-call overhead share of a light call: ")
+(display (exact->inexact (/ n-call 20000)))
+(display " ms\n")

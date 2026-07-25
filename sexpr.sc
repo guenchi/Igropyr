@@ -176,7 +176,15 @@
           (cond
             ((>= j n) (sfail (string-append "unterminated " what) start))
             ((char=? (string-ref s j) #\")
-             (values (base64-decode (substring s start j)) (+ j 1)))
+             ;; base64-decode raises &assertion on a non-canonical tail (the
+             ;; unused bits of the last character must be zero), and this
+             ;; input is a peer's. Keep it inside the documented
+             ;; #(sexpr-error ...) contract rather than letting a raw
+             ;; assertion escape into a node's distribution process.
+             (values (guard (e (#t (sfail (string-append "bad base64 in " what)
+                                          start)))
+                       (base64-decode (substring s start j)))
+                     (+ j 1)))
             ((let ((c (string-ref s j)))
                (or (char<=? #\A c #\Z) (char<=? #\a c #\z) (char<=? #\0 c #\9)
                    (char=? c #\+) (char=? c #\/) (char=? c #\=)))

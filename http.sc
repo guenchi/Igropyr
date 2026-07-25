@@ -40,6 +40,7 @@
           res-begin! res-write! res-end!
           res-begin-file! res-write-file! res-write-chunk! res-abort-file!
           res-conn res-req res-status res-headers res-keep-alive?
+          res-head-request? res-send-head!
           send-response! parse-query
           ;; Re-exported app-facing (igropyr actor) surface, so a core
           ;; application imports this library alone. Advanced primitives
@@ -628,21 +629,40 @@
   ;; Write a full response, guarded by the request's token. The libuv
   ;; write callback (no yielding) tells the reader to continue
   ;; (keep-alive) or closes the connection.
-  (define (send-response! c token status headers body ka)
+  ;; head-only: a HEAD response must carry the SAME headers a GET would --
+  ;; Content-Length included -- and no body at all (RFC 9110 9.3.2). Writing
+  ;; the body anyway desynchronises the connection: a conforming client
+  ;; stops after the blank line, so the bytes that follow are read as the
+  ;; start of the next response. Behind a shared cache that is a poisoning
+  ;; primitive, which is why this is decided here, at the one place every
+  ;; response is serialized, rather than left to each handler.
+  ;; head-only: #f -- normal response; #t -- suppress the body, declaring
+  ;; the length of the body passed in; an integer -- suppress the body and
+  ;; declare THAT length (a HEAD for a file too large to read into memory,
+  ;; where the size is known but the bytes must not be).
+  (define (send-response!* c token status headers body ka head-only)
     (when (claim! token)
       (let* ((head
               (assemble-head status headers
-                "Content-Length: " (number->string (bytevector-length body))
+                "Content-Length: "
+                (number->string (if (integer? head-only)
+                                    head-only
+                                    (bytevector-length body)))
                 (if ka keep-alive-tail close-tail)))
-             (owner (conn-owner c)))
+             (owner (conn-owner c))
+             (done (lambda (st)
+                     (if (and ka (>= st 0))
+                         (send owner (vector 'next-request))
+                         (begin
+                           (tcp-close! c)
+                           (send owner (vector 'conn-closed)))))))
         ;; head and body are written as two segments -- no bv-append copy
-        (tcp-writev! c (list (string->utf8 head) body)
-          (lambda (st)
-            (if (and ka (>= st 0))
-                (send owner (vector 'next-request))
-                (begin
-                  (tcp-close! c)
-                  (send owner (vector 'conn-closed)))))))))
+        (if head-only
+            (tcp-writev! c (list (string->utf8 head)) done)
+            (tcp-writev! c (list (string->utf8 head) body) done)))))
+
+  (define (send-response! c token status headers body ka)
+    (send-response!* c token status headers body ka #f))
 
   ;; minimal error response; always closes. Uses a fresh token unless
   ;; one is supplied (reader-level errors have no task yet).
@@ -676,9 +696,19 @@
 
   ;; Send the response: current status + accumulated headers + body
   ;; bytevector. One shot per request; later calls are ignored.
+  (define (res-head-request? r)
+    (let ((req (res-req r))) (and req (eq? (req-method req) 'HEAD) #t)))
+
   (define (res-send! r body)
-    (send-response! (res-conn r) (res-token r) (res-status r) (res-headers r)
-                    body (res-keep-alive? r)))
+    (send-response!* (res-conn r) (res-token r) (res-status r) (res-headers r)
+                     body (res-keep-alive? r) (res-head-request? r)))
+
+  ;; Answer a HEAD with the headers a GET would carry, declaring
+  ;; content-length, and no body -- used where the body would otherwise be
+  ;; streamed from disk and must not even be read.
+  (define (res-send-head! r content-length)
+    (send-response!* (res-conn r) (res-token r) (res-status r) (res-headers r)
+                     empty-bv (res-keep-alive? r) content-length))
 
   ;; ---- streaming responses (Transfer-Encoding: chunked) ------------------------
 

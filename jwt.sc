@@ -88,7 +88,11 @@
                        (char<=? #\0 c #\9))
                    c)
                   (else (jwt-fail "invalid base64url character"))))))
-      (base64-decode t)))
+      ;; a non-canonical tail (unused bits of the last character set) makes
+      ;; base64-decode raise &assertion; keep it inside the jwt error
+      ;; contract, since the token is untrusted input
+      (guard (e (#t (jwt-fail "malformed base64url")))
+        (base64-decode t))))
 
   ;; ---- helpers -----------------------------------------------------------
 

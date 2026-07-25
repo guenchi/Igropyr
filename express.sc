@@ -475,6 +475,11 @@
   ;; the Scheme heap, so a gigabyte download causes no GC traffic.
   (define (stream-file! r st size ctype)
     (set-header! r "Content-Type" ctype)
+    (if (res-head-request? r)
+        ;; HEAD: same headers a GET would send, including the real length,
+        ;; but the bytes must never leave (and need not even be read)
+        (begin (file-stream-close! st) (res-send-head! r size))
+        (begin
     (res-begin-file! r size)
     (spawn
       (lambda ()
@@ -491,7 +496,7 @@
             ;; eof before the promised length: file shrank underneath us
             (`#(file-eof) (res-abort-file! r))
             (`#(file-error ,e) (res-abort-file! r))))
-        (file-stream-close! st))))
+        (file-stream-close! st))))))
 
   ;; window-hit download of a large (metadata-cached) file: open a
   ;; fresh stream on demand. Content-Length comes from the live fstat;
@@ -502,19 +507,48 @@
           (stream-file! r st size ctype)
           (begin (set-status! r 404) (send-text! r "Not Found")))))
 
-  ;; Public helper: send a file (cached read; no conditional request
-  ;; since there is no req here). Path traversal is rejected. Files
-  ;; over the cache cap are streamed with backpressure, not buffered.
-  (define-checked (send-file! (r res?) (path string?))
-    (if (path-has-dotdot? path)
-        (begin (set-status! r 403) (send-text! r "Forbidden"))
-        (let ((e (static-entry path)))
-          (cond
-            ((not e) (set-status! r 404) (send-text! r "Not Found"))
-            ((stream-entry? e)
-             (stream-file! r (vector-ref e 1) (vector-ref e 2) (vector-ref e 4)))
-            ((large-entry? e) (serve-large! r (vector-ref e 3) path))
-            (else (finish! r (vector-ref e 3) (vector-ref e 4)))))))
+  ;; Public helper: send a file (cached read; no conditional request since
+  ;; there is no req here). Files over the cache cap are streamed with
+  ;; backpressure, not buffered.
+  ;;
+  ;;   (send-file! res "./data/report.pdf")        ; path used as given
+  ;;   (send-file! res user-supplied "./data")     ; RESOLVED INSIDE ./data
+  ;;
+  ;; With a root, `path` is treated as a relative path inside it and gets
+  ;; the full app-static treatment: no "..", no NUL, no dotfiles, and no
+  ;; segment that is a symlink (so an uploaded link cannot point out of
+  ;; the root). PASS THE ROOT whenever any part of the path comes from the
+  ;; request -- without one this cannot tell an intended prefix from a
+  ;; traversal, and an absolute path is sent as-is.
+  ;;
+  ;; Even rootless, a NUL is refused: file APIs below truncate at it, so
+  ;; "secret.db\x0;.png" would pass an extension check in the caller and
+  ;; then open secret.db.
+  (define (send-file*! r path root)
+    (let ((resolved
+           (cond
+             (root (safe-static-path root path))
+             ((or (path-has-dotdot? path) (path-has-nul? path)) #f)
+             (else path))))
+      (if (not resolved)
+          (begin (set-status! r 403) (send-text! r "Forbidden"))
+          (let ((e (static-entry resolved)))
+            (cond
+              ((not e) (set-status! r 404) (send-text! r "Not Found"))
+              ((stream-entry? e)
+               (stream-file! r (vector-ref e 1) (vector-ref e 2) (vector-ref e 4)))
+              ((large-entry? e) (serve-large! r (vector-ref e 3) resolved))
+              (else (finish! r (vector-ref e 3) (vector-ref e 4))))))))
+
+  (define (send-file! r path . rest)
+    (unless (res? r)
+      (assertion-violation 'send-file! "not a response" r))
+    (unless (string? path)
+      (assertion-violation 'send-file! "path must be a string" path))
+    (let ((root (and (pair? rest) (car rest))))
+      (when (and root (not (string? root)))
+        (assertion-violation 'send-file! "root must be a string" root))
+      (send-file*! r path root)))
 
   ;; Serve a static file with caching + conditional request. abs-path is
   ;; already inside the mount root; caller has done the boundary check.
@@ -901,6 +935,17 @@
   ;; comparing platform-specific canonical spellings) -- this blocks
   ;; symlink-based escapes as well as ".." and NUL. Returns the safe
   ;; absolute path or #f.
+  ;; A segment starting with "." is refused: mounting a project directory
+  ;; otherwise serves .env, .git/config and friends -- with a public
+  ;; Cache-Control, so an intermediary keeps handing them out. ".well-known"
+  ;; is the standard exception (ACME challenges, security.txt) and stays
+  ;; reachable. "." itself is a no-op segment, handled above.
+  (define (dotfile-segment? seg)
+    (and (fx> (string-length seg) 0)
+         (char=? (string-ref seg 0) #\.)
+         (not (string=? seg "."))
+         (not (string=? seg ".well-known"))))
+
   (define (safe-static-path root rel)
     (and (not (path-has-dotdot? rel))
          (not (path-has-nul? rel))
@@ -909,13 +954,14 @@
              ((null? parts) base)
              ((or (string=? (car parts) "") (string=? (car parts) "."))
               (loop base (cdr parts)))
+             ((dotfile-segment? (car parts)) #f)
              (else
               (let ((next (string-append base "/" (car parts))))
                 (and (not (guard (e (#t #t)) (file-symbolic-link? next)))
                      (loop next (cdr parts)))))))))
 
   (define (try-static a req r)
-    (and (eq? (req-method req) 'GET)
+    (and (eq? (routing-method req) 'GET)
          (exists
            (lambda (entry)
              (let* ((prefix (car entry)) (root (cdr entry))
@@ -931,6 +977,15 @@
                       #t))))
            (app-statics a))))
 
+  ;; RFC 9110 9.3.2: HEAD is GET without the body, so it is answered by the
+  ;; GET route (and the GET static mount) -- the response encoder is what
+  ;; drops the body, so the headers, including Content-Length, are exactly
+  ;; the ones a GET would send. Without this every HEAD fell through to the
+  ;; 404 arm, which then sent that page's body on a HEAD response and
+  ;; desynchronised the connection.
+  (define (routing-method req)
+    (let ((m (req-method req))) (if (eq? m 'HEAD) 'GET m)))
+
   (define (route-dispatch a req r)
     (let ((segs (split-segments (req-path req))))
       (let loop ((routes (app-routes a)))
@@ -940,7 +995,7 @@
                (begin (set-status! r 404) (send-text! r "Not Found"))))
           (else
            (let ((route (car routes)))
-             (let ((params (and (eq? (vector-ref route 0) (req-method req))
+             (let ((params (and (eq? (vector-ref route 0) (routing-method req))
                                 (match-segments (vector-ref route 1) segs))))
                (if params
                    (begin
