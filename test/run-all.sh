@@ -1,10 +1,12 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+# POSIX sh, no bashisms: FreeBSD (a deployment target) has no bash in
+# the base system, and the suite must run where the code runs.
+set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-if [[ -n "${SCHEME_BIN:-}" ]]; then
+if [ -n "${SCHEME_BIN:-}" ]; then
   scheme_bin="$SCHEME_BIN"
 elif command -v chez >/dev/null 2>&1; then
   scheme_bin=chez
@@ -68,7 +70,11 @@ set +e
 badenv_output=$(IGROPYR_CONTRACTS=on "$scheme_bin" --script igropyr/test/checked-badenv.sc 2>&1)
 badenv_status=$?
 set -e
-if [[ $badenv_status -eq 0 || "$badenv_output" != *"IGROPYR_CONTRACTS"* ]]; then
+case "$badenv_output" in
+  *IGROPYR_CONTRACTS*) badenv_msg=1 ;;
+  *)                   badenv_msg=0 ;;
+esac
+if [ "$badenv_status" -eq 0 ] || [ "$badenv_msg" -eq 0 ]; then
   printf '%s\n' "$badenv_output"
   echo "checked bad-env rejection test failed" >&2
   exit 1
@@ -79,8 +85,15 @@ set +e
 boot_output=$("$scheme_bin" --script igropyr/test/smoke-boot-failure.sc 2>&1)
 boot_status=$?
 set -e
-if [[ $boot_status -ne 70 || "$boot_output" != *"PANIC: boot"* ||
-      "$boot_output" != *"deliberate boot failure"* ]]; then
+case "$boot_output" in
+  *"PANIC: boot"*) boot_panic=1 ;;
+  *)               boot_panic=0 ;;
+esac
+case "$boot_output" in
+  *"deliberate boot failure"*) boot_msg=1 ;;
+  *)                           boot_msg=0 ;;
+esac
+if [ "$boot_status" -ne 70 ] || [ "$boot_panic" -eq 0 ] || [ "$boot_msg" -eq 0 ]; then
   printf '%s\n' "$boot_output"
   echo "boot failure propagation test failed" >&2
   exit 1

@@ -42,7 +42,7 @@
 ;; the client must only trust the test CA
 (putenv "SSL_CERT_FILE" (string-append dir "/ca.pem"))
 
-(system "bash igropyr/test/tls-certs.sh /tmp/igropyr-tls-test")
+(system "sh igropyr/test/tls-certs.sh /tmp/igropyr-tls-test")
 (cleanup!)
 
 (define (get-error url)

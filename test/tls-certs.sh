@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Helper for test/tls.sc: ephemeral test PKI in $1.
 #   ca.pem            test CA (the trust anchor the client is given)
 #   good.pem/.key     leaf signed by ca, SAN DNS:localhost,IP:127.0.0.1
