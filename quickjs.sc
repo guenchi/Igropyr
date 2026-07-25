@@ -65,7 +65,14 @@
                 (let ((e (getenv "IGROPYR_LIBQUICKJS_SO"))) (if e (list e) '()))
                 (list "libquickjs.dylib" "libquickjs.so"
                       "/opt/homebrew/lib/quickjs/libquickjs.dylib"
+                      ;; FreeBSD's quickjs / quickjs-ng packages install the
+                      ;; shared library directly under lib, not in a quickjs/
+                      ;; subdirectory, and the versioned soname is what the
+                      ;; package actually ships
+                      "/usr/local/lib/libquickjs.so"
+                      "/usr/local/lib/libquickjs.so.0"
                       "/usr/local/lib/quickjs/libquickjs.so"
+                      "/usr/lib/libquickjs.so"
                       "/usr/lib/quickjs/libquickjs.so")))
       (set! so-loaded #t)))
 

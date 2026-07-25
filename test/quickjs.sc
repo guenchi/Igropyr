@@ -17,7 +17,11 @@
   (or (let ((e (getenv "IGROPYR_LIBQUICKJS_SO"))) (and e (> (string-length e) 0) (file-exists? e)))
       (file-exists? "libquickjs.dylib") (file-exists? "libquickjs.so")
       (file-exists? "/opt/homebrew/lib/quickjs/libquickjs.dylib")
+      ;; FreeBSD packages install straight under lib/ (see quickjs.sc)
+      (file-exists? "/usr/local/lib/libquickjs.so")
+      (file-exists? "/usr/local/lib/libquickjs.so.0")
       (file-exists? "/usr/local/lib/quickjs/libquickjs.so")
+      (file-exists? "/usr/lib/libquickjs.so")
       (file-exists? "/usr/lib/quickjs/libquickjs.so")))
 
 (unless (raw-quickjs-present?)
