@@ -52,9 +52,11 @@
 ;;; the password. Pass '((allow-cleartext-auth . #t)) to permit it
 ;;; (appropriate over a trusted local socket). SASLprep normalization
 ;;; is not implemented (its Unicode tables dwarf this driver), so
-;;; non-ASCII passwords are REJECTED with a clear error on the SCRAM
-;;; path rather than failing with a baffling 28P01; ASCII passwords are
-;;; exact (SASLprep is the identity on ASCII).
+;;; passwords outside PRINTABLE ASCII (non-ASCII, or the control
+;;; characters SASLprep prohibits) are REJECTED with a clear error --
+;;; in the caller when SCRAM is the only possible path, and during the
+;;; exchange otherwise -- rather than failing with a baffling 28P01.
+;;; Printable-ASCII passwords are exact (SASLprep leaves them unchanged).
 ;;;
 ;;; TLS: pass the byte-codec connector from (igropyr tls) as the 'tls
 ;;; option and the connection is upgraded via SSLRequest before startup,
@@ -140,11 +142,6 @@
   (define (u32 v)
     (let ((bv (make-bytevector 4)))
       (bytevector-u32-set! bv 0 v (endianness big))
-      bv))
-
-  (define (u16 v)
-    (let ((bv (make-bytevector 2)))
-      (bytevector-u16-set! bv 0 v (endianness big))
       bv))
 
   (define (read-u32-be bv pos) (bytevector-u32-ref bv pos (endianness big)))
@@ -353,16 +350,17 @@
       (values (bv-xor client-key client-sig)
               (hmac-sha256 server-key (string->utf8 auth-msg)))))
 
-  ;; SASLprep (RFC 4013) is a Unicode normalization the full tables of
-  ;; which dwarf this whole driver; without it a non-ASCII password can
-  ;; hash to different bytes than the server's stored verifier and fail
-  ;; with a baffling 28P01. ASCII is untouched by SASLprep, so it is
-  ;; exact; anything else is rejected loudly instead.
-  (define (ascii-string? s)
+  ;; Printable ASCII (space..tilde) passes SASLprep (RFC 4013) unchanged,
+  ;; so it is exact without the normalization tables (which would dwarf
+  ;; this driver). Everything else -- non-ASCII, and the C0/DEL control
+  ;; characters SASLprep PROHIBITS -- must be rejected loudly, not hashed
+  ;; raw into a proof no SASLprep-ing client could ever reproduce.
+  (define (scram-safe-password? s)
     (let ((n (string-length s)))
       (let loop ((i 0))
         (or (= i n)
-            (and (char<=? (string-ref s i) #\delete)
+            (and (char<=? #\space (string-ref s i))
+                 (char<? (string-ref s i) #\delete)
                  (loop (+ i 1)))))))
 
   ;; Drive the SASL exchange to AuthenticationSASLFinal (verifying the
@@ -376,16 +374,21 @@
   ;; through its own TLS session presents a different certificate hash
   ;; and the server rejects the proof. The gs2 flag is three-valued:
   ;;   p=tls-server-end-point  binding in use (PLUS chosen)
-  ;;   y  we could bind but the server offered no PLUS -- if a server
-  ;;      that DID offer PLUS sees this, someone stripped it: rejected
-  ;;   n  no binding available (plaintext connection)
+  ;;   y  TLS is active but binding is not in use (the server offered no
+  ;;      PLUS, or the certificate's hash is unavailable, e.g. RSA-PSS /
+  ;;      Ed25519 signatures) -- if a server that DID offer PLUS sees
+  ;;      this, someone stripped it from the mechanism list: rejected.
+  ;;      Keyed on TLS BEING ACTIVE, not on having a hash, or a MITM
+  ;;      with an unhashable certificate could downgrade us to "n".
+  ;;   n  plaintext connection, no binding possible
   (define (scram-auth! c buf user password sasl-payload)
-    (unless (ascii-string? password)
+    (unless (scram-safe-password? password)
       (postgresql-fail 'transport
         (string-append
-          "non-ASCII passwords require SASLprep normalization, which this "
-          "client does not implement; SCRAM authentication would fail "
-          "against a libpq-written verifier")))
+          "password contains characters outside printable ASCII, which "
+          "require SASLprep normalization; this client does not implement "
+          "SASLprep, and SCRAM authentication would fail against a "
+          "libpq-written verifier")))
     (let* ((mechs (sasl-mechanisms sasl-payload))
            (cb (tx-cb c))
            (plus? (and cb (member "SCRAM-SHA-256-PLUS" mechs) #t)))
@@ -393,8 +396,8 @@
         (postgresql-fail 'transport "server offered no SCRAM-SHA-256 mechanism"))
       (let* ((mech (if plus? "SCRAM-SHA-256-PLUS" "SCRAM-SHA-256"))
              (gs2 (cond (plus? "p=tls-server-end-point,,")
-                        (cb "y,,")
-                        (else "n,,")))
+                        ((tx-enc c) "y,,")        ; TLS active, no binding
+                        (else "n,,")))            ; plaintext
              ;; c= carries base64(gs2-header [+ binding data]); with no
              ;; binding this is base64("n,,") = the fixed "biws"
              (cbind (base64-encode
@@ -408,40 +411,47 @@
           (bv-append (cstr mech)
                      (u32 (string-length client-first))
                      (string->utf8 client-first)))
-      (let-values (((t p) (next-msg!/skip-notices c buf)))
-        (unless (and (fx= t (char->integer #\R)) (= (read-u32-be p 0) 11))
-          (if (fx= t (char->integer #\E))
-              (raise (error-response->fail p))
-              (postgresql-fail 'transport "expected SASLContinue")))
-        (let* ((server-first (utf8->string (bv-sub p 4 (bytevector-length p))))
-               (a (scram-attrs server-first))
-               (snonce (attr a #\r))
-               (salt-b64 (attr a #\s))
-               (iters (let ((s (attr a #\i))) (and s (string->number s)))))
-          ;; validate everything before touching it: a missing or bogus
-          ;; field is a protocol error, not a raw assertion
-          (unless (and snonce salt-b64 iters (fixnum? iters) (> iters 0)
-                       (>= (string-length snonce) (string-length cnonce))
-                       (string=? (substring snonce 0 (string-length cnonce)) cnonce))
-            (postgresql-fail 'transport "malformed SCRAM server-first message"))
-          (let* ((salt (base64-decode salt-b64))
-                 (final-noproof (string-append "c=" cbind ",r=" snonce))
-                 (auth-msg (string-append client-first-bare "," server-first
-                                          "," final-noproof)))
-            (let-values (((proof server-sig) (scram-derive password salt iters auth-msg)))
-              (send-msg! c MSG-PASSWORD
-                (string->utf8
-                  (string-append final-noproof ",p=" (base64-encode proof))))
-              (let-values (((t2 p2) (next-msg!/skip-notices c buf)))
-                (cond
-                  ((and (fx= t2 (char->integer #\R)) (= (read-u32-be p2 0) 12))
-                   (let ((v (attr (scram-attrs
-                                    (utf8->string (bv-sub p2 4 (bytevector-length p2))))
-                                  #\v)))
-                     (unless (and v (bytevector=? (base64-decode v) server-sig))
-                       (postgresql-fail 'transport "server signature mismatch"))))
-                  ((fx= t2 (char->integer #\E)) (raise (error-response->fail p2)))
-                  (else (postgresql-fail 'transport "expected SASLFinal")))))))))))
+        (let-values (((t p) (next-msg!/skip-notices c buf)))
+          (unless (and (fx= t (char->integer #\R)) (= (read-u32-be p 0) 11))
+            (if (fx= t (char->integer #\E))
+                (raise (error-response->fail p))
+                (postgresql-fail 'transport "expected SASLContinue")))
+          (let* ((server-first (utf8->string (bv-sub p 4 (bytevector-length p))))
+                 (a (scram-attrs server-first))
+                 (snonce (attr a #\r))
+                 (salt-b64 (attr a #\s))
+                 (iters (let ((s (attr a #\i))) (and s (string->number s)))))
+            ;; validate everything before touching it: a missing or bogus
+            ;; field is a protocol error, not a raw assertion. The server
+            ;; nonce must EXTEND ours (RFC 5802: client nonce + a non-empty
+            ;; server part), so strictly longer.
+            (unless (and snonce salt-b64 iters (fixnum? iters) (> iters 0)
+                         (> (string-length snonce) (string-length cnonce))
+                         (string=? (substring snonce 0 (string-length cnonce))
+                                   cnonce))
+              (postgresql-fail 'transport "malformed SCRAM server-first message"))
+            (let* ((salt (base64-decode salt-b64))
+                   (final-noproof (string-append "c=" cbind ",r=" snonce))
+                   (auth-msg (string-append client-first-bare "," server-first
+                                            "," final-noproof)))
+              (let-values (((proof server-sig)
+                            (scram-derive password salt iters auth-msg)))
+                (send-msg! c MSG-PASSWORD
+                  (string->utf8
+                    (string-append final-noproof ",p=" (base64-encode proof))))
+                (let-values (((t2 p2) (next-msg!/skip-notices c buf)))
+                  (cond
+                    ((and (fx= t2 (char->integer #\R)) (= (read-u32-be p2 0) 12))
+                     (let ((v (attr (scram-attrs
+                                      (utf8->string
+                                        (bv-sub p2 4 (bytevector-length p2))))
+                                    #\v)))
+                       (unless (and v (bytevector=? (base64-decode v) server-sig))
+                         (postgresql-fail 'transport "server signature mismatch"))))
+                    ((fx= t2 (char->integer #\E))
+                     (raise (error-response->fail p2)))
+                    (else
+                     (postgresql-fail 'transport "expected SASLFinal")))))))))))
 
   ;; ---- authentication ----------------------------------------------------
 
@@ -471,6 +481,15 @@
                       "server requested cleartext password authentication, "
                       "which would send the password unprotected; pass "
                       "'allow-cleartext-auth to permit it on a trusted socket")))
+                ;; the PasswordMessage payload is a NUL-terminated string:
+                ;; an embedded NUL would silently truncate the password
+                ;; server-side and authenticate against the prefix
+                (when (let scan ((i 0))
+                        (and (< i (string-length password))
+                             (or (char=? (string-ref password i) #\nul)
+                                 (scan (+ i 1)))))
+                  (postgresql-fail 'transport
+                    "password contains a NUL character, which cannot be represented in cleartext authentication"))
                 (send-msg! c MSG-PASSWORD (cstr password))
                 (loop))
                ((= code 5)
@@ -700,7 +719,10 @@
   ;; no 'tls option this is just the plain wrapper. With one, send
   ;; SSLRequest and read its answer -- a single RAW byte outside message
   ;; framing -- then hand the socket to the injected connector, which
-  ;; drives the handshake and returns the #(encrypt decrypt close!) codec.
+  ;; drives the handshake and returns the codec
+  ;; #(encrypt decrypt close! cb-hash): cb-hash is the RFC 5929
+  ;; tls-server-end-point value for SCRAM channel binding, or #f (a
+  ;; 3-slot codec is accepted and simply disables binding).
   ;; 'N' (server refuses TLS) fails hard: the caller asked for TLS, so
   ;; falling back to plaintext silently would defeat the point; trailing
   ;; bytes after the answer are injected plaintext and also fail.
@@ -722,8 +744,15 @@
                             (let ((v (connector raw host connect-timeout-ms)))
                               ;; validate the shape inside the guard, so a
                               ;; misbehaving custom connector surfaces as a
-                              ;; clear tls-tagged error, not a raw assertion
-                              (unless (and (vector? v) (>= (vector-length v) 3))
+                              ;; clear tls-tagged error, not a raw assertion.
+                              ;; Slot 3, when present, must be the binding
+                              ;; hash (bytevector) or #f -- anything else
+                              ;; would be mistaken for one and blow up
+                              ;; mid-SCRAM.
+                              (unless (and (vector? v) (>= (vector-length v) 3)
+                                           (or (< (vector-length v) 4)
+                                               (let ((cb (vector-ref v 3)))
+                                                 (or (not cb) (bytevector? cb)))))
                                 (error 'postgresql
                                   "tls: connector returned an invalid codec"))
                               v))))
@@ -744,13 +773,19 @@
 
   ;; (igropyr tls) raises the neutral #(tls-error "tls: ...") -- keep the
   ;; text (the older http-client tag is accepted too, for any third-party
-  ;; connector still using it)
+  ;; connector still using it). Conditions render via display-condition,
+  ;; so our own shape-check error keeps its message instead of printing
+  ;; as an opaque #<compound condition>.
   (define (tls-failure-reason e)
-    (if (and (vector? e)
-             (memq (vector-ref e 0) '(tls-error http-client-error))
-             (> (vector-length e) 1) (string? (vector-ref e 1)))
-        (vector-ref e 1)
-        (call-with-string-output-port (lambda (p) (write e p)))))
+    (cond
+      ((and (vector? e)
+            (memq (vector-ref e 0) '(tls-error http-client-error))
+            (> (vector-length e) 1) (string? (vector-ref e 1)))
+       (vector-ref e 1))
+      ((condition? e)
+       (call-with-string-output-port (lambda (p) (display-condition e p))))
+      (else
+       (call-with-string-output-port (lambda (p) (write e p))))))
 
   ;; spawn a connection worker; reports #(db-up ,ref ,self status) to
   ;; report-to -- ref lets the receiver ignore a stale report from an
@@ -812,6 +847,21 @@
     (values (if (and (pair? rest) (car rest)) (car rest) user)
             (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) '())))
 
+  ;; Without 'allow-cleartext-auth, SCRAM is the only auth this client
+  ;; can complete, so a password SCRAM must reject is statically doomed:
+  ;; fail HERE, in the caller. Inside a pool the connect worker's failure
+  ;; is invisible -- the pool retries every second and callers see only
+  ;; checkout timeouts. (scram-auth! keeps its own check as the backstop
+  ;; for the cleartext-opted case where the server picks SCRAM anyway.)
+  (define (check-password! who password opts)
+    (unless (or (scram-safe-password? password)
+                (assq-ref opts 'allow-cleartext-auth))
+      (assertion-violation who
+        (string-append
+          "password contains characters outside printable ASCII; SCRAM "
+          "requires SASLprep normalization, which this client does not "
+          "implement"))))
+
   ;; Connect + authenticate a single connection; returns the connection
   ;; process or raises #(postgresql-error tag msg). The database defaults to
   ;; the user name (as PostgreSQL itself defaults). Optional args after the
@@ -822,6 +872,7 @@
   ;;                          with full certificate verification.
   (define (postgresql-connect host port user password . rest)
     (let-values (((db opts) (conn-args rest user)))
+      (check-password! 'postgresql-connect password opts)
       (let ((ref (gensym)))
         (start-connection host port user password db opts #f self ref)
         (receive (after (+ connect-timeout-ms 2000)
@@ -840,6 +891,7 @@
   ;; db + options as postgresql-connect.
   (define (postgresql-pool n host port user password . rest)
     (let-values (((db opts) (conn-args rest user)))
+      (check-password! 'postgresql-pool password opts)
       (spawn
         (lambda ()
           (sql-pool-loop n
@@ -871,9 +923,15 @@
            ((and (flonum? v) (nan? v)) "NaN")
            ((and (flonum? v) (infinite? v))
             (if (fl> v 0.0) "Infinity" "-Infinity"))
-           ;; an exact non-integer would render as "1/3"; send a decimal
+           ;; an exact non-integer would render as "1/3"; send a decimal.
+           ;; The conversion itself can overflow to an infinity (a
+           ;; rational beyond double range) -- spell that PostgreSQL's
+           ;; way too, never the rejected Scheme literal.
            ((and (exact? v) (not (integer? v)))
-            (number->string (exact->inexact v)))
+            (let ((f (exact->inexact v)))
+              (if (infinite? f)
+                  (if (> f 0.0) "Infinity" "-Infinity")
+                  (number->string f))))
            (else (number->string v)))))
       (else (assertion-violation 'postgresql-execute
               "parameter must be a string, number, bytevector or #f" v))))

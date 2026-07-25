@@ -32,7 +32,9 @@
 ;;; Failures raise the neutral #(tls-error "tls: ...") -- this library
 ;;; serves any protocol, not just https. The https connector registered
 ;;; by tls-enable! re-tags them as #(http-client-error "tls: ...") so
-;;; the http-client error contract is unchanged.
+;;; the http-client error contract for REQUESTS is unchanged; note that
+;;; tls-enable! itself (e.g. a missing system trust store at startup)
+;;; raises tls-error directly.
 ;;;
 ;;; Sessions are closed by freeing (no close_notify): the client speaks
 ;;; Connection: close and hard-closes the socket right after, and both

@@ -287,7 +287,10 @@
       (receive (after 0 'done)
         (`#(db-reply ,r ,v) (loop))
         (`#(db-checkout-reply ,r ,conn) (loop))
-        (`#(db-checkout-failed ,r ,e) (loop)))))
+        (`#(db-checkout-failed ,r ,e) (loop))
+        ;; a lone driver connect that timed out leaves the worker's late
+        ;; up-report behind (its per-attempt ref never matches again)
+        (`#(db-up ,r ,p ,s) (loop)))))
 
   ;; Run one SQL statement on a connection or a pool; blocks only the
   ;; calling green process. The per-call ref (a fresh gensym) is echoed in

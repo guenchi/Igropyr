@@ -358,6 +358,12 @@
                                    +inf.0 -inf.0 +nan.0)))
         (check "execute-nonfinite-spelling"
           (equal? (vector-ref r 2) '(("Infinity" "-Infinity" "NaN")))))
+      ;; ...including an exact rational that overflows double on conversion
+      (let ((r (postgresql-execute conn "SELECT $1, $2"
+                                   (/ (expt 10 400) 3)
+                                   (- (/ (expt 10 400) 3)))))
+        (check "execute-exact-overflow-spelling"
+          (equal? (vector-ref r 2) '(("Infinity" "-Infinity")))))
       ;; >65535 params: caller-side assertion, connection survives
       (check "param-overflow-is-callers-error"
         (guard (e ((not (and (vector? e)
@@ -406,14 +412,37 @@
         (and e (eq? (vector-ref e 1) 'transport)
              (string-contains? (vector-ref e 2) "invalid message length"))))
 
-    ;; 9. non-ASCII password on the SCRAM path: rejected with a clear error
-    ;;    (SASLprep is not implemented), never a baffling auth failure
+    ;; 9. passwords outside printable ASCII (SASLprep unimplemented):
+    ;;    with SCRAM as the only possible path this is a CALLER-side
+    ;;    assertion -- inside a pool a worker-side failure would be an
+    ;;    invisible 1s retry loop -- and control characters are rejected
+    ;;    too (SASLprep prohibits them)
     (let ((e (connect-error "127.0.0.1" port "user"
                             (string-append "p" (string (integer->char #xE4)) "ss")
                             "scram")))
-      (check "non-ascii-password-rejected"
-        (and e (eq? (vector-ref e 1) 'transport)
+      (check "non-ascii-password-caller-assertion"
+        (and e (not (vector? e)) (condition? e))))
+    (let ((e (connect-error "127.0.0.1" port "user"
+                            (string-append "p" (string (integer->char 1)) "ss")
+                            "scram")))
+      (check "control-char-password-caller-assertion"
+        (and e (not (vector? e)) (condition? e))))
+    ;; with cleartext opted in the caller check defers -- the SCRAM
+    ;; backstop still rejects when the server picks SCRAM anyway
+    (let ((e (connect-error "127.0.0.1" port "user"
+                            (string-append "p" (string (integer->char #xE4)) "ss")
+                            "scram" '((allow-cleartext-auth . #t)))))
+      (check "scram-backstop-rejects-non-ascii"
+        (and e (vector? e) (eq? (vector-ref e 1) 'transport)
              (string-contains? (vector-ref e 2) "SASLprep"))))
+    ;; an embedded NUL cannot ride a NUL-terminated PasswordMessage --
+    ;; it would silently truncate server-side
+    (let ((e (connect-error "127.0.0.1" port "user"
+                            (string-append "p" (string #\nul) "w2")
+                            "cleartext" '((allow-cleartext-auth . #t)))))
+      (check "cleartext-nul-password-rejected"
+        (and e (vector? e) (eq? (vector-ref e 1) 'transport)
+             (string-contains? (vector-ref e 2) "NUL"))))
 
     ;; 10. server refusing TLS must fail the connection, never fall back to
     ;;    plaintext (the connector must not even be called)
