@@ -707,6 +707,23 @@
   ;; open any more (e.g. the client disconnected) -- stop the loop then.
   (define crlf-bv (string->utf8 "\r\n"))
 
+  ;; Write one chunk and WAIT for it to drain -- backpressure: the producer
+  ;; runs at the client's pace, one chunk in flight. Without it a client
+  ;; that stops reading (or simply reads slowly) never leaves conn-state
+  ;; 'open, so a producer loop would keep queueing: enqueue-write! has no
+  ;; cap and foreign-allocs every queued block, so memory the GC cannot
+  ;; even see grows at the producer's full speed. One stalled reader per
+  ;; streaming endpoint was enough to exhaust the machine.
+  ;;
+  ;; Same shape as res-write-fixed!: the completion usually runs INLINE
+  ;; (uv_try_write took it all), leaving the status in the box with no
+  ;; message and no receive; only a genuinely queued write parks this
+  ;; process. A callback can only run inline here or from the event loop,
+  ;; never between the unbox and the set-box!, because neither yields.
+  ;;
+  ;; A client that never drains parks the handler indefinitely, exactly as
+  ;; in res-write-fixed!; the worker's stuck-ms is what bounds that, and
+  ;; the resulting kill now closes the connection (see fail-task).
   (define (res-write! r data)
     (let ((bv (if (string? data) (string->utf8 data) data))
           (c (res-conn r)))
@@ -714,12 +731,22 @@
            (eq? (conn-state c) 'open)
            (> (bytevector-length bv) 0)
            ;; chunk = <hex size>CRLF <data> CRLF, written as three segments
-           (tcp-writev! c
-             (list (string->utf8
-                     (string-append (number->string (bytevector-length bv) 16) "\r\n"))
-                   bv
-                   crlf-bv)
-             #f))))
+           (let ((b (box 'pending)) (me self))
+             (tcp-writev! c
+               (list (string->utf8
+                       (string-append (number->string (bytevector-length bv) 16) "\r\n"))
+                     bv
+                     crlf-bv)
+               (lambda (st)
+                 (if (eq? (unbox b) 'pending)
+                     (set-box! b st)
+                     (send me (vector 'chunk-written st)))))
+             (let ((st (unbox b)))
+               (if (eq? st 'pending)
+                   (begin
+                     (set-box! b 'parked)
+                     (receive (`#(chunk-written ,st2) (>= st2 0))))
+                   (>= st 0)))))))
 
   ;; Finish the stream: terminating chunk, then the usual keep-alive /
   ;; close continuation. The terminator is encoded once at load time;

@@ -44,6 +44,8 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # a handler crashing after it began streaming must close the connection,
 # not leave the reader parked forever on a leaked fd
 "$scheme_bin" --script igropyr/test/stream-crash.sc
+# a chunked producer must run at the client's pace, not queue unboundedly
+"$scheme_bin" --script igropyr/test/stream-backpressure.sc
 "$scheme_bin" --script igropyr/test/http-client-stream.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc
