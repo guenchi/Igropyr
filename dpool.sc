@@ -97,16 +97,29 @@
   ;; the worker down), so one node serves many tasks concurrently -- up
   ;; to `max-concurrency` (optional, default 64) at once; the rest wait
   ;; in FIFO order and start as slots free.
+  ;; rest: [max-concurrency [task-timeout-ms]]. task-timeout-ms > 0 kills a
+  ;; task that has run that long (its slot is then reclaimed by the monitor
+  ;; below and the caller sees a task-error); 0 -- the default -- means a
+  ;; task may run indefinitely, so a handler that can block forever should
+  ;; either carry its own timeout or be given one here.
   (define (dpool-worker-start name handler . rest)
-    (let ((cap (if (pair? rest) (car rest) default-worker-concurrency)))
+    (let ((cap (if (pair? rest) (car rest) default-worker-concurrency))
+          (task-timeout (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) 0)))
       (unless (and (integer? cap) (exact? cap) (> cap 0))
         (assertion-violation 'dpool-worker-start
           "max-concurrency must be a positive integer" cap))
+      (unless (and (integer? task-timeout) (exact? task-timeout)
+                   (>= task-timeout 0))
+        (assertion-violation 'dpool-worker-start
+          "task-timeout-ms must be a nonnegative integer" task-timeout))
       (register name
         (spawn
           (lambda ()
-            (let ((worker self)          ; tasks send #(slot-free) back here
+            (let ((worker self)          ; tasks send #(slot-free ,self) back
                   (running 0)
+                  ;; task pid -> #(monitor-ref started-ms); a task occupies a
+                  ;; slot exactly as long as it has an entry here
+                  (live (make-eq-hashtable))
                   (pf '()) (pb '()))     ; two-list FIFO of tasks over the cap
               (define (penq! x) (set! pb (cons x pb)))
               (define (pdeq!)            ; oldest queued task, or #f
@@ -114,20 +127,55 @@
                 (and (pair? pf) (let ((x (car pf))) (set! pf (cdr pf)) x)))
               ;; Run one task in its own process, ship the result tagged
               ;; with the SAME token the coordinator dispatched, then free
-              ;; the slot. Both a handler crash and a non-serializable
-              ;; reply are caught, so #(slot-free) is always sent -- a
-              ;; task can never leak a slot and wedge the worker.
+              ;; the slot. The guard covers a handler crash and a
+              ;; non-serializable reply -- but NOT a task that is killed or
+              ;; never returns, which is why the worker also monitors it.
               (define (run! id rnode rname payload token)
-                (spawn
-                  (lambda ()
-                    (let ((result
-                           (guard (e (#t (vector 'task-error (reason-of e))))
-                             (vector 'ok (handler payload)))))
-                      (guard (e (#t (rsend rnode rname
-                                      (vector 'dresult id token
-                                        (vector 'task-error 'not-serializable)))))
-                        (rsend rnode rname (vector 'dresult id token result))))
-                    (send worker (vector 'slot-free)))))
+                (let ((p (spawn
+                           (lambda ()
+                             (let ((me self))
+                               (let ((result
+                                      (guard (e (#t (vector 'task-error (reason-of e))))
+                                        (vector 'ok (handler payload)))))
+                                 (guard (e (#t (rsend rnode rname
+                                                 (vector 'dresult id token
+                                                   (vector 'task-error 'not-serializable)))))
+                                   (rsend rnode rname (vector 'dresult id token result))))
+                               (send worker (vector 'slot-free me)))))))
+                  (hashtable-set! live p (vector (monitor p) (real-time)))
+                  p))
+              ;; Release the slot p holds, if it still holds one. Idempotent:
+              ;; a task normally reports #(slot-free) and THEN dies, so its
+              ;; DOWN arrives afterwards and must not free a second slot.
+              (define (release! p)
+                (let ((e (hashtable-ref live p #f)))
+                  (and e
+                       (begin
+                         (demonitor (vector-ref e 0))
+                         (hashtable-delete! live p)
+                         (set! running (- running 1))
+                         (let ((t (pdeq!)))
+                           (when t
+                             (set! running (+ running 1))
+                             (run! (vector-ref t 0) (vector-ref t 1)
+                                   (vector-ref t 2) (vector-ref t 3)
+                                   (vector-ref t 4))))
+                         #t))))
+              ;; kill tasks that have outstayed task-timeout; the DOWN each
+              ;; one produces is what actually reclaims its slot
+              (define (reap-stuck!)
+                (let ((now (real-time)) (ks (hashtable-keys live)))
+                  (do ((i 0 (+ i 1))) ((= i (vector-length ks)))
+                    (let* ((p (vector-ref ks i)) (e (hashtable-ref live p #f)))
+                      (when (and e (> (- now (vector-ref e 1)) task-timeout))
+                        (kill p 'dpool-task-timeout))))))
+              (when (> task-timeout 0)
+                (let ((w worker) (period (max 1000 (div task-timeout 2))))
+                  (spawn (lambda ()
+                           (let tick ()
+                             (sleep-ms period)
+                             (send w (vector 'check-stuck-tasks))
+                             (tick))))))
               (let loop ()
                 (receive
                   (`#(dtask ,id ,rnode ,rname ,payload ,token)
@@ -136,13 +184,20 @@
                                (run! id rnode rname payload token))
                         (penq! (vector id rnode rname payload token)))
                     (loop))
-                  (`#(slot-free)
-                    (set! running (- running 1))
-                    (let ((t (pdeq!)))
-                      (when t
-                        (set! running (+ running 1))
-                        (run! (vector-ref t 0) (vector-ref t 1) (vector-ref t 2)
-                              (vector-ref t 3) (vector-ref t 4))))
+                  (`#(slot-free ,p)
+                    (release! p)
+                    (loop))
+                  ;; A task died without reporting -- killed as stuck, killed
+                  ;; by a supervisor (dynamic-wind winders are discarded, so
+                  ;; no message is ever sent), or crashed outside the guard.
+                  ;; Without this the slot would be occupied forever, and
+                  ;; after `cap` such tasks the node would keep ACCEPTING
+                  ;; work while executing none of it.
+                  (`#(DOWN ,p ,reason)
+                    (release! p)
+                    (loop))
+                  (`#(check-stuck-tasks)
+                    (reap-stuck!)
                     (loop))
                   (other (loop))))))))))            ; ignore stray messages
 
