@@ -121,8 +121,17 @@
                  (loop))))
       store))
 
+  ;; Key on the CONNECTION's peer address, never on X-Forwarded-For:
+  ;; that header is written by the client, so keying on it lets an
+  ;; attacker mint a fresh bucket per request (unlimited attempts, plus
+  ;; unbounded store growth), while clients that send none all collapse
+  ;; into one shared bucket where a single attacker can lock everyone
+  ;; out. Behind a trusted proxy -- where the peer is the proxy and XFF
+  ;; is meaningful -- pass an explicit key procedure that parses the
+  ;; chain according to how many hops YOU trust:
+  ;;   (rate-limit `((key . ,(lambda (req) (client-ip-from-xff req)))))
   (define (default-rate-key req)
-    (or (req-header req 'x-forwarded-for) "global"))
+    (or (req-peer req) "unknown-peer"))
 
   (define (rate-limit . rest)
     (let* ((o (if (pair? rest) (car rest) '()))

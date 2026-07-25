@@ -59,9 +59,26 @@
   ;; async: put / drop / prune (no reply needed)
   (define (store-cast msg tbl)
     (case (vector-ref msg 0)
+      ;; #(put sid delta cleared? ttl): MERGE the keys this request
+      ;; actually touched into whatever the store holds now, rather than
+      ;; overwriting with a snapshot taken before the handler ran. Two
+      ;; concurrent requests on one sid both read the same starting data;
+      ;; a whole-alist write would silently drop the first one's fields.
       ((put)
-       (hashtable-set! tbl (vector-ref msg 1)
-         (cons (vector-ref msg 2) (+ (now-ms) (vector-ref msg 3)))))
+       (let* ((sid (vector-ref msg 1))
+              (delta (vector-ref msg 2))
+              (cleared? (vector-ref msg 3))
+              (entry (hashtable-ref tbl sid #f))
+              (base (if (or cleared? (not entry) (<= (cdr entry) (now-ms)))
+                        '()
+                        (car entry)))
+              (merged (fold-left
+                        (lambda (acc kv)
+                          (cons kv (remp (lambda (p) (eq? (car p) (car kv)))
+                                         acc)))
+                        base delta)))
+         (hashtable-set! tbl sid
+           (cons merged (+ (now-ms) (vector-ref msg 4))))))
       ((drop) (hashtable-delete! tbl (vector-ref msg 1)))
       ((prune)
        (let ((now (now-ms)))
@@ -95,12 +112,20 @@
 
   ;; ---- session object (lives on the request) --------------------------
 
-  ;; sid, mutable data alist, mutable dirty?/new? flags
+  ;; sid, mutable data alist, mutable dirty?/new? flags; `touched` is the
+  ;; alist of keys this request actually wrote (the delta merged into the
+  ;; store), and `cleared?` records a session-clear! so the merge starts
+  ;; from empty instead of from a concurrent writer's data.
   (define-checked-record session
     (sid string?)
     (mutable data list?)
     (mutable dirty? boolean?)
-    (mutable new? boolean?))
+    (mutable new? boolean?)
+    (mutable touched list?)
+    (mutable cleared? boolean?))
+
+  (define (make-session/fresh sid data new?)
+    (make-session sid data #f new? '() #f))
 
   (define-checked (session-get (s session?) (key symbol?))
     (let ((p (assq key (session-data s)))) (and p (cdr p))))
@@ -109,10 +134,16 @@
     (let ((p (assq key (session-data s))))
       (if p (set-cdr! p val)
           (session-data-set! s (cons (cons key val) (session-data s)))))
+    ;; record the write itself, so the store merges only this key
+    (session-touched-set! s
+      (cons (cons key val)
+            (remp (lambda (p) (eq? (car p) key)) (session-touched s))))
     (session-dirty?-set! s #t))
 
   (define-checked (session-clear! (s session?))
     (session-data-set! s '())
+    (session-touched-set! s '())
+    (session-cleared?-set! s #t)
     (session-dirty?-set! s #t))
 
   ;; handler-facing accessor
@@ -120,23 +151,59 @@
 
   ;; ---- middleware ------------------------------------------------------
 
-  (define cookie-name "sid")
+  (define default-cookie-name "sid")
 
-  (define-checked (session-middleware (store vector?))
-    (lambda (req res next)
-      (let* ((sid (req-cookie req cookie-name))
-             (data (and sid (gen-server-call (store-pid store)
-                              (vector 'get sid))))
-             (s (if data
-                    (make-session sid data #f #f)
-                    (make-session (new-sid) '() #f #t))))
-        (req-set-local! req 'session s)
-        (when (session-new? s)
-          (set-cookie! res cookie-name (session-sid s)
-                       "Path=/" "HttpOnly" "SameSite=Lax"))
-        (next)
-        ;; persist after the handler if the session changed
-        (when (or (session-dirty? s) (session-new? s))
-          (gen-server-cast (store-pid store)   ; async: don't block the response
-            (vector 'put (session-sid s) (session-data s) (store-ttl store)))))))
+  (define (opt o k d) (let ((p (assq k o))) (if p (cdr p) d)))
+
+  ;; Options: (cookie . "name"), (secure . bool), (same-site . "Lax"),
+  ;; (max-age . seconds | #f), (path . "/").
+  ;;
+  ;; `secure` defaults to #t: the sid is a bearer credential (it is also
+  ;; what session-guard authenticates a WebSocket upgrade with), so the
+  ;; browser must never attach it to a plaintext request. Pass
+  ;; '((secure . #f)) for local http development.
+  ;;
+  ;; A session is persisted only when the handler actually WROTE to it.
+  ;; Minting a store entry for every cookie-less request would (a) let
+  ;; any anonymous visitor hold a live, store-resident session -- which
+  ;; session-guard would then have to distinguish from a real login --
+  ;; and (b) grow the store without bound under unauthenticated traffic.
+  ;; (define-checked has no rest-argument form; check by hand)
+  (define (session-middleware store . rest)
+    (unless (vector? store)
+      (assertion-violation 'session-middleware
+        "store must be a session store" store))
+    (let* ((o (if (pair? rest) (car rest) '()))
+           (cname (opt o 'cookie default-cookie-name))
+           (path (opt o 'path "/"))
+           (same-site (opt o 'same-site "Lax"))
+           (max-age (opt o 'max-age #f))
+           (secure? (opt o 'secure #t)))
+      (lambda (req res next)
+        (let* ((sid (req-cookie req cname))
+               (data (and sid (gen-server-call (store-pid store)
+                                (vector 'get sid))))
+               (s (if data
+                      (make-session/fresh sid data #f)
+                      (make-session/fresh (new-sid) '() #t))))
+          (req-set-local! req 'session s)
+          ;; The cookie must go out with the response headers, i.e. before
+          ;; the handler runs, so a new sid is always announced; only the
+          ;; STORE entry waits for an actual write.
+          (when (session-new? s)
+            (apply set-cookie! res cname (session-sid s)
+                   (string-append "Path=" path)
+                   "HttpOnly"
+                   (string-append "SameSite=" same-site)
+                   (append (if secure? '("Secure") '())
+                           (if max-age
+                               (list (string-append "Max-Age="
+                                                    (number->string max-age)))
+                               '()))))
+          (next)
+          ;; persist only what the handler wrote (see store-cast 'put)
+          (when (session-dirty? s)
+            (gen-server-cast (store-pid store)  ; async: don't block the response
+              (vector 'put (session-sid s) (session-touched s)
+                      (session-cleared? s) (store-ttl store))))))))
 )

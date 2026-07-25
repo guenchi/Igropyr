@@ -203,9 +203,15 @@
   (define (flight-call msg from tbl)      ; claim -> 'leader | 'follower
     (case (vector-ref msg 0)
       ((claim)
-       (let ((key (vector-ref msg 1)) (who (vector-ref msg 2)))
+       ;; waiters are (who . ref): the ref makes each wait unique, so a
+       ;; publish that arrives after its follower gave up cannot be
+       ;; matched by a LATER flight round on the same key (which would
+       ;; hand back an arbitrarily stale render).
+       (let ((key (vector-ref msg 1)) (who (vector-ref msg 2))
+             (ref (vector-ref msg 3)))
          (if (hashtable-contains? tbl key)
-             (begin (hashtable-set! tbl key (cons who (hashtable-ref tbl key '())))
+             (begin (hashtable-set! tbl key
+                      (cons (cons who ref) (hashtable-ref tbl key '())))
                     (values 'follower tbl))
              (begin (hashtable-set! tbl key '()) (values 'leader tbl)))))
       (else (values 'bad-request tbl))))
@@ -214,13 +220,14 @@
     (case (vector-ref msg 0)
       ((publish)                          ; leader done: wake waiters, drop key
        (let ((key (vector-ref msg 1)) (res (vector-ref msg 2)))
-         (for-each (lambda (w) (send w (vector 'ssr-flight key res)))
+         (for-each (lambda (w) (send (car w) (vector 'ssr-flight (cdr w) res)))
                    (hashtable-ref tbl key '()))
          (hashtable-delete! tbl key)))
       ((unclaim)                          ; a follower timed out (dead leader)
-       (let ((key (vector-ref msg 1)) (who (vector-ref msg 2)))
+       (let ((key (vector-ref msg 1)) (ref (vector-ref msg 2)))
          (when (hashtable-contains? tbl key)
-           (let ((ws (remq who (hashtable-ref tbl key '()))))
+           (let ((ws (remp (lambda (w) (eq? (cdr w) ref))
+                           (hashtable-ref tbl key '()))))
              ;; last waiter gone with no publish -> the leader is stuck; drop
              ;; the entry so the key isn't wedged in follower-forever mode
              (if (null? ws) (hashtable-delete! tbl key)
@@ -251,7 +258,12 @@
           (rnd (ssr-renders r)))
       (if (not flight)
           (call+cache rnd backend key fn json ttl)
-          (let ((role (gen-server-call flight (vector 'claim key self))))
+          (begin
+          ;; drop the late answer to any earlier round we abandoned: its
+          ;; ref can never match again, so it would linger forever
+          (let drain () (receive (after 0 'done) (`#(ssr-flight ,r ,v) (drain))))
+          (let* ((ref (gensym))
+                 (role (gen-server-call flight (vector 'claim key self ref))))
             (if (eq? role 'leader)
                 (let* ((again (b-get backend key))       ; double-check
                        (res (if again (cons #t again)
@@ -260,9 +272,9 @@
                   res)
                 (receive (after (ssr-flight-wait r)
                             ;; leader vanished -> render ourselves
-                            (gen-server-cast flight (vector 'unclaim key self))
+                            (gen-server-cast flight (vector 'unclaim key ref))
                             (call+cache rnd backend key fn json ttl))
-                  (`#(ssr-flight ,@key ,res) res)))))))
+                  (`#(ssr-flight ,@ref ,res) res))))))))
 
   ;; ---- public ssr: #(backend ttl flight) -------------------------------
   (define (make-ssr bundle . opt)

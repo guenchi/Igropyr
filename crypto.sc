@@ -303,11 +303,23 @@
       ((char=? ch #\/) 63)
       (else #f)))
 
+  ;; Decoding is CANONICAL: the bits left over in the final character
+  ;; (2 for a 32-byte value, 4 for a 31-byte one) must be zero. Dropping
+  ;; them instead would make four different last characters decode to
+  ;; the same bytes, so one signature would have several valid textual
+  ;; spellings -- token malleability that defeats any denylist, replay
+  ;; cache or audit keyed on the token STRING (the signature itself
+  ;; still verifies, so this is not forgery, but the identity of the
+  ;; token must be unique). Raises &assertion on a non-canonical tail.
   (define (base64-decode s)
     (let-values (((p get) (open-bytevector-output-port)))
       (let loop ((i 0) (acc 0) (bits 0))
         (if (= i (string-length s))
-            (get)
+            (begin
+              (unless (zero? acc)
+                (assertion-violation 'base64-decode
+                  "non-canonical base64: unused trailing bits are set" s))
+              (get))
             (let ((v (b64-value (string-ref s i))))
               (if (not v)
                   (loop (+ i 1) acc bits)   ; skip '=', newlines, etc.

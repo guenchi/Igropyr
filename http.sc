@@ -34,7 +34,7 @@
           ;; user code that wants to type-test req/res values
           request? res?
           req-method req-path req-query req-headers req-header req-body
-          req-keep-alive? req-params req-params-set!
+          req-keep-alive? req-peer req-params req-params-set!
           req-local req-set-local!
           set-status! set-header! res-send!
           res-begin! res-write! res-end!
@@ -94,6 +94,9 @@
       (immutable headers req-headers)    ; alist of (symbol . string)
       (immutable body req-body)          ; bytevector
       (immutable keep-alive? req-keep-alive?)
+      ;; the connection's peer IP ("a.b.c.d") or #f -- the one client
+      ;; identity that cannot be forged by a header
+      (immutable peer req-peer)
       ;; per-request scratch alist for middleware to stash values
       ;; (session, authenticated user, ...) for later handlers
       (mutable locals req-locals req-locals-set!)))
@@ -314,11 +317,16 @@
                          (cond ((fx>= j n) n)
                                ((char=? (string-ref text j) #\newline) j)
                                (else (scan (fx+ j 1))))))
-                   (e (if (and (fx> nl i)
-                               (char=? (string-ref text (fx- nl 1)) #\return))
-                          (fx- nl 1)
-                          nl)))
+                   (crlf? (and (fx< nl n) (fx> nl i)
+                               (char=? (string-ref text (fx- nl 1)) #\return)))
+                   (e (if crlf? (fx- nl 1) nl)))
               (cond
+                ;; A line MUST end with CRLF. A bare LF is the classic
+                ;; smuggling wedge: this parser would split on it while a
+                ;; CRLF-strict proxy in front reads the same bytes as one
+                ;; folded value, so the two disagree about how many
+                ;; headers (and which Content-Length) the request has.
+                ((and (fx< nl n) (not crlf?)) #f)
                 ((fx= e i) (loop (fx+ nl 1) acc))                  ; blank line
                 ((memv (string-ref text i) '(#\space #\tab)) #f)   ; obs-fold
                 (else
@@ -362,10 +370,16 @@
                     (cond ((fx>= j n) n)
                           ((char=? (string-ref text j) #\newline) j)
                           (else (scan (fx+ j 1))))))
-             (rl-end (if (and (fx> nl1 0)
-                              (char=? (string-ref text (fx- nl1 1)) #\return))
-                         (fx- nl1 1)
-                         nl1)))
+             ;; the request line must be CRLF-terminated as well (a bare
+             ;; LF here is the same smuggling wedge as in the headers)
+             (rl-crlf? (and (fx> nl1 0)
+                            (char=? (string-ref text (fx- nl1 1)) #\return)))
+             ;; a bare-LF request line is rejected (the guard above turns
+             ;; the raise into a parse failure -> 400): same smuggling
+             ;; wedge as a bare LF between headers
+             (rl-end (cond (rl-crlf? (fx- nl1 1))
+                           ((fx>= nl1 n) nl1)
+                           (else (raise 'bare-lf-request-line)))))
         (define (find-sp from)
           (let loop ((i from))
             (cond ((fx>= i rl-end) #f)
@@ -457,12 +471,39 @@
           (k (assq 'sec-websocket-key headers)))
       (and u k (string-ci=? (cdr u) "websocket") (cdr k))))
 
-  ;; case-insensitive compare in place: no string-downcase copy per request
-  (define (keep-alive? version headers)
+  ;; Connection is a comma-separated TOKEN LIST (RFC 9110): "close, TE"
+  ;; really does mean close. Comparing the whole coalesced value would
+  ;; read that as keep-alive and reuse a socket the peer is closing --
+  ;; a framing desync with whatever sits in front of us.
+  ;; Case-insensitive compare in place: no string-downcase copy.
+  (define (connection-has-token? headers tok)
     (let ((p (assq 'connection headers)))
-      (if (string=? version "HTTP/1.1")
-          (not (and p (string-ci=? (cdr p) "close")))
-          (and p (string-ci=? (cdr p) "keep-alive")))))
+      (and p
+           (let* ((v (cdr p)) (n (string-length v)) (tn (string-length tok)))
+             (let loop ((i 0))
+               (and (fx<= (fx+ i tn) n)
+                    ;; token boundary on both sides: start of value or
+                    ;; just past a comma/space, end likewise
+                    (let ((before-ok?
+                           (or (fx= i 0)
+                               (let ((c (string-ref v (fx- i 1))))
+                                 (or (char=? c #\,) (char=? c #\space)
+                                     (char=? c #\tab)))))
+                          (after-ok?
+                           (or (fx= (fx+ i tn) n)
+                               (let ((c (string-ref v (fx+ i tn))))
+                                 (or (char=? c #\,) (char=? c #\space)
+                                     (char=? c #\tab))))))
+                      (if (and before-ok? after-ok?
+                               (string-ci=? (substring v i (fx+ i tn)) tok))
+                          #t
+                          (loop (fx+ i 1))))))))))
+
+  (define (keep-alive? version headers)
+    (if (string=? version "HTTP/1.1")
+        (not (connection-has-token? headers "close"))
+        (and (connection-has-token? headers "keep-alive")
+             (not (connection-has-token? headers "close")))))
 
   ;; ---- responses -------------------------------------------------------------
 
@@ -977,7 +1018,8 @@
                (let* ((req (make-request (vector-ref parsed 0)
                                          (vector-ref parsed 1)
                                          (vector-ref parsed 2)
-                                         '() headers empty-bv #f '()))
+                                         '() headers empty-bv #f
+                                         (conn-peer-ip c) '()))
                       (session (resolver req)))
                  (cond
                    ((procedure? session)
@@ -1021,6 +1063,7 @@
                               headers
                               body
                               (keep-alive? (vector-ref parsed 3) headers)
+                              (conn-peer-ip c)
                               '()))
            (id (next-task-id!))
            (token (make-token)))

@@ -18,7 +18,7 @@
           file-stream-own! file-stream-raw! file-stream-chunk-ptr
           tcp-read-start! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
-          conn? conn-handle conn-owner conn-set-owner!
+          conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
           conn-state conn-count uv-strerror)
   (import (chezscheme) (igropyr platform))
 
@@ -156,6 +156,8 @@
   (define uv-loop 0)
   (define wakeup-timer 0)
   (define sockaddr-buf 0)
+  (define peername-buf 0)            ; conn-peer-ip scratch (own buffer:
+  (define peername-len 0)            ; sockaddr-buf holds connect state)
   (define read-buf 0)
   (define read-buf-size 65536)
   ;; reusable scratch for the uv_try_write fast path (single OS thread,
@@ -563,6 +565,8 @@
     (set! wakeup-timer (foreign-alloc timer-handle-size))
     (check 'uv-timer-init (uv-timer-init uv-loop wakeup-timer))
     (set! sockaddr-buf (foreign-alloc 128))
+    (set! peername-buf (foreign-alloc 128))
+    (set! peername-len (foreign-alloc 8))
     (set! read-buf (foreign-alloc read-buf-size))
     (set! write-scratch (foreign-alloc write-scratch-size))
     (set! scratch-buf (foreign-alloc buf-t-size)))
@@ -581,6 +585,7 @@
   ;; optional trailing arg: uv_tcp_bind flags (UV_TCP_REUSEPORT = 2,
   ;; kernel-balanced multi-process listening; Linux/FreeBSD only)
   (define (tcp-listen! host port backlog on-accept . opts)
+    (with-interrupts-disabled          ; shared sockaddr-buf: see tcp-connect!
     (let ((flags (if (pair? opts) (car opts) 0))
           (l (foreign-alloc tcp-handle-size)))
       (check 'uv-tcp-init (uv-tcp-init uv-loop l))
@@ -588,7 +593,7 @@
       (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf flags))
       (check 'uv-listen (uv-listen l backlog on-connection-entry))
       (hashtable-set! listener-table l on-accept)
-      l))
+      l)))
 
   ;; Stop accepting new connections (graceful shutdown step 1);
   ;; established connections are unaffected. With a listener handle
@@ -678,6 +683,12 @@
   ;; #(tcp-connected ,conn) or #(tcp-connect-failed ,errno). Call
   ;; tcp-read-start! on the conn after the connected message arrives.
   (define (tcp-connect! host port owner)
+    ;; sockaddr-buf is a process-wide singleton and the allocations
+    ;; below are preemption points: another green process starting its
+    ;; own connect (or a listener binding) would overwrite the address
+    ;; we just resolved, and we would connect to ITS host. Also covers
+    ;; the connect-table mutation. Nothing here yields.
+    (with-interrupts-disabled
     (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
     (let ((h (foreign-alloc tcp-handle-size))
           (req (foreign-alloc connect-req-size)))
@@ -689,7 +700,31 @@
           (foreign-free req)
           (uv-close h on-close-entry)
           (error 'tcp-connect! (uv-strerror r)))
-        #t)))
+        #t))))
+
+  (define uv-tcp-getpeername
+    (foreign-procedure "uv_tcp_getpeername" (void* void* void*) int))
+
+  ;; The peer's IPv4 address as "a.b.c.d", or #f (not open, IPv6, or the
+  ;; socket is gone). This is the ONLY caller-visible identity a remote
+  ;; client cannot forge -- unlike any header it sends -- so it is what
+  ;; per-client policy (rate limiting, banning) must key on.
+  (define (conn-peer-ip c)
+    (and (eq? (conn-state c) 'open)
+         (with-interrupts-disabled          ; shared peername buffers
+           (foreign-set! 'int peername-len 0 128)
+           (and (>= (uv-tcp-getpeername (conn-handle c) peername-buf peername-len) 0)
+                ;; sockaddr_in: sin_family differs in layout across
+                ;; platforms, but sin_addr is always at offset 4
+                (let ((fam (case platform-os
+                             ((macos freebsd) (foreign-ref 'unsigned-8 peername-buf 1))
+                             (else (foreign-ref 'unsigned-16 peername-buf 0)))))
+                  (and (= fam AF-INET)
+                       (string-append
+                         (number->string (foreign-ref 'unsigned-8 peername-buf 4)) "."
+                         (number->string (foreign-ref 'unsigned-8 peername-buf 5)) "."
+                         (number->string (foreign-ref 'unsigned-8 peername-buf 6)) "."
+                         (number->string (foreign-ref 'unsigned-8 peername-buf 7)))))))))
 
   ;; Start delivering #(tcp-data ...) messages to the conn's owner.
   ;; Call after conn-set-owner!.
@@ -732,6 +767,16 @@
         (let ((total (fold-left (lambda (a b) (+ a (bytevector-length b))) 0 segs)))
           (cond
             ((<= total write-scratch-size)
+             ;; write-scratch and scratch-buf are process-wide singletons,
+             ;; and this runs in ordinary green processes (an HTTP worker
+             ;; writing a response, a db client sending a query) with the
+             ;; preemption timer live. The packing loop and its foreign
+             ;; calls are safe points, so without this guard a second
+             ;; writer could overwrite the scratch between our pack and
+             ;; our uv_try_write -- and we would send ITS bytes on OUR
+             ;; socket. with-interrupts-disabled is exit-safe; nothing in
+             ;; here yields.
+             (with-interrupts-disabled
              ;; pack segments into scratch, then try to write in one shot
              (let loop ((ss segs) (off 0))
                (unless (null? ss)
@@ -751,7 +796,7 @@
                  (else                              ; EAGAIN/0: queue all
                   (enqueue-write! c total
                     (lambda (dest) (memcpy-cc dest write-scratch total))
-                    on-done)))))
+                    on-done))))))
             (else                                    ; too big for scratch
              (enqueue-write! c total
                (lambda (dest)
@@ -774,7 +819,7 @@
   (define (tcp-write-foreign! c ptr len on-done)
     (if (not (eq? (conn-state c) 'open))
         (begin (when on-done (on-done -1)) #f)
-        (begin
+        (with-interrupts-disabled          ; shared scratch-buf: see tcp-writev!
           (foreign-set! 'void* scratch-buf 0 ptr)
           (foreign-set! 'unsigned-64 scratch-buf 8 len)
           (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))

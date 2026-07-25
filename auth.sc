@@ -108,15 +108,28 @@
           (and tok (verify tok))))))
 
   ;; request guard on the cookie session: the sid cookie must name a
-  ;; live session in the store; its data alist becomes the claims.
+  ;; live session in the store AND that session must carry data; its
+  ;; data alist becomes the claims.
   ;; (cookie . "name") matches a session-middleware with a custom
-  ;; cookie name (the default is "sid" on both sides).
+  ;; cookie name (the default is "sid" on both sides). (key . symbol)
+  ;; additionally requires that one claim to be present, which is the
+  ;; precise way to say "logged in" when a session also carries
+  ;; pre-login state (a cart, a CSRF token, a locale).
+  ;;
+  ;; The empty alist is REJECTED: '() is a true value in Scheme, so
+  ;; returning it would authenticate any session that merely exists --
+  ;; and a session store holds sessions that were never logged in.
+  ;; "Has a session" is not "is authenticated".
   (define (session-guard store . rest)
     (unless (vector? store)
       (assertion-violation 'session-guard "store must be a session store" store))
     (let* ((o (if (pair? rest) (car rest) '()))
-           (cname (opt o 'cookie "sid")))
+           (cname (opt o 'cookie "sid"))
+           (key (opt o 'key #f)))
       (lambda (req)
-        (let ((sid (req-cookie req cname)))
-          (and sid (session-peek store sid))))))
+        (let* ((sid (req-cookie req cname))
+               (data (and sid (session-peek store sid))))
+          (and (pair? data)                     ; live AND non-empty
+               (or (not key) (assq key data))
+               data)))))
 )

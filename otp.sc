@@ -164,7 +164,14 @@
           (when (hashtable-ref busy w #f)
             (hashtable-delete! busy w)
             (hashtable-delete! attempts task-id)
-            (set! idle (cons w idle)))
+            ;; A worker can finish just as check-stuck! kills it, so this
+            ;; completion may arrive from an already-dead worker (its
+            ;; DOWN is still queued behind us). Returning it to the idle
+            ;; list would dispatch the next task into a dead mailbox --
+            ;; silently lost, and then failed as 'stuck when the DOWN
+            ;; lands, blaming a task that never ran.
+            (unless (hashtable-ref stuck w #f)
+              (set! idle (cons w idle))))
           (drain!))
         (`#(check-stuck-workers) (check-stuck!))
         (`#(get-stats ,from ,ref)
@@ -182,8 +189,13 @@
   ;; synchronous stats snapshot from the supervisor
   (define stats-ref 0)
   (define (pool-stats sup)
-    (set! stats-ref (+ stats-ref 1))
-    (let ((ref stats-ref))
+    ;; drain the late answer to any previously timed-out call: its ref
+    ;; can never match again, so it would sit in this mailbox forever
+    (let drain ()
+      (receive (after 0 'done) (`#(pool-stats ,r ,s) (drain))))
+    (let ((ref (with-interrupts-disabled      ; shared counter, see gen-server
+                 (set! stats-ref (+ stats-ref 1))
+                 stats-ref)))
       (send sup (vector 'get-stats self ref))
       (receive (after 5000 (raise 'pool-stats-timeout))
         (`#(pool-stats ,@ref ,s) s))))

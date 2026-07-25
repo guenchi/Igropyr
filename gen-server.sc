@@ -28,10 +28,16 @@
 
   (define default-timeout-ms 5000)
 
+  ;; guarded like actor.sc's pid-counter: this is a read-modify-write on
+  ;; shared state under preemptive scheduling. It happens to be leaf
+  ;; fixnum code today, which makes it incidentally atomic -- but a lost
+  ;; update would roll the counter back and re-issue a ref that a stale
+  ;; reply still matches, so it must not depend on codegen.
   (define ref-counter 0)
   (define (next-ref!)
-    (set! ref-counter (+ ref-counter 1))
-    ref-counter)
+    (with-interrupts-disabled
+      (set! ref-counter (+ ref-counter 1))
+      ref-counter))
 
   (define (resolve srv)
     (if (symbol? srv)
@@ -62,17 +68,37 @@
   (define (gen-server-start-named name . args)
     (register name (apply gen-server-start args)))
 
+  ;; A call that timed out leaves the server's late #(gen-reply ref v)
+  ;; in our mailbox: refs are never reused, so no future receive can
+  ;; ever match it and selective receive keeps it forever -- every later
+  ;; receive in this process rescans it. Since a call is synchronous
+  ;; within one green process, any gen-reply present at ENTRY is by
+  ;; construction such a leftover, so draining here is race-free.
+  (define (drain-stale-replies!)
+    (let loop ()
+      (receive (after 0 'done)
+        (`#(gen-reply ,r ,v) (loop)))))
+
+  ;; demonitor does not retract a DOWN that was already delivered; left
+  ;; behind it would be misread by any later DOWN-matching receive in
+  ;; this process (a supervisor would treat it as a worker death).
+  (define (release-monitor! m p)
+    (when m
+      (demonitor m)
+      (receive (after 0 'ok) (`#(DOWN ,@p ,reason) 'ok))))
+
   (define (gen-server-call srv msg . rest)
+    (drain-stale-replies!)
     (let* ((timeout (if (pair? rest) (car rest) default-timeout-ms))
            (p (resolve srv))
            (ref (next-ref!))
            (m (monitor p)))
       (send p (vector 'gen-call self ref msg))
       (receive (after timeout
-                  (demonitor m)
+                  (release-monitor! m p)
                   (raise (vector 'gen-server-error 'timeout msg)))
         (`#(gen-reply ,@ref ,reply)
-          (demonitor m)
+          (release-monitor! m p)
           reply)
         (`#(DOWN ,@p ,reason)
           (raise (vector 'gen-server-error 'server-died reason))))))

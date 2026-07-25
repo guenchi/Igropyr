@@ -148,9 +148,24 @@
         (hashtable-delete! name->pid name)
         (when p (hashtable-delete! pid->name p)))))
 
+  ;; guarded like register/unregister: hashtable-ref is preemptible, and
+  ;; a concurrent register that grows the table can relink the chain
+  ;; under a half-finished lookup, yielding a spurious #f for a name
+  ;; that is registered the whole time.
   (define (whereis name)
-    (hashtable-ref name->pid name #f))
+    (no-interrupts (hashtable-ref name->pid name #f)))
 
+  ;; Fast, NON-unwinding interrupt guard: the enable is skipped if body
+  ;; escapes, so `body` must not raise. Every use here is a short
+  ;; sequence of scheduler-state mutations whose arguments are
+  ;; type-checked by the caller BEFORE entering the guard (see send /
+  ;; monitor / link below) precisely so this holds. A raise that is then
+  ;; caught inside the same still-alive process would leave that
+  ;; process's saved interrupt count one too high and permanently
+  ;; disable its preemption; an uncaught one is reconciled at the
+  ;; context switch because the dying process's count is discarded.
+  ;; Use Chez's exit-safe with-interrupts-disabled when the body can
+  ;; raise (panic does).
   (define-syntax no-interrupts
     (syntax-rules ()
       ((_ body ...)
@@ -411,6 +426,8 @@
   ;; Returns the monitor reference for demonitor, or #f if p was already
   ;; dead (the DOWN message is delivered immediately in that case).
   (define (monitor p)
+    (unless (pcb? p)
+      (assertion-violation 'monitor "not a process" p))
     (no-interrupts
       (if (alive? p)
           (let ((m (make-mon *self* p)))
@@ -440,7 +457,17 @@
           (disable-interrupts)
           (@kill p reason)
           (yield #f 0))
-        (no-interrupts (@kill p reason))))
+        (begin
+          (no-interrupts (@kill p reason))
+          ;; @kill cascades along links, and one of those links can be
+          ;; US: a non-trapping process that kills a peer it is linked
+          ;; to dies in the cascade. Without this check it would return
+          ;; here and keep running with a dead pcb (inbox #f) -- sending
+          ;; messages and doing I/O after its monitors already fired,
+          ;; then crashing confusingly at its next receive.
+          (unless (alive? *self*)
+            (disable-interrupts)
+            (yield #f 0)))))
 
   ;; interrupts disabled
   (define (@kill p reason)
@@ -451,6 +478,15 @@
         ((pcb-sleeping? p) (@sleep-remove! p))
         ((enqueued? p) (remove-q! p)))
       (pcb-cont-set! p #f)
+      ;; The victim's dynamic-wind after-thunks are DISCARDED, not run:
+      ;; they belong on the victim's stack, and a killer must not execute
+      ;; arbitrary user cleanup in its own context (a stuck worker being
+      ;; killed is exactly the case where that code must not run again).
+      ;; Normal return and an uncaught raise DO run them. So dynamic-wind
+      ;; is not a reliable release mechanism for a process that can be
+      ;; killed -- have the resource's owner monitor the holder and
+      ;; reclaim on DOWN (see (igropyr sqlpool)'s leases), which is the
+      ;; only teardown that survives a kill.
       (pcb-winders-set! p '())
       (pcb-exception-state-set! p #f)
       (pcb-inbox-set! p #f)
@@ -493,7 +529,12 @@
 
   ;; ---- send / receive ---------------------------------------------------
 
+  ;; the pcb check is deliberately OUTSIDE no-interrupts: raising inside
+  ;; that guard would skip its enable-interrupts (see the macro's note).
+  ;; A whereis miss handing #f here is the common way to reach it.
   (define (send p m)
+    (unless (pcb? p)
+      (assertion-violation 'send "not a process" p))
     (no-interrupts (@send p m)))
 
   ;; interrupts disabled

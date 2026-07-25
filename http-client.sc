@@ -142,12 +142,52 @@
 
   (define crlf (string->utf8 "\r\n"))
 
+  ;; Reject CR/LF (and other control characters) anywhere they would end
+  ;; a line early: a value carrying "\r\n" would inject extra headers or
+  ;; a whole second request into the outbound stream (request splitting),
+  ;; which is how an attacker-influenced object key, content-type or
+  ;; token turns into a forged upstream request. The server side has the
+  ;; same guard for responses (http.sc header-safe?); this is its
+  ;; request-side counterpart, and it FAILS the call rather than silently
+  ;; dropping the header, because a caller that asked to send an
+  ;; authorization or content-type header must not have it vanish.
+  (define (request-safe? s)
+    (let ((n (string-length s)))
+      (let loop ((i 0))
+        (or (= i n)
+            (let ((c (string-ref s i)))
+              (and (char>? c #\space) (char<? c #\delete) (loop (+ i 1))))))))
+
+  (define (check-request-part! what s)
+    (unless (and (string? s) (request-safe? s))
+      (raise (vector 'http-client-error
+               (string-append "invalid " what
+                              ": control characters are not allowed")))))
+
   ;; host-header is host[:port] -- RFC 7230 wants the port whenever it
   ;; is not the scheme default (the caller computes it from parse-url)
   (define (build-request method host-header path headers body)
     (let ((body-bv (cond ((not body) empty-bv)
                          ((string? body) (string->utf8 body))
                          (else body))))
+      ;; the request line and every header must be single-line
+      (check-request-part! "request path" path)
+      (check-request-part! "Host header" host-header)
+      (for-each
+        (lambda (h)
+          (check-request-part! "header name" (car h))
+          ;; a header VALUE may contain spaces, just not CR/LF/controls
+          (unless (and (string? (cdr h))
+                       (let ((v (cdr h)))
+                         (let loop ((i 0))
+                           (or (= i (string-length v))
+                               (let ((c (string-ref v i)))
+                                 (and (char>=? c #\space) (char<? c #\delete)
+                                      (loop (+ i 1))))))))
+            (raise (vector 'http-client-error
+                     (string-append "invalid value for header " (car h)
+                                    ": control characters are not allowed")))))
+        headers)
       (let-values (((p get) (open-bytevector-output-port)))
         (define (line s) (put-bytevector p (string->utf8 s)) (put-bytevector p crlf))
         (line (string-append (symbol->string method) " " path " HTTP/1.1"))
@@ -247,6 +287,13 @@
   ;; a fresh output port on every tcp segment, GB-level rescans against
   ;; the 32MB response cap in the worst case.
   ;; -> #(done body) | #(more pos chunks got) | 'bad
+  ;; are the two bytes at rel-pos exactly CR LF?
+  (define (crlf-at? buf rel)
+    (and (>= (inbuf-length buf) (+ rel 2))
+         (let ((bv (inbuf-bv buf)) (base (inbuf-start buf)))
+           (and (fx= (bytevector-u8-ref bv (fx+ base rel)) 13)
+                (fx= (bytevector-u8-ref bv (fx+ base rel 1)) 10)))))
+
   (define (chunked-step buf pos chunks got)
     (let loop ((pos pos) (chunks chunks) (got got))
       (let ((r (chunk-size-at buf pos)))
@@ -259,6 +306,10 @@
                ((= size 0) (vector 'done (bv-concat (reverse chunks) got)))
                ((< (inbuf-length buf) (+ eol 2 size 2))
                 (vector 'more pos chunks got))
+               ;; the two bytes after the data MUST be CRLF; without
+               ;; this the decoder would silently mis-slice a body from
+               ;; a broken or hostile server (http.sc checks it too)
+               ((not (crlf-at? buf (+ eol 2 size))) 'bad)
                (else
                 (loop (+ eol 2 size 2)
                       (cons (inbuf-sub buf (+ eol 2) (+ eol 2 size)) chunks)
@@ -347,9 +398,17 @@
                     (when emit (inbuf-consume! buf (+ hend 4)))
                     (cond
                       ((assq 'content-length headers)
-                       (let ((len (or (string->number
-                                        (cdr (assq 'content-length headers)))
-                                      0)))
+                       ;; a server-supplied length becomes a bytevector
+                       ;; index: anything but a nonnegative integer (a
+                       ;; negative, a decimal, an exponent) would crash
+                       ;; the connection process on the slice below
+                       (let ((len (let ((v (string->number
+                                             (cdr (assq 'content-length
+                                                        headers)))))
+                                    (if (and v (integer? v) (exact? v)
+                                             (>= v 0))
+                                        v
+                                        (fail "invalid Content-Length")))))
                          (step (if emit
                                    (vector 'sclen status headers len)
                                    (vector 'clen status headers (+ hend 4) len)))))

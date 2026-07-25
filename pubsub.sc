@@ -32,6 +32,18 @@
   ;; state: eq-hashtable topic -> list of subscriber pids
   (define (init) (make-eq-hashtable))
 
+  ;; subscriber pid -> monitor ref, one per subscriber regardless of how
+  ;; many topics it holds (lives beside the gen-server state, which is a
+  ;; single hashtable by contract)
+  (define mons (make-eq-hashtable))
+
+  (define (subscribed-anywhere? topics p)
+    (let ((ks (hashtable-keys topics)))
+      (let loop ((i 0))
+        (and (< i (vector-length ks))
+             (or (memq p (hashtable-ref topics (vector-ref ks i) '()))
+                 (loop (+ i 1)))))))
+
   (define (handle-call msg from topics)
     (let ((tag (vector-ref msg 0))
           (topic (vector-ref msg 1)))
@@ -39,12 +51,25 @@
         ((sub)
          (let ((subs (hashtable-ref topics topic '())))
            (unless (memq from subs)
-             (monitor from)     ; auto-cleanup when the subscriber dies
+             ;; one monitor per subscriber, not per subscription: a
+             ;; process that joins and leaves topics repeatedly would
+             ;; otherwise accumulate a monitor record per cycle (and get
+             ;; one DOWN per record when it finally dies)
+             (unless (hashtable-ref mons from #f)
+               (hashtable-set! mons from (monitor from)))
              (hashtable-set! topics topic (cons from subs))))
          (values 'ok topics))
         ((unsub)
-         (hashtable-set! topics topic
-           (remq from (hashtable-ref topics topic '())))
+         (let ((rest (remq from (hashtable-ref topics topic '()))))
+           (if (null? rest)
+               (hashtable-delete! topics topic)   ; don't keep empty topics
+               (hashtable-set! topics topic rest)))
+         ;; drop the monitor once this subscriber holds no subscriptions
+         (unless (subscribed-anywhere? topics from)
+           (let ((m (hashtable-ref mons from #f)))
+             (when m
+               (demonitor m)
+               (hashtable-delete! mons from))))
          (values 'ok topics))
         (else (values 'bad-request topics)))))
 
@@ -82,9 +107,12 @@
         (let ((dead (vector-ref msg 1)))
           (vector-for-each
             (lambda (topic)
-              (hashtable-set! topics topic
-                (remq dead (hashtable-ref topics topic '()))))
+              (let ((rest (remq dead (hashtable-ref topics topic '()))))
+                (if (null? rest)
+                    (hashtable-delete! topics topic)
+                    (hashtable-set! topics topic rest))))
             (hashtable-keys topics))
+          (hashtable-delete! mons dead)     ; the monitor already fired
           topics)
         topics))
 
