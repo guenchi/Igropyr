@@ -38,6 +38,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/dashboard.sc
 "$scheme_bin" --script igropyr/test/auth.sc
 "$scheme_bin" --script igropyr/test/express-routes.sc
+# path normalization: middleware guards and the router must agree on the
+# path, or an extra slash routes to a handler while skipping its guard
+"$scheme_bin" --script igropyr/test/path-normalization.sc
 "$scheme_bin" --script igropyr/test/http-client-stream.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc

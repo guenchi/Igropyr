@@ -173,6 +173,38 @@
                      (loop (fx+ i 1)))))))
             (utf8->string (get))))))
 
+  ;; Collapse "//", drop "." and resolve ".." (RFC 3986 remove_dot_segments),
+  ;; so EVERY layer sees the same path. The router matches on segments, which
+  ;; silently drops empty ones -- "//admin/x" routes exactly like "/admin/x"
+  ;; -- while a guard written the only way the framework allows,
+  ;; (string-prefix? "/admin" (req-path req)), compares the raw string and
+  ;; does not match. That gap lets a request skip an authentication or
+  ;; rate-limit guard and still reach the guarded handler. Normalizing here,
+  ;; once, closes it for middleware, the router and static serving alike.
+  ;; ".." can never escape the root: it pops a segment only when one exists.
+  (define (normalize-path path)
+    (let ((n (string-length path)))
+      (let loop ((i 0) (start 0) (acc '()))
+        (define (emit)
+          (if (fx> i start)
+              (let ((seg (substring path start i)))
+                (cond
+                  ((string=? seg ".") acc)
+                  ((string=? seg "..") (if (pair? acc) (cdr acc) acc))
+                  (else (cons seg acc))))
+              acc))                                  ; empty segment: drop
+        (cond
+          ((fx= i n)
+           (let ((segs (reverse (emit))))
+             (if (null? segs)
+                 "/"
+                 (let build ((l segs) (out '()))
+                   (if (null? l)
+                       (apply string-append (reverse out))
+                       (build (cdr l) (cons (car l) (cons "/" out))))))))
+          ((char=? (string-ref path i) #\/) (loop (fx+ i 1) (fx+ i 1) (emit)))
+          (else (loop (fx+ i 1) start acc))))))
+
   (define (parse-query s)
     (if (string=? s "")
         '()
@@ -406,9 +438,13 @@
                                      (cond ((fx>= i sp2) #f)
                                            ((char=? (string-ref text i) #\?) i)
                                            (else (loop (fx+ i 1))))))
-                             (path (percent-decode
-                                     (substring text (fx+ sp1 1) (or qpos sp2))
-                                     #f))          ; "+" is literal in a path
+                             ;; decode first, then normalize: %2F decodes to
+                             ;; a real separator, and the router would treat
+                             ;; it as one, so normalization must see it too
+                             (path (normalize-path
+                                     (percent-decode
+                                       (substring text (fx+ sp1 1) (or qpos sp2))
+                                       #f)))        ; "+" is literal in a path
                              (query (if qpos
                                         (parse-query
                                           (substring text (fx+ qpos 1) sp2))
