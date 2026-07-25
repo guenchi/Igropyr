@@ -5,6 +5,20 @@
 ;;; functions with one UTF-8 string argument and get a string back; user input
 ;;; is data, never code.
 ;;;
+;;; Either upstream works, chosen at load time from what the library
+;;; actually exports:
+;;;   quickjs-ng (libqjs)      RECOMMENDED. Actively maintained, and its
+;;;                            real exported JS_FreeValue makes releasing a
+;;;                            value one FFI call -- ~30% less per-call
+;;;                            overhead than reproducing the header inline.
+;;;   bellard/quickjs          JS_FreeValue is inline, so only the
+;;;   (libquickjs)             __JS_FreeValue slow path is exported and the
+;;;                            ref_count must be decremented here, which is
+;;;                            what the boot-time ABI probe is for.
+;;; Interpreter speed is within ~2% between them, but individual operations
+;;; differ (bellard's regexp/string path is faster today) -- benchmark your
+;;; own bundle if one operation dominates it.
+;;;
 ;;; A C-shim binding with the SAME exports lives at
 ;;;   https://github.com/guenchi/igropyr-quickjs
 ;;; -- a drop-in replacement to use when a stock libquickjs is awkward to
