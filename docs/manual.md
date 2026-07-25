@@ -2969,13 +2969,51 @@ OS thread and each call runs with interrupts disabled, so a call blocks the
 scheduler for its duration (sub-millisecond typically, `timeout-ms` worst
 case) — cap input size on latency-sensitive paths.
 
-`qjs-boot!` reports if no `libquickjs` is found; point it at one with
+`qjs-boot!` reports if no library is found; point it at one with
 `IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
+
+#### Which QuickJS: quickjs-ng is recommended
+
+Two upstreams are supported and detected automatically — the binding picks
+its bindings from what the loaded library actually exports, so the same
+build runs against either:
+
+| | library name | `JS_FreeValue` |
+|---|---|---|
+| [quickjs-ng](https://github.com/quickjs-ng/quickjs) (**recommended**) | `libqjs` | exported as a real function |
+| [bellard/quickjs](https://bellard.org/quickjs/) | `libquickjs` | a header inline; only the `__JS_FreeValue` slow path is exported |
+
+**quickjs-ng** is the recommended target for two reasons. It is the
+actively maintained fork; and because it exports a real `JS_FreeValue`,
+releasing a value is one FFI call instead of a hand-written replica of the
+inline function (read the tag, compute the `ref_count` address, decrement
+it, and call the slow path at zero). That replica depends on the private
+`ref_count` layout — which is exactly why the ABI probe exists — so with
+ng there is simply less to get wrong.
+
+It is also measurably cheaper per call. Measured on FreeBSD 15 / amd64,
+best of three runs of 20 000 calls each:
+
+| workload | quickjs-ng | bellard |
+|---|---|---|
+| near-empty function (call overhead only) | **0.50 µs/call** | 0.70 µs/call |
+| argument in, result out | **0.65 µs/call** | 0.80 µs/call |
+| 200 000-iteration numeric loop | 5.05 ms/call | 4.96 ms/call |
+| `toLowerCase` + regexp replace | 5.15 µs/call | **2.35 µs/call** |
+
+Read that carefully before switching: the **call overhead** is ~30 % lower
+on ng (three JSValue releases per call, one FFI call each instead of a
+read-modify-write plus a conditional call), and raw interpreter speed is
+within 2 %. But engine internals differ per workload — the regexp/string
+case above is more than twice as fast on bellard. If your bundle is
+dominated by one such operation, measure your own bundle rather than
+trusting either default.
 
 ### Fallback: the C-shim binding
 
-When a stock `libquickjs` is awkward to obtain — for example Homebrew ships
-only a static archive — a **C-shim binding with identical exports**,
+When no stock shared library is available — for example Homebrew ships
+QuickJS as a static archive only — a **C-shim binding with identical
+exports**,
 self-contained (QuickJS statically linked and version-pinned), is a drop-in
 replacement:
 
