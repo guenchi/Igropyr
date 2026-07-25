@@ -176,13 +176,20 @@
       (for-each
         (lambda (h)
           (check-request-part! "header name" (car h))
-          ;; a header VALUE may contain spaces, just not CR/LF/controls
+          ;; A header VALUE may hold spaces, tabs (legal OWS) and
+          ;; non-ASCII text (an S3 metadata value, a filename in
+          ;; Content-Disposition): only the bytes that could terminate
+          ;; the line or the message are refused, exactly like the
+          ;; server's header-safe?. Over-restricting here would break
+          ;; legitimate callers without adding any protection.
           (unless (and (string? (cdr h))
                        (let ((v (cdr h)))
                          (let loop ((i 0))
                            (or (= i (string-length v))
                                (let ((c (string-ref v i)))
-                                 (and (char>=? c #\space) (char<? c #\delete)
+                                 (and (not (char=? c #\return))
+                                      (not (char=? c #\newline))
+                                      (not (char=? c #\nul))
                                       (loop (+ i 1))))))))
             (raise (vector 'http-client-error
                      (string-append "invalid value for header " (car h)

@@ -86,21 +86,29 @@
   (define (gzip-acceptable? accept-encoding)
     (and accept-encoding
          (let ((n (string-length accept-encoding)))
-           ;; walk comma-separated entries
-           (let entry ((start 0))
-             (and (< start n)
-                  (let* ((end (let scan ((i start))
-                                (cond ((>= i n) n)
-                                      ((char=? (string-ref accept-encoding i) #\,) i)
+           ;; Walk every comma-separated entry and keep the most specific
+           ;; verdict: an explicit "gzip" (or its legacy alias "x-gzip",
+           ;; RFC 9110 8.4.1.3) overrides a wildcard, so "*;q=0, gzip"
+           ;; still compresses. Only when no explicit entry names gzip
+           ;; does the wildcard decide.
+           (let entry ((start 0) (explicit #f) (star #f))
+             (if (>= start n)
+                 (if (eq? explicit #f) (eq? star #t) explicit)
+                 (let* ((end (let scan ((i start))
+                               (cond ((>= i n) n)
+                                     ((char=? (string-ref accept-encoding i) #\,) i)
+                                     (else (scan (+ i 1))))))
+                        (semi (let scan ((i start))
+                                (cond ((>= i end) end)
+                                      ((char=? (string-ref accept-encoding i) #\;) i)
                                       (else (scan (+ i 1))))))
-                         (semi (let scan ((i start))
-                                 (cond ((>= i end) end)
-                                       ((char=? (string-ref accept-encoding i) #\;) i)
-                                       (else (scan (+ i 1))))))
-                         (name (trim accept-encoding start semi)))
-                    (if (or (string-ci=? name "gzip") (string-ci=? name "*"))
-                        (not (q-zero? accept-encoding semi end))
-                        (entry (+ end 1)))))))))
+                        (name (trim accept-encoding start semi))
+                        (ok (not (q-zero? accept-encoding semi end))))
+                   (cond
+                     ((or (string-ci=? name "gzip") (string-ci=? name "x-gzip"))
+                      (entry (+ end 1) ok star))
+                     ((string=? name "*") (entry (+ end 1) explicit ok))
+                     (else (entry (+ end 1) explicit star)))))))))
 
   (define (trim s start end)
     (let* ((b (let scan ((i start))
@@ -111,19 +119,31 @@
                     (scan (- i 1)) i))))
       (substring s b e)))
 
-  ;; is there a q= parameter equal to zero in [from,to)?
+  ;; Is there a q= parameter equal to zero in [from,to)? Parameters are
+  ;; ';'-separated, and the NAME must be exactly "q" -- ";xq=0" is a
+  ;; different parameter and must not be read as a quality value.
   (define (q-zero? s from to)
-    (let loop ((i from))
-      (cond
-        ((>= i (- to 1)) #f)
-        ((and (char-ci=? (string-ref s i) #\q)
-              (let scan ((j (+ i 1)))          ; optional OWS then '='
-                (cond ((>= j to) #f)
-                      ((memv (string-ref s j) '(#\space #\tab)) (scan (+ j 1)))
-                      ((char=? (string-ref s j) #\=)
-                       (let ((v (string->number (trim s (+ j 1) to))))
-                         (and v (zero? v))))
-                      (else #f))))
-         #t)
-        (else (loop (+ i 1))))))
+    (let param ((start from))
+      (and (< start to)
+           (let* ((semi (let scan ((i (if (and (< start to)
+                                               (char=? (string-ref s start) #\;))
+                                          (+ start 1)
+                                          start)))
+                          (cond ((>= i to) to)
+                                ((char=? (string-ref s i) #\;) i)
+                                (else (scan (+ i 1))))))
+                  (body-start (if (and (< start to)
+                                       (char=? (string-ref s start) #\;))
+                                  (+ start 1)
+                                  start))
+                  (eq-pos (let scan ((i body-start))
+                            (cond ((>= i semi) #f)
+                                  ((char=? (string-ref s i) #\=) i)
+                                  (else (scan (+ i 1)))))))
+             (if (and eq-pos
+                      (string-ci=? (trim s body-start eq-pos) "q")
+                      (let ((v (string->number (trim s (+ eq-pos 1) semi))))
+                        (and v (zero? v))))
+                 #t
+                 (param semi))))))
 )

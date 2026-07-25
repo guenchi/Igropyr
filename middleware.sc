@@ -121,23 +121,58 @@
                  (loop))))
       store))
 
-  ;; Key on the CONNECTION's peer address, never on X-Forwarded-For:
-  ;; that header is written by the client, so keying on it lets an
-  ;; attacker mint a fresh bucket per request (unlimited attempts, plus
-  ;; unbounded store growth), while clients that send none all collapse
-  ;; into one shared bucket where a single attacker can lock everyone
-  ;; out. Behind a trusted proxy -- where the peer is the proxy and XFF
-  ;; is meaningful -- pass an explicit key procedure that parses the
-  ;; chain according to how many hops YOU trust:
-  ;;   (rate-limit `((key . ,(lambda (req) (client-ip-from-xff req)))))
-  (define (default-rate-key req)
-    (or (req-peer req) "unknown-peer"))
+  ;; X-Forwarded-For is written by the client, so it can never be trusted
+  ;; wholesale: keying on it lets an attacker mint a fresh bucket per
+  ;; request (unlimited attempts plus unbounded store growth). The
+  ;; connection's peer address cannot be forged -- but behind a reverse
+  ;; proxy the peer is always the proxy, which would put every client in
+  ;; one bucket that a single attacker could exhaust.
+  ;;
+  ;; So the number of trusted hops is a deployment fact the operator
+  ;; states: (trust-proxy . N) means "N proxies of mine append to XFF".
+  ;; We then take the Nth entry from the RIGHT, which is the address the
+  ;; outermost trusted proxy observed. Everything further left is
+  ;; attacker-supplied and ignored.
+  ;;   (rate-limit '((trust-proxy . 1)))     ; one nginx/CDN in front
+  ;; Default 0: no proxy, use the peer address.
+  (define (client-key req trust-proxy)
+    (or (if (> trust-proxy 0)
+            (let ((xff (req-header req 'x-forwarded-for)))
+              (and xff (nth-from-right xff trust-proxy)))
+            #f)
+        (req-peer req)
+        "unknown-peer"))
+
+  ;; the nth comma-separated entry counting from the right (1 = last)
+  (define (nth-from-right s n)
+    (let ((parts (let split ((i 0) (start 0) (acc '()))
+                   (cond
+                     ((= i (string-length s))
+                      (reverse (cons (substring s start i) acc)))
+                     ((char=? (string-ref s i) #\,)
+                      (split (+ i 1) (+ i 1) (cons (substring s start i) acc)))
+                     (else (split (+ i 1) start acc))))))
+      (let* ((len (length parts)) (idx (- len n)))
+        (and (>= idx 0) (< idx len)
+             (let ((v (trim-ws (list-ref parts idx))))
+               (and (> (string-length v) 0) v))))))
+
+  (define (trim-ws s)
+    (let* ((n (string-length s))
+           (b (let scan ((i 0))
+                (if (and (< i n) (memv (string-ref s i) '(#\space #\tab)))
+                    (scan (+ i 1)) i)))
+           (e (let scan ((i n))
+                (if (and (> i b) (memv (string-ref s (- i 1)) '(#\space #\tab)))
+                    (scan (- i 1)) i))))
+      (substring s b e)))
 
   (define (rate-limit . rest)
     (let* ((o (if (pair? rest) (car rest) '()))
            (max-req (opt o 'max 100))
            (window-ms (opt o 'window 60000))
-           (key-fn (opt o 'key default-rate-key))
+           (trust-proxy (opt o 'trust-proxy 0))
+           (key-fn (opt o 'key (lambda (req) (client-key req trust-proxy))))
            (store (make-rate-store)))
       (lambda (req res next)
         (if (eq? 'ok (gen-server-call store

@@ -317,8 +317,12 @@
                          (cond ((fx>= j n) n)
                                ((char=? (string-ref text j) #\newline) j)
                                (else (scan (fx+ j 1))))))
-                   (crlf? (and (fx< nl n) (fx> nl i)
-                               (char=? (string-ref text (fx- nl 1)) #\return)))
+                   ;; the slice stops just before the terminating CRLFCRLF,
+                   ;; so the LAST line legitimately has no newline of its own
+                   (last? (fx>= nl n))
+                   (cr? (and (fx> nl i)
+                             (char=? (string-ref text (fx- nl 1)) #\return)))
+                   (crlf? (and (not last?) cr?))
                    (e (if crlf? (fx- nl 1) nl)))
               (cond
                 ;; A line MUST end with CRLF. A bare LF is the classic
@@ -326,7 +330,11 @@
                 ;; CRLF-strict proxy in front reads the same bytes as one
                 ;; folded value, so the two disagree about how many
                 ;; headers (and which Content-Length) the request has.
-                ((and (fx< nl n) (not crlf?)) #f)
+                ;; A stray CR is rejected for the same reason: leaving it
+                ;; inside the value would hand a control character to
+                ;; handlers and to token matchers like connection-has-token?.
+                ((and (not last?) (not crlf?)) #f)
+                ((and last? cr?) #f)
                 ((fx= e i) (loop (fx+ nl 1) acc))                  ; blank line
                 ((memv (string-ref text i) '(#\space #\tab)) #f)   ; obs-fold
                 (else

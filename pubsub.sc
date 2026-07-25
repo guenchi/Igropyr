@@ -29,13 +29,17 @@
 
   (define server-name 'igropyr-pubsub)
 
-  ;; state: eq-hashtable topic -> list of subscriber pids
-  (define (init) (make-eq-hashtable))
-
-  ;; subscriber pid -> monitor ref, one per subscriber regardless of how
-  ;; many topics it holds (lives beside the gen-server state, which is a
-  ;; single hashtable by contract)
-  (define mons (make-eq-hashtable))
+  ;; State is #(topics mons):
+  ;;   topics: eq-hashtable topic -> list of subscriber pids
+  ;;   mons:   eq-hashtable subscriber pid -> monitor ref
+  ;; mons MUST live in the state, not in a library global: a supervisor
+  ;; restart gives the new server a fresh state, and a global would keep
+  ;; the dead server's monitor refs -- so a re-subscribing process would
+  ;; look already-monitored, never be monitored by the NEW server, and
+  ;; never be cleaned up when it dies.
+  (define (init) (vector (make-eq-hashtable) (make-eq-hashtable)))
+  (define (st-topics st) (vector-ref st 0))
+  (define (st-mons st) (vector-ref st 1))
 
   (define (subscribed-anywhere? topics p)
     (let ((ks (hashtable-keys topics)))
@@ -44,9 +48,11 @@
              (or (memq p (hashtable-ref topics (vector-ref ks i) '()))
                  (loop (+ i 1)))))))
 
-  (define (handle-call msg from topics)
+  (define (handle-call msg from st)
     (let ((tag (vector-ref msg 0))
-          (topic (vector-ref msg 1)))
+          (topic (vector-ref msg 1))
+          (topics (st-topics st))
+          (mons (st-mons st)))
       (case tag
         ((sub)
          (let ((subs (hashtable-ref topics topic '())))
@@ -58,7 +64,7 @@
              (unless (hashtable-ref mons from #f)
                (hashtable-set! mons from (monitor from)))
              (hashtable-set! topics topic (cons from subs))))
-         (values 'ok topics))
+         (values 'ok st))
         ((unsub)
          (let ((rest (remq from (hashtable-ref topics topic '()))))
            (if (null? rest)
@@ -70,8 +76,8 @@
              (when m
                (demonitor m)
                (hashtable-delete! mons from))))
-         (values 'ok topics))
-        (else (values 'bad-request topics)))))
+         (values 'ok st))
+        (else (values 'bad-request st)))))
 
   (define (deliver-local! topics topic payload)
     (for-each
@@ -92,19 +98,21 @@
 
   ;; pub  = a local publish: deliver here, then fan out to peers
   ;; rpub = a publish arriving from a peer: deliver here only (no loop)
-  (define (handle-cast msg topics)
+  (define (handle-cast msg st)
     (let ((tag (vector-ref msg 0))
           (topic (vector-ref msg 1))
           (payload (vector-ref msg 2)))
-      (deliver-local! topics topic payload)
+      (deliver-local! (st-topics st) topic payload)
       (when (eq? tag 'pub) (forward! topic payload))
-      topics))
+      st))
 
   ;; DOWN from a dead subscriber: drop it from every topic
-  (define (handle-info msg topics)
+  (define (handle-info msg st)
     (if (and (vector? msg) (= 3 (vector-length msg))
              (eq? (vector-ref msg 0) 'DOWN))
-        (let ((dead (vector-ref msg 1)))
+        (let ((dead (vector-ref msg 1))
+              (topics (st-topics st))
+              (mons (st-mons st)))
           (vector-for-each
             (lambda (topic)
               (let ((rest (remq dead (hashtable-ref topics topic '()))))
@@ -113,8 +121,8 @@
                     (hashtable-set! topics topic rest))))
             (hashtable-keys topics))
           (hashtable-delete! mons dead)     ; the monitor already fired
-          topics)
-        topics))
+          st)
+        st))
 
   (define (start-pubsub!)
     (gen-server-start-named server-name init handle-call handle-cast handle-info))
