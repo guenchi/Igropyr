@@ -20,6 +20,12 @@
       ;; FreeBSD packages install straight under lib/ (see quickjs.sc)
       (file-exists? "/usr/local/lib/libquickjs.so")
       (file-exists? "/usr/local/lib/libquickjs.so.0")
+      ;; quickjs-ng ships as libqjs, not libquickjs
+      (file-exists? "libqjs.dylib") (file-exists? "libqjs.so")
+      (file-exists? "/usr/local/lib/libqjs.so")
+      (file-exists? "/usr/local/lib/libqjs.so.0")
+      (file-exists? "/opt/homebrew/lib/libqjs.dylib")
+      (file-exists? "/usr/lib/libqjs.so")
       (file-exists? "/usr/local/lib/quickjs/libquickjs.so")
       (file-exists? "/usr/lib/libquickjs.so")
       (file-exists? "/usr/lib/quickjs/libquickjs.so")))
