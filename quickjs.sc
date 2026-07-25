@@ -63,16 +63,21 @@
       (load-first-shared-object! 'quickjs
         (append (if explicit (list explicit) '())
                 (let ((e (getenv "IGROPYR_LIBQUICKJS_SO"))) (if e (list e) '()))
+                ;; Two upstreams, two library names: bellard/quickjs ships
+                ;; libquickjs, quickjs-ng ships libqjs. FreeBSD's packages
+                ;; install either straight under lib/, not in a quickjs/
+                ;; subdirectory.
                 (list "libquickjs.dylib" "libquickjs.so"
+                      "libqjs.dylib" "libqjs.so"
                       "/opt/homebrew/lib/quickjs/libquickjs.dylib"
-                      ;; FreeBSD's quickjs / quickjs-ng packages install the
-                      ;; shared library directly under lib, not in a quickjs/
-                      ;; subdirectory, and the versioned soname is what the
-                      ;; package actually ships
+                      "/opt/homebrew/lib/libqjs.dylib"
                       "/usr/local/lib/libquickjs.so"
                       "/usr/local/lib/libquickjs.so.0"
+                      "/usr/local/lib/libqjs.so"
+                      "/usr/local/lib/libqjs.so.0"
                       "/usr/local/lib/quickjs/libquickjs.so"
                       "/usr/lib/libquickjs.so"
+                      "/usr/lib/libqjs.so"
                       "/usr/lib/quickjs/libquickjs.so")))
       (set! so-loaded #t)))
 
@@ -84,7 +89,8 @@
   (define _eval #f) (define _global #f) (define _get-prop #f)
   (define _is-function #f) (define _new-string #f) (define _call #f)
   (define _tocstr #f) (define _free-cstr #f) (define _get-exception #f)
-  (define __free-value #f)
+  (define __free-value #f)                ; bellard: ref-count-zero slow path
+  (define _free-value #f)                 ; quickjs-ng: real exported JS_FreeValue
   (define bound #f)
   (define (bind!)
     (unless bound
@@ -106,7 +112,17 @@
       (set! _tocstr       (foreign-procedure "JS_ToCStringLen2" (void* void* (& JSValue) int) void*))
       (set! _free-cstr    (foreign-procedure "JS_FreeCString" (void* void*) void))
       (set! _get-exception (foreign-procedure "JS_GetException" (void*) (& JSValue)))
-      (set! __free-value  (foreign-procedure "__JS_FreeValue" (void* (& JSValue)) void))
+      ;; Releasing a value differs between the two upstreams. In
+      ;; bellard/quickjs JS_FreeValue is a header inline, so only the
+      ;; ref-count-zero slow path __JS_FreeValue is exported and we must
+      ;; decrement the count ourselves. quickjs-ng (0.15+) exports a real
+      ;; JS_FreeValue that does the whole job, and does NOT export
+      ;; __JS_FreeValue at all -- binding it there fails at load time.
+      (if (foreign-entry? "__JS_FreeValue")
+          (set! __free-value
+            (foreign-procedure "__JS_FreeValue" (void* (& JSValue)) void))
+          (set! _free-value
+            (foreign-procedure "JS_FreeValue" (void* (& JSValue)) void)))
       (set! bound #t)))
 
   ;; ---- engine state ------------------------------------------------------
@@ -152,15 +168,20 @@
   ;; ref_count, and only at zero call the exported slow path. Needed for the
   ;; per-call setup values (global, function, argument, result). --------------
   (define (js-free! v)
-    (let ((tag (ftype-ref JSValue (tag) v)))
-      (when (< tag 0)                                   ; JS_VALUE_HAS_REF_COUNT
-        ;; ref_count lives rc-offset bytes from JS_VALUE_GET_PTR(v): quickjs-ng
-        ;; puts it 4 bytes BEFORE the pointer (__js_rc = (uint32_t*)ptr - 1),
-        ;; bellard/quickjs at offset 0. The boot probe set rc-offset.
-        (let* ((rca (+ (ftype-ref JSValue (u) v) rc-offset))  ; &p->ref_count
-               (rc  (foreign-ref 'int rca 0)))
-          (foreign-set! 'int rca 0 (- rc 1))
-          (when (<= (- rc 1) 0) (__free-value ctx v))))))
+    (if _free-value
+        ;; quickjs-ng: the exported JS_FreeValue owns the whole operation
+        ;; (including the has-ref-count test), so hand it the value as is.
+        (_free-value ctx v)
+        (let ((tag (ftype-ref JSValue (tag) v)))
+          (when (< tag 0)                               ; JS_VALUE_HAS_REF_COUNT
+            ;; bellard/quickjs: JS_FreeValue is inline, so reproduce it --
+            ;; decrement, and call the exported slow path only at zero.
+            ;; ref_count lives rc-offset bytes from JS_VALUE_GET_PTR(v);
+            ;; the boot probe determined rc-offset.
+            (let* ((rca (+ (ftype-ref JSValue (u) v) rc-offset))  ; &p->ref_count
+                   (rc  (foreign-ref 'int rca 0)))
+              (foreign-set! 'int rca 0 (- rc 1))
+              (when (<= (- rc 1) 0) (__free-value ctx v)))))))
 
   ;; read a JS string value's UTF-8 bytes into a fresh bytevector (via one
   ;; JS_ToCStringLen2 / JS_FreeCString pair) or #f if not string-coercible.
@@ -225,7 +246,11 @@
         (let ((b0 (foreign-ref 'int ptr 0)) (bm4 (foreign-ref 'int (- ptr 4) 0)))
           (_global g-buf ctx)                               ; ref #3
           (let ((c0 (foreign-ref 'int ptr 0)) (cm4 (foreign-ref 'int (- ptr 4) 0)))
-            (let ((off (decide-rc-offset a0 am4 b0 bm4 c0 cm4)))
+            (let ((off (or (decide-rc-offset a0 am4 b0 bm4 c0 cm4)
+                           ;; with ng's exported JS_FreeValue we never read
+                           ;; the count ourselves, so an inconclusive probe
+                           ;; is not fatal there
+                           (and _free-value rc-offset))))
               (unless off
                 (teardown!)
                 (error 'qjs-boot! "cannot determine ref_count offset: unknown QuickJS ABI"))
