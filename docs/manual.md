@@ -2184,7 +2184,7 @@ The client authenticates with **SCRAM-SHA-256** (RFC 7677, the PostgreSQL defaul
   '((allow-cleartext-auth . #t)))
 ```
 
-SASLprep normalization is not implemented (its Unicode tables would dwarf the driver), so non-ASCII passwords are **rejected with a clear error** on the SCRAM path instead of failing with a baffling `28P01`. ASCII passwords are exact — SASLprep is the identity on ASCII.
+SASLprep normalization is not implemented (its Unicode tables would dwarf the driver), so passwords outside **printable ASCII** — non-ASCII, or the control characters SASLprep prohibits — are rejected with a clear error: in the caller (`postgresql-connect`/`postgresql-pool` raise an assertion up front) when SCRAM is the only possible auth path, and during the exchange otherwise, instead of failing with a baffling `28P01`. Printable-ASCII passwords are exact — SASLprep leaves them unchanged.
 
 #### TLS
 
