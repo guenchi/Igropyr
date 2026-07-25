@@ -240,9 +240,13 @@
     (probe-abi!)                          ; validate layout + discover rc-offset
     (arm-deadline! 10)                    ; bundle parse gets 10x the call budget
     (_eval r-buf ctx bundle-bytes (- (bytevector-length bundle-bytes) 1) "<bundle>" 0)
-    (set! deadline 0)
+    ;; NOTE: the deadline stays ARMED past _eval -- read-exception below
+    ;; stringifies an attacker-authored value and that runs JS (see the
+    ;; note in qjs-call*). It is cleared only after the last such call.
     (if (= (ftype-ref JSValue (tag) r-buf) tag-exception)
-        (let ((msg (read-exception))) (teardown!) (error 'qjs-boot! msg))
+        (let ((msg (read-exception)))
+          (set! deadline 0)
+          (teardown!) (error 'qjs-boot! msg))
         (begin (js-free! r-buf)         ; eval result (undefined) -> no-op
                ;; cache the global object's BITS (borrowed): take a ref, keep
                ;; the bits, drop the ref. globalThis is owned by the context and
@@ -250,6 +254,7 @@
                ;; bits without a per-call JS_GetGlobalObject + free. Re-set here
                ;; on every (re)boot, so it always points at the live context.
                (_global g-cache ctx) (js-free! g-cache)
+               (set! deadline 0)        ; no more JS runs on this path
                (set! healthy #t)
                (set! generation (+ generation 1))
                #t)))
@@ -314,8 +319,9 @@
                  ;; the property access itself threw (e.g. a throwing getter):
                  ;; drain the pending exception (keeps the next call clean) and
                  ;; report it, rather than the misleading "no such function"
-                 (set! deadline 0)
-                 (values #f (read-exception)))
+                 (let ((msg (read-exception)))   ; runs JS: keep the deadline
+                   (set! deadline 0)
+                   (values #f msg)))
                 ((fx= 0 (_is-function ctx f-buf))
                  (js-free! f-buf) (set! deadline 0)
                  (values #f "no such function"))
@@ -325,22 +331,34 @@
                  (ftype-set! JSValue (tag) argv-buf (ftype-ref JSValue (tag) a-buf))
                  (mkundef! this-buf)
                  (_call r-buf ctx f-buf this-buf 1 (ftype-pointer-address argv-buf))
-                 (set! deadline 0)
+                 ;; The deadline MUST stay armed past _call. Reading the
+                 ;; result or the exception goes through JS_ToCStringLen2,
+                 ;; which on a non-string value invokes the object's own
+                 ;; toString/valueOf/Symbol.toPrimitive -- i.e. arbitrary
+                 ;; JS, on this single OS thread, with interrupts disabled.
+                 ;; Disarming here would let `return {toString(){for(;;);}}`
+                 ;; freeze the whole scheduler permanently: the interrupt
+                 ;; callback reads deadline = 0 and never aborts. The
+                 ;; remaining budget is the call's own, so a bundle cannot
+                 ;; buy extra time by stalling in toString either.
                  (let ((exc? (= (ftype-ref JSValue (tag) r-buf) tag-exception)))
                    (js-free! a-buf) (js-free! f-buf)   ; g-cache is borrowed: no free
                    (cond
                      (exc?
                       (let ((msg (read-exception)))
+                        (set! deadline 0)
                         (guard (e (#t #f)) (boot-locked!))  ; crash-only, best-effort
                         (values #f msg)))
                      (else
                       (let ((s (read-result r-buf)))
                         (js-free! r-buf)
                         (if s
-                            (values #t s)
+                            (begin (set! deadline 0) (values #t s))
                             ;; not string-coercible: JS_ToCStringLen2 left a
                             ;; pending exception -> drain it and report
-                            (values #f (read-exception))))))))))))))
+                            (let ((msg (read-exception)))
+                              (set! deadline 0)
+                              (values #f msg))))))))))))))
 
   ;; -> (values ok? string):     result HTML/text as a Scheme string on #t.
   (define (qjs-call fname arg) (qjs-call* read-jsstring fname arg))

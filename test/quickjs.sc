@@ -48,6 +48,11 @@ function thrower(_){ return { toString: function(){ throw new Error('toString bo
 Object.defineProperty(globalThis, 'badgetter', { get: function(){ throw new Error('getter boom'); } });
 function spin(_){ while(true){} }            // runaway loop -> interrupt deadline
 function eat(_){ var a=[]; while(true){ a.push(new Float64Array(100000)); } } // OOM bomb -> JS_SetMemoryLimit
+
+// values whose STRINGIFICATION runs hostile JS: JS_ToCStringLen2 invokes
+// toString/valueOf, so the interrupt deadline must still be armed there
+globalThis.evilResult = function(a){ return { toString(){ for(;;){} } }; };
+globalThis.evilThrow  = function(a){ throw { toString(){ for(;;){} } }; };
 ")
 
 ;; ---- boot + basic calls ----
@@ -139,6 +144,25 @@ function eat(_){ var a=[]; while(true){ a.push(new Float64Array(100000)); } } //
   (let* ((ms (- (real-time) t0)) (per (/ ms iters)))
     (display "  [perf] ") (display iters) (display " calls in ") (display ms)
     (display " ms = ") (display (exact->inexact per)) (display " ms/call\n")))
+
+;; ---- the deadline must cover STRINGIFICATION, not just the call ----------
+;; JS_ToCStringLen2 invokes a value's own toString/valueOf, so reading the
+;; result (or the exception) runs attacker-authored JS. Disarming the
+;; deadline when JS_Call returns froze the entire scheduler permanently --
+;; one OS thread, interrupts disabled, an interrupt callback that reads
+;; deadline = 0 and never aborts. Each of these must come back promptly.
+(let ((t0 (real-time)))
+  (check "hostile-toString-on-result-interrupted"
+    (let-values (((ok r) (qjs-call "evilResult" "x"))) (not ok)))
+  (check "  ... promptly" (< (- (real-time) t0) 10000)))
+
+(let ((t0 (real-time)))
+  (check "hostile-toString-on-exception-interrupted"
+    (let-values (((ok r) (qjs-call "evilThrow" "x"))) (not ok)))
+  (check "  ... promptly" (< (- (real-time) t0) 10000)))
+
+(check "engine-usable-after-hostile-stringification"
+  (let-values (((ok r) (qjs-call "slugify" "Hello World"))) ok))
 
 (qjs-shutdown!)
 (check "shutdown-clears" (not (qjs-healthy?)))
