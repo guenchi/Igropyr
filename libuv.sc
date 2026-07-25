@@ -11,7 +11,7 @@
 ;;; frame and corrupt the process.
 
 (library (igropyr libuv)
-  (export uv-init! uv-poll! now-ms now-ns uv-set-deliver!
+  (export uv-init! uv-poll! now-ms now-ns uv-set-deliver! uv-owner-died!
           tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
           file-read-async!
           file-stream-open! file-stream-read! file-stream-close!
@@ -145,6 +145,21 @@
   ;; delivery hook: (deliver owner-pid msg); installed by (igropyr actor)
   (define deliver (lambda (owner msg) (void)))
   (define (uv-set-deliver! proc) (set! deliver proc))
+
+  ;; Reclaim what a dead owner can no longer close itself. A killed
+  ;; process does not run its dynamic-wind winders (see actor.sc @kill),
+  ;; so a handler killed mid-download would otherwise leak its open fd,
+  ;; its 256 KiB foreign chunk buffer and the uv_fs_t for the life of
+  ;; the VM -- fs-table roots them, so the GC cannot help. The actor
+  ;; layer calls this from its process-teardown path.
+  (define (uv-owner-died! owner)
+    (let ((reqs (hashtable-keys fs-table)))
+      (vector-for-each
+        (lambda (req)
+          (let ((op (hashtable-ref fs-table req #f)))
+            (when (and op (eq? (fs-op-owner op) owner))
+              (file-stream-close! op))))
+        reqs)))
 
   ;; live listeners: handle address -> accept hook, one entry per
   ;; tcp-listen!. Keyed dispatch (not a single global) so several

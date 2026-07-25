@@ -323,9 +323,19 @@
        (put-char p #\"))
       (else (sfail "datum not in the wire whitelist" 0))))
 
+  ;; A bare token is re-read by parse-atom, which tries a number first
+  ;; and treats "." as the improper-list marker. So a symbol whose name
+  ;; reads back as a number (|12|, |1.5|) or as the dot would return
+  ;; from the wire as a DIFFERENT datum -- an integer instead of a
+  ;; symbol, or an improper pair instead of a 3-element list. There is
+  ;; no escaped symbol form in this grammar, so such symbols are
+  ;; refused by the writer (the whole point of the whitelist) rather
+  ;; than silently corrupted in transit.
   (define (wire-symbol? s)
     (let ((m (string-length s)))
       (and (> m 0)
+           (not (string->number s))
+           (not (string=? s "."))
            (let lp ((i 0))
              (or (= i m)
                  (and (let ((c (string-ref s i)))

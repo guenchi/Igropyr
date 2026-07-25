@@ -493,6 +493,9 @@
       (pcb-sleeping?-set! p #f)
       (pcb-exit-reason-set! p reason)
       (hashtable-delete! process-table (pcb-id p))
+      ;; release I/O resources the dead process can no longer close
+      ;; itself (its winders do not run -- see the note above)
+      (uv-owner-died! p)
       ;; drop the registered name, if any
       (let ((nm (hashtable-ref pid->name p #f)))
         (when nm

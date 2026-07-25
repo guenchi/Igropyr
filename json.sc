@@ -243,7 +243,19 @@
            (write-json (vector-ref x i) p)))
        (put-char p #\]))
       ((null? x) (put-string p "{}"))
-      ((and (list? x) (pair? (car x)))            ; alist -> object
+      ;; alist -> object. EVERY entry must be a pair with a string or
+      ;; symbol key: a list of lists (a nested array) also has a pair as
+      ;; its car, and treating it as an object used to crash on the
+      ;; non-string key. Note (("a" "b")) stays genuinely ambiguous --
+      ;; it is both a one-entry alist and a one-element array of
+      ;; strings -- and is still written as an object; use a vector for
+      ;; an unambiguous array.
+      ((and (list? x) (pair? (car x))
+            (let all ((l x))
+              (or (null? l)
+                  (and (pair? (car l))
+                       (let ((k (caar l))) (or (string? k) (symbol? k)))
+                       (all (cdr l))))))
        (put-char p #\{)
        (let loop ((l x) (first #t))
          (unless (null? l)
