@@ -21,6 +21,9 @@
   (export string->json json->string json-ref)
   (import (chezscheme))
 
+  ;; nesting cap for untrusted input (same guard as (igropyr sexpr))
+  (define max-depth 64)
+
   (define (jfail msg pos)
     (raise (vector 'json-error msg pos)))
 
@@ -36,13 +39,18 @@
         (if (and (< i n) (char=? (string-ref s i) ch))
             (+ i 1)
             (jfail (string-append "expected " (string ch)) i)))
-      (define (parse-value i)
+      ;; Untrusted input must not be able to drive unbounded recursion:
+      ;; a few MB of '[' would otherwise cost millions of live frames.
+      ;; Mirrors (igropyr sexpr)'s cap for the same threat model.
+      (define (parse-value i) (parse-value* i 0))
+      (define (parse-value* i depth)
+        (when (> depth max-depth) (jfail "nesting too deep" i))
         (let ((i (skip-ws i)))
           (when (>= i n) (jfail "unexpected end of input" i))
           (let ((ch (string-ref s i)))
             (cond
-              ((char=? ch #\{) (parse-object (+ i 1)))
-              ((char=? ch #\[) (parse-array (+ i 1)))
+              ((char=? ch #\{) (parse-object (+ i 1) (+ depth 1)))
+              ((char=? ch #\[) (parse-array (+ i 1) (+ depth 1)))
               ((char=? ch #\") (parse-string (+ i 1)))
               ((char=? ch #\t) (parse-literal i "true" #t))
               ((char=? ch #\f) (parse-literal i "false" #f))
@@ -54,7 +62,7 @@
           (if (and (<= end n) (string=? (substring s i end) word))
               (values value end)
               (jfail "bad literal" i))))
-      (define (parse-object i)
+      (define (parse-object i depth)
         (let ((i (skip-ws i)))
           (if (and (< i n) (char=? (string-ref s i) #\}))
               (values '() (+ i 1))
@@ -64,7 +72,7 @@
                     (jfail "expected object key" i))
                   (let-values (((key i) (parse-string (+ i 1))))
                     (let ((i (expect #\: (skip-ws i))))
-                      (let-values (((val i) (parse-value i)))
+                      (let-values (((val i) (parse-value* i depth)))
                         (let ((i (skip-ws i)))
                           (cond
                             ((and (< i n) (char=? (string-ref s i) #\,))
@@ -72,12 +80,12 @@
                             ((and (< i n) (char=? (string-ref s i) #\}))
                              (values (reverse (cons (cons key val) acc)) (+ i 1)))
                             (else (jfail "expected , or } in object" i))))))))))))
-      (define (parse-array i)
+      (define (parse-array i depth)
         (let ((i (skip-ws i)))
           (if (and (< i n) (char=? (string-ref s i) #\]))
               (values (vector) (+ i 1))
               (let loop ((i i) (acc '()))
-                (let-values (((val i) (parse-value i)))
+                (let-values (((val i) (parse-value* i depth)))
                   (let ((i (skip-ws i)))
                     (cond
                       ((and (< i n) (char=? (string-ref s i) #\,))
@@ -87,7 +95,20 @@
                       (else (jfail "expected , or ] in array" i)))))))))
       (define (hex4 i)
         (unless (<= (+ i 4) n) (jfail "bad \\u escape" i))
-        (let ((v (string->number (substring s i (+ i 4)) 16)))
+        (let ((v (let ((sub (substring s i (+ i 4))))
+                   ;; strictly four hex digits: string->number would also
+                   ;; accept "-abc" (negative -> integer->char raises a
+                   ;; raw assertion, escaping the json-error contract)
+                   ;; and radix/sign prefixes like "#x41" / "+041"
+                   (let scan ((k 0))
+                     (cond
+                       ((= k 4) (string->number sub 16))
+                       ((let ((c (string-ref sub k)))
+                          (or (char<=? #\0 c #\9)
+                              (char<=? #\a c #\f)
+                              (char<=? #\A c #\F)))
+                        (scan (+ k 1)))
+                       (else #f))))))
           (unless v (jfail "bad \\u escape" i))
           v))
       (define (parse-string i)   ; i points after the opening quote

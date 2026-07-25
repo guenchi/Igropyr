@@ -46,6 +46,15 @@
     (let loop ((i 0))
       (or (= i (string-length s))
           (and (atom-safe? (string-ref s i)) (loop (+ i 1))))))
+  ;; A quoted-string may hold spaces and punctuation, but never a control
+  ;; character: CR/LF inside a display name survives quoting and reaches
+  ;; the generated message header, where it can inject a Bcc.
+  (define (printable? s)
+    (let loop ((i 0))
+      (or (= i (string-length s))
+          (let ((c (string-ref s i)))
+            (and (char>=? c #\space) (char<? c #\delete) (loop (+ i 1)))))))
+
   (define (quote-string s)                 ; "..." with \ and " backslash-escaped
     (call-with-string-output-port
       (lambda (p)
@@ -83,7 +92,11 @@
   ;; quoted-string; non-ASCII -> RFC 2047 encoded word(s).
   (define (format-display-name name)
     (if (ascii? name)
-        (if (all-atom-safe? name) name (quote-string name))
+        (begin
+          (unless (printable? name)
+            (assertion-violation 'ses-send-email
+              "display name must not contain control characters" name))
+          (if (all-atom-safe? name) name (quote-string name)))
         (encode-mime-word name)))
 
   ;; from-name may be #f or "" (address only). to is one address string OR a

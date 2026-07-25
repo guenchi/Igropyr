@@ -63,7 +63,36 @@
   ;; base URL ("https://sts.us-east-1.amazonaws.com", or a test
   ;; "http://127.0.0.1:PORT"); host is derived from it and signed. https
   ;; needs (igropyr tls) enabled once at boot.
+  ;; The signature covers `path` alone while the wire URL is
+  ;; endpoint+path, so an endpoint carrying a trailing slash or a path
+  ;; prefix makes the two disagree and every request fails 403
+  ;; SignatureDoesNotMatch -- looking like a credential problem. Reject
+  ;; it up front, as (igropyr s3)'s parse-endpoint already does.
+  (define (check-endpoint! endpoint)
+    (let* ((n (string-length endpoint))
+           (mark (let loop ((i 0))
+                   (cond ((> (+ i 3) n) #f)
+                         ((and (char=? (string-ref endpoint i) #\:)
+                               (char=? (string-ref endpoint (+ i 1)) #\/)
+                               (char=? (string-ref endpoint (+ i 2)) #\/))
+                          (+ i 3))
+                         (else (loop (+ i 1)))))))
+      (unless mark
+        (assertion-violation 'aws
+          "endpoint must be http[s]://host[:port]" endpoint))
+      (let loop ((i mark))
+        (cond
+          ((>= i n)
+           (when (= i mark)
+             (assertion-violation 'aws "endpoint has no host" endpoint)))
+          ((char=? (string-ref endpoint i) #\/)
+           (assertion-violation 'aws
+             "endpoint must be http[s]://host[:port] with no path or trailing slash"
+             endpoint))
+          (else (loop (+ i 1)))))))
+
   (define (aws-signed-post endpoint service region access-key secret path headers body timeout)
+    (check-endpoint! endpoint)
     (let* ((host (endpoint->host endpoint))
            (payload-hash (sha256-hex body))
            (signed (sigv4-sign-headers 'POST path '() headers payload-hash

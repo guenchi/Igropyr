@@ -95,16 +95,29 @@
   (define (verify-response head-bv key)
     (let* ((text (utf8->string head-bv))
            (lower (string-downcase text))
-           (expected (string-downcase (ws-accept-key key))))
+           ;; the header NAME is matched case-insensitively (HTTP), but
+           ;; the accept key itself is base64 and must match exactly --
+           ;; case-folding it would accept digests that differ from the
+           ;; one this handshake proves
+           (expected (ws-accept-key key))
+           (label "sec-websocket-accept:"))
       (and (let ((sp (string-index text #\space 0)))
              (and sp (>= (string-length text) (+ sp 4))
                   (string=? (substring text (+ sp 1) (+ sp 4)) "101")))
-           (let ((needle (string-append "sec-websocket-accept: " expected)))
+           (let ((n (string-length lower)) (ln (string-length label)))
              (let search ((i 0))
                (cond
-                 ((> (+ i (string-length needle)) (string-length lower)) #f)
-                 ((string=? (substring lower i (+ i (string-length needle)))
-                            needle) #t)
+                 ((> (+ i ln) n) #f)
+                 ((string=? (substring lower i (+ i ln)) label)
+                  ;; skip OWS after the colon, then compare exactly
+                  (let skip ((j (+ i ln)))
+                    (cond
+                      ((and (< j n) (memv (string-ref text j) '(#\space #\tab)))
+                       (skip (+ j 1)))
+                      (else
+                       (let ((e (+ j (string-length expected))))
+                         (and (<= e (string-length text))
+                              (string=? (substring text j e) expected)))))))
                  (else (search (+ i 1)))))))))
 
   (define max-handshake-header 16384)   ; cap on the 101 response headers

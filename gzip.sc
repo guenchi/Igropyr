@@ -78,14 +78,52 @@
 
   ;; does an Accept-Encoding header value allow gzip? Case-insensitive
   ;; search in place: no downcased copy, no per-position substring.
+  ;; Accept-Encoding is a list of "coding[;q=value]" entries: a bare
+  ;; substring search would compress for a client that explicitly said
+  ;; "gzip;q=0" (RFC 9110: q=0 means NOT acceptable -- clients send it
+  ;; precisely because they cannot decode it) and would also fire on an
+  ;; unrelated coding that merely contains the letters.
   (define (gzip-acceptable? accept-encoding)
     (and accept-encoding
          (let ((n (string-length accept-encoding)))
-           (let loop ((i 0))
-             (and (fx<= (fx+ i 4) n)
-                  (or (and (char-ci=? (string-ref accept-encoding i) #\g)
-                           (char-ci=? (string-ref accept-encoding (fx+ i 1)) #\z)
-                           (char-ci=? (string-ref accept-encoding (fx+ i 2)) #\i)
-                           (char-ci=? (string-ref accept-encoding (fx+ i 3)) #\p))
-                      (loop (fx+ i 1))))))))
+           ;; walk comma-separated entries
+           (let entry ((start 0))
+             (and (< start n)
+                  (let* ((end (let scan ((i start))
+                                (cond ((>= i n) n)
+                                      ((char=? (string-ref accept-encoding i) #\,) i)
+                                      (else (scan (+ i 1))))))
+                         (semi (let scan ((i start))
+                                 (cond ((>= i end) end)
+                                       ((char=? (string-ref accept-encoding i) #\;) i)
+                                       (else (scan (+ i 1))))))
+                         (name (trim accept-encoding start semi)))
+                    (if (or (string-ci=? name "gzip") (string-ci=? name "*"))
+                        (not (q-zero? accept-encoding semi end))
+                        (entry (+ end 1)))))))))
+
+  (define (trim s start end)
+    (let* ((b (let scan ((i start))
+                (if (and (< i end) (memv (string-ref s i) '(#\space #\tab)))
+                    (scan (+ i 1)) i)))
+           (e (let scan ((i end))
+                (if (and (> i b) (memv (string-ref s (- i 1)) '(#\space #\tab)))
+                    (scan (- i 1)) i))))
+      (substring s b e)))
+
+  ;; is there a q= parameter equal to zero in [from,to)?
+  (define (q-zero? s from to)
+    (let loop ((i from))
+      (cond
+        ((>= i (- to 1)) #f)
+        ((and (char-ci=? (string-ref s i) #\q)
+              (let scan ((j (+ i 1)))          ; optional OWS then '='
+                (cond ((>= j to) #f)
+                      ((memv (string-ref s j) '(#\space #\tab)) (scan (+ j 1)))
+                      ((char=? (string-ref s j) #\=)
+                       (let ((v (string->number (trim s (+ j 1) to))))
+                         (and v (zero? v))))
+                      (else #f))))
+         #t)
+        (else (loop (+ i 1))))))
 )

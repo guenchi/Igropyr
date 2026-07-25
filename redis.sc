@@ -209,12 +209,20 @@
       (`#(redis-quit)
         (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
         (tcp-close! c))
-      (`#(tcp-eof) (fail-all c waiters))
-      (`#(tcp-error ,e) (fail-all c waiters))))
+      (`#(tcp-eof) (fail-all c buf waiters))
+      (`#(tcp-error ,e) (fail-all c buf waiters))))
 
-  (define (fail-all c waiters)
+  ;; The connection dropped: fail everyone waiting, close the socket --
+  ;; and KEEP SERVING. The redis-cmd clause above answers instantly with
+  ;; connection-lost once the state leaves 'open; exiting here instead
+  ;; would leave that fast path unreachable, and every later call would
+  ;; send into a dead mailbox and park the full 30s reply timeout before
+  ;; raising a misleading "reply timeout". Callers get an immediate,
+  ;; accurate error and can rebuild the connection.
+  (define (fail-all c buf waiters)
     (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
-    (tcp-close! c))
+    (tcp-close! c)
+    (conn-loop c buf '()))
 
   ;; ---- public API ----------------------------------------------------------------
 

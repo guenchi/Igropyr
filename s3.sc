@@ -112,11 +112,53 @@
   (define empty-bv (make-bytevector 0))
   (define empty-payload-hash (sha256-hex empty-bv))
 
+  ;; A key is a path segment on the wire. sigv4-uri-encode keeps '/' and
+  ;; '.' literal (both are unreserved/structural), so a key carrying dot
+  ;; segments or a leading slash reaches the request line as-is -- and
+  ;; any normalizing hop (nginx proxy_pass, a CDN, some S3-compatible
+  ;; servers) then collapses it, addressing an object outside the
+  ;; intended prefix. S3 keys legitimately never need either form.
+  (define (check-key! key)
+    (unless (string? key)
+      (assertion-violation 's3 "key must be a string" key))
+    (when (or (fx= 0 (string-length key))
+              (char=? (string-ref key 0) #\/)
+              (dot-segment? key))
+      (assertion-violation 's3
+        "key must be non-empty, must not start with '/' and must not contain a '.' or '..' path segment"
+        key)))
+
+  ;; does key contain a "." or ".." segment (between slashes / at either end)?
+  (define (dot-segment? key)
+    (let ((n (string-length key)))
+      (let loop ((start 0))
+        (and (<= start n)
+             (let ((end (let scan ((i start))
+                          (cond ((>= i n) n)
+                                ((char=? (string-ref key i) #\/) i)
+                                (else (scan (+ i 1)))))))
+              (let ((len (- end start)))
+                (or (and (= len 1) (char=? (string-ref key start) #\.))
+                    (and (= len 2)
+                         (char=? (string-ref key start) #\.)
+                         (char=? (string-ref key (+ start 1)) #\.))
+                    (loop (+ end 1)))))))))
+
+  ;; With a virtual-host endpoint the bucket lives in the hostname and
+  ;; s3-bucket is "": the path is then just "/key", never "//key" (which
+  ;; would store an object whose key has a leading empty segment, so a
+  ;; later list -> delete round trip would address a different object
+  ;; and silently 404 -- reported as a successful delete).
   (define (object-path s key)
-    (string-append "/" (s3-bucket s) "/" (sigv4-uri-encode key #t)))
+    (check-key! key)
+    (let ((b (s3-bucket s)))
+      (if (fx= 0 (string-length b))
+          (string-append "/" (sigv4-uri-encode key #t))
+          (string-append "/" b "/" (sigv4-uri-encode key #t)))))
 
   (define (bucket-path s)
-    (string-append "/" (s3-bucket s)))
+    (let ((b (s3-bucket s)))
+      (if (fx= 0 (string-length b)) "/" (string-append "/" b))))
 
   (define (s3-fail status body)
     (raise (vector 's3-error status

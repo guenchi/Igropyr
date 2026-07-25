@@ -18,7 +18,7 @@
 (library (igropyr s3-control)
   (export make-s3-control s3-control-create-job s3-control-describe-job s3-control-error?)
   (import (chezscheme)
-          (only (igropyr sigv4) sigv4-sign-headers sha256-hex)
+          (only (igropyr sigv4) sigv4-sign-headers sha256-hex sigv4-uri-encode)
           (only (igropyr aws) endpoint->host xml-first)
           (only (igropyr http-client) http-request response-status response-body))
 
@@ -67,7 +67,13 @@
 
   ;; DescribeJob: GET /v20180820/jobs/{id}. -> the status + progress alist.
   (define (s3-control-describe-job c job-id)
-    (let* ((r (signed-request c 'GET (string-append "/v20180820/jobs/" job-id) #f))
+    ;; the id becomes a path segment in BOTH the signed canonical URI and
+    ;; the request line: unencoded, a stray '?' silently starts a query
+    ;; string the signature does not cover (403), and a space or CR/LF
+    ;; corrupts the request line outright
+    (let* ((r (signed-request c 'GET
+                (string-append "/v20180820/jobs/" (sigv4-uri-encode job-id #f))
+                #f))
            (status (response-status r))
            (xml (utf8->string (response-body r))))
       (if (and (>= status 200) (< status 300))
