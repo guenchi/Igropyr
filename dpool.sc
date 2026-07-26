@@ -51,14 +51,21 @@
   (define default-await-ms 30000)
 
   (define ref-counter 0)
+  ;; Guarded like random-token! below: scheduling is preemptive at Chez
+  ;; safe points, so an unguarded read-modify-write on a shared counter can
+  ;; lose an update and REWIND it -- reissuing refs that a stale reply
+  ;; still matches.
   (define (next-ref!)
-    (set! ref-counter (+ ref-counter 1))
-    ref-counter)
+    (with-interrupts-disabled
+      (set! ref-counter (+ ref-counter 1))
+      ref-counter))
 
   (define coord-counter 0)
   (define (next-coord-name!)
-    (set! coord-counter (+ coord-counter 1))
-    (string->symbol (string-append "dpool-coord-" (number->string coord-counter))))
+    (with-interrupts-disabled
+      (set! coord-counter (+ coord-counter 1))
+      (string->symbol
+        (string-append "dpool-coord-" (number->string coord-counter)))))
 
   ;; Per-dispatch unforgeable attempt token. A result is only accepted
   ;; if it echoes the token the coordinator sent with the task, which
@@ -291,14 +298,17 @@
     (define (complete! id result)
       (hashtable-delete! inflight id)
       (let ((aws (hashtable-ref awaiters id '())))
-        (if (pair? aws)
-            (begin
-              (for-each
-                (lambda (a) (send (vector-ref a 0)
-                                  (vector 'dpool-result (vector-ref a 1) result)))
-                aws)
-              (hashtable-delete! awaiters id))
-            (stash-result! id result))))
+        (for-each
+          (lambda (a) (send (vector-ref a 0)
+                            (vector 'dpool-result (vector-ref a 1) result)))
+          aws)
+        (hashtable-delete! awaiters id)
+        ;; Stash it EVEN when awaiters were notified. A caller whose
+        ;; timeout fired microseconds earlier is already gone; without a
+        ;; stash the outcome of an at-most-once task would be permanently
+        ;; unknowable, because a re-await registers against an id no
+        ;; longer in flight and just times out again.
+        (stash-result! id result)))
 
     (define (drain-queue!)
       (let ((q (reverse queue-rev)))
@@ -381,7 +391,18 @@
   ;; Block for a task's result: the handler's return value, or a raised
   ;; #(dpool-error ,reason ,id) where reason is task-error | node-down |
   ;; await-timeout.
+  ;; Drain the late answer to a previously timed-out await. Its ref can
+  ;; never match again (refs are monotonic), so selective receive would
+  ;; keep it in this mailbox forever, rescanned by every later receive.
+  ;; Safe because an await is synchronous within one green process: any
+  ;; dpool-result present at ENTRY is by construction stale.
+  (define (drain-stale-results!)
+    (let loop ()
+      (receive (after 0 'done)
+        (`#(dpool-result ,r ,v) (loop)))))
+
   (define (dpool-await pool id . rest)
+    (drain-stale-results!)
     (let ((timeout (if (pair? rest) (car rest) default-await-ms))
           (ref (next-ref!)))
       (send (dpool-pid pool) (vector 'await id self ref))

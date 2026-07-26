@@ -74,11 +74,18 @@
   ;; ---- a cache backend is #(get put drop clear stats) -------------------
   ;;   get  : key -> html-string or #f      put : key html ttl-ms -> _
   ;;   drop : key -> _   clear : -> _        stats : -> alist
-  (define (b-get b k)       ((vector-ref b 0) k))
-  (define (b-put b k h ttl) ((vector-ref b 1) k h ttl))
-  (define (b-drop b k)      ((vector-ref b 2) k))
-  (define (b-clear b)       ((vector-ref b 3)))
-  (define (b-stats b)       ((vector-ref b 4)))
+  ;; A cache outage must DEGRADE to rendering, never become an outage of
+  ;; its own: with the redis backend, a dropped connection made b-get raise
+  ;; before the engine was ever asked, so every request 500'd while quickjs
+  ;; sat there perfectly able to render. A failed b-put is likewise just a
+  ;; miss next time -- and it must not escape after a successful render,
+  ;; which would strand the single-flight followers waiting on a publish
+  ;; that never comes.
+  (define (b-get b k)       (guard (e (#t #f)) ((vector-ref b 0) k)))
+  (define (b-put b k h ttl) (guard (e (#t #f)) ((vector-ref b 1) k h ttl)))
+  (define (b-drop b k)      (guard (e (#t #f)) ((vector-ref b 2) k)))
+  (define (b-clear b)       (guard (e (#t #f)) ((vector-ref b 3))))
+  (define (b-stats b)       (guard (e (#t '())) ((vector-ref b 4))))
 
   ;; ---- in-process backend: a gen-server (the session-store shape) -------
   ;; state #(tbl hits misses cap); tbl : key -> (html . expiry-ms)

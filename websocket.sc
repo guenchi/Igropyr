@@ -196,6 +196,16 @@
         (tcp-write! c (encode-frame 8 (make-bytevector 0) (ws-client? w))
           (lambda (st) (tcp-close! c))))))
 
+  ;; Codes a peer may legitimately send (RFC 6455 7.4.1): 1000-1003,
+  ;; 1007-1011, 1012-1014, plus the private range 3000-4999. 1004, 1005
+  ;; and 1006 are reserved and never appear on the wire; anything below
+  ;; 1000 or in 1015..2999 is unassigned.
+  (define (valid-close-code? c)
+    (or (and (fx>= c 1000) (fx<= c 1003))
+        (and (fx>= c 1007) (fx<= c 1011))
+        (and (fx>= c 1012) (fx<= c 1014))
+        (and (fx>= c 3000) (fx<= c 4999))))
+
   ;; close with a status code (RFC 6455 7.4): 1002 protocol error,
   ;; 1007 invalid UTF-8 in a text message, 1009 message too big
   (define (ws-fail! w code)
@@ -301,7 +311,24 @@
                   (case fop
                     ((9) (ws-send-frame! w 10 payload) (loop op parts size)) ; ping
                     ((10) (loop op parts size))                              ; pong
-                    ((8) (ws-close! w) (vector 'close))
+                    ((8)
+                     ;; RFC 6455 5.5.1 / 7.4: a close payload is either
+                     ;; empty or a 2-byte status code (plus an optional
+                     ;; UTF-8 reason). Codes below 1000, and the ones
+                     ;; reserved for local use (1004/1005/1006) or
+                     ;; unassigned, must never appear on the wire -- answer
+                     ;; 1002. A conforming peer also expects its own code
+                     ;; echoed; replying with an empty close made every
+                     ;; clean shutdown look like "no status received".
+                     (let ((n (bytevector-length payload)))
+                       (if (fx= n 0)
+                           (ws-close! w)
+                           (let ((code (fx+ (fxsll (bytevector-u8-ref payload 0) 8)
+                                            (bytevector-u8-ref payload 1))))
+                             (if (valid-close-code? code)
+                                 (ws-fail! w code)          ; echo it back
+                                 (ws-fail! w 1002)))))
+                     (vector 'close))
                     ((0)                                    ; continuation frame
                      (cond
                        ((not op) (ws-fail! w 1002) (vector 'close)) ; no message started

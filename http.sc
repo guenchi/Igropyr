@@ -34,7 +34,7 @@
           ;; user code that wants to type-test req/res values
           request? res?
           req-method req-path req-query req-headers req-header req-body
-          req-keep-alive? req-peer req-params req-params-set!
+          req-keep-alive? req-version req-peer req-params req-params-set!
           req-local req-set-local!
           set-status! set-header! res-send!
           res-begin! res-write! res-end!
@@ -68,6 +68,12 @@
   ;; response lets a peer grow the reader's buffer without bound.
   (define pipeline-limit (+ header-limit body-limit))
   (define read-timeout-ms 30000)   ; slow/half requests reaped after this
+  ;; Whole-request deadline. read-timeout-ms bounds the gap BETWEEN
+  ;; segments and re-arms on every one, so a client sending one byte every
+  ;; 29s holds a reader process and its buffer indefinitely -- classic
+  ;; slowloris, at trivial cost to the attacker. This caps how long one
+  ;; request may take to arrive, however steadily it dribbles.
+  (define request-deadline-ms 60000)
   (define await-timeout-ms 60000)  ; reader waits this long for a response
 
   ;; ---- bytevector helpers ------------------------------------------------
@@ -95,6 +101,9 @@
       (immutable headers req-headers)    ; alist of (symbol . string)
       (immutable body req-body)          ; bytevector
       (immutable keep-alive? req-keep-alive?)
+      ;; "HTTP/1.1" | "HTTP/1.0" | 'unsupported -- chunked framing is a
+      ;; 1.1 feature and must not be sent to a 1.0 recipient
+      (immutable version req-version)
       ;; the connection's peer IP ("a.b.c.d") or #f -- the one client
       ;; identity that cannot be forged by a header
       (immutable peer req-peer)
@@ -641,7 +650,14 @@
   ;; declare THAT length (a HEAD for a file too large to read into memory,
   ;; where the size is known but the bytes must not be).
   (define (send-response!* c token status headers body ka head-only)
-    (when (claim! token)
+    ;; Check the socket BEFORE claiming: the reader closes on its own
+    ;; timeout, and a handler that finishes afterwards would otherwise
+    ;; write to a freed handle. If that raises, the supervisor treats it
+    ;; as a task crash and RE-RUNS the whole handler, duplicating whatever
+    ;; non-idempotent work it had already done for a client that is long
+    ;; gone. The streaming writers guard on conn-state for the same
+    ;; reason; this is the one path that did not.
+    (when (and (eq? (conn-state c) 'open) (claim! token))
       (let* ((head
               (assemble-head status headers
                 "Content-Length: "
@@ -722,15 +738,31 @@
   (define chunked-close-tail
     "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
 
+  ;; RFC 7230 3.3.1: chunked is an HTTP/1.1 feature and MUST NOT be sent
+  ;; to an HTTP/1.0 recipient -- it does not implement it, so it reads the
+  ;; hex size lines as body content and the payload is corrupted (and a
+  ;; 1.0 proxy forwards that corruption). Such a client gets a
+  ;; close-delimited body instead: no framing header, raw bytes, and the
+  ;; connection closes to mark the end.
+  (define (res-http10? r)
+    (let ((req (res-req r)))
+      (and req (equal? (req-version req) "HTTP/1.0"))))
+
+  (define close-delimited-tail "Connection: close\r\n\r\n")
+
   (define (res-begin! r)
     (let ((c (res-conn r)))
-      (when (claim! (res-token r))
-        (res-mode-set! r 'streaming)
-        (tcp-write! c
-          (string->utf8
-            (assemble-head (res-status r) (res-headers r)
-              (if (res-keep-alive? r) chunked-keep-alive-tail chunked-close-tail)))
-          #f)
+      (when (and (eq? (conn-state c) 'open) (claim! (res-token r)))
+        (let ((raw? (res-http10? r)))
+          (res-mode-set! r (if raw? 'streaming-raw 'streaming))
+          (tcp-write! c
+            (string->utf8
+              (assemble-head (res-status r) (res-headers r)
+                (cond
+                  (raw? close-delimited-tail)
+                  ((res-keep-alive? r) chunked-keep-alive-tail)
+                  (else chunked-close-tail))))
+            #f))
         (send (conn-owner c) (vector 'streaming)))))
 
   ;; Write one chunk (string or bytevector). #f when the stream is not
@@ -757,16 +789,21 @@
   (define (res-write! r data)
     (let ((bv (if (string? data) (string->utf8 data) data))
           (c (res-conn r)))
-      (and (eq? (res-mode r) 'streaming)
+      (and (memq (res-mode r) '(streaming streaming-raw))
            (eq? (conn-state c) 'open)
            (> (bytevector-length bv) 0)
-           ;; chunk = <hex size>CRLF <data> CRLF, written as three segments
+           ;; chunk = <hex size>CRLF <data> CRLF, written as three
+           ;; segments -- except on the close-delimited HTTP/1.0 path,
+           ;; where the bytes go out bare
            (let ((b (box 'pending)) (me self))
              (tcp-writev! c
-               (list (string->utf8
-                       (string-append (number->string (bytevector-length bv) 16) "\r\n"))
-                     bv
-                     crlf-bv)
+               (if (eq? (res-mode r) 'streaming-raw)
+                   (list bv)
+                   (list (string->utf8
+                           (string-append
+                             (number->string (bytevector-length bv) 16) "\r\n"))
+                         bv
+                         crlf-bv))
                (lambda (st)
                  (if (eq? (unbox b) 'pending)
                      (set-box! b st)
@@ -785,18 +822,23 @@
   (define chunk-terminator (string->utf8 "0\r\n\r\n"))
 
   (define (res-end! r)
-    (when (eq? (res-mode r) 'streaming)
-      (res-mode-set! r 'done)
-      (let* ((c (res-conn r))
-             (owner (conn-owner c))
-             (ka (res-keep-alive? r)))
-        (tcp-write! c chunk-terminator
-          (lambda (st)
-            (if (and ka (>= st 0))
-                (send owner (vector 'next-request))
-                (begin
-                  (tcp-close! c)
-                  (send owner (vector 'conn-closed)))))))))
+    (let ((mode (res-mode r)))
+      (when (memq mode '(streaming streaming-raw))
+        (res-mode-set! r 'done)
+        (let* ((c (res-conn r))
+               (owner (conn-owner c)))
+          (if (eq? mode 'streaming-raw)
+              ;; close-delimited: the close IS the end of the body, so
+              ;; there is no terminator and the connection cannot be reused
+              (begin (tcp-close! c) (send owner (vector 'conn-closed)))
+              (let ((ka (res-keep-alive? r)))
+                (tcp-write! c chunk-terminator
+                  (lambda (st)
+                    (if (and ka (>= st 0))
+                        (send owner (vector 'next-request))
+                        (begin
+                          (tcp-close! c)
+                          (send owner (vector 'conn-closed)))))))))))) 
 
   ;; ---- fixed-length streaming (large files) --------------------------------
 
@@ -1091,18 +1133,32 @@
   ;; appends are amortized O(1)/byte, the header-end scan resumes where
   ;; it left off, and consuming a request is an offset bump -- none of
   ;; the append-and-rescan-from-zero / recopy-the-remainder patterns.
-  (define (reader-loop c srv buf)
+  (define (reader-loop c srv buf) (reader-loop* c srv buf #f))
+
+  ;; started: when the first byte of THIS request arrived (#f while the
+  ;; connection is idle between requests, which may last read-timeout-ms
+  ;; but is not a request in progress).
+  (define (reader-loop* c srv buf started)
     (let ((hend (inbuf-find-header-end buf)))
       (cond
         (hend (have-header c srv buf hend))
         ((> (inbuf-length buf) header-limit)
          (quick-response! c 431 "Header Too Large"))
+        ((and started (> (- (now-ms) started) request-deadline-ms))
+         (quick-response! c 408 "Request Timeout"))
         (else
-         (receive (after read-timeout-ms
+         (receive (after (if started
+                             ;; never wait past the whole-request deadline
+                             (max 1 (min read-timeout-ms
+                                         (- (+ started request-deadline-ms)
+                                            (now-ms))))
+                             read-timeout-ms)
                      (if (> (inbuf-length buf) 0)
                          (quick-response! c 408 "Request Timeout")
                          (tcp-close! c)))   ; idle connection: just close
-           (`#(tcp-data ,bv) (inbuf-append! buf bv) (reader-loop c srv buf))
+           (`#(tcp-data ,bv)
+             (inbuf-append! buf bv)
+             (reader-loop* c srv buf (or started (now-ms))))
            (`#(tcp-eof) (tcp-close! c))
            (`#(tcp-error ,e) (tcp-close! c)))))))
 
@@ -1140,6 +1196,7 @@
                                          (vector-ref parsed 1)
                                          (vector-ref parsed 2)
                                          '() headers empty-bv #f
+                                         (vector-ref parsed 3)
                                          (conn-peer-ip c) '()))
                       (session (resolver req)))
                  (cond
@@ -1184,6 +1241,7 @@
                               headers
                               body
                               (keep-alive? (vector-ref parsed 3) headers)
+                              (vector-ref parsed 3)
                               (conn-peer-ip c)
                               '()))
            (id (next-task-id!))
@@ -1193,31 +1251,54 @@
       (await-response c srv buf #f)))
 
   ;; total = header block + body length, RELATIVE to the buffer start
+  ;; The body phases carry the same whole-request deadline as the header
+  ;; phase: without it a 1 MiB body dribbled one byte per 29 s pins a
+  ;; reader for weeks. `deadline` is an absolute ms timestamp.
+  (define (body-wait-ms deadline)
+    (if deadline
+        (max 1 (min read-timeout-ms (- deadline (now-ms))))
+        read-timeout-ms))
+
   (define (collect-body c srv buf parsed clen total)
-    (if (>= (inbuf-length buf) total)
-        (let ((body (inbuf-sub buf (- total clen) total)))
-          (inbuf-consume! buf total)
-          (dispatch-request! c srv parsed body buf))
-        (receive (after read-timeout-ms (quick-response! c 408 "Request Timeout"))
-          (`#(tcp-data ,bv)
-            (inbuf-append! buf bv)
-            (collect-body c srv buf parsed clen total))
-          (`#(tcp-eof) (tcp-close! c))
-          (`#(tcp-error ,e) (tcp-close! c)))))
+    (collect-body* c srv buf parsed clen total
+                   (+ (now-ms) request-deadline-ms)))
+
+  (define (collect-body* c srv buf parsed clen total deadline)
+    (cond
+      ((>= (inbuf-length buf) total)
+       (let ((body (inbuf-sub buf (- total clen) total)))
+         (inbuf-consume! buf total)
+         (dispatch-request! c srv parsed body buf)))
+      ((> (now-ms) deadline) (quick-response! c 408 "Request Timeout"))
+      (else
+       (receive (after (body-wait-ms deadline)
+                   (quick-response! c 408 "Request Timeout"))
+         (`#(tcp-data ,bv)
+           (inbuf-append! buf bv)
+           (collect-body* c srv buf parsed clen total deadline))
+         (`#(tcp-eof) (tcp-close! c))
+         (`#(tcp-error ,e) (tcp-close! c))))))
 
   (define (collect-chunked c srv buf parsed body-start st)
+    (collect-chunked* c srv buf parsed body-start st
+                      (+ (now-ms) request-deadline-ms)))
+
+  (define (collect-chunked* c srv buf parsed body-start st deadline)
     (let-values (((status a b) (parse-chunked-body buf body-start st)))
       (case status
         ((done)
          (inbuf-consume! buf b)
          (dispatch-request! c srv parsed a buf))
         ((more)
-         (receive (after read-timeout-ms (quick-response! c 408 "Request Timeout"))
-           (`#(tcp-data ,bv)
-             (inbuf-append! buf bv)
-             (collect-chunked c srv buf parsed body-start a))
-           (`#(tcp-eof) (tcp-close! c))
-           (`#(tcp-error ,e) (tcp-close! c))))
+         (if (> (now-ms) deadline)
+             (quick-response! c 408 "Request Timeout")
+             (receive (after (body-wait-ms deadline)
+                         (quick-response! c 408 "Request Timeout"))
+               (`#(tcp-data ,bv)
+                 (inbuf-append! buf bv)
+                 (collect-chunked* c srv buf parsed body-start a deadline))
+               (`#(tcp-eof) (tcp-close! c))
+               (`#(tcp-error ,e) (tcp-close! c)))))
         ((too-large) (quick-response! c 413 "Payload Too Large"))
         ((trailers-too-large) (quick-response! c 431 "Trailer Too Large"))
         (else (quick-response! c 400 "Bad Request")))))

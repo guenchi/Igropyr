@@ -173,6 +173,14 @@
               'gone))
         (lambda ()
           (demonitor-node owner)
+          ;; demonitor-node does not retract a #(node-down ...) already
+          ;; delivered. Left behind, a LATER forward to the same owner --
+          ;; after it rebooted -- would match that stale message at once
+          ;; and answer 'gone, which the contract says GUARANTEES no
+          ;; commit. The conversation would in fact be alive and holding
+          ;; an open transaction, so the client's retry would duplicate
+          ;; the flow's effects. Drain it.
+          (receive (after 0 'ok) (`#(node-down ,@owner) 'ok))
           (unregister reply-name)))))
 
   ;; Start a conversation. flow: (lambda (req suspend!) ... final-reply).

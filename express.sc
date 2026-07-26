@@ -121,6 +121,12 @@
              (string->sexpr-extended (utf8->string body))))))
 
   ;; a bytevector is passed through as a pre-serialized datum
+  ;; Encode to wire bytes SEPARATELY, so a caller can put the encoding
+  ;; inside its own guard: sexpr->string-extended raises on anything the
+  ;; wire whitelist refuses, and where that raise lands decides whether a
+  ;; request gets replayed.
+  (define (encode-sexpr x) (string->utf8 (sexpr->string-extended x)))
+
   (define-checked (send-sexpr! (r res?) x)
     (finish! r "application/sexpr; charset=utf-8"
              (if (bytevector? x)
@@ -160,7 +166,36 @@
 
   ;; add a Set-Cookie header; extra attribute strings are appended:
   ;;   (set-cookie! res "sid" "abc" "Path=/" "HttpOnly" "Max-Age=3600")
+  ;; A cookie value must not be able to introduce ATTRIBUTES. With ';'
+  ;; allowed through, a reflected value like "en; Domain=example.com"
+  ;; produced a cookie the browser accepts as domain-wide -- a host-only
+  ;; session cookie suddenly readable by every subdomain, which is the
+  ;; classic cookie-tossing/fixation setup. CR/LF would be dropped later
+  ;; by set-header!, but SILENTLY, taking the whole Set-Cookie with it: a
+  ;; login would appear to succeed while never setting its cookie. Both
+  ;; are refused here, loudly, at the call site that can still do
+  ;; something about it. Attributes are the caller's own literals and are
+  ;; checked the same way.
+  (define (cookie-part-ok? s)
+    (let ((n (string-length s)))
+      (let loop ((i 0))
+        (or (= i n)
+            (let ((c (string-ref s i)))
+              (and (char>=? c #\space) (char<? c #\delete)
+                   (not (char=? c #\;)) (not (char=? c #\,))
+                   (loop (+ i 1))))))))
+
   (define (set-cookie! res name value . attrs)
+    (unless (and (string? name) (cookie-part-ok? name))
+      (assertion-violation 'set-cookie! "invalid cookie name" name))
+    (unless (and (string? value) (cookie-part-ok? value))
+      (assertion-violation 'set-cookie!
+        "cookie value may not contain ';' ',' or control characters" value))
+    (for-each
+      (lambda (a)
+        (unless (and (string? a) (cookie-part-ok? a))
+          (assertion-violation 'set-cookie! "invalid cookie attribute" a)))
+      attrs)
     (set-header! res "Set-Cookie"
       (apply string-append name "=" value
              (map (lambda (a) (string-append "; " a)) attrs))))
@@ -801,13 +836,28 @@
                  (if (and (pair? msg) (symbol? (car msg)))
                      (let ((h (assq (car msg) handlers)))
                        (if h
+                           ;; The guard must cover the SERIALIZATION too, not
+                           ;; just the call. A reply the wire whitelist
+                           ;; refuses (a record, a port, a too-deep or
+                           ;; cyclic structure) raises inside sexpr->string
+                           ;; -- after the handler's side effects have
+                           ;; committed. Outside the guard that raise killed
+                           ;; the worker and the supervisor replayed the
+                           ;; whole request up to max-retries, so a
+                           ;; non-idempotent write ran four times. Note the
+                           ;; irony it removes: a handler that CRASHES was
+                           ;; never retried (the guard turned it into an
+                           ;; error reply), while one that SUCCEEDED and
+                           ;; returned an unserializable value was.
                            (send-sexpr! res
-                             (guard (e (#t (list 'error 'handler-failed)))
-                               (let ((proc (cdr h)))
-                                 (list 'ok
-                                   (if (logbit? 2 (procedure-arity-mask proc))
-                                       (proc (cdr msg) req)
-                                       (proc (cdr msg)))))))
+                             (guard (e (#t (encode-sexpr (list 'error 'handler-failed))))
+                               (let* ((proc (cdr h))
+                                      (reply
+                                       (list 'ok
+                                         (if (logbit? 2 (procedure-arity-mask proc))
+                                             (proc (cdr msg) req)
+                                             (proc (cdr msg))))))
+                                 (encode-sexpr reply))))
                            (send-sexpr! res (list 'error 'unknown-tag (car msg)))))
                      (send-sexpr! res (list 'error 'bad-payload)))))))))))
 

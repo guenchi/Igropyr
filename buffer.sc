@@ -122,6 +122,10 @@
   ;; position resets: what remains is the NEXT message, none of it
   ;; searched yet.
   (define-checked (inbuf-consume! (b inbuf?) (n fixnum?))
+    ;; a negative n would move start BACKWARDS over consumed bytes,
+    ;; resurrecting a previous request's data into the live window
+    (when (fx< n 0)
+      (assertion-violation 'inbuf-consume! "negative consume" n))
     (let ((start (fx+ (%istart b) n)))
       (if (fx>= start (%iend b))
           (inbuf-clear! b)
@@ -138,7 +142,20 @@
 
   ;; fresh copy of the RELATIVE range [from, to); empty range allocates
   ;; nothing (every bodyless request used to pay two empty allocations)
+  ;; The window invariant is enforced, not assumed: consume! only advances
+  ;; start and never clears what it passes, so bytes of ALREADY-CONSUMED
+  ;; requests stay in the owned storage. A caller arithmetic slip (a body
+  ;; slice computed from a length before the bytes arrived, a negative
+  ;; index from a bookkeeping bug) would otherwise silently copy those
+  ;; bytes out -- handing one request another's data on the same
+  ;; keep-alive connection. define-checked validates types; this validates
+  ;; the range.
   (define-checked (inbuf-sub (b inbuf?) (from fixnum?) (to fixnum?))
+    (unless (and (fx>= from 0) (fx<= from to)
+                 (fx<= to (fx- (%iend b) (%istart b))))
+      (assertion-violation 'inbuf-sub
+        "range outside the buffer's live window" from to
+        (fx- (%iend b) (%istart b))))
     (if (fx>= from to)
         empty-bv
         (let* ((abs-from (fx+ (%istart b) from))

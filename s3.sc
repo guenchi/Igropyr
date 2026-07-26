@@ -250,11 +250,19 @@
              (xml (utf8->string (response-body r)))
              (pages (cons (xml-all xml "Key") pages))
              (truncated (xml-one xml "IsTruncated"))
-             (next (and truncated (string=? truncated "true")
-                        (xml-one xml "NextContinuationToken"))))
-        (if next
-            (loop next pages)
-            (apply append (reverse pages))))))
+             (more? (and truncated (string=? truncated "true")))
+             (next (and more? (xml-one xml "NextContinuationToken"))))
+        (cond
+          (next (loop next pages))
+          ;; The server said there is more but gave no token we could
+          ;; parse (an empty-element form, an S3-compatible quirk).
+          ;; Returning what we have would be a SILENT truncation: callers
+          ;; treat the list as complete, and s3-delete-prefix! then
+          ;; reports success while leaving objects behind forever.
+          (more?
+           (raise (vector 's3-error 0
+                    "listing is truncated but carries no continuation token")))
+          (else (apply append (reverse pages)))))))
 
   (define (s3-delete-prefix! s prefix)
     (for-each (lambda (k) (s3-delete! s k)) (s3-list s prefix))

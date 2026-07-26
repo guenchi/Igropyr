@@ -101,14 +101,20 @@
 
   ;; ---- canonical headers / request --------------------------------------
 
-  ;; trim ends and collapse inner runs of spaces (SigV4 header value rule)
+  ;; Trim ends and collapse inner runs of whitespace to one space (SigV4
+  ;; header value rule). TABS count: they are legal OWS in HTTP and AWS
+  ;; canonicalizes with a whitespace split, so leaving one in signs a
+  ;; different string than the server reconstructs -- an intermittent 403
+  ;; that appears only for tab-bearing values.
+  (define (ws-char? c) (or (char=? c #\space) (char=? c #\tab)))
+
   (define (trim-collapse s)
     (let-values (((p get) (open-string-output-port)))
       (let loop ((i 0) (pending #f) (emitted #f))
         (if (fx= i (string-length s))
             (get)
             (let ((c (string-ref s i)))
-              (if (char=? c #\space)
+              (if (ws-char? c)
                   (loop (fx+ i 1) emitted emitted)
                   (begin
                     (when pending (put-char p #\space))
@@ -122,7 +128,26 @@
                            (cons (string-downcase (car h))
                                  (trim-collapse (cdr h))))
                          headers))
-           (sorted (sort (lambda (a b) (string<? (car a) (car b))) lowered))
+           ;; SigV4 requires values for a REPEATED name to be joined with
+           ;; "," into a single canonical line, appearing once in
+           ;; SignedHeaders. Emitting two lines (and the name twice) made
+           ;; AWS -- which rebuilds the canonical request from the single
+           ;; header it received -- compute a different signature, so every
+           ;; such request failed 403 with no useful diagnostic. Callers
+           ;; reach this by passing a header sigv4-sign-headers also adds,
+           ;; e.g. their own x-amz-content-sha256.
+           (merged (fold-right
+                     (lambda (h acc)
+                       (cond
+                         ((assoc (car h) acc)
+                          => (lambda (prev)
+                               (cons (cons (car h)
+                                           (string-append (cdr h) "," (cdr prev)))
+                                     (remp (lambda (x) (equal? (car x) (car h)))
+                                           acc))))
+                         (else (cons h acc))))
+                     '() lowered))
+           (sorted (sort (lambda (a b) (string<? (car a) (car b))) merged))
            (signed (fold-right (lambda (h acc)
                                  (if (string=? acc "")
                                      (car h)

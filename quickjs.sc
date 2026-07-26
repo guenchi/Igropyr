@@ -373,6 +373,18 @@
                  (values #f "no such function"))
                 (else
                  (_new-string a-buf ctx abytes (bytevector-length abytes))
+                 ;; JS_NewStringLen returns an exception when the argument
+                 ;; pushes the heap past its limit. Passing that value on
+                 ;; as argv[0] would run the bundle against a garbage
+                 ;; argument with an exception already pending -- the call
+                 ;; could then report success for input it never received,
+                 ;; and the stale exception surface on a later call.
+                 (if (= (ftype-ref JSValue (tag) a-buf) tag-exception)
+                     (let ((msg (read-exception)))
+                       (js-free! f-buf)
+                       (set! deadline 0)
+                       (values #f msg))
+                     (begin
                  (ftype-set! JSValue (u)   argv-buf (ftype-ref JSValue (u) a-buf))
                  (ftype-set! JSValue (tag) argv-buf (ftype-ref JSValue (tag) a-buf))
                  (mkundef! this-buf)
@@ -404,7 +416,7 @@
                             ;; pending exception -> drain it and report
                             (let ((msg (read-exception)))
                               (set! deadline 0)
-                              (values #f msg))))))))))))))
+                              (values #f msg))))))))))))))))
 
   ;; -> (values ok? string):     result HTML/text as a Scheme string on #t.
   (define (qjs-call fname arg) (qjs-call* read-jsstring fname arg))

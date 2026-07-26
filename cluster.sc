@@ -324,16 +324,33 @@
   ;; desired set); returns the new one. Only names we introduced are
   ;; ever disconnected, so a manual node-connect! or another cluster
   ;; handle's peers are left alone.
+  ;; `connected` is the set of links THIS handle introduced -- not every
+  ;; name discovery happens to mention. A node someone else dialled (a
+  ;; manual node-connect!, or another cluster handle) can appear in
+  ;; discovery too; claiming it would mean disconnecting a healthy link we
+  ;; never owned the moment its registry entry lapses, tearing down
+  ;; in-flight work on a node that is perfectly fine. So a name is only
+  ;; adopted when we dial it ourselves, or when we already owned it.
   (define (reconcile! connected peers)
     (let ((desired (filter (lambda (nm) (not (eq? nm (node-self))))
-                           (map car peers))))
+                           (map car peers)))
+          (dialed '()))
       (for-each
         (lambda (p)
           (let ((name (car p)))
-            ;; node-connect! is idempotent and self-reconnecting, so we
-            ;; only dial names we have no live link to yet
-            (unless (or (eq? name (node-self)) (memq name (node-peers)))
-              (node-connect! name (cadr p) (caddr p)))))
+            (unless (eq? name (node-self))
+              (cond
+                ;; ours already: keep it, redialing only if the link died
+                ((memq name connected)
+                 (unless (memq name (node-peers))
+                   (node-connect! name (cadr p) (caddr p)))
+                 (set! dialed (cons name dialed)))
+                ;; someone else's link to the same node: leave it alone
+                ((memq name (node-peers)) (void))
+                ;; new to us: dial it, and it becomes ours
+                (else
+                 (node-connect! name (cadr p) (caddr p))
+                 (set! dialed (cons name dialed)))))))
         peers)
       ;; a member removed from discovery (Redis entry expired/deleted, or
       ;; dropped from a static list) must actually lose its connector --
@@ -341,7 +358,7 @@
       (for-each
         (lambda (nm) (unless (memq nm desired) (node-disconnect! nm)))
         connected)
-      desired))
+      dialed))
 
   (define (cluster-loop discover interval-ms)
     (let loop ((connected '()))

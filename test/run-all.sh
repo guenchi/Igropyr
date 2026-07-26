@@ -48,6 +48,8 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/stream-backpressure.sc
 # static/send-file! hardening (dotfiles, NUL, root) and HEAD framing
 "$scheme_bin" --script igropyr/test/serving-hardening.sc
+# cookie attribute injection, HTTP/1.0 framing, slowloris deadline
+"$scheme_bin" --script igropyr/test/protocol-hardening.sc
 "$scheme_bin" --script igropyr/test/http-client-stream.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc

@@ -174,10 +174,27 @@
             (put-char p #\})
             (get)))))
 
+  ;; Guarded like every other shared-global mutation in the tree
+  ;; (actor.sc's registry, dpool's counters): scheduling is preemptive at
+  ;; Chez safe points, so an unguarded read-modify-write here can be
+  ;; preempted mid-rehash by another request process and corrupt the table
+  ;; -- which then raises inside whatever handler calls metrics-count!
+  ;; next.
+  ;;
+  ;; Bounded, too. The cache is keyed on the label alist INCLUDING values,
+  ;; so an app that labels with request-derived data (a user id, a path)
+  ;; would grow it without end. The cap only sheds the memo -- the metric
+  ;; itself is unaffected, the string is simply rebuilt next time -- so
+  ;; losing an entry costs work, never correctness.
+  (define max-label-cache 4096)
+
   (define (label-string labels)
-    (or (hashtable-ref label-cache labels #f)
+    (or (with-interrupts-disabled (hashtable-ref label-cache labels #f))
         (let ((s (build-label-string labels)))
-          (hashtable-set! label-cache labels s)
+          (with-interrupts-disabled
+            (when (fx>= (hashtable-size label-cache) max-label-cache)
+              (hashtable-clear! label-cache))
+            (hashtable-set! label-cache labels s))
           s)))
 
   ;; count a business event: name is the Prometheus family, labels an
