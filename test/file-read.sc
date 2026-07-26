@@ -23,6 +23,11 @@
   (for-each (lambda (p) (when (file-exists? p) (delete-file p)))
             (list empty-path large-path append-path missing-path)))
 
+(define (bytevector-copy-part bv from to)
+  (let ((r (make-bytevector (- to from))))
+    (bytevector-copy! bv from r 0 (- to from))
+    r))
+
 (define (pattern-bytes n seed)
   (let ((bv (make-bytevector n)))
     (do ((i 0 (+ i 1))) ((= i (bytevector-length bv)) bv)
@@ -62,15 +67,34 @@
       (fail "large file content mismatch"))
     (expect-file-error missing-path "missing-file")
     (expect-file-error "/dev/zero" "non-regular file")
+    ;; A file that GROWS while it is being read must still yield a
+    ;; consistent snapshot: the read is sized by one fstat, so it returns
+    ;; either the size seen then or -- if the append landed before that
+    ;; fstat -- the larger one, but never a torn mixture and never more
+    ;; than was actually written.
+    ;;
+    ;; Which of the two sizes comes back is a race with libuv's thread
+    ;; pool, so it is NOT asserted: an earlier version slept 10 ms and
+    ;; demanded the smaller size, which held on an idle machine and failed
+    ;; on FreeBSD under the full suite's load, where the fstat had not run
+    ;; yet. What matters, and what is checked, is that the bytes are a
+    ;; prefix of what the file legitimately held.
     (file-read-async! append-path self)
     (sleep-ms 10)
     (append-bytes append-path append-extra)
     (receive (after 5000 (fail "append-during-read timeout"))
       (`#(file-read ,bv)
-        (unless (= (bytevector-length bv) (bytevector-length append-base))
-          (fail "append-during-read length changed"))
-        (unless (equal? bv append-base)
-          (fail "append-during-read content changed")))
+        (let ((n (bytevector-length bv))
+              (base-n (bytevector-length append-base))
+              (full-n (+ (bytevector-length append-base)
+                         (bytevector-length append-extra))))
+          (unless (or (= n base-n) (= n full-n))
+            (fail "append-during-read size is neither snapshot"))
+          (unless (equal? (bytevector-copy-part bv 0 base-n) append-base)
+            (fail "append-during-read content changed"))
+          (when (= n full-n)
+            (unless (equal? (bytevector-copy-part bv base-n full-n) append-extra)
+              (fail "append-during-read tail mismatched")))))
       (`#(file-error ,e)
         (fail "append-during-read unexpectedly failed")))
     (cleanup)
