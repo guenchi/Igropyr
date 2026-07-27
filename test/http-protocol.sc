@@ -1,6 +1,6 @@
 #!chezscheme
 (import (chezscheme) (igropyr util) (igropyr actor) (igropyr libuv)
-        (igropyr http))
+        (igropyr http) (only (igropyr express) req-form))
 
 (define port 18080)
 (define empty-bv (make-bytevector 0))
@@ -82,6 +82,12 @@
         (error 'http-protocol label "missing response body" response)))
     (display label) (display " ok\n")))
 
+(define (multipart-request boundary body)
+  (string-append
+    "POST /form HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary="
+    boundary "\r\nContent-Length: " (number->string (string-length body))
+    "\r\nConnection: close\r\n\r\n" body))
+
 (define (expect-pipelined-empty-trailer)
   (let* ((body (make-string 9000 #\b))
          (response
@@ -100,10 +106,14 @@
 
 (define (handler req res)
   (set-header! res "Content-Type" "text/plain")
-  (if (string=? (req-path req) "/query")
-      (let ((p (assoc "token" (req-query req))))
-        (res-send! res (string->utf8 (if p (cdr p) "missing"))))
-      (res-send! res (req-body req))))
+  (cond
+    ((string=? (req-path req) "/query")
+     (let ((p (assoc "token" (req-query req))))
+       (res-send! res (string->utf8 (if p (cdr p) "missing")))))
+    ((string=? (req-path req) "/form")
+     (let ((role (assoc "role" (req-form req))))
+       (res-send! res (string->utf8 (if role (cdr role) "safe")))))
+    (else (res-send! res (req-body req)))))
 
 (start-scheduler
   (lambda ()
@@ -188,6 +198,23 @@
       '("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         "3\r" "\nab" "c\r\n" "3\r\ndef\r\n" "0\r\n" "\r\n")
       "200" "abcdef")
+    ;; Boundary-looking bytes inside a file are data, not a new field.
+    (let* ((b "AaB03x")
+           (body (string-append
+                   "--" b "\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"x\"\r\n"
+                   "Content-Type: text/plain\r\n\r\n"
+                   "hello--" b "\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nadmin\r\n"
+                   "--" b "--\r\n")))
+      (expect "multipart delimiter anchoring"
+        (multipart-request b body) "200" "safe"))
+    (expect "multipart boundary length cap"
+      (multipart-request (make-string 71 #\a) "ignored") "200" "safe")
+    (let* ((b "Aa B")
+           (body (string-append
+                   "--" b "\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nuser\r\n"
+                   "--" b "--\r\n")))
+      (expect "quoted multipart boundary"
+        (multipart-request (string-append "\"" b "\"") body) "200" "user"))
     ;; ---- configurable body-limit -----------------------------------
     ;; PROCESS-GLOBAL (last http-listen wins), so these run LAST: the
     ;; second listen lowers the limit for every server in this process.
