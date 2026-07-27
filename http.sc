@@ -1006,6 +1006,10 @@
 
   ;; ---- chunked transfer-encoding (request side) ----------------------------------
 
+  (define chunk-line-limit 4096)
+  (define chunk-count-limit 16384)
+  (define chunk-overhead-limit 65536)
+
   ;; hex chunk size, stopping at ';' (chunk extensions); #f if malformed.
   ;; The size value keeps GENERIC arithmetic on purpose: an absurd hex
   ;; size must overflow into a bignum and be rejected by the body-limit
@@ -1074,50 +1078,55 @@
       (define (u8 i) (bytevector-u8-ref bv (fx+ base i)))
       (let loop ((pos (if st (vector-ref st 0) body-start))
                  (chunks (if st (vector-ref st 1) '()))
-                 (len (if st (vector-ref st 2) 0)))
+                 (len (if st (vector-ref st 2) 0))
+                 (count (if st (vector-ref st 3) 0)))
         (let ((eol (crlf-at pos)))
-          (if (not eol)
-              (if (> (- blen pos) (+ body-limit 1024))
-                  (values 'too-large #f #f)
-                  (values 'more (vector pos chunks len) #f))
-              (let ((size (parse-chunk-size bv (fx+ base pos) (fx+ base eol))))
-                (cond
-                  ((not size) (values 'bad #f #f))
-                  ((> (+ len size) body-limit) (values 'too-large #f #f))
-                  ((= size 0)
-                   ;; Validate and cap optional trailers; a blank line ends
-                   ;; the body. Trailer fields are currently ignored. The
-                   ;; trailer block re-scans from here on each segment --
-                   ;; bounded by trailer-limit, so no quadratic exposure.
-                   (let ((trailer-start (+ eol 2)))
-                     (let scan ((p trailer-start))
-                       (let ((e2 (crlf-at p)))
-                         (cond
-                           ((not e2)
-                            (if (> (- blen trailer-start) trailer-limit)
-                                (values 'trailers-too-large #f #f)
-                                ;; resume at the zero-size line so the
-                                ;; trailer phase re-enters here
-                                (values 'more (vector pos chunks len) #f)))
-                           ((> (- (+ e2 2) trailer-start) trailer-limit)
-                            (values 'trailers-too-large #f #f))
-                           ((= e2 p)
-                            (values 'done (bv-concat (reverse chunks) len) (+ p 2)))
-                           ((valid-trailer-line? bv (fx+ base p) (fx+ base e2))
-                            (scan (+ e2 2)))
-                           (else (values 'bad #f #f)))))))
-                  (else
-                   (let ((dstart (+ eol 2)))
-                     (if (< blen (+ dstart size 2))
-                         (values 'more (vector pos chunks len) #f)
-                         (if (not (and (= (u8 (+ dstart size)) 13)
-                                       (= (u8 (+ dstart size 1)) 10)))
-                             (values 'bad #f #f)
-                             (loop (+ dstart size 2)
-                                   (cons (bv-sub bv (fx+ base dstart)
-                                                 (fx+ base (+ dstart size)))
-                                         chunks)
-                                   (+ len size)))))))))))))
+          (cond
+            ((> (- pos body-start) (+ body-limit chunk-overhead-limit))
+             (values 'too-large #f #f))
+            ((not eol)
+             (if (> (- blen pos) chunk-line-limit)
+                 (values 'too-large #f #f)
+                 (values 'more (vector pos chunks len count) #f)))
+            ((> (- eol pos) chunk-line-limit)
+             (values 'too-large #f #f))
+            (else
+             (let ((size (parse-chunk-size bv (fx+ base pos) (fx+ base eol))))
+               (cond
+                 ((not size) (values 'bad #f #f))
+                 ((> (+ len size) body-limit) (values 'too-large #f #f))
+                 ((= size 0)
+                  ;; Validate and cap optional trailers; a blank line ends
+                  ;; the body. Trailer fields are currently ignored.
+                  (let ((trailer-start (+ eol 2)))
+                    (let scan ((p trailer-start))
+                      (let ((e2 (crlf-at p)))
+                        (cond
+                          ((not e2)
+                           (if (> (- blen trailer-start) trailer-limit)
+                               (values 'trailers-too-large #f #f)
+                               (values 'more (vector pos chunks len count) #f)))
+                          ((> (- (+ e2 2) trailer-start) trailer-limit)
+                           (values 'trailers-too-large #f #f))
+                          ((= e2 p)
+                           (values 'done (bv-concat (reverse chunks) len) (+ p 2)))
+                          ((valid-trailer-line? bv (fx+ base p) (fx+ base e2))
+                           (scan (+ e2 2)))
+                          (else (values 'bad #f #f)))))))
+                 ((>= count chunk-count-limit) (values 'too-large #f #f))
+                 (else
+                  (let ((dstart (+ eol 2)))
+                    (if (< blen (+ dstart size 2))
+                        (values 'more (vector pos chunks len count) #f)
+                        (if (not (and (= (u8 (+ dstart size)) 13)
+                                      (= (u8 (+ dstart size 1)) 10)))
+                            (values 'bad #f #f)
+                            (loop (+ dstart size 2)
+                                  (cons (bv-sub bv (fx+ base dstart)
+                                                (fx+ base (+ dstart size)))
+                                        chunks)
+                                  (+ len size)
+                                  (+ count 1))))))))))))))
 
   ;; ---- reader process ----------------------------------------------------------
 

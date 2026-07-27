@@ -82,6 +82,12 @@
         (error 'http-protocol label "missing response body" response)))
     (display label) (display " ok\n")))
 
+(define (many-chunks n)
+  (let-values (((p get) (open-string-output-port)))
+    (do ((i 0 (+ i 1))) ((= i n)) (display "1\r\na\r\n" p))
+    (display "0\r\n\r\n" p)
+    (get)))
+
 (define (expect-pipelined-empty-trailer)
   (let* ((body (make-string 9000 #\b))
          (response
@@ -188,6 +194,17 @@
       '("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         "3\r" "\nab" "c\r\n" "3\r\ndef\r\n" "0\r\n" "\r\n")
       "200" "abcdef")
+    ;; Tiny decoded payloads cannot hide unbounded chunk metadata/count.
+    (expect "chunk count limit"
+      (string-append
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        (many-chunks 16385))
+      "413")
+    (expect "chunk-size line limit"
+      (string-append
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        "1;" (make-string 4096 #\a) "\r\nx\r\n0\r\n\r\n")
+      "413")
     ;; ---- configurable body-limit -----------------------------------
     ;; PROCESS-GLOBAL (last http-listen wins), so these run LAST: the
     ;; second listen lowers the limit for every server in this process.
