@@ -7,6 +7,7 @@
 
 (import (chezscheme) (igropyr http) (igropyr express) (igropyr session)
         (igropyr auth) (igropyr jwt) (igropyr ws-client)
+        (only (igropyr websocket) ws-conn)
         (igropyr json) (igropyr sexpr) (igropyr libuv))
 
 (define port 18088)
@@ -85,6 +86,14 @@
                (substring resp (+ at 4) j)
                (scan (+ j 1)))))))
 
+(define (zero-fragment-attack)
+  (let* ((frames (+ 1 16384))
+         (out (make-bytevector (* frames 6) 0)))
+    (do ((i 0 (+ i 1))) ((= i frames) out)
+      ;; First frame: non-final text; the rest: non-final continuations.
+      (bytevector-u8-set! out (* i 6) (if (= i 0) #x01 #x00))
+      (bytevector-u8-set! out (+ (* i 6) 1) #x80))))
+
 ;; read one text message from a ws session, then close
 (define (recv-text-and-close w)
   (let ((m (ws-recv w)))
@@ -110,6 +119,8 @@
   (lambda (ws req)
     (ws-send-text! ws "open")
     (ws-recv ws)))
+
+(app-ws app "/sink" (lambda (ws req) (ws-recv ws)))
 
 ;; token-guarded: claims are the verified JWT claims (string keys)
 (app-ws app "/chat"
@@ -160,6 +171,13 @@
       (equal? (recv-text-and-close
                 (ws-connect "ws://127.0.0.1:18088/open"))
               "open"))
+    ;; Zero-length fragments consume list cells even though message bytes
+    ;; stay at zero. The server must cap their count and close the session.
+    (let ((w (ws-connect "ws://127.0.0.1:18088/sink")))
+      (tcp-write! (ws-conn w) (zero-fragment-attack) #f)
+      (check "ws-zero-fragment-limit"
+        (let ((m (ws-recv w)))
+          (and (vector? m) (eq? (vector-ref m 0) 'close)))))
 
     ;; token guard: header credential
     (check "ws-token-header"
