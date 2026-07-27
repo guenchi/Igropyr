@@ -220,16 +220,18 @@
   ;; -> datum ; raises 'closed / 'timeout / 'protocol /
   ;; the sexpr-error vector on a malformed datum
   (define (read-frame c buf timeout limit)
-    (let ((d (parse-frame buf limit)))
-      (if (eq? d incomplete)
-          (receive (after timeout (raise 'timeout))
-            (`#(tcp-data ,bv)
-              (inbuf-append! buf bv)
-              (read-frame c buf timeout limit))
-            (`#(tcp-eof) (raise 'closed))
-            (`#(tcp-error ,e) (raise 'closed))
-            (`#(node-stop) (raise 'stop)))
-          d)))
+    (let ((deadline (+ (now-ms) timeout)))
+      (let loop ()
+        (let ((d (parse-frame buf limit)))
+          (if (eq? d incomplete)
+              (let ((remaining (- deadline (now-ms))))
+                (when (<= remaining 0) (raise 'timeout))
+                (receive (after remaining (raise 'timeout))
+                  (`#(tcp-data ,bv) (inbuf-append! buf bv) (loop))
+                  (`#(tcp-eof) (raise 'closed))
+                  (`#(tcp-error ,e) (raise 'closed))
+                  (`#(node-stop) (raise 'stop))))
+              d)))))
 
   ;; ---- HMAC-SHA256 handshake proofs --------------------------------------
   ;; hmac-sha256 and bytevector->hex come from (igropyr crypto).
