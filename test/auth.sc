@@ -99,9 +99,15 @@
 (define app (create-app))
 (app-use app (session-middleware store))
 
-;; HTTP login: writes the user into the session, cookie comes back
+;; Establish anonymous state, then rotate the identifier at login.
+(app-get app "/seed"
+  (lambda (req res)
+    (session-set! (req-session req) 'preauth "kept")
+    (send-text! res "ok")))
+
 (app-get app "/login"
   (lambda (req res)
+    (session-regenerate! (req-session req))
     (session-set! (req-session req) 'user "ada")
     (send-text! res "ok")))
 
@@ -188,6 +194,26 @@
     ;; unknown ws route stays 404 (reject is 401, not-found is not)
     (check "ws-unknown-404"
       (equal? (status-of (upgrade-req "/nope")) "404"))
+
+    ;; An established anonymous id is invalidated and replaced at the
+    ;; authentication boundary; its data is carried to the new id.
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (old (extract-sid seed))
+           (login (and old (http-req
+                     (string-append
+                       "GET /login HTTP/1.1\r\nHost: x\r\nCookie: sid=" old
+                       "\r\nConnection: close\r\n\r\n"))))
+           (fresh (and login (extract-sid login))))
+      (check "session-login-rotates-id"
+        (and old fresh (not (string=? old fresh))))
+      (sleep-ms 100)
+      (check "session-login-drops-old-id"
+        (and old (not (session-peek store old))))
+      (check "session-login-keeps-state"
+        (let ((data (and fresh (session-peek store fresh))))
+          (and data (equal? (cdr (assq 'preauth data)) "kept")
+               (equal? (cdr (assq 'user data)) "ada")))))
 
     ;; session guard: log in over HTTP, ride the cookie into the upgrade
     (let* ((login (http-req "GET /login HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))

@@ -810,6 +810,15 @@ order matters (outermost first).
            (n (+ 1 (or (session-get s 'visits) 0))))
       (session-set! s 'visits n)             ; persisted automatically
       (send-json! res (list (cons 'visits n))))))
+
+;; Rotate an established anonymous id when authentication/privilege changes.
+(app-post app "/login"
+  (lambda (req res)
+    ;; ...verify the submitted credential first...
+    (let ((s (req-session req)))
+      (session-regenerate! s)                 ; prevents session fixation
+      (session-set! s 'user "alice")
+      (send-json! res '((ok . #t))))))
 ```
 
 Middleware can also stash arbitrary values on the request for later
