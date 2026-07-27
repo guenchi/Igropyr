@@ -26,6 +26,7 @@
 (start-scheduler
   (lambda ()
     (node-start! 'a secret port)
+    (node-set-limits! 64 2)
     (start-pubsub!)
     (register 'main self)
     (monitor-node 'b)
@@ -106,6 +107,18 @@
       (`#(heard ,m)
         (unless (equal? m "cross-node-hello") (fail! "dist-pubsub-payload" m))))
     (display "distributed pubsub fan-out ok\n")
+
+    ;; Remote monitor state is owned by its caller. Short-lived callers
+    ;; must release target-side slots instead of leaving permanent watches.
+    (do ((i 0 (+ i 1))) ((= i 2))
+      (spawn (lambda () (monitor-remote 'b 'svc))))
+    (sleep-ms 600)
+    (let ((m (monitor-remote 'b 'svc)))
+      (receive (after 400 'ok)
+        (`#(remote-down b svc overload)
+          (fail! "dead-monitor-callers-leaked-slots")))
+      (demonitor-remote m))
+    (display "dead monitor callers release remote slots ok\n")
 
     ;; monitor-remote: watch b's 'watched process, kill it, observe the
     ;; real exit reason cross the wire

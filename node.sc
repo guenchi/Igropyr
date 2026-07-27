@@ -94,6 +94,7 @@
   ;;   rmonitors: mref -> #(caller node name)   (for demonitor + the
   ;;              noconnection synthesized when the link to node drops)
   ;;   caller-agents: mref -> agent pid         (self-watch only)
+  ;;   owner-agents: mref -> agent pid          (cleans up when caller dies)
   ;; On the TARGET node:
   ;;   callee-agents: (peer . mref) -> agent pid  (one local monitor per
   ;;              remote watch; killed on demon). Keyed by (peer . mref)
@@ -101,6 +102,7 @@
   ;;              two watchers collide on it -- the pair namespaces them.
   (define rmonitors (make-eqv-hashtable))
   (define caller-agents (make-eqv-hashtable))
+  (define owner-agents (make-eqv-hashtable))
   (define callee-agents (make-hashtable equal-hash equal?))
   (define mref-counter 0)
   (define (next-mref!)
@@ -430,6 +432,48 @@
                 (demonitor m)
                 (atomically (hashtable-delete! callee-agents key))))))))
 
+  (define (stop-owner-agent! mref)
+    (let ((agent (atomically
+                   (let ((a (hashtable-ref owner-agents mref #f)))
+                     (when a (hashtable-delete! owner-agents mref))
+                     a))))
+      (when (and agent (process-alive? agent))
+        (send agent (vector 'owner-stop)))))
+
+  (define (remove-target-watch! mref entry)
+    (let ((node (vector-ref entry 1)))
+      (if (eq? node self-name)
+          (let ((agent (atomically
+                         (let ((a (hashtable-ref caller-agents mref #f)))
+                           (when a (hashtable-delete! caller-agents mref))
+                           a))))
+            (when (and agent (process-alive? agent))
+              (send agent (vector 'demon-local))))
+          (link-write node (list 'demon mref)))))
+
+  ;; One small local monitor ties the global/remote state to the process
+  ;; that requested it. Without this, rmonitors roots a dead pcb and the
+  ;; target node retains its monitor until the target or link dies.
+  (define (owner-mon-agent caller mref)
+    (let ((m (monitor caller)))
+      (receive
+        (`#(DOWN ,@caller ,_)
+          (atomically (hashtable-delete! owner-agents mref))
+          (let ((entry (atomically
+                         (let ((e (hashtable-ref rmonitors mref #f)))
+                           (when e (hashtable-delete! rmonitors mref))
+                           e))))
+            (when entry (remove-target-watch! mref entry))))
+        (`#(owner-stop) (demonitor m)))))
+
+  (define (install-owner-agent! caller mref)
+    ;; Publish the pid before it can run and observe an already-dead caller;
+    ;; otherwise that fast DOWN path could delete the not-yet-present entry
+    ;; and the installer would then leave a dead agent rooted forever.
+    (atomically
+      (let ((agent (spawn (lambda () (owner-mon-agent caller mref)))))
+        (hashtable-set! owner-agents mref agent))))
+
   ;; watcher side: deliver #(remote-down node name reason) to the caller
   ;; that installed mref, once. Used for both a target-side mdown and a
   ;; link drop (which synthesizes 'noconnection).
@@ -439,6 +483,7 @@
                      (when e (hashtable-delete! rmonitors mref))
                      e))))
       (when entry
+        (stop-owner-agent! mref)
         (send (vector-ref entry 0)
               (vector 'remote-down (vector-ref entry 1) (vector-ref entry 2)
                       reason)))))
@@ -699,10 +744,12 @@
         ((eq? node self-name)
          (atomically (hashtable-set! rmonitors mref (vector self node name)))
          (let ((agent (spawn (lambda () (self-mon-agent self mref name)))))
-           (atomically (hashtable-set! caller-agents mref agent))))
+           (atomically (hashtable-set! caller-agents mref agent)))
+         (install-owner-agent! self mref))
         ((live-entry node)
          => (lambda (e)
-              (atomically (hashtable-set! rmonitors mref (vector self node name)))
+               (atomically (hashtable-set! rmonitors mref (vector self node name)))
+               (install-owner-agent! self mref)
               ;; no origin field: the target derives the watcher from the
               ;; authenticated far end of this very link (see dispatch!)
               (write-frame! (vector-ref e 0) (list 'mon name mref))))
@@ -719,13 +766,7 @@
                      (when e (hashtable-delete! rmonitors mref))
                      e))))
       (when entry
-        (let ((node (vector-ref entry 1)))
-          (if (eq? node self-name)
-              (let ((agent (atomically
-                             (let ((a (hashtable-ref caller-agents mref #f)))
-                               (hashtable-delete! caller-agents mref) a))))
-                (when (and agent (process-alive? agent))
-                  (send agent (vector 'demon-local))))
-              (link-write node (list 'demon mref))))))
+        (stop-owner-agent! mref)
+        (remove-target-watch! mref entry)))
     (void))
 )
