@@ -209,19 +209,32 @@
 
   ;; first occurrence of needle in bv at or after `from`
   (define (bv-search bv needle from)
-    (let ((n (bytevector-length bv))
-          (m (bytevector-length needle)))
-      (let outer ((i from))
-        (cond
-          ((> (+ i m) n) #f)
-          ((let inner ((j 0))
-             (cond ((= j m) #t)
-                   ((fx= (bytevector-u8-ref bv (+ i j))
-                         (bytevector-u8-ref needle j))
-                    (inner (+ j 1)))
-                   (else #f)))
-           i)
-          (else (outer (+ i 1)))))))
+    ;; MIME boundaries are attacker-selected. KMP keeps repeated prefixes
+    ;; from turning a body-sized scan into quadratic CPU work.
+    (let* ((n (bytevector-length bv))
+           (m (bytevector-length needle))
+           (fallback (make-vector m 0)))
+      (when (> m 0)
+        (let build ((i 1) (j 0))
+          (when (< i m)
+            (cond
+              ((fx= (bytevector-u8-ref needle i)
+                    (bytevector-u8-ref needle j))
+               (vector-set! fallback i (+ j 1))
+               (build (+ i 1) (+ j 1)))
+              ((> j 0) (build i (vector-ref fallback (- j 1))))
+              (else (build (+ i 1) 0))))))
+      (if (= m 0)
+          (and (<= from n) from)
+          (let scan ((i from) (j 0))
+            (cond
+              ((>= i n) #f)
+              ((fx= (bytevector-u8-ref bv i) (bytevector-u8-ref needle j))
+               (if (= (+ j 1) m)
+                   (- (+ i 1) m)
+                   (scan (+ i 1) (+ j 1))))
+              ((> j 0) (scan i (vector-ref fallback (- j 1))))
+              (else (scan (+ i 1) 0)))))))
 
   ;; boundary=... from a Content-Type header (possibly quoted)
   (define (multipart-boundary ct)
