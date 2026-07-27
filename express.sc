@@ -465,7 +465,7 @@
   (define (stream-entry? e) (eq? (vector-ref e 0) 'stream))
   (define (large-entry? e) (eq? (vector-ref e 4) 'large))
 
-  (define (static-entry path)
+  (define (static-entry path root rel)
     (let ((cached (hashtable-ref static-cache path #f))
           (now (now-ms)))
       (if (and cached (< (- now (vector-ref cached 6)) stat-window-ms))
@@ -474,20 +474,24 @@
             (and mt
                  (if (and cached (= (vector-ref cached 0) mt))
                      (begin (vector-set! cached 6 now) cached)
-                     (open-entry path mt now)))))))
+                     (open-entry path mt now root rel)))))))
 
   ;; open with a timeout that can never leak the fd: the handle comes
   ;; back synchronously, so a timed-out open is closed via its handle
   ;; (the abort flag also suppresses any late ready message).
   ;; -> (values stream size) | (values #f #f)
-  (define (open-stream path)
-    (let ((st (file-stream-open! path self)))
-      (receive (after 30000 (begin (file-stream-close! st) (values #f #f)))
-        (`#(file-stream ,@st ,size) (values st size))
-        (`#(file-error ,e) (values #f #f)))))
+  (define (open-stream path root rel)
+    (let ((st (if root
+                  (file-stream-open-under! root rel self)
+                  (file-stream-open! path self))))
+      (if (not st)
+          (values #f #f)
+          (receive (after 30000 (begin (file-stream-close! st) (values #f #f)))
+            (`#(file-stream ,@st ,size) (values st size))
+            (`#(file-error ,e) (values #f #f))))))
 
-  (define (open-entry path mt now)
-    (let-values (((st size) (open-stream path)))
+  (define (open-entry path mt now root rel)
+    (let-values (((st size) (open-stream path root rel)))
       (and st
            (if (<= size max-cache-file)
                (let ((body (stream-read-all st size)))
@@ -536,8 +540,8 @@
   ;; window-hit download of a large (metadata-cached) file: open a
   ;; fresh stream on demand. Content-Length comes from the live fstat;
   ;; etag/ctype from the metadata (<= 1s stale, like every window hit).
-  (define (serve-large! r ctype path)
-    (let-values (((st size) (open-stream path)))
+  (define (serve-large! r ctype path root rel)
+    (let-values (((st size) (open-stream path root rel)))
       (if st
           (stream-file! r st size ctype)
           (begin (set-status! r 404) (send-text! r "Not Found")))))
@@ -567,12 +571,13 @@
              (else path))))
       (if (not resolved)
           (begin (set-status! r 403) (send-text! r "Forbidden"))
-          (let ((e (static-entry resolved)))
+          (let ((e (static-entry resolved root (and root path))))
             (cond
               ((not e) (set-status! r 404) (send-text! r "Not Found"))
               ((stream-entry? e)
                (stream-file! r (vector-ref e 1) (vector-ref e 2) (vector-ref e 4)))
-              ((large-entry? e) (serve-large! r (vector-ref e 3) resolved))
+              ((large-entry? e)
+               (serve-large! r (vector-ref e 3) resolved root (and root path)))
               (else (finish! r (vector-ref e 3) (vector-ref e 4))))))))
 
   (define (send-file! r path . rest)
@@ -592,10 +597,10 @@
   (define (gzip-etag etag)
     (string-append (substring etag 0 (- (string-length etag) 1)) "-gz\""))
 
-  (define (serve-static! r req abs-path)
+  (define (serve-static! r req abs-path root rel)
     (if (path-has-dotdot? abs-path)
         (begin (set-status! r 403) (send-text! r "Forbidden"))
-        (let ((e (static-entry abs-path)))
+        (let ((e (static-entry abs-path root rel)))
           (cond
             ((not e)
              (set-status! r 404) (send-text! r "Not Found"))
@@ -625,7 +630,7 @@
                    (begin
                      (set-status! r 304)
                      (res-send! r (make-bytevector 0)))
-                   (serve-large! r ctype abs-path))))
+                   (serve-large! r ctype abs-path root rel))))
             (else
              (let* ((size (vector-ref e 1))
                      (etag (vector-ref e 2))
@@ -980,11 +985,9 @@
         (else #f))))                                ; e.g. "/assets-private"
 
   ;; Resolve a URL-relative name under root without letting it escape.
-  ;; Chez has no portable realpath, so reject any symbolic link in the
-  ;; untrusted part of the path (stricter than following the link and
-  ;; comparing platform-specific canonical spellings) -- this blocks
-  ;; symlink-based escapes as well as ".." and NUL. Returns the safe
-  ;; absolute path or #f.
+  ;; Lexically validate the untrusted path. The subsequent file open walks
+  ;; these components from a stable root directory fd with O_NOFOLLOW;
+  ;; pathname checks alone would be vulnerable to a symlink swap race.
   ;; A segment starting with "." is refused: mounting a project directory
   ;; otherwise serves .env, .git/config and friends -- with a public
   ;; Cache-Control, so an intermediary keeps handing them out. ".well-known"
@@ -1006,9 +1009,7 @@
               (loop base (cdr parts)))
              ((dotfile-segment? (car parts)) #f)
              (else
-              (let ((next (string-append base "/" (car parts))))
-                (and (not (guard (e (#t #t)) (file-symbolic-link? next)))
-                     (loop next (cdr parts)))))))))
+              (loop (string-append base "/" (car parts)) (cdr parts)))))))
 
   (define (try-static a req r)
     (and (eq? (routing-method req) 'GET)
@@ -1019,10 +1020,10 @@
                     (path (and rel (safe-static-path root rel))))
                (and rel
                     (begin
-                      ;; safe-static-path rejects "..", NUL, and symlink
-                      ;; escapes; serve-static! then caches + answers 304
+                      ;; safe-static-path rejects ".." and NUL; the openat
+                      ;; walk rejects symlink escapes before serving/cache.
                       (if path
-                          (serve-static! r req path)
+                          (serve-static! r req path root rel)
                           (begin (set-status! r 403) (send-text! r "Forbidden")))
                       #t))))
            (app-statics a))))

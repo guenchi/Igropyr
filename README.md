@@ -241,7 +241,8 @@ demand:
 ;; chunks with backpressure -- each chunk is read from disk only after
 ;; the previous one drained to the client, so a 10 GB download to a
 ;; slow peer costs one chunk of memory, and the pool worker is released
-;; immediately (the pump runs in its own process).
+;; immediately (the pump runs in its own process). Path components are
+;; opened atomically beneath the root without following symlinks.
 (app-static app "/assets" "./public")
 
 ;; enter the scheduler and listen; never returns
