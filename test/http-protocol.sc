@@ -100,10 +100,17 @@
 
 (define (handler req res)
   (set-header! res "Content-Type" "text/plain")
-  (if (string=? (req-path req) "/query")
-      (let ((p (assoc "token" (req-query req))))
-        (res-send! res (string->utf8 (if p (cdr p) "missing"))))
-      (res-send! res (req-body req))))
+  (cond
+    ((string=? (req-path req) "/query")
+     (let ((p (assoc "token" (req-query req))))
+       (res-send! res (string->utf8 (if p (cdr p) "missing")))))
+    ((string=? (req-path req) "/status204")
+     (set-status! res 204)
+     (res-send! res (string->utf8 "forbidden-body-204")))
+    ((string=? (req-path req) "/status304")
+     (set-status! res 304)
+     (res-send! res (string->utf8 "forbidden-body-304")))
+    (else (res-send! res (req-body req)))))
 
 (start-scheduler
   (lambda ()
@@ -188,6 +195,20 @@
       '("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         "3\r" "\nab" "c\r\n" "3\r\ndef\r\n" "0\r\n" "\r\n")
       "200" "abcdef")
+    ;; Handler-provided bytes are suppressed for bodyless status codes.
+    (let ((r (raw-request
+               "GET /status204 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
+      (unless (and (string-contains? r "HTTP/1.1 204 ")
+                   (not (string-contains? r "forbidden-body-204"))
+                   (not (string-contains? r "Content-Length:")))
+        (error 'http-protocol "204 response carried a body/framing" r))
+      (display "204 body suppression ok\n"))
+    (let ((r (raw-request
+               "GET /status304 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
+      (unless (and (string-contains? r "HTTP/1.1 304 ")
+                   (not (string-contains? r "forbidden-body-304")))
+        (error 'http-protocol "304 response carried a body" r))
+      (display "304 body suppression ok\n"))
     ;; ---- configurable body-limit -----------------------------------
     ;; PROCESS-GLOBAL (last http-listen wins), so these run LAST: the
     ;; second listen lowers the limit for every server in this process.

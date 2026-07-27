@@ -635,6 +635,13 @@
   (define keep-alive-tail "\r\nConnection: keep-alive\r\n\r\n")
   (define close-tail "\r\nConnection: close\r\n\r\n")
 
+  (define (status-forbids-body? status)
+    (or (and (fx>= status 100) (fx< status 200))
+        (fx= status 204) (fx= status 304)))
+
+  (define (status-forbids-length? status)
+    (or (and (fx>= status 100) (fx< status 200)) (fx= status 204)))
+
   ;; Write a full response, guarded by the request's token. The libuv
   ;; write callback (no yielding) tells the reader to continue
   ;; (keep-alive) or closes the connection.
@@ -658,13 +665,17 @@
     ;; gone. The streaming writers guard on conn-state for the same
     ;; reason; this is the one path that did not.
     (when (and (eq? (conn-state c) 'open) (claim! token))
-      (let* ((head
-              (assemble-head status headers
-                "Content-Length: "
-                (number->string (if (integer? head-only)
-                                    head-only
-                                    (bytevector-length body)))
-                (if ka keep-alive-tail close-tail)))
+      (let* ((suppress-body? (or head-only (status-forbids-body? status)))
+             (head
+              (if (status-forbids-length? status)
+                  (assemble-head status headers
+                    (if ka keep-alive-tail close-tail))
+                  (assemble-head status headers
+                    "Content-Length: "
+                    (number->string (if (integer? head-only)
+                                        head-only
+                                        (bytevector-length body)))
+                    (if ka keep-alive-tail close-tail))))
              (owner (conn-owner c))
              (done (lambda (st)
                      (if (and ka (>= st 0))
@@ -673,7 +684,7 @@
                            (tcp-close! c)
                            (send owner (vector 'conn-closed)))))))
         ;; head and body are written as two segments -- no bv-append copy
-        (if head-only
+        (if suppress-body?
             (tcp-writev! c (list (string->utf8 head)) done)
             (tcp-writev! c (list (string->utf8 head) body) done)))))
 
@@ -752,18 +763,23 @@
 
   (define (res-begin! r)
     (let ((c (res-conn r)))
-      (when (and (eq? (conn-state c) 'open) (claim! (res-token r)))
-        (let ((raw? (res-http10? r)))
-          (res-mode-set! r (if raw? 'streaming-raw 'streaming))
-          (tcp-write! c
-            (string->utf8
-              (assemble-head (res-status r) (res-headers r)
-                (cond
-                  (raw? close-delimited-tail)
-                  ((res-keep-alive? r) chunked-keep-alive-tail)
-                  (else chunked-close-tail))))
-            #f))
-        (send (conn-owner c) (vector 'streaming)))))
+      (if (status-forbids-body? (res-status r))
+          (begin
+            (res-mode-set! r 'done)
+            (send-response!* c (res-token r) (res-status r) (res-headers r)
+                             empty-bv (res-keep-alive? r) #t))
+          (when (and (eq? (conn-state c) 'open) (claim! (res-token r)))
+            (let ((raw? (res-http10? r)))
+              (res-mode-set! r (if raw? 'streaming-raw 'streaming))
+              (tcp-write! c
+                (string->utf8
+                  (assemble-head (res-status r) (res-headers r)
+                    (cond
+                      (raw? close-delimited-tail)
+                      ((res-keep-alive? r) chunked-keep-alive-tail)
+                      (else chunked-close-tail))))
+                #f))
+            (send (conn-owner c) (vector 'streaming))))))
 
   ;; Write one chunk (string or bytevector). #f when the stream is not
   ;; open any more (e.g. the client disconnected) -- stop the loop then.
@@ -849,16 +865,21 @@
   ;; occupy a worker or it would be killed as stuck.
   (define (res-begin-file! r len)
     (let ((c (res-conn r)))
-      (when (claim! (res-token r))
-        (res-mode-set! r 'raw)
-        (res-remaining-set! r len)
-        (tcp-write! c
-          (string->utf8
-            (assemble-head (res-status r) (res-headers r)
-              "Content-Length: " (number->string len)
-              (if (res-keep-alive? r) keep-alive-tail close-tail)))
-          #f)
-        (send (conn-owner c) (vector 'streaming)))))
+      (if (status-forbids-body? (res-status r))
+          (begin
+            (res-mode-set! r 'done)
+            (send-response!* c (res-token r) (res-status r) (res-headers r)
+                             empty-bv (res-keep-alive? r) len))
+          (when (claim! (res-token r))
+            (res-mode-set! r 'raw)
+            (res-remaining-set! r len)
+            (tcp-write! c
+              (string->utf8
+                (assemble-head (res-status r) (res-headers r)
+                  "Content-Length: " (number->string len)
+                  (if (res-keep-alive? r) keep-alive-tail close-tail)))
+              #f)
+            (send (conn-owner c) (vector 'streaming))))))
 
   ;; Write one chunk and wait for it to drain before returning --
   ;; backpressure: the producer runs exactly at the client's pace, one
