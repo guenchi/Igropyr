@@ -161,6 +161,29 @@
                 (ws-connect "ws://127.0.0.1:18088/open"))
               "open"))
 
+    ;; The HTTP upgrade path validates every RFC 6455 handshake invariant
+    ;; before transferring ownership to a WebSocket session.
+    (check "ws-handshake-method"
+      (equal? (status-of (http-req
+        "POST /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-http-version"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.0\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-connection-token"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-version-13"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 12\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-key-length"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: YQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+
     ;; token guard: header credential
     (check "ws-token-header"
       (equal? (recv-text-and-close
