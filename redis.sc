@@ -26,6 +26,13 @@
 
   (define connect-timeout-ms 5000)
   (define reply-timeout-ms 30000)
+  (define max-reply-bytes (* 16 1024 1024))
+  (define max-array-elements 65536)
+  (define max-reply-items 65536)
+  (define max-reply-depth 64)
+  (define max-resp-line 1024)
+  ;; A legal max-sized bulk also carries its length line and trailing CRLF.
+  (define max-reply-buffer (+ max-reply-bytes max-resp-line 16))
 
   ;; ---- bytevector helpers ---------------------------------------------
 
@@ -113,55 +120,80 @@
       (get)))
 
   ;; ---- RESP parsing ---------------------------------------------------------
-  ;; (parse-reply buf pos) -> (values value next-pos) or (values 'more #f).
-  ;; The symbol 'more cannot collide with real replies (strings, numbers,
-  ;; lists, #f, or #(redis-error msg)).
+  ;; The parser returns 'more for incomplete input or a fatal marker for a
+  ;; malformed/oversized reply. Counts are per top-level reply and prevent
+  ;; shallow arrays from bypassing the nesting ceiling.
+  (define (protocol-fatal msg) (vector 'redis-protocol-fatal msg))
+  (define (protocol-fatal? v)
+    (and (vector? v) (eq? (vector-ref v 0) 'redis-protocol-fatal)))
 
-  (define (parse-reply buf pos)
-    (if (>= pos (bytevector-length buf))
-        (values 'more #f)
-        (let ((eol (find-crlf buf (+ pos 1))))
-          (if (not eol)
-              (values 'more #f)
-              (let ((line (utf8->string (bv-sub buf (+ pos 1) eol)))
-                    (next (+ eol 2)))
-                (case (integer->char (bytevector-u8-ref buf pos))
-                  ((#\+) (values line next))
-                  ((#\-) (values (vector 'redis-error line) next))
-                  ((#\:) (values (string->number line) next))
-                  ((#\$)
-                   (let ((n (string->number line)))
-                     (cond
-                       ((not n) (values (vector 'redis-error "bad bulk length") next))
-                       ((< n 0) (values #f next))          ; nil
-                       ((< (bytevector-length buf) (+ next n 2))
-                        (values 'more #f))
-                       ((not (and (= (bytevector-u8-ref buf (+ next n)) 13)
-                                  (= (bytevector-u8-ref buf (+ next n 1)) 10)))
-                        (values (vector 'redis-error "bad bulk terminator")
-                                (+ next n 2)))
-                       (else
-                        ;; RESP bulk strings are binary-safe: keep the
-                        ;; convenient string for valid UTF-8, but return
-                        ;; raw bytes otherwise (Chez would substitute
-                        ;; U+FFFD, corrupting binary values)
-                        (let ((raw (bv-sub buf next (+ next n))))
-                          (values (if (valid-utf8? raw) (utf8->string raw) raw)
-                                  (+ next n 2)))))))
-                  ((#\*)
-                   (let ((n (string->number line)))
-                     (cond
-                       ((not n) (values (vector 'redis-error "bad array length") next))
-                       ((< n 0) (values #f next))          ; nil array
-                       (else
-                        (let loop ((i 0) (p next) (acc '()))
-                          (if (= i n)
-                              (values (reverse acc) p)
-                              (let-values (((v np) (parse-reply buf p)))
-                                (if (eq? v 'more)
-                                    (values 'more #f)
-                                    (loop (+ i 1) np (cons v acc))))))))))
-                  (else (values (vector 'redis-error "bad reply type") next))))))))
+  (define (parse-reply buf pos depth count-box)
+    (cond
+      ((>= pos (bytevector-length buf)) (values 'more #f))
+      ((>= (unbox count-box) max-reply-items)
+       (values (protocol-fatal "reply has too many items") #f))
+      (else
+       (set-box! count-box (+ (unbox count-box) 1))
+       (let ((eol (find-crlf buf (+ pos 1))))
+         (cond
+           ((not eol)
+            (if (> (- (bytevector-length buf) pos) max-resp-line)
+                (values (protocol-fatal "reply line too long") #f)
+                (values 'more #f)))
+           ((> (- eol pos) max-resp-line)
+            (values (protocol-fatal "reply line too long") #f))
+           (else
+            (let ((line (utf8->string (bv-sub buf (+ pos 1) eol)))
+                  (next (+ eol 2)))
+              (case (integer->char (bytevector-u8-ref buf pos))
+                ((#\+) (values line next))
+                ((#\-) (values (vector 'redis-error line) next))
+                ((#\:)
+                 (let ((n (string->number line)))
+                   (if (and n (integer? n) (exact? n))
+                       (values n next)
+                       (values (protocol-fatal "bad integer reply") #f))))
+                ((#\$)
+                 (let ((n (string->number line)))
+                   (cond
+                     ((not (and n (integer? n) (exact? n)))
+                      (values (protocol-fatal "bad bulk length") #f))
+                     ((= n -1) (values #f next))
+                     ((< n 0) (values (protocol-fatal "bad bulk length") #f))
+                     ((> n max-reply-bytes)
+                      (values (protocol-fatal "bulk reply too large") #f))
+                     ((< (bytevector-length buf) (+ next n 2))
+                      (values 'more #f))
+                     ((not (and (= (bytevector-u8-ref buf (+ next n)) 13)
+                                (= (bytevector-u8-ref buf (+ next n 1)) 10)))
+                      (values (protocol-fatal "bad bulk terminator") #f))
+                     (else
+                      (let ((raw (bv-sub buf next (+ next n))))
+                        (values (if (valid-utf8? raw) (utf8->string raw) raw)
+                                (+ next n 2)))))))
+                ((#\*)
+                 (let ((n (string->number line)))
+                   (cond
+                     ((not (and n (integer? n) (exact? n)))
+                      (values (protocol-fatal "bad array length") #f))
+                     ((= n -1) (values #f next))
+                     ((or (< n 0) (> n max-array-elements))
+                      (values (protocol-fatal "array reply too large") #f))
+                     ((= n 0) (values '() next))
+                     ((>= depth max-reply-depth)
+                      (values (protocol-fatal "reply nesting too deep") #f))
+                     (else
+                      (let loop ((i 0) (p next) (acc '()))
+                        (if (= i n)
+                            (values (reverse acc) p)
+                            (let-values (((v np)
+                                          (parse-reply buf p (+ depth 1)
+                                                       count-box)))
+                              (cond
+                                ((eq? v 'more) (values 'more #f))
+                                ((protocol-fatal? v) (values v #f))
+                                (else (loop (+ i 1) np (cons v acc)))))))))))
+                (else (values (protocol-fatal "bad reply type") #f))))))))))
 
   ;; ---- connection process -----------------------------------------------------
 
@@ -197,15 +229,19 @@
           waiters)
         (conn-loop c buf waiters))
       (`#(tcp-data ,bv)
-        (let drain ((buf (bv-append buf bv)) (waiters waiters))
-          (let-values (((v next) (parse-reply buf 0)))
-            (if (eq? v 'more)
-                (conn-loop c buf waiters)
-                (begin
-                  (when (pair? waiters)
-                    (reply-to! (car waiters) v))
-                  (drain (bv-sub buf next (bytevector-length buf))
-                         (if (pair? waiters) (cdr waiters) '())))))))
+        (if (> (+ (bytevector-length buf) (bytevector-length bv))
+               max-reply-buffer)
+            (protocol-fail c waiters "reply exceeds size limit")
+            (let drain ((buf (bv-append buf bv)) (waiters waiters))
+              (let-values (((v next) (parse-reply buf 0 0 (box 0))))
+                (cond
+                  ((eq? v 'more) (conn-loop c buf waiters))
+                  ((protocol-fatal? v)
+                   (protocol-fail c waiters (vector-ref v 1)))
+                  (else
+                   (when (pair? waiters) (reply-to! (car waiters) v))
+                   (drain (bv-sub buf next (bytevector-length buf))
+                          (if (pair? waiters) (cdr waiters) '()))))))))
       (`#(redis-quit)
         (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
         (tcp-close! c))
@@ -223,6 +259,12 @@
     (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
     (tcp-close! c)
     (conn-loop c buf '()))
+
+  (define (protocol-fail c waiters msg)
+    (let ((e (vector 'redis-error (string-append "protocol error: " msg))))
+      (for-each (lambda (w) (reply-to! w e)) waiters)
+      (tcp-close! c)
+      (conn-loop c (make-bytevector 0) '())))
 
   ;; ---- public API ----------------------------------------------------------------
 
