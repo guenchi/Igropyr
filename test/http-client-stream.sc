@@ -82,6 +82,18 @@
 (app-get app "/never"
   (lambda (req res)
     (sse-start! res)))
+;; Keep resetting the connection actor's idle timer until after the
+;; caller-facing total deadline, then finish so a surviving child would
+;; leave a stale reply in the caller's mailbox.
+(app-get app "/late-finish"
+  (lambda (req res)
+    (sse-start! res)
+    (spawn
+      (lambda ()
+        (do ((i 0 (+ i 1))) ((= i 30))
+          (res-write! res "x")
+          (sleep-ms 100))
+        (res-end! res)))))
 ;; counted body, streamed by the client
 (app-get app "/big" (lambda (req res) (send-text! res big-body)))
 
@@ -285,6 +297,20 @@
                   (http-get (string-append "http://127.0.0.1:" (number->string port) "/never")
                             `((on-chunk . ,(lambda (bv) bv)) (timeout . 200)))))
               "response timeout"))
+    ;; Accumulating requests have a total deadline in addition to the
+    ;; connection actor's idle deadline. The timed-out actor must not later
+    ;; deliver a completed reply into the caller's mailbox.
+    (check "total-timeout"
+      (equal? (client-error-message
+                (lambda ()
+                  (http-get
+                    (string-append "http://127.0.0.1:"
+                                   (number->string port) "/late-finish")
+                    '((timeout . 200)))))
+              "request timeout"))
+    (check "total-timeout-kills-child"
+      (receive (after 1500 #t)
+        (`#(http-reply ,_ ,_) #f)))
     ;; a non-procedure on-chunk is rejected before any connection
     (check "bad-on-chunk-rejected"
       (equal? (client-error-message

@@ -615,6 +615,7 @@
             ;; bounded by the idle timeout (or, with idle 0, by its own
             ;; guards plus the monitor), so every path still answers.
             (receive (after (if on-chunk 'infinity (+ timeout 2000))
+                        (kill pid 'request-timeout)
                         (release!)
                         (raise (vector 'http-client-error "request timeout")))
               (`#(http-reply ,@ref ,resp) (release!) resp)
