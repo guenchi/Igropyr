@@ -15,15 +15,16 @@
 ;;; ws-recv answers pings automatically and handles fragmented messages.
 
 (library (igropyr websocket)
-  (export ws-accept-key
+  (export ws-accept-key ws-valid-client-key?
           make-ws make-ws-client ws? ws-conn
           ws-recv ws-send-text! ws-send-binary! ws-close!)
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv)
-          (only (igropyr crypto) sha1 base64-encode))
+          (only (igropyr crypto) sha1 base64-encode base64-decode))
 
   (define max-frame 1048576)          ; single frame payload cap
   (define max-message 8388608)        ; reassembled multi-frame message cap
+  (define max-fragments 16384)        ; bound per-frame allocation overhead
 
   ;; ---- bytevector helpers -------------------------------------------------
 
@@ -43,6 +44,10 @@
                 (loop (cdr l) (+ off (bytevector-length x)))))))))
 
   ;; SHA-1 + base64 for the RFC 6455 accept-key live in (igropyr crypto).
+  (define (ws-valid-client-key? key)
+    (and (string? key)
+         (guard (e (#t #f))
+           (fx= (bytevector-length (base64-decode key)) 16))))
 
   (define ws-guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
@@ -295,7 +300,7 @@
         (vector 'close)
         ;; op = opcode of the in-progress message (#f = none); size =
         ;; bytes accumulated so far
-        (let loop ((op #f) (parts '()) (size 0))
+        (let loop ((op #f) (parts '()) (size 0) (fragments 0))
           (let ((f (next-frame! w)))
             (if (not (vector? f))
                 (begin
@@ -309,8 +314,9 @@
                        (payload (vector-ref f 2))
                        (new-size (+ size (bytevector-length payload))))
                   (case fop
-                    ((9) (ws-send-frame! w 10 payload) (loop op parts size)) ; ping
-                    ((10) (loop op parts size))                              ; pong
+                    ((9) (ws-send-frame! w 10 payload)
+                         (loop op parts size fragments)) ; ping
+                    ((10) (loop op parts size fragments)) ; pong
                     ((8)
                      ;; RFC 6455 5.5.1 / 7.4: a close payload is either
                      ;; empty or a 2-byte status code (plus an optional
@@ -332,14 +338,16 @@
                     ((0)                                    ; continuation frame
                      (cond
                        ((not op) (ws-fail! w 1002) (vector 'close)) ; no message started
-                       ((> new-size max-message) (ws-fail! w 1009) (vector 'close))
+                       ((or (> new-size max-message) (>= fragments max-fragments))
+                        (ws-fail! w 1009) (vector 'close))
                        (else
-                        (let ((parts (cons payload parts)))
-                          (if fin? (deliver op parts) (loop op parts new-size))))))
+                         (let ((parts (cons payload parts)))
+                           (if fin? (deliver op parts)
+                               (loop op parts new-size (+ fragments 1)))))))
                     (else                                   ; new data frame (1/2)
                      (cond
                        (op (ws-fail! w 1002) (vector 'close))    ; previous msg unfinished
                        ((> new-size max-message) (ws-fail! w 1009) (vector 'close))
                        (fin? (deliver fop (list payload)))
-                       (else (loop fop (list payload) new-size)))))))))))
+                       (else (loop fop (list payload) new-size 1)))))))))))
 )

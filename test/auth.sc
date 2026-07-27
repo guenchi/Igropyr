@@ -7,6 +7,7 @@
 
 (import (chezscheme) (igropyr http) (igropyr express) (igropyr session)
         (igropyr auth) (igropyr jwt) (igropyr ws-client)
+        (only (igropyr websocket) ws-conn)
         (igropyr json) (igropyr sexpr) (igropyr libuv))
 
 (define port 18088)
@@ -85,6 +86,14 @@
                (substring resp (+ at 4) j)
                (scan (+ j 1)))))))
 
+(define (zero-fragment-attack)
+  (let* ((frames (+ 1 16384))
+         (out (make-bytevector (* frames 6) 0)))
+    (do ((i 0 (+ i 1))) ((= i frames) out)
+      ;; first frame: non-final text; the rest: non-final continuations.
+      (bytevector-u8-set! out (* i 6) (if (= i 0) #x01 #x00))
+      (bytevector-u8-set! out (+ (* i 6) 1) #x80))))
+
 ;; read one text message from a ws session, then close
 (define (recv-text-and-close w)
   (let ((m (ws-recv w)))
@@ -99,9 +108,15 @@
 (define app (create-app))
 (app-use app (session-middleware store))
 
-;; HTTP login: writes the user into the session, cookie comes back
+;; Establish anonymous state, then rotate the identifier at login.
+(app-get app "/seed"
+  (lambda (req res)
+    (session-set! (req-session req) 'preauth "kept")
+    (send-text! res "ok")))
+
 (app-get app "/login"
   (lambda (req res)
+    (session-regenerate! (req-session req))
     (session-set! (req-session req) 'user "ada")
     (send-text! res "ok")))
 
@@ -110,6 +125,8 @@
   (lambda (ws req)
     (ws-send-text! ws "open")
     (ws-recv ws)))
+
+(app-ws app "/sink" (lambda (ws req) (ws-recv ws)))
 
 ;; token-guarded: claims are the verified JWT claims (string keys)
 (app-ws app "/chat"
@@ -160,6 +177,35 @@
       (equal? (recv-text-and-close
                 (ws-connect "ws://127.0.0.1:18088/open"))
               "open"))
+    ;; The HTTP upgrade path validates every RFC 6455 handshake invariant
+    ;; before transferring ownership to a WebSocket session.
+    (check "ws-handshake-method"
+      (equal? (status-of (http-req
+        "POST /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-http-version"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.0\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-connection-token"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-version-13"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 12\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-key-length"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: YQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+    ;; Zero-length fragments consume list cells even though message bytes
+    ;; stay at zero. The server must cap their count and close the session.
+    (let ((w (ws-connect "ws://127.0.0.1:18088/sink")))
+      (tcp-write! (ws-conn w) (zero-fragment-attack) #f)
+      (check "ws-zero-fragment-limit"
+        (let ((m (ws-recv w)))
+          (and (vector? m) (eq? (vector-ref m 0) 'close)))))
 
     ;; token guard: header credential
     (check "ws-token-header"
@@ -188,6 +234,26 @@
     ;; unknown ws route stays 404 (reject is 401, not-found is not)
     (check "ws-unknown-404"
       (equal? (status-of (upgrade-req "/nope")) "404"))
+
+    ;; An established anonymous id is invalidated and replaced at the
+    ;; authentication boundary; its data is carried to the new id.
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (old (extract-sid seed))
+           (login (and old (http-req
+                     (string-append
+                       "GET /login HTTP/1.1\r\nHost: x\r\nCookie: sid=" old
+                       "\r\nConnection: close\r\n\r\n"))))
+           (fresh (and login (extract-sid login))))
+      (check "session-login-rotates-id"
+        (and old fresh (not (string=? old fresh))))
+      (sleep-ms 100)
+      (check "session-login-drops-old-id"
+        (and old (not (session-peek store old))))
+      (check "session-login-keeps-state"
+        (let ((data (and fresh (session-peek store fresh))))
+          (and data (equal? (cdr (assq 'preauth data)) "kept")
+               (equal? (cdr (assq 'user data)) "ada")))))
 
     ;; session guard: log in over HTTP, ride the cookie into the upgrade
     (let* ((login (http-req "GET /login HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))

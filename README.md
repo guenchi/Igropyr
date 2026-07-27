@@ -241,7 +241,9 @@ demand:
 ;; chunks with backpressure -- each chunk is read from disk only after
 ;; the previous one drained to the client, so a 10 GB download to a
 ;; slow peer costs one chunk of memory, and the pool worker is released
-;; immediately (the pump runs in its own process).
+;; immediately (the pump runs in its own process). The cache is bounded
+;; (4096 entries / 64 MiB), and path components are opened atomically
+;; beneath the root without following symlinks.
 (app-static app "/assets" "./public")
 
 ;; enter the scheduler and listen; never returns
@@ -810,6 +812,15 @@ order matters (outermost first).
            (n (+ 1 (or (session-get s 'visits) 0))))
       (session-set! s 'visits n)             ; persisted automatically
       (send-json! res (list (cons 'visits n))))))
+
+;; Rotate an established anonymous id when authentication/privilege changes.
+(app-post app "/login"
+  (lambda (req res)
+    ;; ...verify the submitted credential first...
+    (let ((s (req-session req)))
+      (session-regenerate! s)                 ; prevents session fixation
+      (session-set! s 'user "alice")
+      (send-json! res '((ok . #t))))))
 ```
 
 Middleware can also stash arbitrary values on the request for later

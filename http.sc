@@ -519,11 +519,25 @@
                              (string-split (cdr p) #\,))))
             (if (equal? tokens '("chunked")) 'chunked 'bad)))))
 
-  ;; websocket upgrade request? returns the Sec-WebSocket-Key or #f
-  (define (websocket-key headers)
-    (let ((u (assq 'upgrade headers))
-          (k (assq 'sec-websocket-key headers)))
-      (and u k (string-ci=? (cdr u) "websocket") (cdr k))))
+  (define (websocket-attempt? headers)
+    (or (assq 'sec-websocket-key headers)
+        (assq 'sec-websocket-version headers)
+        (let ((u (assq 'upgrade headers)))
+          (and u (string-ci=? (cdr u) "websocket")))))
+
+  ;; Return the client key only for a complete RFC 6455 opening handshake.
+  (define (websocket-key parsed)
+    (let* ((headers (vector-ref parsed 4))
+           (u (assq 'upgrade headers))
+           (k (assq 'sec-websocket-key headers))
+           (v (assq 'sec-websocket-version headers)))
+      (and (eq? (vector-ref parsed 0) 'GET)
+           (equal? (vector-ref parsed 3) "HTTP/1.1")
+           u (string-ci=? (cdr u) "websocket")
+           (connection-has-token? headers "upgrade")
+           v (string=? (cdr v) "13")
+           k (ws-valid-client-key? (cdr k))
+           (cdr k))))
 
   ;; Connection is a comma-separated TOKEN LIST (RFC 9110): "close, TE"
   ;; really does mean close. Comparing the whole coalesced value would
@@ -635,6 +649,13 @@
   (define keep-alive-tail "\r\nConnection: keep-alive\r\n\r\n")
   (define close-tail "\r\nConnection: close\r\n\r\n")
 
+  (define (status-forbids-body? status)
+    (or (and (fx>= status 100) (fx< status 200))
+        (fx= status 204) (fx= status 304)))
+
+  (define (status-forbids-length? status)
+    (or (and (fx>= status 100) (fx< status 200)) (fx= status 204)))
+
   ;; Write a full response, guarded by the request's token. The libuv
   ;; write callback (no yielding) tells the reader to continue
   ;; (keep-alive) or closes the connection.
@@ -658,13 +679,17 @@
     ;; gone. The streaming writers guard on conn-state for the same
     ;; reason; this is the one path that did not.
     (when (and (eq? (conn-state c) 'open) (claim! token))
-      (let* ((head
-              (assemble-head status headers
-                "Content-Length: "
-                (number->string (if (integer? head-only)
-                                    head-only
-                                    (bytevector-length body)))
-                (if ka keep-alive-tail close-tail)))
+      (let* ((suppress-body? (or head-only (status-forbids-body? status)))
+             (head
+              (if (status-forbids-length? status)
+                  (assemble-head status headers
+                    (if ka keep-alive-tail close-tail))
+                  (assemble-head status headers
+                    "Content-Length: "
+                    (number->string (if (integer? head-only)
+                                        head-only
+                                        (bytevector-length body)))
+                    (if ka keep-alive-tail close-tail))))
              (owner (conn-owner c))
              (done (lambda (st)
                      (if (and ka (>= st 0))
@@ -673,7 +698,7 @@
                            (tcp-close! c)
                            (send owner (vector 'conn-closed)))))))
         ;; head and body are written as two segments -- no bv-append copy
-        (if head-only
+        (if suppress-body?
             (tcp-writev! c (list (string->utf8 head)) done)
             (tcp-writev! c (list (string->utf8 head) body) done)))))
 
@@ -752,18 +777,23 @@
 
   (define (res-begin! r)
     (let ((c (res-conn r)))
-      (when (and (eq? (conn-state c) 'open) (claim! (res-token r)))
-        (let ((raw? (res-http10? r)))
-          (res-mode-set! r (if raw? 'streaming-raw 'streaming))
-          (tcp-write! c
-            (string->utf8
-              (assemble-head (res-status r) (res-headers r)
-                (cond
-                  (raw? close-delimited-tail)
-                  ((res-keep-alive? r) chunked-keep-alive-tail)
-                  (else chunked-close-tail))))
-            #f))
-        (send (conn-owner c) (vector 'streaming)))))
+      (if (status-forbids-body? (res-status r))
+          (begin
+            (res-mode-set! r 'done)
+            (send-response!* c (res-token r) (res-status r) (res-headers r)
+                             empty-bv (res-keep-alive? r) #t))
+          (when (and (eq? (conn-state c) 'open) (claim! (res-token r)))
+            (let ((raw? (res-http10? r)))
+              (res-mode-set! r (if raw? 'streaming-raw 'streaming))
+              (tcp-write! c
+                (string->utf8
+                  (assemble-head (res-status r) (res-headers r)
+                    (cond
+                      (raw? close-delimited-tail)
+                      ((res-keep-alive? r) chunked-keep-alive-tail)
+                      (else chunked-close-tail))))
+                #f))
+            (send (conn-owner c) (vector 'streaming))))))
 
   ;; Write one chunk (string or bytevector). #f when the stream is not
   ;; open any more (e.g. the client disconnected) -- stop the loop then.
@@ -849,16 +879,21 @@
   ;; occupy a worker or it would be killed as stuck.
   (define (res-begin-file! r len)
     (let ((c (res-conn r)))
-      (when (claim! (res-token r))
-        (res-mode-set! r 'raw)
-        (res-remaining-set! r len)
-        (tcp-write! c
-          (string->utf8
-            (assemble-head (res-status r) (res-headers r)
-              "Content-Length: " (number->string len)
-              (if (res-keep-alive? r) keep-alive-tail close-tail)))
-          #f)
-        (send (conn-owner c) (vector 'streaming)))))
+      (if (status-forbids-body? (res-status r))
+          (begin
+            (res-mode-set! r 'done)
+            (send-response!* c (res-token r) (res-status r) (res-headers r)
+                             empty-bv (res-keep-alive? r) len))
+          (when (claim! (res-token r))
+            (res-mode-set! r 'raw)
+            (res-remaining-set! r len)
+            (tcp-write! c
+              (string->utf8
+                (assemble-head (res-status r) (res-headers r)
+                  "Content-Length: " (number->string len)
+                  (if (res-keep-alive? r) keep-alive-tail close-tail)))
+              #f)
+            (send (conn-owner c) (vector 'streaming))))))
 
   ;; Write one chunk and wait for it to drain before returning --
   ;; backpressure: the producer runs exactly at the client's pace, one
@@ -1006,6 +1041,10 @@
 
   ;; ---- chunked transfer-encoding (request side) ----------------------------------
 
+  (define chunk-line-limit 4096)
+  (define chunk-count-limit 16384)
+  (define chunk-overhead-limit 65536)
+
   ;; hex chunk size, stopping at ';' (chunk extensions); #f if malformed.
   ;; The size value keeps GENERIC arithmetic on purpose: an absurd hex
   ;; size must overflow into a bignum and be rejected by the body-limit
@@ -1074,50 +1113,55 @@
       (define (u8 i) (bytevector-u8-ref bv (fx+ base i)))
       (let loop ((pos (if st (vector-ref st 0) body-start))
                  (chunks (if st (vector-ref st 1) '()))
-                 (len (if st (vector-ref st 2) 0)))
+                 (len (if st (vector-ref st 2) 0))
+                 (count (if st (vector-ref st 3) 0)))
         (let ((eol (crlf-at pos)))
-          (if (not eol)
-              (if (> (- blen pos) (+ body-limit 1024))
-                  (values 'too-large #f #f)
-                  (values 'more (vector pos chunks len) #f))
-              (let ((size (parse-chunk-size bv (fx+ base pos) (fx+ base eol))))
-                (cond
-                  ((not size) (values 'bad #f #f))
-                  ((> (+ len size) body-limit) (values 'too-large #f #f))
-                  ((= size 0)
-                   ;; Validate and cap optional trailers; a blank line ends
-                   ;; the body. Trailer fields are currently ignored. The
-                   ;; trailer block re-scans from here on each segment --
-                   ;; bounded by trailer-limit, so no quadratic exposure.
-                   (let ((trailer-start (+ eol 2)))
-                     (let scan ((p trailer-start))
-                       (let ((e2 (crlf-at p)))
-                         (cond
-                           ((not e2)
-                            (if (> (- blen trailer-start) trailer-limit)
-                                (values 'trailers-too-large #f #f)
-                                ;; resume at the zero-size line so the
-                                ;; trailer phase re-enters here
-                                (values 'more (vector pos chunks len) #f)))
-                           ((> (- (+ e2 2) trailer-start) trailer-limit)
-                            (values 'trailers-too-large #f #f))
-                           ((= e2 p)
-                            (values 'done (bv-concat (reverse chunks) len) (+ p 2)))
-                           ((valid-trailer-line? bv (fx+ base p) (fx+ base e2))
-                            (scan (+ e2 2)))
-                           (else (values 'bad #f #f)))))))
-                  (else
-                   (let ((dstart (+ eol 2)))
-                     (if (< blen (+ dstart size 2))
-                         (values 'more (vector pos chunks len) #f)
-                         (if (not (and (= (u8 (+ dstart size)) 13)
-                                       (= (u8 (+ dstart size 1)) 10)))
-                             (values 'bad #f #f)
-                             (loop (+ dstart size 2)
-                                   (cons (bv-sub bv (fx+ base dstart)
-                                                 (fx+ base (+ dstart size)))
-                                         chunks)
-                                   (+ len size)))))))))))))
+          (cond
+            ((> (- pos body-start) (+ body-limit chunk-overhead-limit))
+             (values 'too-large #f #f))
+            ((not eol)
+             (if (> (- blen pos) chunk-line-limit)
+                 (values 'too-large #f #f)
+                 (values 'more (vector pos chunks len count) #f)))
+            ((> (- eol pos) chunk-line-limit)
+             (values 'too-large #f #f))
+            (else
+             (let ((size (parse-chunk-size bv (fx+ base pos) (fx+ base eol))))
+               (cond
+                 ((not size) (values 'bad #f #f))
+                 ((> (+ len size) body-limit) (values 'too-large #f #f))
+                 ((= size 0)
+                  ;; Validate and cap optional trailers; a blank line ends
+                  ;; the body. Trailer fields are currently ignored.
+                  (let ((trailer-start (+ eol 2)))
+                    (let scan ((p trailer-start))
+                      (let ((e2 (crlf-at p)))
+                        (cond
+                          ((not e2)
+                           (if (> (- blen trailer-start) trailer-limit)
+                               (values 'trailers-too-large #f #f)
+                               (values 'more (vector pos chunks len count) #f)))
+                          ((> (- (+ e2 2) trailer-start) trailer-limit)
+                           (values 'trailers-too-large #f #f))
+                          ((= e2 p)
+                           (values 'done (bv-concat (reverse chunks) len) (+ p 2)))
+                          ((valid-trailer-line? bv (fx+ base p) (fx+ base e2))
+                           (scan (+ e2 2)))
+                          (else (values 'bad #f #f)))))))
+                 ((>= count chunk-count-limit) (values 'too-large #f #f))
+                 (else
+                  (let ((dstart (+ eol 2)))
+                    (if (< blen (+ dstart size 2))
+                        (values 'more (vector pos chunks len count) #f)
+                        (if (not (and (= (u8 (+ dstart size)) 13)
+                                      (= (u8 (+ dstart size 1)) 10)))
+                            (values 'bad #f #f)
+                            (loop (+ dstart size 2)
+                                  (cons (bv-sub bv (fx+ base dstart)
+                                                (fx+ base (+ dstart size)))
+                                        chunks)
+                                  (+ len size)
+                                  (+ count 1))))))))))))))
 
   ;; ---- reader process ----------------------------------------------------------
 
@@ -1176,7 +1220,7 @@
       (if (not parsed)
           (quick-response! c 400 "Bad Request")
           (let* ((headers (vector-ref parsed 4))
-                 (wskey (websocket-key headers))
+                  (wskey (websocket-key parsed))
                  (resolver (unbox (http-server-wsbox srv)))
                  (te (transfer-encoding headers))
                  (clen (content-length headers)))
@@ -1187,8 +1231,10 @@
                (quick-response! c 505 "HTTP Version Not Supported"))
               ((or (eq? clen 'bad) (eq? te 'bad))
                (quick-response! c 400 "Bad Request"))
-              ((and (eq? te 'chunked) (not (eq? clen 'absent)))
-               (quick-response! c 400 "Bad Request"))
+               ((and (eq? te 'chunked) (not (eq? clen 'absent)))
+                (quick-response! c 400 "Bad Request"))
+               ((and resolver (websocket-attempt? headers) (not wskey))
+                (quick-response! c 400 "Bad WebSocket Handshake"))
               ;; websocket upgrade: resolve a session, shake hands, and
               ;; run the session in this reader process
               ((and wskey resolver)

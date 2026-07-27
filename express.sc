@@ -208,38 +208,77 @@
       r))
 
   ;; first occurrence of needle in bv at or after `from`
-  (define (bv-search bv needle from)
-    (let ((n (bytevector-length bv))
-          (m (bytevector-length needle)))
-      (let outer ((i from))
-        (cond
-          ((> (+ i m) n) #f)
-          ((let inner ((j 0))
-             (cond ((= j m) #t)
-                   ((fx= (bytevector-u8-ref bv (+ i j))
-                         (bytevector-u8-ref needle j))
-                    (inner (+ j 1)))
-                   (else #f)))
-           i)
-          (else (outer (+ i 1)))))))
+  ;; Linear-time KMP search. MIME boundaries are attacker-selected, so a
+  ;; naive restart-at-every-byte scan lets repeated prefixes amplify a
+  ;; body-limit-sized request into quadratic CPU work.
+  (define (bv-search-where bv needle from limit accept?)
+    (let* ((m (bytevector-length needle))
+           (fallback (make-vector m 0)))
+      (when (> m 0)
+        (let build ((i 1) (j 0))
+          (when (< i m)
+            (cond
+              ((fx= (bytevector-u8-ref needle i)
+                    (bytevector-u8-ref needle j))
+               (vector-set! fallback i (+ j 1))
+               (build (+ i 1) (+ j 1)))
+              ((> j 0) (build i (vector-ref fallback (- j 1))))
+              (else (build (+ i 1) 0))))))
+      (if (= m 0)
+          (and (<= from limit) (accept? from) from)
+          (let scan ((i from) (j 0))
+            (cond
+              ((>= i limit) #f)
+              ((fx= (bytevector-u8-ref bv i) (bytevector-u8-ref needle j))
+               (let ((next-j (+ j 1)))
+                 (if (= next-j m)
+                     (let ((p (- (+ i 1) m)))
+                       (if (accept? p)
+                           p
+                           (scan (+ i 1) (vector-ref fallback (- m 1)))))
+                     (scan (+ i 1) next-j))))
+              ((> j 0) (scan i (vector-ref fallback (- j 1))))
+              (else (scan (+ i 1) 0)))))))
+
+  (define (bv-search bv needle from . rest)
+    (bv-search-where bv needle from
+      (if (pair? rest) (car rest) (bytevector-length bv))
+      (lambda (p) #t)))
 
   ;; boundary=... from a Content-Type header (possibly quoted)
+  (define (valid-boundary? s)
+    (and (fx> (string-length s) 0)
+         (fx<= (string-length s) 70)
+         (not (char=? (string-ref s (- (string-length s) 1)) #\space))
+         (let loop ((i 0))
+           (or (fx= i (string-length s))
+               (let ((c (string-ref s i)))
+                 (and (or (char-alphabetic? c) (char-numeric? c)
+                          (char=? c #\space)
+                          (memv c '(#\' #\( #\) #\+ #\_ #\, #\- #\.
+                                    #\/ #\: #\= #\?)))
+                      (loop (fx+ i 1))))))))
+
   (define (multipart-boundary ct)
     (let ((key "boundary="))
       (let lp ((i 0))
         (cond
           ((> (+ i (string-length key)) (string-length ct)) #f)
-          ((string=? (substring ct i (+ i (string-length key))) key)
+          ((string-ci=? (substring ct i (+ i (string-length key))) key)
            (let* ((start (+ i (string-length key)))
-                  (raw (let scan ((j start))
-                         (if (or (= j (string-length ct))
-                                 (memv (string-ref ct j) '(#\; #\space)))
-                             (substring ct start j)
-                             (scan (+ j 1))))))
-             (if (and (> (string-length raw) 1)
-                      (char=? (string-ref raw 0) #\"))
-                 (substring raw 1 (- (string-length raw) 1))
-                 raw)))
+                  (b (if (and (< start (string-length ct))
+                              (char=? (string-ref ct start) #\"))
+                         (let scan ((j (+ start 1)))
+                           (cond ((= j (string-length ct)) #f)
+                                 ((char=? (string-ref ct j) #\")
+                                  (substring ct (+ start 1) j))
+                                 (else (scan (+ j 1)))))
+                         (let scan ((j start))
+                           (if (or (= j (string-length ct))
+                                   (memv (string-ref ct j) '(#\; #\space #\tab)))
+                               (substring ct start j)
+                               (scan (+ j 1)))))))
+             (and b (valid-boundary? b) b)))
           (else (lp (+ i 1)))))))
 
   ;; "form-data; name=\"a\"; filename=\"b\"" -> value of one attribute
@@ -261,7 +300,7 @@
   ;; parse one multipart part: header block + payload
   ;; -> (name . string-value) or (name . #(file filename content-type bytes))
   (define (parse-part bv start end)
-    (let ((hend (bv-search bv crlf2-bv start)))
+    (let ((hend (bv-search bv crlf2-bv start end)))
       (and hend (<= (+ hend 4) end)
            (let* ((head (utf8->string (bv-sub bv start hend)))
                   (data (bv-sub bv (+ hend 4) end))
@@ -298,9 +337,31 @@
                             (vector 'file filename ctype data)
                             (utf8->string data))))))))
 
+  ;; A MIME delimiter is recognized only at the beginning of a line and
+  ;; only when followed by CRLF or the final "--" suffix. Raw substring
+  ;; matches inside uploaded bytes are ordinary file data.
+  (define (bv-search-delimiter bv delim from)
+    (let ((n (bytevector-length bv)) (m (bytevector-length delim)))
+      (bv-search-where bv delim from n
+        (lambda (p)
+          (let ((after (+ p m)))
+            (and (or (= p 0)
+                     (and (>= p 2)
+                          (= (bytevector-u8-ref bv (- p 2)) 13)
+                          (= (bytevector-u8-ref bv (- p 1)) 10)))
+                 (<= (+ after 2) n)
+                 (or (and (= (bytevector-u8-ref bv after) 13)
+                          (= (bytevector-u8-ref bv (+ after 1)) 10))
+                     (and (= (bytevector-u8-ref bv after) 45)
+                          (= (bytevector-u8-ref bv (+ after 1)) 45)
+                          (or (= (+ after 2) n)
+                              (and (<= (+ after 4) n)
+                                   (= (bytevector-u8-ref bv (+ after 2)) 13)
+                                   (= (bytevector-u8-ref bv (+ after 3)) 10)))))))))))
+
   (define (parse-multipart bv boundary)
     (let ((delim (string->utf8 (string-append "--" boundary))))
-      (let lp ((pos (or (bv-search bv delim 0) (bytevector-length bv)))
+      (let lp ((pos (or (bv-search-delimiter bv delim 0) (bytevector-length bv)))
                (acc '()))
         (let ((part-start (+ pos (bytevector-length delim) 2))) ; skip \r\n
           (if (or (> part-start (bytevector-length bv))
@@ -309,7 +370,7 @@
                        (fx= (bytevector-u8-ref bv (+ pos (bytevector-length delim))) 45)
                        (fx= (bytevector-u8-ref bv (+ pos (bytevector-length delim) 1)) 45)))
               (reverse acc)
-              (let ((next (bv-search bv delim part-start)))
+              (let ((next (bv-search-delimiter bv delim part-start)))
                 (if (not next)
                     (reverse acc)
                     (let ((part (parse-part bv part-start (- next 2)))) ; strip \r\n
@@ -421,6 +482,51 @@
   (define stat-window-ms 1000)
   ;; path -> #(mtime size etag content-type body gzip-box last-stat-ms)
   (define static-cache (make-hashtable string-hash string=?))
+  (define max-static-cache-entries 4096)
+  (define max-static-cache-bytes (* 64 1024 1024))
+  (define static-cache-bytes 0)
+
+  (define (entry-bytes e)
+    (if (and e (bytevector? (vector-ref e 4)))
+        (+ (bytevector-length (vector-ref e 4))
+           (let ((g (unbox (vector-ref e 5))))
+             (if g (bytevector-length g) 0)))
+        0))
+
+  (define (cache-ref path)
+    (with-interrupts-disabled (hashtable-ref static-cache path #f)))
+
+  (define (cache-delete! path)
+    (with-interrupts-disabled
+      (let ((old (hashtable-ref static-cache path #f)))
+        (when old
+          (set! static-cache-bytes (- static-cache-bytes (entry-bytes old)))
+          (hashtable-delete! static-cache path)))))
+
+  (define (cache-store! path e)
+    (with-interrupts-disabled
+      (let ((old (hashtable-ref static-cache path #f)))
+        (when old (set! static-cache-bytes (- static-cache-bytes (entry-bytes old))))
+        (let ((n (entry-bytes e)))
+          (when (or (and (not old)
+                         (fx>= (hashtable-size static-cache) max-static-cache-entries))
+                    (> (+ static-cache-bytes n) max-static-cache-bytes))
+            (hashtable-clear! static-cache)
+            (set! static-cache-bytes 0))
+          (hashtable-set! static-cache path e)
+          (set! static-cache-bytes (+ static-cache-bytes n))))))
+
+  ;; Cache a lazily generated representation only while the aggregate byte
+  ;; budget has room. The caller may still serve g once when it does not.
+  (define (cache-gzip! path e g)
+    (with-interrupts-disabled
+      (when (and (eq? (hashtable-ref static-cache path #f) e)
+                 (not (unbox (vector-ref e 5)))
+                 (<= (+ static-cache-bytes (bytevector-length g))
+                     max-static-cache-bytes))
+        (set-box! (vector-ref e 5) g)
+        (set! static-cache-bytes (+ static-cache-bytes (bytevector-length g)))))
+    g)
 
   (define (file-mtime path)
     (guard (e (#t #f))
@@ -465,29 +571,36 @@
   (define (stream-entry? e) (eq? (vector-ref e 0) 'stream))
   (define (large-entry? e) (eq? (vector-ref e 4) 'large))
 
-  (define (static-entry path)
-    (let ((cached (hashtable-ref static-cache path #f))
+  (define (static-entry path root rel)
+    (let ((cached (cache-ref path))
           (now (now-ms)))
       (if (and cached (< (- now (vector-ref cached 6)) stat-window-ms))
           cached
-          (let ((mt (file-mtime path)))
-            (and mt
+           (let ((mt (file-mtime path)))
+             (if (not mt)
+                 (begin (cache-delete! path) #f)
                  (if (and cached (= (vector-ref cached 0) mt))
                      (begin (vector-set! cached 6 now) cached)
-                     (open-entry path mt now)))))))
+                     (let ((fresh (open-entry path mt now root rel)))
+                       (unless fresh (cache-delete! path))
+                       fresh)))))))
 
   ;; open with a timeout that can never leak the fd: the handle comes
   ;; back synchronously, so a timed-out open is closed via its handle
   ;; (the abort flag also suppresses any late ready message).
   ;; -> (values stream size) | (values #f #f)
-  (define (open-stream path)
-    (let ((st (file-stream-open! path self)))
-      (receive (after 30000 (begin (file-stream-close! st) (values #f #f)))
-        (`#(file-stream ,@st ,size) (values st size))
-        (`#(file-error ,e) (values #f #f)))))
+  (define (open-stream path root rel)
+    (let ((st (if root
+                  (file-stream-open-under! root rel self)
+                  (file-stream-open! path self))))
+      (if (not st)
+          (values #f #f)
+          (receive (after 30000 (begin (file-stream-close! st) (values #f #f)))
+            (`#(file-stream ,@st ,size) (values st size))
+            (`#(file-error ,e) (values #f #f))))))
 
-  (define (open-entry path mt now)
-    (let-values (((st size) (open-stream path)))
+  (define (open-entry path mt now root rel)
+    (let-values (((st size) (open-stream path root rel)))
       (and st
            (if (<= size max-cache-file)
                (let ((body (stream-read-all st size)))
@@ -495,11 +608,10 @@
                       ;; gzip-box holds the lazily-built gzip body
                       (let ((e (vector mt size (etag-of size mt)
                                        (mime-type path) body (box #f) now)))
-                        (hashtable-set! static-cache path e)
+                        (cache-store! path e)
                         e)))
                (let ((etag (etag-of size mt)) (ctype (mime-type path)))
-                 (hashtable-set! static-cache path
-                   (vector mt size etag ctype 'large #f now))
+                 (cache-store! path (vector mt size etag ctype 'large #f now))
                  (vector 'stream st size etag ctype))))))
 
   ;; Pump a large file through a fixed-length response from a detached
@@ -536,8 +648,8 @@
   ;; window-hit download of a large (metadata-cached) file: open a
   ;; fresh stream on demand. Content-Length comes from the live fstat;
   ;; etag/ctype from the metadata (<= 1s stale, like every window hit).
-  (define (serve-large! r ctype path)
-    (let-values (((st size) (open-stream path)))
+  (define (serve-large! r ctype path root rel)
+    (let-values (((st size) (open-stream path root rel)))
       (if st
           (stream-file! r st size ctype)
           (begin (set-status! r 404) (send-text! r "Not Found")))))
@@ -567,12 +679,13 @@
              (else path))))
       (if (not resolved)
           (begin (set-status! r 403) (send-text! r "Forbidden"))
-          (let ((e (static-entry resolved)))
+          (let ((e (static-entry resolved root (and root path))))
             (cond
               ((not e) (set-status! r 404) (send-text! r "Not Found"))
               ((stream-entry? e)
                (stream-file! r (vector-ref e 1) (vector-ref e 2) (vector-ref e 4)))
-              ((large-entry? e) (serve-large! r (vector-ref e 3) resolved))
+               ((large-entry? e)
+                (serve-large! r (vector-ref e 3) resolved root (and root path)))
               (else (finish! r (vector-ref e 3) (vector-ref e 4))))))))
 
   (define (send-file! r path . rest)
@@ -592,10 +705,10 @@
   (define (gzip-etag etag)
     (string-append (substring etag 0 (- (string-length etag) 1)) "-gz\""))
 
-  (define (serve-static! r req abs-path)
+  (define (serve-static! r req abs-path root rel)
     (if (path-has-dotdot? abs-path)
         (begin (set-status! r 403) (send-text! r "Forbidden"))
-        (let ((e (static-entry abs-path)))
+        (let ((e (static-entry abs-path root rel)))
           (cond
             ((not e)
              (set-status! r 404) (send-text! r "Not Found"))
@@ -625,7 +738,7 @@
                    (begin
                      (set-status! r 304)
                      (res-send! r (make-bytevector 0)))
-                   (serve-large! r ctype abs-path))))
+                    (serve-large! r ctype abs-path root rel))))
             (else
              (let* ((size (vector-ref e 1))
                      (etag (vector-ref e 2))
@@ -637,9 +750,8 @@
                               (compressible-type? ctype)
                               (gzip-acceptable? (req-header req 'accept-encoding))
                               (or (unbox gzbox)
-                                  (let ((g (gzip-compress body 6)))
-                                    (when g (set-box! gzbox g))
-                                    g))))
+                                   (let ((g (gzip-compress body 6)))
+                                     (and g (cache-gzip! abs-path e g))))))
                      (tag (if gz (gzip-etag etag) etag)))
                 (set-header! r "ETag" tag)
                 (set-header! r "Cache-Control" "public, max-age=3600")
@@ -980,11 +1092,9 @@
         (else #f))))                                ; e.g. "/assets-private"
 
   ;; Resolve a URL-relative name under root without letting it escape.
-  ;; Chez has no portable realpath, so reject any symbolic link in the
-  ;; untrusted part of the path (stricter than following the link and
-  ;; comparing platform-specific canonical spellings) -- this blocks
-  ;; symlink-based escapes as well as ".." and NUL. Returns the safe
-  ;; absolute path or #f.
+  ;; Lexically validate the untrusted path. The subsequent file open walks
+  ;; these components from a stable root directory fd with O_NOFOLLOW;
+  ;; pathname checks alone would be vulnerable to a symlink swap race.
   ;; A segment starting with "." is refused: mounting a project directory
   ;; otherwise serves .env, .git/config and friends -- with a public
   ;; Cache-Control, so an intermediary keeps handing them out. ".well-known"
@@ -1005,10 +1115,8 @@
              ((or (string=? (car parts) "") (string=? (car parts) "."))
               (loop base (cdr parts)))
              ((dotfile-segment? (car parts)) #f)
-             (else
-              (let ((next (string-append base "/" (car parts))))
-                (and (not (guard (e (#t #t)) (file-symbolic-link? next)))
-                     (loop next (cdr parts)))))))))
+              (else
+               (loop (string-append base "/" (car parts)) (cdr parts)))))))
 
   (define (try-static a req r)
     (and (eq? (routing-method req) 'GET)
@@ -1019,10 +1127,10 @@
                     (path (and rel (safe-static-path root rel))))
                (and rel
                     (begin
-                      ;; safe-static-path rejects "..", NUL, and symlink
-                      ;; escapes; serve-static! then caches + answers 304
+                      ;; safe-static-path rejects ".." and NUL; the openat
+                      ;; walk rejects symlink escapes before serving/cache.
                       (if path
-                          (serve-static! r req path)
+                           (serve-static! r req path root rel)
                           (begin (set-status! r 403) (send-text! r "Forbidden")))
                       #t))))
            (app-statics a))))

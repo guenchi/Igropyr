@@ -1,6 +1,6 @@
 #!chezscheme
 (import (chezscheme) (igropyr util) (igropyr actor) (igropyr libuv)
-        (igropyr http))
+        (igropyr http) (only (igropyr express) req-form))
 
 (define port 18080)
 (define empty-bv (make-bytevector 0))
@@ -82,6 +82,18 @@
         (error 'http-protocol label "missing response body" response)))
     (display label) (display " ok\n")))
 
+(define (many-chunks n)
+  (let-values (((p get) (open-string-output-port)))
+    (do ((i 0 (+ i 1))) ((= i n)) (display "1\r\na\r\n" p))
+    (display "0\r\n\r\n" p)
+    (get)))
+
+(define (multipart-request boundary body)
+  (string-append
+    "POST /form HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary="
+    boundary "\r\nContent-Length: " (number->string (string-length body))
+    "\r\nConnection: close\r\n\r\n" body))
+
 (define (expect-pipelined-empty-trailer)
   (let* ((body (make-string 9000 #\b))
          (response
@@ -100,10 +112,20 @@
 
 (define (handler req res)
   (set-header! res "Content-Type" "text/plain")
-  (if (string=? (req-path req) "/query")
-      (let ((p (assoc "token" (req-query req))))
-        (res-send! res (string->utf8 (if p (cdr p) "missing"))))
-      (res-send! res (req-body req))))
+  (cond
+    ((string=? (req-path req) "/query")
+     (let ((p (assoc "token" (req-query req))))
+       (res-send! res (string->utf8 (if p (cdr p) "missing")))))
+    ((string=? (req-path req) "/status204")
+     (set-status! res 204)
+     (res-send! res (string->utf8 "forbidden-body-204")))
+    ((string=? (req-path req) "/status304")
+     (set-status! res 304)
+     (res-send! res (string->utf8 "forbidden-body-304")))
+    ((string=? (req-path req) "/form")
+     (let ((role (assoc "role" (req-form req))))
+       (res-send! res (string->utf8 (if role (cdr role) "safe")))))
+    (else (res-send! res (req-body req)))))
 
 (start-scheduler
   (lambda ()
@@ -188,6 +210,49 @@
       '("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         "3\r" "\nab" "c\r\n" "3\r\ndef\r\n" "0\r\n" "\r\n")
       "200" "abcdef")
+    ;; Handler-provided bytes are suppressed for bodyless status codes.
+    (let ((r (raw-request
+               "GET /status204 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
+      (unless (and (string-contains? r "HTTP/1.1 204 ")
+                   (not (string-contains? r "forbidden-body-204"))
+                   (not (string-contains? r "Content-Length:")))
+        (error 'http-protocol "204 response carried a body/framing" r))
+      (display "204 body suppression ok\n"))
+    (let ((r (raw-request
+               "GET /status304 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
+      (unless (and (string-contains? r "HTTP/1.1 304 ")
+                   (not (string-contains? r "forbidden-body-304")))
+        (error 'http-protocol "304 response carried a body" r))
+      (display "304 body suppression ok\n"))
+    ;; Tiny decoded payloads cannot hide unbounded chunk metadata/count.
+    (expect "chunk count limit"
+      (string-append
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        (many-chunks 16385))
+      "413")
+    (expect "chunk-size line limit"
+      (string-append
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        "1;" (make-string 4096 #\a) "\r\nx\r\n0\r\n\r\n")
+      "413")
+    ;; A boundary-looking substring inside upload bytes is not a MIME
+    ;; delimiter unless it begins a CRLF-delimited line.
+    (let* ((b "AaB03x")
+           (body (string-append
+                   "--" b "\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"x\"\r\n"
+                   "Content-Type: text/plain\r\n\r\n"
+                   "hello--" b "\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nadmin\r\n"
+                   "--" b "--\r\n")))
+      (expect "multipart delimiter anchoring"
+        (multipart-request b body) "200" "safe"))
+    (expect "multipart boundary length cap"
+      (multipart-request (make-string 71 #\a) "ignored") "200" "safe")
+    (let* ((b "Aa B")
+           (body (string-append
+                   "--" b "\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nuser\r\n"
+                   "--" b "--\r\n")))
+      (expect "quoted multipart boundary"
+        (multipart-request (string-append "\"" b "\"") body) "200" "user"))
     ;; ---- configurable body-limit -----------------------------------
     ;; PROCESS-GLOBAL (last http-listen wins), so these run LAST: the
     ;; second listen lowers the limit for every server in this process.

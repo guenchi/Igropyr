@@ -162,7 +162,11 @@
     (unless (and (string? s) (request-safe? s))
       (raise (vector 'http-client-error
                (string-append "invalid " what
-                              ": control characters are not allowed")))))
+                               ": control characters are not allowed")))))
+
+  (define (managed-request-header? name)
+    (exists (lambda (reserved) (string-ci=? name reserved))
+            '("Host" "Connection" "Content-Length" "Transfer-Encoding")))
 
   ;; host-header is host[:port] -- RFC 7230 wants the port whenever it
   ;; is not the scheme default (the caller computes it from parse-url)
@@ -176,6 +180,9 @@
       (for-each
         (lambda (h)
           (check-request-part! "header name" (car h))
+          (when (managed-request-header? (car h))
+            (raise (vector 'http-client-error
+                     (string-append "header is managed by the client: " (car h)))))
           ;; A header VALUE may hold spaces, tabs (legal OWS) and
           ;; non-ASCII text (an S3 metadata value, a filename in
           ;; Content-Disposition): only the bytes that could terminate
@@ -203,21 +210,14 @@
         (for-each
           (lambda (h) (line (string-append (car h) ": " (cdr h))))
           headers)
-        ;; Content-Length is ours unless the caller supplied one (never
-        ;; write it twice -- servers reject duplicates): the body's
-        ;; length when there is a body, and an explicit 0 on bodyless
-        ;; body-carrying methods -- some servers (S3 among them) answer
-        ;; 411 Length Required without it
-        (unless (let scan ((h headers))
-                  (and (pair? h)
-                       (or (string-ci=? (caar h) "content-length")
-                           (scan (cdr h)))))
-          (cond
-            ((> (bytevector-length body-bv) 0)
-             (line (string-append "Content-Length: "
-                                  (number->string (bytevector-length body-bv)))))
-            ((memq method '(PUT POST PATCH))
-             (line "Content-Length: 0"))))
+        ;; Framing is derived exclusively from the bytes this function
+        ;; serializes; callers cannot create duplicate/conflicting lengths.
+        (cond
+          ((> (bytevector-length body-bv) 0)
+           (line (string-append "Content-Length: "
+                                (number->string (bytevector-length body-bv)))))
+          ((memq method '(PUT POST PATCH))
+           (line "Content-Length: 0")))
         (put-bytevector p crlf)                    ; end of headers
         (put-bytevector p body-bv)
         (get))))
@@ -615,6 +615,7 @@
             ;; bounded by the idle timeout (or, with idle 0, by its own
             ;; guards plus the monitor), so every path still answers.
             (receive (after (if on-chunk 'infinity (+ timeout 2000))
+                        (kill pid 'request-timeout)
                         (release!)
                         (raise (vector 'http-client-error "request timeout")))
               (`#(http-reply ,@ref ,resp) (release!) resp)

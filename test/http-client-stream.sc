@@ -82,6 +82,17 @@
 (app-get app "/never"
   (lambda (req res)
     (sse-start! res)))
+;; keeps resetting the child actor's idle timer forever. The caller-facing
+;; total timeout must kill that child and release both socket owners.
+(app-get app "/forever"
+  (lambda (req res)
+    (sse-start! res)
+    (spawn
+      (lambda ()
+        (let loop ()
+          (when (res-write! res "x")
+            (sleep-ms 100)
+            (loop)))))))
 ;; counted body, streamed by the client
 (app-get app "/big" (lambda (req res) (send-text! res big-body)))
 
@@ -285,6 +296,32 @@
                   (http-get (string-append "http://127.0.0.1:" (number->string port) "/never")
                             `((on-chunk . ,(lambda (bv) bv)) (timeout . 200)))))
               "response timeout"))
+    ;; Accumulating requests have a total deadline in addition to the
+    ;; child's idle deadline. A peer that drips forever must not leave the
+    ;; child actor/socket rooted after the caller times out.
+    (let* ((before (conn-count))
+           (msg (client-error-message
+                  (lambda ()
+                    (http-get
+                      (string-append "http://127.0.0.1:"
+                                     (number->string port) "/forever")
+                      '((timeout . 200)))))))
+      (check "total-timeout" (equal? msg "request timeout"))
+      (sleep-ms 400)
+      (check "total-timeout-closes-sockets" (<= (conn-count) before)))
+    ;; Framing and routing headers are owned by the serializer. Allowing a
+    ;; caller to duplicate them creates request-smuggling differentials.
+    (for-each
+      (lambda (name)
+        (check (string-append "managed-header-" name)
+          (equal? (client-error-message
+                    (lambda ()
+                      (http-get
+                        (string-append "http://127.0.0.1:"
+                                       (number->string port) "/sse")
+                        `((headers . ((,name . "attacker")))))))
+                  (string-append "header is managed by the client: " name))))
+      '("Host" "Connection" "Content-Length" "Transfer-Encoding"))
     ;; a non-procedure on-chunk is rejected before any connection
     (check "bad-on-chunk-rejected"
       (equal? (client-error-message
