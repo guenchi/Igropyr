@@ -58,6 +58,7 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/redis-splits.sc
 "$scheme_bin" --script igropyr/test/redis-incremental.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc
+"$scheme_bin" --script igropyr/test/static-cache-capacity.sc
 "$scheme_bin" --script igropyr/test/node.sc
 # worker slot accounting: a killed or stuck task must not hold its slot
 "$scheme_bin" --script igropyr/test/dpool-slots.sc
