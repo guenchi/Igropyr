@@ -133,6 +133,23 @@
     (session-set! (req-session req) 'user "ada")
     (send-text! res "ok")))
 
+;; the ordering mistake: answer, then rotate. The replacement cookie can no
+;; longer reach the client, so rotating anyway would drop the live id and
+;; silently log the user out.
+(define late-outcome 'unrun)
+(app-get app "/late-rotate"
+  (lambda (req res)
+    (send-text! res "answered")
+    (set! late-outcome
+      (guard (e (#t 'raised))
+        (session-regenerate! (req-session req))
+        'returned))))
+
+;; reports what the handler above saw; the client of /late-rotate cannot,
+;; because its response was already on the wire before the raise
+(app-get app "/late-outcome"
+  (lambda (req res) (send-text! res (symbol->string late-outcome))))
+
 ;; unguarded ws route (regression: guards are opt-in)
 (app-ws app "/open"
   (lambda (ws req)
@@ -260,6 +277,30 @@
         (let ((data (and fresh (session-peek store fresh))))
           (and data (equal? (cdr (assq 'preauth data)) "kept")
                (equal? (cdr (assq 'user data)) "ada")))))
+
+    ;; Rotating after the response is out must fail loudly rather than
+    ;; half-apply: the cookie cannot be delivered, so the id must not be
+    ;; dropped either. The handler raise surfaces as a 500.
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (sid (extract-sid seed))
+           (late (and sid (http-req
+                    (string-append
+                      "GET /late-rotate HTTP/1.1\r\nHost: x\r\nCookie: sid=" sid
+                      "\r\nConnection: close\r\n\r\n")))))
+      (sleep-ms 150)
+      ;; the client legitimately still sees its 200: the response was
+      ;; complete before the mistake was made
+      (check "late-rotate-answers-normally" (equal? "200" (status-of late)))
+      (check "late-rotate-raises"
+        (equal? "raised"
+                (let ((r (http-req
+                           "GET /late-outcome HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
+                  (let ((b (find-substr r "\r\n\r\n")))
+                    (and b (substring r (+ b 4) (string-length r)))))))
+      (check "late-rotate-keeps-the-live-id"
+        (let ((data (and sid (session-peek store sid))))
+          (and data (equal? (cdr (assq 'preauth data)) "kept")))))
 
     ;; session guard: log in over HTTP, ride the cookie into the upgrade
     (let* ((login (http-req "GET /login HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
