@@ -505,6 +505,44 @@
   (define stat-window-ms 1000)
   ;; path -> #(mtime size etag content-type body gzip-box last-stat-ms)
   (define static-cache (make-hashtable string-hash string=?))
+  (define max-static-cache-entries 4096)
+  (define max-static-cache-bytes (* 64 1024 1024))
+  (define static-cache-bytes 0)
+
+  (define (entry-bytes e)
+    (if (and e (bytevector? (vector-ref e 4)))
+        (+ (bytevector-length (vector-ref e 4))
+           (let ((g (unbox (vector-ref e 5))))
+             (if g (bytevector-length g) 0)))
+        0))
+
+  (define (cache-store! path e)
+    (with-interrupts-disabled
+      (let ((old (hashtable-ref static-cache path #f)))
+        (when old
+          (set! static-cache-bytes (- static-cache-bytes (entry-bytes old))))
+        (let ((n (entry-bytes e)))
+          (when (or (and (not old)
+                         (fx>= (hashtable-size static-cache)
+                               max-static-cache-entries))
+                    (> (+ static-cache-bytes n) max-static-cache-bytes))
+            (hashtable-clear! static-cache)
+            (set! static-cache-bytes 0))
+          (hashtable-set! static-cache path e)
+          (set! static-cache-bytes (+ static-cache-bytes n))))))
+
+  ;; Cache a lazily generated representation only while the aggregate byte
+  ;; budget has room. The caller may still serve g once when it does not.
+  (define (cache-gzip! path e g)
+    (with-interrupts-disabled
+      (when (and (eq? (hashtable-ref static-cache path #f) e)
+                 (not (unbox (vector-ref e 5)))
+                 (<= (+ static-cache-bytes (bytevector-length g))
+                     max-static-cache-bytes))
+        (set-box! (vector-ref e 5) g)
+        (set! static-cache-bytes
+          (+ static-cache-bytes (bytevector-length g)))))
+    g)
 
   (define (file-mtime path)
     (guard (e (#t #f))
@@ -579,11 +617,10 @@
                       ;; gzip-box holds the lazily-built gzip body
                       (let ((e (vector mt size (etag-of size mt)
                                        (mime-type path) body (box #f) now)))
-                        (hashtable-set! static-cache path e)
+                        (cache-store! path e)
                         e)))
                (let ((etag (etag-of size mt)) (ctype (mime-type path)))
-                 (hashtable-set! static-cache path
-                   (vector mt size etag ctype 'large #f now))
+                 (cache-store! path (vector mt size etag ctype 'large #f now))
                  (vector 'stream st size etag ctype))))))
 
   ;; Pump a large file through a fixed-length response from a detached
@@ -722,8 +759,7 @@
                               (gzip-acceptable? (req-header req 'accept-encoding))
                               (or (unbox gzbox)
                                   (let ((g (gzip-compress body 6)))
-                                    (when g (set-box! gzbox g))
-                                    g))))
+                                    (and g (cache-gzip! abs-path e g))))))
                      (tag (if gz (gzip-etag etag) etag)))
                 (set-header! r "ETag" tag)
                 (set-header! r "Cache-Control" "public, max-age=3600")
