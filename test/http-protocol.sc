@@ -203,7 +203,7 @@
       '("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         "3\r" "\nab" "c\r\n" "3\r\ndef\r\n" "0\r\n" "\r\n")
       "200" "abcdef")
-    ;; Boundary-looking bytes inside a file are data, not a new field.
+ ;; Boundary-looking bytes inside a file are data, not a new field.
     (let* ((b "AaB03x")
            (body (string-append
                    "--" b "\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"x\"\r\n"
@@ -244,6 +244,25 @@
                    "--" b "--\r\n")))
       (expect "quoted multipart boundary"
         (multipart-request (string-append "\"" b "\"") body) "200" "user"))
+    ;; Every payload byte begins a near-match for this delimiter, so a
+    ;; restart-at-every-byte search pays the boundary length at each of
+    ;; them. The status alone cannot see that: it stays 200 either way (the
+    ;; naive scan measures ~100 ms, nowhere near a timeout), so the cost is
+    ;; what has to be asserted -- as the cost-bomb checks in test/kdf.sc do.
+    (let* ((pboundary (string-append (make-string 69 #\-) "x"))
+           (pbody (string-append
+                    "--" pboundary
+                    "\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\n"
+                    (make-string 750000 #\-)
+                    "\r\n--" pboundary "--\r\n"))
+           (t0 (real-time)))
+      (expect "multipart repeated-prefix search"
+        (multipart-request pboundary pbody) "200" "safe")
+      ;; ~13 ms linear vs ~100 ms naive, end to end; 50 ms sits between them
+      ;; with room on both sides so load does not make this flaky
+      (let ((ms (- (real-time) t0)))
+        (unless (< ms 50)
+          (error 'http-protocol "repeated-prefix search too slow (ms)" ms))))
     ;; ---- configurable body-limit -----------------------------------
     ;; PROCESS-GLOBAL (last http-listen wins), so these run LAST: the
     ;; second listen lowers the limit for every server in this process.

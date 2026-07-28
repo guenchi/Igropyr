@@ -209,22 +209,39 @@
 
   ;; first occurrence of needle in bv at or after `from`, before optional `end`
   ;; (clamped: an end past the buffer would read off it with no error)
+  ;;
+  ;; KMP, because the needle is a MIME boundary and therefore chosen by the
+  ;; sender. Restarting at every byte costs a factor of the boundary length
+  ;; -- at the 1 MiB body limit a 70-byte all-dash boundary against an
+  ;; all-dash body measures ~100 ms versus ~4 ms here, and that is 100 ms
+  ;; during which the single-threaded scheduler runs nothing else.
   (define (bv-search bv needle from . rest)
-    (let ((n (if (pair? rest)
-                 (fxmin (car rest) (bytevector-length bv))
-                 (bytevector-length bv)))
-          (m (bytevector-length needle)))
-      (let outer ((i from))
-        (cond
-          ((> (+ i m) n) #f)
-          ((let inner ((j 0))
-             (cond ((= j m) #t)
-                   ((fx= (bytevector-u8-ref bv (+ i j))
-                         (bytevector-u8-ref needle j))
-                    (inner (+ j 1)))
-                   (else #f)))
-           i)
-          (else (outer (+ i 1)))))))
+    (let* ((n (if (pair? rest)
+                  (fxmin (car rest) (bytevector-length bv))
+                  (bytevector-length bv)))
+           (m (bytevector-length needle))
+           (fallback (make-vector m 0)))
+      (when (> m 0)
+        (let build ((i 1) (j 0))
+          (when (< i m)
+            (cond
+              ((fx= (bytevector-u8-ref needle i)
+                    (bytevector-u8-ref needle j))
+               (vector-set! fallback i (+ j 1))
+               (build (+ i 1) (+ j 1)))
+              ((> j 0) (build i (vector-ref fallback (- j 1))))
+              (else (build (+ i 1) 0))))))
+      (if (= m 0)
+          (and (<= from n) from)
+          (let scan ((i from) (j 0))
+            (cond
+              ((>= i n) #f)
+              ((fx= (bytevector-u8-ref bv i) (bytevector-u8-ref needle j))
+               (if (= (+ j 1) m)
+                   (- (+ i 1) m)
+                   (scan (+ i 1) (+ j 1))))
+              ((> j 0) (scan i (vector-ref fallback (- j 1))))
+              (else (scan (+ i 1) 0)))))))
 
   ;; RFC 2046 bchars, spelled out as ASCII ranges. NOT char-alphabetic? /
   ;; char-numeric?: those are Unicode-aware here, so they admit characters
