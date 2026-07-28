@@ -66,6 +66,53 @@
             (fail! "slow-handshake-deadline-not-absolute" elapsed))))
       (display "absolute pre-auth handshake deadline ok\n"))
 
+    ;; Each pre-auth connection is bounded in bytes and in time, but a
+    ;; stranger must not be able to hold an unbounded NUMBER of them --
+    ;; every one is an fd and a process, and the fd budget belongs to the
+    ;; whole OS process, not just the mesh. Over the ceiling the node must
+    ;; close without answering and without spawning. Runs before any child
+    ;; node exists, so nothing else is competing for a slot.
+    (node-set-limits! #f #f 4)
+    (let ((me self) (ref (gensym)))
+      ;; one prober process per connection: tcp-data carries no connection,
+      ;; so a shared mailbox could not tell which socket was answered
+      (do ((i 0 (+ i 1))) ((= i 8))
+        (spawn
+          (lambda ()
+            (tcp-connect! "127.0.0.1" port self)
+            (receive (after 3000 (send me (vector ref 'no-connect)))
+              (`#(tcp-connected ,c)
+                (tcp-read-start! c)
+                (receive (after 3000 (send me (vector ref 'silent)))
+                  (`#(tcp-data ,_)
+                    ;; report, then HOLD. Closing here would free the slot
+                    ;; and let the next prober take it, so the eight
+                    ;; connections would never be in flight at once and the
+                    ;; ceiling would never be reached.
+                    (send me (vector ref 'challenged))
+                    (receive (after 6000 (tcp-close! c))
+                      (`#(tcp-eof) 'ok)
+                      (`#(tcp-error ,_) 'ok)))
+                  (`#(tcp-eof) (send me (vector ref 'refused)))
+                  (`#(tcp-error ,_) (send me (vector ref 'refused)))))
+              (`#(tcp-connect-failed ,e) (send me (vector ref 'refused)))))))
+      (let loop ((k 0) (challenged 0) (refused 0))
+        (if (= k 8)
+            (begin
+              (unless (= challenged 4)
+                (fail! "preauth-cap-challenged" challenged))
+              (unless (= refused 4)
+                (fail! "preauth-cap-refused" refused)))
+            (receive (after 8000 (fail! "preauth-cap-timeout" k))
+              (`#(,@ref ,tag)
+                (case tag
+                  ((challenged) (loop (+ k 1) (+ challenged 1) refused))
+                  ((refused) (loop (+ k 1) challenged (+ refused 1)))
+                  (else (fail! "preauth-cap-unexpected" tag))))))))
+    ;; back to a ceiling that cannot interfere with the real handshakes below
+    (node-set-limits! #f #f 256)
+    (display "pre-auth connection ceiling ok\n")
+
     ;; rsend to an unknown node: #f, no crash
     (unless (eq? #f (rsend 'nowhere 'svc 'x))
       (fail! "rsend-unknown"))
