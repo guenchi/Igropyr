@@ -242,7 +242,10 @@ demand:
 ;; the previous one drained to the client, so a 10 GB download to a
 ;; slow peer costs one chunk of memory, and the pool worker is released
 ;; immediately (the pump runs in its own process). The cache is bounded
-;; to 4096 entries and 64 MiB, including cached gzip representations.
+;; to 4096 entries and 64 MiB, including cached gzip representations,
+;; and is keyed by the name the OS resolves to -- so on a case-insensitive
+;; filesystem the many spellings of one file share one entry instead of
+;; letting a caller mint an entry per spelling.
 (app-static app "/assets" "./public")
 
 ;; enter the scheduler and listen; never returns

@@ -587,6 +587,20 @@
   (define (stream-entry? e) (eq? (vector-ref e 0) 'stream))
   (define (large-entry? e) (eq? (vector-ref e 4) 'large))
 
+  ;; ONE FILE, ONE ENTRY. The key is the name the OS resolves to, not the
+  ;; one the client typed. On a case-insensitive filesystem -- macOS and
+  ;; Windows by default -- every spelling of a name opens the same file,
+  ;; so keying on the request path let a single asset occupy 2^letters
+  ;; entries: unbounded memory from one file, and, once the capacity
+  ;; ceilings existed, a way to wipe the whole cache with a few dozen
+  ;; requests. Symlink aliases collapse for the same reason.
+  ;;
+  ;; Resolving costs a blocking syscall, so it happens only when the typed
+  ;; path is not already a key -- a client using the spelling its links
+  ;; contain still reaches the body with no syscall at all, which is the
+  ;; property the hot path is built around. Entries therefore only ever
+  ;; exist under resolved names, and a request for a variant looks itself
+  ;; up rather than storing a second copy.
   (define (static-entry path)
     (let ((cached (hashtable-ref static-cache path #f))
           (now (now-ms)))
@@ -596,7 +610,12 @@
             (and mt
                  (if (and cached (= (vector-ref cached 0) mt))
                      (begin (vector-set! cached 6 now) cached)
-                     (open-entry path mt now)))))))
+                     (let ((key (or (file-realpath path) path)))
+                       (let ((e (and (not (string=? key path))
+                                     (hashtable-ref static-cache key #f))))
+                         (if (and e (= (vector-ref e 0) mt))
+                             (begin (vector-set! e 6 now) e)
+                             (open-entry key mt now))))))))))
 
   ;; open with a timeout that can never leak the fd: the handle comes
   ;; back synchronously, so a timed-out open is closed via its handle
@@ -608,19 +627,21 @@
         (`#(file-stream ,@st ,size) (values st size))
         (`#(file-error ,e) (values #f #f)))))
 
-  (define (open-entry path mt now)
-    (let-values (((st size) (open-stream path)))
+  ;; `key' is the resolved name from static-entry: what gets opened, what
+  ;; the entry is filed under, and what the content type is taken from.
+  (define (open-entry key mt now)
+    (let-values (((st size) (open-stream key)))
       (and st
            (if (<= size max-cache-file)
                (let ((body (stream-read-all st size)))
                  (and body
                       ;; gzip-box holds the lazily-built gzip body
                       (let ((e (vector mt size (etag-of size mt)
-                                       (mime-type path) body (box #f) now)))
-                        (cache-store! path e)
+                                       (mime-type key) body (box #f) now)))
+                        (cache-store! key e)
                         e)))
-               (let ((etag (etag-of size mt)) (ctype (mime-type path)))
-                 (cache-store! path (vector mt size etag ctype 'large #f now))
+               (let ((etag (etag-of size mt)) (ctype (mime-type key)))
+                 (cache-store! key (vector mt size etag ctype 'large #f now))
                  (vector 'stream st size etag ctype))))))
 
   ;; Pump a large file through a fixed-length response from a detached
@@ -758,6 +779,11 @@
                               (compressible-type? ctype)
                               (gzip-acceptable? (req-header req 'accept-encoding))
                               (or (unbox gzbox)
+                                  ;; keyed by the requested name, so this
+                                  ;; caches for the spelling links use and
+                                  ;; merely serves for any other -- which
+                                  ;; also keeps a variant from spending the
+                                  ;; byte budget on a duplicate gzip
                                   (let ((g (gzip-compress body 6)))
                                     (and g (cache-gzip! abs-path e g))))))
                      (tag (if gz (gzip-etag etag) etag)))
