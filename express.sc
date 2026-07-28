@@ -23,7 +23,8 @@
           req-sexpr send-sexpr! app-rpc
           ws-send-sexpr! ws-recv-sexpr sse-send-sexpr!
           send-text! send-html! send-json! send-file!
-          sse-start! sse-send! make-fault-handler)
+          sse-start! sse-send! make-fault-handler
+          static-cache-limits!)
   (import (chezscheme) (igropyr checked)
           (igropyr actor) (igropyr libuv) (igropyr http)
           (igropyr json) (igropyr gzip) (igropyr sexpr)
@@ -505,9 +506,32 @@
   (define stat-window-ms 1000)
   ;; path -> #(mtime size etag content-type body gzip-box last-stat-ms)
   (define static-cache (make-hashtable string-hash string=?))
+  ;; Ceilings on what the cache may hold. Generous by default -- a bound
+  ;; on growth, not a working-set policy; over either one the cache is
+  ;; cleared rather than evicted from, which is why they are set high
+  ;; enough that ordinary serving never reaches them.
   (define max-static-cache-entries 4096)
   (define max-static-cache-bytes (* 64 1024 1024))
   (define static-cache-bytes 0)
+
+  ;; Lower them for a memory-tight deployment, raise them for a host
+  ;; serving a large asset set. #f leaves either alone. Takes effect on
+  ;; the next store; lowering below what is already held simply means the
+  ;; next one clears. Reaching a ceiling is also the only way to observe
+  ;; this behaviour, so a test can ask for numbers it can actually fill
+  ;; instead of writing 64 MiB to prove it.
+  (define (static-cache-limits! entries bytes)
+    (define (check-cap who cap)
+      (unless (and (integer? cap) (exact? cap) (> cap 0))
+        (assertion-violation 'static-cache-limits!
+          (string-append who " cap must be a positive integer") cap)))
+    (when entries
+      (check-cap "entry" entries)
+      (set! max-static-cache-entries entries))
+    (when bytes
+      (check-cap "byte" bytes)
+      (set! max-static-cache-bytes bytes))
+    (void))
 
   (define (entry-bytes e)
     (if (and e (bytevector? (vector-ref e 4)))

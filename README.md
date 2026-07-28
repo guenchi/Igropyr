@@ -245,7 +245,8 @@ demand:
 ;; to 4096 entries and 64 MiB, including cached gzip representations,
 ;; and is keyed by the name the OS resolves to -- so on a case-insensitive
 ;; filesystem the many spellings of one file share one entry instead of
-;; letting a caller mint an entry per spelling.
+;; letting a caller mint an entry per spelling. Both ceilings are
+;; adjustable: (static-cache-limits! entries bytes), #f to leave either.
 (app-static app "/assets" "./public")
 
 ;; enter the scheduler and listen; never returns
