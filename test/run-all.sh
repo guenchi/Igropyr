@@ -52,6 +52,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/protocol-hardening.sc
 "$scheme_bin" --script igropyr/test/http-client-stream.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
+# RESP parsing, both against a fake server so neither needs a live redis:
+# the same value at every split offset, and a fragmented reply parsed in
+# linear rather than quadratic time
+"$scheme_bin" --script igropyr/test/redis-splits.sc
 "$scheme_bin" --script igropyr/test/redis-incremental.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc
 "$scheme_bin" --script igropyr/test/node.sc
