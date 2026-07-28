@@ -38,7 +38,12 @@
 (define case-folding?
   (file-exists? (string-append root "/PROBE.TXT")))
 
-(define one-mib (* 1024 1024))
+(define asset-bytes (* 32 1024))
+;; Four assets' worth of budget: five distinct entries would cross it,
+;; one shared entry does not. Set low so the test can fill it without
+;; writing megabytes to prove a constant.
+(define byte-cap (* 4 asset-bytes))
+(define variants 6)
 
 ;; bit j of k decides the case of the j-th letter -> 2^11 spellings
 (define (spelling k)
@@ -63,11 +68,12 @@
    (let ()
    (write-text (string-append root "/hot.txt") "old")
    (system (string-append "cp -p " root "/hot.txt " root "/stamp"))
-   (write-text (string-append root "/bigasset.bin") (make-string one-mib #\z))
+   (write-text (string-append root "/bigasset.bin") (make-string asset-bytes #\z))
 
    (start-scheduler
      (lambda ()
        (let ((app (create-app)))
+         (static-cache-limits! #f byte-cap)
          (app-static app "/static" root)
          (app-listen app port)
          (sleep-ms 200)
@@ -88,10 +94,10 @@
            (check "and so does a mixed one"
              (equal? "old" (body-of "hOt.TXT")))
 
-           ;; 70 spellings of one 1 MiB file. As separate entries that is
-           ;; 70 MiB, past the byte ceiling, and the hot entry goes with
-           ;; it; as one entry it costs 1 MiB and nothing is evicted.
-           (do ((k 0 (+ k 1))) ((= k 70))
+           ;; Spellings of ONE asset. As separate entries they cross the
+           ;; byte ceiling and take the hot entry with them; as a single
+           ;; shared entry they cost one asset and evict nothing.
+           (do ((k 0 (+ k 1))) ((= k variants))
              (GET (spelling k)))
            (check "a variant flood does not evict the hot entry"
              (equal? "old" (body-of "hot.txt")))))
