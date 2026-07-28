@@ -207,11 +207,18 @@
       (bytevector-copy! bv start r 0 (- end start))
       r))
 
-  ;; first occurrence of needle in bv at or after `from`
-  (define (bv-search bv needle from)
-    ;; MIME boundaries are attacker-selected. KMP keeps repeated prefixes
-    ;; from turning a body-sized scan into quadratic CPU work.
-    (let* ((n (bytevector-length bv))
+  ;; first occurrence of needle in bv at or after `from`, before optional `end`
+  ;; (clamped: an end past the buffer would read off it with no error)
+  ;;
+  ;; KMP, because the needle is a MIME boundary and therefore chosen by the
+  ;; sender. Restarting at every byte costs a factor of the boundary length
+  ;; -- at the 1 MiB body limit a 70-byte all-dash boundary against an
+  ;; all-dash body measures ~100 ms versus ~4 ms here, and that is 100 ms
+  ;; during which the single-threaded scheduler runs nothing else.
+  (define (bv-search bv needle from . rest)
+    (let* ((n (if (pair? rest)
+                  (fxmin (car rest) (bytevector-length bv))
+                  (bytevector-length bv)))
            (m (bytevector-length needle))
            (fallback (make-vector m 0)))
       (when (> m 0)
@@ -236,23 +243,47 @@
               ((> j 0) (scan i (vector-ref fallback (- j 1))))
               (else (scan (+ i 1) 0)))))))
 
+  ;; RFC 2046 bchars, spelled out as ASCII ranges. NOT char-alphabetic? /
+  ;; char-numeric?: those are Unicode-aware here, so they admit characters
+  ;; the grammar does not (char-alphabetic? #\e-acute and char-numeric? on
+  ;; ARABIC-INDIC digits are both true). The boundary is what the delimiter
+  ;; bytes are built from, so accepting more than a conforming sender can
+  ;; emit is exactly the kind of disagreement the anchoring above closes.
+  (define (bchar? c)
+    (or (char<=? #\a c #\z) (char<=? #\A c #\Z) (char<=? #\0 c #\9)
+        (char=? c #\space)
+        (memv c '(#\' #\( #\) #\+ #\_ #\, #\- #\. #\/ #\: #\= #\?))))
+
   ;; boundary=... from a Content-Type header (possibly quoted)
+  (define (valid-boundary? s)
+    (and (fx> (string-length s) 0)
+         (fx<= (string-length s) 70)
+         (not (char=? (string-ref s (- (string-length s) 1)) #\space))
+         (let loop ((i 0))
+           (or (fx= i (string-length s))
+               (and (bchar? (string-ref s i))
+                    (loop (fx+ i 1)))))))
+
   (define (multipart-boundary ct)
     (let ((key "boundary="))
       (let lp ((i 0))
         (cond
           ((> (+ i (string-length key)) (string-length ct)) #f)
-          ((string=? (substring ct i (+ i (string-length key))) key)
+          ((string-ci=? (substring ct i (+ i (string-length key))) key)
            (let* ((start (+ i (string-length key)))
-                  (raw (let scan ((j start))
-                         (if (or (= j (string-length ct))
-                                 (memv (string-ref ct j) '(#\; #\space)))
-                             (substring ct start j)
-                             (scan (+ j 1))))))
-             (if (and (> (string-length raw) 1)
-                      (char=? (string-ref raw 0) #\"))
-                 (substring raw 1 (- (string-length raw) 1))
-                 raw)))
+                  (b (if (and (< start (string-length ct))
+                              (char=? (string-ref ct start) #\"))
+                         (let scan ((j (+ start 1)))
+                           (cond ((= j (string-length ct)) #f)
+                                 ((char=? (string-ref ct j) #\")
+                                  (substring ct (+ start 1) j))
+                                 (else (scan (+ j 1)))))
+                         (let scan ((j start))
+                           (if (or (= j (string-length ct))
+                                   (memv (string-ref ct j) '(#\; #\space #\tab)))
+                               (substring ct start j)
+                               (scan (+ j 1)))))))
+             (and b (valid-boundary? b) b)))
           (else (lp (+ i 1)))))))
 
   ;; "form-data; name=\"a\"; filename=\"b\"" -> value of one attribute
@@ -274,7 +305,7 @@
   ;; parse one multipart part: header block + payload
   ;; -> (name . string-value) or (name . #(file filename content-type bytes))
   (define (parse-part bv start end)
-    (let ((hend (bv-search bv crlf2-bv start)))
+    (let ((hend (bv-search bv crlf2-bv start end)))
       (and hend (<= (+ hend 4) end)
            (let* ((head (utf8->string (bv-sub bv start hend)))
                   (data (bv-sub bv (+ hend 4) end))
@@ -311,9 +342,34 @@
                             (vector 'file filename ctype data)
                             (utf8->string data))))))))
 
+  ;; A MIME delimiter is recognized only at the beginning of a line and
+  ;; only when followed by CRLF or the final "--" suffix. Raw substring
+  ;; matches inside uploaded bytes are ordinary file data.
+  (define (bv-search-delimiter bv delim from)
+    (let ((n (bytevector-length bv)) (m (bytevector-length delim)))
+      (let loop ((from from))
+        (let ((p (bv-search bv delim from)))
+          (and p
+               (let ((after (+ p m)))
+                 (if (and (or (= p 0)
+                              (and (>= p 2)
+                                   (= (bytevector-u8-ref bv (- p 2)) 13)
+                                   (= (bytevector-u8-ref bv (- p 1)) 10)))
+                          (<= (+ after 2) n)
+                          (or (and (= (bytevector-u8-ref bv after) 13)
+                                   (= (bytevector-u8-ref bv (+ after 1)) 10))
+                              (and (= (bytevector-u8-ref bv after) 45)
+                                   (= (bytevector-u8-ref bv (+ after 1)) 45)
+                                   (or (= (+ after 2) n)
+                                       (and (<= (+ after 4) n)
+                                            (= (bytevector-u8-ref bv (+ after 2)) 13)
+                                            (= (bytevector-u8-ref bv (+ after 3)) 10))))))
+                     p
+                     (loop (+ p 1)))))))))
+
   (define (parse-multipart bv boundary)
     (let ((delim (string->utf8 (string-append "--" boundary))))
-      (let lp ((pos (or (bv-search bv delim 0) (bytevector-length bv)))
+      (let lp ((pos (or (bv-search-delimiter bv delim 0) (bytevector-length bv)))
                (acc '()))
         (let ((part-start (+ pos (bytevector-length delim) 2))) ; skip \r\n
           (if (or (> part-start (bytevector-length bv))
@@ -322,7 +378,7 @@
                        (fx= (bytevector-u8-ref bv (+ pos (bytevector-length delim))) 45)
                        (fx= (bytevector-u8-ref bv (+ pos (bytevector-length delim) 1)) 45)))
               (reverse acc)
-              (let ((next (bv-search bv delim part-start)))
+              (let ((next (bv-search-delimiter bv delim part-start)))
                 (if (not next)
                     (reverse acc)
                     (let ((part (parse-part bv part-start (- next 2)))) ; strip \r\n
