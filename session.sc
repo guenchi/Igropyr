@@ -160,6 +160,14 @@
   ;; boundary. A cookie-less request already has a freshly generated,
   ;; unguessable id, so rotating that new id would only emit two competing
   ;; Set-Cookie fields for the same response.
+  ;;
+  ;; IDEMPOTENT within one request: rotating marks the session new, so a
+  ;; second call takes the branch above and returns the id the first one
+  ;; issued, without a second rotation or a second cookie. That is what
+  ;; makes it safe for two layers to each insist on rotating -- neither has
+  ;; to know whether the other already did. It also means a caller cannot
+  ;; use repeated calls to mint successive ids inside one request; there is
+  ;; one identity per request, and this decides what it is.
   (define-checked (session-regenerate! (s session?))
     (if (session-new? s)
         (session-sid s)

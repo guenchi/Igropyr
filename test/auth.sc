@@ -150,6 +150,39 @@
 (app-get app "/late-outcome"
   (lambda (req res) (send-text! res (symbol->string late-outcome))))
 
+;; Rotating twice in one request is idempotent: the first call marks the
+;; session new, so the second returns that same id rather than minting a
+;; competing one. Two layers can each insist on rotating without knowing
+;; about each other.
+(define twice-same? 'unrun)
+(app-get app "/rotate-twice"
+  (lambda (req res)
+    (let* ((s (req-session req))
+           (a (session-regenerate! s))
+           (b (session-regenerate! s)))
+      (set! twice-same? (string=? a b))
+      (send-text! res "done"))))
+
+;; A session handed to a process that outlives the handler must not be
+;; able to rotate against that request's finished response. Nothing
+;; answers here, so the refusal rests on the framework answering for an
+;; unanswered request -- if that ever stops being true, the response token
+;; stays unclaimed, res-answered? stays #f, and the drop goes through with
+;; a cookie no one will ever receive. This pins that dependency.
+(define escaped-outcome 'unrun)
+(app-get app "/escape-rotate"
+  (lambda (req res)
+    (let ((s (req-session req)))
+      (spawn (lambda ()
+               (sleep-ms 300)
+               (set! escaped-outcome
+                 (guard (e (#t 'raised))
+                   (session-regenerate! s)
+                   'returned)))))))
+
+(app-get app "/escape-outcome"
+  (lambda (req res) (send-text! res (symbol->string escaped-outcome))))
+
 ;; unguarded ws route (regression: guards are opt-in)
 (app-ws app "/open"
   (lambda (ws req)
@@ -299,6 +332,41 @@
                   (let ((b (find-substr r "\r\n\r\n")))
                     (and b (substring r (+ b 4) (string-length r)))))))
       (check "late-rotate-keeps-the-live-id"
+        (let ((data (and sid (session-peek store sid))))
+          (and data (equal? (cdr (assq 'preauth data)) "kept")))))
+
+    ;; one identity per request, however many layers ask for it
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (sid (extract-sid seed))
+           (resp (and sid (http-req
+                    (string-append
+                      "GET /rotate-twice HTTP/1.1\r\nHost: x\r\nCookie: sid=" sid
+                      "\r\nConnection: close\r\n\r\n")))))
+      (check "rotate-twice-is-idempotent" (eq? #t twice-same?))
+      (check "rotate-twice-issues-one-cookie"
+        (= 1 (let loop ((i 0) (n 0))
+               (let ((at (find-substr (substring resp i (string-length resp))
+                                      "Set-Cookie")))
+                 (if at (loop (+ i at 10) (+ n 1)) n))))))
+
+    ;; a session that outlives its handler cannot rotate against the
+    ;; finished response
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (sid (extract-sid seed)))
+      (when sid
+        (http-req (string-append
+                    "GET /escape-rotate HTTP/1.1\r\nHost: x\r\nCookie: sid=" sid
+                    "\r\nConnection: close\r\n\r\n")))
+      (sleep-ms 700)
+      (check "escaped-session-rotate-raises"
+        (equal? "raised"
+                (let ((r (http-req
+                           "GET /escape-outcome HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
+                  (let ((b (find-substr r "\r\n\r\n")))
+                    (and b (substring r (+ b 4) (string-length r)))))))
+      (check "escaped-session-rotate-keeps-the-live-id"
         (let ((data (and sid (session-peek store sid))))
           (and data (equal? (cdr (assq 'preauth data)) "kept")))))
 
