@@ -7,7 +7,8 @@
 ;;;   - a peer with the WRONG secret never becomes a node
 ;;;   - rsend to a disconnected node returns #f; to self delivers locally
 
-(import (chezscheme) (igropyr actor) (igropyr node) (igropyr pubsub))
+(import (chezscheme) (igropyr actor) (igropyr libuv)
+        (igropyr node) (igropyr pubsub))
 
 (define port 18091)
 (define secret "test-mesh-secret")
@@ -30,6 +31,22 @@
     (start-pubsub!)
     (register 'main self)
     (monitor-node 'b)
+
+    ;; The pre-auth handshake has one absolute deadline. Dripping a byte
+    ;; before each idle timeout must not hold an unauthenticated fd forever.
+    (tcp-connect! "127.0.0.1" port self)
+    (let ((slow
+            (receive (after 2000 (fail! "slow-handshake-connect"))
+              (`#(tcp-connected ,c) c)
+              (`#(tcp-connect-failed ,e) (fail! "slow-handshake-connect" e)))))
+      (tcp-read-start! slow)
+      (tcp-write! slow (string->utf8 "10\n(") #f)
+      (sleep-ms 4000)
+      (tcp-write! slow (string->utf8 "x") #f)
+      (receive (after 2500 (tcp-close! slow) (fail! "slow-handshake-deadline"))
+        (`#(tcp-eof) 'ok)
+        (`#(tcp-error ,_) 'ok))
+      (display "absolute pre-auth handshake deadline ok\n"))
 
     ;; rsend to an unknown node: #f, no crash
     (unless (eq? #f (rsend 'nowhere 'svc 'x))
