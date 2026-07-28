@@ -821,6 +821,9 @@ order matters (outermost first).
       (send-json! res (list (cons 'visits n))))))
 
 ;; Rotate an established anonymous id when authentication/privilege changes.
+;; Must happen BEFORE the response goes out -- the replacement arrives as a
+;; Set-Cookie header, so afterwards it could not reach the client. Called
+;; on an answered response it raises rather than dropping the live id.
 (app-post app "/login"
   (lambda (req res)
     ;; ...verify the submitted credential first...

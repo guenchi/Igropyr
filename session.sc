@@ -221,6 +221,17 @@
                                                   (number->string max-age)))
                              '()))))
         (define (rotate! old fresh)
+          ;; Once the response is out, set-cookie! still succeeds and still
+          ;; does nothing -- the header it would have written is already on
+          ;; the wire. Dropping the old id anyway would leave the client
+          ;; holding a cookie for a session that no longer exists: silently
+          ;; logged out, with the next request starting over as anonymous.
+          ;; Refuse instead, and refuse BEFORE either effect, so the live
+          ;; id survives a handler that regenerates in the wrong order.
+          (when (res-answered? res)
+            (assertion-violation 'session-regenerate!
+              "response already sent -- the new cookie cannot reach the client; regenerate before answering"
+              old))
           (issue-cookie! fresh)
           (gen-server-cast (store-pid store) (vector 'drop old)))
         (let* ((sid (req-cookie req cname))
