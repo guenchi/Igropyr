@@ -207,9 +207,12 @@
       (bytevector-copy! bv start r 0 (- end start))
       r))
 
-  ;; first occurrence of needle in bv at or after `from`
+  ;; first occurrence of needle in bv at or after `from`, before optional `end`
+  ;; (clamped: an end past the buffer would read off it with no error)
   (define (bv-search bv needle from . rest)
-    (let ((n (if (pair? rest) (car rest) (bytevector-length bv)))
+    (let ((n (if (pair? rest)
+                 (fxmin (car rest) (bytevector-length bv))
+                 (bytevector-length bv)))
           (m (bytevector-length needle)))
       (let outer ((i from))
         (cond
@@ -223,6 +226,17 @@
            i)
           (else (outer (+ i 1)))))))
 
+  ;; RFC 2046 bchars, spelled out as ASCII ranges. NOT char-alphabetic? /
+  ;; char-numeric?: those are Unicode-aware here, so they admit characters
+  ;; the grammar does not (char-alphabetic? #\e-acute and char-numeric? on
+  ;; ARABIC-INDIC digits are both true). The boundary is what the delimiter
+  ;; bytes are built from, so accepting more than a conforming sender can
+  ;; emit is exactly the kind of disagreement the anchoring above closes.
+  (define (bchar? c)
+    (or (char<=? #\a c #\z) (char<=? #\A c #\Z) (char<=? #\0 c #\9)
+        (char=? c #\space)
+        (memv c '(#\' #\( #\) #\+ #\_ #\, #\- #\. #\/ #\: #\= #\?))))
+
   ;; boundary=... from a Content-Type header (possibly quoted)
   (define (valid-boundary? s)
     (and (fx> (string-length s) 0)
@@ -230,12 +244,8 @@
          (not (char=? (string-ref s (- (string-length s) 1)) #\space))
          (let loop ((i 0))
            (or (fx= i (string-length s))
-               (let ((c (string-ref s i)))
-                 (and (or (char-alphabetic? c) (char-numeric? c)
-                          (char=? c #\space)
-                          (memv c '(#\' #\( #\) #\+ #\_ #\, #\- #\.
-                                    #\/ #\: #\= #\?)))
-                      (loop (fx+ i 1))))))))
+               (and (bchar? (string-ref s i))
+                    (loop (fx+ i 1)))))))
 
   (define (multipart-boundary ct)
     (let ((key "boundary="))

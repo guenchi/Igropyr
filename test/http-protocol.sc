@@ -82,10 +82,15 @@
         (error 'http-protocol label "missing response body" response)))
     (display label) (display " ok\n")))
 
+;; Content-Length counts BYTES, not characters: a non-ASCII boundary makes
+;; the two differ, and a short length would truncate the body -- the server
+;; would then find no fields for a reason that has nothing to do with what
+;; the test is asserting.
 (define (multipart-request boundary body)
   (string-append
     "POST /form HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary="
-    boundary "\r\nContent-Length: " (number->string (string-length body))
+    boundary "\r\nContent-Length: "
+    (number->string (bytevector-length (string->utf8 body)))
     "\r\nConnection: close\r\n\r\n" body))
 
 (define (expect-pipelined-empty-trailer)
@@ -207,8 +212,32 @@
                    "--" b "--\r\n")))
       (expect "multipart delimiter anchoring"
         (multipart-request b body) "200" "safe"))
-    (expect "multipart boundary length cap"
-      (multipart-request (make-string 71 #\a) "ignored") "200" "safe")
+    ;; A boundary rejection has to be pinned with a body that WOULD parse,
+    ;; and against a length that would be accepted. With an unparseable body
+    ;; there are no fields either way, so "no role field" is true whether or
+    ;; not the boundary was ever looked at -- the assertion would hold with
+    ;; the length check deleted. One valid body on each side of 70 is what
+    ;; separates the two.
+    (let ((valid-body
+            (lambda (b)
+              (string-append
+                "--" b "\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nuser\r\n"
+                "--" b "--\r\n"))))
+      (let ((b (make-string 70 #\a)))
+        (expect "boundary at the 70-char limit"
+          (multipart-request b (valid-body b)) "200" "user"))
+      (let ((b (make-string 71 #\a)))
+        (expect "boundary over the 70-char limit"
+          (multipart-request b (valid-body b)) "200" "safe"))
+      ;; RFC 2046 bchars are ASCII. char-alphabetic? / char-numeric? are
+      ;; Unicode-aware in Chez, so spelling the set as ranges is what keeps
+      ;; these out.
+      (let ((b "Aa\x00e9;B"))                  ; LATIN SMALL LETTER E WITH ACUTE
+        (expect "non-ASCII boundary rejected"
+          (multipart-request b (valid-body b)) "200" "safe"))
+      (let ((b "Aa\x0663;B"))                  ; ARABIC-INDIC DIGIT THREE
+        (expect "non-ASCII digit boundary rejected"
+          (multipart-request b (valid-body b)) "200" "safe")))
     (let* ((b "Aa B")
            (body (string-append
                    "--" b "\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nuser\r\n"
