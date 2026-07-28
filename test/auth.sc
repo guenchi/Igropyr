@@ -7,7 +7,7 @@
 
 (import (chezscheme) (igropyr http) (igropyr express) (igropyr session)
         (igropyr auth) (igropyr jwt) (igropyr ws-client)
-        (only (igropyr websocket) ws-conn)
+        (only (igropyr websocket) ws-conn ws-send-text! ws-close!)
         (igropyr json) (igropyr sexpr) (igropyr libuv))
 
 (define port 18088)
@@ -86,13 +86,26 @@
                (substring resp (+ at 4) j)
                (scan (+ j 1)))))))
 
+;; One more frame than (igropyr websocket)'s max-fragments accepts. That
+;; constant is library-internal, so the number here has to track it by
+;; hand: if it grows, these frames quietly stop reaching the cap and the
+;; check goes back to passing without exercising anything.
+(define fragment-cap 16384)
+
 (define (zero-fragment-attack)
-  (let* ((frames (+ 1 16384))
-         (out (make-bytevector (* frames 6) 0)))
-    (do ((i 0 (+ i 1))) ((= i frames) out)
+  ;; ... and then ONE final continuation. Without it a server that does not
+  ;; cap simply waits for a frame that never comes while the test waits for
+  ;; a message that never arrives: a regression hangs the suite instead of
+  ;; failing it, which in CI is a burned job timeout with no diagnostic.
+  (let* ((frames (+ 1 fragment-cap))
+         (out (make-bytevector (* (+ frames 1) 6) 0)))
+    (do ((i 0 (+ i 1))) ((= i frames))
       ;; First frame: non-final text; the rest: non-final continuations.
       (bytevector-u8-set! out (* i 6) (if (= i 0) #x01 #x00))
-      (bytevector-u8-set! out (+ (* i 6) 1) #x80))))
+      (bytevector-u8-set! out (+ (* i 6) 1) #x80))
+    (bytevector-u8-set! out (* frames 6) #x80)          ; FIN + continuation
+    (bytevector-u8-set! out (+ (* frames 6) 1) #x80)    ; masked, length 0
+    out))
 
 ;; read one text message from a ws session, then close
 (define (recv-text-and-close w)
@@ -120,7 +133,16 @@
     (ws-send-text! ws "open")
     (ws-recv ws)))
 
-(app-ws app "/sink" (lambda (ws req) (ws-recv ws)))
+;; Answers only if a message actually got assembled and delivered. A bare
+;; close cannot say why it happened -- the cap closing the session and this
+;; handler simply returning look identical from the client, and ws-recv
+;; surfaces no status code -- so the delivery itself has to be what is
+;; observable.
+(app-ws app "/sink"
+  (lambda (ws req)
+    (let ((m (ws-recv ws)))
+      (unless (and (vector? m) (eq? (vector-ref m 0) 'close))
+        (ws-send-text! ws "delivered")))))
 
 ;; token-guarded: claims are the verified JWT claims (string keys)
 (app-ws app "/chat"
@@ -171,13 +193,19 @@
       (equal? (recv-text-and-close
                 (ws-connect "ws://127.0.0.1:18088/open"))
               "open"))
-    ;; Zero-length fragments consume list cells even though message bytes
-    ;; stay at zero. The server must cap their count and close the session.
+    ;; Zero-length fragments consume a list cell and a bytevector each even
+    ;; though the message stays at zero bytes, so the byte cap never fires.
+    ;; The server must cap their COUNT: a close here means it did, because
+    ;; the handler only answers when a message was actually delivered.
     (let ((w (ws-connect "ws://127.0.0.1:18088/sink")))
       (tcp-write! (ws-conn w) (zero-fragment-attack) #f)
       (check "ws-zero-fragment-limit"
         (let ((m (ws-recv w)))
-          (and (vector? m) (eq? (vector-ref m 0) 'close)))))
+          (and (vector? m) (eq? (vector-ref m 0) 'close))))
+      ;; the session outlives the check when the cap is missing; leaving it
+      ;; open takes the rest of the suite down with it, so a failure here
+      ;; stays one failure instead of aborting every check after it
+      (ws-close! w))
 
     ;; token guard: header credential
     (check "ws-token-header"
