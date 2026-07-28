@@ -41,11 +41,29 @@
               (`#(tcp-connect-failed ,e) (fail! "slow-handshake-connect" e)))))
       (tcp-read-start! slow)
       (tcp-write! slow (string->utf8 "10\n(") #f)
-      (sleep-ms 4000)
-      (tcp-write! slow (string->utf8 "x") #f)
-      (receive (after 2500 (tcp-close! slow) (fail! "slow-handshake-deadline"))
-        (`#(tcp-eof) 'ok)
-        (`#(tcp-error ,_) 'ok))
+      ;; Drip a byte every second rather than once. A single drip has to
+      ;; land inside the server's own window to prove anything: if the
+      ;; scheduler drifts past it, the server closes on its own schedule
+      ;; and the check passes against the very code it exists to reject --
+      ;; moving one sleep from 4000 to 5200 was enough to make this report
+      ;; ok against a per-receive timeout. Dripping continuously removes
+      ;; the dependency: a refreshing window outlives the whole loop no
+      ;; matter where individual bytes land, and an absolute deadline is
+      ;; moved by none of them.
+      (let ((t0 (now-ms)))
+        (let loop ((k 0))
+          (if (= k 8)
+              (begin (tcp-close! slow) (fail! "slow-handshake-deadline"))
+              (receive (after 1000
+                          (tcp-write! slow (string->utf8 "x") #f)
+                          (loop (+ k 1)))
+                (`#(tcp-eof) 'ok)
+                (`#(tcp-error ,_) 'ok))))
+        ;; reaching k = 8 already fails; this keeps the check honest if the
+        ;; deadline is ever made longer than the loop
+        (let ((elapsed (- (now-ms) t0)))
+          (when (>= elapsed 7000)
+            (fail! "slow-handshake-deadline-not-absolute" elapsed))))
       (display "absolute pre-auth handshake deadline ok\n"))
 
     ;; rsend to an unknown node: #f, no crash
