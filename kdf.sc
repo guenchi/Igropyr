@@ -13,15 +13,21 @@
 ;;;   stronger algorithm transparently:
 ;;;     (password-hash "pw" 'scrypt '())    ; -> "scrypt$32768$8$1$<salt>$<dk>"
 ;;;     (password-hash "pw" 'pbkdf2 '())    ; -> "pbkdf2-sha256$600000$<salt>$<dk>"
+;;;     (password-hash "pw" 'argon2id '())  ; -> "argon2id$2$19456$1$<salt>$<dk>"
 ;;;     (password-verify "pw" stored)       ; -> #t | #f (constant time)
+;;;
+;;; argon2id needs OpenSSL 3.2+ (Debian 12 and Ubuntu 22.04 ship 3.0, which
+;;; has everything else here). There is no default algorithm, so an older
+;;; libcrypto costs you that one choice, not the module:
+;;;     (kdf-argon2id-available?)           ; -> #t | #f
 ;;;
 ;;; This is the FAST path; (igropyr crypto) keeps a pure-Scheme
 ;;; pbkdf2-hmac-sha256 for environments without libcrypto. scrypt is
 ;;; memory-hard -- meaningfully harder to crack on GPU/ASIC than PBKDF2 --
-;;; which is why it is the sensible default; argon2id joins this module next.
+;;; which is why it is the sensible choice where argon2id is not available.
 
 (library (igropyr kdf)
-  (export kdf-pbkdf2-sha256 kdf-scrypt kdf-argon2id
+  (export kdf-pbkdf2-sha256 kdf-scrypt kdf-argon2id kdf-argon2id-available?
           password-hash password-verify)
   (import (chezscheme) (igropyr platform)
           (only (igropyr crypto) base64-encode base64-decode))
@@ -107,6 +113,21 @@
           (error 'kdf-scrypt "EVP_PBE_scrypt failed (bad N/r/p or over memory cap)"))))
 
   ;; ---- argon2id via EVP_KDF --------------------------------------------
+  ;; ARGON2ID arrived in OpenSSL 3.2, so a 3.0/3.1 libcrypto (Debian 12 and
+  ;; Ubuntu 22.04 ship 3.0) has every other KDF here but not this one. That
+  ;; is a property of the host, not a failure: report it, so a caller can
+  ;; pick a different algorithm and a test can pin what it can actually run
+  ;; instead of taking the whole module down with it. Probed once -- the
+  ;; fetch is a provider lookup, not free.
+  (define kdf-argon2id-available?
+    (let ((cached 'unprobed))
+      (lambda ()
+        (when (eq? cached 'unprobed)
+          (let ((k (_EVP_KDF_fetch 0 "ARGON2ID" 0)))
+            (set! cached (not (zero? k)))
+            (unless (zero? k) (_EVP_KDF_free k))))
+        cached)))
+
   ;; The OSSL_PARAM array is assembled in foreign (C) memory: the key
   ;; strings, the pass/salt copies and the uint cells all live outside the
   ;; Scheme heap, so nothing the array points at can move between building
@@ -156,7 +177,9 @@
         "t/m/p positive fixnums < 2^32 and dk-len > 0" (list t m p dk-len)))
     (let ((out (make-bytevector dk-len))          ; Scheme heap first: an OOM
           (kdf (_EVP_KDF_fetch 0 "ARGON2ID" 0)))  ; here frees nothing native
-      (when (zero? kdf) (error 'kdf-argon2id "ARGON2ID unavailable (need OpenSSL 3.2+)"))
+      (when (zero? kdf)
+        (error 'kdf-argon2id
+          "ARGON2ID unavailable -- this libcrypto predates OpenSSL 3.2 (Debian 12 and Ubuntu 22.04 ship 3.0). Test with kdf-argon2id-available? and use 'scrypt or 'pbkdf2 there"))
       (let ((ctx (_EVP_KDF_CTX_new kdf)))
         (_EVP_KDF_free kdf)
         (when (zero? ctx) (error 'kdf-argon2id "EVP_KDF_CTX_new failed"))
