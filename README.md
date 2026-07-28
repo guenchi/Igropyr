@@ -177,11 +177,6 @@ brew install chezscheme libuv        # macOS
 # apt install chezscheme libuv1-dev zlib1g-dev  # Debian/Ubuntu
 ```
 
-The full suite is run on 9.5.8 in CI, so Debian 12 and Ubuntu 22.04/24.04
-are covered by their packaged Chez. One optional dependency is newer than
-that floor: `(igropyr kdf)`'s argon2id needs OpenSSL 3.2+ (Debian 12 ships
-3.0), and reports its own availability rather than failing the module.
-
 Igropyr selects the platform ABI and loads libuv, zlib, and the system C
 library automatically. Supported Chez machine types are macOS/Linux on
 x86_64 and arm64; an unsupported host fails at import time with a clear error.
