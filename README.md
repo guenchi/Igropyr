@@ -167,7 +167,7 @@ guidelines, see [the manual](https://igropyr.dev/manual.html).
 
 ## Requirements
 
-- Chez Scheme 10.x
+- Chez Scheme 9.5.8 or newer
 - libuv 1.x
 - zlib 1.x
 - macOS or Linux on x86_64/arm64
@@ -176,6 +176,11 @@ guidelines, see [the manual](https://igropyr.dev/manual.html).
 brew install chezscheme libuv        # macOS
 # apt install chezscheme libuv1-dev zlib1g-dev  # Debian/Ubuntu
 ```
+
+The full suite is run on 9.5.8 in CI, so Debian 12 and Ubuntu 22.04/24.04
+are covered by their packaged Chez. One optional dependency is newer than
+that floor: `(igropyr kdf)`'s argon2id needs OpenSSL 3.2+ (Debian 12 ships
+3.0), and reports its own availability rather than failing the module.
 
 Igropyr selects the platform ABI and loads libuv, zlib, and the system C
 library automatically. Supported Chez machine types are macOS/Linux on
@@ -772,6 +777,10 @@ three and a login can rehash to a stronger algorithm transparently.
 (kdf-pbkdf2-sha256 pw salt iterations dk-len)
 (kdf-scrypt        pw salt N r p dk-len)
 (kdf-argon2id      pw salt t m p dk-len)
+
+;; argon2id needs OpenSSL 3.2+; scrypt and pbkdf2 do not. There is no
+;; default algorithm, so an older libcrypto costs you that one choice:
+(kdf-argon2id-available?)                 ; -> #t | #f
 ```
 
 A blocking KDF freezes the single-threaded scheduler for its duration, so
