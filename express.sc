@@ -207,20 +207,27 @@
       (bytevector-copy! bv start r 0 (- end start))
       r))
 
-  ;; first occurrence of needle in bv at or after `from`, before optional `end`
-  ;; (clamped: an end past the buffer would read off it with no error)
+  ;; A searcher bound to one needle -> (searcher bv from [end]), giving the
+  ;; first occurrence at or after `from` and before optional `end` (clamped:
+  ;; an end past the buffer would read off it with no error).
   ;;
   ;; KMP, because the needle is a MIME boundary and therefore chosen by the
   ;; sender. Restarting at every byte costs a factor of the boundary length
   ;; -- at the 1 MiB body limit a 70-byte all-dash boundary against an
   ;; all-dash body measures ~100 ms versus ~4 ms here, and that is 100 ms
   ;; during which the single-threaded scheduler runs nothing else.
-  (define (bv-search bv needle from . rest)
-    (let* ((n (if (pair? rest)
-                  (fxmin (car rest) (bytevector-length bv))
-                  (bytevector-length bv)))
-           (m (bytevector-length needle))
-           (fallback (make-vector m 0)))
+  ;;
+  ;; The failure table depends only on the needle, so it is built once and
+  ;; captured WITH that needle -- the two cannot drift apart. One body is
+  ;; scanned for the same delimiter many times (once per part, plus once
+  ;; more for every match the anchoring check rejects), and a body packed
+  ;; with delimiters that are not at a line start makes those rejections
+  ;; frequent: rebuilding per call adds table work proportional to the whole
+  ;; body, which is the same order as the scan it is supposed to be cheap
+  ;; against.
+  (define (make-bv-searcher needle)
+    (let ((m (bytevector-length needle))
+          (fallback (make-vector (bytevector-length needle) 0)))
       (when (> m 0)
         (let build ((i 1) (j 0))
           (when (< i m)
@@ -231,17 +238,21 @@
                (build (+ i 1) (+ j 1)))
               ((> j 0) (build i (vector-ref fallback (- j 1))))
               (else (build (+ i 1) 0))))))
-      (if (= m 0)
-          (and (<= from n) from)
-          (let scan ((i from) (j 0))
-            (cond
-              ((>= i n) #f)
-              ((fx= (bytevector-u8-ref bv i) (bytevector-u8-ref needle j))
-               (if (= (+ j 1) m)
-                   (- (+ i 1) m)
-                   (scan (+ i 1) (+ j 1))))
-              ((> j 0) (scan i (vector-ref fallback (- j 1))))
-              (else (scan (+ i 1) 0)))))))
+      (lambda (bv from . rest)
+        (let ((n (if (pair? rest)
+                     (fxmin (car rest) (bytevector-length bv))
+                     (bytevector-length bv))))
+          (if (= m 0)
+              (and (<= from n) from)
+              (let scan ((i from) (j 0))
+                (cond
+                  ((>= i n) #f)
+                  ((fx= (bytevector-u8-ref bv i) (bytevector-u8-ref needle j))
+                   (if (= (+ j 1) m)
+                       (- (+ i 1) m)
+                       (scan (+ i 1) (+ j 1))))
+                  ((> j 0) (scan i (vector-ref fallback (- j 1))))
+                  (else (scan (+ i 1) 0)))))))))
 
   ;; RFC 2046 bchars, spelled out as ASCII ranges. NOT char-alphabetic? /
   ;; char-numeric?: those are Unicode-aware here, so they admit characters
@@ -300,12 +311,14 @@
                      (else (scan (+ j 1)))))))
           (else (lp (+ i 1)))))))
 
-  (define crlf2-bv (string->utf8 "\r\n\r\n"))
+  ;; the header/body separator never varies, so its table is built once for
+  ;; the life of the module rather than once per part
+  (define search-crlf2 (make-bv-searcher (string->utf8 "\r\n\r\n")))
 
   ;; parse one multipart part: header block + payload
   ;; -> (name . string-value) or (name . #(file filename content-type bytes))
   (define (parse-part bv start end)
-    (let ((hend (bv-search bv crlf2-bv start end)))
+    (let ((hend (search-crlf2 bv start end)))
       (and hend (<= (+ hend 4) end)
            (let* ((head (utf8->string (bv-sub bv start hend)))
                   (data (bv-sub bv (+ hend 4) end))
@@ -345,10 +358,10 @@
   ;; A MIME delimiter is recognized only at the beginning of a line and
   ;; only when followed by CRLF or the final "--" suffix. Raw substring
   ;; matches inside uploaded bytes are ordinary file data.
-  (define (bv-search-delimiter bv delim from)
+  (define (bv-search-delimiter bv delim search from)
     (let ((n (bytevector-length bv)) (m (bytevector-length delim)))
       (let loop ((from from))
-        (let ((p (bv-search bv delim from)))
+        (let ((p (search bv from)))
           (and p
                (let ((after (+ p m)))
                  (if (and (or (= p 0)
@@ -368,8 +381,10 @@
                      (loop (+ p 1)))))))))
 
   (define (parse-multipart bv boundary)
-    (let ((delim (string->utf8 (string-append "--" boundary))))
-      (let lp ((pos (or (bv-search-delimiter bv delim 0) (bytevector-length bv)))
+    (let* ((delim (string->utf8 (string-append "--" boundary)))
+           (search (make-bv-searcher delim)))
+      (let lp ((pos (or (bv-search-delimiter bv delim search 0)
+                        (bytevector-length bv)))
                (acc '()))
         (let ((part-start (+ pos (bytevector-length delim) 2))) ; skip \r\n
           (if (or (> part-start (bytevector-length bv))
@@ -378,7 +393,7 @@
                        (fx= (bytevector-u8-ref bv (+ pos (bytevector-length delim))) 45)
                        (fx= (bytevector-u8-ref bv (+ pos (bytevector-length delim) 1)) 45)))
               (reverse acc)
-              (let ((next (bv-search-delimiter bv delim part-start)))
+              (let ((next (bv-search-delimiter bv delim search part-start)))
                 (if (not next)
                     (reverse acc)
                     (let ((part (parse-part bv part-start (- next 2)))) ; strip \r\n
