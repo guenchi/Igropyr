@@ -31,6 +31,13 @@
 (define chunk (* 16 1024))                 ; one cached body
 (define byte-cap (* 8 chunk))              ; eight of them
 
+;; One body that fits the normal per-file policy but can never fit this
+;; test's aggregate budget. It must be served without entering the cache.
+(define oversize-bytes (+ byte-cap 1))
+(write-text (string-append root "/oversize.txt")
+  (string-append "A" (make-string (- oversize-bytes 1) #\a)))
+(system (string-append "cp -p " root "/oversize.txt " root "/oversize-stamp"))
+
 ;; One primed entry plus entry-cap distinct inserts crosses the count.
 (do ((i 0 (+ i 1))) ((= i (+ entry-cap 1)))
   (write-text
@@ -69,6 +76,17 @@
                  (http-request 'GET (string-append base name)
                    '((headers . (("Accept-Encoding" . "gzip")))
                      (timeout . 10000))))))
+        (check "serve an entry larger than the byte ceiling"
+          (= 200 (response-status (GET "oversize.txt"))))
+        (delete-file (string-append root "/oversize.txt"))
+        (write-text (string-append root "/oversize.txt")
+          (string-append "B" (make-string (- oversize-bytes 1) #\b)))
+        (system (string-append "touch -r " root "/oversize-stamp "
+                               root "/oversize.txt"))
+        (check "an entry larger than the byte ceiling is not cached"
+          (= (char->integer #\B)
+             (bytevector-u8-ref (response-body (GET "oversize.txt")) 0)))
+
         (check "prime entry-count sentinel"
           (= 200 (response-status (GET "entry-0.txt"))))
         (delete-file (string-append root "/entry-0.txt"))
