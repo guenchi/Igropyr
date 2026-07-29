@@ -268,6 +268,12 @@
                  (s (if data
                         (make-session/fresh sid data #f rotate!)
                         (make-session/fresh (new-sid) '() #t rotate!))))
+            (define (persist!)
+              ;; Persist only what the handler wrote (see store-cast 'put).
+              (when (session-dirty? s)
+                (gen-server-cast (store-pid store)
+                  (vector 'put (session-sid s) (session-touched s)
+                          (session-cleared? s) (store-ttl store)))))
             (req-set-local! req 'session s)
             ;; The cookie must go out with the response headers, i.e. before
             ;; the handler runs, so a new sid is always announced; only the
@@ -276,22 +282,20 @@
               (issue-cookie! (session-sid s)))
             (guard (e
                     (#t
-                     ;; If the handler answered, the client has fresh and its
-                     ;; prepared copy must survive. Otherwise it still has old,
-                     ;; so discard the unannounced copy instead. Then preserve
-                     ;; the handler failure for the normal HTTP supervisor.
+                     ;; An answered response may already have exposed the
+                     ;; session id, so commit every write made before the
+                     ;; failure. If rotation happened, keep fresh and retire
+                     ;; old; otherwise discard the unannounced copy. Then
+                     ;; preserve the handler failure for the HTTP supervisor.
+                     (when (res-answered? res) (persist!))
                      (when rotated-old
                        (if (res-answered? res)
                            (drop! rotated-old)
                            (drop! rotated-fresh)))
                      (raise e)))
               (next)
-              ;; Persist only what the handler wrote (see store-cast 'put).
               ;; Both casts target the same store and are sent in order, so a
               ;; successful rotation commits fresh before invalidating old.
-              (when (session-dirty? s)
-                (gen-server-cast (store-pid store)
-                  (vector 'put (session-sid s) (session-touched s)
-                          (session-cleared? s) (store-ttl store))))
+              (persist!)
               (when rotated-old (drop! rotated-old))))))))
 )

@@ -135,10 +135,12 @@
 
 ;; The response (and therefore the fresh cookie) is already on the wire when
 ;; this handler fails. The fresh store entry must have been prepared before
-;; send-text!, or the client receives an id that cannot be looked up.
+;; send-text!, or the client receives an id that cannot be looked up. Writes
+;; made before the failure must also be committed to that delivered id.
 (app-get app "/login-crash"
   (lambda (req res)
     (session-regenerate! (req-session req))
+    (session-set! (req-session req) 'user "ada")
     (send-text! res "sent")
     (raise 'deliberate-login-crash)))
 
@@ -337,7 +339,8 @@
       (sleep-ms 100)
       (check "failed-handler-keeps-fresh-id-valid"
         (let ((data (and fresh (session-peek store fresh))))
-          (and data (equal? (cdr (assq 'preauth data)) "kept"))))
+          (and data (equal? (cdr (assq 'preauth data)) "kept")
+               (equal? (cdr (assq 'user data)) "ada"))))
       (check "failed-handler-invalidates-delivered-old-id"
         (and old (not (session-peek store old)))))
 
