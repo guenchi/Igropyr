@@ -133,6 +133,15 @@
     (session-set! (req-session req) 'user "ada")
     (send-text! res "ok")))
 
+;; The response (and therefore the fresh cookie) is already on the wire when
+;; this handler fails. The fresh store entry must have been prepared before
+;; send-text!, or the client receives an id that cannot be looked up.
+(app-get app "/login-crash"
+  (lambda (req res)
+    (session-regenerate! (req-session req))
+    (send-text! res "sent")
+    (raise 'deliberate-login-crash)))
+
 ;; the ordering mistake: answer, then rotate. The replacement cookie can no
 ;; longer reach the client, so rotating anyway would drop the live id and
 ;; silently log the user out.
@@ -310,6 +319,27 @@
         (let ((data (and fresh (session-peek store fresh))))
           (and data (equal? (cdr (assq 'preauth data)) "kept")
                (equal? (cdr (assq 'user data)) "ada")))))
+
+    ;; A handler can fail after sending the replacement cookie. Rotation
+    ;; prepares fresh synchronously, so that cookie still names a live session;
+    ;; since the response was sent, old is invalidated on the failure path.
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (old (extract-sid seed))
+           (crashed (and old (http-req
+                       (string-append
+                         "GET /login-crash HTTP/1.1\r\nHost: x\r\nCookie: sid=" old
+                         "\r\nConnection: close\r\n\r\n"))))
+           (fresh (and crashed (extract-sid crashed))))
+      (check "failed-handler-delivers-fresh-id"
+        (and fresh (not (string=? old fresh))
+             (equal? "200" (status-of crashed))))
+      (sleep-ms 100)
+      (check "failed-handler-keeps-fresh-id-valid"
+        (let ((data (and fresh (session-peek store fresh))))
+          (and data (equal? (cdr (assq 'preauth data)) "kept"))))
+      (check "failed-handler-invalidates-delivered-old-id"
+        (and old (not (session-peek store old)))))
 
     ;; Rotating after the response is out must fail loudly rather than
     ;; half-apply: the cookie cannot be delivered, so the id must not be
