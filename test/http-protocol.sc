@@ -244,12 +244,13 @@
                    "--" b "--\r\n")))
       (expect "quoted multipart boundary"
         (multipart-request (string-append "\"" b "\"") body) "200" "user"))
-    ;; Every payload byte begins a near-match for this delimiter, so a
-    ;; restart-at-every-byte search pays the boundary length at each of
-    ;; them. The status alone cannot see that: it stays 200 either way (the
-    ;; naive scan measures ~100 ms, nowhere near a timeout), so the cost is
-    ;; what has to be asserted -- as the cost-bomb checks in test/kdf.sc do.
-    (let* ((pboundary (string-append (make-string 69 #\-) "x"))
+    ;; Every payload byte begins an overlapping FULL match for this all-dash
+    ;; delimiter. The candidates are then rejected by the line/suffix rules.
+    ;; Restarting KMP at candidate+1 repeats the whole 72-byte comparison at
+    ;; every byte; retaining the fallback state keeps the scan linear. The
+    ;; old test ended the boundary in "x", so it covered repeated prefixes
+    ;; but never reached this full-match rejection path.
+    (let* ((pboundary (make-string 70 #\-))
            (pbody (string-append
                     "--" pboundary
                     "\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\n"

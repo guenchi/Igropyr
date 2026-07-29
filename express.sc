@@ -208,9 +208,10 @@
       (bytevector-copy! bv start r 0 (- end start))
       r))
 
-  ;; A searcher bound to one needle -> (searcher bv from [end]), giving the
-  ;; first occurrence at or after `from` and before optional `end` (clamped:
-  ;; an end past the buffer would read off it with no error).
+  ;; A searcher bound to one needle -> (searcher bv from [end [accept?]]),
+  ;; giving the first accepted occurrence at or after `from` and before
+  ;; optional `end` (clamped: an end past the buffer would read off it with
+  ;; no error). accept? is called with each candidate start.
   ;;
   ;; KMP, because the needle is a MIME boundary and therefore chosen by the
   ;; sender. Restarting at every byte costs a factor of the boundary length
@@ -219,13 +220,11 @@
   ;; during which the single-threaded scheduler runs nothing else.
   ;;
   ;; The failure table depends only on the needle, so it is built once and
-  ;; captured WITH that needle -- the two cannot drift apart. One body is
-  ;; scanned for the same delimiter many times (once per part, plus once
-  ;; more for every match the anchoring check rejects), and a body packed
-  ;; with delimiters that are not at a line start makes those rejections
-  ;; frequent: rebuilding per call adds table work proportional to the whole
-  ;; body, which is the same order as the scan it is supposed to be cheap
-  ;; against.
+  ;; captured WITH that needle -- the two cannot drift apart. A rejected
+  ;; candidate resumes from its KMP fallback state in the SAME scan. Starting
+  ;; a fresh search at candidate+1 would compare the entire needle again for
+  ;; every overlapping full match: a 70-dash boundary in an all-dash payload
+  ;; is exactly that CPU amplification path.
   (define (make-bv-searcher needle)
     (let ((m (bytevector-length needle))
           (fallback (make-vector (bytevector-length needle) 0)))
@@ -242,15 +241,21 @@
       (lambda (bv from . rest)
         (let ((n (if (pair? rest)
                      (fxmin (car rest) (bytevector-length bv))
-                     (bytevector-length bv))))
+                     (bytevector-length bv)))
+              (accept? (if (and (pair? rest) (pair? (cdr rest)))
+                           (cadr rest)
+                           (lambda (p) #t))))
           (if (= m 0)
-              (and (<= from n) from)
+              (and (<= from n) (accept? from) from)
               (let scan ((i from) (j 0))
                 (cond
                   ((>= i n) #f)
                   ((fx= (bytevector-u8-ref bv i) (bytevector-u8-ref needle j))
                    (if (= (+ j 1) m)
-                       (- (+ i 1) m)
+                       (let ((p (- (+ i 1) m)))
+                         (if (accept? p)
+                             p
+                             (scan (+ i 1) (vector-ref fallback (- m 1)))))
                        (scan (+ i 1) (+ j 1))))
                   ((> j 0) (scan i (vector-ref fallback (- j 1))))
                   (else (scan (+ i 1) 0)))))))))
@@ -361,25 +366,22 @@
   ;; matches inside uploaded bytes are ordinary file data.
   (define (bv-search-delimiter bv delim search from)
     (let ((n (bytevector-length bv)) (m (bytevector-length delim)))
-      (let loop ((from from))
-        (let ((p (search bv from)))
-          (and p
-               (let ((after (+ p m)))
-                 (if (and (or (= p 0)
-                              (and (>= p 2)
-                                   (= (bytevector-u8-ref bv (- p 2)) 13)
-                                   (= (bytevector-u8-ref bv (- p 1)) 10)))
-                          (<= (+ after 2) n)
-                          (or (and (= (bytevector-u8-ref bv after) 13)
-                                   (= (bytevector-u8-ref bv (+ after 1)) 10))
-                              (and (= (bytevector-u8-ref bv after) 45)
-                                   (= (bytevector-u8-ref bv (+ after 1)) 45)
-                                   (or (= (+ after 2) n)
-                                       (and (<= (+ after 4) n)
-                                            (= (bytevector-u8-ref bv (+ after 2)) 13)
-                                            (= (bytevector-u8-ref bv (+ after 3)) 10))))))
-                     p
-                     (loop (+ p 1)))))))))
+      (search bv from n
+        (lambda (p)
+          (let ((after (+ p m)))
+            (and (or (= p 0)
+                     (and (>= p 2)
+                          (= (bytevector-u8-ref bv (- p 2)) 13)
+                          (= (bytevector-u8-ref bv (- p 1)) 10)))
+                 (<= (+ after 2) n)
+                 (or (and (= (bytevector-u8-ref bv after) 13)
+                          (= (bytevector-u8-ref bv (+ after 1)) 10))
+                     (and (= (bytevector-u8-ref bv after) 45)
+                          (= (bytevector-u8-ref bv (+ after 1)) 45)
+                          (or (= (+ after 2) n)
+                              (and (<= (+ after 4) n)
+                                   (= (bytevector-u8-ref bv (+ after 2)) 13)
+                                   (= (bytevector-u8-ref bv (+ after 3)) 10)))))))))))
 
   (define (parse-multipart bv boundary)
     (let* ((delim (string->utf8 (string-append "--" boundary)))
