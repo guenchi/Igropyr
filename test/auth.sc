@@ -133,6 +133,20 @@
     (session-set! (req-session req) 'user "ada")
     (send-text! res "ok")))
 
+;; Hold an established request open across another request's rotation. Its
+;; eventual write must not recreate the old id after login has retired it.
+(define delayed-write-started? #f)
+(define release-delayed-write? #f)
+(app-get app "/delayed-write"
+  (lambda (req res)
+    (set! delayed-write-started? #t)
+    (let wait ()
+      (unless release-delayed-write?
+        (sleep-ms 10)
+        (wait)))
+    (session-set! (req-session req) 'late "write")
+    (send-text! res "done")))
+
 ;; the ordering mistake: answer, then rotate. The replacement cookie can no
 ;; longer reach the client, so rotating anyway would drop the live id and
 ;; silently log the user out.
@@ -310,6 +324,52 @@
         (let ((data (and fresh (session-peek store fresh))))
           (and data (equal? (cdr (assq 'preauth data)) "kept")
                (equal? (cdr (assq 'user data)) "ada")))))
+
+    ;; A concurrent request can have loaded old before login rotates it. Once
+    ;; login drops old, that request's delayed commit must be ignored instead
+    ;; of recreating an authentication credential the server retired.
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (old (extract-sid seed))
+           (ref (gensym))
+           (caller self))
+      (set! delayed-write-started? #f)
+      (set! release-delayed-write? #f)
+      ;; Pin the seed write before the concurrent request tries to load it.
+      (unless (let wait-live ((n 0))
+                (cond ((and old (session-peek store old)) #t)
+                      ((= n 200) #f)
+                      (else (sleep-ms 10) (wait-live (+ n 1)))))
+        (fail "delayed-write-seed" old))
+      (spawn
+        (lambda ()
+          (send caller
+            (vector 'delayed-result ref
+              (http-req
+                (string-append
+                  "GET /delayed-write HTTP/1.1\r\nHost: x\r\nCookie: sid=" old
+                  "\r\nConnection: close\r\n\r\n"))))))
+      (unless (let wait-started ((n 0))
+                (cond (delayed-write-started? #t)
+                      ((= n 200) #f)
+                      (else (sleep-ms 10) (wait-started (+ n 1)))))
+        (fail "delayed-write-started" 'timeout))
+      (http-req
+        (string-append
+          "GET /login HTTP/1.1\r\nHost: x\r\nCookie: sid=" old
+          "\r\nConnection: close\r\n\r\n"))
+      (unless (let wait-retired ((n 0))
+                (cond ((not (session-peek store old)) #t)
+                      ((= n 200) #f)
+                      (else (sleep-ms 10) (wait-retired (+ n 1)))))
+        (fail "delayed-write-retired" old))
+      (set! release-delayed-write? #t)
+      (receive (after 10000 (fail "delayed-write-result" 'timeout))
+        (`#(delayed-result ,@ref ,resp)
+          (check "delayed-write-completes" (equal? "200" (status-of resp)))))
+      (sleep-ms 100)
+      (check "delayed-write-cannot-resurrect-retired-id"
+        (and old (not (session-peek store old)))))
 
     ;; Rotating after the response is out must fail loudly rather than
     ;; half-apply: the cookie cannot be delivered, so the id must not be
