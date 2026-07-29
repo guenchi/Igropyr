@@ -544,16 +544,20 @@
     (with-interrupts-disabled
       (let ((old (hashtable-ref static-cache path #f)))
         (when old
-          (set! static-cache-bytes (- static-cache-bytes (entry-bytes old))))
+          (set! static-cache-bytes (- static-cache-bytes (entry-bytes old)))
+          (hashtable-delete! static-cache path))
         (let ((n (entry-bytes e)))
-          (when (or (and (not old)
-                         (fx>= (hashtable-size static-cache)
-                               max-static-cache-entries))
-                    (> (+ static-cache-bytes n) max-static-cache-bytes))
-            (hashtable-clear! static-cache)
-            (set! static-cache-bytes 0))
-          (hashtable-set! static-cache path e)
-          (set! static-cache-bytes (+ static-cache-bytes n))))))
+          ;; Clearing cannot make an entry that is larger than the entire
+          ;; byte budget fit. Serve it once, but do not let that single item
+          ;; leave the supposedly hard ceiling exceeded.
+          (unless (> n max-static-cache-bytes)
+            (when (or (fx>= (hashtable-size static-cache)
+                            max-static-cache-entries)
+                      (> (+ static-cache-bytes n) max-static-cache-bytes))
+              (hashtable-clear! static-cache)
+              (set! static-cache-bytes 0))
+            (hashtable-set! static-cache path e)
+            (set! static-cache-bytes (+ static-cache-bytes n)))))))
 
   ;; Cache a lazily generated representation only while the aggregate byte
   ;; budget has room. The caller may still serve g once when it does not.
