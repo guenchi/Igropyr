@@ -547,6 +547,15 @@
           (set! static-cache-bytes (- static-cache-bytes (entry-bytes old)))
           (hashtable-delete! static-cache path))
         (let ((n (entry-bytes e)))
+          ;; A runtime limit reduction takes effect on this store even when
+          ;; the incoming entry itself cannot fit and will be skipped below.
+          ;; Otherwise an already-over-budget cache could survive forever on
+          ;; a workload made entirely of oversized misses.
+          (when (or (> (hashtable-size static-cache)
+                       max-static-cache-entries)
+                    (> static-cache-bytes max-static-cache-bytes))
+            (hashtable-clear! static-cache)
+            (set! static-cache-bytes 0))
           ;; Clearing cannot make an entry that is larger than the entire
           ;; byte budget fit. Serve it once, but do not let that single item
           ;; leave the supposedly hard ceiling exceeded.
