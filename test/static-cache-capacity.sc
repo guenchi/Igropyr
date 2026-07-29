@@ -14,7 +14,10 @@
         (igropyr http) (igropyr http-client))
 
 (define port 18781)
-(define root "/tmp/igropyr-static-cache-capacity")
+;; Relative on purpose: file-realpath returns an absolute cache key. The
+;; request spelling still needs a bounded hot lookup and must address the
+;; same entry when adding a lazy gzip representation.
+(define root "igropyr/test/tmp-static-cache-capacity")
 (define failures 0)
 
 (define (check label ok)
@@ -29,7 +32,9 @@
 
 (define entry-cap 32)
 (define chunk (* 16 1024))                 ; one cached body
-(define byte-cap (* 8 chunk))              ; eight of them
+(define byte-cap (* 9 chunk))              ; all nine plain bodies fit
+
+(write-text (string-append root "/hot.txt") "cached")
 
 ;; One primed entry plus entry-cap distinct inserts crosses the count.
 (do ((i 0 (+ i 1))) ((= i (+ entry-cap 1)))
@@ -69,6 +74,15 @@
                  (http-request 'GET (string-append base name)
                    '((headers . (("Accept-Encoding" . "gzip")))
                      (timeout . 10000))))))
+        ;; A relative root differs from file-realpath's canonical key. The
+        ;; first request spelling is kept hot without creating alias entries.
+        (check "prime relative-root hot entry"
+          (= 200 (response-status (GET "hot.txt"))))
+        (delete-file (string-append root "/hot.txt"))
+        (check "relative-root hit avoids a second filesystem lookup"
+          (equal? "cached"
+                  (utf8->string (response-body (GET "hot.txt")))))
+
         (check "prime entry-count sentinel"
           (= 200 (response-status (GET "entry-0.txt"))))
         (delete-file (string-append root "/entry-0.txt"))
@@ -85,8 +99,12 @@
           (equal? "new"
                   (utf8->string (response-body (GET "entry-0.txt")))))
 
+        ;; Force the count ceiling to clear the preceding small entries, so
+        ;; the byte phase starts with exactly its sentinel body.
+        (static-cache-limits! 1 byte-cap)
         (check "prime byte-count sentinel"
           (= 200 (response-status (GET "byte-0.txt"))))
+        (static-cache-limits! entry-cap byte-cap)
         (delete-file (string-append root "/byte-0.txt"))
         (write-text (string-append root "/byte-0.txt")
           (string-append "B" (substring (filler 0) 1 chunk)))
