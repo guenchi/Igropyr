@@ -504,8 +504,14 @@
   ;; Within the window a hit costs a hashtable lookup and NO syscalls --
   ;; the stat pair (exists? + mtime) dominated cached static serving.
   (define stat-window-ms 1000)
-  ;; path -> #(mtime size etag content-type body gzip-box last-stat-ms)
+  ;; canonical-path ->
+  ;;   #(mtime size etag content-type body gzip-box last-stat-ms
+  ;;     canonical-path hot-path)
   (define static-cache (make-hashtable string-hash string=?))
+  ;; Keep exactly one request spelling hot for each canonical entry. This
+  ;; preserves the no-syscall hit path for relative roots without letting
+  ;; case/symlink aliases multiply full cache entries.
+  (define static-cache-hot (make-hashtable string-hash string=?))
   ;; Ceilings on what the cache may hold. Generous by default -- a bound
   ;; on growth, not a working-set policy; over either one the cache is
   ;; cleared rather than evicted from, which is why they are set high
@@ -544,15 +550,20 @@
     (with-interrupts-disabled
       (let ((old (hashtable-ref static-cache path #f)))
         (when old
-          (set! static-cache-bytes (- static-cache-bytes (entry-bytes old))))
+          (set! static-cache-bytes (- static-cache-bytes (entry-bytes old)))
+          (let ((hot (vector-ref old 8)))
+            (when (eq? (hashtable-ref static-cache-hot hot #f) old)
+              (hashtable-delete! static-cache-hot hot))))
         (let ((n (entry-bytes e)))
           (when (or (and (not old)
                          (fx>= (hashtable-size static-cache)
                                max-static-cache-entries))
                     (> (+ static-cache-bytes n) max-static-cache-bytes))
             (hashtable-clear! static-cache)
+            (hashtable-clear! static-cache-hot)
             (set! static-cache-bytes 0))
           (hashtable-set! static-cache path e)
+          (hashtable-set! static-cache-hot (vector-ref e 8) e)
           (set! static-cache-bytes (+ static-cache-bytes n))))))
 
   ;; Cache a lazily generated representation only while the aggregate byte
@@ -626,7 +637,8 @@
   ;; exist under resolved names, and a request for a variant looks itself
   ;; up rather than storing a second copy.
   (define (static-entry path)
-    (let ((cached (hashtable-ref static-cache path #f))
+    (let ((cached (or (hashtable-ref static-cache-hot path #f)
+                      (hashtable-ref static-cache path #f)))
           (now (now-ms)))
       (if (and cached (< (- now (vector-ref cached 6)) stat-window-ms))
           cached
@@ -639,7 +651,7 @@
                                      (hashtable-ref static-cache key #f))))
                          (if (and e (= (vector-ref e 0) mt))
                              (begin (vector-set! e 6 now) e)
-                             (open-entry key mt now))))))))))
+                             (open-entry key path mt now))))))))))
 
   ;; open with a timeout that can never leak the fd: the handle comes
   ;; back synchronously, so a timed-out open is closed via its handle
@@ -653,19 +665,21 @@
 
   ;; `key' is the resolved name from static-entry: what gets opened, what
   ;; the entry is filed under, and what the content type is taken from.
-  (define (open-entry key mt now)
+  (define (open-entry key hot-path mt now)
     (let-values (((st size) (open-stream key)))
       (and st
            (if (<= size max-cache-file)
                (let ((body (stream-read-all st size)))
                  (and body
                       ;; gzip-box holds the lazily-built gzip body
-                      (let ((e (vector mt size (etag-of size mt)
-                                       (mime-type key) body (box #f) now)))
-                        (cache-store! key e)
-                        e)))
+                       (let ((e (vector mt size (etag-of size mt)
+                                        (mime-type key) body (box #f) now
+                                        key hot-path)))
+                         (cache-store! key e)
+                         e)))
                (let ((etag (etag-of size mt)) (ctype (mime-type key)))
-                 (cache-store! key (vector mt size etag ctype 'large #f now))
+                 (cache-store! key
+                   (vector mt size etag ctype 'large #f now key hot-path))
                  (vector 'stream st size etag ctype))))))
 
   ;; Pump a large file through a fixed-length response from a detached
@@ -809,7 +823,8 @@
                                   ;; also keeps a variant from spending the
                                   ;; byte budget on a duplicate gzip
                                   (let ((g (gzip-compress body 6)))
-                                    (and g (cache-gzip! abs-path e g))))))
+                                    (and g
+                                         (cache-gzip! (vector-ref e 7) e g))))))
                      (tag (if gz (gzip-etag etag) etag)))
                 (set-header! r "ETag" tag)
                 (set-header! r "Cache-Control" "public, max-age=3600")
