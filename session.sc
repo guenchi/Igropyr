@@ -46,7 +46,7 @@
   ;; state: eqv? no -- keys are strings, use string hashtable sid -> (data . expiry)
   (define (store-init) (make-hashtable string-hash string=?))
 
-  ;; sync: get (needs a reply)
+  ;; sync: get / copy (need a reply)
   (define (store-call msg from tbl)
     (case (vector-ref msg 0)
       ((get)
@@ -63,6 +63,19 @@
              (values (map (lambda (kv) (cons (car kv) (cdr kv))) (car entry))
                      tbl)
              (values #f tbl))))
+      ;; Prepare a rotated id before it can be announced to the client.
+      ;; Keep the old id until the middleware knows whether the handler
+      ;; actually answered: a pre-response failure leaves the client on old,
+      ;; while a post-response failure leaves it on this already-live copy.
+      ((copy)
+       (let ((fresh (vector-ref msg 1))
+             (data (vector-ref msg 2))
+             (ttl (vector-ref msg 3)))
+         ;; Copy the pairs: session-set! mutates the request-local alist.
+         (hashtable-set! tbl fresh
+           (cons (map (lambda (kv) (cons (car kv) (cdr kv))) data)
+                 (+ (now-ms) ttl)))
+         (values #t tbl)))
       (else (values 'bad-request tbl))))
 
   ;; async: put / drop / prune (no reply needed)
@@ -174,10 +187,12 @@
         (let ((old (session-sid s)) (fresh (new-sid)))
           ;; Issue the replacement cookie before mutating the object; a bad
           ;; middleware option must fail without invalidating the live id.
-          ((session-rotate s) old fresh)
+          ((session-rotate s) old fresh (session-data s))
           (session-sid-set! s fresh)
           (session-new?-set! s #t)
-          ;; The new store entry starts empty, so persist the full snapshot.
+          ;; The prepared store entry has the pre-rotation snapshot; mark the
+          ;; final commit as a full replacement so later handler writes are
+          ;; applied to exactly this request's state.
           (session-touched-set! s
             (map (lambda (kv) (cons (car kv) (cdr kv))) (session-data s)))
           (session-cleared?-set! s #t)
@@ -218,46 +233,65 @@
            (max-age (opt o 'max-age #f))
            (secure? (opt o 'secure #t)))
       (lambda (req res next)
-        (define (issue-cookie! sid)
-          (apply set-cookie! res cname sid
-                 (string-append "Path=" path)
-                 "HttpOnly"
-                 (string-append "SameSite=" same-site)
-                 (append (if secure? '("Secure") '())
-                         (if max-age
-                             (list (string-append "Max-Age="
-                                                  (number->string max-age)))
-                             '()))))
-        (define (rotate! old fresh)
-          ;; Once the response is out, set-cookie! still succeeds and still
-          ;; does nothing -- the header it would have written is already on
-          ;; the wire. Dropping the old id anyway would leave the client
-          ;; holding a cookie for a session that no longer exists: silently
-          ;; logged out, with the next request starting over as anonymous.
-          ;; Refuse instead, and refuse BEFORE either effect, so the live
-          ;; id survives a handler that regenerates in the wrong order.
-          (when (res-answered? res)
-            (assertion-violation 'session-regenerate!
-              "response already sent -- the new cookie cannot reach the client; regenerate before answering"
-              old))
-          (issue-cookie! fresh)
-          (gen-server-cast (store-pid store) (vector 'drop old)))
-        (let* ((sid (req-cookie req cname))
-               (data (and sid (gen-server-call (store-pid store)
-                                (vector 'get sid))))
-               (s (if data
-                      (make-session/fresh sid data #f rotate!)
-                      (make-session/fresh (new-sid) '() #t rotate!))))
-          (req-set-local! req 'session s)
-          ;; The cookie must go out with the response headers, i.e. before
-          ;; the handler runs, so a new sid is always announced; only the
-          ;; STORE entry waits for an actual write.
-          (when (session-new? s)
-            (issue-cookie! (session-sid s)))
-          (next)
-          ;; persist only what the handler wrote (see store-cast 'put)
-          (when (session-dirty? s)
-            (gen-server-cast (store-pid store)  ; async: don't block the response
-              (vector 'put (session-sid s) (session-touched s)
-                      (session-cleared? s) (store-ttl store))))))))
+        (let ((rotated-old #f) (rotated-fresh #f))
+          (define (issue-cookie! sid)
+            (apply set-cookie! res cname sid
+                   (string-append "Path=" path)
+                   "HttpOnly"
+                   (string-append "SameSite=" same-site)
+                   (append (if secure? '("Secure") '())
+                           (if max-age
+                               (list (string-append "Max-Age="
+                                                    (number->string max-age)))
+                               '()))))
+          (define (drop! sid)
+            (gen-server-cast (store-pid store) (vector 'drop sid)))
+          (define (rotate! old fresh data)
+            ;; Once the response is out, set-cookie! still succeeds and still
+            ;; does nothing -- the header it would have written is already on
+            ;; the wire. Refuse before changing either side.
+            (when (res-answered? res)
+              (assertion-violation 'session-regenerate!
+                "response already sent -- the new cookie cannot reach the client; regenerate before answering"
+                old))
+            (issue-cookie! fresh)
+            ;; Synchronous: session-regenerate! cannot return (and the handler
+            ;; cannot send the cookie) until fresh is a valid store entry.
+            ;; old deliberately stays live until next either returns or fails.
+            (gen-server-call (store-pid store)
+              (vector 'copy fresh data (store-ttl store)))
+            (set! rotated-old old)
+            (set! rotated-fresh fresh))
+          (let* ((sid (req-cookie req cname))
+                 (data (and sid (gen-server-call (store-pid store)
+                                  (vector 'get sid))))
+                 (s (if data
+                        (make-session/fresh sid data #f rotate!)
+                        (make-session/fresh (new-sid) '() #t rotate!))))
+            (req-set-local! req 'session s)
+            ;; The cookie must go out with the response headers, i.e. before
+            ;; the handler runs, so a new sid is always announced; only the
+            ;; STORE entry waits for an actual write.
+            (when (session-new? s)
+              (issue-cookie! (session-sid s)))
+            (guard (e
+                    (#t
+                     ;; If the handler answered, the client has fresh and its
+                     ;; prepared copy must survive. Otherwise it still has old,
+                     ;; so discard the unannounced copy instead. Then preserve
+                     ;; the handler failure for the normal HTTP supervisor.
+                     (when rotated-old
+                       (if (res-answered? res)
+                           (drop! rotated-old)
+                           (drop! rotated-fresh)))
+                     (raise e)))
+              (next)
+              ;; Persist only what the handler wrote (see store-cast 'put).
+              ;; Both casts target the same store and are sent in order, so a
+              ;; successful rotation commits fresh before invalidating old.
+              (when (session-dirty? s)
+                (gen-server-cast (store-pid store)
+                  (vector 'put (session-sid s) (session-touched s)
+                          (session-cleared? s) (store-ttl store))))
+              (when rotated-old (drop! rotated-old))))))))
 )
