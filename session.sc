@@ -68,26 +68,32 @@
   ;; async: put / drop / prune (no reply needed)
   (define (store-cast msg tbl)
     (case (vector-ref msg 0)
-      ;; #(put sid delta cleared? ttl): MERGE the keys this request
+      ;; #(put sid delta cleared? ttl create?): MERGE the keys this request
       ;; actually touched into whatever the store holds now, rather than
       ;; overwriting with a snapshot taken before the handler ran. Two
       ;; concurrent requests on one sid both read the same starting data;
       ;; a whole-alist write would silently drop the first one's fields.
+      ;; An established request may update only an id that is still live:
+      ;; after rotation drops old, an in-flight request on old must not be
+      ;; able to recreate that retired bearer credential.
       ((put)
        (let* ((sid (vector-ref msg 1))
               (delta (vector-ref msg 2))
               (cleared? (vector-ref msg 3))
-              (entry (hashtable-ref tbl sid #f))
-              (base (if (or cleared? (not entry) (<= (cdr entry) (now-ms)))
-                        '()
-                        (car entry)))
-              (merged (fold-left
-                        (lambda (acc kv)
-                          (cons kv (remp (lambda (p) (eq? (car p) (car kv)))
-                                         acc)))
-                        base delta)))
-         (hashtable-set! tbl sid
-           (cons merged (+ (now-ms) (vector-ref msg 4))))))
+              (entry (hashtable-ref tbl sid #f)))
+         (when (or entry (vector-ref msg 5))
+           (let* ((base (if (or cleared? (not entry)
+                               (<= (cdr entry) (now-ms)))
+                            '()
+                            (car entry)))
+                  (merged (fold-left
+                            (lambda (acc kv)
+                              (cons kv
+                                (remp (lambda (p) (eq? (car p) (car kv)))
+                                      acc)))
+                            base delta)))
+             (hashtable-set! tbl sid
+               (cons merged (+ (now-ms) (vector-ref msg 4))))))))
       ((drop) (hashtable-delete! tbl (vector-ref msg 1)))
       ((prune)
        (let ((now (now-ms)))
@@ -259,5 +265,6 @@
           (when (session-dirty? s)
             (gen-server-cast (store-pid store)  ; async: don't block the response
               (vector 'put (session-sid s) (session-touched s)
-                      (session-cleared? s) (store-ttl store))))))))
+                      (session-cleared? s) (store-ttl store)
+                      (session-new? s))))))))
 )
