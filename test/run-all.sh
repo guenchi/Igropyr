@@ -61,6 +61,8 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # linear rather than quadratic time
 "$scheme_bin" --script igropyr/test/redis-splits.sc
 "$scheme_bin" --script igropyr/test/redis-incremental.sc
+# ceilings on what a reply may cost, each case lowering the one it tests
+"$scheme_bin" --script igropyr/test/redis-limits.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc
 "$scheme_bin" --script igropyr/test/static-cache-capacity.sc
 # one file must be one cache entry: self-skips on a case-sensitive

@@ -1,10 +1,22 @@
 #!chezscheme
-;;; RESP byte, item, depth, and line ceilings against a hostile server.
+;;; RESP byte, item, depth and line ceilings against a hostile server.
+;;;
+;;; Each case lowers the ceiling it is about to something it can reach,
+;;; instead of building a reply large enough to hit the shipped default.
+;;; The defaults sit where no legitimate Redis reply arrives -- LRANGE and
+;;; SMEMBERS return hundreds of thousands of elements, and one value may be
+;;; 512 MiB -- so testing them at face value would mean sending half a
+;;; gigabyte to prove a constant.
+;;;
+;;; Each case asserts the ceiling is enforced AND that the failure is a
+;;; protocol error rather than a hang or a wrong value: a malformed reply
+;;; desynchronises the stream, so the only correct outcome is to tell every
+;;; waiter and drop the connection.
 
 (import (chezscheme) (igropyr actor) (igropyr libuv)
         (igropyr redis) (igropyr util))
 
-(define port 18813)
+(define port 18815)
 (define failures 0)
 (define responses '())
 
@@ -62,26 +74,47 @@
       (redis-close! r)
       v)))
 
+;; (label tighten reply expected-fragment)
+(define cases
+  (list
+    (list "oversized bulk declaration"
+          (lambda () (redis-set-limits! 1024 #f #f #f #f))
+          "$1025\r\n"
+          "bulk reply too large")
+    (list "oversized array declaration"
+          (lambda () (redis-set-limits! #f 8 #f #f #f))
+          "*9\r\n"
+          "array reply too large")
+    (list "excessive reply nesting"
+          (lambda () (redis-set-limits! #f #f #f 4 #f))
+          (deep-reply 5)
+          "reply nesting too deep")
+    (list "unterminated reply line"
+          (lambda () (redis-set-limits! #f #f #f #f 64))
+          (string-append "+" (make-string 100 #\a))
+          "reply line too long")
+    (list "aggregate reply item cap"
+          ;; every element is legal on its own and the array is well inside
+          ;; its own ceiling: only the running total refuses this one
+          (lambda () (redis-set-limits! #f 1000 4 #f #f))
+          (array-reply 8 "*0\r\n")
+          "reply has too many items")))
+
 (start-scheduler
   (lambda ()
-    (set! responses
-      (list "$16777217\r\n"
-            "*65537\r\n"
-            (deep-reply 65)
-            (string-append "+" (make-string 1025 #\a))
-            (array-reply 65536 "*0\r\n")))
+    (set! responses (map caddr cases))
     (start-server!)
     (sleep-ms 100)
     (for-each
-      (lambda (case)
+      (lambda (c)
+        ;; back to generous first, then tighten only the ceiling under
+        ;; test: no case may pass because an earlier one left one low
+        (redis-set-limits! (* 512 1024 1024) 4000000 8000000 64 1024)
+        ((cadr c))
         (let ((msg (redis-error-message one-call)))
-          (check (car case)
-            (and (string? msg) (string-contains? msg (cdr case))))))
-      '(("oversized bulk declaration" . "bulk reply too large")
-        ("oversized array declaration" . "array reply too large")
-        ("excessive reply nesting" . "reply nesting too deep")
-        ("unterminated reply line" . "reply line too long")
-        ("aggregate reply item cap" . "reply has too many items")))
+          (check (car c)
+            (and (string? msg) (string-contains? msg (cadddr c))))))
+      cases)
     (if (zero? failures)
         (begin (display "redis-limits: all tests passed\n") (exit 0))
         (begin (display failures) (display " failures\n") (exit 1)))))
