@@ -651,6 +651,19 @@
   (define keep-alive-tail "\r\nConnection: keep-alive\r\n\r\n")
   (define close-tail "\r\nConnection: close\r\n\r\n")
 
+  ;; 1xx, 204 and 304 are defined as bodyless: a client stops at the blank
+  ;; line whatever follows it, so writing a body desynchronises a persistent
+  ;; connection exactly the way a body on a HEAD does (RFC 9110 6.4.1/15.4.5).
+  (define (status-forbids-body? status)
+    (or (and (fx>= status 100) (fx< status 200))
+        (fx= status 204) (fx= status 304)))
+
+  ;; Narrower than the above on purpose: Content-Length is forbidden on 1xx
+  ;; and 204, but a 304 MAY carry the length the corresponding 200 would
+  ;; have had -- it is metadata there, not framing (RFC 9110 8.6/15.4.5).
+  (define (status-forbids-length? status)
+    (or (and (fx>= status 100) (fx< status 200)) (fx= status 204)))
+
   ;; Write a full response after its caller has claimed the request token.
   ;; The libuv write callback (no yielding) tells the reader to continue
   ;; (keep-alive) or closes the connection.
@@ -666,13 +679,17 @@
   ;; declare THAT length (a HEAD for a file too large to read into memory,
   ;; where the size is known but the bytes must not be).
   (define (write-response!* c status headers body ka head-only)
-    (let* ((head
-              (assemble-head status headers
-                "Content-Length: "
-                (number->string (if (integer? head-only)
-                                    head-only
-                                    (bytevector-length body)))
-                (if ka keep-alive-tail close-tail)))
+    (let* ((suppress-body? (or head-only (status-forbids-body? status)))
+           (head
+              (if (status-forbids-length? status)
+                  (assemble-head status headers
+                    (if ka keep-alive-tail close-tail))
+                  (assemble-head status headers
+                    "Content-Length: "
+                    (number->string (if (integer? head-only)
+                                        head-only
+                                        (bytevector-length body)))
+                    (if ka keep-alive-tail close-tail))))
              (owner (conn-owner c))
              (done (lambda (st)
                      (if (and ka (>= st 0))
@@ -681,7 +698,7 @@
                            (tcp-close! c)
                            (send owner (vector 'conn-closed)))))))
         ;; head and body are written as two segments -- no bv-append copy
-        (if head-only
+        (if suppress-body?
             (tcp-writev! c (list (string->utf8 head)) done)
             (tcp-writev! c (list (string->utf8 head) body) done))))
 
@@ -816,17 +833,31 @@
   (define (res-begin! r)
     (let ((c (res-conn r)) (snapshot (claim-res! r)))
       (when snapshot
-        (let ((raw? (res-http10? r)))
-          (res-mode-set! r (if raw? 'streaming-raw 'streaming))
-          (tcp-write! c
-            (string->utf8
-              (assemble-head (vector-ref snapshot 0) (vector-ref snapshot 1)
-                (cond
-                  (raw? close-delimited-tail)
-                  ((res-keep-alive? r) chunked-keep-alive-tail)
-                  (else chunked-close-tail))))
-            #f))
-        (send (conn-owner c) (vector 'streaming)))))
+        (let ((status (vector-ref snapshot 0)) (headers (vector-ref snapshot 1)))
+          ;; Branch on the SNAPSHOT, not on (res-status r): claim-res! pairs
+          ;; the claim with the status/header read under one interrupt-free
+          ;; window, and re-reading here would reopen the gap it closes.
+          (if (status-forbids-body? status)
+              ;; No chunked framing for a status that cannot carry a body --
+              ;; announcing Transfer-Encoding and then sending the terminator
+              ;; is itself a body. Answer it as a complete response and leave
+              ;; the mode 'done, so res-write! returns #f and res-end! is a
+              ;; no-op: a handler written as begin/write/end still terminates.
+              (begin
+                (res-mode-set! r 'done)
+                (write-response!* c status headers
+                                  empty-bv (res-keep-alive? r) #t))
+              (let ((raw? (res-http10? r)))
+                (res-mode-set! r (if raw? 'streaming-raw 'streaming))
+                (tcp-write! c
+                  (string->utf8
+                    (assemble-head status headers
+                      (cond
+                        (raw? close-delimited-tail)
+                        ((res-keep-alive? r) chunked-keep-alive-tail)
+                        (else chunked-close-tail))))
+                  #f)
+                (send (conn-owner c) (vector 'streaming))))))))
 
   ;; Write one chunk (string or bytevector). #f when the stream is not
   ;; open any more (e.g. the client disconnected) -- stop the loop then.
@@ -913,15 +944,25 @@
   (define (res-begin-file! r len)
     (let ((c (res-conn r)) (snapshot (claim-res! r)))
       (when snapshot
-        (res-mode-set! r 'raw)
-        (res-remaining-set! r len)
-        (tcp-write! c
-          (string->utf8
-            (assemble-head (vector-ref snapshot 0) (vector-ref snapshot 1)
-              "Content-Length: " (number->string len)
-              (if (res-keep-alive? r) keep-alive-tail close-tail)))
-          #f)
-        (send (conn-owner c) (vector 'streaming)))))
+        (let ((status (vector-ref snapshot 0)) (headers (vector-ref snapshot 1)))
+          (if (status-forbids-body? status)
+              ;; Passing len as head-only keeps the declared length of the
+              ;; representation while sending none of it -- which is exactly
+              ;; what a 304 wants, and is dropped outright for 204 and 1xx.
+              (begin
+                (res-mode-set! r 'done)
+                (write-response!* c status headers
+                                  empty-bv (res-keep-alive? r) len))
+              (begin
+                (res-mode-set! r 'raw)
+                (res-remaining-set! r len)
+                (tcp-write! c
+                  (string->utf8
+                    (assemble-head status headers
+                      "Content-Length: " (number->string len)
+                      (if (res-keep-alive? r) keep-alive-tail close-tail)))
+                  #f)
+                (send (conn-owner c) (vector 'streaming))))))))
 
   ;; Write one chunk and wait for it to drain before returning --
   ;; backpressure: the producer runs exactly at the client's pace, one

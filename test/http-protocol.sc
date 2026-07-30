@@ -125,6 +125,20 @@
     ((string=? (req-path req) "/form")
      (let ((role (assoc "role" (req-form req))))
        (res-send! res (string->utf8 (if role (cdr role) "safe")))))
+    ((string=? (req-path req) "/status204")
+     (set-status! res 204)
+     (res-send! res (string->utf8 "forbidden-body-204")))
+    ((string=? (req-path req) "/status304")
+     (set-status! res 304)
+     (res-send! res (string->utf8 "forbidden-body-304")))
+    ;; The streaming writers are a separate path to the same wire, and the
+    ;; one where a bodyless status is easiest to get wrong: announcing
+    ;; chunked and then sending the terminator is itself a body.
+    ((string=? (req-path req) "/stream204")
+     (set-status! res 204)
+     (res-begin! res)
+     (res-write! res "forbidden-stream-204")
+     (res-end! res))
     (else (res-send! res (req-body req)))))
 
 (start-scheduler
@@ -281,6 +295,62 @@
       (let ((ms (- (real-time) t0)))
         (unless (< ms 50)
           (error 'http-protocol "repeated-prefix search too slow (ms)" ms))))
+    ;; Handler-provided bytes are suppressed for bodyless status codes.
+    (let ((r (raw-request
+               "GET /status204 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
+      (unless (and (string-contains? r "HTTP/1.1 204 ")
+                   (not (string-contains? r "forbidden-body-204"))
+                   (not (string-contains? r "Content-Length:")))
+        (error 'http-protocol "204 response carried a body/framing" r))
+      (display "204 body suppression ok\n"))
+    (let ((r (raw-request
+               "GET /status304 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
+      (unless (and (string-contains? r "HTTP/1.1 304 ")
+                   (not (string-contains? r "forbidden-body-304")))
+        (error 'http-protocol "304 response carried a body" r))
+      (display "304 body suppression ok\n"))
+    ;; Suppression is only half of it: what makes a body on a bodyless
+    ;; status dangerous is that the client stops at the blank line, so the
+    ;; bytes leak into the NEXT response on a kept-alive connection. Both
+    ;; cases above use Connection: close, where that cannot show. Pipeline
+    ;; a second request behind the bodyless one and require both replies.
+    (let ((r (raw-request
+               (string-append
+                 "GET /status204 HTTP/1.1\r\nHost: x\r\n\r\n"
+                 "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+                 "Connection: close\r\n\r\nafter"))))
+      (unless (and (string-contains? r "HTTP/1.1 204 ")
+                   (string-contains? r "HTTP/1.1 200 ")
+                   (string-contains? r "after")
+                   (not (string-contains? r "forbidden-body-204")))
+        (error 'http-protocol "204 desynchronised the connection" r))
+      (display "204 keep-alive framing ok\n"))
+    (let ((r (raw-request
+               (string-append
+                 "GET /status304 HTTP/1.1\r\nHost: x\r\n\r\n"
+                 "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+                 "Connection: close\r\n\r\nafter"))))
+      (unless (and (string-contains? r "HTTP/1.1 304 ")
+                   (string-contains? r "HTTP/1.1 200 ")
+                   (string-contains? r "after")
+                   (not (string-contains? r "forbidden-body-304")))
+        (error 'http-protocol "304 desynchronised the connection" r))
+      (display "304 keep-alive framing ok\n"))
+    ;; res-begin!/res-write!/res-end! on a bodyless status: no chunked
+    ;; framing may be announced and the handler's writes must vanish, with
+    ;; the connection still usable afterwards.
+    (let ((r (raw-request
+               (string-append
+                 "GET /stream204 HTTP/1.1\r\nHost: x\r\n\r\n"
+                 "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+                 "Connection: close\r\n\r\nafter"))))
+      (unless (and (string-contains? r "HTTP/1.1 204 ")
+                   (not (string-contains? r "forbidden-stream-204"))
+                   (not (string-contains? r "Transfer-Encoding"))
+                   (string-contains? r "HTTP/1.1 200 ")
+                   (string-contains? r "after"))
+        (error 'http-protocol "streamed 204 carried a body or framing" r))
+      (display "streamed 204 suppression ok\n"))
     ;; ---- configurable body-limit -----------------------------------
     ;; PROCESS-GLOBAL (last http-listen wins), so these run LAST: the
     ;; second listen lowers the limit for every server in this process.
