@@ -214,6 +214,16 @@
     (ws-recv ws))
   (session-guard store))
 
+;; Same credential, with an origin allow-list. The cookie is attached by
+;; the browser whatever page opened the socket, and the same-origin policy
+;; does not apply to WebSockets, so this is the only thing standing between
+;; a hostile page and an authenticated session.
+(app-ws app "/feed-origin"
+  (lambda (ws req)
+    (ws-send-text! ws "ok")
+    (ws-recv ws))
+  (session-guard store '((origins . ("https://app.example")))))
+
 ;; token-guarded sexpr RPC: refusal is sexpr data; two-argument
 ;; handlers see the request (claims), one-argument ones work as before
 (app-rpc app "/rpc"
@@ -392,6 +402,32 @@
       (check "escaped-session-rotate-keeps-the-live-id"
         (let ((data (and sid (session-peek store sid))))
           (and data (equal? (cdr (assq 'preauth data)) "kept")))))
+
+    ;; Cross-site WebSocket hijacking: a page on another origin can open
+    ;; this socket and the browser attaches the session cookie regardless.
+    ;; With an allow-list the foreign origin must be refused BEFORE the
+    ;; handshake, and the configured one must still get through.
+    (let* ((login (http-req "GET /login HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (sid (extract-sid login))
+           (upgrade
+             (lambda (origin)
+               (status-of
+                 (http-req
+                   (string-append
+                     "GET /feed-origin HTTP/1.1\r\nHost: x\r\n"
+                     "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                     "Sec-WebSocket-Version: 13\r\n"
+                     (if origin (string-append "Origin: " origin "\r\n") "")
+                     "Cookie: sid=" sid "\r\n\r\n"))))))
+      (unless sid (fail "origin-login" login))
+      (check "ws-origin-allowed" (equal? "101" (upgrade "https://app.example")))
+      (check "ws-origin-foreign-refused"
+        (not (equal? "101" (upgrade "http://evil.example"))))
+      ;; no Origin at all is a non-browser client, which cannot be carrying
+      ;; somebody else's cookie -- refusing it would lock out every ordinary
+      ;; WebSocket library without closing anything
+      (check "ws-origin-absent-allowed" (equal? "101" (upgrade #f))))
 
     ;; session guard: log in over HTTP, ride the cookie into the upgrade
     (let* ((login (http-req "GET /login HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))

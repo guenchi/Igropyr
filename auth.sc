@@ -120,16 +120,47 @@
   ;; returning it would authenticate any session that merely exists --
   ;; and a session store holds sessions that were never logged in.
   ;; "Has a session" is not "is authenticated".
+  ;;
+  ;; ORIGIN. This is the one guard whose credential the browser attaches by
+  ;; itself, and the same-origin policy does not cover WebSockets: a page on
+  ;; any site can open a socket to this app and the browser sends the
+  ;; session cookie with it. Nothing else stops that -- checking Origin is
+  ;; the only defence, which is why RFC 6455 leaves it a MAY and why it
+  ;; stops being optional the moment a cookie is the credential.
+  ;;
+  ;;   (session-guard store '((origins . ("https://app.example"))))
+  ;;   (session-guard store `((origins . ,(lambda (o) ...))))
+  ;;
+  ;; A list is matched exactly; a procedure receives the header value (or
+  ;; #f when absent) and answers. UNSET MEANS ANY ORIGIN IS ACCEPTED, which
+  ;; is only safe where no browser can reach the port.
+  ;;
+  ;; A missing Origin is allowed even when the list is set: browsers always
+  ;; send one on an upgrade, so its absence means a non-browser client --
+  ;; and a non-browser client is not carrying somebody else's cookie, which
+  ;; is the entire threat. Refusing it would lock out every ordinary
+  ;; WebSocket library without closing anything.
   (define (session-guard store . rest)
     (unless (vector? store)
       (assertion-violation 'session-guard "store must be a session store" store))
     (let* ((o (if (pair? rest) (car rest) '()))
            (cname (opt o 'cookie "sid"))
-           (key (opt o 'key #f)))
+           (key (opt o 'key #f))
+           (origins (opt o 'origins #f)))
+      (unless (or (not origins) (procedure? origins)
+                  (and (list? origins) (for-all string? origins)))
+        (assertion-violation 'session-guard
+          "'origins must be a list of strings or a procedure" origins))
       (lambda (req)
         (let* ((sid (req-cookie req cname))
-               (data (and sid (session-peek store sid))))
+               (data (and sid (session-peek store sid)))
+               (origin (req-header req 'origin)))
           (and (pair? data)                     ; live AND non-empty
                (or (not key) (assq key data))
+               (cond
+                 ((not origins) #t)
+                 ((procedure? origins) (origins origin))
+                 ((not origin) #t)              ; not a browser: see above
+                 (else (and (member origin origins) #t)))
                data)))))
 )
