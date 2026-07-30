@@ -78,6 +78,40 @@
           (fail "owner-cleanup leaked a connection"))))
     (display "owner resource cleanup ok\n")
 
+    ;; A connect that completes after its owner died is the worse half of
+    ;; the same leak: on-connect would root a conn in conn-table under a
+    ;; dead pid, and no later uv-owner-died! can reach it -- that pid's
+    ;; teardown has already run. Nothing but the VM exit frees it.
+    ;;
+    ;; tcp-connect! takes the owner as an argument, so the request can be
+    ;; put in flight and the owner killed within one scheduler turn: spawn,
+    ;; tcp-connect! and kill do not yield, so the loop cannot have polled
+    ;; and the connect is guaranteed still outstanding. Do not rewrite this
+    ;; to have the victim call tcp-connect! on itself -- the handshake then
+    ;; races the kill and the test silently degrades into the established-
+    ;; socket case above.
+    (let* ((caller self)
+           (before (conn-count))
+           (listener
+             (tcp-listen! "127.0.0.1" 18920 4
+               (lambda (c) (send caller (vector 'served c)))
+               0))
+           (victim (spawn (lambda () (receive (`#(never) (void)))))))
+      (monitor victim)
+      (tcp-connect! "127.0.0.1" 18920 victim)
+      (kill victim 'died-mid-connect)
+      (receive (after 1000 (fail "mid-connect no DOWN"))
+        (`#(DOWN ,@victim ,_) 'ok))
+      (let ((served (receive (after 1000 (fail "mid-connect never accepted"))
+                      (`#(served ,c) c))))
+        (sleep-ms 200)
+        (tcp-close! served)
+        (tcp-stop-listen! listener)
+        (sleep-ms 100)
+        (unless (<= (conn-count) before)
+          (fail "connect completed for a dead owner and was registered"))))
+    (display "mid-connect owner death ok\n")
+
     ;; 5. spawn&link + trap-exit turns a crash into an EXIT message
     (process-trap-exit #t)
     (spawn&link (lambda () (raise 'linked-crash)))

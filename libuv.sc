@@ -191,7 +191,11 @@
             (when (and entry (eq? (cdr entry) owner)) (set-cdr! entry #f))))
         (hashtable-keys connect-table))
       ;; DNS has no handle to close. Suppress its eventual delivery while
-      ;; retaining the request entry so the callback still frees it.
+      ;; retaining the request entry so the callback still frees it. Do NOT
+      ;; "simplify" this into a hashtable-delete!: on-getaddrinfo runs either
+      ;; way and does the foreign-free, so dropping the key here only loses
+      ;; the record that this request is still outstanding. Setting #f is
+      ;; safe because both delivery sites are guarded by (when owner ...).
       (vector-for-each
         (lambda (req)
           (when (eq? (hashtable-ref getaddrinfo-table req #f) owner)
