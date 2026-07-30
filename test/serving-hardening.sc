@@ -38,9 +38,11 @@
   (lambda (p) (display "well-known ok" p)))
 (call-with-output-file (string-append root "/secret.db")
   (lambda (p) (display "PRIVATE" p)))
+(system (string-append "ln -s /etc/passwd " root "/link"))
+(system (string-append "ln -s /etc " root "/escape"))
 (call-with-output-file (string-append root "/cached.txt")
   (lambda (p) (display "old" p)))
-(system (string-append "cp -p " root "/cached.txt " root "/cache-stamp"))
+(system (string-append "cp -p " root "/cache-stamp" ))
 
 (start-scheduler
   (lambda ()
@@ -96,6 +98,10 @@
           (= 403 (response-status (GET "/static/.git/config"))))
         (check ".well-known stays reachable"
           (= 200 (response-status (GET "/static/.well-known/probe"))))
+        (check "static refuses a symlinked file"
+          (not (= 200 (response-status (GET "/static/link")))))
+        (check "static refuses a symlinked directory escape"
+          (not (= 200 (response-status (GET "/static/escape/passwd")))))
 
         ;; Missing files must be evicted. Recreating one with the original
         ;; timestamp must not resurrect the deleted cached bytes.
