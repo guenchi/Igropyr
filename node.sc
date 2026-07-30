@@ -46,7 +46,8 @@
 (library (igropyr node)
   (export node-start! node-connect! node-disconnect! node-self
           rsend rcall monitor-node demonitor-node node-peers
-          monitor-remote demonitor-remote node-set-limits!)
+          monitor-remote demonitor-remote node-set-limits!
+          node-monitor-stats)
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv) (igropyr sexpr)
           (igropyr gen-server)
@@ -169,6 +170,23 @@
   (define (node-peers)
     (filter live-entry
             (vector->list (atomically (hashtable-keys peers)))))
+
+  ;; Live sizes of the cross-node monitor tables. Every entry is an active
+  ;; watch: rmonitors is what this node is watching elsewhere, callee-agents
+  ;; what it hosts for others, and the two agent tables are the processes
+  ;; keeping those honest. All four must return to their baseline once the
+  ;; watches they belong to have ended -- an entry that outlives its monitor
+  ;; is retained forever, since nothing sweeps them.
+  ;;
+  ;; Exported because that is otherwise unobservable: a leak here shows up
+  ;; only as a long-lived node growing, with no way to attribute it. It is
+  ;; also what lets a test assert reclamation rather than just delivery.
+  (define (node-monitor-stats)
+    (atomically
+      (list (cons 'rmonitors (hashtable-size rmonitors))
+            (cons 'caller-agents (hashtable-size caller-agents))
+            (cons 'owner-agents (hashtable-size owner-agents))
+            (cons 'callee-agents (hashtable-size callee-agents)))))
 
   ;; ---- node up/down notification --------------------------------------
 

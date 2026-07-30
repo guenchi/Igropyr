@@ -139,6 +139,17 @@
     (receive (after 50 'ok)
       (`#(remote-down a missing-local-service ,reason)
         (fail! "self-monitor-duplicate-down" reason)))
+    ;; Delivery was never the broken part -- retention was. The immediate
+    ;; noproc path returned without removing its own caller-agents entry,
+    ;; so 64 dead agent pids stayed rooted with nothing to ever sweep them.
+    ;; Nothing above can see that; the table sizes can.
+    (let ((stats (node-monitor-stats)))
+      (for-each
+        (lambda (k)
+          (let ((n (cdr (assq k stats))))
+            (unless (zero? n)
+              (fail! "self-monitor-retained" k n))))
+        '(rmonitors caller-agents owner-agents)))
     (display "missing self monitors clean up exactly once ok\n")
 
     ;; wrong secret: must never come up
