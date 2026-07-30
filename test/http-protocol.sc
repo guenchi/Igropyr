@@ -88,6 +88,18 @@
     (display "0\r\n\r\n" p)
     (get)))
 
+;; Content-Length counts BYTES, not characters: a non-ASCII boundary makes
+;; the two differ, and a short length would truncate the body -- the server
+;; would then find no fields for a reason that has nothing to do with what
+;; the test is asserting.
+(define (multipart-request boundary body)
+  (string-append
+    "POST /form HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary="
+    boundary "\r\nContent-Length: "
+    (number->string (bytevector-length (string->utf8 body)))
+    "\r\nConnection: close\r\n\r\n" body))
+
+
 (define (expect-pipelined-empty-trailer)
   (let* ((body (make-string 9000 #\b))
          (response
@@ -209,6 +221,66 @@
         "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         "1;" (make-string 4096 #\a) "\r\nx\r\n0\r\n\r\n")
       "413")
+ ;; Boundary-looking bytes inside a file are data, not a new field.
+    (let* ((b "AaB03x")
+           (body (string-append
+                   "--" b "\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"x\"\r\n"
+                   "Content-Type: text/plain\r\n\r\n"
+                   "hello--" b "\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nadmin\r\n"
+                   "--" b "--\r\n")))
+      (expect "multipart delimiter anchoring"
+        (multipart-request b body) "200" "safe"))
+    ;; A boundary rejection has to be pinned with a body that WOULD parse,
+    ;; and against a length that would be accepted. With an unparseable body
+    ;; there are no fields either way, so "no role field" is true whether or
+    ;; not the boundary was ever looked at -- the assertion would hold with
+    ;; the length check deleted. One valid body on each side of 70 is what
+    ;; separates the two.
+    (let ((valid-body
+            (lambda (b)
+              (string-append
+                "--" b "\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nuser\r\n"
+                "--" b "--\r\n"))))
+      (let ((b (make-string 70 #\a)))
+        (expect "boundary at the 70-char limit"
+          (multipart-request b (valid-body b)) "200" "user"))
+      (let ((b (make-string 71 #\a)))
+        (expect "boundary over the 70-char limit"
+          (multipart-request b (valid-body b)) "200" "safe"))
+      ;; RFC 2046 bchars are ASCII. char-alphabetic? / char-numeric? are
+      ;; Unicode-aware in Chez, so spelling the set as ranges is what keeps
+      ;; these out.
+      (let ((b "Aa\x00e9;B"))                  ; LATIN SMALL LETTER E WITH ACUTE
+        (expect "non-ASCII boundary rejected"
+          (multipart-request b (valid-body b)) "200" "safe"))
+      (let ((b "Aa\x0663;B"))                  ; ARABIC-INDIC DIGIT THREE
+        (expect "non-ASCII digit boundary rejected"
+          (multipart-request b (valid-body b)) "200" "safe")))
+    (let* ((b "Aa B")
+           (body (string-append
+                   "--" b "\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nuser\r\n"
+                   "--" b "--\r\n")))
+      (expect "quoted multipart boundary"
+        (multipart-request (string-append "\"" b "\"") body) "200" "user"))
+    ;; Every payload byte begins a near-match for this delimiter, so a
+    ;; restart-at-every-byte search pays the boundary length at each of
+    ;; them. The status alone cannot see that: it stays 200 either way (the
+    ;; naive scan measures ~100 ms, nowhere near a timeout), so the cost is
+    ;; what has to be asserted -- as the cost-bomb checks in test/kdf.sc do.
+    (let* ((pboundary (string-append (make-string 69 #\-) "x"))
+           (pbody (string-append
+                    "--" pboundary
+                    "\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\n"
+                    (make-string 750000 #\-)
+                    "\r\n--" pboundary "--\r\n"))
+           (t0 (real-time)))
+      (expect "multipart repeated-prefix search"
+        (multipart-request pboundary pbody) "200" "safe")
+      ;; ~13 ms linear vs ~100 ms naive, end to end; 50 ms sits between them
+      ;; with room on both sides so load does not make this flaky
+      (let ((ms (- (real-time) t0)))
+        (unless (< ms 50)
+          (error 'http-protocol "repeated-prefix search too slow (ms)" ms))))
     ;; ---- configurable body-limit -----------------------------------
     ;; PROCESS-GLOBAL (last http-listen wins), so these run LAST: the
     ;; second listen lowers the limit for every server in this process.
@@ -234,5 +306,25 @@
         "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         "40\r\n" (make-string 64 #\a) "\r\n40\r\n" (make-string 64 #\a) "\r\n0\r\n\r\n")
       "413")
+
+    ;; The chunk-count ceiling has to move with body-limit. Pinned to a
+    ;; constant it silently rejects uploads the operator just made room
+    ;; for: a body a third of the configured limit, chunked finely, was
+    ;; answered 413. Raise the limit and send more chunks than the old
+    ;; fixed 16384 while staying well inside it -- 20 000 x 512 bytes is
+    ;; 10 MiB against 32.
+    (http-listen 18083 handler '((workers . 2) (body-limit . 33554432)))
+    (set! port 18083)
+    (expect "fine-grained chunking within a raised body-limit"
+      (string-append
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        (let-values (((p get) (open-string-output-port)))
+          (let ((chunk (make-string 512 #\z)))
+            (do ((i 0 (+ i 1))) ((= i 20000))
+              (display "200\r\n" p) (display chunk p) (display "\r\n" p)))
+          (display "0\r\n\r\n" p)
+          (get)))
+      "200")
+
     (display "ALL HTTP PROTOCOL TESTS PASSED\n")
     (exit 0)))
