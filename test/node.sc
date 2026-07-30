@@ -7,7 +7,8 @@
 ;;;   - a peer with the WRONG secret never becomes a node
 ;;;   - rsend to a disconnected node returns #f; to self delivers locally
 
-(import (chezscheme) (igropyr actor) (igropyr node) (igropyr pubsub))
+(import (chezscheme) (igropyr actor) (igropyr libuv)
+        (igropyr node) (igropyr pubsub))
 
 (define port 18091)
 (define secret "test-mesh-secret")
@@ -26,9 +27,91 @@
 (start-scheduler
   (lambda ()
     (node-start! 'a secret port)
+    (node-set-limits! 64 2)
     (start-pubsub!)
     (register 'main self)
     (monitor-node 'b)
+
+    ;; The pre-auth handshake has one absolute deadline. Dripping a byte
+    ;; before each idle timeout must not hold an unauthenticated fd forever.
+    (tcp-connect! "127.0.0.1" port self)
+    (let ((slow
+            (receive (after 2000 (fail! "slow-handshake-connect"))
+              (`#(tcp-connected ,c) c)
+              (`#(tcp-connect-failed ,e) (fail! "slow-handshake-connect" e)))))
+      (tcp-read-start! slow)
+      (tcp-write! slow (string->utf8 "10\n(") #f)
+      ;; Drip a byte every second rather than once. A single drip has to
+      ;; land inside the server's own window to prove anything: if the
+      ;; scheduler drifts past it, the server closes on its own schedule
+      ;; and the check passes against the very code it exists to reject --
+      ;; moving one sleep from 4000 to 5200 was enough to make this report
+      ;; ok against a per-receive timeout. Dripping continuously removes
+      ;; the dependency: a refreshing window outlives the whole loop no
+      ;; matter where individual bytes land, and an absolute deadline is
+      ;; moved by none of them.
+      (let ((t0 (now-ms)))
+        (let loop ((k 0))
+          (if (= k 8)
+              (begin (tcp-close! slow) (fail! "slow-handshake-deadline"))
+              (receive (after 1000
+                          (tcp-write! slow (string->utf8 "x") #f)
+                          (loop (+ k 1)))
+                (`#(tcp-eof) 'ok)
+                (`#(tcp-error ,_) 'ok))))
+        ;; reaching k = 8 already fails; this keeps the check honest if the
+        ;; deadline is ever made longer than the loop
+        (let ((elapsed (- (now-ms) t0)))
+          (when (>= elapsed 7000)
+            (fail! "slow-handshake-deadline-not-absolute" elapsed))))
+      (display "absolute pre-auth handshake deadline ok\n"))
+
+    ;; Each pre-auth connection is bounded in bytes and in time, but a
+    ;; stranger must not be able to hold an unbounded NUMBER of them --
+    ;; every one is an fd and a process, and the fd budget belongs to the
+    ;; whole OS process, not just the mesh. Over the ceiling the node must
+    ;; close without answering and without spawning. Runs before any child
+    ;; node exists, so nothing else is competing for a slot.
+    (node-set-limits! #f #f 4)
+    (let ((me self) (ref (gensym)))
+      ;; one prober process per connection: tcp-data carries no connection,
+      ;; so a shared mailbox could not tell which socket was answered
+      (do ((i 0 (+ i 1))) ((= i 8))
+        (spawn
+          (lambda ()
+            (tcp-connect! "127.0.0.1" port self)
+            (receive (after 3000 (send me (vector ref 'no-connect)))
+              (`#(tcp-connected ,c)
+                (tcp-read-start! c)
+                (receive (after 3000 (send me (vector ref 'silent)))
+                  (`#(tcp-data ,_)
+                    ;; report, then HOLD. Closing here would free the slot
+                    ;; and let the next prober take it, so the eight
+                    ;; connections would never be in flight at once and the
+                    ;; ceiling would never be reached.
+                    (send me (vector ref 'challenged))
+                    (receive (after 6000 (tcp-close! c))
+                      (`#(tcp-eof) 'ok)
+                      (`#(tcp-error ,_) 'ok)))
+                  (`#(tcp-eof) (send me (vector ref 'refused)))
+                  (`#(tcp-error ,_) (send me (vector ref 'refused)))))
+              (`#(tcp-connect-failed ,e) (send me (vector ref 'refused)))))))
+      (let loop ((k 0) (challenged 0) (refused 0))
+        (if (= k 8)
+            (begin
+              (unless (= challenged 4)
+                (fail! "preauth-cap-challenged" challenged))
+              (unless (= refused 4)
+                (fail! "preauth-cap-refused" refused)))
+            (receive (after 8000 (fail! "preauth-cap-timeout" k))
+              (`#(,@ref ,tag)
+                (case tag
+                  ((challenged) (loop (+ k 1) (+ challenged 1) refused))
+                  ((refused) (loop (+ k 1) challenged (+ refused 1)))
+                  (else (fail! "preauth-cap-unexpected" tag))))))))
+    ;; back to a ceiling that cannot interfere with the real handshakes below
+    (node-set-limits! #f #f 256)
+    (display "pre-auth connection ceiling ok\n")
 
     ;; rsend to an unknown node: #f, no crash
     (unless (eq? #f (rsend 'nowhere 'svc 'x))
@@ -106,6 +189,18 @@
       (`#(heard ,m)
         (unless (equal? m "cross-node-hello") (fail! "dist-pubsub-payload" m))))
     (display "distributed pubsub fan-out ok\n")
+
+    ;; Remote monitor state is owned by its caller. Short-lived callers
+    ;; must release target-side slots instead of leaving permanent watches.
+    (do ((i 0 (+ i 1))) ((= i 2))
+      (spawn (lambda () (monitor-remote 'b 'svc))))
+    (sleep-ms 600)
+    (let ((m (monitor-remote 'b 'svc)))
+      (receive (after 400 'ok)
+        (`#(remote-down b svc overload)
+          (fail! "dead-monitor-callers-leaked-slots")))
+      (demonitor-remote m))
+    (display "dead monitor callers release remote slots ok\n")
 
     ;; monitor-remote: watch b's 'watched process, kill it, observe the
     ;; real exit reason cross the wire

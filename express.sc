@@ -23,7 +23,8 @@
           req-sexpr send-sexpr! app-rpc
           ws-send-sexpr! ws-recv-sexpr sse-send-sexpr!
           send-text! send-html! send-json! send-file!
-          sse-start! sse-send! make-fault-handler)
+          sse-start! sse-send! make-fault-handler
+          static-cache-limits!)
   (import (chezscheme) (igropyr checked)
           (igropyr actor) (igropyr libuv) (igropyr http)
           (igropyr json) (igropyr gzip) (igropyr sexpr)
@@ -207,39 +208,94 @@
       (bytevector-copy! bv start r 0 (- end start))
       r))
 
-  ;; first occurrence of needle in bv at or after `from`
-  (define (bv-search bv needle from)
-    (let ((n (bytevector-length bv))
-          (m (bytevector-length needle)))
-      (let outer ((i from))
-        (cond
-          ((> (+ i m) n) #f)
-          ((let inner ((j 0))
-             (cond ((= j m) #t)
-                   ((fx= (bytevector-u8-ref bv (+ i j))
-                         (bytevector-u8-ref needle j))
-                    (inner (+ j 1)))
-                   (else #f)))
-           i)
-          (else (outer (+ i 1)))))))
+  ;; A searcher bound to one needle -> (searcher bv from [end]), giving the
+  ;; first occurrence at or after `from` and before optional `end` (clamped:
+  ;; an end past the buffer would read off it with no error).
+  ;;
+  ;; KMP, because the needle is a MIME boundary and therefore chosen by the
+  ;; sender. Restarting at every byte costs a factor of the boundary length
+  ;; -- at the 1 MiB body limit a 70-byte all-dash boundary against an
+  ;; all-dash body measures ~100 ms versus ~4 ms here, and that is 100 ms
+  ;; during which the single-threaded scheduler runs nothing else.
+  ;;
+  ;; The failure table depends only on the needle, so it is built once and
+  ;; captured WITH that needle -- the two cannot drift apart. One body is
+  ;; scanned for the same delimiter many times (once per part, plus once
+  ;; more for every match the anchoring check rejects), and a body packed
+  ;; with delimiters that are not at a line start makes those rejections
+  ;; frequent: rebuilding per call adds table work proportional to the whole
+  ;; body, which is the same order as the scan it is supposed to be cheap
+  ;; against.
+  (define (make-bv-searcher needle)
+    (let ((m (bytevector-length needle))
+          (fallback (make-vector (bytevector-length needle) 0)))
+      (when (> m 0)
+        (let build ((i 1) (j 0))
+          (when (< i m)
+            (cond
+              ((fx= (bytevector-u8-ref needle i)
+                    (bytevector-u8-ref needle j))
+               (vector-set! fallback i (+ j 1))
+               (build (+ i 1) (+ j 1)))
+              ((> j 0) (build i (vector-ref fallback (- j 1))))
+              (else (build (+ i 1) 0))))))
+      (lambda (bv from . rest)
+        (let ((n (if (pair? rest)
+                     (fxmin (car rest) (bytevector-length bv))
+                     (bytevector-length bv))))
+          (if (= m 0)
+              (and (<= from n) from)
+              (let scan ((i from) (j 0))
+                (cond
+                  ((>= i n) #f)
+                  ((fx= (bytevector-u8-ref bv i) (bytevector-u8-ref needle j))
+                   (if (= (+ j 1) m)
+                       (- (+ i 1) m)
+                       (scan (+ i 1) (+ j 1))))
+                  ((> j 0) (scan i (vector-ref fallback (- j 1))))
+                  (else (scan (+ i 1) 0)))))))))
+
+  ;; RFC 2046 bchars, spelled out as ASCII ranges. NOT char-alphabetic? /
+  ;; char-numeric?: those are Unicode-aware here, so they admit characters
+  ;; the grammar does not (char-alphabetic? #\e-acute and char-numeric? on
+  ;; ARABIC-INDIC digits are both true). The boundary is what the delimiter
+  ;; bytes are built from, so accepting more than a conforming sender can
+  ;; emit is exactly the kind of disagreement the anchoring above closes.
+  (define (bchar? c)
+    (or (char<=? #\a c #\z) (char<=? #\A c #\Z) (char<=? #\0 c #\9)
+        (char=? c #\space)
+        (memv c '(#\' #\( #\) #\+ #\_ #\, #\- #\. #\/ #\: #\= #\?))))
 
   ;; boundary=... from a Content-Type header (possibly quoted)
+  (define (valid-boundary? s)
+    (and (fx> (string-length s) 0)
+         (fx<= (string-length s) 70)
+         (not (char=? (string-ref s (- (string-length s) 1)) #\space))
+         (let loop ((i 0))
+           (or (fx= i (string-length s))
+               (and (bchar? (string-ref s i))
+                    (loop (fx+ i 1)))))))
+
   (define (multipart-boundary ct)
     (let ((key "boundary="))
       (let lp ((i 0))
         (cond
           ((> (+ i (string-length key)) (string-length ct)) #f)
-          ((string=? (substring ct i (+ i (string-length key))) key)
+          ((string-ci=? (substring ct i (+ i (string-length key))) key)
            (let* ((start (+ i (string-length key)))
-                  (raw (let scan ((j start))
-                         (if (or (= j (string-length ct))
-                                 (memv (string-ref ct j) '(#\; #\space)))
-                             (substring ct start j)
-                             (scan (+ j 1))))))
-             (if (and (> (string-length raw) 1)
-                      (char=? (string-ref raw 0) #\"))
-                 (substring raw 1 (- (string-length raw) 1))
-                 raw)))
+                  (b (if (and (< start (string-length ct))
+                              (char=? (string-ref ct start) #\"))
+                         (let scan ((j (+ start 1)))
+                           (cond ((= j (string-length ct)) #f)
+                                 ((char=? (string-ref ct j) #\")
+                                  (substring ct (+ start 1) j))
+                                 (else (scan (+ j 1)))))
+                         (let scan ((j start))
+                           (if (or (= j (string-length ct))
+                                   (memv (string-ref ct j) '(#\; #\space #\tab)))
+                               (substring ct start j)
+                               (scan (+ j 1)))))))
+             (and b (valid-boundary? b) b)))
           (else (lp (+ i 1)))))))
 
   ;; "form-data; name=\"a\"; filename=\"b\"" -> value of one attribute
@@ -256,12 +312,14 @@
                      (else (scan (+ j 1)))))))
           (else (lp (+ i 1)))))))
 
-  (define crlf2-bv (string->utf8 "\r\n\r\n"))
+  ;; the header/body separator never varies, so its table is built once for
+  ;; the life of the module rather than once per part
+  (define search-crlf2 (make-bv-searcher (string->utf8 "\r\n\r\n")))
 
   ;; parse one multipart part: header block + payload
   ;; -> (name . string-value) or (name . #(file filename content-type bytes))
   (define (parse-part bv start end)
-    (let ((hend (bv-search bv crlf2-bv start)))
+    (let ((hend (search-crlf2 bv start end)))
       (and hend (<= (+ hend 4) end)
            (let* ((head (utf8->string (bv-sub bv start hend)))
                   (data (bv-sub bv (+ hend 4) end))
@@ -298,9 +356,36 @@
                             (vector 'file filename ctype data)
                             (utf8->string data))))))))
 
+  ;; A MIME delimiter is recognized only at the beginning of a line and
+  ;; only when followed by CRLF or the final "--" suffix. Raw substring
+  ;; matches inside uploaded bytes are ordinary file data.
+  (define (bv-search-delimiter bv delim search from)
+    (let ((n (bytevector-length bv)) (m (bytevector-length delim)))
+      (let loop ((from from))
+        (let ((p (search bv from)))
+          (and p
+               (let ((after (+ p m)))
+                 (if (and (or (= p 0)
+                              (and (>= p 2)
+                                   (= (bytevector-u8-ref bv (- p 2)) 13)
+                                   (= (bytevector-u8-ref bv (- p 1)) 10)))
+                          (<= (+ after 2) n)
+                          (or (and (= (bytevector-u8-ref bv after) 13)
+                                   (= (bytevector-u8-ref bv (+ after 1)) 10))
+                              (and (= (bytevector-u8-ref bv after) 45)
+                                   (= (bytevector-u8-ref bv (+ after 1)) 45)
+                                   (or (= (+ after 2) n)
+                                       (and (<= (+ after 4) n)
+                                            (= (bytevector-u8-ref bv (+ after 2)) 13)
+                                            (= (bytevector-u8-ref bv (+ after 3)) 10))))))
+                     p
+                     (loop (+ p 1)))))))))
+
   (define (parse-multipart bv boundary)
-    (let ((delim (string->utf8 (string-append "--" boundary))))
-      (let lp ((pos (or (bv-search bv delim 0) (bytevector-length bv)))
+    (let* ((delim (string->utf8 (string-append "--" boundary)))
+           (search (make-bv-searcher delim)))
+      (let lp ((pos (or (bv-search-delimiter bv delim search 0)
+                        (bytevector-length bv)))
                (acc '()))
         (let ((part-start (+ pos (bytevector-length delim) 2))) ; skip \r\n
           (if (or (> part-start (bytevector-length bv))
@@ -309,7 +394,7 @@
                        (fx= (bytevector-u8-ref bv (+ pos (bytevector-length delim))) 45)
                        (fx= (bytevector-u8-ref bv (+ pos (bytevector-length delim) 1)) 45)))
               (reverse acc)
-              (let ((next (bv-search bv delim part-start)))
+              (let ((next (bv-search-delimiter bv delim search part-start)))
                 (if (not next)
                     (reverse acc)
                     (let ((part (parse-part bv part-start (- next 2)))) ; strip \r\n
@@ -421,6 +506,67 @@
   (define stat-window-ms 1000)
   ;; path -> #(mtime size etag content-type body gzip-box last-stat-ms)
   (define static-cache (make-hashtable string-hash string=?))
+  ;; Ceilings on what the cache may hold. Generous by default -- a bound
+  ;; on growth, not a working-set policy; over either one the cache is
+  ;; cleared rather than evicted from, which is why they are set high
+  ;; enough that ordinary serving never reaches them.
+  (define max-static-cache-entries 4096)
+  (define max-static-cache-bytes (* 64 1024 1024))
+  (define static-cache-bytes 0)
+
+  ;; Lower them for a memory-tight deployment, raise them for a host
+  ;; serving a large asset set. #f leaves either alone. Takes effect on
+  ;; the next store; lowering below what is already held simply means the
+  ;; next one clears. Reaching a ceiling is also the only way to observe
+  ;; this behaviour, so a test can ask for numbers it can actually fill
+  ;; instead of writing 64 MiB to prove it.
+  (define (static-cache-limits! entries bytes)
+    (define (check-cap who cap)
+      (unless (and (integer? cap) (exact? cap) (> cap 0))
+        (assertion-violation 'static-cache-limits!
+          (string-append who " cap must be a positive integer") cap)))
+    (when entries
+      (check-cap "entry" entries)
+      (set! max-static-cache-entries entries))
+    (when bytes
+      (check-cap "byte" bytes)
+      (set! max-static-cache-bytes bytes))
+    (void))
+
+  (define (entry-bytes e)
+    (if (and e (bytevector? (vector-ref e 4)))
+        (+ (bytevector-length (vector-ref e 4))
+           (let ((g (unbox (vector-ref e 5))))
+             (if g (bytevector-length g) 0)))
+        0))
+
+  (define (cache-store! path e)
+    (with-interrupts-disabled
+      (let ((old (hashtable-ref static-cache path #f)))
+        (when old
+          (set! static-cache-bytes (- static-cache-bytes (entry-bytes old))))
+        (let ((n (entry-bytes e)))
+          (when (or (and (not old)
+                         (fx>= (hashtable-size static-cache)
+                               max-static-cache-entries))
+                    (> (+ static-cache-bytes n) max-static-cache-bytes))
+            (hashtable-clear! static-cache)
+            (set! static-cache-bytes 0))
+          (hashtable-set! static-cache path e)
+          (set! static-cache-bytes (+ static-cache-bytes n))))))
+
+  ;; Cache a lazily generated representation only while the aggregate byte
+  ;; budget has room. The caller may still serve g once when it does not.
+  (define (cache-gzip! path e g)
+    (with-interrupts-disabled
+      (when (and (eq? (hashtable-ref static-cache path #f) e)
+                 (not (unbox (vector-ref e 5)))
+                 (<= (+ static-cache-bytes (bytevector-length g))
+                     max-static-cache-bytes))
+        (set-box! (vector-ref e 5) g)
+        (set! static-cache-bytes
+          (+ static-cache-bytes (bytevector-length g)))))
+    g)
 
   (define (file-mtime path)
     (guard (e (#t #f))
@@ -465,6 +611,21 @@
   (define (stream-entry? e) (eq? (vector-ref e 0) 'stream))
   (define (large-entry? e) (eq? (vector-ref e 4) 'large))
 
+  ;; ONE FILE, ONE ENTRY. The key is the name the OS resolves to, not the
+  ;; one the client typed. On a case-insensitive filesystem -- macOS and
+  ;; Windows by default -- every spelling of a name opens the same file,
+  ;; so keying on the request path let a single asset occupy 2^letters
+  ;; entries: unbounded memory from one file, and, once the capacity
+  ;; ceilings existed, a way to wipe the whole cache with a few dozen
+  ;; requests. Symlink aliases would collapse for the same reason, except
+  ;; the confined open refuses them before an entry can exist at all.
+  ;;
+  ;; Resolving costs a blocking syscall, so it happens only when the typed
+  ;; path is not already a key -- a client using the spelling its links
+  ;; contain still reaches the body with no syscall at all, which is the
+  ;; property the hot path is built around. Entries therefore only ever
+  ;; exist under resolved names, and a request for a variant looks itself
+  ;; up rather than storing a second copy.
   (define (static-entry path root rel)
     (let ((cached (hashtable-ref static-cache path #f))
           (now (now-ms)))
@@ -474,7 +635,12 @@
             (and mt
                  (if (and cached (= (vector-ref cached 0) mt))
                      (begin (vector-set! cached 6 now) cached)
-                     (open-entry path mt now root rel)))))))
+                     (let ((key (or (file-realpath path) path)))
+                       (let ((e (and (not (string=? key path))
+                                     (hashtable-ref static-cache key #f))))
+                         (if (and e (= (vector-ref e 0) mt))
+                             (begin (vector-set! e 6 now) e)
+                             (open-entry key mt now root rel))))))))))
 
   ;; open with a timeout that can never leak the fd: the handle comes
   ;; back synchronously, so a timed-out open is closed via its handle
@@ -490,20 +656,23 @@
             (`#(file-stream ,@st ,size) (values st size))
             (`#(file-error ,e) (values #f #f))))))
 
-  (define (open-entry path mt now root rel)
-    (let-values (((st size) (open-stream path root rel)))
+  ;; `key' is the resolved name from static-entry: what the entry is filed
+  ;; under and what the content type is taken from. The OPEN still goes
+  ;; through the confined walk when there is a root -- resolving a name is
+  ;; not permission to open it.
+  (define (open-entry key mt now root rel)
+    (let-values (((st size) (open-stream key root rel)))
       (and st
            (if (<= size max-cache-file)
                (let ((body (stream-read-all st size)))
                  (and body
                       ;; gzip-box holds the lazily-built gzip body
                       (let ((e (vector mt size (etag-of size mt)
-                                       (mime-type path) body (box #f) now)))
-                        (hashtable-set! static-cache path e)
+                                       (mime-type key) body (box #f) now)))
+                        (cache-store! key e)
                         e)))
-               (let ((etag (etag-of size mt)) (ctype (mime-type path)))
-                 (hashtable-set! static-cache path
-                   (vector mt size etag ctype 'large #f now))
+               (let ((etag (etag-of size mt)) (ctype (mime-type key)))
+                 (cache-store! key (vector mt size etag ctype 'large #f now))
                  (vector 'stream st size etag ctype))))))
 
   ;; Pump a large file through a fixed-length response from a detached
@@ -642,9 +811,13 @@
                               (compressible-type? ctype)
                               (gzip-acceptable? (req-header req 'accept-encoding))
                               (or (unbox gzbox)
+                                  ;; keyed by the requested name, so this
+                                  ;; caches for the spelling links use and
+                                  ;; merely serves for any other -- which
+                                  ;; also keeps a variant from spending the
+                                  ;; byte budget on a duplicate gzip
                                   (let ((g (gzip-compress body 6)))
-                                    (when g (set-box! gzbox g))
-                                    g))))
+                                    (and g (cache-gzip! abs-path e g))))))
                      (tag (if gz (gzip-etag etag) etag)))
                 (set-header! r "ETag" tag)
                 (set-header! r "Cache-Control" "public, max-age=3600")

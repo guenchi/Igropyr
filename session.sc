@@ -18,7 +18,7 @@
 
 (library (igropyr session)
   (export make-session-store session-middleware
-          req-session session-get session-set! session-clear!
+          req-session session-get session-set! session-clear! session-regenerate!
           session-peek)
   (import (chezscheme) (igropyr checked)
           (igropyr actor) (igropyr libuv) (igropyr gen-server)
@@ -126,15 +126,16 @@
   ;; store), and `cleared?` records a session-clear! so the merge starts
   ;; from empty instead of from a concurrent writer's data.
   (define-checked-record session
-    (sid string?)
+    (mutable sid string?)
     (mutable data list?)
     (mutable dirty? boolean?)
     (mutable new? boolean?)
     (mutable touched list?)
-    (mutable cleared? boolean?))
+    (mutable cleared? boolean?)
+    (rotate procedure?))
 
-  (define (make-session/fresh sid data new?)
-    (make-session sid data #f new? '() #f))
+  (define (make-session/fresh sid data new? rotate)
+    (make-session sid data #f new? '() #f rotate))
 
   (define-checked (session-get (s session?) (key symbol?))
     (let ((p (assq key (session-data s)))) (and p (cdr p))))
@@ -154,6 +155,34 @@
     (session-touched-set! s '())
     (session-cleared?-set! s #t)
     (session-dirty?-set! s #t))
+
+  ;; Rotate an established identifier at an authentication or privilege
+  ;; boundary. A cookie-less request already has a freshly generated,
+  ;; unguessable id, so rotating that new id would only emit two competing
+  ;; Set-Cookie fields for the same response.
+  ;;
+  ;; IDEMPOTENT within one request: rotating marks the session new, so a
+  ;; second call takes the branch above and returns the id the first one
+  ;; issued, without a second rotation or a second cookie. That is what
+  ;; makes it safe for two layers to each insist on rotating -- neither has
+  ;; to know whether the other already did. It also means a caller cannot
+  ;; use repeated calls to mint successive ids inside one request; there is
+  ;; one identity per request, and this decides what it is.
+  (define-checked (session-regenerate! (s session?))
+    (if (session-new? s)
+        (session-sid s)
+        (let ((old (session-sid s)) (fresh (new-sid)))
+          ;; Issue the replacement cookie before mutating the object; a bad
+          ;; middleware option must fail without invalidating the live id.
+          ((session-rotate s) old fresh)
+          (session-sid-set! s fresh)
+          (session-new?-set! s #t)
+          ;; The new store entry starts empty, so persist the full snapshot.
+          (session-touched-set! s
+            (map (lambda (kv) (cons (car kv) (cdr kv))) (session-data s)))
+          (session-cleared?-set! s #t)
+          (session-dirty?-set! s #t)
+          fresh)))
 
   ;; handler-facing accessor
   (define-checked (req-session (req request?)) (req-local req 'session))
@@ -189,26 +218,42 @@
            (max-age (opt o 'max-age #f))
            (secure? (opt o 'secure #t)))
       (lambda (req res next)
+        (define (issue-cookie! sid)
+          (apply set-cookie! res cname sid
+                 (string-append "Path=" path)
+                 "HttpOnly"
+                 (string-append "SameSite=" same-site)
+                 (append (if secure? '("Secure") '())
+                         (if max-age
+                             (list (string-append "Max-Age="
+                                                  (number->string max-age)))
+                             '()))))
+        (define (rotate! old fresh)
+          ;; Once the response is out, set-cookie! still succeeds and still
+          ;; does nothing -- the header it would have written is already on
+          ;; the wire. Dropping the old id anyway would leave the client
+          ;; holding a cookie for a session that no longer exists: silently
+          ;; logged out, with the next request starting over as anonymous.
+          ;; Refuse instead, and refuse BEFORE either effect, so the live
+          ;; id survives a handler that regenerates in the wrong order.
+          (when (res-answered? res)
+            (assertion-violation 'session-regenerate!
+              "response already sent -- the new cookie cannot reach the client; regenerate before answering"
+              old))
+          (issue-cookie! fresh)
+          (gen-server-cast (store-pid store) (vector 'drop old)))
         (let* ((sid (req-cookie req cname))
                (data (and sid (gen-server-call (store-pid store)
                                 (vector 'get sid))))
                (s (if data
-                      (make-session/fresh sid data #f)
-                      (make-session/fresh (new-sid) '() #t))))
+                      (make-session/fresh sid data #f rotate!)
+                      (make-session/fresh (new-sid) '() #t rotate!))))
           (req-set-local! req 'session s)
           ;; The cookie must go out with the response headers, i.e. before
           ;; the handler runs, so a new sid is always announced; only the
           ;; STORE entry waits for an actual write.
           (when (session-new? s)
-            (apply set-cookie! res cname (session-sid s)
-                   (string-append "Path=" path)
-                   "HttpOnly"
-                   (string-append "SameSite=" same-site)
-                   (append (if secure? '("Secure") '())
-                           (if max-age
-                               (list (string-append "Max-Age="
-                                                    (number->string max-age)))
-                               '()))))
+            (issue-cookie! (session-sid s)))
           (next)
           ;; persist only what the handler wrote (see store-cast 'put)
           (when (session-dirty? s)
