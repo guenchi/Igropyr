@@ -14,7 +14,8 @@
   (export uv-init! uv-poll! now-ms now-ns uv-set-deliver! uv-owner-died!
           tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
           file-read-async! file-realpath
-          file-stream-open! file-stream-read! file-stream-close!
+          file-stream-open! file-stream-open-under!
+          file-stream-read! file-stream-close!
           file-stream-own! file-stream-raw! file-stream-chunk-ptr
           tcp-read-start! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
@@ -88,11 +89,27 @@
   (define memcpy-from-c  (foreign-procedure "memcpy" (u8* void* size_t) void*))
   (define memcpy-to-c    (foreign-procedure "memcpy" (void* u8* size_t) void*))
   (define memcpy-cc      (foreign-procedure "memcpy" (void* void* size_t) void*))
+  (define c-open          (foreign-procedure "open" (string int int) int))
+  (define c-openat        (foreign-procedure "openat" (int string int int) int))
+  (define c-close         (foreign-procedure "close" (int) int))
 
   (define UV-CONNECT 2)
   (define UV-GETADDRINFO 8)
   (define UV-FS 6)
   (define O-RDONLY 0)
+  ;; open(2) flags differ across the supported Unix families. Static-file
+  ;; confinement uses openat one component at a time with O_NOFOLLOW, so
+  ;; no pathname component can be swapped to a symlink between validation
+  ;; and the actual open.
+  (define O-DIRECTORY
+    (case platform-os ((linux) #o200000) ((macos) #x100000)
+                      ((freebsd) #x20000) (else 0)))
+  (define O-NOFOLLOW
+    (case platform-os ((linux) #o400000) ((macos freebsd) #x100)
+                      (else 0)))
+  (define O-CLOEXEC
+    (case platform-os ((linux) #o2000000) ((macos) #x1000000)
+                      ((freebsd) #x100000) (else 0)))
   (define UV-EINVAL -22)
   (define S-IFMT #o170000)
   (define S-IFREG #o100000)
@@ -636,6 +653,59 @@
           (fs-fail! op req r)))
       op))
 
+ ;; Start the ordinary asynchronous fstat/read pipeline from an fd that
+  ;; has already been opened securely with openat.
+  (define (fs-start-fd! fd path owner mode)
+    (let* ((req (foreign-alloc fs-req-size))
+           (op (make-fs-op owner path mode req 'fstat #f #f fd 0 0 '() 0 0)))
+      (hashtable-set! fs-table req op)
+      (start-fs-fstat! op req)
+      op))
+
+  (define (relative-parts rel)
+    (let ((n (string-length rel)))
+      (let loop ((i 0) (start 0) (acc '()))
+        (cond
+          ((= i n)
+           (let ((part (substring rel start i)))
+             (reverse (if (or (string=? part "") (string=? part "."))
+                          acc (cons part acc)))))
+          ((char=? (string-ref rel i) #\/)
+           (let ((part (substring rel start i)))
+             (loop (+ i 1) (+ i 1)
+                   (if (or (string=? part "") (string=? part "."))
+                       acc (cons part acc)))))
+          (else (loop (+ i 1) start acc))))))
+
+  ;; Open rel beneath root without following any untrusted path component.
+  ;; The trusted root is opened once; every child is then resolved relative
+  ;; to that stable directory fd. Returns an fd or -1.
+  (define (open-under root rel)
+    (let ((parts (relative-parts rel)))
+      (if (or (null? parts)
+              (exists (lambda (p)
+                        (or (string=? p "..")
+                            (let loop ((i 0))
+                              (and (< i (string-length p))
+                                   (or (char=? (string-ref p i) #\nul)
+                                       (loop (+ i 1)))))))
+                      parts))
+          -1
+          (let ((root-fd
+                  (c-open root
+                    (bitwise-ior O-RDONLY O-DIRECTORY O-CLOEXEC) 0)))
+            (if (< root-fd 0)
+                -1
+                (let loop ((dir root-fd) (xs parts))
+                  (let* ((last? (null? (cdr xs)))
+                         (flags (bitwise-ior O-RDONLY O-CLOEXEC O-NOFOLLOW
+                                  (if last? 0 O-DIRECTORY)))
+                         (next (c-openat dir (car xs) flags 0)))
+                    (c-close dir)
+                    (cond ((< next 0) -1)
+                          (last? next)
+                          (else (loop next (cdr xs)))))))))))
+
   ;; The path the OS itself would call this file: symlinks and . / ..
   ;; resolved, and on a case-insensitive filesystem the spelling corrected
   ;; to the one on disk, so every way of naming one file gives one answer.
@@ -685,6 +755,15 @@
   ;; holds one chunk of memory, not the file.
   (define (file-stream-open! path owner)
     (fs-start! path owner 'stream))
+
+  ;; Confined counterpart used by app-static and rooted send-file!. #f is
+  ;; an immediate refusal (missing path, symlink, or invalid component).
+  (define (file-stream-open-under! root rel owner)
+    ;; Keep the raw fd continuously protected: before fs-start-fd! installs
+    ;; it in fs-table, actor teardown has no way to discover and close it.
+    (with-interrupts-disabled
+      (let ((fd (open-under root rel)))
+        (and (>= fd 0) (fs-start-fd! fd rel owner 'stream)))))
 
   ;; Switch chunk delivery to lengths: the bytes stay in the stream's C
   ;; buffer (file-stream-chunk-ptr) until the next pull, so a consumer
