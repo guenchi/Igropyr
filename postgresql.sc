@@ -91,6 +91,9 @@
                 base64-encode base64-decode))
 
   (define connect-timeout-ms 10000)
+  ;; RFC 5802 warns that a hostile server can DoS a client with an extreme
+  ;; iteration count. Match the untrusted PBKDF2 ceiling used by kdf.sc.
+  (define scram-max-iters 2000000)
   ;; per-socket-read clock while a QUERY is in flight (the caller-facing
   ;; query timeout is (igropyr sqlpool)'s own, same value); auth-phase
   ;; reads use connect-timeout-ms instead, so a server that stalls
@@ -426,6 +429,7 @@
             ;; nonce must EXTEND ours (RFC 5802: client nonce + a non-empty
             ;; server part), so strictly longer.
             (unless (and snonce salt-b64 iters (fixnum? iters) (> iters 0)
+                         (fx<= iters scram-max-iters)
                          (> (string-length snonce) (string-length cnonce))
                          (string=? (substring snonce 0 (string-length cnonce))
                                    cnonce))

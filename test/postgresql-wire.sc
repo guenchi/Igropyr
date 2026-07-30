@@ -181,6 +181,23 @@
                   (tcp-close! c)
                   #f)))))))
 
+  ;; Advertise an otherwise valid SCRAM challenge with a hostile PBKDF2
+  ;; work factor. The client must reject it before deriving any key.
+  (define (scram-cost-server!)
+    (let-values (((t p) (read-msg!)))
+      (let* ((mech-end (find-u8 p 0 0))
+             (n (ru32 p (+ mech-end 1)))
+             (client-first (utf8->string
+                             (bv-sub p (+ mech-end 5) (+ mech-end 5 n))))
+             (bare (substring client-first 3 (string-length client-first)))
+             (snonce (string-append
+                       (substring bare 5 (string-length bare)) "SRVNONCE"))
+             (server-first
+               (string-append "r=" snonce ",s="
+                              (base64-encode (make-bytevector 16 7))
+                              ",i=2000001")))
+        (write! (smsg #\R (bv-append (u32 11) (string->utf8 server-first)))))))
+
   ;; Bind payload -> list of param values (#f for NULL, else string).
   ;; portal cstr + stmt cstr + Int16 nfmt + fmts + Int16 nparams +
   ;; (Int32 len + bytes)* + Int16 nresfmt ...
@@ -299,6 +316,10 @@
          (write! notice-msg)
          (when (scram-server! scram-password)
            (query-loop!)))
+        ((equal? db "scram-cost")
+         (write! (smsg #\R (bv-append (u32 10) (cstr "SCRAM-SHA-256")
+                                      (bytevector 0))))
+         (scram-cost-server!))
         ((equal? db "cleartext")
          (write! (smsg #\R (u32 3)))
          (let-values (((t p) (read-msg!)))
@@ -411,6 +432,17 @@
       (check "invalid-length-clean-error"
         (and e (eq? (vector-ref e 1) 'transport)
              (string-contains? (vector-ref e 2) "invalid message length"))))
+
+    ;; A malicious server cannot turn SCRAM authentication into minutes of
+    ;; client-side PBKDF2 work by choosing an extreme iteration count.
+    (let* ((started (now-ms))
+           (e (connect-error "127.0.0.1" port "user" scram-password
+                             "scram-cost"))
+           (elapsed (- (now-ms) started)))
+      (check "scram-iteration-cap"
+        (and e (vector? e) (eq? (vector-ref e 1) 'transport)
+             (string-contains? (vector-ref e 2) "malformed SCRAM server-first")
+             (< elapsed 2000))))
 
     ;; 9. passwords outside printable ASCII (SASLprep unimplemented):
     ;;    with SCRAM as the only possible path this is a CALLER-side
