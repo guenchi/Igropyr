@@ -15,12 +15,12 @@
 ;;; ws-recv answers pings automatically and handles fragmented messages.
 
 (library (igropyr websocket)
-  (export ws-accept-key
+  (export ws-accept-key ws-valid-client-key?
           make-ws make-ws-client ws? ws-conn
           ws-recv ws-send-text! ws-send-binary! ws-close!)
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv)
-          (only (igropyr crypto) sha1 base64-encode))
+          (only (igropyr crypto) sha1 base64-encode base64-decode))
 
   (define max-frame 1048576)          ; single frame payload cap
   (define max-message 8388608)        ; reassembled multi-frame message cap
@@ -44,6 +44,11 @@
                 (loop (cdr l) (+ off (bytevector-length x)))))))))
 
   ;; SHA-1 + base64 for the RFC 6455 accept-key live in (igropyr crypto).
+
+  (define (ws-valid-client-key? key)
+    (and (string? key)
+         (guard (e (#t #f))
+           (fx= (bytevector-length (base64-decode key)) 16))))
 
   (define ws-guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
