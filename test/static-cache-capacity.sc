@@ -76,6 +76,22 @@
                      (timeout . 10000))))))
         ;; A relative root differs from file-realpath's canonical key. The
         ;; first request spelling is kept hot without creating alias entries.
+        ;; Eviction must discharge the bytes, not just drop the mapping.
+        ;; A bare delete leaves the counter charged forever, and the only
+        ;; symptom is the ceiling tripping on every later store -- which no
+        ;; assertion about content would ever notice.
+        (let ((before (cdr (assq 'bytes (static-cache-stats)))))
+          (check "evict-probe caches" (= 200 (response-status (GET "hot.txt"))))
+          (check "evict-probe charged bytes"
+            (> (cdr (assq 'bytes (static-cache-stats))) before))
+          (delete-file (string-append root "/hot.txt"))
+          (sleep-ms 1100)
+          (check "evicting a deleted file observes it gone"
+            (= 404 (response-status (GET "hot.txt"))))
+          (check "eviction discharges the bytes it charged"
+            (= before (cdr (assq 'bytes (static-cache-stats))))))
+        (write-text (string-append root "/hot.txt") "cached")
+
         (check "prime relative-root hot entry"
           (= 200 (response-status (GET "hot.txt"))))
         (delete-file (string-append root "/hot.txt"))

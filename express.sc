@@ -25,7 +25,7 @@
           ws-send-sexpr! ws-recv-sexpr sse-send-sexpr!
           send-text! send-html! send-json! send-file!
           sse-start! sse-send! make-fault-handler
-          static-cache-limits!)
+          static-cache-limits! static-cache-stats)
   (import (chezscheme) (igropyr checked)
           (igropyr actor) (igropyr libuv) (igropyr http)
           (igropyr json) (igropyr gzip) (igropyr sexpr)
@@ -575,6 +575,42 @@
           (hashtable-set! static-cache path e)
           (hashtable-set! static-cache-hot (vector-ref e 8) e)
           (set! static-cache-bytes (+ static-cache-bytes n))))))
+
+  ;; What the cache is holding. Exported for the same reason as the node
+  ;; monitor tables: the byte total is the thing that silently goes wrong --
+  ;; an entry removed without discharging its bytes leaves the counter high
+  ;; forever, and the only symptom is a cache that starts clearing itself on
+  ;; every store. Nothing outside can see that, including a test.
+  (define (static-cache-stats)
+    (with-interrupts-disabled
+      (list (cons 'entries (hashtable-size static-cache))
+            (cons 'hot (hashtable-size static-cache-hot))
+            (cons 'bytes static-cache-bytes))))
+
+  ;; Undo exactly what cache-store! did for one entry: both tables and the
+  ;; byte counter.
+  ;;
+  ;; A bare hashtable-delete! is not enough, and fails in two ways that are
+  ;; both invisible. It would delete by the REQUEST path while the entry is
+  ;; filed under the name the OS resolved -- those differ for every relative
+  ;; root, and on macOS for anything under /tmp, which is a symlink -- so
+  ;; usually nothing would be removed at all. And it would leave the bytes
+  ;; charged: the counter only ever drops here or in cache-store!'s replace
+  ;; path, so a root that sees churn drifts upward until it is permanently
+  ;; over the ceiling, at which point every store clears the whole cache and
+  ;; the hit rate goes to zero -- worse than the stale entry being evicted.
+  ;;
+  ;; The eq? guards are cache-store!'s: never remove a mapping that now
+  ;; points at a different, live entry.
+  (define (cache-evict! e)
+    (with-interrupts-disabled
+      (let ((canonical (vector-ref e 7)))
+        (when (eq? (hashtable-ref static-cache canonical #f) e)
+          (hashtable-delete! static-cache canonical)
+          (set! static-cache-bytes (- static-cache-bytes (entry-bytes e)))))
+      (let ((hot (vector-ref e 8)))
+        (when (eq? (hashtable-ref static-cache-hot hot #f) e)
+          (hashtable-delete! static-cache-hot hot)))))
 
   ;; Cache a lazily generated representation only while the aggregate byte
   ;; budget has room. The caller may still serve g once when it does not.
