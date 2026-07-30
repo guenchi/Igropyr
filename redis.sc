@@ -107,16 +107,24 @@
 
   ;; ---- RESP parsing ---------------------------------------------------------
 
-  ;; Resumable parse state is #(position array-stack). Each
-  ;; stack frame is (remaining . reversed-values). Completed array elements
-  ;; stay in the state when more bytes are needed, so a one-byte-at-a-time
-  ;; server cannot make us reparse an ever-growing prefix quadratically.
+  ;; Resumable parse state is
+  ;;   #(position array-stack line-scan pending-bulk)
+  ;; Each stack frame is (remaining . reversed-values). Completed array
+  ;; elements, the CRLF scan cursor, and an already parsed bulk length all
+  ;; stay in the state when more bytes are needed. Thus neither a fragmented
+  ;; line nor a fragmented bulk body is rescanned from its beginning.
   ;; -> (values 'done #(value consumed)) | (values 'more state)
   (define (parse-reply buf base limit state)
     (letrec
-      ((more
+      ((more-line
          (lambda (pos stack)
-           (values 'more (vector pos stack))))
+           ;; Retain one byte of overlap so a trailing CR can pair with an
+           ;; LF in the next segment.
+           (values 'more
+             (vector pos stack (max (+ pos 1) (- limit 1)) #f))))
+       (more-bulk
+         (lambda (pos stack next n)
+           (values 'more (vector pos stack #f (vector next n)))))
        (accept
          (lambda (v pos stack)
            (if (null? stack)
@@ -128,15 +136,31 @@
                      (accept (reverse (cons v acc)) pos (cdr stack))
                      (loop pos
                            (cons (cons (- remaining 1) (cons v acc))
-                                 (cdr stack))))))))
+                                 (cdr stack))
+                           (+ pos 1) #f))))))
+       (bulk
+         (lambda (pos stack next n)
+           (cond
+             ((< limit (+ next n 2)) (more-bulk pos stack next n))
+             ((not (and
+                     (= (bytevector-u8-ref buf (+ base next n)) 13)
+                     (= (bytevector-u8-ref buf (+ base next n 1)) 10)))
+              (accept (vector 'redis-error "bad bulk terminator")
+                      (+ next n 2) stack))
+             (else
+              (let ((raw (bv-sub buf (+ base next) (+ base next n))))
+                (accept (if (valid-utf8? raw) (utf8->string raw) raw)
+                        (+ next n 2) stack))))))
        (loop
-         (lambda (pos stack)
-           (if (>= pos limit)
-               (more pos stack)
-               (let ((eol (find-crlf buf base limit (+ pos 1))))
-                 (if (not eol)
-                     (more pos stack)
-                     (let ((line (utf8->string
+         (lambda (pos stack scan pending)
+           (if pending
+               (bulk pos stack (vector-ref pending 0) (vector-ref pending 1))
+               (if (>= pos limit)
+                   (more-line pos stack)
+                   (let ((eol (find-crlf buf base limit scan)))
+                     (if (not eol)
+                         (more-line pos stack)
+                         (let ((line (utf8->string
                                    (bv-sub buf (+ base pos 1) (+ base eol))))
                            (next (+ eol 2)))
                        (case (integer->char (bytevector-u8-ref buf (+ base pos)))
@@ -150,18 +174,7 @@
                                (accept (vector 'redis-error "bad bulk length")
                                        next stack))
                               ((< n 0) (accept #f next stack))
-                              ((< limit (+ next n 2)) (more pos stack))
-                              ((not (and
-                                      (= (bytevector-u8-ref buf (+ base next n)) 13)
-                                      (= (bytevector-u8-ref buf (+ base next n 1)) 10)))
-                               (accept (vector 'redis-error "bad bulk terminator")
-                                       (+ next n 2) stack))
-                              (else
-                               (let ((raw (bv-sub buf (+ base next)
-                                                  (+ base next n))))
-                                 (accept
-                                   (if (valid-utf8? raw) (utf8->string raw) raw)
-                                   (+ next n 2) stack))))))
+                              (else (bulk pos stack next n)))))
                          ((#\*)
                           (let ((n (string->number line)))
                             (cond
@@ -170,13 +183,16 @@
                                        next stack))
                               ((< n 0) (accept #f next stack))
                               ((= n 0) (accept '() next stack))
-                              (else (loop next (cons (cons n '()) stack))))))
+                              (else
+                               (loop next (cons (cons n '()) stack)
+                                     (+ next 1) #f)))))
                          (else
                           (accept (vector 'redis-error "bad reply type")
-                                  next stack))))))))))
+                                  next stack)))))))))))
       (if state
-          (loop (vector-ref state 0) (vector-ref state 1))
-          (loop 0 '()))))
+          (loop (vector-ref state 0) (vector-ref state 1)
+                (vector-ref state 2) (vector-ref state 3))
+          (loop 0 '() 1 #f))))
 
   ;; ---- connection process -----------------------------------------------------
 
