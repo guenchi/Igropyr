@@ -91,6 +91,25 @@
                 base64-encode base64-decode))
 
   (define connect-timeout-ms 10000)
+  ;; RFC 5802 warns that a hostile server can DoS a client with an extreme
+  ;; iteration count -- the client does the work the SERVER asks for.
+  ;;
+  ;; This number is a TIME budget, not a copy of kdf.sc's ceiling, even
+  ;; though both bound "untrusted PBKDF2 iterations". kdf.sc bounds
+  ;; libcrypto's; SCRAM here runs (igropyr crypto)'s pure-Scheme one so it
+  ;; works without OpenSSL, and the same count costs about ninety times
+  ;; more. Measured: 2 000 000 iterations is 152 ms through libcrypto and
+  ;; 13 502 ms here. Sharing the constant would have authorised thirteen
+  ;; seconds of a single-OS-thread runtime per connection attempt, which a
+  ;; reconnecting pool turns into saturation.
+  ;;
+  ;; 100 000 costs ~660 ms here and is 24x PostgreSQL's own default
+  ;; scram_iterations of 4096 (~29 ms), so no ordinary server comes close.
+  ;; A deployment that has raised scram_iterations past this can raise the
+  ;; ceiling with the 'scram-max-iters option rather than failing to
+  ;; connect -- refusing a legitimately configured server would be limiting
+  ;; what the server may say, not what an attacker may.
+  (define default-scram-max-iters 100000)
   ;; per-socket-read clock while a QUERY is in flight (the caller-facing
   ;; query timeout is (igropyr sqlpool)'s own, same value); auth-phase
   ;; reads use connect-timeout-ms instead, so a server that stalls
@@ -381,7 +400,7 @@
   ;;      Keyed on TLS BEING ACTIVE, not on having a hash, or a MITM
   ;;      with an unhashable certificate could downgrade us to "n".
   ;;   n  plaintext connection, no binding possible
-  (define (scram-auth! c buf user password sasl-payload)
+  (define (scram-auth! c buf user password sasl-payload max-iters)
     (unless (scram-safe-password? password)
       (postgresql-fail 'transport
         (string-append
@@ -426,6 +445,7 @@
             ;; nonce must EXTEND ours (RFC 5802: client nonce + a non-empty
             ;; server part), so strictly longer.
             (unless (and snonce salt-b64 iters (fixnum? iters) (> iters 0)
+                         (fx<= iters max-iters)
                          (> (string-length snonce) (string-length cnonce))
                          (string=? (substring snonce 0 (string-length cnonce))
                                    cnonce))
@@ -459,6 +479,15 @@
     (let ((p (and (pair? alist) (assq key alist))))
       (and p (cdr p))))
 
+  (define (scram-iter-ceiling opts)
+    (let ((v (assq-ref opts 'scram-max-iters)))
+      (cond
+        ((not v) default-scram-max-iters)
+        ((and (fixnum? v) (fx> v 0)) v)
+        (else
+          (assertion-violation 'postgresql-connect
+            "'scram-max-iters must be a positive fixnum" v)))))
+
   (define (authenticate! c buf user password db opts)
     (tx-write! c (startup-msg user db))
     (let loop ()
@@ -469,7 +498,8 @@
              (cond
                ((= code 0) (finish-startup! c buf))         ; AuthenticationOk
                ((= code 10)                                 ; AuthenticationSASL
-                (scram-auth! c buf user password p)
+                (scram-auth! c buf user password p
+                             (scram-iter-ceiling opts))
                 (loop))                                     ; then AuthenticationOk
                ((= code 3)                                  ; cleartext password
                 ;; the auth method is the SERVER's choice, i.e. an active

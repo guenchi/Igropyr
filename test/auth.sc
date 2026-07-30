@@ -7,6 +7,7 @@
 
 (import (chezscheme) (igropyr http) (igropyr express) (igropyr session)
         (igropyr auth) (igropyr jwt) (igropyr ws-client)
+        (only (igropyr websocket) ws-conn ws-send-text! ws-close!)
         (igropyr json) (igropyr sexpr) (igropyr libuv))
 
 (define port 18088)
@@ -85,6 +86,27 @@
                (substring resp (+ at 4) j)
                (scan (+ j 1)))))))
 
+;; One more frame than (igropyr websocket)'s max-fragments accepts. That
+;; constant is library-internal, so the number here has to track it by
+;; hand: if it grows, these frames quietly stop reaching the cap and the
+;; check goes back to passing without exercising anything.
+(define fragment-cap 16384)
+
+(define (zero-fragment-attack)
+  ;; ... and then ONE final continuation. Without it a server that does not
+  ;; cap simply waits for a frame that never comes while the test waits for
+  ;; a message that never arrives: a regression hangs the suite instead of
+  ;; failing it, which in CI is a burned job timeout with no diagnostic.
+  (let* ((frames (+ 1 fragment-cap))
+         (out (make-bytevector (* (+ frames 1) 6) 0)))
+    (do ((i 0 (+ i 1))) ((= i frames))
+      ;; First frame: non-final text; the rest: non-final continuations.
+      (bytevector-u8-set! out (* i 6) (if (= i 0) #x01 #x00))
+      (bytevector-u8-set! out (+ (* i 6) 1) #x80))
+    (bytevector-u8-set! out (* frames 6) #x80)          ; FIN + continuation
+    (bytevector-u8-set! out (+ (* frames 6) 1) #x80)    ; masked, length 0
+    out))
+
 ;; read one text message from a ws session, then close
 (define (recv-text-and-close w)
   (let ((m (ws-recv w)))
@@ -99,17 +121,84 @@
 (define app (create-app))
 (app-use app (session-middleware store))
 
-;; HTTP login: writes the user into the session, cookie comes back
+;; Establish anonymous state, then rotate the identifier at login.
+(app-get app "/seed"
+  (lambda (req res)
+    (session-set! (req-session req) 'preauth "kept")
+    (send-text! res "ok")))
+
 (app-get app "/login"
   (lambda (req res)
+    (session-regenerate! (req-session req))
     (session-set! (req-session req) 'user "ada")
     (send-text! res "ok")))
+
+;; the ordering mistake: answer, then rotate. The replacement cookie can no
+;; longer reach the client, so rotating anyway would drop the live id and
+;; silently log the user out.
+(define late-outcome 'unrun)
+(app-get app "/late-rotate"
+  (lambda (req res)
+    (send-text! res "answered")
+    (set! late-outcome
+      (guard (e (#t 'raised))
+        (session-regenerate! (req-session req))
+        'returned))))
+
+;; reports what the handler above saw; the client of /late-rotate cannot,
+;; because its response was already on the wire before the raise
+(app-get app "/late-outcome"
+  (lambda (req res) (send-text! res (symbol->string late-outcome))))
+
+;; Rotating twice in one request is idempotent: the first call marks the
+;; session new, so the second returns that same id rather than minting a
+;; competing one. Two layers can each insist on rotating without knowing
+;; about each other.
+(define twice-same? 'unrun)
+(app-get app "/rotate-twice"
+  (lambda (req res)
+    (let* ((s (req-session req))
+           (a (session-regenerate! s))
+           (b (session-regenerate! s)))
+      (set! twice-same? (string=? a b))
+      (send-text! res "done"))))
+
+;; A session handed to a process that outlives the handler must not be
+;; able to rotate against that request's finished response. Nothing
+;; answers here, so the refusal rests on the framework answering for an
+;; unanswered request -- if that ever stops being true, the response token
+;; stays unclaimed, res-answered? stays #f, and the drop goes through with
+;; a cookie no one will ever receive. This pins that dependency.
+(define escaped-outcome 'unrun)
+(app-get app "/escape-rotate"
+  (lambda (req res)
+    (let ((s (req-session req)))
+      (spawn (lambda ()
+               (sleep-ms 300)
+               (set! escaped-outcome
+                 (guard (e (#t 'raised))
+                   (session-regenerate! s)
+                   'returned)))))))
+
+(app-get app "/escape-outcome"
+  (lambda (req res) (send-text! res (symbol->string escaped-outcome))))
 
 ;; unguarded ws route (regression: guards are opt-in)
 (app-ws app "/open"
   (lambda (ws req)
     (ws-send-text! ws "open")
     (ws-recv ws)))
+
+;; Answers only if a message actually got assembled and delivered. A bare
+;; close cannot say why it happened -- the cap closing the session and this
+;; handler simply returning look identical from the client, and ws-recv
+;; surfaces no status code -- so the delivery itself has to be what is
+;; observable.
+(app-ws app "/sink"
+  (lambda (ws req)
+    (let ((m (ws-recv ws)))
+      (unless (and (vector? m) (eq? (vector-ref m 0) 'close))
+        (ws-send-text! ws "delivered")))))
 
 ;; token-guarded: claims are the verified JWT claims (string keys)
 (app-ws app "/chat"
@@ -124,6 +213,16 @@
     (ws-send-text! ws (cdr (assq 'user (req-claims req))))
     (ws-recv ws))
   (session-guard store))
+
+;; Same credential, with an origin allow-list. The cookie is attached by
+;; the browser whatever page opened the socket, and the same-origin policy
+;; does not apply to WebSockets, so this is the only thing standing between
+;; a hostile page and an authenticated session.
+(app-ws app "/feed-origin"
+  (lambda (ws req)
+    (ws-send-text! ws "ok")
+    (ws-recv ws))
+  (session-guard store '((origins . ("https://app.example")))))
 
 ;; token-guarded sexpr RPC: refusal is sexpr data; two-argument
 ;; handlers see the request (claims), one-argument ones work as before
@@ -160,6 +259,42 @@
       (equal? (recv-text-and-close
                 (ws-connect "ws://127.0.0.1:18088/open"))
               "open"))
+    ;; Zero-length fragments consume a list cell and a bytevector each even
+    ;; though the message stays at zero bytes, so the byte cap never fires.
+    ;; The server must cap their COUNT: a close here means it did, because
+    ;; the handler only answers when a message was actually delivered.
+    (let ((w (ws-connect "ws://127.0.0.1:18088/sink")))
+      (tcp-write! (ws-conn w) (zero-fragment-attack) #f)
+      (check "ws-zero-fragment-limit"
+        (let ((m (ws-recv w)))
+          (and (vector? m) (eq? (vector-ref m 0) 'close))))
+      ;; the session outlives the check when the cap is missing; leaving it
+      ;; open takes the rest of the suite down with it, so a failure here
+      ;; stays one failure instead of aborting every check after it
+      (ws-close! w))
+
+    ;; The HTTP upgrade path validates every RFC 6455 handshake invariant
+    ;; before transferring ownership to a WebSocket session.
+    (check "ws-handshake-method"
+      (equal? (status-of (http-req
+        "POST /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-http-version"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.0\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-connection-token"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-version-13"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 12\r\n\r\n"))
+              "400"))
+    (check "ws-handshake-key-length"
+      (equal? (status-of (http-req
+        "GET /open HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: YQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+              "400"))
 
     ;; token guard: header credential
     (check "ws-token-header"
@@ -188,6 +323,111 @@
     ;; unknown ws route stays 404 (reject is 401, not-found is not)
     (check "ws-unknown-404"
       (equal? (status-of (upgrade-req "/nope")) "404"))
+
+    ;; An established anonymous id is invalidated and replaced at the
+    ;; authentication boundary; its data is carried to the new id.
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (old (extract-sid seed))
+           (login (and old (http-req
+                     (string-append
+                       "GET /login HTTP/1.1\r\nHost: x\r\nCookie: sid=" old
+                       "\r\nConnection: close\r\n\r\n"))))
+           (fresh (and login (extract-sid login))))
+      (check "session-login-rotates-id"
+        (and old fresh (not (string=? old fresh))))
+      (sleep-ms 100)
+      (check "session-login-drops-old-id"
+        (and old (not (session-peek store old))))
+      (check "session-login-keeps-state"
+        (let ((data (and fresh (session-peek store fresh))))
+          (and data (equal? (cdr (assq 'preauth data)) "kept")
+               (equal? (cdr (assq 'user data)) "ada")))))
+
+    ;; Rotating after the response is out must fail loudly rather than
+    ;; half-apply: the cookie cannot be delivered, so the id must not be
+    ;; dropped either. The handler raise surfaces as a 500.
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (sid (extract-sid seed))
+           (late (and sid (http-req
+                    (string-append
+                      "GET /late-rotate HTTP/1.1\r\nHost: x\r\nCookie: sid=" sid
+                      "\r\nConnection: close\r\n\r\n")))))
+      (sleep-ms 150)
+      ;; the client legitimately still sees its 200: the response was
+      ;; complete before the mistake was made
+      (check "late-rotate-answers-normally" (equal? "200" (status-of late)))
+      (check "late-rotate-raises"
+        (equal? "raised"
+                (let ((r (http-req
+                           "GET /late-outcome HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
+                  (let ((b (find-substr r "\r\n\r\n")))
+                    (and b (substring r (+ b 4) (string-length r)))))))
+      (check "late-rotate-keeps-the-live-id"
+        (let ((data (and sid (session-peek store sid))))
+          (and data (equal? (cdr (assq 'preauth data)) "kept")))))
+
+    ;; one identity per request, however many layers ask for it
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (sid (extract-sid seed))
+           (resp (and sid (http-req
+                    (string-append
+                      "GET /rotate-twice HTTP/1.1\r\nHost: x\r\nCookie: sid=" sid
+                      "\r\nConnection: close\r\n\r\n")))))
+      (check "rotate-twice-is-idempotent" (eq? #t twice-same?))
+      (check "rotate-twice-issues-one-cookie"
+        (= 1 (let loop ((i 0) (n 0))
+               (let ((at (find-substr (substring resp i (string-length resp))
+                                      "Set-Cookie")))
+                 (if at (loop (+ i at 10) (+ n 1)) n))))))
+
+    ;; a session that outlives its handler cannot rotate against the
+    ;; finished response
+    (let* ((seed (http-req
+                   "GET /seed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (sid (extract-sid seed)))
+      (when sid
+        (http-req (string-append
+                    "GET /escape-rotate HTTP/1.1\r\nHost: x\r\nCookie: sid=" sid
+                    "\r\nConnection: close\r\n\r\n")))
+      (sleep-ms 700)
+      (check "escaped-session-rotate-raises"
+        (equal? "raised"
+                (let ((r (http-req
+                           "GET /escape-outcome HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
+                  (let ((b (find-substr r "\r\n\r\n")))
+                    (and b (substring r (+ b 4) (string-length r)))))))
+      (check "escaped-session-rotate-keeps-the-live-id"
+        (let ((data (and sid (session-peek store sid))))
+          (and data (equal? (cdr (assq 'preauth data)) "kept")))))
+
+    ;; Cross-site WebSocket hijacking: a page on another origin can open
+    ;; this socket and the browser attaches the session cookie regardless.
+    ;; With an allow-list the foreign origin must be refused BEFORE the
+    ;; handshake, and the configured one must still get through.
+    (let* ((login (http-req "GET /login HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+           (sid (extract-sid login))
+           (upgrade
+             (lambda (origin)
+               (status-of
+                 (http-req
+                   (string-append
+                     "GET /feed-origin HTTP/1.1\r\nHost: x\r\n"
+                     "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                     "Sec-WebSocket-Version: 13\r\n"
+                     (if origin (string-append "Origin: " origin "\r\n") "")
+                     "Cookie: sid=" sid "\r\n\r\n"))))))
+      (unless sid (fail "origin-login" login))
+      (check "ws-origin-allowed" (equal? "101" (upgrade "https://app.example")))
+      (check "ws-origin-foreign-refused"
+        (not (equal? "101" (upgrade "http://evil.example"))))
+      ;; no Origin at all is a non-browser client, which cannot be carrying
+      ;; somebody else's cookie -- refusing it would lock out every ordinary
+      ;; WebSocket library without closing anything
+      (check "ws-origin-absent-allowed" (equal? "101" (upgrade #f))))
 
     ;; session guard: log in over HTTP, ride the cookie into the upgrade
     (let* ((login (http-req "GET /login HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))

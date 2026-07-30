@@ -1,6 +1,6 @@
 #!chezscheme
 (import (chezscheme) (igropyr util) (igropyr actor) (igropyr libuv)
-        (igropyr http))
+        (igropyr http) (only (igropyr express) req-form))
 
 (define port 18080)
 (define empty-bv (make-bytevector 0))
@@ -106,10 +106,14 @@
 
 (define (handler req res)
   (set-header! res "Content-Type" "text/plain")
-  (if (string=? (req-path req) "/query")
-      (let ((p (assoc "token" (req-query req))))
-        (res-send! res (string->utf8 (if p (cdr p) "missing"))))
-      (res-send! res (req-body req))))
+  (cond
+    ((string=? (req-path req) "/query")
+     (let ((p (assoc "token" (req-query req))))
+       (res-send! res (string->utf8 (if p (cdr p) "missing")))))
+    ((string=? (req-path req) "/form")
+     (let ((role (assoc "role" (req-form req))))
+       (res-send! res (string->utf8 (if role (cdr role) "safe")))))
+    (else (res-send! res (req-body req)))))
 
 (start-scheduler
   (lambda ()

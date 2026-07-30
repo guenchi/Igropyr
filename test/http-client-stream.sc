@@ -285,6 +285,19 @@
                   (http-get (string-append "http://127.0.0.1:" (number->string port) "/never")
                             `((on-chunk . ,(lambda (bv) bv)) (timeout . 200)))))
               "response timeout"))
+    ;; Framing and routing headers are owned by the serializer. Allowing a
+    ;; caller to duplicate them creates request-smuggling differentials.
+    (for-each
+      (lambda (name)
+        (check (string-append "managed-header-" name)
+          (equal? (client-error-message
+                    (lambda ()
+                      (http-get
+                        (string-append "http://127.0.0.1:"
+                                       (number->string port) "/sse")
+                        `((headers . ((,name . "attacker")))))))
+                  (string-append "header is managed by the client: " name))))
+      '("Host" "Connection" "Content-Length" "Transfer-Encoding"))
     ;; a non-procedure on-chunk is rejected before any connection
     (check "bad-on-chunk-rejected"
       (equal? (client-error-message
