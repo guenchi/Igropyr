@@ -516,7 +516,9 @@
   (define (self-mon-agent caller mref name)
     (let ((p (whereis name)))
       (if (not p)
-          (fire-remote-down! mref 'noproc)
+          (begin
+            (atomically (hashtable-delete! caller-agents mref))
+            (fire-remote-down! mref 'noproc))
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
@@ -525,6 +527,14 @@
               (`#(demon-local)
                 (demonitor m)
                 (atomically (hashtable-delete! caller-agents mref))))))))
+
+  (define (install-self-agent! caller mref name)
+    ;; As with owner-agents, publish the pid before it can run. In
+    ;; particular, a missing name takes the immediate noproc path above;
+    ;; publishing afterwards would reinsert that already-dead agent.
+    (atomically
+      (let ((agent (spawn (lambda () (self-mon-agent caller mref name)))))
+        (hashtable-set! caller-agents mref agent))))
 
   ;; every rmonitor watching a node whose link just dropped gets a
   ;; synthesized noconnection (the target may be alive or dead -- across
@@ -790,9 +800,11 @@
       (cond
         ((eq? node self-name)
          (atomically (hashtable-set! rmonitors mref (vector self node name)))
-         (let ((agent (spawn (lambda () (self-mon-agent self mref name)))))
-           (atomically (hashtable-set! caller-agents mref agent)))
-         (install-owner-agent! self mref))
+         ;; The owner must exist before the target agent can report DOWN;
+         ;; otherwise that fast path cannot stop it and leaves another dead
+         ;; agent rooted after the monitor has already completed.
+         (install-owner-agent! self mref)
+         (install-self-agent! self mref name))
         ((live-entry node)
          => (lambda (e)
                (atomically (hashtable-set! rmonitors mref (vector self node name)))
