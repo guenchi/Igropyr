@@ -15,6 +15,18 @@
 
 (define (u s) (string->utf8 s))
 
+;; ARGON2ID needs OpenSSL 3.2+; a 3.0/3.1 libcrypto has every other KDF
+;; here. Only the checks that actually DERIVE are gated -- the malformed
+;; input and cost-bomb checks below use argon2id-shaped strings but are
+;; rejected by the parameter guards before any KDF runs, so they must keep
+;; running everywhere, and would be silently lost to a blanket skip.
+(define argon2? (kdf-argon2id-available?))
+(unless argon2?
+  (display "  SKIP argon2id derivations: this libcrypto has no ARGON2ID.\n")
+  (display "       It needs OpenSSL 3.2+ -- Debian 12 and Ubuntu 22.04 ship\n")
+  (display "       3.0. Everything else in this suite still runs; to cover\n")
+  (display "       argon2id, run on a host with OpenSSL >= 3.2.\n"))
+
 ;; ---- PBKDF2-HMAC-SHA256 (RFC 6070 inputs, SHA-256 outputs) ----
 (check "pbkdf2-c1"
   (string=? (bytevector->hex (kdf-pbkdf2-sha256 (u "password") (u "salt") 1 32))
@@ -36,9 +48,16 @@
     "7023bdcb3afd7348461c06cd81fd38ebfda8fbba904f8e3ea9b543f6545da1f2d5432955613f0fcf62d49705242a9af9e61e85dc0d651e40dfcf017b45575887"))
 
 ;; ---- argon2id (vector from `openssl kdf ... ARGON2ID`, i.e. this libcrypto) ----
-(check "argon2id-vector"    ; t=2 m=64 p=1
-  (string=? (bytevector->hex (kdf-argon2id (u "password") (u "0123456789abcdef") 2 64 1 32))
-            "fb83b5711fd91df630b63677dee62ccd13ee6f0c4897d856b49542b9b1e9975b"))
+(when argon2?
+  (check "argon2id-vector"    ; t=2 m=64 p=1
+    (string=? (bytevector->hex (kdf-argon2id (u "password") (u "0123456789abcdef") 2 64 1 32))
+              "fb83b5711fd91df630b63677dee62ccd13ee6f0c4897d856b49542b9b1e9975b")))
+
+;; where it is absent, the failure must be the documented one -- not a
+;; segfault, and not a hash silently derived by some other primitive
+(unless argon2?
+  (check "argon2id-absent-raises"
+    (guard (e (#t #t)) (kdf-argon2id (u "password") (u "0123456789abcdef") 2 64 1 32) #f)))
 
 ;; ---- self-describing password hashes ----
 ;; scrypt roundtrip (small N for test speed; the format is cost-agnostic)
@@ -53,16 +72,18 @@
   (check "pbkdf2-roundtrip"  (password-verify "hunter2" s))
   (check "pbkdf2-wrong"      (not (password-verify "wrong" s))))
 ;; argon2id roundtrip (small m for test speed)
-(let ((s (password-hash "hunter2" 'argon2id '((t . 1) (m . 8) (p . 1)))))
-  (check "argon2id-format"    (string=? (substring s 0 9) "argon2id$"))
-  (check "argon2id-roundtrip" (password-verify "hunter2" s))
-  (check "argon2id-wrong"     (not (password-verify "wrong" s)))
-  (check "argon2id-tampered"  (not (password-verify "hunter2" (string-append s "x")))))
+(when argon2?
+  (let ((s (password-hash "hunter2" 'argon2id '((t . 1) (m . 8) (p . 1)))))
+    (check "argon2id-format"    (string=? (substring s 0 9) "argon2id$"))
+    (check "argon2id-roundtrip" (password-verify "hunter2" s))
+    (check "argon2id-wrong"     (not (password-verify "wrong" s)))
+    (check "argon2id-tampered"  (not (password-verify "hunter2" (string-append s "x"))))))
 ;; ONE verify dispatches on the prefix -> an app can migrate algorithms
 (check "cross-dispatch"
   (and (password-verify "a" (password-hash "a" 'scrypt '((N . 1024))))
        (password-verify "b" (password-hash "b" 'pbkdf2 '((iterations . 4096))))
-       (password-verify "c" (password-hash "c" 'argon2id '((t . 1) (m . 8) (p . 1))))))
+       (or (not argon2?)
+           (password-verify "c" (password-hash "c" 'argon2id '((t . 1) (m . 8) (p . 1)))))))
 ;; malformed / crafted -> #f, never a crash and never "matches anything"
 (check "malformed-empty-dk-scrypt" (not (password-verify "x" "scrypt$1024$8$1$@@@$@@@")))
 (check "malformed-empty-dk-pbkdf2" (not (password-verify "x" "pbkdf2-sha256$4096$@@@$@@@")))
@@ -97,8 +118,9 @@
 (let* ((t0 (real-time)) (_ (password-hash "measure" 'scrypt '())) (ms (- (real-time) t0)))
   (display "  [perf] scrypt N=32768 = ") (display ms)
   (display " ms/hash (vs ~790 ms pure-Scheme pbkdf2)\n"))
-(let* ((t0 (real-time)) (_ (password-hash "measure" 'argon2id '())) (ms (- (real-time) t0)))
-  (display "  [perf] argon2id m=19456,t=2 = ") (display ms) (display " ms/hash\n"))
+(when argon2?
+  (let* ((t0 (real-time)) (_ (password-hash "measure" 'argon2id '())) (ms (- (real-time) t0)))
+    (display "  [perf] argon2id m=19456,t=2 = ") (display ms) (display " ms/hash\n")))
 
 (if (zero? failures)
     (begin (display "kdf: all tests passed\n") (exit 0))

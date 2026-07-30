@@ -13,7 +13,7 @@
 (library (igropyr libuv)
   (export uv-init! uv-poll! now-ms now-ns uv-set-deliver! uv-owner-died!
           tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
-          file-read-async!
+          file-read-async! file-realpath
           file-stream-open! file-stream-open-under!
           file-stream-read! file-stream-close!
           file-stream-own! file-stream-raw! file-stream-chunk-ptr
@@ -66,6 +66,9 @@
   (define uv-fs-read  (foreign-procedure "uv_fs_read" (void* void* int void* unsigned-int long void*) int))
   (define uv-fs-close (foreign-procedure "uv_fs_close" (void* void* int void*) int))
   (define uv-fs-fstat (foreign-procedure "uv_fs_fstat" (void* void* int void*) int))
+  (define uv-fs-realpath
+    (foreign-procedure "uv_fs_realpath" (void* void* string void*) int))
+  (define uv-fs-get-ptr (foreign-procedure "uv_fs_get_ptr" (void*) void*))
   (define uv-fs-get-result (foreign-procedure "uv_fs_get_result" (void*) ssize_t))
   (define uv-fs-get-statbuf (foreign-procedure "uv_fs_get_statbuf" (void*) void*))
   (define uv-fs-req-cleanup (foreign-procedure "uv_fs_req_cleanup" (void*) void))
@@ -650,7 +653,7 @@
           (fs-fail! op req r)))
       op))
 
-  ;; Start the ordinary asynchronous fstat/read pipeline from an fd that
+ ;; Start the ordinary asynchronous fstat/read pipeline from an fd that
   ;; has already been opened securely with openat.
   (define (fs-start-fd! fd path owner mode)
     (let* ((req (foreign-alloc fs-req-size))
@@ -702,6 +705,36 @@
                     (cond ((< next 0) -1)
                           (last? next)
                           (else (loop next (cdr xs)))))))))))
+
+  ;; The path the OS itself would call this file: symlinks and . / ..
+  ;; resolved, and on a case-insensitive filesystem the spelling corrected
+  ;; to the one on disk, so every way of naming one file gives one answer.
+  ;; #f if it does not resolve.
+  ;;
+  ;; SYNCHRONOUS -- a passed callback of 0 makes uv_fs_* block -- so this
+  ;; stalls the scheduler for one path lookup. That is the same cost the
+  ;; surrounding code already pays for file-exists?; do not put it on a
+  ;; path that runs per request when the answer can be cached.
+  (define (file-realpath path)
+    (let ((req (foreign-alloc fs-req-size)))
+      (dynamic-wind
+        (lambda () (void))
+        (lambda ()
+          (let ((r (uv-fs-realpath uv-loop req path 0)))
+            (and (>= r 0)
+                 (let ((p (uv-fs-get-ptr req)))
+                   (and (not (eqv? p 0))
+                        ;; the string is owned by the request; copy before
+                        ;; the cleanup below frees it
+                        (let loop ((i 0) (acc '()))
+                          (let ((b (foreign-ref 'unsigned-8 p i)))
+                            (if (fx= b 0)
+                                (utf8->string
+                                  (u8-list->bytevector (reverse acc)))
+                                (loop (fx+ i 1) (cons b acc))))))))))
+        (lambda ()
+          (uv-fs-req-cleanup req)
+          (foreign-free req)))))
 
   ;; Read a whole file on libuv's thread pool. The owner process later
   ;; receives #(file-read ,bytevector) or #(file-error ,errno). Never

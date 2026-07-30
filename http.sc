@@ -40,7 +40,7 @@
           res-begin! res-write! res-end!
           res-begin-file! res-write-file! res-write-chunk! res-abort-file!
           res-conn res-req res-status res-headers res-keep-alive?
-          res-head-request? res-send-head!
+          res-head-request? res-send-head! res-answered?
           send-response! parse-query
           ;; Re-exported app-facing (igropyr actor) surface, so a core
           ;; application imports this library alone. Advanced primitives
@@ -703,6 +703,16 @@
       (mutable remaining res-remaining res-remaining-set!)))
 
   (define (set-status! r s) (res-status-set! r s))
+
+  ;; #t once the status line has gone out -- by res-send!, by res-begin!,
+  ;; or by anything else that claimed the one-shot token. After that,
+  ;; set-status! and set-header! still succeed and still do nothing: the
+  ;; headers they would have written are already on the wire.
+  ;;
+  ;; Exported so a layer whose correctness depends on a header actually
+  ;; reaching the client -- a rotated session cookie, say -- can refuse
+  ;; loudly instead of half-applying an effect the client never learns of.
+  (define (res-answered? r) (and (unbox (res-token r)) #t))
 
   ;; Silently ignore header names/values containing CR or LF; they are
   ;; also rejected again at render time.
