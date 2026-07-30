@@ -519,11 +519,25 @@
                              (string-split (cdr p) #\,))))
             (if (equal? tokens '("chunked")) 'chunked 'bad)))))
 
-  ;; websocket upgrade request? returns the Sec-WebSocket-Key or #f
-  (define (websocket-key headers)
-    (let ((u (assq 'upgrade headers))
-          (k (assq 'sec-websocket-key headers)))
-      (and u k (string-ci=? (cdr u) "websocket") (cdr k))))
+  (define (websocket-attempt? headers)
+    (or (assq 'sec-websocket-key headers)
+        (assq 'sec-websocket-version headers)
+        (let ((u (assq 'upgrade headers)))
+          (and u (string-ci=? (cdr u) "websocket")))))
+
+  ;; Return the client key only for a complete RFC 6455 opening handshake.
+  (define (websocket-key parsed)
+    (let* ((headers (vector-ref parsed 4))
+           (u (assq 'upgrade headers))
+           (k (assq 'sec-websocket-key headers))
+           (v (assq 'sec-websocket-version headers)))
+      (and (eq? (vector-ref parsed 0) 'GET)
+           (equal? (vector-ref parsed 3) "HTTP/1.1")
+           u (string-ci=? (cdr u) "websocket")
+           (connection-has-token? headers "upgrade")
+           v (string=? (cdr v) "13")
+           k (ws-valid-client-key? (cdr k))
+           (cdr k))))
 
   ;; Connection is a comma-separated TOKEN LIST (RFC 9110): "close, TE"
   ;; really does mean close. Comparing the whole coalesced value would
@@ -1225,7 +1239,7 @@
       (if (not parsed)
           (quick-response! c 400 "Bad Request")
           (let* ((headers (vector-ref parsed 4))
-                 (wskey (websocket-key headers))
+                 (wskey (websocket-key parsed))
                  (resolver (unbox (http-server-wsbox srv)))
                  (te (transfer-encoding headers))
                  (clen (content-length headers)))
@@ -1238,6 +1252,8 @@
                (quick-response! c 400 "Bad Request"))
               ((and (eq? te 'chunked) (not (eq? clen 'absent)))
                (quick-response! c 400 "Bad Request"))
+              ((and resolver (websocket-attempt? headers) (not wskey))
+               (quick-response! c 400 "Bad WebSocket Handshake"))
               ;; websocket upgrade: resolve a session, shake hands, and
               ;; run the session in this reader process
               ((and wskey resolver)
