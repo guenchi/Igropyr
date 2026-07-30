@@ -36,11 +36,11 @@
           req-method req-path req-query req-headers req-header req-body
           req-keep-alive? req-version req-peer req-params req-params-set!
           req-local req-set-local!
-          set-status! set-header! res-send!
+          set-status! set-header! set-header-if-unanswered! res-send!
           res-begin! res-write! res-end!
           res-begin-file! res-write-file! res-write-chunk! res-abort-file!
           res-conn res-req res-status res-headers res-keep-alive?
-          res-head-request? res-send-head!
+          res-head-request? res-send-head! res-answered?
           send-response! parse-query
           ;; Re-exported app-facing (igropyr actor) surface, so a core
           ;; application imports this library alone. Advanced primitives
@@ -599,7 +599,9 @@
   ;; a stale write from a previous keep-alive request can never bleed
   ;; into the next one, and a fallback can never double-write.
   (define (make-token) (box #f))
-  (define (claim! token) (and (not (unbox token)) (set-box! token #t) #t))
+  (define (claim! token)
+    (with-interrupts-disabled
+      (and (not (unbox token)) (set-box! token #t) #t)))
 
   ;; Framing headers are always emitted by the framework; drop any the
   ;; user set so they cannot be duplicated or conflict. Compared
@@ -635,8 +637,8 @@
   (define keep-alive-tail "\r\nConnection: keep-alive\r\n\r\n")
   (define close-tail "\r\nConnection: close\r\n\r\n")
 
-  ;; Write a full response, guarded by the request's token. The libuv
-  ;; write callback (no yielding) tells the reader to continue
+  ;; Write a full response after its caller has claimed the request token.
+  ;; The libuv write callback (no yielding) tells the reader to continue
   ;; (keep-alive) or closes the connection.
   ;; head-only: a HEAD response must carry the SAME headers a GET would --
   ;; Content-Length included -- and no body at all (RFC 9110 9.3.2). Writing
@@ -649,16 +651,8 @@
   ;; the length of the body passed in; an integer -- suppress the body and
   ;; declare THAT length (a HEAD for a file too large to read into memory,
   ;; where the size is known but the bytes must not be).
-  (define (send-response!* c token status headers body ka head-only)
-    ;; Check the socket BEFORE claiming: the reader closes on its own
-    ;; timeout, and a handler that finishes afterwards would otherwise
-    ;; write to a freed handle. If that raises, the supervisor treats it
-    ;; as a task crash and RE-RUNS the whole handler, duplicating whatever
-    ;; non-idempotent work it had already done for a client that is long
-    ;; gone. The streaming writers guard on conn-state for the same
-    ;; reason; this is the one path that did not.
-    (when (and (eq? (conn-state c) 'open) (claim! token))
-      (let* ((head
+  (define (write-response!* c status headers body ka head-only)
+    (let* ((head
               (assemble-head status headers
                 "Content-Length: "
                 (number->string (if (integer? head-only)
@@ -675,7 +669,18 @@
         ;; head and body are written as two segments -- no bv-append copy
         (if head-only
             (tcp-writev! c (list (string->utf8 head)) done)
-            (tcp-writev! c (list (string->utf8 head) body) done)))))
+            (tcp-writev! c (list (string->utf8 head) body) done))))
+
+  (define (send-response!* c token status headers body ka head-only)
+    ;; Check the socket BEFORE claiming: the reader closes on its own
+    ;; timeout, and a handler that finishes afterwards would otherwise
+    ;; write to a freed handle. If that raises, the supervisor treats it
+    ;; as a task crash and RE-RUNS the whole handler, duplicating whatever
+    ;; non-idempotent work it had already done for a client that is long
+    ;; gone. The streaming writers guard on conn-state for the same
+    ;; reason; this is the one path that did not.
+    (when (and (eq? (conn-state c) 'open) (claim! token))
+      (write-response!* c status headers body ka head-only)))
 
   (define (send-response! c token status headers body ka)
     (send-response!* c token status headers body ka #f))
@@ -702,7 +707,30 @@
       ;; bytes still owed in a fixed-length (res-begin-file!) response
       (mutable remaining res-remaining res-remaining-set!)))
 
+  ;; Claim the response and capture the mutable status/header fields as
+  ;; one operation. A layer can therefore conditionally publish a header
+  ;; against the same token without a responder claiming an older header
+  ;; snapshot in between its check and mutation.
+  (define (claim-res! r)
+    (with-interrupts-disabled
+      (let ((c (res-conn r)) (token (res-token r)))
+        (and (eq? (conn-state c) 'open)
+             (not (unbox token))
+             (begin
+               (set-box! token #t)
+               (vector (res-status r) (res-headers r)))))))
+
   (define (set-status! r s) (res-status-set! r s))
+
+  ;; #t once the status line has gone out -- by res-send!, by res-begin!,
+  ;; or by anything else that claimed the one-shot token. After that,
+  ;; set-status! and set-header! still succeed and still do nothing: the
+  ;; headers they would have written are already on the wire.
+  ;;
+  ;; Exported so a layer whose correctness depends on a header actually
+  ;; reaching the client -- a rotated session cookie, say -- can refuse
+  ;; loudly instead of half-applying an effect the client never learns of.
+  (define (res-answered? r) (and (unbox (res-token r)) #t))
 
   ;; Silently ignore header names/values containing CR or LF; they are
   ;; also rejected again at render time.
@@ -710,21 +738,42 @@
     (when (and (header-safe? k) (header-safe? v))
       (res-headers-set! r (cons (cons k v) (res-headers r)))))
 
+  ;; Atomically add a header only while it is still possible for every
+  ;; res response path to include it. #f means the response was already
+  ;; claimed (or the header was unsafe); #t means a later claim snapshots
+  ;; this header. This is for layers whose side effects depend on header
+  ;; delivery, such as deleting an old session only after publishing its
+  ;; replacement cookie.
+  (define (set-header-if-unanswered! r k v)
+    (and (header-safe? k) (header-safe? v)
+         (with-interrupts-disabled
+           (let ((token (res-token r)))
+             (and (not (unbox token))
+                  (begin
+                    (res-headers-set! r (cons (cons k v) (res-headers r)))
+                    #t))))))
+
   ;; Send the response: current status + accumulated headers + body
   ;; bytevector. One shot per request; later calls are ignored.
   (define (res-head-request? r)
     (let ((req (res-req r))) (and req (eq? (req-method req) 'HEAD) #t)))
 
   (define (res-send! r body)
-    (send-response!* (res-conn r) (res-token r) (res-status r) (res-headers r)
-                     body (res-keep-alive? r) (res-head-request? r)))
+    (let ((snapshot (claim-res! r)))
+      (when snapshot
+        (write-response!* (res-conn r)
+          (vector-ref snapshot 0) (vector-ref snapshot 1)
+          body (res-keep-alive? r) (res-head-request? r)))))
 
   ;; Answer a HEAD with the headers a GET would carry, declaring
   ;; content-length, and no body -- used where the body would otherwise be
   ;; streamed from disk and must not even be read.
   (define (res-send-head! r content-length)
-    (send-response!* (res-conn r) (res-token r) (res-status r) (res-headers r)
-                     empty-bv (res-keep-alive? r) content-length))
+    (let ((snapshot (claim-res! r)))
+      (when snapshot
+        (write-response!* (res-conn r)
+          (vector-ref snapshot 0) (vector-ref snapshot 1)
+          empty-bv (res-keep-alive? r) content-length))))
 
   ;; ---- streaming responses (Transfer-Encoding: chunked) ------------------------
 
@@ -751,13 +800,13 @@
   (define close-delimited-tail "Connection: close\r\n\r\n")
 
   (define (res-begin! r)
-    (let ((c (res-conn r)))
-      (when (and (eq? (conn-state c) 'open) (claim! (res-token r)))
+    (let ((c (res-conn r)) (snapshot (claim-res! r)))
+      (when snapshot
         (let ((raw? (res-http10? r)))
           (res-mode-set! r (if raw? 'streaming-raw 'streaming))
           (tcp-write! c
             (string->utf8
-              (assemble-head (res-status r) (res-headers r)
+              (assemble-head (vector-ref snapshot 0) (vector-ref snapshot 1)
                 (cond
                   (raw? close-delimited-tail)
                   ((res-keep-alive? r) chunked-keep-alive-tail)
@@ -848,13 +897,13 @@
   ;; for the writes (as with res-begin!) -- a long download must not
   ;; occupy a worker or it would be killed as stuck.
   (define (res-begin-file! r len)
-    (let ((c (res-conn r)))
-      (when (claim! (res-token r))
+    (let ((c (res-conn r)) (snapshot (claim-res! r)))
+      (when snapshot
         (res-mode-set! r 'raw)
         (res-remaining-set! r len)
         (tcp-write! c
           (string->utf8
-            (assemble-head (res-status r) (res-headers r)
+            (assemble-head (vector-ref snapshot 0) (vector-ref snapshot 1)
               "Content-Length: " (number->string len)
               (if (res-keep-alive? r) keep-alive-tail close-tail)))
           #f)
