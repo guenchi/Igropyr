@@ -44,6 +44,40 @@
         (`#(DOWN ,pid ,reason) 'ok)))
     (display "preemption+kill ok\n")
 
+    ;; Established sockets are owned resources. Killing their actor must
+    ;; remove the conn-table root and close the fd without actor cooperation.
+    (let* ((caller self)
+           (before (conn-count))
+           (owner (spawn (lambda () (receive (`#(stop) (void))))))
+           (listener
+             (tcp-listen! "127.0.0.1" 18919 4
+               (lambda (c)
+                 (conn-set-owner! c owner)
+                 (tcp-read-start! c)
+                 (send caller (vector 'accepted c)))
+               0)))
+      (tcp-connect! "127.0.0.1" 18919 self)
+      (let ((client
+              (receive (after 1000 (fail "owner-cleanup connect timeout"))
+                (`#(tcp-connected ,c) c)
+                (`#(tcp-connect-failed ,e)
+                  (fail "owner-cleanup connect failed")))))
+        (receive (after 1000 (fail "owner-cleanup accept timeout"))
+          (`#(accepted ,c) 'ok))
+        (monitor owner)
+        (kill owner 'owner-cleanup-test)
+        (receive (after 1000 (fail "owner-cleanup no DOWN"))
+          (`#(DOWN ,@owner ,_) 'ok))
+        (sleep-ms 100)
+        (unless (<= (conn-count) (+ before 1))
+          (fail "dead owner retained its socket"))
+        (tcp-close! client)
+        (tcp-stop-listen! listener)
+        (sleep-ms 100)
+        (unless (<= (conn-count) before)
+          (fail "owner-cleanup leaked a connection"))))
+    (display "owner resource cleanup ok\n")
+
     ;; 5. spawn&link + trap-exit turns a crash into an EXIT message
     (process-trap-exit #t)
     (spawn&link (lambda () (raise 'linked-crash)))
