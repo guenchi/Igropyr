@@ -11,6 +11,11 @@
 ;;; pieces: the loopback coalesces, and 64000 one-byte writes were measured
 ;;; arriving as FOUR segments of ~16 KB. What produces segments is a reply
 ;;; bigger than the socket buffer. Size is the knob.
+;;;
+;;; The companion check on a fragmented LINE lived here until max-resp-line
+;;; was introduced: a line long enough to show quadratic rescanning is now
+;;; refused outright, so the input cannot be built. redis-limits.sc asserts
+;;; that ceiling instead.
 
 (import (chezscheme) (igropyr actor) (igropyr libuv)
         (igropyr redis))
@@ -20,15 +25,7 @@
 ;; both stable within a few percent, so 250 ms sits clear of either.
 (define elements 800000)
 (define budget-ms 250)
-(define line-length (* 8 1024 1024))
-;; Measured: ~740 ms rescanning the line from its start on every segment,
-;; ~25 ms with the cursor kept. 750 sat ON the failure value -- eight runs
-;; against the unfixed parser passed three times, because 736-753 straddles
-;; it. 150 leaves 6x headroom below and is exceeded 5x above: 0/8 and 8/8
-;; respectively. Do not raise it back toward the number it is measuring.
-(define line-budget-ms 150)
 (define failures 0)
-(define connection-number 0)
 
 (define (check label ok)
   (unless ok
@@ -41,34 +38,21 @@
     (do ((i 0 (+ i 1))) ((= i n)) (display ":1\r\n" p))
     (get)))
 
-(define line-reply
-  (let ((bv (make-bytevector (+ line-length 3) (char->integer #\x))))
-    (bytevector-u8-set! bv 0 (char->integer #\+))
-    (bytevector-u8-set! bv (+ line-length 1) 13)
-    (bytevector-u8-set! bv (+ line-length 2) 10)
-    bv))
-
 (define (start-server!)
   (tcp-listen! "127.0.0.1" port 16
     (lambda (c)
-      (let ((reply-number connection-number))
-        (set! connection-number (+ connection-number 1))
-        (let ((pid
+      (let ((pid
               (spawn
                 (lambda ()
                   (receive
                     (`#(tcp-data ,_)
-                      (tcp-write! c
-                        (if (zero? reply-number)
-                            (string->utf8 (array-reply elements))
-                            line-reply)
-                        #f)
+                      (tcp-write! c (string->utf8 (array-reply elements)) #f)
                       (sleep-ms 100)
                       (tcp-close! c))
                     (`#(tcp-eof) (tcp-close! c))
                     (`#(tcp-error ,_) (tcp-close! c)))))))
-          (conn-set-owner! c pid)
-          (tcp-read-start! c))))
+        (conn-set-owner! c pid)
+        (tcp-read-start! c)))
     0))
 
 (start-scheduler
@@ -87,21 +71,6 @@
         (check "fragmented array parses in linear time" (< ms budget-ms))
         (display "  [timing] ") (display ms) (display " ms of ")
         (display budget-ms) (display " ms budget\n"))
-      (redis-close! r))
-    (collect)
-    (let ((r (redis-connect "127.0.0.1" port)))
-      (let* ((t0 (real-time))
-             (v (redis r "PING"))
-             (ms (- (real-time) t0)))
-        (check "fragmented line parses correctly"
-          (and (string? v)
-               (= (string-length v) line-length)
-               (char=? (string-ref v 0) #\x)
-               (char=? (string-ref v (- line-length 1)) #\x)))
-        ;; A saved CRLF cursor makes the total scan linear in the reply.
-        (check "fragmented line parses in linear time" (< ms line-budget-ms))
-        (display "  [line timing] ") (display ms) (display " ms of ")
-        (display line-budget-ms) (display " ms budget\n"))
       (redis-close! r))
     (if (zero? failures)
         (begin (display "redis-incremental: all tests passed\n") (exit 0))
