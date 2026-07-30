@@ -654,15 +654,20 @@
       (if (and cached (< (- now (vector-ref cached 6)) stat-window-ms))
           cached
           (let ((mt (file-mtime path)))
-            (and mt
-                 (if (and cached (= (vector-ref cached 0) mt))
-                     (begin (vector-set! cached 6 now) cached)
-                     (let ((key (or (file-realpath path) path)))
-                       (let ((e (and (not (string=? key path))
-                                     (hashtable-ref static-cache key #f))))
-                         (if (and e (= (vector-ref e 0) mt))
-                             (begin (vector-set! e 6 now) e)
-                             (open-entry key path mt now root rel))))))))))
+            (if (not mt)
+                (begin (when cached (cache-evict! cached)) #f)
+                (if (and cached (= (vector-ref cached 0) mt))
+                    (begin (vector-set! cached 6 now) cached)
+                    (let ((key (or (file-realpath path) path)))
+                      (let ((e (and (not (string=? key path))
+                                    (hashtable-ref static-cache key #f))))
+                        (if (and e (= (vector-ref e 0) mt))
+                            (begin (vector-set! e 6 now) e)
+                            (let ((fresh (open-entry key path mt now root rel)))
+                              (unless fresh
+                                (let ((stale (or e cached)))
+                                  (when stale (cache-evict! stale))))
+                              fresh))))))))))
 
   ;; open with a timeout that can never leak the fd: the handle comes
   ;; back synchronously, so a timed-out open is closed via its handle
