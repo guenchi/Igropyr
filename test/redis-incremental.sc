@@ -21,7 +21,12 @@
 (define elements 800000)
 (define budget-ms 250)
 (define line-length (* 8 1024 1024))
-(define line-budget-ms 750)
+;; Measured: ~740 ms rescanning the line from its start on every segment,
+;; ~25 ms with the cursor kept. 750 sat ON the failure value -- eight runs
+;; against the unfixed parser passed three times, because 736-753 straddles
+;; it. 150 leaves 6x headroom below and is exceeded 5x above: 0/8 and 8/8
+;; respectively. Do not raise it back toward the number it is measuring.
+(define line-budget-ms 150)
 (define failures 0)
 (define connection-number 0)
 
