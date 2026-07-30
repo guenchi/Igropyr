@@ -173,13 +173,36 @@
   ;; the VM -- fs-table roots them, so the GC cannot help. The actor
   ;; layer calls this from its process-teardown path.
   (define (uv-owner-died! owner)
-    (let ((reqs (hashtable-keys fs-table)))
+    (with-interrupts-disabled
+      ;; Close established sockets. conn-table is the GC root for both the
+      ;; Scheme record and libuv handle, so leaving one here leaks an fd for
+      ;; the lifetime of the VM.
+      (vector-for-each
+        (lambda (handle)
+          (let ((c (hashtable-ref conn-table handle #f)))
+            (when (and c (eq? (conn-owner c) owner)) (tcp-close! c))))
+        (hashtable-keys conn-table))
+      ;; A connect request cannot be synchronously cancelled on every
+      ;; supported libuv. Clear its owner instead; on-connect then closes a
+      ;; late successful handle rather than registering it for a dead pid.
+      (vector-for-each
+        (lambda (req)
+          (let ((entry (hashtable-ref connect-table req #f)))
+            (when (and entry (eq? (cdr entry) owner)) (set-cdr! entry #f))))
+        (hashtable-keys connect-table))
+      ;; DNS has no handle to close. Suppress its eventual delivery while
+      ;; retaining the request entry so the callback still frees it.
+      (vector-for-each
+        (lambda (req)
+          (when (eq? (hashtable-ref getaddrinfo-table req #f) owner)
+            (hashtable-set! getaddrinfo-table req #f)))
+        (hashtable-keys getaddrinfo-table))
       (vector-for-each
         (lambda (req)
           (let ((op (hashtable-ref fs-table req #f)))
             (when (and op (eq? (fs-op-owner op) owner))
               (file-stream-close! op))))
-        reqs)))
+        (hashtable-keys fs-table))))
 
   ;; live listeners: handle address -> accept hook, one entry per
   ;; tcp-listen!. Keyed dispatch (not a single global) so several
@@ -546,14 +569,18 @@
           (foreign-free req)
           (when entry
             (let ((handle (car entry)) (owner (cdr entry)))
-              (if (< status 0)
-                  (begin
-                    (uv-close handle on-close-entry)
-                    (deliver owner (vector 'tcp-connect-failed status)))
-                  (let ((c (make-conn handle owner 'open)))
-                    (uv-tcp-nodelay handle 1)
-                    (hashtable-set! conn-table handle c)
-                    (deliver owner (vector 'tcp-connected c))))))))
+              (cond
+                ((< status 0)
+                 (uv-close handle on-close-entry)
+                 (when owner (deliver owner (vector 'tcp-connect-failed status))))
+                ((not owner)
+                 ;; The owner died while connect was in flight.
+                 (uv-close handle on-close-entry))
+                (else
+                 (let ((c (make-conn handle owner 'open)))
+                   (uv-tcp-nodelay handle 1)
+                   (hashtable-set! conn-table handle c)
+                   (deliver owner (vector 'tcp-connected c)))))))))
       (void* int)
       void))
 
