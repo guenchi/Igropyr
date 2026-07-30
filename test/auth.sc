@@ -224,6 +224,14 @@
     (ws-recv ws))
   (session-guard store '((origins . ("https://app.example")))))
 
+;; A foreign Origin must be rejected before session-peek. This deliberately
+;; unusable store makes an accidental lookup raise instead of letting the
+;; status check pass without exercising the ordering.
+(app-ws app "/feed-origin-first"
+  (lambda (ws req) (ws-recv ws))
+  (session-guard (vector 'missing-session-store 0)
+    '((origins . ("https://app.example")))))
+
 ;; token-guarded sexpr RPC: refusal is sexpr data; two-argument
 ;; handlers see the request (claims), one-argument ones work as before
 (app-rpc app "/rpc"
@@ -410,24 +418,35 @@
     (let* ((login (http-req "GET /login HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
            (sid (extract-sid login))
            (upgrade
-             (lambda (origin)
+             (lambda (path origin)
                (status-of
                  (http-req
                    (string-append
-                     "GET /feed-origin HTTP/1.1\r\nHost: x\r\n"
+                     "GET " path " HTTP/1.1\r\nHost: x\r\n"
                      "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
                      "Sec-WebSocket-Version: 13\r\n"
                      (if origin (string-append "Origin: " origin "\r\n") "")
                      "Cookie: sid=" sid "\r\n\r\n"))))))
       (unless sid (fail "origin-login" login))
-      (check "ws-origin-allowed" (equal? "101" (upgrade "https://app.example")))
+      (check "ws-origin-allowed"
+        (equal? "101" (upgrade "/feed-origin" "https://app.example")))
       (check "ws-origin-foreign-refused"
-        (not (equal? "101" (upgrade "http://evil.example"))))
+        (equal? "401" (upgrade "/feed-origin" "http://evil.example")))
+      ;; Omitting the option is fail-closed for browsers, rather than
+      ;; silently preserving the cross-site session-hijacking exposure.
+      (check "ws-origin-default-refused"
+        (equal? "401" (upgrade "/feed" "https://app.example")))
+      ;; Prove the Origin decision happens before the synchronous lookup:
+      ;; this route's store cannot answer a session-peek call.
+      (check "ws-origin-foreign-skips-store"
+        (equal? "401"
+          (upgrade "/feed-origin-first" "http://evil.example")))
       ;; no Origin at all is a non-browser client, which cannot be carrying
       ;; somebody else's cookie -- refusing it would lock out every ordinary
       ;; WebSocket library without closing anything
-      (check "ws-origin-absent-allowed" (equal? "101" (upgrade #f))))
+      (check "ws-origin-absent-allowed"
+        (equal? "101" (upgrade "/feed-origin" #f))))
 
     ;; session guard: log in over HTTP, ride the cookie into the upgrade
     (let* ((login (http-req "GET /login HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
