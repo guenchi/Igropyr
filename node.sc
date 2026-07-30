@@ -46,7 +46,8 @@
 (library (igropyr node)
   (export node-start! node-connect! node-disconnect! node-self
           rsend rcall monitor-node demonitor-node node-peers
-          monitor-remote demonitor-remote node-set-limits!)
+          monitor-remote demonitor-remote node-set-limits!
+          node-monitor-stats)
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv) (igropyr sexpr)
           (igropyr gen-server)
@@ -94,6 +95,7 @@
   ;;   rmonitors: mref -> #(caller node name)   (for demonitor + the
   ;;              noconnection synthesized when the link to node drops)
   ;;   caller-agents: mref -> agent pid         (self-watch only)
+  ;;   owner-agents: mref -> agent pid          (cleans up when caller dies)
   ;; On the TARGET node:
   ;;   callee-agents: (peer . mref) -> agent pid  (one local monitor per
   ;;              remote watch; killed on demon). Keyed by (peer . mref)
@@ -101,6 +103,7 @@
   ;;              two watchers collide on it -- the pair namespaces them.
   (define rmonitors (make-eqv-hashtable))
   (define caller-agents (make-eqv-hashtable))
+  (define owner-agents (make-eqv-hashtable))
   (define callee-agents (make-hashtable equal-hash equal?))
   (define mref-counter 0)
   (define (next-mref!)
@@ -122,11 +125,24 @@
   ;;     timeout, and a held slot is a parked process either way).
   ;;   - hosted monitors (callee-agents): over the cap the monitor is
   ;;     REFUSED with (mdown ... overload).
+  ;; Those two bound what an AUTHENTICATED member can make this node do.
+  ;; A stranger gets a third:
+  ;;   - handshakes in flight: over the cap the connection is CLOSED in
+  ;;     the accept callback, without answering and without spawning --
+  ;;     a stranger must not be able to make this node create a process.
+  ;; Per connection the pre-auth cost was already bounded (4 KiB of parse
+  ;; input, one absolute deadline), but nothing bounded how many of them
+  ;; could be held at once, and each is an fd as well as a process. The fd
+  ;; budget belongs to the OS process and is shared with every other
+  ;; listener the program runs, so exhausting it here is not contained to
+  ;; the mesh.
   ;; Generous by default -- a ceiling on a flood, not a throttle on
   ;; healthy traffic; tune with node-set-limits!.
   (define max-rcall-serving 256)
   (define max-hosted-monitors 4096)
+  (define max-preauth-conns 256)
   (define rcall-serving 0)
+  (define preauth-conns 0)
 
   ;; take a serve-rcall slot iff one is free; #t if taken
   (define (rcall-slot-take!)
@@ -135,6 +151,14 @@
            (begin (set! rcall-serving (fx+ rcall-serving 1)) #t))))
   (define (rcall-slot-free!)
     (atomically (set! rcall-serving (fx- rcall-serving 1))))
+
+  ;; take a pre-auth handshake slot iff one is free; #t if taken
+  (define (preauth-slot-take!)
+    (atomically
+      (and (fx< preauth-conns max-preauth-conns)
+           (begin (set! preauth-conns (fx+ preauth-conns 1)) #t))))
+  (define (preauth-slot-free!)
+    (atomically (set! preauth-conns (fx- preauth-conns 1))))
 
   (define (peer-entry name)
     (atomically (hashtable-ref peers name #f)))
@@ -146,6 +170,23 @@
   (define (node-peers)
     (filter live-entry
             (vector->list (atomically (hashtable-keys peers)))))
+
+  ;; Live sizes of the cross-node monitor tables. Every entry is an active
+  ;; watch: rmonitors is what this node is watching elsewhere, callee-agents
+  ;; what it hosts for others, and the two agent tables are the processes
+  ;; keeping those honest. All four must return to their baseline once the
+  ;; watches they belong to have ended -- an entry that outlives its monitor
+  ;; is retained forever, since nothing sweeps them.
+  ;;
+  ;; Exported because that is otherwise unobservable: a leak here shows up
+  ;; only as a long-lived node growing, with no way to attribute it. It is
+  ;; also what lets a test assert reclamation rather than just delivery.
+  (define (node-monitor-stats)
+    (atomically
+      (list (cons 'rmonitors (hashtable-size rmonitors))
+            (cons 'caller-agents (hashtable-size caller-agents))
+            (cons 'owner-agents (hashtable-size owner-agents))
+            (cons 'callee-agents (hashtable-size callee-agents)))))
 
   ;; ---- node up/down notification --------------------------------------
 
@@ -220,16 +261,18 @@
   ;; -> datum ; raises 'closed / 'timeout / 'protocol /
   ;; the sexpr-error vector on a malformed datum
   (define (read-frame c buf timeout limit)
-    (let ((d (parse-frame buf limit)))
-      (if (eq? d incomplete)
-          (receive (after timeout (raise 'timeout))
-            (`#(tcp-data ,bv)
-              (inbuf-append! buf bv)
-              (read-frame c buf timeout limit))
-            (`#(tcp-eof) (raise 'closed))
-            (`#(tcp-error ,e) (raise 'closed))
-            (`#(node-stop) (raise 'stop)))
-          d)))
+    (let ((deadline (+ (now-ms) timeout)))
+      (let loop ()
+        (let ((d (parse-frame buf limit)))
+          (if (eq? d incomplete)
+              (let ((remaining (- deadline (now-ms))))
+                (when (<= remaining 0) (raise 'timeout))
+                (receive (after remaining (raise 'timeout))
+                  (`#(tcp-data ,bv) (inbuf-append! buf bv) (loop))
+                  (`#(tcp-eof) (raise 'closed))
+                  (`#(tcp-error ,e) (raise 'closed))
+                  (`#(node-stop) (raise 'stop))))
+              d)))))
 
   ;; ---- HMAC-SHA256 handshake proofs --------------------------------------
   ;; hmac-sha256 and bytevector->hex come from (igropyr crypto).
@@ -430,6 +473,48 @@
                 (demonitor m)
                 (atomically (hashtable-delete! callee-agents key))))))))
 
+  (define (stop-owner-agent! mref)
+    (let ((agent (atomically
+                   (let ((a (hashtable-ref owner-agents mref #f)))
+                     (when a (hashtable-delete! owner-agents mref))
+                     a))))
+      (when (and agent (process-alive? agent))
+        (send agent (vector 'owner-stop)))))
+
+  (define (remove-target-watch! mref entry)
+    (let ((node (vector-ref entry 1)))
+      (if (eq? node self-name)
+          (let ((agent (atomically
+                         (let ((a (hashtable-ref caller-agents mref #f)))
+                           (when a (hashtable-delete! caller-agents mref))
+                           a))))
+            (when (and agent (process-alive? agent))
+              (send agent (vector 'demon-local))))
+          (link-write node (list 'demon mref)))))
+
+  ;; One small local monitor ties the global/remote state to the process
+  ;; that requested it. Without this, rmonitors roots a dead pcb and the
+  ;; target node retains its monitor until the target or link dies.
+  (define (owner-mon-agent caller mref)
+    (let ((m (monitor caller)))
+      (receive
+        (`#(DOWN ,@caller ,_)
+          (atomically (hashtable-delete! owner-agents mref))
+          (let ((entry (atomically
+                         (let ((e (hashtable-ref rmonitors mref #f)))
+                           (when e (hashtable-delete! rmonitors mref))
+                           e))))
+            (when entry (remove-target-watch! mref entry))))
+        (`#(owner-stop) (demonitor m)))))
+
+  (define (install-owner-agent! caller mref)
+    ;; Publish the pid before it can run and observe an already-dead caller;
+    ;; otherwise that fast DOWN path could delete the not-yet-present entry
+    ;; and the installer would then leave a dead agent rooted forever.
+    (atomically
+      (let ((agent (spawn (lambda () (owner-mon-agent caller mref)))))
+        (hashtable-set! owner-agents mref agent))))
+
   ;; watcher side: deliver #(remote-down node name reason) to the caller
   ;; that installed mref, once. Used for both a target-side mdown and a
   ;; link drop (which synthesizes 'noconnection).
@@ -439,6 +524,7 @@
                      (when e (hashtable-delete! rmonitors mref))
                      e))))
       (when entry
+        (stop-owner-agent! mref)
         (send (vector-ref entry 0)
               (vector 'remote-down (vector-ref entry 1) (vector-ref entry 2)
                       reason)))))
@@ -448,7 +534,9 @@
   (define (self-mon-agent caller mref name)
     (let ((p (whereis name)))
       (if (not p)
-          (fire-remote-down! mref 'noproc)
+          (begin
+            (atomically (hashtable-delete! caller-agents mref))
+            (fire-remote-down! mref 'noproc))
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
@@ -457,6 +545,14 @@
               (`#(demon-local)
                 (demonitor m)
                 (atomically (hashtable-delete! caller-agents mref))))))))
+
+  (define (install-self-agent! caller mref name)
+    ;; As with owner-agents, publish the pid before it can run. In
+    ;; particular, a missing name takes the immediate noproc path above;
+    ;; publishing afterwards would reinsert that already-dead agent.
+    (atomically
+      (let ((agent (spawn (lambda () (self-mon-agent caller mref name)))))
+        (hashtable-set! caller-agents mref agent))))
 
   ;; every rmonitor watching a node whose link just dropped gets a
   ;; synthesized noconnection (the target may be alive or dead -- across
@@ -493,25 +589,38 @@
 
   ;; ---- accept side -----------------------------------------------------------
 
+  ;; Runs holding a pre-auth slot, taken by the accept callback. The slot
+  ;; covers the handshake only: it is released the moment the peer is
+  ;; authenticated, because run-link is no longer a stranger's connection
+  ;; and would otherwise pin a slot for the life of the link. Every other
+  ;; exit -- a bad proof, a timeout, the 'stop raised at node-stop! -- goes
+  ;; through the guard, and free! is idempotent so the two cannot
+  ;; double-count. Nothing here is killed abruptly (shutdown is a
+  ;; node-stop message, not a kill), so the guard is enough to keep the
+  ;; count from drifting.
   (define (acceptor c)
-    (guard (e (#t (tcp-close! c)))              ; failed handshake: just close
-      (let ((nonce (random-hex 16))
-            (buf (make-inbuf)))
-        (write-frame! c (list 'challenge nonce))
-        (let ((d (read-frame c buf handshake-timeout-ms
-                             handshake-max-frame)))
-          (unless (and (pair? d) (eq? (car d) 'hello)
-                       (= (length d) 4)
-                       (symbol? (cadr d))
-                       (not (eq? (cadr d) self-name))
-                       (proof=? (caddr d) (proof nonce (cadr d)))
-                       (string? (cadddr d)))
-            (raise 'auth))
-          (let ((peer (cadr d)) (nonce-b (cadddr d)))
-            (write-frame! c (list 'welcome self-name (proof nonce-b self-name)))
-            (if (install-peer! peer c peer)     ; dialer = the remote side
-                (run-link c peer buf)
-                (tcp-close! c)))))))            ; lost the tie-break
+    (let ((freed #f))
+      (define (free!)
+        (unless freed (set! freed #t) (preauth-slot-free!)))
+      (guard (e (#t (free!) (tcp-close! c)))    ; failed handshake: just close
+        (let ((nonce (random-hex 16))
+              (buf (make-inbuf)))
+          (write-frame! c (list 'challenge nonce))
+          (let ((d (read-frame c buf handshake-timeout-ms
+                               handshake-max-frame)))
+            (unless (and (pair? d) (eq? (car d) 'hello)
+                         (= (length d) 4)
+                         (symbol? (cadr d))
+                         (not (eq? (cadr d) self-name))
+                         (proof=? (caddr d) (proof nonce (cadr d)))
+                         (string? (cadddr d)))
+              (raise 'auth))
+            (let ((peer (cadr d)) (nonce-b (cadddr d)))
+              (write-frame! c (list 'welcome self-name (proof nonce-b self-name)))
+              (free!)                           ; authenticated: no longer pre-auth
+              (if (install-peer! peer c peer)   ; dialer = the remote side
+                  (run-link c peer buf)
+                  (tcp-close! c))))))))         ; lost the tie-break
 
   ;; ---- dial side --------------------------------------------------------------
 
@@ -582,10 +691,13 @@
             (host (if (pair? (cdr rest)) (cadr rest) "127.0.0.1")))
         (tcp-listen! host port 128
           (lambda (c)
-            ;; libuv callback context: spawn + own + read-start only
-            (let ((pid (spawn (lambda () (acceptor c)))))
-              (conn-set-owner! c pid)
-              (tcp-read-start! c))))))
+            ;; libuv callback context: spawn + own + read-start only,
+            ;; or -- over the pre-auth ceiling -- close and do none of it
+            (if (preauth-slot-take!)
+                (let ((pid (spawn (lambda () (acceptor c)))))
+                  (conn-set-owner! c pid)
+                  (tcp-read-start! c))
+                (tcp-close! c))))))
     name)
 
   ;; Dial a peer (and keep dialing whenever the link is down).
@@ -613,19 +725,27 @@
     (void))
 
   ;; Tune the inbound backpressure ceilings: the max serve-rcall
-  ;; processes in flight and the max monitors hosted for remote watchers.
-  ;; #f leaves either at its current value. The defaults (256 / 4096)
-  ;; suit ordinary meshes; raise them for a hub node, lower them to bound
-  ;; a node more tightly. Takes effect immediately for new frames.
-  (define (node-set-limits! rcall-cap monitor-cap)
+  ;; processes in flight, the max monitors hosted for remote watchers,
+  ;; and -- optionally -- the max handshakes in flight from peers that
+  ;; are not authenticated yet. #f leaves any of them at its current
+  ;; value. The defaults (256 / 4096 / 256) suit ordinary meshes; raise
+  ;; them for a hub node, lower them to bound a node more tightly. Takes
+  ;; effect immediately: for new frames, and for the next connection
+  ;; accepted.
+  (define (node-set-limits! rcall-cap monitor-cap . rest)
+    (define (check-cap who cap)
+      (unless (and (integer? cap) (exact? cap) (> cap 0))
+        (assertion-violation 'node-set-limits!
+          (string-append who " cap must be a positive integer") cap)))
     (when rcall-cap
-      (unless (and (integer? rcall-cap) (exact? rcall-cap) (> rcall-cap 0))
-        (assertion-violation 'node-set-limits! "rcall cap must be a positive integer" rcall-cap))
+      (check-cap "rcall" rcall-cap)
       (set! max-rcall-serving rcall-cap))
     (when monitor-cap
-      (unless (and (integer? monitor-cap) (exact? monitor-cap) (> monitor-cap 0))
-        (assertion-violation 'node-set-limits! "monitor cap must be a positive integer" monitor-cap))
+      (check-cap "monitor" monitor-cap)
       (set! max-hosted-monitors monitor-cap))
+    (when (and (pair? rest) (car rest))
+      (check-cap "pre-auth connection" (car rest))
+      (set! max-preauth-conns (car rest)))
     (void))
 
   ;; Send msg to the process registered as reg-name on node. #t = handed
@@ -698,11 +818,15 @@
       (cond
         ((eq? node self-name)
          (atomically (hashtable-set! rmonitors mref (vector self node name)))
-         (let ((agent (spawn (lambda () (self-mon-agent self mref name)))))
-           (atomically (hashtable-set! caller-agents mref agent))))
+         ;; The owner must exist before the target agent can report DOWN;
+         ;; otherwise that fast path cannot stop it and leaves another dead
+         ;; agent rooted after the monitor has already completed.
+         (install-owner-agent! self mref)
+         (install-self-agent! self mref name))
         ((live-entry node)
          => (lambda (e)
-              (atomically (hashtable-set! rmonitors mref (vector self node name)))
+               (atomically (hashtable-set! rmonitors mref (vector self node name)))
+               (install-owner-agent! self mref)
               ;; no origin field: the target derives the watcher from the
               ;; authenticated far end of this very link (see dispatch!)
               (write-frame! (vector-ref e 0) (list 'mon name mref))))
@@ -719,13 +843,7 @@
                      (when e (hashtable-delete! rmonitors mref))
                      e))))
       (when entry
-        (let ((node (vector-ref entry 1)))
-          (if (eq? node self-name)
-              (let ((agent (atomically
-                             (let ((a (hashtable-ref caller-agents mref #f)))
-                               (hashtable-delete! caller-agents mref) a))))
-                (when (and agent (process-alive? agent))
-                  (send agent (vector 'demon-local))))
-              (link-write node (list 'demon mref))))))
+        (stop-owner-agent! mref)
+        (remove-target-watch! mref entry)))
     (void))
 )

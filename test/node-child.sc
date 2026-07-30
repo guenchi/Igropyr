@@ -21,6 +21,7 @@
 (start-scheduler
   (lambda ()
     (node-start! name secret)
+    (node-set-limits! 64 2)
     (node-connect! 'a "127.0.0.1" port)
     (start-pubsub!)
     (register 'svc self)
