@@ -19,7 +19,8 @@
 (library (igropyr express)
   (export create-app app-get app-post app-put app-delete app-patch
           app-use app-static app-ws app-listen app->handler
-          req-param req-json req-form req-cookie set-cookie!
+          req-param req-json req-form req-cookie
+          set-cookie! set-cookie-if-unanswered!
           req-sexpr send-sexpr! app-rpc
           ws-send-sexpr! ws-recv-sexpr sse-send-sexpr!
           send-text! send-html! send-json! send-file!
@@ -186,20 +187,29 @@
                    (not (char=? c #\;)) (not (char=? c #\,))
                    (loop (+ i 1))))))))
 
-  (define (set-cookie! res name value . attrs)
+  (define (cookie-header who name value attrs)
     (unless (and (string? name) (cookie-part-ok? name))
-      (assertion-violation 'set-cookie! "invalid cookie name" name))
+      (assertion-violation who "invalid cookie name" name))
     (unless (and (string? value) (cookie-part-ok? value))
-      (assertion-violation 'set-cookie!
+      (assertion-violation who
         "cookie value may not contain ';' ',' or control characters" value))
     (for-each
       (lambda (a)
         (unless (and (string? a) (cookie-part-ok? a))
-          (assertion-violation 'set-cookie! "invalid cookie attribute" a)))
+          (assertion-violation who "invalid cookie attribute" a)))
       attrs)
+    (apply string-append name "=" value
+           (map (lambda (a) (string-append "; " a)) attrs)))
+
+  (define (set-cookie! res name value . attrs)
     (set-header! res "Set-Cookie"
-      (apply string-append name "=" value
-             (map (lambda (a) (string-append "; " a)) attrs))))
+      (cookie-header 'set-cookie! name value attrs)))
+
+  ;; #f when another process has already claimed the response; #t means
+  ;; its eventual res response is guaranteed to include this cookie.
+  (define (set-cookie-if-unanswered! res name value . attrs)
+    (set-header-if-unanswered! res "Set-Cookie"
+      (cookie-header 'set-cookie-if-unanswered! name value attrs)))
 
   ;; ---- form bodies (urlencoded + multipart/form-data) ---------------------------
 
