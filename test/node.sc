@@ -124,6 +124,23 @@
       (`#(loopback 1) 'ok))
     (display "rsend to self ok\n")
 
+    ;; A missing local name completes through the self-monitor agent's
+    ;; immediate path. Exercise a burst so agent publication and cleanup
+    ;; can be preempted at every point without losing or duplicating DOWN.
+    (do ((i 0 (+ i 1))) ((= i 64))
+      (monitor-remote 'a 'missing-local-service))
+    (let loop ((left 64))
+      (unless (zero? left)
+        (receive (after 2000 (fail! "self-monitor-noproc-timeout" left))
+          (`#(remote-down a missing-local-service ,reason)
+            (unless (eq? reason 'noproc)
+              (fail! "self-monitor-noproc-reason" reason))
+            (loop (- left 1))))))
+    (receive (after 50 'ok)
+      (`#(remote-down a missing-local-service ,reason)
+        (fail! "self-monitor-duplicate-down" reason)))
+    (display "missing self monitors clean up exactly once ok\n")
+
     ;; wrong secret: must never come up
     (spawn-child! "evil" "wrong-secret")
     (monitor-node 'evil)
