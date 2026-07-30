@@ -26,6 +26,13 @@
 
   (define connect-timeout-ms 5000)
   (define reply-timeout-ms 30000)
+  (define max-reply-bytes (* 16 1024 1024))
+  (define max-array-elements 65536)
+  (define max-reply-items 65536)
+  (define max-reply-depth 64)
+  (define max-resp-line 1024)
+  ;; A legal max-sized bulk also carries its length line and trailing CRLF.
+  (define max-reply-buffer (+ max-reply-bytes max-resp-line 16))
 
   ;; ---- bytevector helpers ---------------------------------------------
 
@@ -257,6 +264,12 @@
     (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
     (tcp-close! c)
     (conn-loop c (make-inbuf) '() #f))
+
+  (define (protocol-fail c waiters msg)
+    (let ((e (vector 'redis-error (string-append "protocol error: " msg))))
+      (for-each (lambda (w) (reply-to! w e)) waiters)
+      (tcp-close! c)
+      (conn-loop c (make-bytevector 0) '())))
 
   ;; ---- public API ----------------------------------------------------------------
 
