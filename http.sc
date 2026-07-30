@@ -1069,8 +1069,22 @@
 
   ;; ---- chunked transfer-encoding (request side) ----------------------------------
 
+  ;; A chunked body's DECODED length is bounded by body-limit, but the
+  ;; framing around it was not: a body well inside the limit could arrive
+  ;; as a million chunk headers, costing a cons and a bytevector each.
+  ;;
+  ;; The count has to move with body-limit, which is a per-listen option.
+  ;; Pinning it to a constant means raising the limit for uploads silently
+  ;; starts rejecting them: at 32 MiB a 10 MiB body in 512-byte chunks is
+  ;; 20 000 chunks and was answered 413 while a third of the configured
+  ;; limit. Deriving it holds one invariant instead -- an average chunk of
+  ;; at least 64 bytes -- and reproduces the old 16384 exactly at the
+  ;; default limit. The floor keeps a deliberately tiny body-limit from
+  ;; making ordinary chunking impossible.
+  (define (chunk-count-limit) (max 16384 (div body-limit 64)))
+  ;; Absolute, unlike the count: a single chunk-size line of four kilobytes
+  ;; is malformed however large the body is allowed to be.
   (define chunk-line-limit 4096)
-  (define chunk-count-limit 16384)
   (define chunk-overhead-limit 65536)
 
   ;; hex chunk size, stopping at ';' (chunk extensions); #f if malformed.
@@ -1176,7 +1190,7 @@
                           ((valid-trailer-line? bv (fx+ base p) (fx+ base e2))
                            (scan (+ e2 2)))
                           (else (values 'bad #f #f)))))))
-                 ((>= count chunk-count-limit) (values 'too-large #f #f))
+                 ((>= count (chunk-count-limit)) (values 'too-large #f #f))
                  (else
                   (let ((dstart (+ eol 2)))
                     (if (< blen (+ dstart size 2))
