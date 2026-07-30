@@ -678,8 +678,17 @@
           (else (loop (+ i 1) start acc))))))
 
   ;; Open rel beneath root without following any untrusted path component.
-  ;; The trusted root is opened once; every child is then resolved relative
-  ;; to that stable directory fd. Returns an fd or -1.
+  ;; The trusted root is opened once per call; every child is then resolved
+  ;; relative to that stable directory fd. Returns an fd or -1.
+  ;;
+  ;; Do NOT hoist the root open into a cached fd. A directory fd names an
+  ;; inode, not a path -- which is exactly why the walk below cannot be
+  ;; raced, and exactly why keeping one across requests would pin the
+  ;; directory that was there when it was opened. A deployment that swaps
+  ;; its root atomically (ln -sfn releases/v2 current) would go on serving
+  ;; the previous release until the process restarted, with nothing to
+  ;; indicate it. The saving would be one syscall out of the 1 + 2N this
+  ;; makes, on the cache-miss path only.
   (define (open-under root rel)
     (let ((parts (relative-parts rel)))
       (if (or (null? parts)
