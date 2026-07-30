@@ -218,8 +218,8 @@
            (max-age (opt o 'max-age #f))
            (secure? (opt o 'secure #t)))
       (lambda (req res next)
-        (define (issue-cookie! sid)
-          (apply set-cookie! res cname sid
+        (define (issue-cookie-with! setter sid)
+          (apply setter res cname sid
                  (string-append "Path=" path)
                  "HttpOnly"
                  (string-append "SameSite=" same-site)
@@ -228,19 +228,20 @@
                              (list (string-append "Max-Age="
                                                   (number->string max-age)))
                              '()))))
+        (define (issue-cookie! sid)
+          (issue-cookie-with! set-cookie! sid))
+        (define (issue-cookie-if-unanswered! sid)
+          (issue-cookie-with! set-cookie-if-unanswered! sid))
         (define (rotate! old fresh)
-          ;; Once the response is out, set-cookie! still succeeds and still
-          ;; does nothing -- the header it would have written is already on
-          ;; the wire. Dropping the old id anyway would leave the client
-          ;; holding a cookie for a session that no longer exists: silently
-          ;; logged out, with the next request starting over as anonymous.
-          ;; Refuse instead, and refuse BEFORE either effect, so the live
-          ;; id survives a handler that regenerates in the wrong order.
-          (when (res-answered? res)
+          ;; Publishing the replacement cookie and claiming a response race
+          ;; on the same token. Whichever wins is definitive: a successful
+          ;; publication is included in the responder's atomic header
+          ;; snapshot; a claimed response makes this return #f before the old
+          ;; id is dropped. A separate res-answered? check has a TOCTOU gap.
+          (unless (issue-cookie-if-unanswered! fresh)
             (assertion-violation 'session-regenerate!
               "response already sent -- the new cookie cannot reach the client; regenerate before answering"
               old))
-          (issue-cookie! fresh)
           (gen-server-cast (store-pid store) (vector 'drop old)))
         (let* ((sid (req-cookie req cname))
                (data (and sid (gen-server-call (store-pid store)
