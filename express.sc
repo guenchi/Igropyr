@@ -19,7 +19,8 @@
 (library (igropyr express)
   (export create-app app-get app-post app-put app-delete app-patch
           app-use app-static app-ws app-listen app->handler
-          req-param req-json req-form req-cookie set-cookie!
+          req-param req-json req-form req-cookie
+          set-cookie! set-cookie-if-unanswered!
           req-sexpr send-sexpr! app-rpc
           ws-send-sexpr! ws-recv-sexpr sse-send-sexpr!
           send-text! send-html! send-json! send-file!
@@ -186,20 +187,29 @@
                    (not (char=? c #\;)) (not (char=? c #\,))
                    (loop (+ i 1))))))))
 
-  (define (set-cookie! res name value . attrs)
+  (define (cookie-header who name value attrs)
     (unless (and (string? name) (cookie-part-ok? name))
-      (assertion-violation 'set-cookie! "invalid cookie name" name))
+      (assertion-violation who "invalid cookie name" name))
     (unless (and (string? value) (cookie-part-ok? value))
-      (assertion-violation 'set-cookie!
+      (assertion-violation who
         "cookie value may not contain ';' ',' or control characters" value))
     (for-each
       (lambda (a)
         (unless (and (string? a) (cookie-part-ok? a))
-          (assertion-violation 'set-cookie! "invalid cookie attribute" a)))
+          (assertion-violation who "invalid cookie attribute" a)))
       attrs)
+    (apply string-append name "=" value
+           (map (lambda (a) (string-append "; " a)) attrs)))
+
+  (define (set-cookie! res name value . attrs)
     (set-header! res "Set-Cookie"
-      (apply string-append name "=" value
-             (map (lambda (a) (string-append "; " a)) attrs))))
+      (cookie-header 'set-cookie! name value attrs)))
+
+  ;; #f when another process has already claimed the response; #t means
+  ;; its eventual res response is guaranteed to include this cookie.
+  (define (set-cookie-if-unanswered! res name value . attrs)
+    (set-header-if-unanswered! res "Set-Cookie"
+      (cookie-header 'set-cookie-if-unanswered! name value attrs)))
 
   ;; ---- form bodies (urlencoded + multipart/form-data) ---------------------------
 
@@ -628,7 +638,8 @@
   ;; so keying on the request path let a single asset occupy 2^letters
   ;; entries: unbounded memory from one file, and, once the capacity
   ;; ceilings existed, a way to wipe the whole cache with a few dozen
-  ;; requests. Symlink aliases collapse for the same reason.
+  ;; requests. Symlink aliases would collapse for the same reason, except
+  ;; the confined open refuses them before an entry can exist at all.
   ;;
   ;; Resolving costs a blocking syscall, so it happens only when the typed
   ;; path is not already a key -- a client using the spelling its links
@@ -636,7 +647,7 @@
   ;; property the hot path is built around. Entries therefore only ever
   ;; exist under resolved names, and a request for a variant looks itself
   ;; up rather than storing a second copy.
-  (define (static-entry path)
+  (define (static-entry path root rel)
     (let ((cached (or (hashtable-ref static-cache-hot path #f)
                       (hashtable-ref static-cache path #f)))
           (now (now-ms)))
@@ -651,22 +662,29 @@
                                      (hashtable-ref static-cache key #f))))
                          (if (and e (= (vector-ref e 0) mt))
                              (begin (vector-set! e 6 now) e)
-                             (open-entry key path mt now))))))))))
+                             (open-entry key path mt now root rel))))))))))
 
   ;; open with a timeout that can never leak the fd: the handle comes
   ;; back synchronously, so a timed-out open is closed via its handle
   ;; (the abort flag also suppresses any late ready message).
   ;; -> (values stream size) | (values #f #f)
-  (define (open-stream path)
-    (let ((st (file-stream-open! path self)))
-      (receive (after 30000 (begin (file-stream-close! st) (values #f #f)))
-        (`#(file-stream ,@st ,size) (values st size))
-        (`#(file-error ,e) (values #f #f)))))
+  (define (open-stream path root rel)
+    (let ((st (if root
+                  (file-stream-open-under! root rel self)
+                  (file-stream-open! path self))))
+      (if (not st)
+          (values #f #f)
+          (receive (after 30000 (begin (file-stream-close! st) (values #f #f)))
+            (`#(file-stream ,@st ,size) (values st size))
+            (`#(file-error ,e) (values #f #f))))))
 
-  ;; `key' is the resolved name from static-entry: what gets opened, what
-  ;; the entry is filed under, and what the content type is taken from.
-  (define (open-entry key hot-path mt now)
-    (let-values (((st size) (open-stream key)))
+  ;; `key' is the resolved name from static-entry: what the entry is filed
+  ;; under and what the content type is taken from. The OPEN still goes
+  ;; through the confined walk when there is a root -- resolving a name is
+  ;; not permission to open it. `hot-path' is the spelling the client sent,
+  ;; kept as that entry's no-syscall lookup key.
+  (define (open-entry key hot-path mt now root rel)
+    (let-values (((st size) (open-stream key root rel)))
       (and st
            (if (<= size max-cache-file)
                (let ((body (stream-read-all st size)))
@@ -716,8 +734,8 @@
   ;; window-hit download of a large (metadata-cached) file: open a
   ;; fresh stream on demand. Content-Length comes from the live fstat;
   ;; etag/ctype from the metadata (<= 1s stale, like every window hit).
-  (define (serve-large! r ctype path)
-    (let-values (((st size) (open-stream path)))
+  (define (serve-large! r ctype path root rel)
+    (let-values (((st size) (open-stream path root rel)))
       (if st
           (stream-file! r st size ctype)
           (begin (set-status! r 404) (send-text! r "Not Found")))))
@@ -747,12 +765,13 @@
              (else path))))
       (if (not resolved)
           (begin (set-status! r 403) (send-text! r "Forbidden"))
-          (let ((e (static-entry resolved)))
+          (let ((e (static-entry resolved root (and root path))))
             (cond
               ((not e) (set-status! r 404) (send-text! r "Not Found"))
               ((stream-entry? e)
                (stream-file! r (vector-ref e 1) (vector-ref e 2) (vector-ref e 4)))
-              ((large-entry? e) (serve-large! r (vector-ref e 3) resolved))
+              ((large-entry? e)
+               (serve-large! r (vector-ref e 3) resolved root (and root path)))
               (else (finish! r (vector-ref e 3) (vector-ref e 4))))))))
 
   (define (send-file! r path . rest)
@@ -772,10 +791,10 @@
   (define (gzip-etag etag)
     (string-append (substring etag 0 (- (string-length etag) 1)) "-gz\""))
 
-  (define (serve-static! r req abs-path)
+  (define (serve-static! r req abs-path root rel)
     (if (path-has-dotdot? abs-path)
         (begin (set-status! r 403) (send-text! r "Forbidden"))
-        (let ((e (static-entry abs-path)))
+        (let ((e (static-entry abs-path root rel)))
           (cond
             ((not e)
              (set-status! r 404) (send-text! r "Not Found"))
@@ -805,7 +824,7 @@
                    (begin
                      (set-status! r 304)
                      (res-send! r (make-bytevector 0)))
-                   (serve-large! r ctype abs-path))))
+                   (serve-large! r ctype abs-path root rel))))
             (else
              (let* ((size (vector-ref e 1))
                      (etag (vector-ref e 2))
@@ -1165,11 +1184,9 @@
         (else #f))))                                ; e.g. "/assets-private"
 
   ;; Resolve a URL-relative name under root without letting it escape.
-  ;; Chez has no portable realpath, so reject any symbolic link in the
-  ;; untrusted part of the path (stricter than following the link and
-  ;; comparing platform-specific canonical spellings) -- this blocks
-  ;; symlink-based escapes as well as ".." and NUL. Returns the safe
-  ;; absolute path or #f.
+  ;; Lexically validate the untrusted path. The subsequent file open walks
+  ;; these components from a stable root directory fd with O_NOFOLLOW;
+  ;; pathname checks alone would be vulnerable to a symlink swap race.
   ;; A segment starting with "." is refused: mounting a project directory
   ;; otherwise serves .env, .git/config and friends -- with a public
   ;; Cache-Control, so an intermediary keeps handing them out. ".well-known"
@@ -1191,9 +1208,7 @@
               (loop base (cdr parts)))
              ((dotfile-segment? (car parts)) #f)
              (else
-              (let ((next (string-append base "/" (car parts))))
-                (and (not (guard (e (#t #t)) (file-symbolic-link? next)))
-                     (loop next (cdr parts)))))))))
+              (loop (string-append base "/" (car parts)) (cdr parts)))))))
 
   (define (try-static a req r)
     (and (eq? (routing-method req) 'GET)
@@ -1204,10 +1219,10 @@
                     (path (and rel (safe-static-path root rel))))
                (and rel
                     (begin
-                      ;; safe-static-path rejects "..", NUL, and symlink
-                      ;; escapes; serve-static! then caches + answers 304
+                      ;; safe-static-path rejects ".." and NUL; the openat
+                      ;; walk rejects symlink escapes before serving/cache.
                       (if path
-                          (serve-static! r req path)
+                          (serve-static! r req path root rel)
                           (begin (set-status! r 403) (send-text! r "Forbidden")))
                       #t))))
            (app-statics a))))

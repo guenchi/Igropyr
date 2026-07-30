@@ -78,9 +78,10 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   verified — the core stays dependency-free)
 - **Static file serving** — hot files come from an in-memory cache (a
   hashtable lookup: no disk read, no `stat` syscall; mtime re-checked at
-  most once a second). A cache miss reads once on libuv's thread pool, so
-  a cold read never blocks the scheduler; files over 1 MiB stream in
-  bounded chunks with backpressure, never read whole
+  most once a second). A cache miss opens the file beneath its root with
+  `openat`, one component at a time and never following a symlink, then
+  reads it on libuv's thread pool; files over 1 MiB stream in bounded
+  chunks with backpressure, never read whole
 - **gzip compression** — responses negotiated via `Accept-Encoding`;
   static files cache their compressed form
 - **S3 object storage & AWS service clients** — `(igropyr sigv4)` signs
@@ -241,12 +242,14 @@ demand:
 ;; chunks with backpressure -- each chunk is read from disk only after
 ;; the previous one drained to the client, so a 10 GB download to a
 ;; slow peer costs one chunk of memory, and the pool worker is released
-;; immediately (the pump runs in its own process). The cache is bounded
-;; to 4096 entries and 64 MiB, including cached gzip representations,
-;; and is keyed by the name the OS resolves to -- so on a case-insensitive
-;; filesystem the many spellings of one file share one entry instead of
-;; letting a caller mint an entry per spelling. Both ceilings are
-;; adjustable: (static-cache-limits! entries bytes), #f to leave either.
+;; immediately (the pump runs in its own process). Path components are
+;; opened atomically beneath the root without following symlinks. The
+;; cache is bounded to 4096 entries and 64 MiB, including cached gzip
+;; representations, and is keyed by the name the OS resolves to -- so on
+;; a case-insensitive filesystem the many spellings of one file share one
+;; entry instead of letting a caller mint an entry per spelling. Both
+;; ceilings are adjustable: (static-cache-limits! entries bytes), #f to
+;; leave either.
 (app-static app "/assets" "./public")
 
 ;; enter the scheduler and listen; never returns
