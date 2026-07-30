@@ -37,6 +37,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/metrics.sc
 "$scheme_bin" --script igropyr/test/dashboard.sc
 "$scheme_bin" --script igropyr/test/auth.sc
+# session id rotation: the header-publication contract (no timing), and the
+# race it exists to survive (a concurrent responder claiming the same token)
+"$scheme_bin" --script igropyr/test/response-header-claim.sc
+"$scheme_bin" --script igropyr/test/session-rotation-race.sc
 "$scheme_bin" --script igropyr/test/express-routes.sc
 # path normalization: middleware guards and the router must agree on the
 # path, or an extra slash routes to a handler while skipping its guard
@@ -52,8 +56,16 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/protocol-hardening.sc
 "$scheme_bin" --script igropyr/test/http-client-stream.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
-"$scheme_bin" --script igropyr/test/redis-limits.sc
+# RESP parsing, both against a fake server so neither needs a live redis:
+# the same value at every split offset, and a fragmented reply parsed in
+# linear rather than quadratic time
+"$scheme_bin" --script igropyr/test/redis-splits.sc
+"$scheme_bin" --script igropyr/test/redis-incremental.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc
+"$scheme_bin" --script igropyr/test/static-cache-capacity.sc
+# one file must be one cache entry: self-skips on a case-sensitive
+# filesystem (naming why), where there are no variant spellings to collapse
+"$scheme_bin" --script igropyr/test/static-cache-key.sc
 "$scheme_bin" --script igropyr/test/node.sc
 # worker slot accounting: a killed or stuck task must not hold its slot
 "$scheme_bin" --script igropyr/test/dpool-slots.sc
@@ -64,6 +76,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/conv-cluster.sc
 "$scheme_bin" --script igropyr/test/tls.sc
 "$scheme_bin" --script igropyr/test/apple-jws.sc
+# pbkdf2/scrypt always run; the argon2id derivations self-skip (naming what
+# is missing) on a libcrypto older than OpenSSL 3.2, which is what Debian 12
+# and Ubuntu 22.04 ship. The argon2id guard tests still run there.
 "$scheme_bin" --script igropyr/test/kdf.sc
 # mysql option validation (no server needed, always runs)
 "$scheme_bin" --script igropyr/test/mysql-opts.sc

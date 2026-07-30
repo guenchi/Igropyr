@@ -78,9 +78,10 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   verified — the core stays dependency-free)
 - **Static file serving** — hot files come from an in-memory cache (a
   hashtable lookup: no disk read, no `stat` syscall; mtime re-checked at
-  most once a second). A cache miss reads once on libuv's thread pool, so
-  a cold read never blocks the scheduler; files over 1 MiB stream in
-  bounded chunks with backpressure, never read whole
+  most once a second). A cache miss opens the file beneath its root with
+  `openat`, one component at a time and never following a symlink, then
+  reads it on libuv's thread pool; files over 1 MiB stream in bounded
+  chunks with backpressure, never read whole
 - **gzip compression** — responses negotiated via `Accept-Encoding`;
   static files cache their compressed form
 - **S3 object storage & AWS service clients** — `(igropyr sigv4)` signs
@@ -167,7 +168,7 @@ guidelines, see [the manual](https://igropyr.dev/manual.html).
 
 ## Requirements
 
-- Chez Scheme 10.x
+- Chez Scheme 9.5.8 or newer
 - libuv 1.x
 - zlib 1.x
 - macOS or Linux on x86_64/arm64
@@ -241,7 +242,14 @@ demand:
 ;; chunks with backpressure -- each chunk is read from disk only after
 ;; the previous one drained to the client, so a 10 GB download to a
 ;; slow peer costs one chunk of memory, and the pool worker is released
-;; immediately (the pump runs in its own process).
+;; immediately (the pump runs in its own process). Path components are
+;; opened atomically beneath the root without following symlinks. The
+;; cache is bounded to 4096 entries and 64 MiB, including cached gzip
+;; representations, and is keyed by the name the OS resolves to -- so on
+;; a case-insensitive filesystem the many spellings of one file share one
+;; entry instead of letting a caller mint an entry per spelling. Both
+;; ceilings are adjustable: (static-cache-limits! entries bytes), #f to
+;; leave either.
 (app-static app "/assets" "./public")
 
 ;; enter the scheduler and listen; never returns
@@ -772,6 +780,10 @@ three and a login can rehash to a stronger algorithm transparently.
 (kdf-pbkdf2-sha256 pw salt iterations dk-len)
 (kdf-scrypt        pw salt N r p dk-len)
 (kdf-argon2id      pw salt t m p dk-len)
+
+;; argon2id needs OpenSSL 3.2+; scrypt and pbkdf2 do not. There is no
+;; default algorithm, so an older libcrypto costs you that one choice:
+(kdf-argon2id-available?)                 ; -> #t | #f
 ```
 
 A blocking KDF freezes the single-threaded scheduler for its duration, so
@@ -810,6 +822,18 @@ order matters (outermost first).
            (n (+ 1 (or (session-get s 'visits) 0))))
       (session-set! s 'visits n)             ; persisted automatically
       (send-json! res (list (cons 'visits n))))))
+
+;; Rotate an established anonymous id when authentication/privilege changes.
+;; Must happen BEFORE the response goes out -- the replacement arrives as a
+;; Set-Cookie header, so afterwards it could not reach the client. Called
+;; on an answered response it raises rather than dropping the live id.
+(app-post app "/login"
+  (lambda (req res)
+    ;; ...verify the submitted credential first...
+    (let ((s (req-session req)))
+      (session-regenerate! s)                 ; prevents session fixation
+      (session-set! s 'user "alice")
+      (send-json! res '((ok . #t))))))
 ```
 
 Middleware can also stash arbitrary values on the request for later

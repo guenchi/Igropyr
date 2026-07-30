@@ -22,7 +22,7 @@
 
 (library (igropyr redis)
   (export redis-connect redis redis-close!)
-  (import (chezscheme) (igropyr actor) (igropyr libuv))
+  (import (chezscheme) (igropyr actor) (igropyr buffer) (igropyr libuv))
 
   (define connect-timeout-ms 5000)
   (define reply-timeout-ms 30000)
@@ -36,28 +36,21 @@
 
   ;; ---- bytevector helpers ---------------------------------------------
 
-  (define (bv-append a b)
-    (let* ((la (bytevector-length a))
-           (lb (bytevector-length b))
-           (r (make-bytevector (+ la lb))))
-      (bytevector-copy! a 0 r 0 la)
-      (bytevector-copy! b 0 r la lb)
-      r))
-
   (define (bv-sub bv start end)
     (let ((r (make-bytevector (- end start))))
       (bytevector-copy! bv start r 0 (- end start))
       r))
 
-  (define (find-crlf bv start)
-    (let ((n (bytevector-length bv)))
-      (let loop ((i start))
-        (cond
-          ((>= (+ i 1) n) #f)
-          ((and (fx= (bytevector-u8-ref bv i) 13)
-                (fx= (bytevector-u8-ref bv (+ i 1)) 10))
-           i)
-          (else (loop (+ i 1)))))))
+  ;; Positions are relative to base, so parsing can work directly against
+  ;; the amortized inbuf without copying the accumulated reply per segment.
+  (define (find-crlf bv base limit start)
+    (let loop ((i start))
+      (cond
+        ((>= (+ i 1) limit) #f)
+        ((and (fx= (bytevector-u8-ref bv (+ base i)) 13)
+              (fx= (bytevector-u8-ref bv (+ base i 1)) 10))
+         i)
+        (else (loop (+ i 1))))))
 
   ;; strict UTF-8 check (RFC 3629); Chez's utf8->string substitutes
   ;; U+FFFD, so a binary value must be detected here to keep it raw
@@ -120,80 +113,93 @@
       (get)))
 
   ;; ---- RESP parsing ---------------------------------------------------------
-  ;; The parser returns 'more for incomplete input or a fatal marker for a
-  ;; malformed/oversized reply. Counts are per top-level reply and prevent
-  ;; shallow arrays from bypassing the nesting ceiling.
-  (define (protocol-fatal msg) (vector 'redis-protocol-fatal msg))
-  (define (protocol-fatal? v)
-    (and (vector? v) (eq? (vector-ref v 0) 'redis-protocol-fatal)))
 
-  (define (parse-reply buf pos depth count-box)
-    (cond
-      ((>= pos (bytevector-length buf)) (values 'more #f))
-      ((>= (unbox count-box) max-reply-items)
-       (values (protocol-fatal "reply has too many items") #f))
-      (else
-       (set-box! count-box (+ (unbox count-box) 1))
-       (let ((eol (find-crlf buf (+ pos 1))))
-         (cond
-           ((not eol)
-            (if (> (- (bytevector-length buf) pos) max-resp-line)
-                (values (protocol-fatal "reply line too long") #f)
-                (values 'more #f)))
-           ((> (- eol pos) max-resp-line)
-            (values (protocol-fatal "reply line too long") #f))
-           (else
-            (let ((line (utf8->string (bv-sub buf (+ pos 1) eol)))
-                  (next (+ eol 2)))
-              (case (integer->char (bytevector-u8-ref buf pos))
-                ((#\+) (values line next))
-                ((#\-) (values (vector 'redis-error line) next))
-                ((#\:)
-                 (let ((n (string->number line)))
-                   (if (and n (integer? n) (exact? n))
-                       (values n next)
-                       (values (protocol-fatal "bad integer reply") #f))))
-                ((#\$)
-                 (let ((n (string->number line)))
-                   (cond
-                     ((not (and n (integer? n) (exact? n)))
-                      (values (protocol-fatal "bad bulk length") #f))
-                     ((= n -1) (values #f next))
-                     ((< n 0) (values (protocol-fatal "bad bulk length") #f))
-                     ((> n max-reply-bytes)
-                      (values (protocol-fatal "bulk reply too large") #f))
-                     ((< (bytevector-length buf) (+ next n 2))
-                      (values 'more #f))
-                     ((not (and (= (bytevector-u8-ref buf (+ next n)) 13)
-                                (= (bytevector-u8-ref buf (+ next n 1)) 10)))
-                      (values (protocol-fatal "bad bulk terminator") #f))
-                     (else
-                      (let ((raw (bv-sub buf next (+ next n))))
-                        (values (if (valid-utf8? raw) (utf8->string raw) raw)
-                                (+ next n 2)))))))
-                ((#\*)
-                 (let ((n (string->number line)))
-                   (cond
-                     ((not (and n (integer? n) (exact? n)))
-                      (values (protocol-fatal "bad array length") #f))
-                     ((= n -1) (values #f next))
-                     ((or (< n 0) (> n max-array-elements))
-                      (values (protocol-fatal "array reply too large") #f))
-                     ((= n 0) (values '() next))
-                     ((>= depth max-reply-depth)
-                      (values (protocol-fatal "reply nesting too deep") #f))
-                     (else
-                      (let loop ((i 0) (p next) (acc '()))
-                        (if (= i n)
-                            (values (reverse acc) p)
-                            (let-values (((v np)
-                                          (parse-reply buf p (+ depth 1)
-                                                       count-box)))
-                              (cond
-                                ((eq? v 'more) (values 'more #f))
-                                ((protocol-fatal? v) (values v #f))
-                                (else (loop (+ i 1) np (cons v acc)))))))))))
-                (else (values (protocol-fatal "bad reply type") #f))))))))))
+  ;; Resumable parse state is
+  ;;   #(position array-stack line-scan pending-bulk)
+  ;; Each stack frame is (remaining . reversed-values). Completed array
+  ;; elements, the CRLF scan cursor, and an already parsed bulk length all
+  ;; stay in the state when more bytes are needed. Thus neither a fragmented
+  ;; line nor a fragmented bulk body is rescanned from its beginning.
+  ;; -> (values 'done #(value consumed)) | (values 'more state)
+  (define (parse-reply buf base limit state)
+    (letrec
+      ((more-line
+         (lambda (pos stack)
+           ;; Retain one byte of overlap so a trailing CR can pair with an
+           ;; LF in the next segment.
+           (values 'more
+             (vector pos stack (max (+ pos 1) (- limit 1)) #f))))
+       (more-bulk
+         (lambda (pos stack next n)
+           (values 'more (vector pos stack #f (vector next n)))))
+       (accept
+         (lambda (v pos stack)
+           (if (null? stack)
+               (values 'done (vector v pos))
+               (let* ((frame (car stack))
+                      (remaining (car frame))
+                      (acc (cdr frame)))
+                 (if (= remaining 1)
+                     (accept (reverse (cons v acc)) pos (cdr stack))
+                     (loop pos
+                           (cons (cons (- remaining 1) (cons v acc))
+                                 (cdr stack))
+                           (+ pos 1) #f))))))
+       (bulk
+         (lambda (pos stack next n)
+           (cond
+             ((< limit (+ next n 2)) (more-bulk pos stack next n))
+             ((not (and
+                     (= (bytevector-u8-ref buf (+ base next n)) 13)
+                     (= (bytevector-u8-ref buf (+ base next n 1)) 10)))
+              (accept (vector 'redis-error "bad bulk terminator")
+                      (+ next n 2) stack))
+             (else
+              (let ((raw (bv-sub buf (+ base next) (+ base next n))))
+                (accept (if (valid-utf8? raw) (utf8->string raw) raw)
+                        (+ next n 2) stack))))))
+       (loop
+         (lambda (pos stack scan pending)
+           (if pending
+               (bulk pos stack (vector-ref pending 0) (vector-ref pending 1))
+               (if (>= pos limit)
+                   (more-line pos stack)
+                   (let ((eol (find-crlf buf base limit scan)))
+                     (if (not eol)
+                         (more-line pos stack)
+                         (let ((line (utf8->string
+                                   (bv-sub buf (+ base pos 1) (+ base eol))))
+                           (next (+ eol 2)))
+                       (case (integer->char (bytevector-u8-ref buf (+ base pos)))
+                         ((#\+) (accept line next stack))
+                         ((#\-) (accept (vector 'redis-error line) next stack))
+                         ((#\:) (accept (string->number line) next stack))
+                         ((#\$)
+                          (let ((n (string->number line)))
+                            (cond
+                              ((not n)
+                               (accept (vector 'redis-error "bad bulk length")
+                                       next stack))
+                              ((< n 0) (accept #f next stack))
+                              (else (bulk pos stack next n)))))
+                         ((#\*)
+                          (let ((n (string->number line)))
+                            (cond
+                              ((not n)
+                               (accept (vector 'redis-error "bad array length")
+                                       next stack))
+                              ((< n 0) (accept #f next stack))
+                              ((= n 0) (accept '() next stack))
+                              (else
+                               (loop next (cons (cons n '()) stack)
+                                     (+ next 1) #f)))))
+                         (else
+                          (accept (vector 'redis-error "bad reply type")
+                                  next stack)))))))))))
+      (if state
+          (loop (vector-ref state 0) (vector-ref state 1)
+                (vector-ref state 2) (vector-ref state 3))
+          (loop 0 '() 1 #f))))
 
   ;; ---- connection process -----------------------------------------------------
 
@@ -211,37 +217,36 @@
       (send (vector-ref waiter 0)
             (vector 'redis-reply (vector-ref waiter 1) v))))
 
-  (define (conn-loop c buf waiters)
+  (define (conn-loop c buf waiters parse-state)
     (receive
       (`#(redis-cmd ,args ,ref ,from)
         (if (eq? (conn-state c) 'open)
             (begin
               (tcp-write! c (encode-command args) #f)
-              (conn-loop c buf (append waiters (list (vector from ref #t)))))
+        (conn-loop c buf (append waiters (list (vector from ref #t))) parse-state))
             (begin
               (send from (vector 'redis-reply ref connection-lost))
-              (conn-loop c buf waiters))))
+              (conn-loop c buf waiters parse-state))))
       (`#(redis-cancel ,ref ,from)
         (for-each
           (lambda (w) (when (and (eq? (vector-ref w 0) from)
                                  (eq? (vector-ref w 1) ref))
                         (vector-set! w 2 #f)))
           waiters)
-        (conn-loop c buf waiters))
+        (conn-loop c buf waiters parse-state))
       (`#(tcp-data ,bv)
-        (if (> (+ (bytevector-length buf) (bytevector-length bv))
-               max-reply-buffer)
-            (protocol-fail c waiters "reply exceeds size limit")
-            (let drain ((buf (bv-append buf bv)) (waiters waiters))
-              (let-values (((v next) (parse-reply buf 0 0 (box 0))))
-                (cond
-                  ((eq? v 'more) (conn-loop c buf waiters))
-                  ((protocol-fatal? v)
-                   (protocol-fail c waiters (vector-ref v 1)))
-                  (else
-                   (when (pair? waiters) (reply-to! (car waiters) v))
-                   (drain (bv-sub buf next (bytevector-length buf))
-                          (if (pair? waiters) (cdr waiters) '()))))))))
+        (inbuf-append! buf bv)
+        (let drain ((waiters waiters) (state parse-state))
+          (let-values (((tag payload)
+                        (parse-reply (inbuf-bv buf) (inbuf-start buf)
+                                     (inbuf-length buf) state)))
+            (if (eq? tag 'more)
+                (conn-loop c buf waiters payload)
+                (let ((v (vector-ref payload 0))
+                      (next (vector-ref payload 1)))
+                  (when (pair? waiters) (reply-to! (car waiters) v))
+                  (inbuf-consume! buf next)
+                  (drain (if (pair? waiters) (cdr waiters) '()) #f))))))
       (`#(redis-quit)
         (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
         (tcp-close! c))
@@ -258,7 +263,7 @@
   (define (fail-all c buf waiters)
     (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
     (tcp-close! c)
-    (conn-loop c buf '()))
+    (conn-loop c (make-inbuf) '() #f))
 
   (define (protocol-fail c waiters msg)
     (let ((e (vector 'redis-error (string-append "protocol error: " msg))))
@@ -279,7 +284,7 @@
                        (`#(tcp-connected ,c)
                          (tcp-read-start! c)
                          (send caller (vector 'redis-up self 'ok))
-                         (conn-loop c (make-bytevector 0) '()))
+                          (conn-loop c (make-inbuf) '() #f))
                        (`#(tcp-connect-failed ,e)
                          (send caller (vector 'redis-up self e))))))))
         (receive (after (+ connect-timeout-ms 1000)
