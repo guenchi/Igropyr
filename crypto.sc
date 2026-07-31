@@ -358,23 +358,30 @@
   ;; STRICT on purpose: base64-decode skips characters outside the alphabet,
   ;; which would let a token segment carry whitespace or padding and still
   ;; verify. Input here is untrusted, so anything off the url alphabet is an
-  ;; error rather than something to step over. A non-canonical tail (unused
-  ;; bits of the final character set) is rejected by base64-decode itself.
+  ;; error rather than something to step over. A length congruent to one
+  ;; modulo four cannot encode a whole number of bytes; reject it before the
+  ;; decoder can silently discard the dangling six-bit group. A non-canonical
+  ;; tail (unused bits of the final character set) is rejected by
+  ;; base64-decode itself.
   ;; Both failures raise &assertion; callers with their own error contract
   ;; are expected to guard and re-tag.
   (define (base64url-decode s)
-    (let* ((n (string-length s)) (t (make-string n)))
-      (do ((i 0 (fx+ i 1))) ((fx= i n))
-        (let ((c (string-ref s i)))
-          (string-set! t i
-            (cond ((char=? c #\-) #\+)
-                  ((char=? c #\_) #\/)
-                  ((or (char<=? #\A c #\Z) (char<=? #\a c #\z)
-                       (char<=? #\0 c #\9))
-                   c)
-                  (else (assertion-violation 'base64url-decode
-                          "invalid base64url character" s))))))
-      (base64-decode t)))
+    (let ((n (string-length s)))
+      (when (= (mod n 4) 1)
+        (assertion-violation 'base64url-decode
+          "invalid base64url length" s))
+      (let ((t (make-string n)))
+        (do ((i 0 (fx+ i 1))) ((fx= i n))
+          (let ((c (string-ref s i)))
+            (string-set! t i
+              (cond ((char=? c #\-) #\+)
+                    ((char=? c #\_) #\/)
+                    ((or (char<=? #\A c #\Z) (char<=? #\a c #\z)
+                         (char<=? #\0 c #\9))
+                     c)
+                    (else (assertion-violation 'base64url-decode
+                            "invalid base64url character" s))))))
+        (base64-decode t))))
 
   ;; ---- hex ------------------------------------------------------------
 

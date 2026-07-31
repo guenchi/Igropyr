@@ -89,6 +89,11 @@
   (rejects? (lambda () (base64url-decode "Zm 9v"))))
 (check-reject "b64url-rejects-newline"
   (rejects? (lambda () (base64url-decode "Zm9v\n"))))
+;; one base64url character leaves an impossible dangling six-bit group
+(check-reject "b64url-rejects-length-1"
+  (rejects? (lambda () (base64url-decode "A"))))
+(check-reject "b64url-rejects-length-5"
+  (rejects? (lambda () (base64url-decode "AAAAA"))))
 ;; non-canonical tail: "Zh" has unused bits set in the final character
 (check-reject "b64url-rejects-non-canonical-tail"
   (rejects? (lambda () (base64url-decode "Zh"))))
