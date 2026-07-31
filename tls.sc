@@ -44,7 +44,7 @@
 (library (igropyr tls)
   (export tls-enable! tls-establish!)
   (import (chezscheme) (igropyr actor) (igropyr platform)
-          (only (igropyr libuv) tcp-write!)
+          (only (igropyr libuv) tcp-write! conn-on-close!)
           (only (igropyr http-client) set-https-connector!))
 
   ;; ---- shared objects ---------------------------------------------------
@@ -256,12 +256,24 @@
         (unless (zero? rbio) (BIO_free rbio))
         (unless (zero? wbio) (BIO_free wbio))
         (die "tls: BIO_new failed"))
-      (let ((ssl (SSL_new ctx)))
-        (define (fail! msg) (SSL_free ssl) (die msg))   ; frees both BIOs too
+      (let ((ssl (SSL_new ctx))
+            (closed #f))
+        (define (close!)                 ; frees both BIOs too (SSL owns them)
+          (unless closed
+            (set! closed #t)
+            (SSL_free ssl)))
+        (define (fail! msg) (close!) (die msg))
         (when (zero? ssl)
           (BIO_free rbio) (BIO_free wbio)
           (die (tls-reason "tls: SSL_new failed")))
         (SSL_set_bio ssl rbio wbio)
+        ;; From here the SSL exists and this process can be killed while
+        ;; parked in the handshake receive below -- winders and guards do
+        ;; not run then, so freeing cannot be owned by this code path.
+        ;; Tie it to the connection instead: the owner-death sweep closes
+        ;; the conn, and the close completion runs close! (idempotent, so
+        ;; the normal-path free through the codec stays correct).
+        (conn-on-close! c close!)
         (if (ip-literal? host)
             (when (zero? (X509_VERIFY_PARAM_set1_ip_asc (SSL_get0_param ssl) host))
               (fail! "tls: bad ip literal"))
@@ -287,8 +299,7 @@
                   (fail! (tls-reason "tls handshake failed"))))))
 
         ;; ---- established: hand back the codec --------------------------
-        (let ((scratch (make-bytevector 16384))
-              (closed #f))
+        (let ((scratch (make-bytevector 16384)))
           (define (encrypt bv)
             (let ((n (bytevector-length bv)))
               (if (zero? n)
@@ -319,10 +330,6 @@
               ;; post-handshake protocol output (ticket acks, key updates)
               (flush-out! c wbio)
               (get)))
-          (define (close!)
-            (unless closed
-              (set! closed #t)
-              (SSL_free ssl)))
           ;; 4th slot: the tls-server-end-point hash for SCRAM channel
           ;; binding (or #f); https ignores it, the postgresql client
           ;; feeds it into SCRAM-SHA-256-PLUS.

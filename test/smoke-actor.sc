@@ -112,6 +112,45 @@
           (fail "connect completed for a dead owner and was registered"))))
     (display "mid-connect owner death ok\n")
 
+    ;; Cleanup owned by the resource, not the code path: a thunk attached
+    ;; with conn-on-close! must run when the conn closes -- including when
+    ;; the close came from the owner-death sweep, where no user code (no
+    ;; winders, no guards) gets to run. This is what lets a TLS session be
+    ;; freed even when its process is killed mid-request.
+    (let* ((caller self)
+           (ran (box 0))
+           (listener
+             (tcp-listen! "127.0.0.1" 18921 4
+               (lambda (c) (tcp-read-start! c)) 0)))
+      ;; normal close path
+      (tcp-connect! "127.0.0.1" 18921 self)
+      (let ((c (receive (after 1000 (fail "on-close connect timeout"))
+                 (`#(tcp-connected ,c) c))))
+        (conn-on-close! c (lambda () (set-box! ran (+ 1 (unbox ran)))))
+        (tcp-close! c)
+        (sleep-ms 100)
+        (unless (= (unbox ran) 1) (fail "on-close hook missed tcp-close!"))
+        ;; registering on an already-closed conn runs immediately
+        (conn-on-close! c (lambda () (set-box! ran (+ 1 (unbox ran)))))
+        (unless (= (unbox ran) 2) (fail "on-close hook missed late registration")))
+      ;; owner-death path: the kill must trigger it via uv-owner-died!
+      (let ((victim (spawn (lambda ()
+                             (tcp-connect! "127.0.0.1" 18921 self)
+                             (receive
+                               (`#(tcp-connected ,c)
+                                 (conn-on-close! c
+                                   (lambda () (set-box! ran (+ 1 (unbox ran)))))
+                                 (send caller (vector 'armed))
+                                 (receive (`#(never) (void)))))))))
+        (receive (after 1000 (fail "on-close arm timeout")) (`#(armed) 'ok))
+        (monitor victim)
+        (kill victim 'on-close-test)
+        (receive (after 1000 (fail "on-close no DOWN")) (`#(DOWN ,@victim ,_) 'ok))
+        (sleep-ms 100)
+        (unless (= (unbox ran) 3) (fail "on-close hook missed owner death")))
+      (tcp-stop-listen! listener))
+    (display "conn on-close cleanup ok\n")
+
     ;; 5. spawn&link + trap-exit turns a crash into an EXIT message
     (process-trap-exit #t)
     (spawn&link (lambda () (raise 'linked-crash)))

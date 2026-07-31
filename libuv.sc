@@ -20,6 +20,7 @@
           tcp-read-start! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
           conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
+          conn-on-close!
           conn-state conn-count uv-strerror)
   (import (chezscheme) (igropyr platform))
 
@@ -143,7 +144,10 @@
     (fields
       (immutable handle conn-handle)             ; foreign address of uv_tcp_t
       (mutable owner conn-owner conn-set-owner!) ; pid of the reader process
-      (mutable state conn-state conn-set-state!))) ; open | closing | closed
+      (mutable state conn-state conn-set-state!) ; open | closing | closed
+      ;; one thunk, run exactly once when the handle's close completes --
+      ;; see conn-on-close! below for why cleanup hangs off the conn
+      (mutable cleanup conn-cleanup conn-set-cleanup!)))
 
   ;; GC roots (the "keep-live" story):
   ;; - conn-table roots every live connection's Scheme state while libuv
@@ -268,7 +272,13 @@
       (lambda (handle)
         (let ((c (hashtable-ref conn-table handle #f)))
           (hashtable-delete! conn-table handle)
-          (when c (conn-set-state! c 'closed)))
+          (when c
+            (conn-set-state! c 'closed)
+            (let ((clean (conn-cleanup c)))
+              (when clean
+                (conn-set-cleanup! c #f)
+                ;; callback context: an escaping raise would unwind into C
+                (guard (e (#t (void))) (clean))))))
         (foreign-free handle))
       (void*)
       void))
@@ -295,7 +305,7 @@
             (uv-tcp-init uv-loop client)
             (if (< (uv-accept server client) 0)
                 (uv-close client on-close-entry)
-                (let ((c (make-conn client #f 'open))
+                (let ((c (make-conn client #f 'open #f))
                       (p (hashtable-ref listener-table server #f)))
                   (uv-tcp-nodelay client 1)
                   (hashtable-set! conn-table client c)
@@ -581,7 +591,7 @@
                  ;; The owner died while connect was in flight.
                  (uv-close handle on-close-entry))
                 (else
-                 (let ((c (make-conn handle owner 'open)))
+                 (let ((c (make-conn handle owner 'open #f)))
                    (uv-tcp-nodelay handle 1)
                    (hashtable-set! conn-table handle c)
                    (deliver owner (vector 'tcp-connected c)))))))))
@@ -1004,6 +1014,20 @@
 
   ;; Idempotent close; memory is freed only in close_cb, so there is no
   ;; double-close and no fd leak.
+  ;; Attach a cleanup thunk to a connection: it runs exactly once, when
+  ;; libuv reports the handle closed -- WHOEVER closed it. That is the
+  ;; point of hanging it off the conn instead of a code path: an owner
+  ;; killed mid-request closes the conn via uv-owner-died!, and a killed
+  ;; process runs neither winders nor guards, so any cleanup owned by
+  ;; control flow is skipped. Cleanup owned by the resource is not.
+  ;; Registering on an already-closed conn runs the thunk immediately.
+  ;; The thunk runs in libuv callback context: it must not yield, park,
+  ;; or raise (a raise here would unwind into C; it is swallowed).
+  (define (conn-on-close! c thunk)
+    (if (eq? (conn-state c) 'closed)
+        (thunk)
+        (conn-set-cleanup! c thunk)))
+
   (define (tcp-close! c)
     (when (and (eq? (conn-state c) 'open)
                (= 0 (uv-is-closing (conn-handle c))))
