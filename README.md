@@ -54,7 +54,9 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   before the handshake. `session-guard` takes an `origins` allow-list:
   the same-origin policy does not cover WebSockets and the browser attaches
   the session cookie whatever page opened the socket, so that list is what
-  keeps a hostile page from holding an authenticated session
+  keeps a hostile page from holding an authenticated session. Browser
+  origins fail closed until the application configures the list; clients
+  without an Origin header remain supported
 - **JWT** — `(igropyr jwt)` signs and verifies HS256 tokens (algorithm
   pinned, constant-time compare, strict base64url, fail-closed), the
   credential format plugged into `(igropyr auth)`
