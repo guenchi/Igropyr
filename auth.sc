@@ -10,7 +10,8 @@
 ;;;
 ;;;   ;; WebSocket routes: guard checked BEFORE the 101 handshake
 ;;;   (app-ws app "/chat" chat-session (token-guard (jwt-verifier key)))
-;;;   (app-ws app "/feed" feed-session (session-guard store))
+;;;   (app-ws app "/feed" feed-session
+;;;     (session-guard store '((origins . ("https://app.example")))))
 ;;;
 ;;;   ;; both channels: claims in the handler / ws session
 ;;;   (req-claims req)
@@ -132,8 +133,10 @@
   ;;   (session-guard store `((origins . ,(lambda (o) ...))))
   ;;
   ;; A list is matched exactly; a procedure receives the header value (or
-  ;; #f when absent) and answers. UNSET MEANS ANY ORIGIN IS ACCEPTED, which
-  ;; is only safe where no browser can reach the port.
+  ;; #f when absent) and answers. Unset is an EMPTY allow-list, so browser
+  ;; handshakes fail closed until the application names its origins. An
+  ;; explicit #f accepts any Origin and is only safe where no browser can
+  ;; reach the port.
   ;;
   ;; A missing Origin is allowed even when the list is set: browsers always
   ;; send one on an upgrade, so its absence means a non-browser client --
@@ -146,21 +149,26 @@
     (let* ((o (if (pair? rest) (car rest) '()))
            (cname (opt o 'cookie "sid"))
            (key (opt o 'key #f))
-           (origins (opt o 'origins #f)))
+           (origins (opt o 'origins '())))
       (unless (or (not origins) (procedure? origins)
                   (and (list? origins) (for-all string? origins)))
         (assertion-violation 'session-guard
-          "'origins must be a list of strings or a procedure" origins))
-      (lambda (req)
-        (let* ((sid (req-cookie req cname))
-               (data (and sid (session-peek store sid)))
-               (origin (req-header req 'origin)))
-          (and (pair? data)                     ; live AND non-empty
-               (or (not key) (assq key data))
-               (cond
-                 ((not origins) #t)
-                 ((procedure? origins) (origins origin))
-                 ((not origin) #t)              ; not a browser: see above
-                 (else (and (member origin origins) #t)))
-               data)))))
+          "'origins must be #f, a list of strings, or a procedure" origins))
+      (let ((origin-allowed?
+              (lambda (origin)
+                (cond
+                  ((not origins) #t)               ; explicit opt-out
+                  ((procedure? origins) (origins origin))
+                  ((not origin) #t)                ; not a browser: see above
+                  (else (and (member origin origins) #t))))))
+        (lambda (req)
+          ;; Reject a foreign browser before touching the shared session store:
+          ;; upgrades bypass middleware rate limits, and session-peek is a
+          ;; synchronous call through the store's single gen-server.
+          (and (origin-allowed? (req-header req 'origin))
+               (let* ((sid (req-cookie req cname))
+                      (data (and sid (session-peek store sid))))
+                 (and (pair? data)                 ; live AND non-empty
+                      (or (not key) (assq key data))
+                      data)))))))
 )
