@@ -59,6 +59,7 @@
     ("igropyr/s3-control.sc" . 2)
     ("igropyr/tls.sc" . 2)
     ("igropyr/apple-jws.sc" . 2)
+    ("igropyr/jwks.sc" . 2)
     ("igropyr/kdf.sc" . 2)
     ("igropyr/redis.sc" . 2)
     ("igropyr/sqlpool.sc" . 2)
