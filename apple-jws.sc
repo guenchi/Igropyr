@@ -39,7 +39,7 @@
 (library (igropyr apple-jws)
   (export verify-apple-jws verify-jws-x5c apple-root-ca-g3-der)
   (import (chezscheme) (igropyr platform)
-          (only (igropyr crypto) base64-decode)
+          (only (igropyr crypto) base64-decode base64url-decode)
           (only (igropyr json) string->json json-ref))
 
   ;; ---- libcrypto (loaded explicitly, like (igropyr tls)) ----------------
@@ -94,34 +94,12 @@
       (bytevector-copy! bv s r 0 (- e s))
       r))
 
-  (define (b64url-char? c)
-    (or (char<=? #\A c #\Z) (char<=? #\a c #\z) (char<=? #\0 c #\9)
-        (char=? c #\-) (char=? c #\_)))
-
-  ;; base64url (the JWS parts) -> bytes. A compact JWS part is UNPADDED
-  ;; base64url; a stray character (padding, whitespace, +/, smuggled byte)
-  ;; is a malformed token, refused here rather than silently normalised
-  ;; away by the lenient (igropyr crypto) base64-decode.
+  ;; Decode every JWS part with the shared strict base64url primitive. Its
+  ;; assertions describe attacker-controlled input here, so re-tag them with
+  ;; the public apple-jws error contract instead of leaking an assertion.
   (define (b64url->bytes s)
-    (let ((n (string-length s)))
-      (do ((i 0 (+ i 1))) ((= i n))
-        (unless (b64url-char? (string-ref s i))
-          (ajws-fail 'not-jws "invalid base64url character in token")))
-      (let ((t (make-string n)))
-        (do ((i 0 (+ i 1))) ((= i n))
-          (let ((c (string-ref s i)))
-            (string-set! t i (cond ((char=? c #\-) #\+)
-                                   ((char=? c #\_) #\/)
-                                   (else c)))))
-        ;; base64-decode raises &assertion when the last character's unused
-        ;; bits are set (a non-canonical encoding). This input is an
-        ;; attacker's, so that assertion would escape the documented
-        ;; #(apple-jws-error CODE MSG) contract -- a caller guarding on that
-        ;; tag would let it through and take down its request process, and
-        ;; a webhook would turn a 401 into a retryable 5xx.
-        (guard (e (#t (ajws-fail 'not-jws "malformed base64url in token")))
-          (base64-decode
-            (string-append t (make-string (mod (- 4 (mod n 4)) 4) #\=)))))))
+    (guard (e (#t (ajws-fail 'not-jws "malformed base64url in token")))
+      (base64url-decode s)))
 
   ;; ---- X.509 from DER --------------------------------------------------
 
