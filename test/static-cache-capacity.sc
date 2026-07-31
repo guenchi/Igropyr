@@ -36,6 +36,18 @@
 
 (write-text (string-append root "/hot.txt") "cached")
 
+;; One body that fits the normal per-file policy but can never fit this
+;; test's aggregate budget. It must be served without entering the cache.
+(define oversize-bytes (+ byte-cap 1))
+(write-text (string-append root "/oversize.txt")
+  (string-append "A" (make-string (- oversize-bytes 1) #\a)))
+(system (string-append "cp -p " root "/oversize.txt " root "/oversize-stamp"))
+
+;; Sentinel for lowering the byte ceiling below an already-cached body.
+(write-text (string-append root "/lowered.txt")
+  (string-append "L" (make-string (- chunk 1) #\l)))
+(system (string-append "cp -p " root "/lowered.txt " root "/lowered-stamp"))
+
 ;; One primed entry plus entry-cap distinct inserts crosses the count.
 (do ((i 0 (+ i 1))) ((= i (+ entry-cap 1)))
   (write-text
@@ -74,6 +86,17 @@
                  (http-request 'GET (string-append base name)
                    '((headers . (("Accept-Encoding" . "gzip")))
                      (timeout . 10000))))))
+        (check "serve an entry larger than the byte ceiling"
+          (= 200 (response-status (GET "oversize.txt"))))
+        (delete-file (string-append root "/oversize.txt"))
+        (write-text (string-append root "/oversize.txt")
+          (string-append "B" (make-string (- oversize-bytes 1) #\b)))
+        (system (string-append "touch -r " root "/oversize-stamp "
+                               root "/oversize.txt"))
+        (check "an entry larger than the byte ceiling is not cached"
+          (= (char->integer #\B)
+             (bytevector-u8-ref (response-body (GET "oversize.txt")) 0)))
+
         ;; A relative root differs from file-realpath's canonical key. The
         ;; first request spelling is kept hot without creating alias entries.
         ;; Eviction must discharge the bytes, not just drop the mapping.
@@ -135,7 +158,24 @@
         (check "byte/gzip ceiling evicts the primed sentinel"
           (= (char->integer #\B)
              (bytevector-u8-ref
-               (response-body (GET "byte-0.txt")) 0)))))
+               (response-body (GET "byte-0.txt")) 0)))
+
+        (check "prime limit-reduction sentinel"
+          (= 200 (response-status (GET "lowered.txt"))))
+        (delete-file (string-append root "/lowered.txt"))
+        (write-text (string-append root "/lowered.txt")
+          (string-append "N" (make-string (- chunk 1) #\n)))
+        (system (string-append "touch -r " root "/lowered-stamp "
+                               root "/lowered.txt"))
+        (static-cache-limits! #f (- chunk 1))
+        ;; This store is skipped because the incoming item is also too large;
+        ;; it must still clear entries left above the newly lowered ceiling.
+        (check "serve oversized item after lowering the ceiling"
+          (= 200 (response-status (GET "oversize.txt"))))
+        (check "lowered ceiling clears the existing oversized cache"
+          (= (char->integer #\N)
+             (bytevector-u8-ref
+               (response-body (GET "lowered.txt")) 0)))))
     (system (string-append "rm -rf " root))
     (if (zero? failures)
         (begin

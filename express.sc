@@ -563,18 +563,35 @@
           (set! static-cache-bytes (- static-cache-bytes (entry-bytes old)))
           (let ((hot (vector-ref old 8)))
             (when (eq? (hashtable-ref static-cache-hot hot #f) old)
-              (hashtable-delete! static-cache-hot hot))))
+              (hashtable-delete! static-cache-hot hot)))
+          ;; delete rather than rely on the overwrite below: the oversize
+          ;; branch no longer inserts, and a stale entry whose bytes were
+          ;; just discharged must not keep serving
+          (hashtable-delete! static-cache path))
         (let ((n (entry-bytes e)))
-          (when (or (and (not old)
-                         (fx>= (hashtable-size static-cache)
-                               max-static-cache-entries))
-                    (> (+ static-cache-bytes n) max-static-cache-bytes))
+          ;; A runtime limit reduction takes effect on this store even when
+          ;; the incoming entry itself cannot fit and will be skipped below.
+          ;; Otherwise an already-over-budget cache could survive forever on
+          ;; a workload made entirely of oversized misses.
+          (when (or (> (hashtable-size static-cache)
+                       max-static-cache-entries)
+                    (> static-cache-bytes max-static-cache-bytes))
             (hashtable-clear! static-cache)
             (hashtable-clear! static-cache-hot)
             (set! static-cache-bytes 0))
-          (hashtable-set! static-cache path e)
-          (hashtable-set! static-cache-hot (vector-ref e 8) e)
-          (set! static-cache-bytes (+ static-cache-bytes n))))))
+          ;; Clearing cannot make an entry that is larger than the entire
+          ;; byte budget fit. Serve it once, but do not let that single item
+          ;; leave the supposedly hard ceiling exceeded.
+          (unless (> n max-static-cache-bytes)
+            (when (or (fx>= (hashtable-size static-cache)
+                            max-static-cache-entries)
+                      (> (+ static-cache-bytes n) max-static-cache-bytes))
+              (hashtable-clear! static-cache)
+              (hashtable-clear! static-cache-hot)
+              (set! static-cache-bytes 0))
+            (hashtable-set! static-cache path e)
+            (hashtable-set! static-cache-hot (vector-ref e 8) e)
+            (set! static-cache-bytes (+ static-cache-bytes n)))))))
 
   ;; What the cache is holding. Exported for the same reason as the node
   ;; monitor tables: the byte total is the thing that silently goes wrong --
