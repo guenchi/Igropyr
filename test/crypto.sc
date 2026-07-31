@@ -46,6 +46,53 @@
 (check-reject "neg-dklen-rejected"
   (rejects? (lambda () (pbkdf2-hmac-sha256 (string->utf8 "pw") (string->utf8 "salt") 1 -1))))
 
+;; ---- base64url (RFC 4648 section 5) -------------------------------------
+;; The JOSE alphabet, shared by jwt and the JWKS/RS256 paths. What matters
+;; beyond round-tripping is the STRICTNESS: base64-decode skips characters
+;; outside the alphabet, so a lax base64url would let a token segment carry
+;; whitespace or padding and still verify.
+
+;; RFC 4648 section 10 vectors, url alphabet with padding removed
+(check "b64url-empty"  (base64url-encode (string->utf8 "")) "")
+(check "b64url-f"      (base64url-encode (string->utf8 "f")) "Zg")
+(check "b64url-fo"     (base64url-encode (string->utf8 "fo")) "Zm8")
+(check "b64url-foo"    (base64url-encode (string->utf8 "foo")) "Zm9v")
+(check "b64url-foobar" (base64url-encode (string->utf8 "foobar")) "Zm9vYmFy")
+
+;; the two substituted characters: 0xFB 0xFF encodes to "+/" in standard
+;; base64, so this is what separates the alphabets
+(check "b64url-alphabet"
+  (base64url-encode (bytevector #xfb #xff)) "-_8")
+(check "b64url-roundtrip-alphabet"
+  (utf8->string (base64url-decode "Zm9vYmFy")) "foobar")
+(check "b64url-decode-substituted"
+  (bytevector->hex (base64url-decode "-_8")) "fbff")
+
+;; every byte value survives a round trip
+(check "b64url-roundtrip-all-bytes"
+  (bytevector->hex
+    (base64url-decode
+      (base64url-encode (let ((bv (make-bytevector 256)))
+                          (do ((i 0 (+ i 1))) ((= i 256) bv)
+                            (bytevector-u8-set! bv i i))))))
+  (bytevector->hex (let ((bv (make-bytevector 256)))
+                     (do ((i 0 (+ i 1))) ((= i 256) bv)
+                       (bytevector-u8-set! bv i i)))))
+
+;; strictness: each of these decodes FINE under a lax decoder that merely
+;; skips what it does not recognise, which is exactly the bug being pinned
+(check-reject "b64url-rejects-padding"
+  (rejects? (lambda () (base64url-decode "Zm9v="))))
+(check-reject "b64url-rejects-standard-alphabet"
+  (rejects? (lambda () (base64url-decode "-/8"))))
+(check-reject "b64url-rejects-whitespace"
+  (rejects? (lambda () (base64url-decode "Zm 9v"))))
+(check-reject "b64url-rejects-newline"
+  (rejects? (lambda () (base64url-decode "Zm9v\n"))))
+;; non-canonical tail: "Zh" has unused bits set in the final character
+(check-reject "b64url-rejects-non-canonical-tail"
+  (rejects? (lambda () (base64url-decode "Zh"))))
+
 (if (zero? failures)
-    (begin (display "crypto: all pbkdf2 tests passed\n") (exit 0))
+    (begin (display "crypto: all tests passed\n") (exit 0))
     (begin (display failures) (display " failures\n") (exit 1)))

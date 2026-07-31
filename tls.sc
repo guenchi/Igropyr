@@ -53,21 +53,9 @@
   ;; foreign-procedure regardless of how the platform scopes transitive
   ;; dependencies.
 
-  (define brew-arm "/opt/homebrew/opt/openssl@3/lib/")
-  (define brew-x86 "/usr/local/opt/openssl@3/lib/")
 
-  (define (candidates base)
-    (case platform-os
-      ((macos) (list (string-append brew-arm base ".3.dylib")
-                     (string-append brew-x86 base ".3.dylib")
-                     (string-append base ".3.dylib")
-                     (string-append base ".dylib")))
-      (else    (list (string-append base ".so.3")
-                     (string-append base ".so.1.1")
-                     (string-append base ".so")))))
-
-  (define _libcrypto (load-first-shared-object! 'igropyr-tls (candidates "libcrypto")))
-  (define _libssl    (load-first-shared-object! 'igropyr-tls (candidates "libssl")))
+  (define _libcrypto (load-first-shared-object! 'igropyr-tls (shared-object-candidates "libcrypto")))
+  (define _libssl    (load-first-shared-object! 'igropyr-tls (shared-object-candidates "libssl")))
 
   ;; ---- FFI ---------------------------------------------------------------
 

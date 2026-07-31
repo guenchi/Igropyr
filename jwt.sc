@@ -59,40 +59,16 @@
   (define (jwt-fail msg)
     (raise (vector 'jwt-error msg)))
 
-  ;; ---- base64url (RFC 4648 section 5, unpadded) ------------------------
-
-  (define (base64url-encode bv)
-    (let* ((s (base64-encode bv))
-           (end (let lp ((i (string-length s)))
-                  (if (and (fx> i 0) (char=? (string-ref s (fx- i 1)) #\=))
-                      (lp (fx- i 1))
-                      i)))
-           (r (make-string end)))
-      (do ((i 0 (fx+ i 1))) ((fx= i end) r)
-        (let ((c (string-ref s i)))
-          (string-set! r i
-            (cond ((char=? c #\+) #\-)
-                  ((char=? c #\/) #\_)
-                  (else c)))))))
-
-  ;; strict: crypto's base64-decode skips foreign characters, so the
-  ;; url-alphabet check happens here and anything else rejects
-  (define (base64url-decode s)
-    (let* ((n (string-length s)) (t (make-string n)))
-      (do ((i 0 (fx+ i 1))) ((fx= i n))
-        (let ((c (string-ref s i)))
-          (string-set! t i
-            (cond ((char=? c #\-) #\+)
-                  ((char=? c #\_) #\/)
-                  ((or (char<=? #\A c #\Z) (char<=? #\a c #\z)
-                       (char<=? #\0 c #\9))
-                   c)
-                  (else (jwt-fail "invalid base64url character"))))))
-      ;; a non-canonical tail (unused bits of the last character set) makes
-      ;; base64-decode raise &assertion; keep it inside the jwt error
-      ;; contract, since the token is untrusted input
-      (guard (e (#t (jwt-fail "malformed base64url")))
-        (base64-decode t))))
+  ;; ---- base64url ---------------------------------------------------------
+  ;;
+  ;; The pair lives in (igropyr crypto); it is shared with the JWKS/RS256
+  ;; paths, which must decode token segments exactly the same way. Only the
+  ;; error tagging is local: crypto raises &assertion for a stray character
+  ;; or a non-canonical tail, and a malformed TOKEN has to surface as a jwt
+  ;; error, since it is untrusted input rather than a caller bug.
+  (define (b64url-decode s)
+    (guard (e (#t (jwt-fail "malformed base64url")))
+      (base64url-decode s)))
 
   ;; ---- helpers -----------------------------------------------------------
 
@@ -199,7 +175,7 @@
              (parts (and (string? token) (split-3 token))))
         (and parts
              (let* ((h64 (car parts)) (p64 (cadr parts)) (s64 (caddr parts))
-                    (header (string->json (utf8->string (base64url-decode h64)))))
+                    (header (string->json (utf8->string (b64url-decode h64)))))
                (and (list? header)
                     (equal? (json-ref header "alg") "HS256")
                     (let ((typ (json-ref header "typ")))
@@ -207,9 +183,9 @@
                     (bv-ct=?
                       (hmac-sha256 kbv
                         (string->utf8 (string-append h64 "." p64)))
-                      (base64url-decode s64))
+                      (b64url-decode s64))
                     ;; signature holds: now, and only now, judge claims
-                    (let ((claims (string->json (utf8->string (base64url-decode p64))))
+                    (let ((claims (string->json (utf8->string (b64url-decode p64))))
                           (now (now-sec)))
                       (and (list? claims)
                            (time-claim-ok? claims "exp" (lambda (v) (< now (+ v leeway))))
@@ -225,8 +201,8 @@
     (guard (e (#t #f))
       (let ((parts (split-3 token)))
         (and parts
-             (cons (string->json (utf8->string (base64url-decode (car parts))))
-                   (string->json (utf8->string (base64url-decode (cadr parts)))))))))
+             (cons (string->json (utf8->string (b64url-decode (car parts))))
+                   (string->json (utf8->string (b64url-decode (cadr parts)))))))))
 
   ;; ---- verifier factory ------------------------------------------------------
 
