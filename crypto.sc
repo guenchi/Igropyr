@@ -9,6 +9,8 @@
 ;;;                            the 64-byte block are hashed first (RFC 2104)
 ;;;   base64-encode          bytevector -> string (RFC 4648, '=' padded)
 ;;;   base64-decode          string -> bytevector (skips '=', whitespace)
+;;;   base64url-encode       bytevector -> string (RFC 4648 s5, unpadded)
+;;;   base64url-decode       string -> bytevector, STRICT (see below)
 ;;;   bytevector->hex        bytevector -> lowercase hex string
 ;;;
 ;;; None of it is a security boundary on its own: SHA-1 lives here only
@@ -19,7 +21,9 @@
 
 (library (igropyr crypto)
   (export sha1 sha256 hmac-sha1 hmac-sha256 pbkdf2-hmac-sha256
-          base64-encode base64-decode bytevector->hex)
+          base64-encode base64-decode
+          base64url-encode base64url-decode
+          bytevector->hex)
   (import (chezscheme))
 
   ;; concatenate two bytevectors (HMAC's inner/outer pad || message)
@@ -329,6 +333,48 @@
                           (put-u8 p (fxand (bitwise-arithmetic-shift-right acc keep) #xFF))
                           (loop (+ i 1) (fxand acc (- (fxsll 1 keep) 1)) keep))
                         (loop (+ i 1) acc bits)))))))))
+
+  ;; ---- base64url (RFC 4648 section 5, unpadded) -------------------------
+  ;;
+  ;; The JOSE alphabet: '+' and '/' become '-' and '_', and the padding is
+  ;; dropped. Lives here rather than in one consumer because every caller
+  ;; that touches JWS/JWKS needs the identical pair, and two spellings of
+  ;; "decode a token segment" is how a strict decoder and a lax one end up
+  ;; guarding the same signature.
+  (define (base64url-encode bv)
+    (let* ((s (base64-encode bv))
+           (end (let lp ((i (string-length s)))
+                  (if (and (fx> i 0) (char=? (string-ref s (fx- i 1)) #\=))
+                      (lp (fx- i 1))
+                      i)))
+           (r (make-string end)))
+      (do ((i 0 (fx+ i 1))) ((fx= i end) r)
+        (let ((c (string-ref s i)))
+          (string-set! r i
+            (cond ((char=? c #\+) #\-)
+                  ((char=? c #\/) #\_)
+                  (else c)))))))
+
+  ;; STRICT on purpose: base64-decode skips characters outside the alphabet,
+  ;; which would let a token segment carry whitespace or padding and still
+  ;; verify. Input here is untrusted, so anything off the url alphabet is an
+  ;; error rather than something to step over. A non-canonical tail (unused
+  ;; bits of the final character set) is rejected by base64-decode itself.
+  ;; Both failures raise &assertion; callers with their own error contract
+  ;; are expected to guard and re-tag.
+  (define (base64url-decode s)
+    (let* ((n (string-length s)) (t (make-string n)))
+      (do ((i 0 (fx+ i 1))) ((fx= i n))
+        (let ((c (string-ref s i)))
+          (string-set! t i
+            (cond ((char=? c #\-) #\+)
+                  ((char=? c #\_) #\/)
+                  ((or (char<=? #\A c #\Z) (char<=? #\a c #\z)
+                       (char<=? #\0 c #\9))
+                   c)
+                  (else (assertion-violation 'base64url-decode
+                          "invalid base64url character" s))))))
+      (base64-decode t)))
 
   ;; ---- hex ------------------------------------------------------------
 

@@ -3,7 +3,7 @@
 
 (library (igropyr platform)
   (export platform-os platform-arch ensure-supported-platform!
-          load-first-shared-object!
+          load-first-shared-object! shared-object-candidates
           addrinfo-address-offset addrinfo-next-offset
           uv-stat-mode-offset uv-stat-size-offset)
   (import (chezscheme) (igropyr util))
@@ -29,6 +29,23 @@
       (assertion-violation 'igropyr
         "unsupported platform; expected Chez Scheme 10 on macOS/Linux/FreeBSD x86_64/arm64"
         (machine-type))))
+
+  ;; Filename candidates for an OpenSSL-family library, most specific first.
+  ;; Homebrew keeps openssl@3 keg-only, so its lib directory is not on the
+  ;; default search path and has to be named outright; elsewhere the soname
+  ;; carries the ABI version and the bare name is the last resort (a system
+  ;; without a -dev package often ships only the versioned file).
+  ;; Every caller needing libcrypto/libssl shares this list: a fix for one
+  ;; platform's layout must not have to be repeated per module.
+  (define (shared-object-candidates base)
+    (case platform-os
+      ((macos) (list (string-append "/opt/homebrew/opt/openssl@3/lib/" base ".3.dylib")
+                     (string-append "/usr/local/opt/openssl@3/lib/" base ".3.dylib")
+                     (string-append base ".3.dylib")
+                     (string-append base ".dylib")))
+      (else    (list (string-append base ".so.3")
+                     (string-append base ".so.1.1")
+                     (string-append base ".so")))))
 
   ;; Try names in order and report every candidate when none can be loaded.
   (define (load-first-shared-object! who candidates)
