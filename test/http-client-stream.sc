@@ -82,6 +82,18 @@
 (app-get app "/never"
   (lambda (req res)
     (sse-start! res)))
+;; Keep resetting the connection actor's idle timer until after the
+;; caller-facing total deadline, then finish so a surviving child would
+;; leave a stale reply in the caller's mailbox.
+(app-get app "/late-finish"
+  (lambda (req res)
+    (sse-start! res)
+    (spawn
+      (lambda ()
+        (do ((i 0 (+ i 1))) ((= i 30))
+          (res-write! res "x")
+          (sleep-ms 100))
+        (res-end! res)))))
 ;; counted body, streamed by the client
 (app-get app "/big" (lambda (req res) (send-text! res big-body)))
 
@@ -298,6 +310,43 @@
                         `((headers . ((,name . "attacker")))))))
                   (string-append "header is managed by the client: " name))))
       '("Host" "Connection" "Content-Length" "Transfer-Encoding"))
+    ;; Accumulating requests have a total deadline in addition to the
+    ;; connection actor's idle deadline. The timed-out actor must not later
+    ;; deliver a completed reply into the caller's mailbox.
+    (check "total-timeout"
+      (equal? (client-error-message
+                (lambda ()
+                  (http-get
+                    (string-append "http://127.0.0.1:"
+                                   (number->string port) "/late-finish")
+                    '((timeout . 200)))))
+              "request timeout"))
+    (check "total-timeout-kills-child"
+      (receive (after 1500 #t)
+        (`#(http-reply ,_ ,_) #f)))
+    ;; The stale reply above is only half the invariant; the other half is
+    ;; that timing out FREES the TLS codec. An identity codec whose close!
+    ;; counts stands in for TLS -- no OpenSSL needed -- and the plain HTTP
+    ;; server cannot tell the difference. This pins the deadline running
+    ;; inside the connection process (err! -> done!): a caller-side kill
+    ;; would strand the count at 0, because a killed process runs neither
+    ;; its winders nor its guards.
+    (let ((codec-closes (box 0)))
+      (set-https-connector!
+        (lambda (c host timeout)
+          (vector (lambda (bv) bv)
+                  (lambda (bv) bv)
+                  (lambda () (set-box! codec-closes (+ 1 (unbox codec-closes))))
+                  #f)))
+      (check "total-timeout-frees-codec"
+        (and (equal? (client-error-message
+                       (lambda ()
+                         (http-get
+                           (string-append "https://127.0.0.1:"
+                                          (number->string port) "/late-finish")
+                           '((timeout . 200)))))
+                     "request timeout")
+             (begin (sleep-ms 200) (= (unbox codec-closes) 1)))))
     ;; a non-procedure on-chunk is rejected before any connection
     (check "bad-on-chunk-rejected"
       (equal? (client-error-message

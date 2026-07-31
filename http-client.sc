@@ -358,7 +358,7 @@
   ;;   #(sclen status headers remaining)
   ;;   #(schunked status headers)
   ;;   #(seof status headers)
-  (define (client-loop c caller ref buf state timeout codec emit max-resp method)
+  (define (client-loop c caller ref buf state timeout codec emit max-resp method deadline)
     (define (done!) (when codec ((vector-ref codec 2))) (tcp-close! c))
     (define (reply! r) (send caller (vector 'http-reply ref r)) (done!))
     (define (err! msg) (send caller (vector 'http-error ref msg)) (done!))
@@ -477,18 +477,30 @@
         (else state)))                          ; 'eof mode: wait for close
     (let ((state (step state)))
       (when state
-        (receive (after timeout (err! "response timeout"))
+        ;; Two clocks, one wait: `timeout` is the idle allowance and resets
+        ;; with every arrival; `deadline` is the absolute total budget and
+        ;; never does. Whichever runs out first ends the request -- HERE, in
+        ;; the process that owns the socket and the codec, so done! always
+        ;; runs. The caller's own timer is only a backstop against this
+        ;; process wedging, and a kill from it no longer happens on the
+        ;; ordinary slow-upstream path.
+        (receive (after (if deadline
+                            (min timeout (max 0 (- deadline (now-ms))))
+                            timeout)
+                    (err! (if (and deadline (>= (now-ms) deadline))
+                              "request timeout"
+                              "response timeout")))
           (`#(tcp-data ,raw)
             (let ((bv (if codec ((vector-ref codec 1) raw) raw)))
               (if (zero? (bytevector-length bv))   ; pure TLS records, no app data
-                  (client-loop c caller ref buf state timeout codec emit max-resp method)
+                  (client-loop c caller ref buf state timeout codec emit max-resp method deadline)
                   (begin
                     (inbuf-append! buf bv)
                     ;; with streaming consumption this caps the UNPARSED
                     ;; tail (e.g. one oversized chunk), not the stream total
                     (if (> (inbuf-length buf) max-resp)
                         (err! "response too large")
-                        (client-loop c caller ref buf state timeout codec emit max-resp method))))))
+                        (client-loop c caller ref buf state timeout codec emit max-resp method deadline))))))
           (`#(tcp-eof)
             (cond
               ((and (vector? state) (eq? (vector-ref state 0) 'eof))
@@ -512,7 +524,11 @@
   ;;                                      limit) is only legal together
   ;;                                      with on-chunk -- a plain
   ;;                                      request with no deadline could
-  ;;                                      only ever hang.
+  ;;                                      only ever hang. Without
+  ;;                                      on-chunk it is also the total
+  ;;                                      budget: dns + connect + TLS +
+  ;;                                      response together answer
+  ;;                                      within timeout + 2000ms.
   ;;   (on-chunk . proc)                  streaming: body bytevectors are
   ;;                                      handed to proc as they decode;
   ;;                                      the reply's body is empty. With
@@ -555,8 +571,22 @@
                  (host-header (if (= port (if tls? default-tls-port default-port))
                                   host
                                   (string-append host ":" (number->string port))))
+                 ;; The total deadline is absolute and lives in the
+                 ;; connection process, because that is where the socket and
+                 ;; the TLS codec live: when it expires the process answers
+                 ;; err! -> done! and frees them itself. It also caps the
+                 ;; setup phases, which each kept a full setup-timeout before
+                 ;; -- dns + connect + handshake could take 3x timeout while
+                 ;; the caller's watchdog fired at timeout + 2000. Streaming
+                 ;; keeps no total deadline (documented contract), so #f.
+                 (deadline (and (not on-chunk) (+ (now-ms) timeout 2000)))
                  (pid (spawn
                         (lambda ()
+                          (define (setup-left)
+                            (if deadline
+                                (min setup-timeout
+                                     (max 0 (- deadline (now-ms))))
+                                setup-timeout))
                           (guard (e (#t (send caller
                                           (vector 'http-error ref
                                             ;; surface codec/parse errors (e.g. a TLS
@@ -569,11 +599,11 @@
                             ;; resolve the host (a dotted IP resolves to itself), then
                             ;; connect to the IP
                             (dns-resolve! host self)
-                            (receive (after setup-timeout
+                            (receive (after (setup-left)
                                         (send caller (vector 'http-error ref "dns timeout")))
                               (`#(dns-resolved ,ip)
                                 (tcp-connect! ip port self)
-                                (receive (after setup-timeout
+                                (receive (after (setup-left)
                                             (send caller (vector 'http-error ref "connect timeout"))
                                             ;; the connect is still in flight; if it
                                             ;; lands after we gave up, close it so the
@@ -590,11 +620,11 @@
                                                     (tcp-close! c)
                                                     (raise e)))
                                         (when tls?
-                                          (set! codec (https-connector c host setup-timeout)))
+                                          (set! codec (https-connector c host (setup-left))))
                                         (let ((req (build-request method host-header path headers body)))
                                           (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f))
                                         (client-loop c caller ref (make-inbuf) 'head idle codec
-                                                     on-chunk max-resp method))))
+                                                     on-chunk max-resp method deadline))))
                                   (`#(tcp-connect-failed ,e)
                                     (send caller (vector 'http-error ref (uv-strerror e))))))
                               (`#(dns-failed ,e)
@@ -610,11 +640,20 @@
             (define (release!)
               (demonitor mon)
               (receive (after 0 #f) (`#(DOWN ,@pid ,_) #t)))
-            ;; Non-streaming keeps the historical total deadline. A stream
-            ;; parks until the connection process reports -- and IT is
-            ;; bounded by the idle timeout (or, with idle 0, by its own
-            ;; guards plus the monitor), so every path still answers.
-            (receive (after (if on-chunk 'infinity (+ timeout 2000))
+            ;; The total deadline is enforced INSIDE the connection process
+            ;; (see `deadline` above), which answers http-error and cleans up
+            ;; after itself; on the ordinary timeout path this receive gets
+            ;; that message, not the after. The watchdog below fires only if
+            ;; the connection process wedged past its own deadline, and only
+            ;; then kills it -- a kill skips done!, so it must stay the last
+            ;; resort, never the mechanism. Killing an already-exited pid is
+            ;; a no-op (@kill checks alive?), so the race with a normal exit
+            ;; is benign. A stream parks until the connection process
+            ;; reports -- IT is bounded by the idle timeout (or, with idle
+            ;; 0, by its own guards plus the monitor) -- so every path
+            ;; still answers.
+            (receive (after (if on-chunk 'infinity (+ timeout 7000))
+                        (kill pid 'request-timeout)
                         (release!)
                         (raise (vector 'http-client-error "request timeout")))
               (`#(http-reply ,@ref ,resp) (release!) resp)
