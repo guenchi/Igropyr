@@ -78,6 +78,8 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/conv-cluster.sc
 "$scheme_bin" --script igropyr/test/tls.sc
 "$scheme_bin" --script igropyr/test/apple-jws.sc
+# needs the openssl CLI to mint its ephemeral RSA keys, same as tls.sc above
+"$scheme_bin" --script igropyr/test/jwks.sc
 # pbkdf2/scrypt always run; the argon2id derivations self-skip (naming what
 # is missing) on a libcrypto older than OpenSSL 3.2, which is what Debian 12
 # and Ubuntu 22.04 ship. The argon2id guard tests still run there.

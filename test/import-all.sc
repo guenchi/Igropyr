@@ -8,7 +8,7 @@
         (igropyr json) (igropyr gzip) (igropyr gen-server)
         (igropyr conversation)
         (igropyr pubsub) (igropyr express) (igropyr session) (igropyr ssr)
-        (igropyr auth) (igropyr middleware) (igropyr jwt)
+        (igropyr auth) (igropyr middleware) (igropyr jwt) (igropyr jwks)
         (igropyr metrics) (igropyr dashboard) (igropyr http-client)
         (igropyr sigv4) (igropyr s3)
         (igropyr tls)
