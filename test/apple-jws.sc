@@ -96,6 +96,22 @@
 (check "non-base64url-rejected"
   (eq? 'not-jws (err-code (lambda () (verify-jws-x5c (string-append "!" JWS)
                                                      (list test-root-der))))))
+;; ...but that one only proves the HEADER path, which is wrapped in its own
+;; guard anyway. The signature segment is decoded AFTER the chain is
+;; validated, with no guard around it, so a malformed one there is what
+;; actually tests the re-tagging: an escaping &assertion would leave the
+;; documented #(apple-jws-error CODE MSG) contract, and a caller guarding on
+;; that tag would take the raise in its request process -- turning a 401 into
+;; a retryable 5xx for a webhook. Verified load-bearing: dropping the guard
+;; in b64url->bytes trips this and nothing else.
+(check "malformed-signature-segment-stays-in-contract"
+  (eq? 'not-jws
+       (err-code (lambda ()
+                   (verify-jws-x5c
+                     (let ((d2 (let loop ((i (+ (dot1 JWS) 1)))
+                                 (if (char=? (string-ref JWS i) #\.) i (loop (+ i 1))))))
+                       (string-append (substring JWS 0 (+ d2 1)) "!!bad"))
+                     (list test-root-der))))))
 ;; not a compact JWS at all
 (check "not-a-jws-rejected"
   (eq? 'not-jws (err-code (lambda () (verify-jws-x5c "not-a-jws" (list test-root-der))))))
