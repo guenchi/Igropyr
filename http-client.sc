@@ -263,6 +263,73 @@
                       (loop (+ eol 2) (cons (cons k v) acc)))
                     (loop (+ eol 2) acc))))))))
 
+  (define (header-values headers name)
+    (let loop ((hs headers) (acc '()))
+      (cond ((null? hs) (reverse acc))
+            ((eq? (caar hs) name)
+             (loop (cdr hs) (cons (cdar hs) acc)))
+            (else (loop (cdr hs) acc)))))
+
+  (define (trim-ows s)
+    (let ((n (string-length s)))
+      (let left ((start 0))
+        (if (and (< start n) (memv (string-ref s start) '(#\space #\tab)))
+            (left (+ start 1))
+            (let right ((end n))
+              (if (and (> end start)
+                       (memv (string-ref s (- end 1)) '(#\space #\tab)))
+                  (right (- end 1))
+                  (substring s start end)))))))
+
+  ;; Expand repeated fields and comma lists into one ordered value list.
+  ;; Empty elements are retained so framing parsers can reject them.
+  (define (comma-header-values headers name)
+    (let split-fields ((fields (header-values headers name)) (acc '()))
+      (if (null? fields)
+          (reverse acc)
+          (let* ((s (car fields)) (n (string-length s)))
+            (let split-one ((start 0) (i 0) (acc acc))
+              (cond
+                ((= i n)
+                 (split-fields (cdr fields)
+                   (cons (trim-ows (substring s start i)) acc)))
+                ((char=? (string-ref s i) #\,)
+                 (split-one (+ i 1) (+ i 1)
+                   (cons (trim-ows (substring s start i)) acc)))
+                (else (split-one start (+ i 1) acc))))))))
+
+  (define (decimal-integer s)
+    (and (> (string-length s) 0)
+         (let loop ((i 0))
+           (cond ((= i (string-length s)) (string->number s))
+                 ((char<=? #\0 (string-ref s i) #\9) (loop (+ i 1)))
+                 (else #f)))))
+
+  ;; -> #f (absent) | nonnegative integer | 'bad. Repeated/comma-separated
+  ;; Content-Length values are legal only when every decimal value agrees.
+  (define (response-content-length headers)
+    (let ((values (comma-header-values headers 'content-length)))
+      (if (null? values)
+          #f
+          (let ((first (decimal-integer (car values))))
+            (if (and first (for-all (lambda (s)
+                                      (let ((n (decimal-integer s)))
+                                        (and n (= n first))))
+                                    (cdr values)))
+                first
+                'bad)))))
+
+  ;; The decoder implements only a single, final chunked transfer coding.
+  ;; Any duplicate or unsupported coding must fail instead of falling back
+  ;; to close-delimited input and disagreeing with another HTTP hop.
+  (define (response-transfer-encoding headers)
+    (let ((values (comma-header-values headers 'transfer-encoding)))
+      (cond ((null? values) #f)
+            ((and (null? (cdr values))
+                  (string-ci=? (car values) "chunked"))
+             'chunked)
+            (else 'bad))))
+
   ;; Parse the chunk-size line at offset pos (relative to the buffer
   ;; start): scan for CRLF, strip any ";ext", read the hex size. The
   ;; ONE copy of the chunked-transfer grammar -- both the accumulating
@@ -381,7 +448,9 @@
                (let* ((head (inbuf-sub buf 0 (fx+ hend 2)))
                       (sl-end (or (find-crlf head 0) hend))
                       (status (parse-status-line head sl-end))
-                      (headers (parse-headers head (+ sl-end 2) hend)))
+                      (headers (parse-headers head (+ sl-end 2) hend))
+                      (content-length (response-content-length headers))
+                      (transfer-encoding (response-transfer-encoding headers)))
                  (cond
                    ((not status) (err! "malformed status line") #f)
                    ;; a 1xx interim response (100 Continue, 103 Early Hints, ...)
@@ -392,6 +461,12 @@
                    ((and (fx>= status 100) (fx< status 200) (not (fx= status 101)))
                     (inbuf-consume! buf (fx+ hend 4))
                     (step 'head))
+                   ((eq? content-length 'bad)
+                    (err! "invalid Content-Length") #f)
+                   ((eq? transfer-encoding 'bad)
+                    (err! "invalid Transfer-Encoding") #f)
+                   ((and content-length transfer-encoding)
+                    (err! "ambiguous response framing") #f)
                    ;; HEAD, and 204/304/101, carry no body whatever the headers
                    ;; say (RFC 7230 3.3.3) -- reply now. Without this a HEAD to
                    ;; S3 would block on a Content-Length body never sent.
@@ -404,23 +479,12 @@
                     ;; works from the buffer start and stays flat
                     (when emit (inbuf-consume! buf (+ hend 4)))
                     (cond
-                      ((assq 'content-length headers)
-                       ;; a server-supplied length becomes a bytevector
-                       ;; index: anything but a nonnegative integer (a
-                       ;; negative, a decimal, an exponent) would crash
-                       ;; the connection process on the slice below
-                       (let ((len (let ((v (string->number
-                                             (cdr (assq 'content-length
-                                                        headers)))))
-                                    (if (and v (integer? v) (exact? v)
-                                             (>= v 0))
-                                        v
-                                        (fail "invalid Content-Length")))))
-                         (step (if emit
-                                   (vector 'sclen status headers len)
-                                   (vector 'clen status headers (+ hend 4) len)))))
-                      ((let ((te (assq 'transfer-encoding headers)))
-                         (and te (string-ci=? (cdr te) "chunked")))
+                      (content-length
+                       (step (if emit
+                                 (vector 'sclen status headers content-length)
+                                 (vector 'clen status headers (+ hend 4)
+                                         content-length))))
+                      (transfer-encoding
                        (step (if emit
                                  (vector 'schunked status headers)
                                  (vector 'chunked status headers (+ hend 4) '() 0))))
