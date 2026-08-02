@@ -18,11 +18,15 @@
   (export flsin flcos fltan
           v3 v3-x v3-y v3-z
           v3-add v3-sub v3-scale v3-dot v3-cross v3-normalize
+          v3-set! v3-copy! v3-add! v3-sub! v3-scale! v3-cross!
+          v3-normalize!
           m4-identity m4-mul m4-scratch! m4-transform
+          m4s-write! m4s-read m4s-identity! m4s-mul! m4s-trs!
+          m4s-tqs!
           m4-translate m4-scale m4-rotate-x m4-rotate-y m4-rotate-z
           m4-from-quat m4-perspective m4-ortho m4-look-at
           m4-inverse m4-unproject
-          m4-frustum-planes sphere-in-frustum?)
+          m4-frustum-planes sphere-in-frustum? sphere-in-frustum-xyz?)
   (import (rnrs))
 
   (define ($mat-fl v) (if (flonum? v) v (exact->inexact v)))
@@ -78,6 +82,50 @@
     (let ((n (flsqrt (v3-dot a a))))
       (vector (fl/ (v3-x a) n) (fl/ (v3-y a) n) (fl/ (v3-z a) n))))
 
+  ;; destructive variants for per-frame loops: same math, the result
+  ;; lands in dst (which may alias an operand) and dst returns, so
+  ;; chains read as before but a hot path allocates its vectors once.
+  ;; Arguments are assumed flonums -- these are the inner loop
+  (define (v3-set! dst x y z)
+    (vector-set! dst 0 ($mat-fl x))
+    (vector-set! dst 1 ($mat-fl y))
+    (vector-set! dst 2 ($mat-fl z))
+    dst)
+  (define (v3-copy! dst a)
+    (vector-set! dst 0 (v3-x a))
+    (vector-set! dst 1 (v3-y a))
+    (vector-set! dst 2 (v3-z a))
+    dst)
+  (define (v3-add! dst a b)
+    (vector-set! dst 0 (fl+ (v3-x a) (v3-x b)))
+    (vector-set! dst 1 (fl+ (v3-y a) (v3-y b)))
+    (vector-set! dst 2 (fl+ (v3-z a) (v3-z b)))
+    dst)
+  (define (v3-sub! dst a b)
+    (vector-set! dst 0 (fl- (v3-x a) (v3-x b)))
+    (vector-set! dst 1 (fl- (v3-y a) (v3-y b)))
+    (vector-set! dst 2 (fl- (v3-z a) (v3-z b)))
+    dst)
+  (define (v3-scale! dst a s)
+    (let ((s ($mat-fl s)))
+      (vector-set! dst 0 (fl* (v3-x a) s))
+      (vector-set! dst 1 (fl* (v3-y a) s))
+      (vector-set! dst 2 (fl* (v3-z a) s))
+      dst))
+  (define (v3-cross! dst a b)           ; dst must not alias a or b
+    (let ((ax (v3-x a)) (ay (v3-y a)) (az (v3-z a))
+          (bx (v3-x b)) (by (v3-y b)) (bz (v3-z b)))
+      (vector-set! dst 0 (fl- (fl* ay bz) (fl* az by)))
+      (vector-set! dst 1 (fl- (fl* az bx) (fl* ax bz)))
+      (vector-set! dst 2 (fl- (fl* ax by) (fl* ay bx)))
+      dst))
+  (define (v3-normalize! dst a)
+    (let ((n (flsqrt (v3-dot a a))))
+      (vector-set! dst 0 (fl/ (v3-x a) n))
+      (vector-set! dst 1 (fl/ (v3-y a) n))
+      (vector-set! dst 2 (fl/ (v3-z a) n))
+      dst))
+
   ;; ---- mat4, column-major: m[col*4 + row] ----
   (define (m4-identity)
     (vector 1.0 0.0 0.0 0.0  0.0 1.0 0.0 0.0
@@ -113,6 +161,106 @@
           (vector-set! m k (%mem-f32-ref (+ cbase (* k 4))))
           (out (+ k 1))))
       m))
+
+  ;; ---- staging-resident matrices: the copy tax refunded ----
+  ;; An m4s is a byte address of sixteen f32 in the linear memory.
+  ;; Chains multiply entirely in SIMD -- no boxed reads in, no boxed
+  ;; vector out -- and consumers that live in staging anyway
+  ;; (instance buffers, uniform uploads) read the bytes where they
+  ;; already are.  Convert at the edges with m4s-write!/m4s-read.
+  (define (m4s-write! at m)             ; vector -> staging
+    (let put ((k 0))
+      (when (< k 16)
+        (%mem-f32-set! (+ at (* k 4)) (vector-ref m k))
+        (put (+ k 1)))))
+
+  (define (m4s-read at)                 ; staging -> vector
+    (let ((m (make-vector 16 0.0)))
+      (let get ((k 0))
+        (when (< k 16)
+          (vector-set! m k (%mem-f32-ref (+ at (* k 4))))
+          (get (+ k 1))))
+      m))
+
+  (define (m4s-identity! at)
+    (let put ((k 0))
+      (when (< k 16)
+        (%mem-f32-set! (+ at (* k 4))
+                       (if (= 0 (remainder k 5)) 1.0 0.0))
+        (put (+ k 1)))))
+
+  ;; dst = a x b, pure SIMD: one scale and three axpys per column,
+  ;; scalars loaded straight from staging through the f64 context.
+  ;; dst must not alias a or b (the columns land as they compute)
+  (define (m4s-mul! dst a b)
+    (let col ((c 0))
+      (when (< c 4)
+        (let ((d (+ dst (* c 16)))
+              (bc (+ b (* c 16))))
+          (%f32x4-scale! d a (%mem-f32-ref bc))
+          (%f32x4-axpy! d d (+ a 16) (%mem-f32-ref (+ bc 4)))
+          (%f32x4-axpy! d d (+ a 32) (%mem-f32-ref (+ bc 8)))
+          (%f32x4-axpy! d d (+ a 48) (%mem-f32-ref (+ bc 12))))
+        (col (+ c 1)))))
+
+  ;; the whole T x Ry x Rx x Rz x S(s) composite in closed form,
+  ;; written straight into staging -- the per-object matrix every
+  ;; scene rebuilds each frame, without four constructors and three
+  ;; multiplies' worth of boxed intermediates
+  (define (m4s-trs! at px py pz rx ry rz s)
+    (let* ((s ($mat-fl s))
+           (cx (flcos ($mat-fl rx))) (sx (flsin ($mat-fl rx)))
+           (cy (flcos ($mat-fl ry))) (sy (flsin ($mat-fl ry)))
+           (cz (flcos ($mat-fl rz))) (sz (flsin ($mat-fl rz))))
+      (%mem-f32-set! at (fl* s (fl+ (fl* cy cz) (fl* sy (fl* sx sz)))))
+      (%mem-f32-set! (+ at 4) (fl* s (fl* cx sz)))
+      (%mem-f32-set! (+ at 8)
+                     (fl* s (fl+ (fl- 0.0 (fl* sy cz))
+                                 (fl* cy (fl* sx sz)))))
+      (%mem-f32-set! (+ at 12) 0.0)
+      (%mem-f32-set! (+ at 16)
+                     (fl* s (fl+ (fl- 0.0 (fl* cy sz))
+                                 (fl* sy (fl* sx cz)))))
+      (%mem-f32-set! (+ at 20) (fl* s (fl* cx cz)))
+      (%mem-f32-set! (+ at 24)
+                     (fl* s (fl+ (fl* sy sz) (fl* cy (fl* sx cz)))))
+      (%mem-f32-set! (+ at 28) 0.0)
+      (%mem-f32-set! (+ at 32) (fl* s (fl* sy cx)))
+      (%mem-f32-set! (+ at 36) (fl* s (fl- 0.0 sx)))
+      (%mem-f32-set! (+ at 40) (fl* s (fl* cy cx)))
+      (%mem-f32-set! (+ at 44) 0.0)
+      (%mem-f32-set! (+ at 48) ($mat-fl px))
+      (%mem-f32-set! (+ at 52) ($mat-fl py))
+      (%mem-f32-set! (+ at 56) ($mat-fl pz))
+      (%mem-f32-set! (+ at 60) 1.0)))
+
+  ;; T x R(quat) x S in closed form, straight into staging: the local
+  ;; matrix every skeleton node rebuilds each frame (glTF nodes carry
+  ;; translation/rotation-quaternion/scale), without a constructor
+  ;; chain's boxed intermediates.  The quaternion is assumed unit
+  (define (m4s-tqs! at tx ty tz qx qy qz qw sx sy sz)
+    (let* ((qx ($mat-fl qx)) (qy ($mat-fl qy))
+           (qz ($mat-fl qz)) (qw ($mat-fl qw))
+           (sx ($mat-fl sx)) (sy ($mat-fl sy)) (sz ($mat-fl sz))
+           (xx (fl* qx qx)) (yy (fl* qy qy)) (zz (fl* qz qz))
+           (xy (fl* qx qy)) (xz (fl* qx qz)) (yz (fl* qy qz))
+           (wx (fl* qw qx)) (wy (fl* qw qy)) (wz (fl* qw qz)))
+      (%mem-f32-set! at (fl* sx (fl- 1.0 (fl* 2.0 (fl+ yy zz)))))
+      (%mem-f32-set! (+ at 4) (fl* sx (fl* 2.0 (fl+ xy wz))))
+      (%mem-f32-set! (+ at 8) (fl* sx (fl* 2.0 (fl- xz wy))))
+      (%mem-f32-set! (+ at 12) 0.0)
+      (%mem-f32-set! (+ at 16) (fl* sy (fl* 2.0 (fl- xy wz))))
+      (%mem-f32-set! (+ at 20) (fl* sy (fl- 1.0 (fl* 2.0 (fl+ xx zz)))))
+      (%mem-f32-set! (+ at 24) (fl* sy (fl* 2.0 (fl+ yz wx))))
+      (%mem-f32-set! (+ at 28) 0.0)
+      (%mem-f32-set! (+ at 32) (fl* sz (fl* 2.0 (fl+ xz wy))))
+      (%mem-f32-set! (+ at 36) (fl* sz (fl* 2.0 (fl- yz wx))))
+      (%mem-f32-set! (+ at 40) (fl* sz (fl- 1.0 (fl* 2.0 (fl+ xx yy)))))
+      (%mem-f32-set! (+ at 44) 0.0)
+      (%mem-f32-set! (+ at 48) ($mat-fl tx))
+      (%mem-f32-set! (+ at 52) ($mat-fl ty))
+      (%mem-f32-set! (+ at 56) ($mat-fl tz))
+      (%mem-f32-set! (+ at 60) 1.0)))
 
   (define (m4-mul a b)                  ; (m4-mul a b) transforms as a after b
     (if $mat-scratch
@@ -290,17 +438,23 @@
             ($mat-plane vp 2 1.0) ($mat-plane vp 2 -1.0))) ; near far
 
   ;; #f only when the sphere is entirely outside some plane, so a
-  ;; #t is conservative -- exactly what a cull wants
-  (define (sphere-in-frustum? planes c r)
+  ;; #t is conservative -- exactly what a cull wants.  The -xyz
+  ;; spelling takes the center unboxed -- per-frame culls compute
+  ;; those scalars anyway and skip making a v3 of them
+  (define (sphere-in-frustum-xyz? planes x y z r)
     (let ((r (fl- 0.0 ($mat-fl r))))
       (let each ((i 0))
         (or (= i 6)
             (let ((p (vector-ref planes i)))
-              (and (fl<? r (fl+ (fl+ (fl+ (fl* (vector-ref p 0) (v3-x c))
-                                          (fl* (vector-ref p 1) (v3-y c)))
-                                     (fl* (vector-ref p 2) (v3-z c)))
-                                (vector-ref p 3)))
-                   (each (+ i 1))))))))
+              (let ((d (fl+ (fl+ (fl+ (fl* (vector-ref p 0) x)
+                                       (fl* (vector-ref p 1) y))
+                                  (fl* (vector-ref p 2) z))
+                             (vector-ref p 3))))
+                (and (not (fl<? d r))
+                     (each (+ i 1)))))))))
+
+  (define (sphere-in-frustum? planes c r)
+    (sphere-in-frustum-xyz? planes (v3-x c) (v3-y c) (v3-z c) r))
 
   (define (m4-look-at eye center up)
     (let* ((z (v3-normalize (v3-sub eye center)))

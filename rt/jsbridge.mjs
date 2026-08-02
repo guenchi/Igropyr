@@ -8,6 +8,33 @@ export function makeJsBridge(getExports) {
     const cbStack = [];
     const utf8Decoder = new TextDecoder();
     const utf8Encoder = new TextEncoder();
+    const localGlobals = new Map();
+    const isLocalGlobal = key => typeof key === 'string' &&
+        key.startsWith('__goeteia_');
+    let instanceGlobal;
+    // eval'd code sees `globalThis` bound to this instance's proxy, so
+    // `globalThis.__goeteia_*` resolves to per-instance state. Only the
+    // `globalThis` identifier is shadowed -- a bare unqualified
+    // `__goeteia_*` inside eval would still reach the real global, but
+    // Scheme codegen always accesses globals qualified (js-get), so it
+    // never emits that form.
+    const scopedEval = code => Function(
+        'globalThis', 'code', 'return eval(code);'
+    )(instanceGlobal, String(code));
+    instanceGlobal = new Proxy(globalThis, {
+        get(target, key) {
+            if (key === 'eval') return scopedEval;
+            if (key === '__goeteia_mem') return getExports()?.memory;
+            if (localGlobals.has(key)) return localGlobals.get(key);
+            return Reflect.get(target, key, target);
+        },
+        set(target, key, value) {
+            if (isLocalGlobal(key)) { localGlobals.set(key, value); return true; }
+            // propagate a real failure (e.g. a non-writable global) so a
+            // strict-mode assignment throws instead of silently no-op'ing
+            return Reflect.set(target, key, value, target);
+        },
+    });
     const takeName = () => {
         // Goeteia strings are UTF-8 byte arrays; decode to a real JS
         // string so non-ASCII (Γ, —, →) crosses correctly
@@ -22,11 +49,12 @@ export function makeJsBridge(getExports) {
     };
     return {
         arg_byte: b => nameBuf.push(b),
-        global: () => globalThis,
+        global: () => instanceGlobal,
         get: obj => obj[takeName()],
         set: (obj, v) => { obj[takeName()] = v; },
         push: v => argStack.push(v),
-        call: (f, thisv) => f.apply(thisv, takeArgs()),
+        call: (f, thisv) => f.apply(
+            thisv === instanceGlobal ? globalThis : thisv, takeArgs()),
         new: ctor => new ctor(...takeArgs()),
         string: () => takeName(),
         str_len: s => { staged = [...utf8Encoder.encode(String(s))]; return staged.length; },

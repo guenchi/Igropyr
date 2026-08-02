@@ -54,9 +54,13 @@
       (if (and (> i 1) (char=? (string-ref s (- i 1)) #\0))
           (loop (- i 1))
           (substring s 0 i))))
-  (define (frac->glsl f)
+  ;; a fraction's digits, leading-zero-padded to `width' (default 2)
+  ;; then trailing-zeros stripped.  Scheme drops a literal's leading
+  ;; zeros, so a third (fl) argument states the intended width: 2037
+  ;; with width 5 is the fraction 02037, i.e. .02037
+  (define (frac->glsl f width)
     (let loop ((s (number->string f)))
-      (if (< (string-length s) 2)
+      (if (< (string-length s) width)
           (loop (string-append "0" s))
           (strip-trailing-zeros s))))
 
@@ -68,10 +72,15 @@
      ((pair? e)
       (let ((h (car e)))
         (cond
-         ;; float literal: (fl 2) -> 2.0, (fl 0 50) -> 0.5, (fl 1 25) -> 1.25
+         ;; float literal: (fl 2) -> 2.0, (fl 0 50) -> 0.5,
+         ;; (fl 1 25) -> 1.25; a width (fl 0 2037 5) -> 0.02037 keeps
+         ;; leading zeros Scheme would drop
          ((eq? h 'fl)
           (string-append (number->string (cadr e)) "."
-                         (if (null? (cddr e)) "0" (frac->glsl (caddr e)))))
+                         (if (null? (cddr e)) "0"
+                             (frac->glsl (caddr e)
+                                         (if (pair? (cdddr e))
+                                             (cadddr e) 2)))))
          ;; unary minus
          ((and (eq? h '-) (null? (cddr e)))
           (string-append "(-" (expr->glsl (cadr e)) ")"))

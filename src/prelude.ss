@@ -77,15 +77,20 @@
     ($wb 105))
    ((< n 0) ($wb 45) (%display-digits (- 0 n)))
    (else (%display-digits n))))
-(define ($display-bignum b)
-  (when ($bn-neg? b) ($wb 45))
-  ($display-mag (%bignum-limbs b)))
-(define ($display-mag m)
-  (if (and (= ($mag-len m) 1) (< (vector-ref m 0) 10))
-      ($wb (+ 48 (vector-ref m 0)))
-      (let ((qr ($mag-divmod-small m 10)))
-        ($display-mag (car qr))
-        ($wb (+ 48 (cdr qr))))))
+(%target-case
+ (js
+  ;; the host prints an arbitrary-precision integer directly
+  (define ($display-bignum b) (%display-string (%big->str b) 0)))
+ (wasm
+  (define ($display-bignum b)
+    (when ($bn-neg? b) ($wb 45))
+    ($display-mag (%bignum-limbs b)))
+  (define ($display-mag m)
+    (if (and (= ($mag-len m) 1) (< (vector-ref m 0) 10))
+        ($wb (+ 48 (vector-ref m 0)))
+        (let ((qr ($mag-divmod-small m 10)))
+          ($display-mag (car qr))
+          ($wb (+ 48 (cdr qr))))))))
 (define ($display-flonum x)
   (if (not (fl=? x x))
       (%display-string "+nan.0" 0)
@@ -1027,7 +1032,22 @@
         (%make-bignum 1 (vector 0 0 2))
         (%make-bignum 1 ($bn-limbs-of (- 0 n)))))
    (else (%make-bignum 0 ($bn-limbs-of n)))))
-(define ($->bn x) (if (fixnum? x) ($fx->bn x) x))
+(%target-case
+ (js
+  ;; the integer layer rides the host's arbitrary-precision integers;
+  ;; the limb machinery above is never referenced on this target and
+  ;; DCE removes it
+  (define ($->bn x) (if (fixnum? x) (%fx->big x) x))
+  (define ($bn-add a b) (%big-norm (%big-add a b)))
+  (define ($bn-negate b) (%big-neg b))
+  (define ($bn-mul2 a b) (%big-norm (%big-mul ($->bn a) ($->bn b))))
+  (define ($bn-quot2 a b) (%big-norm (%big-quot ($->bn a) ($->bn b))))
+  (define ($bn-rem2 a b) (%big-norm (%big-rem ($->bn a) ($->bn b))))
+  (define ($bn-lt2 a b) (%big-lt ($->bn a) ($->bn b)))
+  (define ($bn-eq2 a b) (%big-eq ($->bn a) ($->bn b)))
+  (define ($bn->fl x) (%big->fl x)))
+ (wasm
+  (define ($->bn x) (if (fixnum? x) ($fx->bn x) x))))
 (define ($bn-neg? b) (= (%bignum-sign b) 1))
 
 (define ($bn-norm sign limbs)
@@ -1126,22 +1146,29 @@
             (vector-set! q i (quotient cur d))
             (loop (- i 1) (remainder cur d)))))))
 
-(define ($bn-add a b)                   ; bignum x bignum
-  (let ((sa (%bignum-sign a)) (sb (%bignum-sign b))
-        (ma (%bignum-limbs a)) (mb (%bignum-limbs b)))
-    (cond
-     ((= sa sb) ($bn-norm sa ($mag-add ma mb)))
-     ((< ($mag-cmp ma mb) 0) ($bn-norm sb ($mag-sub mb ma)))
-     (else ($bn-norm sa ($mag-sub ma mb))))))
-(define ($bn-negate b)
-  (%make-bignum (- 1 (%bignum-sign b)) (%bignum-limbs b)))
+(%target-case
+ (js)
+ (wasm
+  (define ($bn-add a b)                 ; bignum x bignum
+    (let ((sa (%bignum-sign a)) (sb (%bignum-sign b))
+          (ma (%bignum-limbs a)) (mb (%bignum-limbs b)))
+      (cond
+       ((= sa sb) ($bn-norm sa ($mag-add ma mb)))
+       ((< ($mag-cmp ma mb) 0) ($bn-norm sb ($mag-sub mb ma)))
+       (else ($bn-norm sa ($mag-sub ma mb))))))
+  (define ($bn-negate b)
+    (%make-bignum (- 1 (%bignum-sign b)) (%bignum-limbs b)))))
 
 (define ($->fl x)
   (cond
    ((flonum? x) x)
    ((fixnum? x) (fixnum->flonum x))
    ((%ratio? x) (fl/ ($->fl (%ratio-num x)) ($->fl (%ratio-den x))))
-   (else
+   (else ($bn->fl x))))
+(%target-case
+ (js)
+ (wasm
+  (define ($bn->fl x)
     (let* ((m (%bignum-limbs x))
            (base (fixnum->flonum 16384))
            (mag (let loop ((i (- ($mag-len m) 1)) (acc (fixnum->flonum 0)))
@@ -1188,7 +1215,11 @@
    ((or (%ratio? a) (%ratio? b))
     ($make-rat ($mul2 (numerator a) (numerator b))
                ($mul2 (denominator a) (denominator b))))
-   (else
+   (else ($bn-mul2 a b))))
+(%target-case
+ (js)
+ (wasm
+  (define ($bn-mul2 a b)
     (let ((ba ($->bn a)) (bb ($->bn b)))
       ($bn-norm (if (= (%bignum-sign ba) (%bignum-sign bb)) 0 1)
                 ($mag-mul (%bignum-limbs ba) (%bignum-limbs bb)))))))
@@ -1196,31 +1227,41 @@
   (cond
    ((or (flonum? a) (flonum? b))
     (fltruncate (fl/ ($->fl a) ($->fl b))))
-   ((and (%bignum? a) (fixnum? b) (< 0 b) (< b 16385))
-    (let ((qr ($mag-divmod-small (%bignum-limbs a) b)))
-      ($bn-norm (%bignum-sign a) (car qr))))
    ((and (integer? a) (integer? b))
     (when ($eq2 b 0) (errorf 'quotient "division by zero"))
-    (let* ((ba ($->bn a)) (bb ($->bn b))
-           (qr ($mag-divmod (%bignum-limbs ba) (%bignum-limbs bb))))
-      ($bn-norm (if (= (%bignum-sign ba) (%bignum-sign bb)) 0 1)
-                (car qr))))
+    ($bn-quot2 a b))
    (else (errorf 'quotient "unsupported operand combination"))))
+(%target-case
+ (js)
+ (wasm
+  (define ($bn-quot2 a b)
+    (if (and (%bignum? a) (fixnum? b) (< 0 b) (< b 16385))
+        (let ((qr ($mag-divmod-small (%bignum-limbs a) b)))
+          ($bn-norm (%bignum-sign a) (car qr)))
+        (let* ((ba ($->bn a)) (bb ($->bn b))
+               (qr ($mag-divmod (%bignum-limbs ba) (%bignum-limbs bb))))
+          ($bn-norm (if (= (%bignum-sign ba) (%bignum-sign bb)) 0 1)
+                    (car qr)))))))
 (define ($rem2 a b)
   (cond
    ((or (flonum? a) (flonum? b))
     (let ((q (fltruncate (fl/ ($->fl a) ($->fl b)))))
       (fl- ($->fl a) (fl* q ($->fl b)))))
-   ((and (%bignum? a) (fixnum? b) (< 0 b) (< b 16385))
-    (let ((r (cdr ($mag-divmod-small (%bignum-limbs a) b))))
-      (if ($bn-neg? a) (- 0 r) r)))
    ((and (integer? a) (integer? b))
     (when ($eq2 b 0) (errorf 'remainder "division by zero"))
-    (let* ((ba ($->bn a)) (bb ($->bn b))
-           (qr ($mag-divmod (%bignum-limbs ba) (%bignum-limbs bb)))
-           (r ($bn-norm 0 (cdr qr))))
-      (if ($bn-neg? ba) (- 0 r) r)))
+    ($bn-rem2 a b))
    (else (errorf 'remainder "unsupported operand combination"))))
+(%target-case
+ (js)
+ (wasm
+  (define ($bn-rem2 a b)
+    (if (and (%bignum? a) (fixnum? b) (< 0 b) (< b 16385))
+        (let ((r (cdr ($mag-divmod-small (%bignum-limbs a) b))))
+          (if ($bn-neg? a) (- 0 r) r))
+        (let* ((ba ($->bn a)) (bb ($->bn b))
+               (qr ($mag-divmod (%bignum-limbs ba) (%bignum-limbs bb)))
+               (r ($bn-norm 0 (cdr qr))))
+          (if ($bn-neg? ba) (- 0 r) r))))))
 (define ($lt2 a b)
   (cond
    ((or (%complex? a) (%complex? b))
@@ -1231,7 +1272,11 @@
     ;; denominators are positive, so cross-multiplication is safe
     ($lt2 ($mul2 (numerator a) (denominator b))
           ($mul2 (numerator b) (denominator a))))
-   (else
+   (else ($bn-lt2 a b))))
+(%target-case
+ (js)
+ (wasm
+  (define ($bn-lt2 a b)
     (let* ((ba ($->bn a)) (bb ($->bn b))
            (sa (%bignum-sign ba)) (sb (%bignum-sign bb)))
       (cond
@@ -1249,7 +1294,11 @@
    ((or (%ratio? a) (%ratio? b))
     (and ($eq2 (numerator a) (numerator b))
          ($eq2 (denominator a) (denominator b))))
-   (else
+   (else ($bn-eq2 a b))))
+(%target-case
+ (js)
+ (wasm
+  (define ($bn-eq2 a b)
     (let ((ba ($->bn a)) (bb ($->bn b)))
       (and (= (%bignum-sign ba) (%bignum-sign bb))
            (zero? ($mag-cmp (%bignum-limbs ba) (%bignum-limbs bb))))))))

@@ -3,6 +3,8 @@
 // Copyright (c) 2026 guenchi. MIT license; see LICENSE.
 
 import fs from 'fs';
+import path from 'path';
+import { pathToFileURL } from 'url';
 import { makeJsBridge, callMain } from './jsbridge.mjs';
 
 export async function runModule(bytes, input = []) {
@@ -52,15 +54,12 @@ export async function runModule(bytes, input = []) {
         js: makeJsBridge(() => exportsRef),
     });
     exportsRef = instance.exports;
-    // expose the staging memory so Scheme can build typed-array views
-    // over it through the FFI ((js-get (js-global) "__goeteia_mem"))
-    if (instance.exports.memory) globalThis.__goeteia_mem = instance.exports.memory;
     const ex = instance.exports;
     const result = decode(await callMain(ex), ex);
     // drain microtasks so promise callbacks into wasm (fetch .then
     // chains from (web rpc)) run before we report the output
     await new Promise(r => setImmediate(r));
-    return { text: Buffer.from(out).toString('latin1'), result };
+    return { text: Buffer.from(out).toString('utf8'), result };
 }
 
 export function decode(v, ex) {
@@ -76,7 +75,8 @@ export function decode(v, ex) {
     return '#<object>';
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] &&
+    import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
     const file = process.argv[2];
     if (!file) {
         console.error('usage: node run.mjs <module.wasm> [input-file]');

@@ -44,8 +44,8 @@
      ((number? v) (number->js v))
      ((string? v) (string->js v))
      ((symbol? v) (string->js (symbol->string v)))
-     ((eq? v #t) (js-eval "true"))
-     ((eq? v #f) (js-eval "false"))
+     ((eq? v #t) js-true)
+     ((eq? v #f) js-false)
      ((procedure? v) (%js-fn v))
      (else (error '->js "cannot convert to a JS value" v))))
 
@@ -89,4 +89,16 @@
   ;; (JSPI). Only legal on the main stack -- not inside a $jscb
   ;; callback re-entered from JS. Without engine support (host fell
   ;; back to the identity import) the promise comes back unawaited.
-  (define (js-await p) (%js-await p)))
+  (define (js-await p) (%js-await p))
+
+  ;; JS true/false are immutable primitives with no handle lifecycle,
+  ;; so we materialize them once here at library init -- when the
+  ;; shared argStack is quiescent -- and hand ->js the cached refs.
+  ;; Doing it lazily inside ->js would nest a js-eval (itself a
+  ;; js-call) in the middle of an outer arg-marshalling loop, pushing
+  ;; onto and draining the same argStack and shifting the caller's
+  ;; earlier arguments: (js-method cl "toggle" "active" #f) collapsed
+  ;; into eval("active"). These defines run after every procedure
+  ;; above is initialized, so js-eval is ready when they evaluate.
+  (define js-true (js-eval "true"))
+  (define js-false (js-eval "false")))

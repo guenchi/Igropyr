@@ -7,6 +7,7 @@
           remove-all-children!
           set-inner-html! inner-text set-text!
           set-attribute! set-style!
+          computed-style computed-px
           add-event-listener! console-log alert)
   (import (rnrs) (web js))
 
@@ -38,6 +39,17 @@
     (js-method el "setAttribute" name v))
   (define (set-style! el prop v)
     (js-set! (js-get el "style") prop v))
+  ;; a resolved style value: (computed-style el "fontFamily")
+  (define (computed-style el name)
+    (js->string (js-get (js-method (window) "getComputedStyle" el) name)))
+  ;; the same, parsed as pixels: "28.5px" -> 28.5; anything parseFloat
+  ;; rejects ("normal", "auto") takes the fallback
+  (define (computed-px el name fallback)
+    (let* ((v (js->number (js-call (js-get (window) "parseFloat")
+                                   (js-undefined)
+                                   (computed-style el name))))
+           (f (if (flonum? v) v (exact->inexact v))))
+      (if (fl=? f f) f fallback)))     ; NaN -> the fallback
   (define (add-event-listener! el event handler)
     (js-method el "addEventListener" event handler))
   (define (console-log x)

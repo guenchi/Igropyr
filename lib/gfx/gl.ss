@@ -37,18 +37,25 @@
           cmd-bind-target! cmd-bind-canvas! cmd-resolve!
           cmd-region! cmd-begin! cmd-flush! cmd-pos cmd-draws
           cmd-clear! cmd-use-program! cmd-bind-buffer! cmd-buffer-data!
-          cmd-vertex-attrib! cmd-uniform1f! cmd-uniform4f!
+          cmd-vertex-attrib! cmd-vertex-attrib-h!
+          cmd-uniform1f! cmd-uniform4f!
           cmd-uniform1i! cmd-uniform2f! cmd-uniform3f! cmd-uniform-matrix4!
+          cmd-uniform-matrix4s!
           cmd-bind-texture! cmd-unbind-texture!
           cmd-bind-cubemap! cmd-unbind-cubemap!
-          cmd-depth!
+          gl-texture-array! gl-texture-layer! gl-texture-layer-data!
+          cmd-bind-texture-array!
+          gl-gpu-timer! gl-gpu-ms
+          gl-compressed-family gl-texture-compressed!
+          gl-compressed-level! gl-texture-base-level!
+          cmd-depth! cmd-depth-write!
           gl-vao! cmd-bind-vao! cmd-unbind-vao!
           gl-ubo! gl-uniform-block! cmd-bind-ubo! cmd-ubo-data!
           gl-tf-program! cmd-tf-buffer! cmd-tf-begin! cmd-tf-end!
           cmd-bind-index! cmd-index-data! cmd-draw-elements!
           cmd-index-data32! cmd-draw-elements32!
           cmd-attrib-divisor! cmd-draw-elements-instanced!
-          cmd-uniform-matrices!
+          cmd-uniform-matrices! cmd-uniform-matrices4s!
           cmd-draw-arrays! cmd-viewport! cmd-blend!
           GL-POINTS GL-LINES GL-TRIANGLES GL-TRIANGLE-STRIP)
   (import (rnrs) (web js))
@@ -104,6 +111,54 @@
      "    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);"
      "    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);"
      "    slots[slot] = t; },"
+     "  compressedFamily() {"
+     "    if (gl.getExtension('WEBGL_compressed_texture_etc')"
+     "        || gl.getExtension('WEBGL_compressed_texture_etc1'))"
+     "      return 2;"
+     "    if (gl.getExtension('WEBGL_compressed_texture_s3tc')) return 1;"
+     "    return 0; },"
+     "  textureCompressed(slot, levels) {"
+     "    const t = gl.createTexture();"
+     "    gl.bindTexture(gl.TEXTURE_2D, t);"
+     "    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER,"
+     "                     levels > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);"
+     "    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);"
+     "    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);"
+     "    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);"
+     "    slots[slot] = t; },"
+     "  baseLevel(slot, l) {"
+     "    gl.bindTexture(gl.TEXTURE_2D, slots[slot]);"
+     "    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_BASE_LEVEL, l); },"
+     "  compressedLevel(slot, level, fmt, w, h, base, bytes) {"
+     "    gl.bindTexture(gl.TEXTURE_2D, slots[slot]);"
+     "    const etc1 = gl.getExtension('WEBGL_compressed_texture_etc1');"
+     "    const etc = gl.getExtension('WEBGL_compressed_texture_etc');"
+     "    const s3tc = gl.getExtension('WEBGL_compressed_texture_s3tc');"
+     "    const F = fmt === 0"
+     "      ? (etc1 ? etc1.COMPRESSED_RGB_ETC1_WEBGL"
+     "              : etc.COMPRESSED_RGB8_ETC2)"
+     "      : s3tc.COMPRESSED_RGB_S3TC_DXT1_EXT;"
+     "    gl.compressedTexImage2D(gl.TEXTURE_2D, level, F, w, h, 0,"
+     "      new Uint8Array(memory.buffer, base, bytes)); },"
+     "  textureArray(slot, w, h, layers) {"
+     "    const t = gl.createTexture();"
+     "    gl.bindTexture(gl.TEXTURE_2D_ARRAY, t);"
+     "    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, w, h, layers);"
+     "    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);"
+     "    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);"
+     "    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);"
+     "    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);"
+     "    slots[slot] = t; },"
+     "  textureLayer(slot, layer, src) {"
+     "    gl.bindTexture(gl.TEXTURE_2D_ARRAY, slots[slot]);"
+     "    gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, layer,"
+     "                     src.width, src.height, 1,"
+     "                     gl.RGBA, gl.UNSIGNED_BYTE, src); },"
+     "  textureLayerData(slot, layer, w, h, base) {"
+     "    gl.bindTexture(gl.TEXTURE_2D_ARRAY, slots[slot]);"
+     "    gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, layer, w, h, 1,"
+     "                     gl.RGBA, gl.UNSIGNED_BYTE,"
+     "                     new Uint8Array(memory.buffer, base, w * h * 4)); },"
      "  target(slot, tslot, w, h, mode) {"        ; 0 rgba8, 1 depth, 2 rgba16f
      "    const depthOnly = mode === 1;"
      "    const t = gl.createTexture();"
@@ -287,9 +342,19 @@
      "    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);"
      "    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);"
      "    slots[slot] = t; },"
+     "  gpuTimer() {"
+     "    this.__tq = gl.getExtension('EXT_disjoint_timer_query_webgl2');"
+     "    this.__tqPool = []; this.__tqPending = []; this.__tqMs = -1;"
+     "    return this.__tq ? 1 : 0; },"
+     "  gpuMs() { return this.__tqMs === undefined ? -1 : this.__tqMs; },"
      "  replay(base, end) {"
      "    const u = new Uint32Array(memory.buffer);"
      "    const f = new Float32Array(memory.buffer);"
+     "    const tq = this.__tq; let tquery = null;"
+     "    if (tq) {"
+     "      tquery = this.__tqPool.pop() || gl.createQuery();"
+     "      gl.beginQuery(tq.TIME_ELAPSED_EXT, tquery);"
+     "    }"
      "    let p = base >> 2; const stop = end >> 2;"
      "    while (p < stop) switch (u[p++]) {"
      "     case 1: gl.clearColor(f[p], f[p+1], f[p+2], f[p+3]); p += 4;"
@@ -322,6 +387,7 @@
      "                f.subarray(p + 1, p + 17)); p += 17; break;"
      "     case 15: if (u[p] === 1) gl.enable(gl.DEPTH_TEST);"
      "              else gl.disable(gl.DEPTH_TEST); p += 1; break;"
+     "     case 42: gl.depthMask(u[p] === 1); p += 1; break;"
      "     case 16: gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, slots[u[p]]);"
      "              p += 1; break;"
      "     case 17: gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,"
@@ -377,6 +443,20 @@
      "              gl.bufferSubData(gl.UNIFORM_BUFFER, 0,"
      "                new Uint8Array(memory.buffer, u[p+1], u[p+2]));"
      "              p += 3; break;"
+     "     case 38: gl.uniformMatrix4fv(slots[u[p]], false,"
+     "                new Float32Array(memory.buffer, u[p+1], 16));"
+     "              p += 2; break;"
+     "     case 39: gl.uniformMatrix4fv(slots[u[p]], false,"
+     "                new Float32Array(memory.buffer, u[p+1], u[p+2] * 16));"
+     "              p += 3; break;"
+     "     case 40: gl.enableVertexAttribArray(u[p]);"
+     "              gl.vertexAttribPointer(u[p], u[p+1], gl.HALF_FLOAT,"
+     "                                     false, u[p+2], u[p+3]);"
+     "              if (gl.vertexAttribDivisor) gl.vertexAttribDivisor(u[p], 0);"
+     "              p += 4; break;"
+     "     case 41: gl.activeTexture(gl.TEXTURE0 + u[p]);"
+     "              gl.bindTexture(gl.TEXTURE_2D_ARRAY, slots[u[p+1]]);"
+     "              p += 2; break;"
      "     case 26: gl.bindFramebuffer(gl.READ_FRAMEBUFFER, slots[u[p]]);"
      "              gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, slots[u[p+1]]);"
      "              gl.blitFramebuffer(0, 0, u[p+2], u[p+3],"
@@ -385,6 +465,16 @@
      "              gl.bindFramebuffer(gl.FRAMEBUFFER, null);"
      "              p += 4; break;"
      "     default: throw new Error('bad gl opcode');"
+     "    }"
+     "    if (tquery) {"
+     "      gl.endQuery(tq.TIME_ELAPSED_EXT);"
+     "      this.__tqPending.push(tquery);"
+     "      const h = this.__tqPending[0];"
+     "      if (gl.getQueryParameter(h, gl.QUERY_RESULT_AVAILABLE)) {"
+     "        if (!gl.getParameter(tq.GPU_DISJOINT_EXT))"
+     "          this.__tqMs = gl.getQueryParameter(h, gl.QUERY_RESULT) / 1e6;"
+     "        this.__tqPool.push(this.__tqPending.shift());"
+     "      }"
      "    } } }; };"))
 
   (define $gl #f)                       ; the replayer handle
@@ -459,6 +549,43 @@
   ;; raw RGBA bytes out of the staging memory -- procedural textures
   (define (gl-texture-data! slot base w h)
     (js-method $gl "textureData" slot base w h))
+  ;; compressed textures: which block families does this context
+  ;; speak?  2 = ETC2/ETC1 (mobile, ANGLE), 1 = S3TC/BC (desktop),
+  ;; 0 = neither -- transcode to RGBA then.  Upload straight from
+  ;; staging bytes with explicit mip levels (compressed textures
+  ;; cannot generateMipmap; ship the chain)
+  (define (gl-compressed-family)
+    (js->number (js-method $gl "compressedFamily")))
+  (define (gl-texture-compressed! slot levels)
+    (js-method $gl "textureCompressed" slot levels))
+  ;; fmt: 0 = ETC1 RGB, 1 = BC1 RGB
+  (define (gl-compressed-level! slot level fmt w h base bytes)
+    (js-method $gl "compressedLevel" slot level fmt w h base bytes))
+  ;; the streaming knob: while only levels >= l have arrived, the
+  ;; texture is complete from base level l -- drop it as bigger
+  ;; mips land
+  (define (gl-texture-base-level! slot l)
+    (js-method $gl "baseLevel" slot l))
+
+  ;; GPU frame time (webgl2 + EXT_disjoint_timer_query_webgl2): turn
+  ;; the timer on once and every replay wraps itself in a TIME_ELAPSED
+  ;; query; results surface a few frames later through gl-gpu-ms
+  ;; (-1.0 until the first result, and gl-gpu-timer! answers #f when
+  ;; the extension is missing -- hide the readout then)
+  (define (gl-gpu-timer!)
+    (= 1 (js->number (js-method $gl "gpuTimer"))))
+  (define (gl-gpu-ms)
+    (let ((v (js->number (js-method $gl "gpuMs"))))
+      (if (flonum? v) v (exact->inexact v))))
+  ;; a texture array (webgl2): many same-size images behind ONE bind,
+  ;; the shader picks a layer -- sampler2DArray + texture(u, vec3(uv,
+  ;; layer)), and a layer index rides an instance attribute for free
+  (define (gl-texture-array! slot w h layers)
+    (js-method $gl "textureArray" slot w h layers))
+  (define (gl-texture-layer! slot layer src)
+    (js-method $gl "textureLayer" slot layer src))
+  (define (gl-texture-layer-data! slot layer w h base)
+    (js-method $gl "textureLayerData" slot layer w h base))
   ;; a cube map from six dim*dim RGBA faces laid out consecutively at
   ;; base, in +x -x +y -y +z -z order
   (define (gl-cubemap! slot base dim)
@@ -478,12 +605,20 @@
   ;; ---- the encoder: words into the staging memory ----
   (define $base 0)
   (define $p 0)
+  (define $limit #f)
   (define $draw-count 0)                ; draws encoded this frame
-  (define (cmd-region! base) (set! $base base))
+  (define (cmd-region! base . limit)
+    (set! $base base)
+    (set! $limit (and (pair? limit) (car limit)))
+    (when (and $limit (< $limit $base))
+      (error 'cmd-region! "limit precedes command base" $limit)))
   (define (cmd-begin!) (set! $p $base) (set! $draw-count 0))
   (define ($draw!) (set! $draw-count (+ $draw-count 1)))
-  (define (u! v) (%mem-i32-set! $p v) (set! $p (+ $p 4)))
-  (define (f! v) (%mem-f32-set! $p v) (set! $p (+ $p 4)))
+  (define ($word!)
+    (when (and $limit (> (+ $p 4) $limit))
+      (error 'cmd-region! "command region overflow" $p)))
+  (define (u! v) ($word!) (%mem-i32-set! $p v) (set! $p (+ $p 4)))
+  (define (f! v) ($word!) (%mem-f32-set! $p v) (set! $p (+ $p 4)))
 
   (define (cmd-clear! r g b a) (u! 1) (f! r) (f! g) (f! b) (f! a))
   (define (cmd-use-program! slot) (u! 2) (u! slot))
@@ -491,6 +626,11 @@
   (define (cmd-buffer-data! offset bytes) (u! 4) (u! offset) (u! bytes))
   (define (cmd-vertex-attrib! loc size stride offset)
     (u! 5) (u! loc) (u! size) (u! stride) (u! offset))
+  ;; the HALF_FLOAT spelling: same wiring, two bytes a component --
+  ;; vertex data written by mesh-write-f16! draws at half the
+  ;; bandwidth and the GPU converts on fetch
+  (define (cmd-vertex-attrib-h! loc size stride offset)
+    (u! 40) (u! loc) (u! size) (u! stride) (u! offset))
   (define (cmd-uniform1f! slot x) (u! 6) (u! slot) (f! x))
   (define (cmd-uniform4f! slot x y z w)
     (u! 7) (u! slot) (f! x) (f! y) (f! z) (f! w))
@@ -498,6 +638,7 @@
     ($draw!) (u! 8) (u! mode) (u! first) (u! count))
   (define (cmd-bind-texture! unit slot) (u! 11) (u! unit) (u! slot))
   (define (cmd-bind-cubemap! unit slot) (u! 25) (u! unit) (u! slot))
+  (define (cmd-bind-texture-array! unit slot) (u! 41) (u! unit) (u! slot))
   ;; unbind before rendering into a cube target's faces: a cube map
   ;; both attached and bound for sampling is a feedback loop, and
   ;; ANGLE (Chrome) rejects every draw of it
@@ -527,7 +668,16 @@
       (when (< i 16)
         (f! (vector-ref m i))
         (loop (+ i 1)))))
+  ;; the m4s twin: the matrix already lives in staging at `at`, so
+  ;; the command carries its ADDRESS and the replayer reads the
+  ;; sixteen floats in place -- three words instead of eighteen
+  (define (cmd-uniform-matrix4s! slot at)
+    (u! 38) (u! slot) (u! at))
   (define (cmd-depth! on?) (u! 15) (u! (if on? 1 0)))
+  ;; the depth WRITE mask, independent of the test: translucent
+  ;; passes keep the test (occluded by opaque) but stop writing (so
+  ;; blended fragments don't occlude each other)
+  (define (cmd-depth-write! on?) (u! 42) (u! (if on? 1 0)))
   ;; indexed meshes: a buffer slot bound as the element array, u16
   ;; indices uploaded from the staging memory, one drawElements
   (define (cmd-bind-index! slot) (u! 16) (u! slot))
@@ -560,6 +710,10 @@
               (f! (vector-ref m i))
               (mat (+ i 1)))))
         (each (+ k 1)))))
+  ;; the staging-resident flavor: n matrices already lying at `at`
+  ;; upload in three words -- the replayer reads them in place
+  (define (cmd-uniform-matrices4s! slot at n)
+    (u! 39) (u! slot) (u! at) (u! n))
   (define (cmd-pos) $p)                 ; for overflow checks by callers
   (define (cmd-draws) $draw-count)      ; and HUDs counting the frame
   (define (cmd-viewport! x y w h) (u! 9) (u! x) (u! y) (u! w) (u! h))

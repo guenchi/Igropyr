@@ -32,8 +32,19 @@
 ;;
 ;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
 (library (web css)
-  (export css->string num->css)
+  (export css->string num->css palette->root)
   (import (rnrs))
+
+  ;; a palette alist ((name value) ...) as a :root rule of custom
+  ;; properties -- one binding names a colour for Scheme AND css:
+  ;;   (palette->root '((ink "#14203a"))) -> (:root (--ink "#14203a"))
+  (define (palette->root palette)
+    (cons ':root
+          (map (lambda (p)
+                 (list (string->symbol
+                        (string-append "--" (symbol->string (car p))))
+                       (cadr p)))
+               palette)))
 
   (define (join parts sep)
     (cond

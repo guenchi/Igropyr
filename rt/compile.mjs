@@ -33,18 +33,27 @@ function topLevelSpans(text) {
 // a minimal sexpr reader for import clauses: symbols and nesting
 function parseSexpr(text) {
     let i = 0;
-    function skip() { while (i < text.length && /[\s]/.test(text[i])) i++; }
+    function skip() {
+        for (;;) {
+            while (i < text.length && /[\s]/.test(text[i])) i++;
+            if (text[i] !== ';') return;
+            while (i < text.length && text[i] !== '\n') i++;
+        }
+    }
     function one() {
         skip();
         if (text[i] === '(') {
             i++;
             const items = [];
-            for (skip(); text[i] !== ')'; skip()) items.push(one());
+            for (skip(); i < text.length && text[i] !== ')'; skip())
+                items.push(one());
+            if (i >= text.length) throw new Error('unterminated import clause');
             i++;
             return items;
         }
         const start = i;
-        while (i < text.length && !/[\s()]/.test(text[i])) i++;
+        while (i < text.length && !/[\s();]/.test(text[i])) i++;
+        if (i === start) throw new Error('invalid import clause');
         return text.slice(start, i);
     }
     return one();
@@ -99,6 +108,138 @@ function lineAt(text, idx) {
     return n;
 }
 
+// outermost mount points, lexically (same string / comment /
+// char-literal awareness as topLevelSpans); each is an independent
+// import scope resolved separately below.  The define- family are
+// mount points too -- keep this list in step with the chez driver's,
+// or an import inside a define-wasm body resolves on one host only
+const $mountHeads = /^\(\s*(?:conjure|define-js|define-wasm|define-wasm-js)[\s(]/;
+
+// Skip a complete quoted datum without disturbing the surrounding
+// parenthesis depth: mount-shaped data must never become an import scope.
+function listDatumEnd(text, open) {
+    let depth = 0;
+    for (let i = open; i < text.length; i++) {
+        const c = text[i];
+        if (c === ';') { while (i < text.length && text[i] !== '\n') i++; continue; }
+        if (c === '"') { i++; while (i < text.length && text[i] !== '"') { if (text[i] === '\\') i++; i++; } continue; }
+        if (c === '#' && text[i + 1] === '\\') { i += 2; continue; }
+        if (c === '(') depth++;
+        else if (c === ')' && --depth === 0) return i + 1;
+    }
+    return text.length;
+}
+
+function datumEnd(text, at) {
+    let i = at;
+    for (;;) {
+        while (i < text.length && /[\s]/.test(text[i])) i++;
+        if (text[i] !== ';') break;
+        while (i < text.length && text[i] !== '\n') i++;
+    }
+    if (i >= text.length) return i;
+    if (text[i] === '\'' || text[i] === '`') return datumEnd(text, i + 1);
+    if (text[i] === ',') return datumEnd(text, i + (text[i + 1] === '@' ? 2 : 1));
+    if (text[i] === '"') {
+        for (i++; i < text.length && text[i] !== '"'; i++)
+            if (text[i] === '\\') i++;
+        return Math.min(i + 1, text.length);
+    }
+    if (text[i] === '#' && text[i + 1] === '\\') {
+        i += 2;
+        if (i < text.length && /[\s()]/.test(text[i])) return i + 1;
+        while (i < text.length && !/[\s();]/.test(text[i])) i++;
+        return i;
+    }
+    if (text[i] === '(') return listDatumEnd(text, i);
+    if (text.startsWith('#(', i)) return listDatumEnd(text, i + 1);
+    if (text.startsWith('#vu8(', i)) return listDatumEnd(text, i + 4);
+    while (i < text.length && !/[\s();]/.test(text[i])) i++;
+    return i;
+}
+
+function embedBlocks(text) {
+    const blocks = [];
+    let depth = 0, embedStart = -1, embedDepth = 0;
+    // quasiquote suspends mounting by nesting depth and unquote
+    // resumes it, mirroring the compiler's embed-expand: a mount head
+    // is data under ` and a mount point again under , -- qqAt[d] is
+    // the quasiquote depth entered at paren depth d
+    let qq = 0;
+    const qqAt = [];
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === ';') { while (i < text.length && text[i] !== '\n') i++; continue; }
+        if (c === '"') { i++; while (i < text.length && text[i] !== '"') { if (text[i] === '\\') i++; i++; } continue; }
+        if (c === '#' && text[i + 1] === '\\') { i += 2; continue; }
+        if (c === '\'') { i = datumEnd(text, i + 1) - 1; continue; }
+        if (c === '`') { qq++; qqAt.push([depth, +1]); continue; }
+        if (c === ',' && qq > 0) {
+            qq--; qqAt.push([depth, -1]);
+            if (text[i + 1] === '@') i++;
+            continue;
+        }
+        if (c === '(') {
+            if (/^\(\s*quote[\s(]/.test(text.slice(i, i + 16))) {
+                i = datumEnd(text, i) - 1;
+                continue;
+            }
+            if (/^\(\s*quasiquote[\s(]/.test(text.slice(i, i + 20))) {
+                qq++; qqAt.push([depth, +1]);
+            } else if (qq > 0
+                       && /^\(\s*unquote(-splicing)?[\s(]/.test(text.slice(i, i + 22))) {
+                qq--; qqAt.push([depth, -1]);
+            }
+            if (qq === 0 && embedStart < 0
+                && $mountHeads.test(text.slice(i, i + 24))) {
+                embedStart = i; embedDepth = depth;
+            }
+            depth++;
+        } else if (c === ')') {
+            depth--;
+            // a reader-macro prefix binds to the next datum, so any
+            // shift recorded at this depth expires with the list
+            while (qqAt.length && qqAt[qqAt.length - 1][0] >= depth) {
+                qq -= qqAt.pop()[1];
+            }
+            if (embedStart >= 0 && depth === embedDepth) {
+                blocks.push([embedStart, i + 1]);
+                embedStart = -1;
+            }
+        }
+    }
+    return blocks;
+}
+
+// resolve the imports inside each outermost embed block, each in a
+// fresh scope: the embed compiles as an independent unit, so the
+// host's already-spliced libraries must not deduplicate its own
+function resolveEmbedImports(text, dirs, file) {
+    let result = '', at = 0;
+    for (const [start, end] of embedBlocks(text)) {
+        const block = text.slice(start, end);
+        const head = block.match(/^\(\s*([a-z-]+)/)[1];
+        const open = block.indexOf(head) + head.length;
+        const inner = block.slice(open, block.length - 1);
+        result += text.slice(at, start);
+        // leave the block untouched unless it actually imports (or
+        // nests another block that might): quoted data that merely
+        // LOOKS like a mount point -- the compiler's own sources
+        // hold such tables -- must pass through byte-for-byte, or
+        // self-compilation loses its fixed point
+        const needsWork = embedBlocks(inner).length > 0
+            || topLevelSpans(inner).some(([s2, e2]) =>
+                /^\(\s*import[\s)]/.test(inner.slice(s2, e2)));
+        result += needsWork
+            ? '(' + head
+              + resolveImports(resolveEmbedImports(inner, dirs, file),
+                               dirs, new Set(), file + ':embed') + ')'
+            : block;
+        at = end;
+    }
+    return result + text.slice(at);
+}
+
 function resolveImports(text, dirs, visited = new Set(), file = 'input') {
     // replace top-level (import ...) spans with the inlined
     // libraries; every other byte passes through untouched
@@ -128,7 +269,11 @@ function loadLibrary(spec, dirs, visited) {
     for (const d of dirs) {
         const p = path.join(d, ...spec) + '.ss';
         if (fs.existsSync(p)) {
-            const text = fs.readFileSync(p, 'latin1');
+            // a library body may itself hold mount points, whose
+            // imports resolve in their own scope (the chez driver
+            // walks library forms the same way)
+            const text = resolveEmbedImports(fs.readFileSync(p, 'latin1'),
+                                             dirs, p);
             const deps = libraryImports(text)
                 .map(s => loadLibrary(specTarget(s), dirs, visited)
                           + '\n' + specAliases(s))
@@ -139,6 +284,31 @@ function loadLibrary(spec, dirs, visited) {
     throw new Error(`library not found: (${spec.join(' ')})`);
 }
 
+
+// the runtime glue a default conjure section inlines: jsbridge +
+// web.mjs with the module plumbing stripped, non-ASCII normalized
+// (both drivers must produce the identical string)
+let conjureGlueCache = null;
+function conjureGlue() {
+    if (conjureGlueCache !== null) return conjureGlueCache;
+    const strip = t => t.split('\n')
+        .filter(l => !/^\s*import\s.*jsbridge/.test(l))
+        .join('\n')
+        .replace(/^export /gm, '');
+    const clean = t => {
+        let r = '';
+        for (const ch of t) r += ch.charCodeAt(0) > 126 ? ' ' : ch;
+        return r;
+    };
+    const jb = fs.readFileSync(path.join(here, 'jsbridge.mjs'), 'latin1');
+    const wb = fs.readFileSync(path.join(here, 'web.mjs'), 'latin1');
+    conjureGlueCache = clean(strip(jb) + '\n' + strip(wb));
+    return conjureGlueCache;
+}
+function conjureGlueDirective() {
+    const esc = conjureGlue().replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    return '(%conjure-rt "' + esc + '")\n';
+}
 // the bundled self-hosted compiler, shipped at the package root
 const defaultCompiler = path.join(here, '../goeteia.wasm');
 
@@ -172,15 +342,22 @@ async function runCompiler(input, compilerWasm) {
 // Compile a source file to wasm bytes.  Resolves (import ...) forms
 // against the source directory, its lib/, and the bundled lib/, then
 // prepends the prelude and feeds the whole stream to the compiler.
-export async function compileToBytes(sourceFile, { compilerWasm = defaultCompiler } = {}) {
+// script: true compiles at -O0 -- the optimization passes stand
+// down, for callers who compile on every keystroke.
+export async function compileToBytes(sourceFile,
+    { compilerWasm = defaultCompiler, script = false, target = null } = {}) {
     const inDir = path.dirname(path.resolve(sourceFile));
     const dirs = [inDir, path.join(inDir, 'lib'), path.join(here, '../lib')];
     const preludePath = path.join(here, '../src/prelude.ss');
     const prelude = fs.readFileSync(preludePath, 'latin1');
-    const source = resolveImports(fs.readFileSync(sourceFile, 'latin1'),
-                                  dirs, new Set(), sourceFile);
-    const input = Buffer.from(locMark(preludePath, 1) + prelude
-                              + '\n' + source, 'latin1');
+    const source = resolveImports(
+        resolveEmbedImports(fs.readFileSync(sourceFile, 'latin1'),
+                            dirs, sourceFile),
+        dirs, new Set(), sourceFile);
+    const input = Buffer.from((target ? `(%target ${target})\n` : '')
+                              + (script ? '(%opt 0)\n' : '')
+                              + locMark(preludePath, 1) + prelude
+                              + '\n' + conjureGlueDirective() + '(%prelude-end)\n' + source, 'latin1');
     return runCompiler(input, compilerWasm);
 }
 
@@ -188,15 +365,18 @@ export async function compileToBytes(sourceFile, { compilerWasm = defaultCompile
 // resolve against baseDir, its lib/, and the bundled lib/.
 export async function compileSource(text,
     { baseDir = process.cwd(), compilerWasm = defaultCompiler,
-      name = 'repl' } = {}) {
+      name = 'repl', script = false, target = null } = {}) {
     const dirs = [baseDir, path.join(baseDir, 'lib'), path.join(here, '../lib')];
     const preludePath = path.join(here, '../src/prelude.ss');
     const prelude = fs.readFileSync(preludePath, 'latin1');
     // utf-8 text to one-byte-per-char, matching the byte reader
     const raw = Buffer.from(text, 'utf8').toString('latin1');
-    const source = resolveImports(raw, dirs, new Set(), name);
-    const input = Buffer.from(locMark(preludePath, 1) + prelude
-                              + '\n' + source, 'latin1');
+    const source = resolveImports(resolveEmbedImports(raw, dirs, name),
+                                  dirs, new Set(), name);
+    const input = Buffer.from((target ? `(%target ${target})\n` : '')
+                              + (script ? '(%opt 0)\n' : '')
+                              + locMark(preludePath, 1) + prelude
+                              + '\n' + conjureGlueDirective() + '(%prelude-end)\n' + source, 'latin1');
     return runCompiler(input, compilerWasm);
 }
 
@@ -206,18 +386,26 @@ export async function compileFile(sourceFile, outFile, opts = {}) {
 }
 
 async function main() {
-    const args = process.argv.slice(2);
+    const argv = process.argv.slice(2);
+    // --script / -O0: compile without the optimization passes
+    const script = argv.some(a => a === '--script' || a === '-O0');
+    // --js: emit a JavaScript module instead of wasm
+    const js = argv.some(a => a === '--js');
+    const args = argv.filter(a => a !== '--script' && a !== '-O0'
+                                  && a !== '--js');
     // legacy form: compile.mjs <compiler.wasm> <input.ss> <output.wasm>
     // new form:    compile.mjs <input.ss> <output.wasm>  (bundled compiler)
     let compilerWasm, sourceFile, outFile;
     if (args.length >= 3) [compilerWasm, sourceFile, outFile] = args;
     else [sourceFile, outFile] = args;
     if (!sourceFile || !outFile) {
-        console.error('usage: node compile.mjs [<compiler.wasm>] <input.ss> <output.wasm>');
+        console.error('usage: node compile.mjs [--script] [--js] [<compiler.wasm>] <input.ss> <output.wasm|.js>');
         process.exit(1);
     }
     try {
-        await compileFile(sourceFile, outFile, compilerWasm ? { compilerWasm } : {});
+        await compileFile(sourceFile, outFile,
+                          { ...(compilerWasm ? { compilerWasm } : {}), script,
+                            ...(js ? { target: 'js' } : {}) });
     } catch (e) {
         if (e.output) process.stderr.write(e.output);
         console.error(`\n${e.message}`);
@@ -225,4 +413,5 @@ async function main() {
     }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) main();
+if (process.argv[1] &&
+    import.meta.url === url.pathToFileURL(path.resolve(process.argv[1])).href) main();
