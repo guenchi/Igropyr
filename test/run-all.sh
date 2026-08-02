@@ -37,6 +37,7 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/metrics.sc
 "$scheme_bin" --script igropyr/test/dashboard.sc
 "$scheme_bin" --script igropyr/test/auth.sc
+"$scheme_bin" --script igropyr/test/ws-client-request.sc
 # session id rotation: the header-publication contract (no timing), and the
 # race it exists to survive (a concurrent responder claiming the same token)
 "$scheme_bin" --script igropyr/test/response-header-claim.sc
@@ -55,7 +56,6 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # cookie attribute injection, HTTP/1.0 framing, slowloris deadline
 "$scheme_bin" --script igropyr/test/protocol-hardening.sc
 "$scheme_bin" --script igropyr/test/http-client-stream.sc
-"$scheme_bin" --script igropyr/test/ws-client-request.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
 # RESP parsing, both against a fake server so neither needs a live redis:
 # the same value at every split offset, and a fragmented reply parsed in
