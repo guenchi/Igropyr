@@ -119,8 +119,9 @@
         (tcp-read-start! c)))
     0))
 
-;; raw server answering with a NEGATIVE chunk size: both decoders must
-;; reject it as a bad chunked response, not misframe the stream or spin
+;; raw server answering with malformed chunk framing: both decoders must
+;; reject a negative size, and the streaming decoder must reject a bad data
+;; delimiter before exposing that chunk to its caller.
 (define (start-badchunk-server!)
   (tcp-listen! "0.0.0.0" bad-port 16
     (lambda (c)
@@ -128,11 +129,14 @@
                    (lambda ()
                      (receive
                        (`#(tcp-data ,bv)
-                         (tcp-write! c (string->utf8
-                                         (string-append
-                                           "HTTP/1.1 200 OK\r\n"
-                                           "Transfer-Encoding: chunked\r\n\r\n"
-                                           "-2\r\nxx\r\n0\r\n\r\n")) #f)
+                         (let ((req (guard (e (#t "")) (utf8->string bv))))
+                           (tcp-write! c (string->utf8
+                                           (string-append
+                                             "HTTP/1.1 200 OK\r\n"
+                                             "Transfer-Encoding: chunked\r\n\r\n"
+                                             (if (str-has? req " /separator ")
+                                                 "3\r\nabcXX0\r\n\r\n"
+                                                 "-2\r\nxx\r\n0\r\n\r\n"))) #f))
                          (sleep-ms 200)
                          (tcp-close! c))
                        (`#(tcp-eof) (tcp-close! c))
@@ -383,6 +387,17 @@
                 (lambda ()
                   (http-get (string-append "http://127.0.0.1:" (number->string bad-port) "/"))))
               "bad chunked response"))
+
+    (let-values (((b collect) (collector)))
+      (check "bad-chunk-separator-stream"
+        (equal? (client-error-message
+                  (lambda ()
+                    (http-get
+                      (string-append "http://127.0.0.1:"
+                                     (number->string bad-port) "/separator")
+                      `((on-chunk . ,collect)))))
+                "bad chunked response"))
+      (check "bad-chunk-not-emitted" (null? (collected b))))
 
     ;; a crashing handler surfaces as a typed client error, not a hang
     (check "handler-crash"
