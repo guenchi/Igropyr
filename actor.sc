@@ -134,32 +134,35 @@
   ;; process registry: names survive restarts, pids don't. A dead
   ;; process is unregistered automatically (see @kill).
   (define name->pid (make-eq-hashtable))
-  (define pid->name (make-eq-hashtable))
+  ;; A name has one owner, but a process may intentionally expose several
+  ;; names (conversation routing does this), so the reverse side is a list.
+  (define pid->names (make-eq-hashtable))
+
+  (define (remove-pid-name! pid name)
+    (let ((remaining (remq name (hashtable-ref pid->names pid '()))))
+      (if (null? remaining)
+          (hashtable-delete! pid->names pid)
+          (hashtable-set! pid->names pid remaining))))
 
   (define (register name pid)
     (no-interrupts
-      ;; Keep the two tables a one-to-one map when either side is rebound.
-      ;; Otherwise replacing name's pid leaves the old pid->name entry
-      ;; behind; when that old process later dies, @kill follows the stale
-      ;; reverse entry and deletes the NEW name->pid registration.
-      (let ((old-pid (hashtable-ref name->pid name #f))
-            (old-name (hashtable-ref pid->name pid #f)))
-        (when old-pid
-          (when (eq? (hashtable-ref pid->name old-pid #f) name)
-            (hashtable-delete! pid->name old-pid)))
-        (when old-name
-          (when (eq? (hashtable-ref name->pid old-name #f) pid)
-            (hashtable-delete! name->pid old-name))))
+      ;; Rebinding a NAME must also detach it from the displaced process.
+      ;; Otherwise that process's later @kill follows a stale reverse entry
+      ;; and deletes the replacement registration.
+      (let ((old-pid (hashtable-ref name->pid name #f)))
+        (when (and old-pid (not (eq? old-pid pid)))
+          (remove-pid-name! old-pid name)))
       (hashtable-set! name->pid name pid)
-      (hashtable-set! pid->name pid name))
+      (let ((names (hashtable-ref pid->names pid '())))
+        (unless (memq name names)
+          (hashtable-set! pid->names pid (cons name names)))))
     pid)
 
   (define (unregister name)
     (no-interrupts
       (let ((p (hashtable-ref name->pid name #f)))
         (hashtable-delete! name->pid name)
-        (when (and p (eq? (hashtable-ref pid->name p #f) name))
-          (hashtable-delete! pid->name p)))))
+        (when p (remove-pid-name! p name)))))
 
   ;; guarded like register/unregister: hashtable-ref is preemptible, and
   ;; a concurrent register that grows the table can relink the chain
@@ -509,13 +512,15 @@
       ;; release I/O resources the dead process can no longer close
       ;; itself (its winders do not run -- see the note above)
       (uv-owner-died! p)
-      ;; drop the registered name, if any
-      (let ((nm (hashtable-ref pid->name p #f)))
-        (when nm
-          ;; A stale reverse mapping must never erase a newer binding.
-          (when (eq? (hashtable-ref name->pid nm #f) p)
-            (hashtable-delete! name->pid nm))
-          (hashtable-delete! pid->name p)))
+      ;; drop every registered alias still owned by this process
+      (let ((names (hashtable-ref pid->names p '())))
+        (for-each
+          (lambda (name)
+            ;; A stale reverse entry must never erase a newer binding.
+            (when (eq? (hashtable-ref name->pid name #f) p)
+              (hashtable-delete! name->pid name)))
+          names)
+        (hashtable-delete! pid->names p))
       ;; notify/cascade links
       (let ((links (pcb-links p)))
         (pcb-links-set! p '())
