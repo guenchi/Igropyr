@@ -13,6 +13,9 @@
 (define bad-port 18093)
 (define head-port 18094)
 (define interim-port 18095)
+(define framing-port 18100)
+(define framing-base
+  (string-append "http://127.0.0.1:" (number->string framing-port)))
 
 (define failures 0)
 (define (check label ok)
@@ -211,6 +214,55 @@
         (tcp-read-start! c)))
     0))
 
+;; Response framing fields must describe one unambiguous body. This raw
+;; server deliberately emits conflicts and duplicates that a proxy and this
+;; client could otherwise interpret differently.
+(define (start-framing-server!)
+  (tcp-listen! "0.0.0.0" framing-port 16
+    (lambda (c)
+      (let ((pid (spawn
+                   (lambda ()
+                     (receive
+                       (`#(tcp-data ,bv)
+                         (let* ((req (guard (e (#t "")) (utf8->string bv)))
+                                (resp
+                                 (cond
+                                   ((str-has? req " /both ")
+                                    (string-append
+                                      "HTTP/1.1 200 OK\r\n"
+                                      "Transfer-Encoding: chunked\r\n"
+                                      "Content-Length: 3\r\n\r\n"
+                                      "3\r\nabc\r\n0\r\n\r\n"))
+                                   ((str-has? req " /cl-conflict ")
+                                    (string-append
+                                      "HTTP/1.1 200 OK\r\n"
+                                      "Content-Length: 5\r\n"
+                                      "Content-Length: 6\r\n\r\nhello!"))
+                                   ((str-has? req " /cl-same ")
+                                    (string-append
+                                      "HTTP/1.1 200 OK\r\n"
+                                      "Content-Length: 5\r\n"
+                                      "Content-Length: 5\r\n\r\nhello"))
+                                   ((str-has? req " /te-duplicate ")
+                                    (string-append
+                                      "HTTP/1.1 200 OK\r\n"
+                                      "Transfer-Encoding: chunked\r\n"
+                                      "Transfer-Encoding: chunked\r\n\r\n"
+                                      "3\r\nabc\r\n0\r\n\r\n"))
+                                   (else
+                                    (string-append
+                                      "HTTP/1.1 200 OK\r\n"
+                                      "Transfer-Encoding: gzip\r\n"
+                                      "Connection: close\r\n\r\nabc")))))
+                           (tcp-write! c (string->utf8 resp) #f))
+                         (sleep-ms 40)
+                         (tcp-close! c))
+                       (`#(tcp-eof) (tcp-close! c))
+                       (`#(tcp-error ,e) (tcp-close! c)))))))
+        (conn-set-owner! c pid)
+        (tcp-read-start! c)))
+    0))
+
 ;; ---- tests -----------------------------------------------------------------
 
 (start-scheduler
@@ -220,6 +272,7 @@
     (start-badchunk-server!)
     (start-head-server!)
     (start-interim-server!)
+    (start-framing-server!)
     (sleep-ms 100)
 
     ;; chunked (SSE) streaming: one emit per wire chunk, in order,
@@ -283,6 +336,26 @@
     (let ((r (http-get (string-append "http://127.0.0.1:" (number->string interim-port) "/multi"))))
       (check "interim-multi-status" (= 200 (response-status r)))
       (check "interim-multi-body" (equal? (utf8->string (response-body r)) "yay")))
+
+    (check "transfer-encoding-plus-content-length"
+      (equal? (client-error-message
+                (lambda () (http-get (string-append framing-base "/both"))))
+              "ambiguous response framing"))
+    (check "conflicting-content-length"
+      (equal? (client-error-message
+                (lambda () (http-get (string-append framing-base "/cl-conflict"))))
+              "invalid Content-Length"))
+    (let ((r (http-get (string-append framing-base "/cl-same"))))
+      (check "identical-content-length-accepted"
+        (equal? (utf8->string (response-body r)) "hello")))
+    (check "duplicate-transfer-encoding"
+      (equal? (client-error-message
+                (lambda () (http-get (string-append framing-base "/te-duplicate"))))
+              "invalid Transfer-Encoding"))
+    (check "unsupported-transfer-encoding"
+      (equal? (client-error-message
+                (lambda () (http-get (string-append framing-base "/te-unsupported"))))
+              "invalid Transfer-Encoding"))
 
     ;; timeout 0 = no idle limit: a slow drip still completes
     (let-values (((b collect) (collector)))
