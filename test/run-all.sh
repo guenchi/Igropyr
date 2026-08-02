@@ -55,6 +55,7 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # cookie attribute injection, HTTP/1.0 framing, slowloris deadline
 "$scheme_bin" --script igropyr/test/protocol-hardening.sc
 "$scheme_bin" --script igropyr/test/http-client-stream.sc
+"$scheme_bin" --script igropyr/test/ws-client-handshake.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
 # RESP parsing, both against a fake server so neither needs a live redis:
 # the same value at every split offset, and a fragmented reply parsed in
