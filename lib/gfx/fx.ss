@@ -58,7 +58,7 @@
   (define $fx-heap 65536)
 
   (define ($fx-gen)
-    (let ((g (js-get (js-global) "__goeteia_fx_gen")))
+    (let ((g (js-get (js-global) "goeteiaFxGeneration")))
       (if (js-truthy? g) (js->number g) 0)))
 
   ;; the VAO cache: (program, buffer, instance buffer) -> vao slot
@@ -73,8 +73,12 @@
     ;; 128 bytes of scratch turn every m4-mul into wasm SIMD
     (m4-scratch! (fx-alloc! 128))
     ;; a fresh init retires loops from any earlier run of the page
-    ;; (live editors re-run whole programs; fx-ticks! checks this)
-    (js-set! (js-global) "__goeteia_fx_gen" (+ 1 ($fx-gen)))
+    ;; (live editors re-run whole programs; fx-ticks! checks this).
+    ;; The key is deliberately OUTSIDE the __goeteia_ namespace: the
+    ;; bridge keeps that private per module instance, so a counter
+    ;; living there could never retire a previous instance's loop --
+    ;; exactly the case a live page hits on every demo switch.
+    (js-set! (js-global) "goeteiaFxGeneration" (+ 1 ($fx-gen)))
     (cmd-region! 0 $fx-cmd-limit))
 
   (define (fx-slot!)

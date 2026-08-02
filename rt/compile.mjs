@@ -161,22 +161,29 @@ function datumEnd(text, at) {
 function embedBlocks(text) {
     const blocks = [];
     let depth = 0, embedStart = -1, embedDepth = 0;
-    // quasiquote suspends mounting by nesting depth and unquote
-    // resumes it, mirroring the compiler's embed-expand: a mount head
-    // is data under ` and a mount point again under , -- qqAt[d] is
-    // the quasiquote depth entered at paren depth d
+    // quasiquote suspends mounting and unquote resumes it, mirroring
+    // the compiler's embed-expand.  Each reader prefix records the
+    // exact end of its datum, so `atom and ,atom expire just as lists do.
     let qq = 0;
-    const qqAt = [];
+    const qqUntil = [];
     for (let i = 0; i < text.length; i++) {
+        while (qqUntil.length && qqUntil[qqUntil.length - 1][0] <= i)
+            qq -= qqUntil.pop()[1];
         const c = text[i];
         if (c === ';') { while (i < text.length && text[i] !== '\n') i++; continue; }
         if (c === '"') { i++; while (i < text.length && text[i] !== '"') { if (text[i] === '\\') i++; i++; } continue; }
         if (c === '#' && text[i + 1] === '\\') { i += 2; continue; }
         if (c === '\'') { i = datumEnd(text, i + 1) - 1; continue; }
-        if (c === '`') { qq++; qqAt.push([depth, +1]); continue; }
+        if (c === '`') {
+            qq++;
+            qqUntil.push([datumEnd(text, i + 1), +1]);
+            continue;
+        }
         if (c === ',' && qq > 0) {
-            qq--; qqAt.push([depth, -1]);
-            if (text[i + 1] === '@') i++;
+            const prefixEnd = i + (text[i + 1] === '@' ? 2 : 1);
+            qq--;
+            qqUntil.push([datumEnd(text, prefixEnd), -1]);
+            if (prefixEnd === i + 2) i++;
             continue;
         }
         if (c === '(') {
@@ -185,10 +192,12 @@ function embedBlocks(text) {
                 continue;
             }
             if (/^\(\s*quasiquote[\s(]/.test(text.slice(i, i + 20))) {
-                qq++; qqAt.push([depth, +1]);
+                qq++;
+                qqUntil.push([datumEnd(text, i), +1]);
             } else if (qq > 0
                        && /^\(\s*unquote(-splicing)?[\s(]/.test(text.slice(i, i + 22))) {
-                qq--; qqAt.push([depth, -1]);
+                qq--;
+                qqUntil.push([datumEnd(text, i), -1]);
             }
             if (qq === 0 && embedStart < 0
                 && $mountHeads.test(text.slice(i, i + 24))) {
@@ -197,11 +206,6 @@ function embedBlocks(text) {
             depth++;
         } else if (c === ')') {
             depth--;
-            // a reader-macro prefix binds to the next datum, so any
-            // shift recorded at this depth expires with the list
-            while (qqAt.length && qqAt[qqAt.length - 1][0] >= depth) {
-                qq -= qqAt.pop()[1];
-            }
             if (embedStart >= 0 && depth === embedDepth) {
                 blocks.push([embedStart, i + 1]);
                 embedStart = -1;

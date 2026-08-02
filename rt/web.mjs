@@ -2,26 +2,99 @@
 // access through the js bridge.
 // Copyright (c) 2026 guenchi. MIT license; see LICENSE.
 
-import { makeJsBridge, callMain } from './jsbridge.mjs';
+import { makeJsBridge, callMain, jsBridgeStubs } from './jsbridge.mjs';
 
-export async function loadGoeteia(url) {
+// Instantiate an already-compiled module against the DOM bridge and run
+// its main.  Pages that compile Goeteia in the browser hold the bytes
+// rather than a URL, so this is the half of loadGoeteia they need.
+export async function runGoeteiaBytes(bytes) {
     let exportsRef = null;
-    const { instance } = await WebAssembly.instantiate(
-        await (await fetch(url)).arrayBuffer(),
-        {
-            io: {
-                write_byte: b => loadGoeteia._out.push(b),
-                read_byte: () => -1,
-                path_byte: () => {}, open_read: () => -1, open_write: () => -1,
-                fread: () => -1, fwrite: () => {}, fclose: () => {},
-            },
-            js: makeJsBridge(() => exportsRef),
-        });
+    const io = {
+        write_byte: b => loadGoeteia._out.push(b),
+        read_byte: () => -1,
+        path_byte: () => {}, open_read: () => -1, open_write: () => -1,
+        fread: () => -1, fwrite: () => {}, fclose: () => {},
+    };
+    let instance;
+    try {
+        ({ instance } = await WebAssembly.instantiate(
+            bytes, { io, js: makeJsBridge(() => exportsRef) }));
+    } catch {
+        // an engine that advertises WebAssembly.Suspending yet rejects
+        // the import: retry with a pass-through await
+        const js = makeJsBridge(() => exportsRef);
+        js.await = p => p;
+        ({ instance } = await WebAssembly.instantiate(bytes, { io, js }));
+    }
     exportsRef = instance.exports;
     await callMain(instance.exports);
     return instance.exports;
 }
+
+// Compile Scheme source in the browser: the compiler module reads the
+// text as its stdin and writes the module bytes as its stdout.  A page
+// that ships sources instead of a binary -- "compiled by Goeteia in
+// your browser" -- needs exactly this and nothing else.
+export async function compileGoeteia(source, compilerUrl = 'goeteia.wasm') {
+    const input = new TextEncoder().encode(source);
+    const out = [];
+    let pos = 0;
+    const { instance } = await WebAssembly.instantiate(
+        await (await fetch(compilerUrl)).arrayBuffer(),
+        {
+            io: {
+                write_byte: b => out.push(b),
+                read_byte: () => (pos < input.length ? input[pos++] : -1),
+                path_byte: () => {}, open_read: () => -1, open_write: () => -1,
+                fread: () => -1, fwrite: () => {}, fclose: () => {},
+            },
+            js: jsBridgeStubs,          // the compiler never calls out to JS
+        });
+    try {
+        instance.exports.main();
+    } catch (cause) {
+        // Compiler diagnostics share stdout with successful module bytes.
+        // Preserve them when main traps instead of reducing every source
+        // error to the Wasm engine's unhelpful "unreachable" message.
+        const output = new TextDecoder().decode(new Uint8Array(out)).trim();
+        const error = new Error(
+            output || `Goeteia: compile failed: ${cause.message}`);
+        error.cause = cause;
+        error.output = output;
+        throw error;
+    }
+    if (out.length === 0) throw new Error('Goeteia: compile produced no output');
+    return new Uint8Array(out);
+}
+
+// The whole browser-compiler cycle: fetch a source list in parallel,
+// concatenate in order (dependencies before dependents -- the compiler
+// splices each (library ...) and treats (import ...) as a no-op), and
+// compile.  This is what a page that ships sources instead of a binary
+// actually calls.
+export async function compileGoeteiaFrom(urls, compilerUrl = 'goeteia.wasm') {
+    const texts = await Promise.all(
+        urls.map(u => fetch(u).then(r => {
+            if (!r.ok) throw new Error(`Goeteia: ${u} not found`);
+            return r.text();
+        })));
+    return compileGoeteia(texts.join('\n'), compilerUrl);
+}
+
+export async function loadGoeteia(url) {
+    return runGoeteiaBytes(await (await fetch(url)).arrayBuffer());
+}
 loadGoeteia._out = [];
+// A page-global handle: a define-js section (a JS-target Scheme
+// program, e.g. capability-gating logic deciding whether a heavy
+// module should load at all) has no other way to reach this loader,
+// which lives in the glue's module scope.  Any wasm/auto section's
+// glue runs before later scripts in document order, so the handle is
+// set by the time such a section needs it.
+globalThis.__goeteia_load = loadGoeteia;
+globalThis.__goeteia_run = runGoeteiaBytes;
+globalThis.__goeteia_compile = compileGoeteia;
+globalThis.__goeteia_compile_from = compileGoeteiaFrom;
 
 // Run a module in a Worker over an OffscreenCanvas: the render loop
 // leaves the main thread entirely (a busy main thread no longer
