@@ -151,6 +151,28 @@
       (tcp-stop-listen! listener))
     (display "conn on-close cleanup ok\n")
 
+    ;; The registry is a one-to-one name <-> pid map. Rebinding either
+    ;; side must remove the displaced reverse entry: otherwise a replaced
+    ;; process can die later and unregister its replacement, while moving a
+    ;; pid to a new name leaves its old name pointing at a process whose
+    ;; eventual teardown no longer knows to remove it.
+    (let ((old (spawn (lambda () (receive (`#(never) (void))))))
+          (new (spawn (lambda () (receive (`#(never) (void)))))))
+      (register 'registry-rebind old)
+      (register 'registry-rebind new)
+      (kill old 'replaced)
+      (unless (eq? (whereis 'registry-rebind) new)
+        (fail "old process death removed replacement registration"))
+      (register 'registry-moved new)
+      (when (whereis 'registry-rebind)
+        (fail "moving pid left its old name registered"))
+      (unless (eq? (whereis 'registry-moved) new)
+        (fail "moving pid lost its new name"))
+      (kill new 'done)
+      (when (whereis 'registry-moved)
+        (fail "dead process retained its rebound name")))
+    (display "registry rebinding ok\n")
+
     ;; 5. spawn&link + trap-exit turns a crash into an EXIT message
     (process-trap-exit #t)
     (spawn&link (lambda () (raise 'linked-crash)))
