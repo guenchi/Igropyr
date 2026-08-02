@@ -25,9 +25,17 @@
 (define port 18776)
 (define root "/tmp/igropyr-serving-test")
 
+(define (system! label command)
+  (let ((status (system command)))
+    (unless (zero? status)
+      (display "FAIL  fixture command: ") (display label)
+      (display " (exit ") (display status) (display ")") (newline)
+      (exit 1))))
+
 ;; a served tree with a dotfile and a secret whose name a suffix check
 ;; would accept only after NUL truncation
-(system (string-append "rm -rf " root " && mkdir -p " root "/.git " root "/.well-known"))
+(system! "create serving tree"
+  (string-append "rm -rf " root " && mkdir -p " root "/.git " root "/.well-known"))
 (call-with-output-file (string-append root "/ok.txt")
   (lambda (p) (display "public file" p)))
 (call-with-output-file (string-append root "/.env")
@@ -38,11 +46,12 @@
   (lambda (p) (display "well-known ok" p)))
 (call-with-output-file (string-append root "/secret.db")
   (lambda (p) (display "PRIVATE" p)))
-(system (string-append "ln -s /etc/passwd " root "/link"))
-(system (string-append "ln -s /etc " root "/escape"))
+(system! "create file symlink" (string-append "ln -s /etc/passwd " root "/link"))
+(system! "create directory symlink" (string-append "ln -s /etc " root "/escape"))
 (call-with-output-file (string-append root "/cached.txt")
   (lambda (p) (display "old" p)))
-(system (string-append "cp -p " root "/cache-stamp" ))
+(system! "capture cached file timestamp"
+  (string-append "cp -p " root "/cached.txt " root "/cache-stamp"))
 
 (start-scheduler
   (lambda ()
@@ -114,8 +123,8 @@
           (= 404 (response-status (GET "/static/cached.txt"))))
         (call-with-output-file (string-append root "/cached.txt")
           (lambda (p) (display "new" p)))
-        (system (string-append "touch -r " root "/cache-stamp "
-                               root "/cached.txt"))
+        (system! "restore cached file timestamp"
+          (string-append "touch -r " root "/cache-stamp " root "/cached.txt"))
         (check "static does not resurrect deleted cache entry"
           (equal? "new" (utf8->string
                           (response-body (GET "/static/cached.txt")))))
@@ -151,7 +160,7 @@
           (= 200 (response-status (GET "/hello"))))))
 
     (sleep-ms 100)
-    (system (string-append "rm -rf " root))
+    (system! "remove serving tree" (string-append "rm -rf " root))
     (if (zero? failures)
         (begin (display "serving-hardening: all tests passed\n") (exit 0))
         (begin (display failures) (display " failures\n") (exit 1)))))
