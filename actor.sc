@@ -138,6 +138,18 @@
 
   (define (register name pid)
     (no-interrupts
+      ;; Keep the two tables a one-to-one map when either side is rebound.
+      ;; Otherwise replacing name's pid leaves the old pid->name entry
+      ;; behind; when that old process later dies, @kill follows the stale
+      ;; reverse entry and deletes the NEW name->pid registration.
+      (let ((old-pid (hashtable-ref name->pid name #f))
+            (old-name (hashtable-ref pid->name pid #f)))
+        (when old-pid
+          (when (eq? (hashtable-ref pid->name old-pid #f) name)
+            (hashtable-delete! pid->name old-pid)))
+        (when old-name
+          (when (eq? (hashtable-ref name->pid old-name #f) pid)
+            (hashtable-delete! name->pid old-name))))
       (hashtable-set! name->pid name pid)
       (hashtable-set! pid->name pid name))
     pid)
@@ -146,7 +158,8 @@
     (no-interrupts
       (let ((p (hashtable-ref name->pid name #f)))
         (hashtable-delete! name->pid name)
-        (when p (hashtable-delete! pid->name p)))))
+        (when (and p (eq? (hashtable-ref pid->name p #f) name))
+          (hashtable-delete! pid->name p)))))
 
   ;; guarded like register/unregister: hashtable-ref is preemptible, and
   ;; a concurrent register that grows the table can relink the chain
@@ -499,7 +512,9 @@
       ;; drop the registered name, if any
       (let ((nm (hashtable-ref pid->name p #f)))
         (when nm
-          (hashtable-delete! name->pid nm)
+          ;; A stale reverse mapping must never erase a newer binding.
+          (when (eq? (hashtable-ref name->pid nm #f) p)
+            (hashtable-delete! name->pid nm))
           (hashtable-delete! pid->name p)))
       ;; notify/cascade links
       (let ((links (pcb-links p)))
