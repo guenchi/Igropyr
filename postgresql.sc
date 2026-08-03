@@ -709,6 +709,11 @@
               (begin
                 (when notify (send notify (vector 'db-idle self)))
                 (serve-loop c buf notify)))))
+      ;; sql-query sends this to whatever handle it was given when a call
+      ;; times out; only a pool acts on it. Consume it here so it does not
+      ;; sit in the mailbox forever, slowing every later selective receive
+      ;; (the same accumulation drain-stale! exists to prevent).
+      (`#(db-query-cancel ,ref ,from) (serve-loop c buf notify))
       (`#(db-quit)
         ;; best-effort Terminate: over TLS the encrypt can fail when the
         ;; session already saw close_notify -- the close must run anyway,

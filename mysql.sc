@@ -505,6 +505,11 @@
               (begin
                 (when notify (send notify (vector 'db-idle self)))
                 (serve-loop c bufbox notify)))))
+      ;; sql-query sends this to whatever handle it was given when a call
+      ;; times out; only a pool acts on it. Consume it here so it does not
+      ;; sit in the mailbox forever, slowing every later selective receive
+      ;; (the same accumulation drain-stale! exists to prevent).
+      (`#(db-query-cancel ,ref ,from) (serve-loop c bufbox notify))
       (`#(db-quit)
         (send-packet! c (bytevector 1) 0)          ; COM_QUIT
         (tcp-close! c))

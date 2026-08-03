@@ -95,14 +95,27 @@
       (hashtable-set! busy c (cons (vector-ref job 2) (vector-ref job 1)))
       (send c (vector 'db-query (vector-ref job 0)
                       (vector-ref job 1) (vector-ref job 2))))
-    ;; hand connection c to a checkout request req = (ref . from), and
-    ;; monitor the borrower: the supervisor killing a stuck worker discards
-    ;; its dynamic-wind winders (see actor @kill), so the checkin never runs
-    ;; -- this monitor is the only thing that reclaims the connection.
-    (define (lease! c req)
-      (let ((ref (car req)) (from (cdr req)))
-        (hashtable-set! leased c (vector from (monitor from) ref))
-        (send from (vector 'db-checkout-reply ref c))))
+    ;; A waiter is #(ref from mon). The monitor is taken WHEN THE REQUEST
+    ;; ARRIVES, not when a connection is handed over, because the window in
+    ;; between is real: a caller can die queued, and monitoring only at
+    ;; handover means the pool learns of it by monitoring a pid that is
+    ;; already dead -- which delivers DOWN immediately (see actor.sc), lands
+    ;; in the borrower-died case, and destroys a healthy connection that the
+    ;; dead caller never received, let alone opened a transaction on.
+    ;;
+    ;; It is also what reclaims a lease afterwards: the supervisor killing a
+    ;; stuck worker discards its dynamic-wind winders (actor @kill), so the
+    ;; checkin never runs and this monitor is the only path back.
+    (define (make-waiter ref from) (vector ref from (monitor from)))
+    (define (waiter-ref w) (vector-ref w 0))
+    (define (waiter-from w) (vector-ref w 1))
+    (define (waiter-mon w) (vector-ref w 2))
+    ;; hand connection c to waiter w, carrying its existing monitor into the
+    ;; lease record rather than taking a second one
+    (define (lease! c w)
+      (hashtable-set! leased c (vector (waiter-from w) (waiter-mon w)
+                                       (waiter-ref w)))
+      (send (waiter-from w) (vector 'db-checkout-reply (waiter-ref w) c)))
     (define (drop-lease! c entry)
       (demonitor (vector-ref entry 1))
       (hashtable-delete! leased c))
@@ -164,11 +177,12 @@
           (hashtable-set! dying c #t)
           (loop))
         (`#(db-checkout ,ref ,from)
-          (if (pair? idle)
-              (let ((c (car idle)))
-                (set! idle (cdr idle))
-                (lease! c (cons ref from)))
-              (set! co-back (cons (cons ref from) co-back)))
+          (let ((w (make-waiter ref from)))
+            (if (pair? idle)
+                (let ((c (car idle)))
+                  (set! idle (cdr idle))
+                  (lease! c w))
+                (set! co-back (cons w co-back))))
           (loop))
         (`#(db-checkin ,from ,c)
           ;; only when c really is leased to `from` -- guards a stale or double
@@ -189,14 +203,35 @@
               (hashtable-set! dying c #t)
               (send c (vector 'db-quit))))       ; -> DOWN -> rebuild (case 2)
           (loop))
+        (`#(db-query-cancel ,ref ,from)
+          ;; A query timed out. If it is STILL QUEUED it has not been sent
+          ;; anywhere, so dropping it is exact: the caller has already been
+          ;; told the call failed, and executing it later would apply a write
+          ;; the application believes never happened. (Once assigned to a
+          ;; connection the statement is in flight and its outcome is
+          ;; genuinely unknown -- that is documented on sql-query and is not
+          ;; something a cancel can undo.)
+          (let ((mine? (lambda (job) (not (and (eq? (vector-ref job 1) ref)
+                                               (eq? (vector-ref job 2) from))))))
+            (set! pending-front (filter mine? pending-front))
+            (set! pending-back  (filter mine? pending-back)))
+          (loop))
         (`#(db-checkout-cancel ,ref ,from)
           ;; a checkout timed out: drop its still-queued request so a freed
           ;; connection is never leased to a borrower that has moved on. If the
           ;; pool already leased one to it (raced the timeout), reclaim exactly
           ;; that lease -- matched by ref, so other leases the same borrower
           ;; holds are untouched.
-          (set! co-front (filter (lambda (x) (not (eq? (car x) ref))) co-front))
-          (set! co-back  (filter (lambda (x) (not (eq? (car x) ref))) co-back))
+          ;; drop the queued request AND release its monitor: without the
+          ;; demonitor the pool keeps watching a caller it no longer owes
+          ;; anything, and that caller's eventual death lands in the
+          ;; borrower-died case with no lease to find
+          (let ((drop! (lambda (w)
+                         (when (eq? (waiter-ref w) ref)
+                           (demonitor (waiter-mon w)))
+                         (not (eq? (waiter-ref w) ref)))))
+            (set! co-front (filter drop! co-front))
+            (set! co-back  (filter drop! co-back)))
           (let ((hit (lease-by-ref ref from)))
             (when hit
               (drop-lease! (car hit) (cdr hit))
@@ -216,6 +251,17 @@
           (connect!)
           (loop))
         (`#(DOWN ,pid ,reason)
+          ;; First: a caller that died while still QUEUED holds nothing. Drop
+          ;; its requests before the cases below, so it is never mistaken for
+          ;; a borrower whose connection might carry an open transaction --
+          ;; that mistake destroys and rebuilds a healthy connection the dead
+          ;; caller never received. Its monitor died with it, so no demonitor.
+          (let ((mine? (lambda (w) (not (eq? (waiter-from w) pid)))))
+            (set! co-front (filter mine? co-front))
+            (set! co-back  (filter mine? co-back)))
+          (let ((mine? (lambda (job) (not (eq? (vector-ref job 2) pid)))))
+            (set! pending-front (filter mine? pending-front))
+            (set! pending-back  (filter mine? pending-back)))
           (cond
             ;; (1) a transaction borrower died (a crash, or the supervisor
             ;; killing a stuck worker -- winders discarded, so no checkin ran).
@@ -267,8 +313,8 @@
               (append pending-front (reverse pending-back)))
             (for-each
               (lambda (req)
-                (send (cdr req)
-                      (vector 'db-checkout-failed (car req) closed)))
+                (send (waiter-from req)
+                      (vector 'db-checkout-failed (waiter-ref req) closed)))
               (append co-front (reverse co-back))))
           'done))))
 
@@ -301,7 +347,15 @@
     (drain-stale!)
     (let ((ref (gensym)))
       (send h (vector 'db-query sql ref self))
-      (receive (after query-timeout-ms (raise (sql-cfg-query-timeout-err cfg)))
+      (receive (after query-timeout-ms
+                  ;; symmetric with sql-checkout: tell the pool to drop the
+                  ;; request if it is still queued. A statement left behind
+                  ;; runs whenever the pool recovers -- long after the caller
+                  ;; was told it failed -- so a write the application gave up
+                  ;; on still lands. Harmless against a lone connection, which
+                  ;; ignores the message.
+                  (send h (vector 'db-query-cancel ref self))
+                  (raise (sql-cfg-query-timeout-err cfg)))
         (`#(db-reply ,@ref ,r)
           (if ((sql-cfg-error? cfg) r) (raise r) r)))))
 
