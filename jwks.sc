@@ -236,6 +236,32 @@
   ;; is parsed into memory before anything about it is trusted.
   (define jwks-max-bytes 262144)
 
+  ;; A kid miss may mean that the issuer rotated since the cached document
+  ;; was fetched, so verification is allowed to force a refresh. The kid is
+  ;; still attacker-controlled at that point, however: without a cooldown,
+  ;; every distinct unknown kid drives another outbound HTTP request and can
+  ;; exhaust both this service and the issuer. Keep the gate separate from
+  ;; the document cache so this policy does not extend the cache's six-hour
+  ;; lifetime. The alist mutation is tiny but shared by preemptive actors, so
+  ;; it must be one interrupt-free operation.
+  (define jwks-kid-refresh-cooldown-s 5)
+  (define jwks-kid-refresh-at '())               ; url -> last attempt time
+
+  (define (kid-refresh-slot-take! url)
+    (with-interrupts-disabled
+      (let* ((now (now-sec))
+             (p (assoc url jwks-kid-refresh-at))
+             (recent? (and p (>= now (cdr p))
+                           (< (- now (cdr p)) jwks-kid-refresh-cooldown-s))))
+        (if recent?
+            #f
+            (begin
+              (if p
+                  (set-cdr! p now)
+                  (set! jwks-kid-refresh-at
+                        (cons (cons url now) jwks-kid-refresh-at)))
+              #t)))))
+
   (define-checked (jwks-fetch! (url string?))
     (let ((r (guard (e (#t (jwks-fail "jwks fetch failed")))
                (http-request 'GET url
@@ -332,12 +358,13 @@
                       (or (not typ) (and (string? typ) (string-ci=? typ "JWT"))))
                     (let ((kid (json-ref header "kid")))
                       (and (string? kid)
-                           ;; A kid miss is refetched ONCE: the issuer may have
-                           ;; rotated since the document was cached. Bounded to
-                           ;; one attempt so unknown kids cannot be used to
-                           ;; drive fetches at the issuer on demand.
+                           ;; A kid miss may be a rotation. Force one refresh
+                           ;; when this URL's cooldown grants the slot; misses
+                           ;; during the cooldown fail closed without I/O.
                            (let ((jwk (or (jwks-key-for (cached-jwks url) kid)
-                                          (jwks-key-for (jwks-fetch! url) kid))))
+                                          (and (kid-refresh-slot-take! url)
+                                               (jwks-key-for
+                                                 (jwks-fetch! url) kid)))))
                              (and jwk
                                   (let ((n (json-ref jwk "n"))
                                         (ev (json-ref jwk "e")))
