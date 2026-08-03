@@ -5,19 +5,22 @@
 ;;; functions with one UTF-8 string argument and get a string back; user input
 ;;; is data, never code.
 ;;;
-;;; Either upstream works, chosen at load time from what the library
-;;; actually exports:
-;;;   quickjs-ng (libqjs)      RECOMMENDED. Actively maintained, and its
-;;;                            real exported JS_FreeValue makes releasing a
-;;;                            value one FFI call -- ~30% less per-call
-;;;                            overhead than reproducing the header inline.
-;;;   bellard/quickjs          JS_FreeValue is inline, so only the
-;;;   (libquickjs)             __JS_FreeValue slow path is exported and the
-;;;                            ref_count must be decremented here, which is
-;;;                            what the boot-time ABI probe is for.
-;;; Interpreter speed is within ~2% between them, but individual operations
-;;; differ (bellard's regexp/string path is faster today) -- benchmark your
-;;; own bundle if one operation dominates it.
+;;; REQUIRES quickjs-ng (libqjs, 0.15+), which exports a real JS_FreeValue.
+;;; bellard/quickjs makes JS_FreeValue a header inline and exports only the
+;;; ref-count-zero slow path, which forced this library to reproduce the
+;;; inline: decrement a ref_count whose offset differs between the two
+;;; upstreams and so had to be DISCOVERED at boot, by reading both candidate
+;;; positions on a live object. One candidate sits 4 bytes BEFORE the object.
+;;; That read is undefined behaviour -- harmless under a plain allocator,
+;;; a crash under ASan, Guard Malloc, or whenever an object lands at a page
+;;; boundary -- and it ran three times per boot, on every boot, including
+;;; each crash-only rebuild.
+;;;
+;;; Pinning the upstream deletes that machinery instead of guarding it: with
+;;; the offset gone there is nothing to discover and nothing reads outside an
+;;; object. A build without the symbol is refused at boot with a clear
+;;; message rather than silently taking a different path. Releasing a value
+;;; is also ~30% cheaper as one FFI call than as the reproduced inline.
 ;;;
 ;;; A C-shim binding with the SAME exports lives at
 ;;;   https://github.com/guenchi/igropyr-quickjs
@@ -103,8 +106,7 @@
   (define _eval #f) (define _global #f) (define _get-prop #f)
   (define _is-function #f) (define _new-string #f) (define _call #f)
   (define _tocstr #f) (define _free-cstr #f) (define _get-exception #f)
-  (define __free-value #f)                ; bellard: ref-count-zero slow path
-  (define _free-value #f)                 ; quickjs-ng: real exported JS_FreeValue
+  (define _free-value #f)                 ; the exported JS_FreeValue (required)
   (define bound #f)
   (define (bind!)
     (unless bound
@@ -126,17 +128,25 @@
       (set! _tocstr       (foreign-procedure "JS_ToCStringLen2" (void* void* (& JSValue) int) void*))
       (set! _free-cstr    (foreign-procedure "JS_FreeCString" (void* void*) void))
       (set! _get-exception (foreign-procedure "JS_GetException" (void*) (& JSValue)))
-      ;; Releasing a value differs between the two upstreams. In
-      ;; bellard/quickjs JS_FreeValue is a header inline, so only the
-      ;; ref-count-zero slow path __JS_FreeValue is exported and we must
-      ;; decrement the count ourselves. quickjs-ng (0.15+) exports a real
-      ;; JS_FreeValue that does the whole job, and does NOT export
-      ;; __JS_FreeValue at all -- binding it there fails at load time.
-      (if (foreign-entry? "__JS_FreeValue")
-          (set! __free-value
-            (foreign-procedure "__JS_FreeValue" (void* (& JSValue)) void))
-          (set! _free-value
-            (foreign-procedure "JS_FreeValue" (void* (& JSValue)) void)))
+      ;; A real exported JS_FreeValue is REQUIRED. bellard/quickjs makes it a
+      ;; header inline and exports only the ref-count-zero slow path, which
+      ;; left this library reproducing the inline itself: decrement a count
+      ;; whose offset had to be discovered by reading both candidate
+      ;; positions on a live object -- and one candidate, ptr-4, is BEFORE
+      ;; the object. That is undefined behaviour a plain allocator hides and
+      ;; ASan, Guard Malloc or a page boundary turns into a crash, and it ran
+      ;; three times per boot, every boot, including each crash-only rebuild.
+      ;;
+      ;; Requiring the exported symbol deletes that machinery rather than
+      ;; guarding it: there is no offset to find, so nothing reads outside an
+      ;; object. The cost is bellard/quickjs support, paid deliberately --
+      ;; a pinned upstream in exchange for no undefined behaviour at all.
+      ;; Refuse loudly here rather than silently taking a different path.
+      (unless (foreign-entry? "JS_FreeValue")
+        (assertion-violation 'qjs-boot!
+          "this QuickJS build does not export JS_FreeValue (quickjs-ng 0.15+ required; bellard/quickjs makes it inline)"))
+      (set! _free-value
+        (foreign-procedure "JS_FreeValue" (void* (& JSValue)) void))
       (set! bound #t)))
 
   ;; ---- engine state ------------------------------------------------------
@@ -144,9 +154,6 @@
   (define healthy #f)
   (define generation 0)
   (define deadline 0)                    ; real-time ms; 0 = no deadline armed
-  (define rc-offset -4)                   ; ref_count byte offset from JS_VALUE_GET_PTR;
-                                          ; re-determined by the boot probe (quickjs-ng
-                                          ; = -4, bellard/quickjs = 0)
   (define bundle-bytes #f)               ; NUL-terminated, kept for rebuild
   (define mem-mb 64) (define stack-kb 1024) (define timeout-ms 2000)
 
@@ -181,21 +188,10 @@
   ;; ---- faithful JS_FreeValue (header inline): decrement the object's
   ;; ref_count, and only at zero call the exported slow path. Needed for the
   ;; per-call setup values (global, function, argument, result). --------------
-  (define (js-free! v)
-    (if _free-value
-        ;; quickjs-ng: the exported JS_FreeValue owns the whole operation
-        ;; (including the has-ref-count test), so hand it the value as is.
-        (_free-value ctx v)
-        (let ((tag (ftype-ref JSValue (tag) v)))
-          (when (< tag 0)                               ; JS_VALUE_HAS_REF_COUNT
-            ;; bellard/quickjs: JS_FreeValue is inline, so reproduce it --
-            ;; decrement, and call the exported slow path only at zero.
-            ;; ref_count lives rc-offset bytes from JS_VALUE_GET_PTR(v);
-            ;; the boot probe determined rc-offset.
-            (let* ((rca (+ (ftype-ref JSValue (u) v) rc-offset))  ; &p->ref_count
-                   (rc  (foreign-ref 'int rca 0)))
-              (foreign-set! 'int rca 0 (- rc 1))
-              (when (<= (- rc 1) 0) (__free-value ctx v)))))))
+  ;; The exported JS_FreeValue owns the whole operation, including the
+  ;; has-ref-count test, so hand it the value as is. Nothing here reads the
+  ;; object's memory -- see bind! for why that matters.
+  (define (js-free! v) (_free-value ctx v))
 
   ;; read a JS string value's UTF-8 bytes into a fresh bytevector (via one
   ;; JS_ToCStringLen2 / JS_FreeCString pair) or #f if not string-coercible.
@@ -229,48 +225,19 @@
     (set! deadline (if (> timeout-ms 0) (+ (real-time) (* timeout-ms factor)) 0)))
 
   ;; ---- ABI probe: DISCOVER ref_count's offset instead of hard-coding it ---
-  ;; Pure decision: three successive reads of the two candidate int slots
-  ;; (offset 0 and offset -4) taken as we add one reference each time; the slot
-  ;; that increments by exactly 1 on BOTH steps is ref_count. Only string
-  ;; length/hash and object shape sit in the other slot and they do NOT move
-  ;; when a reference is taken, so the match is unambiguous. Exported so the
-  ;; test can drive both branches without a second QuickJS build.
-  (define (decide-rc-offset a0 am4 b0 bm4 c0 cm4)
-    (let ((d0?  (and (= (- b0 a0) 1) (= (- c0 b0) 1)))       ; offset 0 tracks refs?
-          (dm4? (and (= (- bm4 am4) 1) (= (- cm4 bm4) 1))))  ; offset -4 tracks refs?
-      (cond ((and dm4? (not d0?)) -4)     ; quickjs-ng: ref_count 4 bytes before ptr
-            ((and d0?  (not dm4?)) 0)      ; bellard/quickjs: ref_count at offset 0
-            (else #f))))                   ; ambiguous / unknown -> caller refuses
-
-  ;; Determine rc-offset by perturb-and-observe on the global object
-  ;; (JS_GetGlobalObject bumps its ref_count by 1 each call). Also VALIDATES
-  ;; the JSValue struct layout: the global's tag must read as JS_TAG_OBJECT,
-  ;; which proves u is a real pointer and we are not on a NaN-boxed build.
-  ;; Requires ctx. Leaves the global's ref_count balanced on success; on
-  ;; failure it tears down and raises (a wrong ABI is refused, never guessed).
-  (define (probe-abi!)
-    (_global g-buf ctx)                                     ; ref #1
+  ;; Validate the JSValue struct layout: the global object's tag must read as
+  ;; JS_TAG_OBJECT, which proves `u` is a real pointer and this is not a
+  ;; NaN-boxed build. Cheap, and it reads only OUR OWN JSValue buffer, never
+  ;; the object's memory -- unlike the ref_count probe this replaces, which
+  ;; had to read both candidate offsets on a live object to find one of them.
+  ;; A wrong ABI is refused here, never guessed at.
+  (define (validate-abi!)
+    (_global g-buf ctx)
     (unless (= (ftype-ref JSValue (tag) g-buf) tag-object)
       (teardown!)
       (error 'qjs-boot!
         "global tag != JS_TAG_OBJECT: JSValue layout mismatch (NaN-boxing / wrong QuickJS build?)"))
-    (let ((ptr (ftype-ref JSValue (u) g-buf)))
-      (let ((a0 (foreign-ref 'int ptr 0)) (am4 (foreign-ref 'int (- ptr 4) 0)))
-        (_global g-buf ctx)                                 ; ref #2 (same object)
-        (let ((b0 (foreign-ref 'int ptr 0)) (bm4 (foreign-ref 'int (- ptr 4) 0)))
-          (_global g-buf ctx)                               ; ref #3
-          (let ((c0 (foreign-ref 'int ptr 0)) (cm4 (foreign-ref 'int (- ptr 4) 0)))
-            (let ((off (or (decide-rc-offset a0 am4 b0 bm4 c0 cm4)
-                           ;; with ng's exported JS_FreeValue we never read
-                           ;; the count ourselves, so an inconclusive probe
-                           ;; is not fatal there
-                           (and _free-value rc-offset))))
-              (unless off
-                (teardown!)
-                (error 'qjs-boot! "cannot determine ref_count offset: unknown QuickJS ABI"))
-              (set! rc-offset off)
-              ;; release the three refs we took (js-free! now uses rc-offset)
-              (js-free! g-buf) (js-free! g-buf) (js-free! g-buf)))))))
+    (js-free! g-buf))
 
   ;; (re)create runtime + context and evaluate the saved bundle. -> #t | error text
   (define (boot-locked!)
@@ -283,7 +250,7 @@
     (set! ctx (let ((p (_new-context rt))) (and (not (eqv? p 0)) p)))
     (unless ctx (teardown!) (error 'qjs-boot! "JS_NewContext failed"))
     (_update-stack rt)
-    (probe-abi!)                          ; validate layout + discover rc-offset
+    (validate-abi!)                       ; refuse a build whose JSValue layout differs
     (arm-deadline! 10)                    ; bundle parse gets 10x the call budget
     (_eval r-buf ctx bundle-bytes (- (bytevector-length bundle-bytes) 1) "<bundle>" 0)
     ;; NOTE: the deadline stays ARMED past _eval -- read-exception below
