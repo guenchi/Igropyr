@@ -92,6 +92,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # is missing) on a libcrypto older than OpenSSL 3.2, which is what Debian 12
 # and Ubuntu 22.04 ship. The argon2id guard tests still run there.
 "$scheme_bin" --script igropyr/test/kdf.sc
+# a gen-server must not run a call whose caller was killed while it
+# waited: the effects would be applied for nobody, and the retry
+# applies them again
+"$scheme_bin" --script igropyr/test/gen-server-dead-caller.sc
 # pool settings must be refused at startup: every bad value here fails
 # silently at runtime (0 workers = queue forever, negative check-ms =
 # no stuck detection, bad pool size = unbounded connect loop)
