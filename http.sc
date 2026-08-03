@@ -29,6 +29,7 @@
 (library (igropyr http)
   (export http-listen http-swap! http-set-ws!
           http-stats http-shutdown! http-write-timeout!
+          http-request-deadline!
           ;; record predicates, exported for boundary contracts
           ;; ((igropyr checked) in the framework layers) and any
           ;; user code that wants to type-test req/res values
@@ -111,6 +112,16 @@
       (assertion-violation 'http-write-timeout!
         "timeout must be a nonnegative exact integer (ms); 0 = unbounded" ms))
     (set! write-timeout-ms ms))
+
+  ;; How long ONE request may take to arrive in total, first byte of the
+  ;; request line to last byte of the body. Process-global like the rest.
+  ;; A positive exact integer: unlike the write timeout there is no useful
+  ;; unbounded setting, because "no deadline" is the slowloris this bounds.
+  (define (http-request-deadline! ms)
+    (unless (and (integer? ms) (exact? ms) (> ms 0))
+      (assertion-violation 'http-request-deadline!
+        "deadline must be a positive exact integer (ms)" ms))
+    (set! request-deadline-ms ms))
 
   ;; ---- bytevector helpers ------------------------------------------------
 
@@ -1392,7 +1403,7 @@
         ;; this header, and charging it here would reject legitimate traffic.
         ((and hend (> (+ hend 4) header-limit))
          (quick-response! c 431 "Header Too Large"))
-        (hend (have-header c srv buf hend))
+        (hend (have-header c srv buf hend (or started (now-ms))))
         ((> (inbuf-length buf) header-limit)
          (quick-response! c 431 "Header Too Large"))
         ((and started (> (- (now-ms) started) request-deadline-ms))
@@ -1421,7 +1432,7 @@
 
   (define continue-100 (string->utf8 "HTTP/1.1 100 Continue\r\n\r\n"))
 
-  (define (have-header c srv buf hend)
+  (define (have-header c srv buf hend started)
     (let* ((base (inbuf-start buf))
            (parsed (parse-head (inbuf-bv buf) base (fx+ base hend))))
       (if (not parsed)
@@ -1468,7 +1479,7 @@
                    (else (quick-response! c 404 "Not Found")))))
               ((eq? te 'chunked)
                (when (expect-100? headers) (tcp-write! c continue-100 #f))
-               (collect-chunked c srv buf parsed (fx+ hend 4) #f))
+               (collect-chunked c srv buf parsed (fx+ hend 4) #f started))
               (else
                (let ((n (if (eq? clen 'absent) 0 clen)))
                  (cond
@@ -1477,7 +1488,7 @@
                    (else
                     (when (and (> n 0) (expect-100? headers))
                       (tcp-write! c continue-100 #f))
-                    (collect-body c srv buf parsed n (+ hend 4 n)))))))))))
+                    (collect-body c srv buf parsed n (+ hend 4 n) started))))))))))
 
   ;; Dispatch the parsed request to the worker pool, then await the
   ;; response. Every request goes through the pool, so every handler gets
@@ -1504,17 +1515,25 @@
       (await-response c srv buf #f)))
 
   ;; total = header block + body length, RELATIVE to the buffer start
-  ;; The body phases carry the same whole-request deadline as the header
-  ;; phase: without it a 1 MiB body dribbled one byte per 29 s pins a
-  ;; reader for weeks. `deadline` is an absolute ms timestamp.
+  ;; The body phases share the header phase's whole-request deadline -- the
+  ;; same absolute instant, not a second budget of the same length: without
+  ;; any deadline a 1 MiB body dribbled one byte per 29 s pins a reader for
+  ;; weeks, and with a restarting one it pins it for twice as long as the
+  ;; setting says. `deadline` is an absolute ms timestamp.
   (define (body-wait-ms deadline)
     (if deadline
         (max 1 (min read-timeout-ms (- deadline (now-ms))))
         read-timeout-ms))
 
-  (define (collect-body c srv buf parsed clen total)
+  ;; `started` is when the FIRST byte of this request arrived, carried in
+  ;; from the header phase. Computing (+ (now-ms) request-deadline-ms) here
+  ;; instead restarted the clock at the header/body boundary, so a client
+  ;; could take almost the full deadline over the head and then almost the
+  ;; full deadline again over the body -- twice the budget the setting names,
+  ;; and the reader held for all of it.
+  (define (collect-body c srv buf parsed clen total started)
     (collect-body* c srv buf parsed clen total
-                   (+ (now-ms) request-deadline-ms)))
+                   (+ started request-deadline-ms)))
 
   (define (collect-body* c srv buf parsed clen total deadline)
     (cond
@@ -1532,9 +1551,9 @@
          (`#(tcp-eof) (tcp-close! c))
          (`#(tcp-error ,e) (tcp-close! c))))))
 
-  (define (collect-chunked c srv buf parsed body-start st)
+  (define (collect-chunked c srv buf parsed body-start st started)
     (collect-chunked* c srv buf parsed body-start st
-                      (+ (now-ms) request-deadline-ms)))
+                      (+ started request-deadline-ms)))
 
   (define (collect-chunked* c srv buf parsed body-start st deadline)
     (let-values (((status a b) (parse-chunked-body buf body-start st)))
