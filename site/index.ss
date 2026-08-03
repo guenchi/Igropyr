@@ -251,8 +251,10 @@
              "a multi-request dialogue runs as one green process holding live "
              "state — even an open database transaction — across rounds; "
              '(code "suspend!") " answers and parks, " '(code "conversation-resume!")
-             " continues, and death for any reason (crash, TTL) means guaranteed "
-             "rollback: a later resume gets " '(code "gone"))
+             " continues — carrying a token that names the reply it answers, so a "
+             "double click or a retried request replays that answer instead of "
+             "taking a step nobody asked for; death for any reason (crash, TTL) "
+             "means guaranteed rollback: a later resume gets " '(code "gone"))
           ,(fitem "Hot code swapping"
              "replace the handler (or individual routes) on a live server: the "
              "listener, open connections and worker pool stay up, in-flight "

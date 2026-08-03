@@ -41,8 +41,10 @@
           done))))
   req)
 
-(<span class=\"f\">conversation-resume!</span> id req)   <span class=\"c\">; =&gt; reply | 'gone</span>
-<span class=\"c\">;; 'gone means: rolled back. guaranteed.</span>")
+(<span class=\"f\">conversation-resume!</span> id token req)
+<span class=\"c\">;; =&gt; (values reply next-token) | 'stale | 'gone</span>
+<span class=\"c\">;; the token names the reply you are answering;</span>
+<span class=\"c\">;; repeating one replays its answer, once.</span>")
   (define cluster-code "(<span class=\"f\">node-start!</span> <span class=\"n\">'web-1</span> secret <span class=\"n\">8888</span> <span class=\"s\">\"0.0.0.0\"</span>)
 
 <span class=\"c\">;; discover peers via redis; nodes heartbeat</span>

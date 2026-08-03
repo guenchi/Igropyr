@@ -1282,7 +1282,7 @@ express cannot happen.
 ```scheme
 (app-post app "/transfer"
   (lambda (req res)
-    (let-values (((id reply)
+    (let-values (((id token reply)
                   (conversation-start!
                     (lambda (req suspend!)
                       (let ((tx (begin-tx!)))          ; live, held across rounds
@@ -1291,24 +1291,80 @@ express cannot happen.
                             (commit! tx)
                             done-data))))
                     req)))
-      (send-json! res (cons (cons 'conv id) reply)))))
+      ;; the token goes to the client and must come back with the next request
+      (send-json! res (cons (cons 'conv id)
+                            (cons (cons 'token token) reply))))))
 
 (app-post app "/transfer/:id"
   (lambda (req res)
-    (let ((r (conversation-resume! (req-param req "id") req)))
-      (if (conversation-gone? r)
-          (begin (set-status! res 410)
-                 (send-json! res '((fault . "gone") (rolled-back . #t))))
-          (send-json! res r)))))
+    (let ((token (string->number
+                   (cond ((assoc "token" (req-query req)) => cdr) (else "")))))
+      (let-values (((r next) (conversation-resume! (req-param req "id") token req)))
+        (cond
+          ((conversation-gone? r)
+           (set-status! res 410)
+           (send-json! res '((fault . "gone") (rolled-back . #t))))
+          ((conversation-stale? r)                 ; a duplicate or a retry
+           (set-status! res 409)
+           (send-json! res '((fault . "stale") (applied . #f))))
+          (next (send-json! res (cons (cons 'token next) r)))
+          (else (send-json! res r)))))))
 ```
 
 API: `(conversation-start! flow req [ttl-ms])` spawns the flow and
-returns `(values id first-reply)`; inside the flow, `(suspend! reply)`
-answers the current round and parks until the next
-`(conversation-resume! id req)`, which returns the flow's next reply —
-or `'gone`. The flow's return value is the final reply; the process
+returns `(values id token first-reply)`; inside the flow,
+`(suspend! reply)` answers the current round and parks until the next
+`(conversation-resume! id token req)`, which returns
+`(values next-reply next-token)` — or `'stale`, `'gone`,
+`'unreachable`. The flow's return value is the final reply; the process
 then exits. Default TTL 300 000 ms; expiry raises
 `'conversation-expired` inside the flow so a `guard` can roll back.
+
+**The token names the reply being answered.** A conversation hands one
+out with every reply and consumes it the moment a request is accepted.
+Send it to the client alongside the reply and take it back with the next
+request — it is a small integer, so it crosses JSON, a query string and
+a node link unchanged.
+
+Without it, the only thing separating "the answer to what I just said"
+from "a duplicate of what you said before" is arrival order, and arrival
+order is not causality. A double click, a client retry or a second front
+end sends two requests against the *same* reply; if the duplicate is
+delayed — a slower path, a forwarding hop, a busy scheduler — it arrives
+after the flow has moved on and would be taken as the next step. The
+flow then advances on input written before the reply it claims to
+answer: a confirmation skipped, or one stage's payload applied to the
+next. With the token the duplicate is refused however it is scheduled,
+and a genuine answer is accepted however late it arrives.
+
+**A repeat is answered, not refused.** Presenting the token that was
+just spent hands back the reply it produced, together with the token
+that came with it — exactly what the original caller received. A double
+click, a client retry and a lost response therefore all end the same
+way: the step ran once, and everyone who asked gets the answer to what
+they asked. This is what an idempotency key buys in a payment API.
+
+Only the *last* step is replayable — one reply is retained, not a
+history. An older token is `'stale`: its answer is long superseded, and
+keeping every step's reply would be unbounded memory for a case nobody
+can act on anyway.
+
+`'stale` means the token belongs to no step this conversation can still
+answer. The request was **not** applied and will not be — a fact about
+this conversation, unlike `'unreachable`. It says nothing about whether
+the request it duplicates succeeded. Read the current state; do not
+resubmit, and note there is no valid token to resubmit with.
+
+**Completion lingers.** After the flow returns, the conversation stays
+reachable for one more TTL and can still replay that final reply.
+Exiting at once was a live double-charge path: the client's final
+confirm commits, the reply is lost, the retry meets a process that no
+longer exists and is told `'gone` — which this library documents as *the
+transaction rolled back*. The client believes the transfer failed and
+performs it again. The cost is one parked process per completed
+conversation until the window closes; past it, `'gone` can no longer
+tell a flow that died from one that finished long ago, so size the TTL
+to cover the retry window your clients actually use.
 
 The conversation never touches the connection: pool workers stay the
 protocol adapters, parking until the flow replies, so the pool's
