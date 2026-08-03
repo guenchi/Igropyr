@@ -180,6 +180,114 @@
   ;; parameter unchanged.
   (define (conv-token!) (conv-hex/n! 8))
 
+  ;; ---- the step protocol: state, rules, control ---------------------------
+  ;;
+  ;; These three are kept apart on purpose. The step protocol was written
+  ;; four times over -- tokens, replay, request keys, the completion linger
+  ;; -- and every one of those was a MODIFICATION of a single receive loop
+  ;; that already held seven mutable variables, with the same classification
+  ;; written out twice (once for a parked conversation, once for a completed
+  ;; one) and drifting between them. Adding a rule should be adding a rule.
+  ;;
+  ;;   step-state -- what a conversation is waiting for and what it last did
+  ;;   classify   -- the rules, in one place, valid in every phase
+  ;;   serve-steps! -- the control structure, which knows no rules at all
+  ;;
+  ;; phase is the single source of truth for "is a step running", and
+  ;; set-phase! is the only writer of the boxes the watchdog reads. That
+  ;; ordering was a defect once: publishing "running" before publishing WHEN
+  ;; it started let the watchdog kill a step against the previous step's
+  ;; clock. Writing it in one place is why that cannot come back.
+
+  (define-record-type (step-state make-step-state step-state?)
+    (fields (mutable phase)        ; 'running | 'parked | 'completed
+            (mutable awaiting)     ; token that advances from here, or #f
+            (mutable consumed)     ; token most recently accepted
+            (mutable key)          ; key of the request that was accepted
+            (mutable reply)        ; what accepting it produced
+            (mutable steps)        ; completed suspends, for the watchdog
+            running-box run-start-box))
+
+  (define (set-phase! st phase)
+    (step-state-phase-set! st phase)
+    (when (eq? phase 'running)
+      ;; TIMESTAMP BEFORE THE FLAG. The watchdog reads the flag and then the
+      ;; timestamp, so publishing them the other way round leaves a window
+      ;; in which it sees a step running against the PREVIOUS step's start.
+      (set-box! (step-state-run-start-box st) (now-ms)))
+    (set-box! (step-state-running-box st) (eq? phase 'running)))
+
+  (define (token=? a b)
+    (and a b (string? a) (string? b) (string=? a b)))
+
+  ;; THE RULES. key-of is a thunk, so an invented token costs no application
+  ;; code at all: only a request that already matched the spent token is
+  ;; ever reduced to a key.
+  ;;
+  ;;   'advance -- the answer to the reply this conversation is waiting on
+  ;;   'replay  -- a repeat of the request that was already accepted: same
+  ;;               token AND same request. Not the token alone: two callers
+  ;;               can hold one token and ask different things, and handing
+  ;;               the second the first one's result told a caller who asked
+  ;;               to cancel that it was confirmed.
+  ;;   'stale   -- anything else. Not applied, and will not be.
+  ;;
+  ;; A completed conversation has no `awaiting`, so 'advance simply cannot
+  ;; fire there -- the same rules serve both phases without a special case,
+  ;; which is what stops the two copies drifting apart again.
+  (define (classify st token key-of)
+    (cond
+      ((token=? token (step-state-awaiting st)) 'advance)
+      ((and (token=? token (step-state-consumed st))
+            (equal? (key-of) (step-state-key st)))
+       'replay)
+      (else 'stale)))
+
+  ;; THE CONTROL STRUCTURE. It knows no rules: it receives, asks classify
+  ;; what a request is, and acts. Both phases use it -- a parked
+  ;; conversation waiting for its next step, and a completed one still able
+  ;; to replay its final answer -- because the only thing that differs is
+  ;; what 'advance means and when the deadline falls.
+  ;;
+  ;; on-advance is called with (from ref token request) and does not return:
+  ;; it resumes the flow. on-expire is called when the deadline passes.
+  ;;
+  ;; ONE deadline for the whole wait, not one per message. Rearming it per
+  ;; message let a caller repeating a spent or invented token keep a
+  ;; conversation -- and its open transaction -- parked indefinitely, which
+  ;; the watchdog will not touch because idling between rounds is not what
+  ;; it bounds.
+  (define (serve-steps! st deadline safe-key on-advance on-expire)
+    (let loop ()
+      (let ((left (- deadline (now-ms))))
+        (if (<= left 0)
+            (on-expire)
+            (receive (after left (on-expire))
+              ;; READ-ONLY, in every phase. This is the only way a caller
+              ;; who was told 'unreachable can ever settle the question: a
+              ;; link that came back is not permission to resubmit, and
+              ;; resubmitting is how a flow's effects get applied twice.
+              (`#(conv-peek ,from ,ref2)
+                (send from (vector 'conv-peeked ref2
+                                   (step-state-phase st)
+                                   (step-state-awaiting st)
+                                   (step-state-reply st)))
+                (loop))
+              (`#(conv-step ,from ,ref2 ,token ,r)
+                (case (classify st token (lambda () (safe-key r)))
+                  ((advance) (on-advance from ref2 token r))
+                  ((replay)
+                   ;; the token that came with the reply, so the caller
+                   ;; continues exactly as the original one would have
+                   (send from (vector 'conv-reply ref2 (step-state-reply st)
+                                      (if (eq? (step-state-phase st) 'completed)
+                                          'done
+                                          (step-state-awaiting st))))
+                   (loop))
+                  (else
+                   (send from (vector 'conv-reply ref2 #f 'stale))
+                   (loop)))))))))
+
   ;; ---- completed-conversation tombstones ---------------------------------
   ;;
   ;; 'gone means "no process here". For a conversation that DIED -- crashed,
@@ -529,165 +637,51 @@
                               (when on-killed
                                 (guard (e (#t (void))) (on-killed))))
                              (else (loop))))))))
-                 ;; `awaiting` is the token the flow is currently waiting to
-                 ;; be answered with, or #f while a step is running. It is
-                 ;; the whole mechanism: a resume is accepted when it names
-                 ;; the reply it is answering, and refused otherwise.
-                 ;; awaiting     -- the token that advances from here, or #f
-                 ;;                 while a step is running
-                 ;; last-consumed -- the token most recently accepted
-                 ;; last-reply    -- what accepting it produced
-                 ;;
-                 ;; The last two are what make a repeat IDEMPOTENT: a request
-                 ;; bearing the token that was already spent is handed the
-                 ;; same answer it would have received, rather than an error
-                 ;; it cannot act on.
-                 (let ((who starter) (tag ref) (step 0) (awaiting #f)
-                       (last-consumed #f) (last-key #f) (last-reply #f))
-                   ;; One resume per step. Two concurrent resumes -- a double
-                   ;; click, a client retry, two front ends -- both land in
-                   ;; the mailbox; the first wakes this suspend! and the
-                   ;; SECOND was then consumed by the NEXT one. That request
-                   ;; never saw the reply in between, yet advanced the flow
-                   ;; past it: a confirmation step skipped, or one stage's
-                   ;; payload applied to the next. The per-caller ref cannot
-                   ;; help -- it says who to answer, not which step this is.
-                   ;;
-                   ;; Answering 'busy is the honest outcome: the conversation
-                   ;; is mid-step, and the caller can retry when it is not.
-                   ;; Compute an incoming request's key and compare it.
-                   ;;
-                   ;; This is the one place application code still runs at
-                   ;; replay time -- the incoming request has to be reduced
-                   ;; to a key before it can be compared -- so it is bounded
-                   ;; and it fails safe. `running` is marked while it runs
-                   ;; so the watchdog covers a key function that hangs, and
-                   ;; a raise is read as "not the same request", which sends
-                   ;; the caller to 'stale rather than handing it somebody
+                 (let ((who starter) (tag ref)
+                       (st (make-step-state 'running #f #f #f #f 0
+                                            running-box run-start-box)))
+
+                   ;; The one place application code is run on an incoming
+                   ;; request. It is bounded -- the phase is marked running,
+                   ;; so the watchdog covers a key function that hangs --
+                   ;; and it fails safe: a raise yields a value nothing can
+                   ;; equal, so the caller gets 'stale rather than somebody
                    ;; else's answer.
-                   (define (same-key? r)
-                     (let ((ok (box #f)) (k (box #f)))
-                       (set-box! run-start-box (now-ms))
-                       (set-box! running-box #t)
+                   (define no-key (list 'no-key))
+                   (define (safe-key r)
+                     (let ((k (box no-key))
+                           (was (step-state-phase st)))
+                       (set-phase! st 'running)
                        (guard (e (#t (void)))
-                         (set-box! k (request-key r))
-                         (set-box! ok #t))
-                       (set-box! running-box #f)
-                       (and (unbox ok) (equal? (unbox k) last-key))))
+                         (set-box! k (request-key r)))
+                       (set-phase! st was)
+                       (unbox k)))
 
                    (define (suspend! reply)
-                     (set! step (+ step 1))
-                     (set! awaiting (conv-token!))
-                     (set! last-reply reply)
-                     (set-box! step-box step)
-                     (set-box! running-box #f)      ; parked from here
+                     (step-state-steps-set! st (+ 1 (step-state-steps st)))
+                     (step-state-awaiting-set! st (conv-token!))
+                     (step-state-reply-set! st reply)
+                     (set-box! step-box (step-state-steps st))
+                     (set-phase! st 'parked)
                      ;; the reply carries the token that answers it
-                     (send who (vector 'conv-reply tag reply awaiting))
-                     ;; A resume must name the reply it is answering.
-                     ;;
-                     ;; Arrival order used to stand in for that: everything
-                     ;; already queued when a reply went out was drained as
-                     ;; stale, and whatever came next was presumed to be the
-                     ;; answer. That is exact only while delivery is prompt
-                     ;; and ordered. A duplicate sent DURING the previous
-                     ;; step -- a double click, a client retry, a second
-                     ;; front end -- that was delayed past the drain (a
-                     ;; slower path, a forwarding hop, a busy scheduler)
-                     ;; arrived afterwards and was taken as the next step:
-                     ;; the flow advanced on input written before the reply
-                     ;; it claims to answer, skipping a confirmation or
-                     ;; applying one stage's payload to the next. Draining
-                     ;; cannot see that -- the message did not exist yet.
-                     ;; The mirror error was a genuine answer refused as
-                     ;; 'busy for landing inside the send/drain window.
-                     ;;
-                     ;; The token settles both. It is consumed the moment a
-                     ;; request is accepted, so a second request bearing it
-                     ;; -- concurrent or late, it makes no difference -- is
-                     ;; refused, and a request that really did read the
-                     ;; reply is accepted whenever it arrives.
-                     ;;
-                     ;; 'stale means the request was NOT applied and will
-                     ;; not be. It is not replayed: keeping every step's
-                     ;; reply to hand one back would make resume idempotent,
-                     ;; which is a separate decision with a memory cost, and
-                     ;; one the token protocol makes addable later without
-                     ;; breaking anything.
-                     ;; ONE deadline for the whole park, not one per
-                     ;; message. Recomputing `after ttl` on every loop meant
-                     ;; a caller repeating a spent or invented token less
-                     ;; often than the TTL kept the conversation parked
-                     ;; forever -- holding its open transaction -- and the
-                     ;; watchdog could not help, because it deliberately
-                     ;; ignores a parked conversation.
-                     (let ((park-until (+ (now-ms) ttl)))
-                      (let wait ()
-                       (receive (after (max 1 (- park-until (now-ms)))
-                                   (raise 'conversation-expired))
-                         ;; READ-ONLY. Answers what this conversation is
-                         ;; waiting for without advancing it, which is the
-                         ;; only way a caller who got 'unreachable can ever
-                         ;; find out what happened: a link that came back is
-                         ;; not permission to resubmit, and resubmitting is
-                         ;; how a flow's effects get applied twice.
-                         (`#(conv-peek ,from ,ref2)
-                           (send from (vector 'conv-peeked ref2
-                                              'parked awaiting last-reply))
-                           (wait))
-                         (`#(conv-step ,from ,ref2 ,token ,r)
-                           (cond
-                             ;; the answer to the reply just published
-                             ((and awaiting (string? token) (string=? token awaiting))
-                              (set! last-consumed token)
-                              (set! awaiting #f)       ; spent
-                              (set! who from) (set! tag ref2)
-                              ;; TIMESTAMP FIRST. The watchdog reads
-                              ;; running-box and then run-start-box; setting
-                              ;; running first leaves a window in which it
-                              ;; sees a step running against the PREVIOUS
-                              ;; step's start time, and kills a step that
-                              ;; has had no allowance at all.
-                              (set-box! run-start-box (now-ms))
-                              (set-box! running-box #t)
-                              ;; the key is application code, so it is
-                              ;; computed HERE -- inside the running window
-                              ;; the watchdog bounds -- not at replay time
-                              (set! last-key (request-key r))
-                              r)
-                             ;; A REPEAT of the request that got us here --
-                             ;; the same token AND the same request. Hand
-                             ;; back what it produced, with the token that
-                             ;; came with it: exactly what the original
-                             ;; caller received, so a client whose reply was
-                             ;; lost can continue instead of reconciling.
-                             ;;
-                             ;; The REQUEST has to match, not just the
-                             ;; token. Two callers can hold the same token
-                             ;; and ask different things -- one confirms,
-                             ;; one cancels -- and replaying by token alone
-                             ;; answered the second with the first one's
-                             ;; result: the caller who asked to cancel was
-                             ;; told it was confirmed. A repeat means the
-                             ;; same question; a different question against
-                             ;; a spent token is a caller acting on
-                             ;; information that has moved on.
-                             ((and last-consumed (string? token)
-                                   (string=? token last-consumed)
-                                   (same-key? r))
-                              (send from (vector 'conv-reply ref2 last-reply awaiting))
-                              (wait))
-                             (else
-                              (send from (vector 'conv-reply ref2 #f 'stale))
-                              (wait))))))))
+                     (send who (vector 'conv-reply tag reply
+                                       (step-state-awaiting st)))
+                     (serve-steps! st (+ (now-ms) ttl) safe-key
+                       (lambda (from ref2 token r)
+                         (step-state-consumed-set! st token)
+                         (step-state-awaiting-set! st #f)   ; spent
+                         (set! who from) (set! tag ref2)
+                         (set-phase! st 'running)
+                         ;; the key is application code, computed inside the
+                         ;; running window the watchdog bounds
+                         (step-state-key-set! st (safe-key r))
+                         r)
+                       (lambda () (raise 'conversation-expired))))
+
                    (let ((final (flow req suspend!)))
-                     (set! last-reply final)
-                     (set! awaiting #f)
-                     ;; RECORDED BEFORE THE LINGER, not after. The linger
-                     ;; can die -- a kill, a key function that raises -- and
-                     ;; a resume waiting on that death reads it as 'gone,
-                     ;; which claims the transaction rolled back. It had
-                     ;; already committed the moment the flow returned, so
-                     ;; that is when the fact is written down.
+                     (step-state-reply-set! st final)
+                     (step-state-awaiting-set! st #f)
+                     (set-phase! st 'completed)
                      (tomb-record! id)
                      (send who (vector 'conv-reply tag final 'done))
                      ;; LINGER, then unregister.
@@ -705,25 +699,14 @@
                      ;; until the window closes; the TTL is reused because
                      ;; it is already the caller's statement of how long
                      ;; this dialogue may take.
-                     (set-box! running-box #f)
-                     (let ((until (+ (now-ms) ttl)))
-                       (let linger ()
-                         (let ((left (- until (now-ms))))
-                           (when (> left 0)
-                             (receive (after left 'done)
-                               (`#(conv-peek ,from ,ref2)
-                                 (send from (vector 'conv-peeked ref2
-                                                    'completed #f last-reply))
-                                 (linger))
-                               (`#(conv-step ,from ,ref2 ,token ,token2-request)
-                                 (if (and last-consumed (string? token)
-                                          (string=? token last-consumed)
-                                          (same-key? token2-request))
-                                     (send from
-                                           (vector 'conv-reply ref2 last-reply 'done))
-                                     (send from
-                                           (vector 'conv-reply ref2 #f 'stale)))
-                                 (linger)))))))
+                     ;; the SAME control structure and the SAME rules. A
+                     ;; completed conversation has no `awaiting`, so
+                     ;; 'advance cannot fire and this needs no special case
+                     ;; -- which is what stops a second copy of the
+                     ;; classification drifting away from the first.
+                     (serve-steps! st (+ (now-ms) ttl) safe-key
+                       (lambda (from ref2 token r) 'unreachable)
+                       (lambda () 'done))
                      (unregister name)))))))
       (let ((m (monitor conv)))
         (receive
