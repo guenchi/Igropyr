@@ -392,6 +392,36 @@
            (and (fx= (bytevector-u8-ref bv (fx+ base rel)) 13)
                 (fx= (bytevector-u8-ref bv (fx+ base rel 1)) 10)))))
 
+  ;; After the last chunk (size 0) comes the TRAILER SECTION: zero or more
+  ;; header lines, then a blank line (RFC 7230 4.1). A response is not
+  ;; complete until that blank line arrives.
+  ;;
+  ;; Declaring done at the "0" line meant a server that sent "0\r\n" and then
+  ;; stopped -- or a connection cut at that exact point -- produced a
+  ;; SUCCESSFUL reply with a body that happened to be whatever had arrived.
+  ;; Truncation detection is the entire reason chunked framing exists; the
+  ;; comment in tls.sc promising "the accepted framings detect truncation"
+  ;; was not true of this decoder.
+  ;;
+  ;; -> rel position just past the terminating CRLF | #f (need more) | 'bad
+  (define (trailer-end buf start)
+    (let loop ((pos start) (lines 0))
+      (cond
+        ;; a peer may not spend us without bound on trailers either
+        ((fx> lines 64) 'bad)
+        ((crlf-at? buf pos) (fx+ pos 2))        ; blank line: section over
+        (else
+         (let ((bv (inbuf-bv buf)) (base (inbuf-start buf))
+               (n (inbuf-length buf)))
+           (let scan ((i pos))
+             (cond
+               ((fx> (fx- i pos) chunk-line-limit) 'bad)
+               ((fx>= (fx+ i 1) n) #f)
+               ((and (fx= (bytevector-u8-ref bv (fx+ base i)) 13)
+                     (fx= (bytevector-u8-ref bv (fx+ base (fx+ i 1))) 10))
+                (loop (fx+ i 2) (fx+ lines 1)))
+               (else (scan (fx+ i 1))))))))))
+
   (define (chunked-step buf pos chunks got)
     (let loop ((pos pos) (chunks chunks) (got got))
       (let ((r (chunk-size-at buf pos)))
@@ -401,7 +431,12 @@
           (else
            (let ((size (car r)) (eol (cdr r)))
              (cond
-               ((= size 0) (vector 'done (bv-concat (reverse chunks) got)))
+               ((= size 0)
+                (let ((end (trailer-end buf (fx+ eol 2))))
+                  (cond
+                    ((eq? end 'bad) 'bad)
+                    ((not end) (vector 'more pos chunks got))
+                    (else (vector 'done (bv-concat (reverse chunks) got))))))
                ((< (inbuf-length buf) (+ eol 2 size 2))
                 (vector 'more pos chunks got))
                ;; the two bytes after the data MUST be CRLF; without
@@ -428,7 +463,14 @@
           (else
            (let ((size (car r)) (eol (cdr r)))
              (cond
-               ((= size 0) 'done)               ; final chunk; trailers ignored
+               ;; the trailer section still has to arrive in full; its
+               ;; contents are ignored, its TERMINATOR is what says the
+               ;; response was not cut short
+               ((= size 0)
+                (let ((end (trailer-end buf (fx+ eol 2))))
+                  (cond ((eq? end 'bad) 'bad)
+                        ((not end) 'more)
+                        (else 'done))))
                ((< (inbuf-length buf) (+ eol 2 size 2)) 'more)
                ;; Validate the delimiter before exposing the chunk. The
                ;; accumulating decoder already enforces this; streaming
