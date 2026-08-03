@@ -226,6 +226,14 @@
                                (set-box! b 'abandoned)
                                ;; a late completion may already be queued
                                (receive (after 0 'ok) (`#(ws-written ,_) 'ok))
+                               ;; Mark the SESSION closed, not just the
+                               ;; socket. A local close produces no eof for
+                               ;; the owner, so a session that only closed
+                               ;; the handle went straight back into
+                               ;; ws-recv and parked there for good. The
+                               ;; box is what every other path reads to
+                               ;; know the session is over.
+                               (set-box! (ws-closedbox w) #t)
                                (tcp-close! c)
                                #f)
                      (`#(ws-written ,st2) (>= st2 0))))
@@ -368,8 +376,13 @@
                        (payload (vector-ref f 2))
                        (new-size (+ size (bytevector-length payload))))
                   (case fop
-                    ((9) (ws-send-frame! w 10 payload)
-                         (loop op parts size fragments)) ; ping
+                    ;; ping -> pong. The pong can FAIL -- a peer that has
+                    ;; stopped reading makes it time out -- and continuing
+                    ;; into ws-recv on a session that just ended is how a
+                    ;; process parks forever on a closed connection.
+                    ((9) (if (ws-send-frame! w 10 payload)
+                             (loop op parts size fragments)
+                             'closed))
                     ((10) (loop op parts size fragments)) ; pong
                     ((8)
                      ;; RFC 6455 5.5.1 / 7.4: a close payload is either
