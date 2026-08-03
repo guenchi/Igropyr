@@ -873,8 +873,16 @@
           ;; Branch on the SNAPSHOT, not on (res-status r): claim-res! pairs
           ;; the claim with the status/header read under one interrupt-free
           ;; window, and re-reading here would reopen the gap it closes.
-          (if (status-forbids-body? status)
-              ;; No chunked framing for a status that cannot carry a body --
+          ;; A HEAD belongs here with the bodyless statuses: same rule, same
+          ;; consequence. Express routes HEAD to the GET handler, so a
+          ;; streaming handler streams -- and res-send! and the static file
+          ;; path both suppress the body for HEAD while this one did not,
+          ;; sending chunk framing a conforming client stops before. Those
+          ;; bytes then read as the start of the next response on a
+          ;; kept-alive connection: the desynchronisation the HEAD comment in
+          ;; write-response!* already spells out.
+          (if (or (status-forbids-body? status) (res-head-request? r))
+              ;; No chunked framing for a response that cannot carry a body --
               ;; announcing Transfer-Encoding and then sending the terminator
               ;; is itself a body. Answer it as a complete response and leave
               ;; the mode 'done, so res-write! returns #f and res-end! is a
@@ -1007,7 +1015,11 @@
     (let ((c (res-conn r)) (snapshot (claim-res! r)))
       (when snapshot
         (let ((status (vector-ref snapshot 0)) (headers (vector-ref snapshot 1)))
-          (if (status-forbids-body? status)
+          ;; A HEAD takes the same branch, and len as head-only is exactly
+          ;; what it needs: a HEAD must carry the Content-Length a GET would
+          ;; have declared and none of the bytes (RFC 9110 9.3.2). Without
+          ;; this the file streamed in full behind the headers.
+          (if (or (status-forbids-body? status) (res-head-request? r))
               ;; Passing len as head-only keeps the declared length of the
               ;; representation while sending none of it -- which is exactly
               ;; what a 304 wants, and is dropped outright for 204 and 1xx.
