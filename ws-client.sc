@@ -276,11 +276,26 @@
         ;; Validate before DNS or connect so attacker-controlled request
         ;; metadata cannot become a second header or request on the wire.
         (validate-handshake-request! host path extra-headers)
+        ;; ONE SESSION PER PROCESS -- see ws-recv in (igropyr websocket).
+        ;; DNS, connect and socket events all name this process and carry no
+        ;; connection identity, so two sessions in one process consume each
+        ;; other's messages. Spawn a process per session.
         (dns-resolve! host self)
         (receive (after connect-timeout-ms (fail "dns timeout"))
           (`#(dns-resolved ,ip)
             (tcp-connect! ip port self)
-            (receive (after connect-timeout-ms (fail "connect timeout"))
+            (receive (after connect-timeout-ms
+                        ;; The connect is still in flight. If it lands after
+                        ;; we gave up, close it -- otherwise the conn sits in
+                        ;; conn-table until this process dies, and a LATER
+                        ;; ws-connect from the same process would match the
+                        ;; stale #(tcp-connected) and run its handshake over
+                        ;; somebody else's socket. http-client does the same
+                        ;; thing at the same point.
+                        (receive (after 5000 'done)
+                          (`#(tcp-connected ,late) (tcp-close! late))
+                          (`#(tcp-connect-failed ,e) 'done))
+                        (fail "connect timeout"))
               (`#(tcp-connected ,c)
                 (tcp-read-start! c)
                 (let ((key (make-ws-key)))
