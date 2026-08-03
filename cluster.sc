@@ -124,13 +124,37 @@
              (and port (valid-port? port)
                   (list (string->symbol (car parts)) (cadr parts) port))))))
 
+  ;; Milliseconds from the Redis server's own clock. Every node in the
+  ;; cluster reads and writes scores against this one clock, so they are
+  ;; comparable no matter what each machine's uptime or wall clock says.
+  (define (redis-now-ms conn)
+    (let ((r (redis conn "TIME")))
+      (if (and (list? r) (>= (length r) 2))
+          (+ (* 1000 (or (string->number (car r)) 0))
+             (fxdiv (or (string->number (cadr r)) 0) 1000))
+          ;; A server that does not answer TIME (a proxy, an old build) is a
+          ;; deployment fact worth naming rather than silently falling back
+          ;; to a clock that is wrong across hosts.
+          (assertion-violation 'redis-discover
+            "redis TIME did not answer; cluster TTLs need a shared clock" r))))
+
   (define (redis-discover conn cluster-key self-name self-host self-port ttl-ms max-members)
     ;; self-member is a stable string so a re-heartbeat updates the score
     ;; rather than adding a duplicate
     (let ((self-member (string-append (symbol->string self-name) " "
                                       self-host " " (number->string self-port))))
       (lambda ()
-        (let ((now (now-ms)))
+        ;; REDIS's clock, not ours. now-ms is uv_hrtime -- monotonic from an
+        ;; arbitrary per-machine epoch (boot) -- so scores written by two
+        ;; hosts with different uptimes are not comparable at all. The host
+        ;; up longer expires the other one immediately; the host up less long
+        ;; keeps dead members for as long as the difference. Both look fine
+        ;; in a same-machine test, where every process shares a boot epoch,
+        ;; which is why the existing parent/child test could not see it.
+        ;;
+        ;; TIME returns (seconds microseconds) from the one clock every node
+        ;; already agrees on, because they all talk to it.
+        (let ((now (redis-now-ms conn)))
           (redis conn "ZADD" cluster-key (number->string (+ now ttl-ms)) self-member)
           (redis conn "ZREMRANGEBYSCORE" cluster-key "-inf"
                  (number->string (- now 1)))          ; drop expired members
