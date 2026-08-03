@@ -75,6 +75,67 @@
       (call-with-port (open-file-input-port "/dev/urandom")
         (lambda (p) (get-bytevector-n p 16)))))
 
+  ;; Request-line fields must stay on one printable ASCII line. Header
+  ;; values additionally allow horizontal tab and non-ASCII text, but no
+  ;; control byte that can terminate or corrupt the HTTP header block.
+  (define (request-line-safe? s)
+    (and (string? s)
+         (> (string-length s) 0)
+         (let loop ((i 0))
+           (or (= i (string-length s))
+               (let ((c (string-ref s i)))
+                 (and (char>? c #\space) (char<? c #\delete)
+                      (loop (+ i 1))))))))
+
+  (define token-punctuation "!#$%&'*+-.^_`|~")
+
+  (define (header-name-char? c)
+    (or (char<=? #\a c #\z)
+        (char<=? #\A c #\Z)
+        (char<=? #\0 c #\9)
+        (and (string-index token-punctuation c 0) #t)))
+
+  (define (header-name-safe? s)
+    (and (string? s)
+         (> (string-length s) 0)
+         (let loop ((i 0))
+           (or (= i (string-length s))
+               (and (header-name-char? (string-ref s i))
+                    (loop (+ i 1)))))))
+
+  (define (header-value-safe? s)
+    (and (string? s)
+         (let loop ((i 0))
+           (or (= i (string-length s))
+               (let* ((c (string-ref s i)) (n (char->integer c)))
+                 (and (or (= n 9) (>= n 32))
+                      (not (= n 127))
+                      (loop (+ i 1))))))))
+
+  (define (managed-handshake-header? name)
+    (exists (lambda (reserved) (string-ci=? name reserved))
+            '("Host" "Upgrade" "Connection"
+              "Sec-WebSocket-Key" "Sec-WebSocket-Version"
+              "Content-Length" "Transfer-Encoding")))
+
+  (define (validate-handshake-request! host path extra-headers)
+    (unless (request-line-safe? host)
+      (fail "invalid Host header: control characters are not allowed"))
+    (unless (request-line-safe? path)
+      (fail "invalid request path: control characters are not allowed"))
+    (unless (list? extra-headers)
+      (fail "extra headers must be an alist"))
+    (for-each
+      (lambda (h)
+        (unless (and (pair? h) (header-name-safe? (car h)))
+          (fail "invalid header name"))
+        (when (managed-handshake-header? (car h))
+          (fail (string-append "header is managed by the client: " (car h))))
+        (unless (header-value-safe? (cdr h))
+          (fail (string-append "invalid value for header " (car h)
+                               ": control characters are not allowed"))))
+      extra-headers))
+
   (define (handshake-request host path key extra-headers)
     (string->utf8
       (string-append
@@ -153,6 +214,9 @@
   (define (ws-connect url . rest)
     (let ((extra-headers (if (pair? rest) (car rest) '())))
       (let-values (((host port path) (parse-ws-url url)))
+        ;; Validate before DNS or connect so attacker-controlled request
+        ;; metadata cannot become a second header or request on the wire.
+        (validate-handshake-request! host path extra-headers)
         (dns-resolve! host self)
         (receive (after connect-timeout-ms (fail "dns timeout"))
           (`#(dns-resolved ,ip)

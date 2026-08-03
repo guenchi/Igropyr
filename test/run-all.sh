@@ -37,6 +37,7 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/metrics.sc
 "$scheme_bin" --script igropyr/test/dashboard.sc
 "$scheme_bin" --script igropyr/test/auth.sc
+"$scheme_bin" --script igropyr/test/ws-client-request.sc
 # session id rotation: the header-publication contract (no timing), and the
 # race it exists to survive (a concurrent responder claiming the same token)
 "$scheme_bin" --script igropyr/test/response-header-claim.sc
