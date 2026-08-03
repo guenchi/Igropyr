@@ -144,10 +144,17 @@
   ;; ---- verify ----------------------------------------------------------------
 
   ;; absent -> pass; present -> must be a number and satisfy pred
+  ;; FINITE, not merely real. +inf.0 is a real, so a correctly signed token
+  ;; carrying exp=1e999 used to satisfy (real? v) and then (< now v) -- a
+  ;; token that never expires. (igropyr json) now refuses non-finite numbers
+  ;; at the parse, but this check does not depend on that: claims can reach
+  ;; here from any decoder, and an expiry is the last place to take a value
+  ;; on trust.
   (define (time-claim-ok? claims name pred)
     (let ((p (assoc name claims)))
       (or (not p)
-          (and (real? (cdr p)) (pred (cdr p))))))
+          (let ((v (cdr p)))
+            (and (real? v) (not (nan? v)) (not (infinite? v)) (pred v))))))
 
   ;; aud claim: a string, or an array of strings (list or vector)
   (define (aud-match? a expected)
