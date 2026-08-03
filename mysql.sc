@@ -444,6 +444,8 @@
           (let-values (((v next) (lenenc-str p pos)))
             (loop (+ i 1) next (cons v acc))))))
 
+  (define max-result-rows 1000000)
+
   (define (run-query! c bufbox sql)
     (send-packet! c (bv-append (bytevector 3) (string->utf8 sql)) 0)
     (let-values (((p seq) (next-packet! c bufbox query-timeout-ms)))
@@ -464,15 +466,25 @@
                        (unless (eof-packet? ep)
                          (mysql-fail -1 "expected EOF after columns")))
                      ;; rows until EOF
-                     (let rows ((acc '()))
+                     ;; Bounded: the whole result is materialised in memory,
+                     ;; and there is no per-result ceiling anywhere else. An
+                     ;; unbounded SELECT is how a client runs the VM out of
+                     ;; memory for a query someone wrote by accident. Failing
+                     ;; here means the connection is left mid-result and gets
+                     ;; torn down, which is the right trade against an OOM
+                     ;; that takes every other connection with it.
+                     (let rows ((acc '()) (n 0))
                        (let-values (((rp rs) (next-packet! c bufbox query-timeout-ms)))
                          (cond
                            ((eof-packet? rp)
                             (vector 'rows names (reverse acc)))
                            ((fx= (bytevector-u8-ref rp 0) #xFF)
                             (err-packet->fail rp))
+                           ((>= n max-result-rows)
+                            (mysql-fail -1 "result set exceeds max-result-rows"))
                            (else
-                            (rows (cons (parse-row rp ncols) acc)))))))))))))))
+                            (rows (cons (parse-row rp ncols) acc)
+                                  (+ n 1)))))))))))))))
 
   ;; ---- connection process ----------------------------------------------------------------
 
