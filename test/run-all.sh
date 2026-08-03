@@ -109,6 +109,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # a caller that dies or times out WHILE QUEUED must cost neither a
 # healthy connection nor a later, unwanted execution
 "$scheme_bin" --script igropyr/test/sqlpool-lifecycle.sc
+# a connection worker that dies BEFORE reporting db-up is in none of the
+# pool's tables; its DOWN used to match no branch and the slot was lost
+"$scheme_bin" --script igropyr/test/sqlpool-connect-death.sc
 # mysql option validation (no server needed, always runs)
 "$scheme_bin" --script igropyr/test/mysql-opts.sc
 # opt-in (needs a live MySQL): runs for real only when IGROPYR_MYSQL_TEST is
