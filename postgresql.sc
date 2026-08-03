@@ -746,8 +746,29 @@
   ;; LISTEN, or a server talking out of turn.
   (define max-idle-buffer 262144)
 
+  ;; An adopted connection watches its OWNER.
+  ;;
+  ;; The pool monitors its connections, not the other way round, and a
+  ;; monitor is one-directional: when the pool was killed or died of an
+  ;; internal error, actor cleanup dropped the monitoring relationships and
+  ;; left every connection actor running, each holding an fd and, over TLS,
+  ;; a live session. Only an orderly db-quit ever closed them. Recreating
+  ;; the pool then stacked a second full set on top of the first.
+  ;;
+  ;; A connection whose owner is gone has nobody to serve and no way to be
+  ;; reached, so it closes. Terminate is best-effort for the same reason as
+  ;; in db-quit below.
+  (define (owner-gone! c)
+    (guard (e (#t (void)))
+      (send-msg! c MSG-TERMINATE empty-bv))
+    (tx-close! c))
+
   (define (serve-loop c buf notify)
     (receive
+      (`#(DOWN ,pid ,reason)
+        (if (and notify (eq? pid notify))
+            (owner-gone! c)
+            (serve-loop c buf notify)))
       (`#(db-query ,q ,ref ,from)
         ;; q is a plain SQL string (simple protocol) or (sql . params)
         ;; with params pre-converted by postgresql-execute (extended).
@@ -802,7 +823,9 @@
   ;; authenticated connection forever.
   (define (await-adoption c buf notify)
     (receive (after connect-timeout-ms (tx-close! c))
-      (`#(db-adopt) (serve-loop c buf notify))
+      (`#(db-adopt)
+        (when notify (monitor notify))
+        (serve-loop c buf notify))
       (`#(db-quit)
         (guard (e (#t (void)))                   ; see serve-loop's db-quit
           (send-msg! c MSG-TERMINATE empty-bv))
