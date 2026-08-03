@@ -88,8 +88,22 @@
       (let ((x (car co-front)))
         (set! co-front (cdr co-front))
         x))
+    ;; Workers that have been spawned but have not yet reported #(db-up ...).
+    ;; They are in NO other table, so without this set a worker that dies
+    ;; before reporting -- a crash in the driver, a connect error killing the
+    ;; actor, a supervisor kill -- matched none of the DOWN branches below and
+    ;; the pool silently lost that slot FOREVER. Enough of those and the pool
+    ;; is empty while every caller queues behind connections that no longer
+    ;; exist and will never be rebuilt.
+    ;;
+    ;; A worker that reports failure and then exits is removed here at db-up
+    ;; time, because it has already scheduled its own backed-off retry; only
+    ;; the ones that never reported are rebuilt from DOWN.
+    (define connecting (make-eq-hashtable))
     (define (connect!)
-      (monitor (spawn-conn! me me (gensym))))
+      (let ((pid (spawn-conn! me me (gensym))))
+        (hashtable-set! connecting pid #t)
+        (monitor pid)))
     ;; a job is #(sql ref from)
     (define (assign! c job)
       (hashtable-set! busy c (cons (vector-ref job 2) (vector-ref job 1)))
@@ -254,6 +268,7 @@
               (make-available! (car hit))))
           (loop))
         (`#(db-up ,ref ,pid ,status)
+          (hashtable-delete! connecting pid)
           (if (eq? status 'ok)
               (begin
                 (send pid (vector 'db-adopt))
@@ -320,7 +335,18 @@
                        (vector 'db-reply (cdr entry) (sql-cfg-lost-err cfg)))))
              (let ((e (hashtable-ref leased pid #f)))
                (when e (drop-lease! pid e)))
-             (connect!)))
+             (connect!))
+            ;; (3) a worker that died while still connecting, without ever
+            ;; reporting. Nothing scheduled a retry for it, so this slot is
+            ;; rebuilt here -- backed off, because dying during connect is a
+            ;; connect failure and retrying it flat out is the storm that
+            ;; next-backoff! exists to prevent.
+            ((hashtable-contains? connecting pid)
+             (hashtable-delete! connecting pid)
+             (let ((wait (next-backoff!)))
+               (spawn (lambda ()
+                        (sleep-ms wait)
+                        (send me (vector 'pool-reconnect)))))))
           (loop))
         (`#(db-quit)
           (for-each (lambda (c) (send c (vector 'db-quit))) idle)
