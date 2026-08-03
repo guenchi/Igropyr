@@ -82,6 +82,21 @@
                                     ((string=? path "/effect")
                                      (set-box! effects (+ (unbox effects) 1))
                                      (tcp-close! c))
+                                    ;; HTTP/1.0 asking for keep-alive: the
+                                    ;; original persistent mechanism, and
+                                    ;; perfectly valid
+                                    ((string=? path "/ka10")
+                                     (tcp-write! c (string->utf8
+                                       (string-append
+                                         "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n"
+                                         "Connection: keep-alive\r\n\r\nhi")) #f)
+                                     (loop rest))
+                                    ;; answers and closes AT ONCE, so the eof
+                                    ;; is queued behind the response bytes
+                                    ((string=? path "/answerclose")
+                                     (tcp-write! c (string->utf8
+                                       "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi") #f)
+                                     (tcp-close! c))
                                     ;; a chunked stream that dribbles bytes
                                     ;; which never complete a chunk
                                     ((string=? path "/dribble")
@@ -143,6 +158,55 @@
     (guard (e (#t 'ok)) (get "/oddver"))
     (guard (e (#t 'ok)) (get "/oddver"))
     (check "an unknown HTTP version is not pooled" (= 2 (unbox accepts)))
+
+    ;; ---- HTTP/1.0 that asks for keep-alive --------------------------------
+    ;; 1.1 defaults to persistent and 1.0 does not, but a 1.0 response that
+    ;; SAYS keep-alive is persistent -- that is the original mechanism. An
+    ;; over-tight "1.1 only" rule threw away every reuse against such a peer.
+    (reset!)
+    (guard (e (#t 'ok)) (get "/ka10"))
+    (guard (e (#t 'ok)) (get "/ka10"))
+    (display "  [info] two HTTP/1.0 keep-alive requests over ")
+    (display (unbox accepts)) (display " connection(s)\n")
+    (check "HTTP/1.0 with an explicit keep-alive is reused"
+      (= 1 (unbox accepts)))
+
+    ;; ---- a peer that answers and closes in the same breath ----------------
+    ;; The response is complete and determinately framed, so it looks
+    ;; reusable -- but the eof is already queued behind it. Pooling that
+    ;; connection advertises one that is gone: the next request is handed
+    ;; it, and a non-idempotent one fails without a byte having been written.
+    ;; This race cannot be closed, only survived.
+    ;;
+    ;; The peer's FIN may not have been DELIVERED when the response finishes
+    ;; parsing, so no check at that moment can see it -- the keeper looks at
+    ;; its socket before offering, which catches the case where the evidence
+    ;; is already in hand, and catches nothing when the eof is still in
+    ;; flight. Every HTTP client with a pool has this window; the retry is
+    ;; what it is for.
+    ;;
+    ;; So what is asserted is the outcome that matters: the caller never
+    ;; sees it. Six rounds of answer-then-close, and every following request
+    ;; succeeds -- through a retry when it lost the race, which the counter
+    ;; shows.
+    (reset!)
+    (let ((before (cdr (assq 'stale (http-client-pool-stats))))
+          (ok (box 0)))
+      (let loop ((i 0))
+        (when (< i 6)
+          (guard (e (#t 'ok)) (get "/answerclose"))
+          (guard (e (#t 'failed))
+            (let ((r (get "/ka")))
+              (when (and (= 200 (response-status r))
+                         (equal? "hi" (utf8->string (response-body r))))
+                (set-box! ok (+ (unbox ok) 1)))))
+          (loop (+ i 1))))
+      (let ((after (cdr (assq 'stale (http-client-pool-stats)))))
+        (display "  [info] 6 rounds of answer-then-close: ")
+        (display (- after before)) (display " lost the race, ")
+        (display (unbox ok)) (display "/6 requests served\n")
+        (check "a peer that answers and closes never fails the next request"
+          (= 6 (unbox ok)))))
 
     ;; ---- a bodyless POST is not replayed -----------------------------------
     ;; The server performs the effect and then drops without answering. On a
