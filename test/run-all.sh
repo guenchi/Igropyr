@@ -80,6 +80,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/redis-incremental.sc
 # ceilings on what a reply may cost, each case lowering the one it tests
 "$scheme_bin" --script igropyr/test/redis-limits.sc
+# a bad command argument must be refused in the CALLER; encoding it inside
+# the connection actor killed a connection shared by the whole application
+"$scheme_bin" --script igropyr/test/redis-bad-arg.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc
 "$scheme_bin" --script igropyr/test/static-cache-capacity.sc
 # one file must be one cache entry: self-skips on a case-sensitive
