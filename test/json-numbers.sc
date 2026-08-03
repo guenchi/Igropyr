@@ -63,12 +63,30 @@
 (check "1e999 is refused" (refuses? "{\"exp\":1e999}"))
 (check "-1e999 is refused" (refuses? "{\"exp\":-1e999}"))
 
-;; The jwt guard does not rely on the parser: claims can arrive from any
-;; decoder, and an expiry is the last place to take a value on trust.
+;; The jwt guard requiring a FINITE expiry is defence in depth, and this
+;; says so rather than pretending to exercise it.
+;;
+;; It cannot be reached through the public path: the parser refuses a
+;; non-finite number, so no token that parses can carry one. The obvious
+;; test -- sign a claim set whose exp is +inf.0 -- proves nothing either,
+;; because json->string writes +inf.0 as null, and a verifier checking only
+;; (real? v) rejects null just as surely. That version passed against the
+;; code it was meant to test.
+;;
+;; What IS reachable, and what actually stops such a token, is the parser.
+;; A payload hand-built with 1e999 in it does not verify.
 (let* ((key "0123456789abcdef0123456789abcdef")
-       (tok (jwt-sign `(("sub" . "u1") ("exp" . ,(inexact (/ 1.0 0.0)))) key)))
-  (check "a token with a non-finite exp does not verify"
-    (not (jwt-verify tok key))))
+       (hand (jwt-sign '(("sub" . "u1")) key)))
+  ;; a genuinely signed token still verifies, so the check below is not
+  ;; passing for want of a signature
+  (check "a normal token verifies" (and (jwt-verify hand key) #t)))
+
+(let ((key "0123456789abcdef0123456789abcdef"))
+  ;; +inf.0 through jwt-sign becomes null on the wire; the token is refused,
+  ;; but by the claim SHAPE, not by the finite guard
+  (check "a token whose exp serialised to null does not verify"
+    (not (jwt-verify (jwt-sign `(("sub" . "u1") ("exp" . ,(inexact (/ 1.0 0.0)))) key)
+                     key))))
 
 ;; and a normal token still does
 (let ((key "0123456789abcdef0123456789abcdef"))

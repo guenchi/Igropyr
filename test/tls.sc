@@ -11,7 +11,8 @@
 ;;;
 ;;; Requires the openssl CLI. Certs are ephemeral (test/tls-certs.sh).
 
-(import (chezscheme) (igropyr http-client) (igropyr tls) (igropyr http))
+(import (chezscheme) (igropyr http-client) (igropyr tls) (igropyr http)
+        (igropyr actor) (igropyr libuv))
 
 (define dir "/tmp/igropyr-tls-test")
 (define port-good 18441)
@@ -86,6 +87,51 @@
     (let ((msg (get-error "https://127.0.0.1:18443/")))
       (unless msg (fail! "wrong-host-accepted")))
     (display "wrong-hostname certificate rejected ok\n")
+
+    ;; ---- a DNS hostname, not an IP ------------------------------------
+    ;; Every case above connects to 127.0.0.1, which exercises the IP SAN
+    ;; path and nothing else: no name is resolved, and the SNI extension
+    ;; carries an address rather than a host. The good certificate also
+    ;; carries DNS:localhost, so the name path can be walked for real.
+    (let ((r (http-get "https://localhost:18441/" '((timeout . 8000)))))
+      (unless (= (response-status r) 200)
+        (fail! "dns-name-tls" (response-status r))))
+    (display "TLS to a DNS name (SNI + DNS SAN) ok\n")
+
+    ;; ...and the name must be CHECKED, not merely sent. The wrong-name
+    ;; certificate is for wrong.example, so localhost must be refused --
+    ;; the IP case above cannot show this, since an IP mismatch and a name
+    ;; mismatch are different comparisons.
+    (let ((msg (get-error "https://localhost:18443/")))
+      (unless msg (fail! "dns-name-mismatch-accepted")))
+    (display "a DNS name that the certificate does not cover is rejected ok\n")
+
+    ;; ---- a handshake that never finishes ------------------------------
+    ;; A peer that accepts the TCP connection and then says nothing used to
+    ;; be bounded only per segment, so it could hold the caller for as long
+    ;; as it kept dribbling. What is asserted is WHEN the call returns.
+    (let ((silent-port 18449))
+      (tcp-listen! "127.0.0.1" silent-port 4
+        (lambda (c)
+          ;; accept and stay silent; a process owns it so nothing else
+          ;; consumes its messages
+          (let ((pid (spawn (lambda ()
+                              (receive (after 20000 (tcp-close! c))
+                                (`#(tcp-eof) (tcp-close! c))
+                                (`#(tcp-error ,e) (tcp-close! c)))))))
+            (conn-set-owner! c pid)
+            (tcp-read-start! c)))
+        0)
+      (sleep-ms 100)
+      (let* ((t0 (now-ms))
+             (msg (get-error (string-append "https://127.0.0.1:"
+                                            (number->string silent-port) "/")))
+             (ms (- (now-ms) t0)))
+        (unless msg (fail! "silent-tls-peer-accepted"))
+        (display "  [info] a silent TLS peer gave up after ")
+        (display ms) (display " ms\n")
+        (when (> ms 20000) (fail! "silent-tls-peer-unbounded" ms))))
+    (display "a TLS handshake that never completes is bounded ok\n")
 
     ;; plain http still works with the connector registered
     (http-listen port-plain
