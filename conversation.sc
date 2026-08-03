@@ -229,6 +229,17 @@
   (define (token=? a b)
     (and a b (string? a) (string? b) (string=? a b)))
 
+  ;; The next token, guaranteed different from the one just spent.
+  ;; classify reads 'advance before 'replay, and that order is only
+  ;; unambiguous while the two tokens differ: were a new token to repeat
+  ;; the consumed one, the retry of the request that was already accepted
+  ;; would be read as the answer to the NEXT reply. Sixty-four random bits
+  ;; will not collide -- but a rule's precondition should hold because it
+  ;; is enforced, not because it is unlikely.
+  (define (fresh-token unlike)
+    (let loop ((t (conv-token!)))
+      (if (token=? t unlike) (loop (conv-token!)) t)))
+
   ;; THE RULES. key-of is a thunk, so an invented token costs no application
   ;; code at all: only a request that already matched the spent token is
   ;; ever reduced to a key.
@@ -677,7 +688,8 @@
 
                    (define (suspend! reply)
                      (step-state-steps-set! st (+ 1 (step-state-steps st)))
-                     (step-state-awaiting-set! st (conv-token!))
+                     (step-state-awaiting-set! st
+                       (fresh-token (step-state-consumed st)))
                      (step-state-reply-set! st reply)
                      (set-box! step-box (step-state-steps st))
                      (set-phase! st 'parked)
