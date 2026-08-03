@@ -223,10 +223,42 @@
            (name (conversation-name id))
            (starter self)
            (ref (gensym))
+           ;; shared with the watchdog below: step-box counts completed
+           ;; suspends (progress), running-box says whether the flow is
+           ;; executing rather than parked waiting for the next request
+           (step-box (box 0))
+           (running-box (box #t))
            (conv
              (spawn
                (lambda ()
                  (register name self)
+                 ;; A WATCHDOG, because the TTL below only bounds time spent
+                 ;; parked in suspend!. A step that runs long -- slow I/O, a
+                 ;; wait that never returns, a CPU loop -- leaves that receive
+                 ;; entirely, and nothing else was counting: the conversation
+                 ;; could hold its transaction, its reservation or its
+                 ;; connection indefinitely. The pool's stuck-killer does not
+                 ;; cover it either; that reaps the WORKER waiting for the
+                 ;; reply, while the conversation is its own process.
+                 ;;
+                 ;; Rearmed by each suspend!, so an idle-but-healthy dialogue
+                 ;; is not killed for being slow between rounds; what it
+                 ;; bounds is one step.
+                 (let ((watched self))
+                   (spawn
+                     (lambda ()
+                       (let loop ((seen 0))
+                         (sleep-ms ttl)
+                         (let ((now (unbox step-box)))
+                           (cond
+                             ((not (process-alive? watched)) 'done)
+                             ;; advanced since the last look: still moving
+                             ((not (= now seen)) (loop now))
+                             ;; a whole TTL with no progress and not parked
+                             ;; in suspend! -- the step itself is stuck
+                             ((unbox running-box)
+                              (kill watched 'conversation-expired))
+                             (else (loop now))))))))
                  (let ((who starter) (tag ref) (step 0))
                    ;; One resume per step. Two concurrent resumes -- a double
                    ;; click, a client retry, two front ends -- both land in
@@ -241,6 +273,8 @@
                    ;; is mid-step, and the caller can retry when it is not.
                    (define (suspend! reply)
                      (set! step (+ step 1))
+                     (set-box! step-box step)
+                     (set-box! running-box #f)      ; parked from here
                      (send who (vector 'conv-reply tag reply))
                      ;; Refuse anything that arrived WHILE THE STEP WAS
                      ;; RUNNING, before waiting for the next one. Those
@@ -259,7 +293,9 @@
                            (drain))))
                      (receive (after ttl (raise 'conversation-expired))
                        (`#(conv-step ,from ,ref2 ,r)
-                         (set! who from) (set! tag ref2) r)))
+                         (set! who from) (set! tag ref2)
+                         (set-box! running-box #t)  ; executing again
+                         r)))
                    (let ((final (flow req suspend!)))
                      (unregister name)
                      (send who (vector 'conv-reply tag final))))))))
