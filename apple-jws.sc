@@ -200,6 +200,20 @@
           (ajws-fail 'bad-alg "unexpected JWS alg (want ES256)"))
         (unless (and (vector? x5c) (fx>= (vector-length x5c) 3))
           (ajws-fail 'no-x5c "x5c header missing or shorter than 3 certificates"))
+        ;; And an UPPER bound, checked before any DER is decoded or handed to
+        ;; OpenSSL. The chain below is parsed entry by entry and only then
+        ;; compared against the pinned root, so an oversized x5c buys a lot of
+        ;; synchronous X.509 parsing and native allocation from an unverified
+        ;; header -- on the one OS thread, where a green process cannot
+        ;; isolate the delay. Apple presents three; a handful is generous.
+        (when (fx> (vector-length x5c) 8)
+          (ajws-fail 'no-x5c "x5c chain is longer than 8 certificates"))
+        ;; Likewise the encoded size: one entry can be arbitrarily long, and
+        ;; base64-decode plus der->x509 both scale with it.
+        (do ((i 0 (fx+ i 1))) ((fx= i (vector-length x5c)))
+          (let ((e (vector-ref x5c i)))
+            (unless (and (string? e) (fx<= (string-length e) 8192))
+              (ajws-fail 'cert-parse-failed "x5c entry is missing or too large"))))
         (let ((certs '()))
           (dynamic-wind
             (lambda () (void))
