@@ -23,10 +23,27 @@
   (for-each (lambda (x) (display " ") (write x)) info) (newline)
   (exit 1))
 
+;; Children are killed BY PID, recorded when they start.
+;;
+;; `pkill -f` does not match here -- in a sandboxed run the pattern never
+;; finds them -- so every run left its children alive, holding their ports.
+;; The next run then joined the PREVIOUS run's nodes: a node this test had
+;; just killed went on answering, and the record-expiry case failed with
+;; every later run inheriting the mess. A pid file cannot be wrong about
+;; which process it means.
+(define (child-pid-file name)
+  (string-append "/tmp/igropyr-cluster-" name ".pid"))
+
 (define (spawn-child! name port strategy)
   (system (string-append "scheme --script igropyr/test/cluster-child.sc "
                          name " " (number->string port) " " secret " "
-                         strategy " " (number->string a-port) " &")))
+                         strategy " " (number->string a-port)
+                         " & echo $! > " (child-pid-file name))))
+
+(define (kill-child! name)
+  (system (string-append
+            "kill -9 $(cat " (child-pid-file name) " 2>/dev/null) 2>/dev/null;"
+            " rm -f " (child-pid-file name))))
 
 ;; confirm a two-way link to `who`: ping its 'ping process, await pong
 (define (confirm-link! who)
@@ -74,7 +91,7 @@
     (display "static discovery auto-mesh ok\n")
     (rsend 'b 'ping (vector 'quit))         ; not a ping; child ignores
     (rsend 'b 'main (vector 'quit))         ; no 'main on child; harmless
-    (system "pkill -f 'cluster-child.sc b ' 2>/dev/null")
+    (kill-child! "b")
     (sleep-ms 1500)
 
     ;; ---- redis strategy (guarded) ----
@@ -113,7 +130,7 @@
           (display "redis expiry pruning ok\n")
 
           (rsend 'c 'ping (vector 'quit))
-          (system "pkill -f 'cluster-child.sc c ' 2>/dev/null")
+          (kill-child! "c")
           (redis r "DEL" key)
           (redis-close! r)))
 
@@ -140,7 +157,7 @@
     ;; kill e: its record stops advancing, so it must age OUT OF THE
     ;; VIEW within ttl -- stale echoes between a and d must not keep the
     ;; zombie alive (the record-level assertion, not just link death)
-    (system "pkill -f 'cluster-child.sc e ' 2>/dev/null")
+    (kill-child! "e")
     (let poll ((tries 0))
       (let ((view (gen-server-call 'igropyr-gossip:gossip-cluster 'members)))
         (cond ((not (assq 'e view))
@@ -160,8 +177,8 @@
     (confirm-link! 'e)
     (display "gossip seed rejoin ok\n")
 
-    (system "pkill -f 'cluster-child.sc d ' 2>/dev/null")
-    (system "pkill -f 'cluster-child.sc e ' 2>/dev/null")
+    (kill-child! "d")
+    (kill-child! "e")
 
     (display "ALL CLUSTER TESTS PASSED\n")
     (exit 0)))

@@ -96,9 +96,20 @@
 ;;;     how a flow's effects get applied twice -- exactly what the ring
 ;;;     exists to prevent. Retry only on 'gone; on 'unreachable the
 ;;;     outcome is unknown, so reconcile rather than resubmit.
-;;;   - TTL expiry raises 'conversation-expired inside the flow, so a
-;;;     guard can roll back explicitly; re-raise (or don't catch) so the
-;;;     process exits.
+;;;   - TTL EXPIRY HAS TWO PATHS, and only one of them raises.
+;;;     A conversation that sat PARKED too long is raised at:
+;;;     'conversation-expired reaches the flow, a guard runs, and it can
+;;;     roll back explicitly (re-raise, or don't catch, so the process
+;;;     exits).
+;;;     A STEP that overruns is KILLED -- that is what the watchdog is
+;;;     for, and a step stuck in a loop or a foreign call cannot be raised
+;;;     at. @kill discards dynamic-wind winders, so the flow's guard does
+;;;     NOT run. A pooled database connection is still safe: the pool
+;;;     monitors its borrower and rebuilds the connection when it dies,
+;;;     which drops the transaction. Anything held IN PROCESS is not --
+;;;     a reservation, a file handle, an in-memory hold. Pass an
+;;;     on-killed thunk (conversation-start!'s fifth argument) to release
+;;;     those; it runs after the kill, outside the dead process.
 ;;;   - a crash before the first suspend! makes conversation-start!
 ;;;     raise #(conversation-failed reason) in the caller -- the worker
 ;;;     crashes, and the pool's normal retry handles it (nothing had
@@ -439,6 +450,32 @@
              (if (and (pair? opts) (pair? (cdr opts)) (cadr opts))
                  (cadr opts)
                  values))
+           ;; RUN WHEN THE WATCHDOG KILLS A RUNNING STEP.
+           ;;
+           ;; The library says TTL expiry raises 'conversation-expired
+           ;; inside the flow so a guard can roll back. That is true of a
+           ;; conversation that sat parked too long -- and false of the one
+           ;; the watchdog exists for. A step that overruns is KILLED, and
+           ;; @kill discards dynamic-wind winders, so the flow's guard does
+           ;; not run at all.
+           ;;
+           ;; A pooled database connection survives that anyway: the pool
+           ;; monitors its borrower, and a dead borrower means destroy and
+           ;; rebuild, which drops the connection and the server rolls the
+           ;; transaction back. Anything the flow holds IN PROCESS does not.
+           ;; A reservation, a file handle, an in-memory hold -- the money
+           ;; deducted from a balance and restored in a guard -- stays held
+           ;; for the life of the VM.
+           ;;
+           ;; So: a thunk, run after the kill, in the watchdog's own
+           ;; process. It cannot touch the flow's stack (that is gone); it
+           ;; releases what the flow was holding, which the application
+           ;; reaches through whatever it closed over. Its own exceptions
+           ;; are swallowed -- the watchdog must survive a bad hook.
+           (on-killed
+             (if (and (pair? opts) (pair? (cdr opts)) (pair? (cddr opts)))
+                 (caddr opts)
+                 #f))
            (id (conversation-id!))
            (name (conversation-name id))
            (starter self)
@@ -486,7 +523,11 @@
                              ;; running, and running for longer than one
                              ;; step is allowed
                              ((> (- (now-ms) (unbox run-start-box)) ttl)
-                              (kill watched 'conversation-expired))
+                              (kill watched 'conversation-expired)
+                              ;; the flow's winders did not run; this is
+                              ;; the only chance to release what it held
+                              (when on-killed
+                                (guard (e (#t (void))) (on-killed))))
                              (else (loop))))))))
                  ;; `awaiting` is the token the flow is currently waiting to
                  ;; be answered with, or #f while a step is running. It is

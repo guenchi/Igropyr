@@ -186,34 +186,52 @@
       (if (or (<= amt 0) (> amt (unbox account)))
           (begin (set-status! res 400)
                  (send-json! res (list (cons 'error "bad amount"))))
+          ;; ONE IDEMPOTENT RELEASER, used by every path that gives the
+          ;; hold back. The flow's guard runs when the flow raises; the
+          ;; on-killed hook runs when the watchdog kills a step, because
+          ;; @kill discards that guard. Those are normally exclusive -- but
+          ;; a flow that raises just as the watchdog decides to kill it
+          ;; reaches both, and returning the money twice is a worse bug
+          ;; than never returning it. A hold in a database does not need
+          ;; this; one in a box does.
+          (let* ((released (box #f))
+                 (release!
+                   (lambda ()
+                     (unless (unbox released)
+                       (set-box! released #t)
+                       (set-box! account (+ (unbox account) amt))))))
           (let-values (((id token reply)
                         (conversation-start!
                           (lambda (req suspend!)
                             (set-box! account (- (unbox account) amt))  ; hold
-                            (guard (e (#t (set-box! account (+ (unbox account) amt))
-                                          (raise e)))                   ; roll back
+                            (guard (e (#t (release!) (raise e)))
                               (let ((req2 (suspend! (list (cons 'step "confirm")
                                                           (cons 'amount amt)))))
                                 (if (equal? (utf8->string (req-body req2)) "confirm")
-                                    (list (cons 'done #t)
-                                          (cons 'balance (unbox account)))
                                     (begin
-                                      (set-box! account (+ (unbox account) amt))
+                                      ;; committed: the hold becomes the
+                                      ;; transfer, so nothing is released
+                                      (set-box! released #t)
+                                      (list (cons 'done #t)
+                                            (cons 'balance (unbox account))))
+                                    (begin
+                                      (release!)
                                       (list (cons 'done #f)
-                                            (cons 'cancelled #t)))))))
+                                            (cons 'cancelled #t))))))
                           req
                           15000                                         ; demo TTL 15s
                           ;; two retries of the same call are two different
                           ;; request records; what identifies the call is
                           ;; its body, and the body is all that is retained
-                          req-body)))
+                          req-body
+                          release!)))
             ;; The token goes to the client and must come back with the
             ;; next request. It says WHICH reply is being answered, which is
             ;; what stops a double click or a retried request from advancing
             ;; the flow past a reply nobody read -- here, confirming a
             ;; transfer the user never saw the amount for.
             (send-json! res (cons (cons 'conv id)
-                                  (cons (cons 'token token) reply))))))))
+                                  (cons (cons 'token token) reply))))))))))
 
 ;; The token comes back as ?token=N. A request without it, or with an old
 ;; one, is refused: it was written against a reply that is no longer the
