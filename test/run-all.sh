@@ -128,6 +128,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/sqlpool-connect-death.sc
 # mysql option validation (no server needed, always runs)
 "$scheme_bin" --script igropyr/test/mysql-opts.sc
+# mysql wire-level, against an in-process fake server (always runs): the
+# handshake, a result set reassembled across 256 fragment boundaries, and
+# refusal of a packet the 24-bit length field cannot describe
+"$scheme_bin" --script igropyr/test/mysql-wire.sc
 # opt-in (needs a live MySQL): runs for real only when IGROPYR_MYSQL_TEST is
 # set, otherwise self-skips, so this is a no-op on machines without a database.
 "$scheme_bin" --script igropyr/test/mysql.sc
