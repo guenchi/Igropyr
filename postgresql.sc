@@ -590,30 +590,47 @@
   ;; normal SQL error); TO STDOUT is not supported -- its data stream is
   ;; consumed and a feature-not-supported error is raised, rather than
   ;; silently discarding the rows and reporting success.
+  ;; A whole result set is materialised in memory, so it needs a ceiling of
+  ;; its own: max-message-len bounds ONE wire message, and a million small
+  ;; rows never trip it. An unbounded SELECT is how a client runs the VM out
+  ;; of memory on behalf of a query someone wrote by accident. Refusing
+  ;; leaves the connection framed (the error is raised after ReadyForQuery,
+  ;; like any other), so the pool keeps it.
+  (define max-result-rows 1000000)
+
   (define (read-response! c buf)
-    (let loop ((names #f) (rows '()) (result #f) (err #f))
+    (let loop ((names #f) (rows '()) (result #f) (err #f) (n 0))
       (let-values (((t p) (next-msg! c buf query-timeout-ms)))
         (case (integer->char t)
-          ((#\T) (loop (parse-row-desc p) '() result err))
-          ((#\D) (loop names (cons (parse-data-row p) rows) result err))
+          ((#\T) (loop (parse-row-desc p) '() result err 0))
+          ((#\D)
+           (if (>= n max-result-rows)
+               ;; keep draining to ReadyForQuery so the connection stays
+               ;; usable, but remember the refusal
+               (loop names rows result
+                     (or err (vector 'postgresql-error "53400"
+                                     "result set exceeds max-result-rows"))
+                     n)
+               (loop names (cons (parse-data-row p) rows) result err (+ n 1))))
           ((#\C)
            (loop #f '()
                  (if names
                      (vector 'rows names (reverse rows))
                      (vector 'ok (command-affected p)))
-                 err))
-          ((#\I) (loop #f '() (vector 'ok 0) err))          ; EmptyQueryResponse
+                 err 0))
+          ((#\I) (loop #f '() (vector 'ok 0) err 0))          ; EmptyQueryResponse
           ((#\G #\W)                                        ; CopyIn/CopyBoth
            (send-msg! c MSG-COPY-FAIL
              (cstr "COPY FROM STDIN is not supported by this client"))
-           (loop names rows result err))                    ; server sends E, Z
+           (loop names rows result err n))                   ; server sends E, Z
           ((#\H)                                            ; CopyOutResponse
            (loop names rows result
                  (or err (vector 'postgresql-error "0A000"
-                                 "COPY TO STDOUT is not supported by this client"))))
-          ((#\E) (loop names rows result (error-response->fail p)))
+                                 "COPY TO STDOUT is not supported by this client"))
+                 n))
+          ((#\E) (loop names rows result (error-response->fail p) n))
           ((#\Z) (if err (raise err) (or result (vector 'ok 0))))
-          (else (loop names rows result err))))))     ; S, N, K, 1, 2, n, d, c
+          (else (loop names rows result err n))))))    ; S, N, K, 1, 2, n, d, c
 
   (define (run-query! c buf sql)
     (send-msg! c MSG-QUERY (cstr sql))
