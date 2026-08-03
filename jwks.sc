@@ -230,6 +230,31 @@
   ;; ---- JWKS fetch + cache ------------------------------------------------
 
   (define jwks-cache (make-hashtable string-hash string=?))  ; url -> (jwks . at)
+  ;; Actor processes are preemptive, and Chez hashtable operations are not a
+  ;; safe interruption boundary while a table is being resized. Keep every
+  ;; access in one short interrupt-free section. The generation also gives
+  ;; cache-clear! a linearization point: a fetch that began before the clear
+  ;; may still return its document to its caller, but cannot repopulate the
+  ;; shared cache after the clear has completed.
+  (define jwks-cache-generation 0)
+
+  (define (cache-generation)
+    (with-interrupts-disabled jwks-cache-generation))
+
+  (define (cache-ref url)
+    (with-interrupts-disabled
+      (hashtable-ref jwks-cache url #f)))
+
+  (define (cache-store-if-current! url entry generation)
+    (with-interrupts-disabled
+      (when (= generation jwks-cache-generation)
+        (hashtable-set! jwks-cache url entry))))
+
+  (define (cache-clear!)
+    (with-interrupts-disabled
+      (set! jwks-cache-generation (+ jwks-cache-generation 1))
+      (hashtable-clear! jwks-cache)))
+
   (define jwks-ttl-s 21600)                                  ; 6h
   (define jwks-fetch-timeout-ms 10000)
   ;; A JWKS is a handful of keys; anything larger is not one, and the reply
@@ -263,7 +288,8 @@
               #t)))))
 
   (define-checked (jwks-fetch! (url string?))
-    (let ((r (guard (e (#t (jwks-fail "jwks fetch failed")))
+    (let* ((generation (cache-generation))
+           (r (guard (e (#t (jwks-fail "jwks fetch failed")))
                (http-request 'GET url
                  `((timeout . ,jwks-fetch-timeout-ms)
                    (max-response . ,jwks-max-bytes))))))
@@ -271,16 +297,16 @@
         (jwks-fail "jwks fetch non-200"))
       (let ((jwks (guard (e (#t (jwks-fail "jwks parse failed")))
                     (string->json (utf8->string (response-body r))))))
-        (hashtable-set! jwks-cache url (cons jwks (now-sec)))
+        (cache-store-if-current! url (cons jwks (now-sec)) generation)
         jwks)))
 
   (define (cached-jwks url)
-    (let ((hit (hashtable-ref jwks-cache url #f)))
+    (let ((hit (cache-ref url)))
       (if (and hit (< (- (now-sec) (cdr hit)) jwks-ttl-s))
           (car hit)
           (jwks-fetch! url))))
 
-  (define (jwks-cache-clear!) (hashtable-clear! jwks-cache))
+  (define (jwks-cache-clear!) (cache-clear!))
 
   ;; JWKS document -> the key entry whose kid matches, or #f
   (define (jwks-key-for jwks kid)
