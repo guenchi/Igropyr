@@ -285,6 +285,43 @@
             (`#(r1 ,v) (loop (cons (cons 'r1 v) got) (+ n 1)))
             (`#(r2 ,v) (loop (cons (cons 'r2 v) got) (+ n 1))))))))
 
+;; ---- peek: settling the question after 'unreachable ---------------------
+;;
+;; 'unreachable is not a rollback guarantee and never can be -- a broken
+;; link says nothing about the process behind it. A caller left holding
+;; that answer had no way to settle the question, and the one thing it must
+;; not do is resubmit, which is how a flow's effects get applied twice.
+;;
+;; peek answers without advancing anything: what is it waiting for, and
+;; what did it last say.
+(let-values (((pid ptok pfirst)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (vector 'final a)))
+                'go
+                5000)))
+  ;; parked: peek reports the token that continues it, and the reply it is
+  ;; waiting to have answered
+  (let-values (((state token reply) (conversation-peek pid)))
+    (unless (eq? state 'parked) (fail "peek-parked-state" state))
+    (unless (eqv? token ptok) (fail "peek-parked-token" token))
+    (unless (equal? reply (vector 'parked 'go)) (fail "peek-parked-reply" reply)))
+  ;; ...and it did NOT advance: the token still works
+  (let-values (((r next) (conversation-resume! pid ptok 'X)))
+    (unless (equal? r (vector 'final 'X)) (fail "peek-advanced-the-flow" r)))
+  ;; completed: peek reports the final answer, still inside the linger
+  (let-values (((state token reply) (conversation-peek pid)))
+    (unless (eq? state 'completed) (fail "peek-completed-state" state))
+    (unless (eq? token #f) (fail "peek-completed-token" token))
+    (unless (equal? reply (vector 'final 'X)) (fail "peek-completed-reply" reply)))
+  (display "peek reports parked / completed without advancing ok\n"))
+
+;; an id nobody knows is 'gone, not an error
+(let-values (((state token reply) (conversation-peek "deadbeef")))
+  (unless (eq? state 'gone) (fail "peek-unknown-id" state)))
+(display "peek on an unknown id -> gone ok\n")
+
 ;; The TTL must bound a RUNNING step, not only time parked in suspend!.
 ;; A step that runs long -- slow I/O, a wait that never returns, a CPU loop
 ;; -- leaves that receive entirely, and nothing else was counting: the

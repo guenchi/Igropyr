@@ -59,6 +59,21 @@
         (fail! "id-not-owned-by-b" id))
       (display "forwarded conversation created, owner=b ok\n")
 
+      ;; peek crosses the link too, with the same failure semantics: an
+      ;; owner we cannot reach is 'unreachable, never 'gone. This is the
+      ;; call a caller makes AFTER an 'unreachable resume, once the link is
+      ;; back, instead of resubmitting.
+      (let-values (((st tk rp) (conversation-peek id)))
+        (unless (eq? st 'parked) (fail! "cross-node-peek-state" st))
+        (unless (eqv? tk tok0) (fail! "cross-node-peek-token" tk))
+        (unless (equal? rp (vector 'ack 0)) (fail! "cross-node-peek-reply" rp)))
+      (display "peek across the link reports the parked step ok\n")
+
+      ;; an owner node we never heard of is unreachable, not gone
+      (let-values (((st tk rp) (conversation-peek "nowhere~deadbeef")))
+        (unless (eq? st 'unreachable) (fail! "peek-unknown-owner" st)))
+      (display "peek to an unknown owner -> unreachable ok\n")
+
       ;; each round answers the reply it was handed, and the next token
       ;; comes back over the link with it
       (let-values (((r t1) (conversation-resume! id tok0 5)))
