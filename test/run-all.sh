@@ -92,6 +92,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # is missing) on a libcrypto older than OpenSSL 3.2, which is what Debian 12
 # and Ubuntu 22.04 ship. The argon2id guard tests still run there.
 "$scheme_bin" --script igropyr/test/kdf.sc
+# pool bookkeeping against fake connection workers (no server needed):
+# a caller that dies or times out WHILE QUEUED must cost neither a
+# healthy connection nor a later, unwanted execution
+"$scheme_bin" --script igropyr/test/sqlpool-lifecycle.sc
 # mysql option validation (no server needed, always runs)
 "$scheme_bin" --script igropyr/test/mysql-opts.sc
 # opt-in (needs a live MySQL): runs for real only when IGROPYR_MYSQL_TEST is
