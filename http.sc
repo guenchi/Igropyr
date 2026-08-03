@@ -962,7 +962,16 @@
   ;; completion, if it ever runs, from posting into a mailbox nobody is
   ;; reading -- and the drain covers the narrow case where it fired just as
   ;; the timer did, so the message is already queued.
-  (define (abandon-write! b c)
+  ;; r may be #f where the response record is not to hand; when it is
+  ;; given, the response is marked FINISHED here. Leaving the mode alone
+  ;; meant the exchange was over on the wire and still looked unfinished in
+  ;; the record: res-spawn!'s watcher saw a stream in progress and aborted a
+  ;; connection that was already closed, and a caller following the
+  ;; documented "#f -> res-abort-file!" path did the same -- a second close
+  ;; and a second conn-closed for one response.
+  (define (abandon-write! b c . rest)
+    (let ((r (and (pair? rest) (car rest))))
+      (when r (res-mode-set! r 'done)))
     (set-box! b 'abandoned)
     (receive (after 0 'ok)
       (`#(chunk-written ,_) 'ok)
@@ -1010,7 +1019,7 @@
                    (begin
                      (set-box! b 'parked)
                      (receive (after (write-wait-ms)
-                                 (abandon-write! b c)
+                                 (abandon-write! b c r)
                                  #f)
                        (`#(chunk-written ,st2) (>= st2 0))))
                    (>= st 0)))))))
@@ -1070,11 +1079,16 @@
                   (if (eq? st 'pending)
                       (begin
                         (set-box! b 'parked)
-                        (let ((st2 (receive (after (write-wait-ms)
-                                               (abandon-write! b c)
-                                               -1)
-                                     (`#(chunk-written ,v) v))))
-                          (finish! st2)))
+                        ;; A timeout is TERMINAL here: abandon-write! has
+                        ;; already closed the connection and told the reader.
+                        ;; Running finish! afterwards closed a second time
+                        ;; and sent a second conn-closed for the same
+                        ;; response -- two terminal notifications, and the
+                        ;; second one arriving at whatever the reader had
+                        ;; become.
+                        (receive (after (write-wait-ms)
+                                    (abandon-write! b c r))
+                          (`#(chunk-written ,v) (finish! v))))
                       (finish! st))))))))) 
 
   ;; ---- fixed-length streaming (large files) --------------------------------
@@ -1101,15 +1115,29 @@
                 (write-response!* c status headers
                                   empty-bv (res-keep-alive? r) len))
               (begin
-                (res-mode-set! r 'raw)
-                (res-remaining-set! r len)
-                (tcp-write! c
-                  (string->utf8
-                    (assemble-head status headers
-                      "Content-Length: " (number->string len)
-                      (if (res-keep-alive? r) keep-alive-tail close-tail)))
-                  #f)
-                (send (conn-owner c) (vector 'streaming))))))))
+                ;; A declared length of ZERO is already satisfied: there is
+                ;; no block left to write, so no call can ever reach the
+                ;; final-block branch that ends the response. Answering it
+                ;; as a complete response here leaves the mode 'done, so a
+                ;; caller written as begin-file/write/end still terminates
+                ;; -- the same shape the bodyless branch above uses. Left
+                ;; as a stream it parked the reader with nothing able to
+                ;; release it but an abort.
+                (if (fx= len 0)
+                    (begin
+                      (res-mode-set! r 'done)
+                      (write-response!* c status headers
+                                        empty-bv (res-keep-alive? r) 0))
+                    (begin
+                      (res-mode-set! r 'raw)
+                      (res-remaining-set! r len)
+                      (tcp-write! c
+                        (string->utf8
+                          (assemble-head status headers
+                            "Content-Length: " (number->string len)
+                            (if (res-keep-alive? r) keep-alive-tail close-tail)))
+                        #f)
+                      (send (conn-owner c) (vector 'streaming))))))))))
 
   ;; Write one chunk and wait for it to drain before returning --
   ;; backpressure: the producer runs exactly at the client's pace, one
@@ -1158,7 +1186,7 @@
                  (begin
                    (set-box! b 'parked)
                    (receive (after (write-wait-ms)
-                               (abandon-write! b (res-conn r))
+                               (abandon-write! b (res-conn r) r)
                                #f)
                      (`#(file-written ,st2) (and (>= st2 0) 'more))))
                  (and (>= st 0) 'more))))))))
@@ -1693,7 +1721,7 @@
       (`#(next-request)
         (if eof? (tcp-close! c) (reader-loop c srv buf)))
       (`#(conn-closed) 'done)
-      (`#(streaming) (await-streaming c srv buf))
+      (`#(streaming) (await-streaming c srv buf eof?))
       (`#(tcp-data ,bv)
         (inbuf-append! buf bv)
         (if (> (inbuf-length buf) pipeline-limit)
@@ -1725,23 +1753,31 @@
   ;; A streamed (chunked/SSE) response is in progress: wait without a
   ;; deadline. The producer notices a departed client through res-write!
   ;; returning #f, or through its write timing out.
-  (define (await-streaming c srv buf)
+  ;; eof?: the peer has closed its WRITE side. It cannot send another
+  ;; request, so when the stream ends there is nothing to keep the
+  ;; connection for -- looping back to reader-loop would park it for a full
+  ;; read timeout waiting for bytes that cannot come. Carrying the flag
+  ;; through the transition is also why await-response takes it: dropping
+  ;; it there lost the only thing known about the peer.
+  (define (await-streaming c srv buf . rest)
+    (let ((eof? (and (pair? rest) (car rest))))
     (receive (after 'infinity #f)
-      (`#(next-request) (reader-loop c srv buf))
+      (`#(next-request)
+        (if eof? (begin (tcp-close! c) 'done) (reader-loop c srv buf)))
       (`#(conn-closed) 'done)
       (`#(tcp-data ,bv)
         (inbuf-append! buf bv)
         (if (> (inbuf-length buf) pipeline-limit)
             (begin (tcp-close! c) 'done)
-            (await-streaming c srv buf)))
+            (await-streaming c srv buf eof?)))
       ;; Same reasoning as await-response's eof, and the same mistake was
       ;; here: a stream is under way, which means the request was complete,
       ;; so an eof is the peer closing its WRITE side and waiting. Closing
       ;; ended the stream at its first byte. A client that really left is
       ;; still noticed -- by the writes failing, which is what stops the
       ;; producer either way.
-      (`#(tcp-eof) (await-streaming c srv buf))
-      (`#(tcp-error ,e) (tcp-close! c) 'done)))
+      (`#(tcp-eof) (await-streaming c srv buf #t))
+      (`#(tcp-error ,e) (tcp-close! c) 'done))))
 
   ;; ---- websocket session ---------------------------------------------------------
 

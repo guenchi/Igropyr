@@ -121,6 +121,15 @@
               (let loop ()
                 (if (res-write! res (make-string 262144 #\x)) (loop) (void)))))))
 
+      ;; A fixed-length response of length ZERO. There is no block left to
+      ;; write, so no call can reach the final-block branch that ends the
+      ;; response: left as a stream it parked the reader with nothing able
+      ;; to release it but an abort.
+      (app-get app "/empty-file"
+        (lambda (req res)
+          (res-begin-file! res 0)
+          (res-spawn! res (lambda () (void)))))
+
       ;; the control: a stream that finishes normally must NOT be truncated
       (app-get app "/normal"
         (lambda (req res)
@@ -149,6 +158,37 @@
           ;; this client then hits its own 6 s park. So assert the opposite
           ;; for it: it must NOT be reported as hanging with no data.
           ))
+
+      ;; ---- a zero-length fixed response --------------------------------
+      ;;
+      ;; The head goes out either way, so counting bytes proves nothing.
+      ;; What tells the two apart is whether the RESPONSE ENDED: a second
+      ;; request on the same connection is answered only if the reader was
+      ;; released. Left as a stream it parks in await-streaming, and nothing
+      ;; but an abort can release it.
+      (let ((me self))
+        (spawn (lambda ()
+                 (tcp-connect! "127.0.0.1" port self)
+                 (receive (after 5000 (send me (vector 'z 0)))
+                   (`#(tcp-connected ,c)
+                     (tcp-read-start! c)
+                     (tcp-write! c (string->utf8
+                                     "GET /empty-file HTTP/1.1\r\nHost: x\r\n\r\n") #f)
+                     ;; wait for the first response, then ask again
+                     (receive (after 3000 (tcp-close! c) (send me (vector 'z 0)))
+                       (`#(tcp-data ,bv)
+                         (tcp-write! c (string->utf8
+                                         "GET /empty-file HTTP/1.1\r\nHost: x\r\n\r\n") #f)
+                         (let collect ((n 1))
+                           (receive (after 3000 (tcp-close! c) (send me (vector 'z n)))
+                             (`#(tcp-data ,b2) (collect (+ n 1)))
+                             (`#(tcp-eof) (tcp-close! c)
+                               (send me (vector 'z n)))))))))))
+        (let ((responses (receive (after 9000 0) (`#(z ,n) n))))
+          (display "  [info] responses on one connection: ")
+          (display responses) (newline)
+          (check "a zero-length fixed response ends, freeing the connection"
+            (>= responses 2))))
 
       ;; ---- the reader itself ---------------------------------------
       ;; Case (c) is the one whose symptom is NOT client-visible: closing
