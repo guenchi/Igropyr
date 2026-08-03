@@ -71,6 +71,30 @@
               (guard (e (#t #t)) (set-cookie! res "sid" v "Path=/") #f))
             (set-cookie! res "sid" "clean" "Path=/" "HttpOnly")
             (send-text! res "done"))))
+      ;; A stream that starts LATE. The half-close case needs the eof to
+      ;; arrive while the reader is waiting -- with an immediate response
+      ;; the bytes may already be out before the eof is seen, and the case
+      ;; passes whatever the reader does with it.
+      (app-get app "/slowstream"
+        (lambda (req res)
+          (sleep-ms 500)
+          (sse-start! res)
+          (res-write! res "hello-")
+          (res-write! res "world")
+          (res-end! res)))
+      ;; A stream that keeps going, for a client that half-closes AFTER it
+      ;; has started reading -- the window await-streaming owns, which the
+      ;; case above cannot reach (there the eof arrives before the stream
+      ;; begins and await-response consumes it).
+      (app-get app "/dripstream"
+        (lambda (req res)
+          (res-begin! res)
+          (res-spawn! res
+            (lambda ()
+              (let loop ((i 0))
+                (if (< i 6)
+                    (begin (res-write! res "tick ") (sleep-ms 200) (loop (+ i 1)))
+                    (begin (res-write! res "done") (res-end! res))))))))
       ;; #25: a streaming endpoint, requested by an HTTP/1.0 client
       (app-get app "/stream"
         (lambda (req res)
@@ -133,6 +157,99 @@
         (display outcome) (newline)
         (check "a partial request is eventually reaped"
           (memq outcome '(answered closed))))
+
+      ;; ---- a client that half-closes after its request ------------------
+      ;;
+      ;; shutdown(SHUT_WR) after a complete request is permitted (RFC 7230
+      ;; 6.6) and several clients and load generators do it: the peer has
+      ;; said everything it has to say and is waiting for the response.
+      ;; Reading that eof as "the client left" and closing answered them
+      ;; with nothing -- measured, zero bytes.
+      ;; The client is a python script because this library has no
+      ;; half-close primitive -- which is the point: only a peer OUTSIDE it
+      ;; can produce the shape. The script is written to a file rather than
+      ;; passed with -c, because quoting a multi-line program through the
+      ;; shell is how the first version of this case silently measured
+      ;; nothing at all.
+      (let ((py "/tmp/igropyr-halfclose.py")
+            (out "/tmp/igropyr-halfclose.txt"))
+        (system (string-append "rm -f " out))
+        (call-with-output-file py
+          (lambda (p)
+            (display "import socket\n" p)
+            (display "s=socket.create_connection(('127.0.0.1'," p)
+            (display port p) (display "),timeout=2)\n" p)
+            (display "s.sendall(b'GET /slowstream HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n')\n" p)
+            (display "s.shutdown(socket.SHUT_WR)\n" p)
+            (display "d=b''\n" p)
+            (display "try:\n" p)
+            (display "    while True:\n" p)
+            (display "        b=s.recv(4096)\n" p)
+            (display "        if not b: break\n" p)
+            (display "        d+=b\n" p)
+            (display "except Exception: pass\n" p)
+            (display "open('" p) (display out p) (display "','wb').write(d)\n" p))
+          'replace)
+        ;; IN THE BACKGROUND. system blocks the one OS thread, so a
+        ;; foreground python would wait for a response the scheduler cannot
+        ;; produce while it is blocked -- the first version of this case
+        ;; deadlocked exactly that way and reported zero bytes, which looks
+        ;; identical to the defect being tested.
+        (system (string-append "python3 " py " >/dev/null 2>&1 &"))
+        (let poll ((i 0))
+          (when (and (< i 150) (not (file-exists? out)))
+            (sleep-ms 100)
+            (poll (+ i 1))))
+        (sleep-ms 200)
+        (let* ((raw (guard (e (#t "")) (call-with-input-file out get-string-all)))
+               (text (if (string? raw) raw "")))
+          (display "  [info] a half-closed client received ")
+          (display (string-length text)) (display " bytes\n")
+          ;; HTTP/1.1, so the body is chunked: the two writes arrive as
+          ;; separate chunks and "hello-world" is never contiguous
+          (check "a half-closed client still gets its response"
+            (and (str-has? text "200 OK")
+                 (str-has? text "hello-")
+                 (str-has? text "world")
+                 (str-has? text "0\r\n\r\n")))
+          (system (string-append "rm -f " py " " out))))
+
+      ;; ...and the same for a client that half-closes once the stream is
+      ;; already running. That eof reaches await-streaming, which had the
+      ;; identical mistake one level down: it ended the stream at whatever
+      ;; had been sent so far.
+      (let ((py "/tmp/igropyr-halfclose2.py")
+            (out "/tmp/igropyr-halfclose2.txt"))
+        (system (string-append "rm -f " out))
+        (call-with-output-file py
+          (lambda (p)
+            (display "import socket\n" p)
+            (display "s=socket.create_connection(('127.0.0.1'," p)
+            (display port p) (display "),timeout=4)\n" p)
+            (display "s.sendall(b'GET /dripstream HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n')\n" p)
+            (display "d=s.recv(4096)\n" p)          ; read the head + first chunk
+            (display "s.shutdown(socket.SHUT_WR)\n" p)   ; half-close mid-stream
+            (display "try:\n" p)
+            (display "    while True:\n" p)
+            (display "        b=s.recv(4096)\n" p)
+            (display "        if not b: break\n" p)
+            (display "        d+=b\n" p)
+            (display "except Exception: pass\n" p)
+            (display "open('" p) (display out p) (display "','wb').write(d)\n" p))
+          'replace)
+        (system (string-append "python3 " py " >/dev/null 2>&1 &"))
+        (let poll ((i 0))
+          (when (and (< i 150) (not (file-exists? out)))
+            (sleep-ms 100)
+            (poll (+ i 1))))
+        (sleep-ms 200)
+        (let* ((raw (guard (e (#t "")) (call-with-input-file out get-string-all)))
+               (text (if (string? raw) raw "")))
+          (display "  [info] half-closing mid-stream received ")
+          (display (string-length text)) (display " bytes\n")
+          (check "a stream survives a half-close in the middle of it"
+            (and (str-has? text "done") (str-has? text "0\r\n\r\n")))
+          (system (string-append "rm -f " py " " out))))
 
       ;; ---- inbound framing the two ends could read differently ---------
       ;;

@@ -159,11 +159,28 @@
         "HTTP/1.1 503 " "\"fault\":\"crash\"" "\"attempts\":4"
         "\"retryable\":true" "Connection: keep-alive"))
 
-    ;; A task whose client disconnected before it started must not run.
-    ;; Workers are few, so a slow handler backs requests up in the queue;
-    ;; running one later touches the database and any external service for
-    ;; a request nobody is waiting on, and after an outage the whole stale
-    ;; backlog fires at once.
+    ;; A queued task whose client closed its write side DOES still run, and
+    ;; that is a deliberate reversal.
+    ;;
+    ;; The reader cannot tell the two closes apart. A client that has left
+    ;; and a client that sent shutdown(SHUT_WR) after a complete request --
+    ;; which RFC 9112 9.6 permits, and which several clients and load
+    ;; generators do -- both arrive as one tcp-eof. Treating that as "the
+    ;; client is gone" and closing answered the second kind with nothing:
+    ;; measured, a half-closing client received zero bytes.
+    ;;
+    ;; So the eof is carried and the response is produced. What that costs
+    ;; is what this case used to assert: work queued for a client that
+    ;; really did leave now runs, and after an outage a stale backlog can
+    ;; still fire at the database. That saving is not worth answering a
+    ;; conforming client with silence. It is partly recovered anyway --
+    ;; writing to a socket that is really gone fails at once -- and an eof
+    ;; during reader-loop, where the request is INCOMPLETE, still closes
+    ;; immediately.
+    ;;
+    ;; What is pinned here now is that the queue still DRAINS and the
+    ;; server stays healthy afterwards, which is what the surrounding
+    ;; machinery is about.
     (let ((c1 (raw-open 18084 "GET /gate HTTP/1.1\r\nHost: x\r\n\r\n"))
           (c2 #f))
       (sleep-ms 200)                       ; c1 now occupies the only worker
@@ -173,10 +190,10 @@
       (sleep-ms 600)                       ; let the server observe the EOF
       (set-box! gate-open #t)              ; free the worker; the queue drains
       (sleep-ms 800)
-      (unless (= abandoned-runs 0)
-        (fail "abandoned task still ran" abandoned-runs))
+      (unless (= abandoned-runs 1)
+        (fail "a queued task after a peer close did not run" abandoned-runs))
       (tcp-close! c1)
-      (display "  ok  a disconnected client's queued task does not run\n"))
+      (display "  ok  a queued task survives its peer closing the write side\n"))
 
     ;; A handler that ANSWERED and then crashed must not be re-run. The
     ;; client already holds a success; re-running repeats whatever the

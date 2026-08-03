@@ -118,6 +118,18 @@
               "Sec-WebSocket-Key" "Sec-WebSocket-Version"
               "Content-Length" "Transfer-Encoding")))
 
+  ;; Consume, and close, whatever an earlier timed-out attempt left behind.
+  ;; A connect that lands after its caller gave up is a live socket nobody
+  ;; owns; matched by a later attempt it is worse than a leak, because the
+  ;; handshake would run over it.
+  (define (drain-stale-connects!)
+    (let loop ()
+      (receive (after 0 'done)
+        (`#(tcp-connected ,late) (tcp-close! late) (loop))
+        (`#(tcp-connect-failed ,e) (loop))
+        (`#(dns-resolved ,ip) (loop))
+        (`#(dns-failed ,e) (loop)))))
+
   (define (validate-handshake-request! host path extra-headers)
     (unless (request-line-safe? host)
       (fail "invalid Host header: control characters are not allowed"))
@@ -291,28 +303,29 @@
         ;; DNS, connect and socket events all name this process and carry no
         ;; connection identity, so two sessions in one process consume each
         ;; other's messages. Spawn a process per session.
-        (dns-resolve! host self)
-        (receive (after connect-timeout-ms (fail "dns timeout"))
-          (`#(dns-resolved ,ip)
-            (tcp-connect! ip port self)
-            (receive (after connect-timeout-ms
-                        ;; The connect is still in flight. If it lands after
-                        ;; we gave up, close it -- otherwise the conn sits in
-                        ;; conn-table until this process dies, and a LATER
-                        ;; ws-connect from the same process would match the
-                        ;; stale #(tcp-connected) and run its handshake over
-                        ;; somebody else's socket. http-client does the same
-                        ;; thing at the same point.
-                        (receive (after 5000 'done)
-                          (`#(tcp-connected ,late) (tcp-close! late))
-                          (`#(tcp-connect-failed ,e) 'done))
-                        (fail "connect timeout"))
-              (`#(tcp-connected ,c)
-                (tcp-read-start! c)
-                (let ((key (make-ws-key)))
-                  (tcp-write! c (handshake-request host path key extra-headers) #f)
-                  (await-handshake c key (make-inbuf)
-                                   (+ (now-ms) connect-timeout-ms))))
-              (`#(tcp-connect-failed ,e) (fail (uv-strerror e)))))
-          (`#(dns-failed ,e) (fail "dns resolution failed"))))))
+        ;; An earlier attempt from THIS process that timed out may still have
+        ;; a connect in flight, and its #(tcp-connected ...) would otherwise
+        ;; be matched by the receive below -- this attempt running its
+        ;; handshake over somebody else's socket. Draining at ENTRY closes
+        ;; that connection and costs this attempt nothing; the previous
+        ;; approach waited five seconds at the point of failure, which both
+        ;; delayed the caller and still missed anything landing later.
+        (drain-stale-connects!)
+        ;; ONE deadline for dns + connect + handshake. Each phase used to
+        ;; get a full connect-timeout-ms of its own, so a caller asking for
+        ;; ten seconds could wait twenty-five.
+        (let ((deadline (+ (now-ms) connect-timeout-ms)))
+          (define (left) (max 1 (- deadline (now-ms))))
+          (dns-resolve! host self)
+          (receive (after (left) (fail "dns timeout"))
+            (`#(dns-resolved ,ip)
+              (tcp-connect! ip port self)
+              (receive (after (left) (fail "connect timeout"))
+                (`#(tcp-connected ,c)
+                  (tcp-read-start! c)
+                  (let ((key (make-ws-key)))
+                    (tcp-write! c (handshake-request host path key extra-headers) #f)
+                    (await-handshake c key (make-inbuf) deadline)))
+                (`#(tcp-connect-failed ,e) (fail (uv-strerror e)))))
+            (`#(dns-failed ,e) (fail "dns resolution failed")))))))
 )

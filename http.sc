@@ -1699,18 +1699,32 @@
         (if (> (inbuf-length buf) pipeline-limit)
             (tcp-close! c)                          ; peer over-pipelining
             (await-response c srv buf eof?)))
-      ;; The client is gone. Close NOW rather than carrying eof? until the
-      ;; handler answers: the connection state is what tells the queued or
-      ;; running task that nobody is waiting, and every response path
-      ;; already no-ops on a closed conn. Waiting merely kept a task alive
-      ;; for a client that had left -- and after a backlog builds, the whole
-      ;; stale queue runs against the database for requests long abandoned.
-      (`#(tcp-eof) (tcp-close! c) 'done)
+      ;; EOF HERE IS NOT "THE CLIENT LEFT".
+      ;;
+      ;; This wait begins only once a COMPLETE request has been dispatched,
+      ;; so an eof at this point means the peer closed its WRITE side having
+      ;; said everything it had to say -- shutdown(SHUT_WR), which RFC 7230
+      ;; 6.6 permits and which several clients and load generators do as a
+      ;; matter of course. They are still waiting for the response.
+      ;;
+      ;; Closing immediately answered them with nothing: measured, a raw
+      ;; client that half-closed after a complete request received 0 bytes.
+      ;; So the eof is remembered and the response is delivered, after which
+      ;; the connection closes because there is nothing left to reuse.
+      ;;
+      ;; What that gives up is real and was the reason for the earlier
+      ;; behaviour: a client that truly vanished also reaches here, and its
+      ;; queued work now runs. That saving is not worth answering a
+      ;; conforming client with silence -- and it is partly recovered
+      ;; anyway, because writing to a socket that is really gone fails at
+      ;; once. Eof during reader-loop, where the request is INCOMPLETE, is a
+      ;; different matter and still closes immediately.
+      (`#(tcp-eof) (await-response c srv buf #t))
       (`#(tcp-error ,e) (tcp-close! c) 'done)))
 
   ;; A streamed (chunked/SSE) response is in progress: wait without a
-  ;; deadline. On client disconnect the reader closes and exits; the
-  ;; producer notices through res-write! returning #f.
+  ;; deadline. The producer notices a departed client through res-write!
+  ;; returning #f, or through its write timing out.
   (define (await-streaming c srv buf)
     (receive (after 'infinity #f)
       (`#(next-request) (reader-loop c srv buf))
@@ -1720,7 +1734,13 @@
         (if (> (inbuf-length buf) pipeline-limit)
             (begin (tcp-close! c) 'done)
             (await-streaming c srv buf)))
-      (`#(tcp-eof) (tcp-close! c) 'done)
+      ;; Same reasoning as await-response's eof, and the same mistake was
+      ;; here: a stream is under way, which means the request was complete,
+      ;; so an eof is the peer closing its WRITE side and waiting. Closing
+      ;; ended the stream at its first byte. A client that really left is
+      ;; still noticed -- by the writes failing, which is what stops the
+      ;; producer either way.
+      (`#(tcp-eof) (await-streaming c srv buf))
       (`#(tcp-error ,e) (tcp-close! c) 'done)))
 
   ;; ---- websocket session ---------------------------------------------------------
