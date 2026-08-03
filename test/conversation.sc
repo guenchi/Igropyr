@@ -327,6 +327,32 @@
             (`#(q1 ,v) (loop (cons (cons 'q1 v) got) (+ n 1)))
             (`#(q2 ,v) (loop (cons (cons 'q2 v) got) (+ n 1))))))))
 
+;; ...but a request the application CANNOT key is never a replay of
+;; another one it also cannot key. Failure has to be one value that
+;; equals nothing, itself included: if two unkeyable requests compare
+;; equal, a caller asking to cancel is handed the confirm's answer --
+;; the exact case request keys were added to prevent. Refusing to key
+;; something is the application saying "I cannot tell these apart", and
+;; the safe reading of that is 'stale.
+(let-values (((uid utok ufirst)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (vector 'confirmed a)))
+                'go
+                4000
+                (lambda (r) (raise 'cannot-key)))))   ; keys nothing, ever
+  ;; the first resume advances -- advancing needs the token, not the key
+  (let-values (((r st) (conversation-resume! uid utok 'CONFIRM)))
+    (unless (conversation-done? st) (fail "unkeyable-setup" st))
+    (unless (equal? r (vector 'confirmed 'CONFIRM))
+      (fail "unkeyable-setup answer" r)))
+  ;; a DIFFERENT question on the spent token, equally unkeyable
+  (let-values (((r st) (conversation-resume! uid utok 'CANCEL)))
+    (unless (conversation-stale? st)
+      (fail "an unkeyable request replayed another unkeyable one" (cons r st)))
+    (display "two requests the app cannot key do not replay each other ok\n")))
+
 ;; ---- what a KILLED step leaves behind -----------------------------------
 ;;
 ;; TTL expiry has two paths and only one of them raises. A conversation

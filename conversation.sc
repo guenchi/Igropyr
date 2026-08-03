@@ -239,7 +239,13 @@
     (cond
       ((token=? token (step-state-awaiting st)) 'advance)
       ((and (token=? token (step-state-consumed st))
-            (equal? (key-of) (step-state-key st)))
+            ;; both sides are (key) if the key was computed, #f if the key
+            ;; function raised. A failure equals nothing -- not even
+            ;; another failure, or two requests nobody could key would
+            ;; replay each other's answers.
+            (let ((now (key-of)) (then (step-state-key st)))
+              (and (pair? now) (pair? then)
+                   (equal? (car now) (car then)))))
        'replay)
       (else 'stale)))
 
@@ -644,16 +650,19 @@
                    ;; The one place application code is run on an incoming
                    ;; request. It is bounded -- the phase is marked running,
                    ;; so the watchdog covers a key function that hangs --
-                   ;; and it fails safe: a raise yields a value nothing can
-                   ;; equal, so the caller gets 'stale rather than somebody
-                   ;; else's answer.
-                   (define no-key (list 'no-key))
+                   ;; and it fails safe: a raise yields #f, which the
+                   ;; replay rule refuses to match, so the caller gets
+                   ;; 'stale rather than somebody else's answer.
+                   ;;
+                   ;; A computed key is wrapped -- (key), not key -- so
+                   ;; that failure is one value no key can collide with,
+                   ;; #f included.
                    (define (safe-key r)
-                     (let ((k (box no-key))
+                     (let ((k (box #f))
                            (was (step-state-phase st)))
                        (set-phase! st 'running)
                        (guard (e (#t (void)))
-                         (set-box! k (request-key r)))
+                         (set-box! k (list (request-key r))))
                        (set-phase! st was)
                        (unbox k)))
 
