@@ -28,7 +28,7 @@
 
 (library (igropyr http)
   (export http-listen http-swap! http-set-ws!
-          http-stats http-shutdown!
+          http-stats http-shutdown! http-write-timeout!
           ;; record predicates, exported for boundary contracts
           ;; ((igropyr checked) in the framework layers) and any
           ;; user code that wants to type-test req/res values
@@ -75,6 +75,32 @@
   ;; request may take to arrive, however steadily it dribbles.
   (define request-deadline-ms 60000)
   (define await-timeout-ms 60000)  ; reader waits this long for a response
+
+  ;; How long one streamed write may wait for its peer to accept the bytes.
+  ;;
+  ;; A write parks its process until libuv reports the chunk out, which for a
+  ;; peer that has stopped reading is never. The pool's stuck-ms bounds that
+  ;; for a POOLED handler -- but a long stream is supposed to be detached
+  ;; into its own process (see res-begin!'s docstring), and a spawned process
+  ;; is not a pool worker, so nothing bounded it there. That is the shape a
+  ;; slow SSE consumer takes: one parked relay per client, forever, while
+  ;; whatever feeds it keeps queueing into an unbounded mailbox.
+  ;;
+  ;; Deliberately generous. This is not a liveness timer for the STREAM --
+  ;; an SSE connection with nothing to say is normal and costs no write --
+  ;; it bounds a single write whose bytes the kernel will not take. A mobile
+  ;; peer on a bad link still drains a chunk well inside this.
+  (define default-write-timeout-ms 120000)
+  (define write-timeout-ms default-write-timeout-ms)
+
+  ;; Process-global, like the other ceilings here. 0 restores the old
+  ;; unbounded wait, which is only ever right where no untrusted peer can
+  ;; reach the port.
+  (define (http-write-timeout! ms)
+    (unless (and (integer? ms) (exact? ms) (>= ms 0))
+      (assertion-violation 'http-write-timeout!
+        "timeout must be a nonnegative exact integer (ms); 0 = unbounded" ms))
+    (set! write-timeout-ms ms))
 
   ;; ---- bytevector helpers ------------------------------------------------
 
@@ -877,9 +903,28 @@
   ;; process. A callback can only run inline here or from the event loop,
   ;; never between the unbox and the set-box!, because neither yields.
   ;;
-  ;; A client that never drains parks the handler indefinitely, exactly as
-  ;; in res-write-fixed!; the worker's stuck-ms is what bounds that, and
-  ;; the resulting kill now closes the connection (see fail-task).
+  ;; A client that never drains used to park the writer indefinitely. For a
+  ;; POOLED handler the worker's stuck-ms bounded that, and the resulting
+  ;; kill closed the connection (see fail-task) -- but a long stream is
+  ;; supposed to be detached into its own process (see res-begin! above),
+  ;; and a spawned process is not a pool worker, so the recommended shape
+  ;; was the unbounded one. write-timeout-ms now bounds every write.
+  (define (write-wait-ms)
+    (if (zero? write-timeout-ms) 'infinity write-timeout-ms))
+
+  ;; Give up on a write whose peer never took the bytes. The connection has
+  ;; to go: a chunked or SSE body cannot resume mid-chunk, and half of one
+  ;; is worse on the wire than none. Marking the box first is what keeps the
+  ;; completion, if it ever runs, from posting into a mailbox nobody is
+  ;; reading -- and the drain covers the narrow case where it fired just as
+  ;; the timer did, so the message is already queued.
+  (define (abandon-write! b c)
+    (set-box! b 'abandoned)
+    (receive (after 0 'ok)
+      (`#(chunk-written ,_) 'ok)
+      (`#(file-written ,_) 'ok))
+    (tcp-close! c))
+
   (define (res-write! r data)
     (let ((bv (if (string? data) (string->utf8 data) data))
           (c (res-conn r)))
@@ -899,14 +944,21 @@
                          bv
                          crlf-bv))
                (lambda (st)
-                 (if (eq? (unbox b) 'pending)
-                     (set-box! b st)
-                     (send me (vector 'chunk-written st)))))
+                 (case (unbox b)
+                   ((pending) (set-box! b st))
+                   ;; timed out and gave up: nobody is in a receive for this,
+                   ;; and a message left behind would be matched by the NEXT
+                   ;; write from this process, reporting another chunk's fate
+                   ((abandoned) (void))
+                   (else (send me (vector 'chunk-written st))))))
              (let ((st (unbox b)))
                (if (eq? st 'pending)
                    (begin
                      (set-box! b 'parked)
-                     (receive (`#(chunk-written ,st2) (>= st2 0))))
+                     (receive (after (write-wait-ms)
+                                 (abandon-write! b c)
+                                 #f)
+                       (`#(chunk-written ,st2) (>= st2 0))))
                    (>= st 0)))))))
 
   ;; Finish the stream: terminating chunk, then the usual keep-alive /
@@ -1002,14 +1054,17 @@
          (let ((b (box 'pending)) (me self))
            (do-write
              (lambda (st)
-               (if (eq? (unbox b) 'pending)
-                   (set-box! b st)
-                   (send me (vector 'file-written st)))))
+               (case (unbox b)
+                 ((pending) (set-box! b st))
+                 ((abandoned) (void))       ; see res-write! for why
+                 (else (send me (vector 'file-written st))))))
            (let ((st (unbox b)))
              (if (eq? st 'pending)
                  (begin
                    (set-box! b 'parked)
-                   (receive
+                   (receive (after (write-wait-ms)
+                               (abandon-write! b (res-conn r))
+                               #f)
                      (`#(file-written ,st2) (and (>= st2 0) 'more))))
                  (and (>= st 0) 'more))))))))
 

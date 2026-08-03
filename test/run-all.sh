@@ -51,6 +51,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/stream-crash.sc
 # a chunked producer must run at the client's pace, not queue unboundedly
 "$scheme_bin" --script igropyr/test/stream-backpressure.sc
+# ...and that wait must be bounded: a detached stream is not a pool
+# worker, so stuck-ms never covered the peer that stops reading
+"$scheme_bin" --script igropyr/test/stream-write-timeout.sc
 # static/send-file! hardening (dotfiles, NUL, root) and HEAD framing
 "$scheme_bin" --script igropyr/test/serving-hardening.sc
 # cookie attribute injection, HTTP/1.0 framing, slowloris deadline

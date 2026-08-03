@@ -429,6 +429,30 @@ the pool immediately:
 The lower-level primitives are `res-begin!`, `res-write!` (string or
 bytevector; returns `#f` if the client is gone), and `res-end!`.
 
+### Slow consumers
+
+`res-write!` waits for each chunk to reach the peer, so a producer runs at
+the client's pace rather than queueing chunks in memory. That wait is
+bounded: a write whose bytes the peer never accepts gives up after
+`write-timeout-ms` (default 120 s), closes the connection, and returns
+`#f` — which is already the "stop the loop" answer every producer handles,
+so no caller changes.
+
+The bound matters most for exactly the shape recommended above. A stream
+detached into its own process is **not** a pool worker, so the pool's
+`stuck-ms` never applied to it; before this, one client that opened an SSE
+stream and stopped reading held its writer process for the life of the
+process, while whatever fed the stream kept sending into an unbounded
+mailbox.
+
+```scheme
+(http-write-timeout! 30000)   ; process-global; 0 restores the unbounded wait
+```
+
+This is not a liveness timer for the stream. An SSE connection with nothing
+to say is normal and costs no write; only a write whose bytes the kernel
+will not take can expire.
+
 ## JSON
 
 `(igropyr json)` is a safe recursive-descent parser — it never calls
