@@ -299,6 +299,29 @@
               (and (jwks-verify tok delayed-url)
                    (= (+ before 1) delayed-fetches)))))))
 
+    ;; ---- releasing a key ------------------------------------------------
+    ;; The EVP_PKEY behind a loaded key is a native allocation the record
+    ;; owns, and nothing in Scheme collects it. That is fine for a key held
+    ;; for the life of the process; it was not fine for ROTATION, where every
+    ;; reload added an RSA private key to the native heap permanently.
+    ;;
+    ;; A leak cannot be asserted from inside the process, so what is pinned
+    ;; here is the CONTRACT that makes releasing safe: the call is idempotent,
+    ;; and a freed key is refused rather than passing a NULL to OpenSSL -- a
+    ;; double free of an EVP_PKEY corrupts the allocator, which would be a
+    ;; worse bug than the leak.
+    (let ((rotated (jwks-load-key (string-append dir "/b.pem"))))
+      (check "a freed key still signs before it is freed"
+        (string? (jwks-sign rotated '(("sub" . "u")))))
+      (jwks-key-free! rotated)
+      (check "freeing twice is not a double free"
+        (guard (e (#t #f)) (jwks-key-free! rotated) #t))
+      (check "signing with a freed key is refused, not a NULL deref"
+        (guard (e (#t #t)) (jwks-sign rotated '(("sub" . "u"))) #f))
+      ;; and freeing one key does not disturb another
+      (check "an unrelated key still signs"
+        (string? (jwks-sign key-a '(("sub" . "u"))))))
+
     (system (string-append "rm -rf " dir))
     (if (zero? failures)
         (begin (display "jwks: all tests passed\n") (exit 0))

@@ -438,9 +438,50 @@
     (set-header! res "Cache-Control" "no-cache")
     (res-begin! res))
 
+  ;; SSE breaks lines on CRLF, LF *or* a bare CR (the event stream format),
+  ;; so all three have to become separate data: lines. Splitting on LF alone
+  ;; would leave a bare CR inside a line, where the client still treats it as
+  ;; a break -- and the text after it as a new FIELD.
+  (define (sse-data-lines text)
+    (let ((out '()) (cur '()) (n (string-length text)))
+      (let loop ((i 0))
+        (if (fx= i n)
+            (begin (set! out (cons (list->string (reverse cur)) out))
+                   (reverse out))
+            (let ((ch (string-ref text i)))
+              (cond
+                ((char=? ch #\return)
+                 (set! out (cons (list->string (reverse cur)) out))
+                 (set! cur '())
+                 ;; CRLF is one break, not two
+                 (loop (if (and (fx< (fx+ i 1) n)
+                                (char=? (string-ref text (fx+ i 1)) #\newline))
+                           (fx+ i 2)
+                           (fx+ i 1))))
+                ((char=? ch #\newline)
+                 (set! out (cons (list->string (reverse cur)) out))
+                 (set! cur '())
+                 (loop (fx+ i 1)))
+                (else (set! cur (cons ch cur)) (loop (fx+ i 1)))))))))
+
   ;; returns #f when the client is gone -- stop the producer loop then
+  ;;
+  ;; Every line gets its own "data:" prefix, and EventSource rejoins them
+  ;; with \n, so the string arrives intact. Concatenating the raw string
+  ;; instead let any newline in it start a new FIELD: application data
+  ;; containing "\nevent: x" changed the event type the browser dispatched
+  ;; on, and "\n\n" ended the event early and began another. Anything that
+  ;; streams user-supplied text -- chat, log lines, model output -- handed
+  ;; the writer of that text control of the protocol.
+  ;;
+  ;; sse-send-sexpr! below already did this, for exactly this reason.
   (define-checked (sse-send! (res res?) (data string?))
-    (res-write! res (string-append "data: " data "\n\n")))
+    (res-write! res
+      (string-append
+        (apply string-append
+               (map (lambda (l) (string-append "data: " l "\n"))
+                    (sse-data-lines data)))
+        "\n")))
 
   ;; ---- pool failure hook template -----------------------------------------------
   ;; Ready-made on-failure handler for app-listen's pool options. When the
@@ -1146,7 +1187,7 @@
   ;; with \n on the client, so the datum survives intact.
   (define-checked (sse-send-sexpr! (res res?) x)
     (let* ((text (sexpr->string-extended x))
-           (lines (string-split text #\newline)))
+           (lines (sse-data-lines text)))
       (res-write! res
         (string-append
           (apply string-append
