@@ -93,6 +93,16 @@
                                    (tcp-write! c (string->utf8
                                      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi") #f)
                                    (tcp-close! c))
+                                  ;; a ~9 KiB head, sent COMPLETE in one
+                                  ;; write: the size check used to run only
+                                  ;; while a head was still arriving
+                                  ((string=? path "/bighead")
+                                   (tcp-write! c (string->utf8
+                                     (string-append
+                                       "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Pad: "
+                                       (make-string 9000 #\x)
+                                       "\r\n\r\nhi")) #f)
+                                   (loop rest))
                                   ((string=? path "/chunk")
                                    (tcp-write! c (string->utf8
                                      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n") #f)
@@ -244,6 +254,16 @@
     (let ((r (http-request 'POST (url "/ka") '((body . "x") (timeout . 4000)))))
       (check "a POST reuses a pooled connection like any other request"
         (and (= 200 (response-status r)) (= 1 (unbox accepts)))))
+
+    ;; ---- an oversized response head --------------------------------------
+    ;; The 8 KiB ceiling was checked only while the head was still arriving,
+    ;; so an upstream that sent the whole thing in one segment was never
+    ;; checked: the terminator was found and the block parsed whatever its
+    ;; size. That is the same defect the SERVER side had (fixed there as
+    ;; header-limit), on the other end of the wire.
+    (reset!)
+    (check "a complete oversized response head is refused"
+      (guard (e (#t #t)) (get "/bighead") #f))
 
     ;; ---- the pool is bounded --------------------------------------------
     (reset!)

@@ -190,6 +190,15 @@
     (let ((parts (jws-parts token)))
       (unless parts (ajws-fail 'not-jws "not a compact JWS (need exactly two dots)"))
       (let* ((h-b64 (car parts)) (p-b64 (cadr parts)) (s-b64 (caddr parts))
+             ;; Bound the ENCODED header before touching it. The x5c limits
+             ;; below are checked after base64 decode, UTF-8 conversion and a
+             ;; full JSON parse -- so they bounded the OpenSSL work and left
+             ;; the parsing that precedes it open, paid on the one OS thread
+             ;; from a header nothing has authenticated yet. 64 KiB is
+             ;; generous for the eight certificates the limits below allow
+             ;; (Apple sends three) and three orders under a default body.
+             (_ (when (fx> (string-length h-b64) 65536)
+                  (ajws-fail 'not-jws "JWS header segment is too large")))
              (header (guard (e (#t (ajws-fail 'not-jws "header is not valid JSON")))
                        (string->json (utf8->string (b64url->bytes h-b64)))))
              (alg (and (pair? header) (json-ref header "alg")))

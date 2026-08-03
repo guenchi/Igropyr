@@ -611,13 +611,24 @@
       (cond
         ((eq? state 'head)
          (let ((hend (inbuf-find-header-end buf)))
-           (if (not hend)
+           (cond
+             ;; SIZE FIRST, whether or not the block is complete. Checking it
+             ;; only while still accumulating meant a peer that sent the whole
+             ;; head in one segment was never checked at all -- the terminator
+             ;; was found and the block parsed whatever its size. That is the
+             ;; same defect the server side had (http.sc's header-limit), on
+             ;; the other end of the wire, and it lets an upstream hand this
+             ;; single-threaded parser a block bounded only by max-response.
+             ((and hend (> (fx+ hend 4) max-response-head))
+              (err! "response head too large") #f)
+             ((not hend)
                ;; still accumulating: refuse a head block that has already
                ;; outgrown its ceiling rather than waiting for the terminator
                ;; that a hostile upstream may never send
                (if (> (inbuf-length buf) max-response-head)
                    (begin (err! "response head too large") #f)
-                   'head)
+                   'head))
+             (else
                ;; the head block is copied out once (small); the line
                ;; helpers below work on that standalone bytevector
                (let* ((head (inbuf-sub buf 0 (fx+ hend 2)))
@@ -673,7 +684,7 @@
                       (else
                        (if emit
                            (step (vector 'seof status headers))
-                           (vector 'eof status headers (+ hend 4)))))))))))
+                           (vector 'eof status headers (+ hend 4))))))))))))
         ((eq? (vector-ref state 0) 'clen)
          (let ((body-start (vector-ref state 3)) (len (vector-ref state 4)))
            (if (>= (- (inbuf-length buf) body-start) len)
