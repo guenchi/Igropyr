@@ -72,12 +72,27 @@
     needles)
   (display label) (display " ok\n"))
 
+;; How many times the answered-then-crashing handler actually ran. A retry
+;; re-executes the WHOLE handler, so this counts business effects, not
+;; responses -- the response can only happen once, the token sees to that.
+(define answered-crash-runs 0)
+
 (define (build-app)
   (let ((app (create-app)))
     (app-get app "/ok"
       (lambda (req res) (send-text! res "fine")))
     (app-get app "/crash"
       (lambda (req res) (raise 'deliberate)))
+    ;; The shape that must NOT be retried: the effect (here, the counter --
+    ;; in an application, a charge or an INSERT) lands, the client is
+    ;; answered, and only then something raises. Cleanup, logging, or a
+    ;; middleware on its way back out; the bundled access logger writes
+    ;; after (next) returns, so a broken log port is a real trigger.
+    (app-get app "/answered-then-crash"
+      (lambda (req res)
+        (set! answered-crash-runs (+ answered-crash-runs 1))
+        (send-text! res "done")
+        (raise 'after-the-response)))
     (app-get app "/stuck"
       (lambda (req res) (let loop ((n 0)) (loop (+ n 1)))))
     app))
@@ -105,6 +120,22 @@
       (expect-contains "crash envelope" r
         "HTTP/1.1 503 " "\"fault\":\"crash\"" "\"attempts\":4"
         "\"retryable\":true" "Connection: keep-alive"))
+
+    ;; A handler that ANSWERED and then crashed must not be re-run. The
+    ;; client already holds a success; re-running repeats whatever the
+    ;; handler did before answering, and the claimed token means the retry
+    ;; could not produce a response even if it wanted to. So the only thing
+    ;; a retry can do here is duplicate side effects.
+    (let ((r (raw-ring 18081
+               "GET /answered-then-crash HTTP/1.1\r\nHost: x\r\n\r\n"
+               "done" #f #f 4000)))
+      (expect-contains "answered-then-crash answers once" r
+        "HTTP/1.1 200 " "done"))
+    ;; give the supervisor the time it would have spent on 3 retries
+    (sleep-ms 1200)
+    (unless (= answered-crash-runs 1)
+      (fail "answered-then-crash re-ran the handler" answered-crash-runs))
+    (display "  ok  answered handler is not retried\n")
 
     ;; stuck: killed first, told after, fast (well under the stock 30 s)
     (let* ((t0 (now-ms))
