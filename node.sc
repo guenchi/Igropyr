@@ -351,7 +351,31 @@
       (when mine?
         (drop-hosted-monitors! name)       ; free monitors this peer parked here
         (fail-monitors-for! name)          ; DOWN(noconnection) for watchers
+        (fail-pending-for! name)           ; nothing will answer these now
         (notify! name 'node-down))))
+
+  ;; Calls waiting on a peer that just went: no reply can arrive for them,
+  ;; so the entry would sit here until its caller's own timeout removed it
+  ;; -- and a caller killed while waiting never runs that, leaving a dead
+  ;; PCB pinned in this global table for the life of the VM. Waking the
+  ;; live ones now is also strictly better than making them serve out a
+  ;; timeout for an answer that cannot come; the caller sees the same
+  ;; rcall-error it would have seen, only sooner. The message is harmless
+  ;; to a caller that has already moved on, whose ref can never match again.
+  (define (fail-pending-for! name)
+    (let ((doomed
+            (atomically
+              (let ((ks (hashtable-keys pending)) (acc '()))
+                (do ((i 0 (fx+ i 1))) ((fx= i (vector-length ks)) acc)
+                  (let* ((ref (vector-ref ks i))
+                         (slot (hashtable-ref pending ref #f)))
+                    (when (and slot (eq? (vector-ref slot 1) name))
+                      (hashtable-delete! pending ref)
+                      (set! acc (cons (cons ref (vector-ref slot 0)) acc)))))))))
+      (for-each
+        (lambda (p)
+          (send (cdr p) (vector 'rcall-reply (car p) (list 'error 'noconnection))))
+        doomed)))
 
   ;; ---- the link: one process per live connection ---------------------------
 
@@ -380,7 +404,17 @@
       ;; the caller sent to another)
       ((frame? d 'reply 3)
        (let ((ref (cadr d)) (result (caddr d)))
-         (let ((slot (atomically (hashtable-ref pending ref #f))))
+         ;; Delete here, not only in the caller's branches. Both of those --
+         ;; the reply clause and the timeout handler -- run in the CALLER's
+         ;; process, so a caller killed while waiting (a stuck worker reaped
+         ;; by its supervisor, say) runs neither, and its entry stays in this
+         ;; global table forever, pinning a dead PCB and a node name. A ref
+         ;; is answered at most once, so removing it as the reply is routed
+         ;; is correct for a live caller too: it has the message by then.
+         (let ((slot (atomically
+                       (let ((v (hashtable-ref pending ref #f)))
+                         (when v (hashtable-delete! pending ref))
+                         v))))
            (when (and slot (eq? (vector-ref slot 1) peer))
              (send (vector-ref slot 0) (vector 'rcall-reply ref result))))))
       ;; (mon ,name ,mref) -> watch our local reg-name for the peer at the
