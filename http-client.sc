@@ -3,8 +3,21 @@
 ;;;
 ;;; Same actor model as the database clients: each request runs in its
 ;;; own green process that connects, sends, and reads the reply, while
-;;; the caller parks in receive -- the OS thread keeps serving other
-;;; work. One connection per request (Connection: close); no pooling.
+;;; the caller parks in receive -- the OS thread keeps serving other work.
+;;;
+;;; CONNECTIONS ARE REUSED. After a response that leaves the connection
+;;; framed and drained, it is kept and handed to the next request for the
+;;; same host/port/scheme -- saving a TCP handshake, and over TLS a full
+;;; handshake, which for a small request is most of the cost. Pass
+;;; (reuse . #f) to opt one request out; http-client-pool! sizes the pool,
+;;; http-client-close-idle! empties it, http-client-pool-stats reports it.
+;;;
+;;; A pooled connection lives in its own process, which owns its socket. It
+;;; has to: #(tcp-data bv) carries no connection identity, so one process
+;;; owns exactly one socket. That process is also what makes idle pooling
+;;; safe -- servers close keep-alive connections whenever they like, and a
+;;; process sitting in receive SEES that eof and takes itself out of the
+;;; pool instead of leaving a corpse for the next request to find.
 ;;;
 ;;;   (http-get "http://127.0.0.1:8080/json")
 ;;;     ;; -> a response; response-status / -headers / -body / -header
@@ -44,6 +57,7 @@
   (export http-request http-get http-post
           response? response-status response-headers response-body
           response-header
+          http-client-pool! http-client-pool-stats http-client-close-idle!
           set-https-connector!     ; internal: registered by (igropyr tls)
           ;; Re-exported app-facing (igropyr actor) surface: this library
           ;; can be the sole entry point of a client-only program (a
@@ -186,7 +200,7 @@
 
   ;; host-header is host[:port] -- RFC 7230 wants the port whenever it
   ;; is not the scheme default (the caller computes it from parse-url)
-  (define (build-request method host-header path headers body)
+  (define (build-request method host-header path headers body keep-alive?)
     (let ((body-bv (cond ((not body) empty-bv)
                          ((string? body) (string->utf8 body))
                          (else body))))
@@ -222,7 +236,11 @@
         (define (line s) (put-bytevector p (string->utf8 s)) (put-bytevector p crlf))
         (line (string-append (symbol->string method) " " path " HTTP/1.1"))
         (line (string-append "Host: " host-header))
-        (line "Connection: close")
+        ;; Announcing keep-alive is what makes reuse possible at all; the
+        ;; response still decides (see reusable-response?). "close" is sent
+        ;; when the caller opted out, so a server is never left holding a
+        ;; connection this client will not use.
+        (line (if keep-alive? "Connection: keep-alive" "Connection: close"))
         (for-each
           (lambda (h) (line (string-append (car h) ": " (cdr h))))
           headers)
@@ -259,6 +277,12 @@
              (string->number
                (if sp2 (substring s (+ sp1 1) sp2)
                    (substring s (+ sp1 1) (string-length s))))))))
+
+  ;; the version token of a status line: "HTTP/1.1 200 OK" -> "HTTP/1.1"
+  (define (parse-http-version bv end)
+    (let* ((s (utf8->string (bv-sub bv 0 end)))
+           (sp (string-index s #\space 0)))
+      (if sp (substring s 0 sp) "HTTP/1.1")))
 
   (define (parse-headers bv start end)
     ;; header lines between start and end (the \r\n\r\n index)
@@ -436,7 +460,11 @@
                   (cond
                     ((eq? end 'bad) 'bad)
                     ((not end) (vector 'more pos chunks got))
-                    (else (vector 'done (bv-concat (reverse chunks) got))))))
+                    ;; the end offset comes back too: on a connection that
+                    ;; will be REUSED the caller has to know where this
+                    ;; response stopped, or bytes belonging to it would be
+                    ;; read as the start of the next one
+                    (else (vector 'done (bv-concat (reverse chunks) got) end)))))
                ((< (inbuf-length buf) (+ eol 2 size 2))
                 (vector 'more pos chunks got))
                ;; the two bytes after the data MUST be CRLF; without
@@ -470,7 +498,11 @@
                 (let ((end (trailer-end buf (fx+ eol 2))))
                   (cond ((eq? end 'bad) 'bad)
                         ((not end) 'more)
-                        (else 'done))))
+                        ;; consume the final chunk and its trailer as well:
+                        ;; leaving them in the buffer was harmless while
+                        ;; every connection was closed after one response,
+                        ;; and is corruption on a reused one
+                        (else (inbuf-consume! buf end) 'done))))
                ((< (inbuf-length buf) (+ eol 2 size 2)) 'more)
                ;; Validate the delimiter before exposing the chunk. The
                ;; accumulating decoder already enforces this; streaming
@@ -495,10 +527,63 @@
   ;;   #(sclen status headers remaining)
   ;;   #(schunked status headers)
   ;;   #(seof status headers)
-  (define (client-loop c caller ref buf state timeout codec emit max-resp method deadline)
-    (define (done!) (when codec ((vector-ref codec 2))) (tcp-close! c))
-    (define (reply! r) (send caller (vector 'http-reply ref r)) (done!))
-    (define (err! msg) (send caller (vector 'http-error ref msg)) (done!))
+  ;; Does this response leave the connection usable for another request?
+  ;;
+  ;; Only when the peer has not said otherwise and the response was framed
+  ;; DETERMINATELY -- Content-Length or chunked. A body that ends at close
+  ;; obviously cannot be followed by anything, and an error leaves the
+  ;; framing in an unknown state. HTTP/1.0 defaults the other way (close
+  ;; unless it says keep-alive), which matters behind an old proxy.
+  (define (connection-header-says headers)
+    (let ((p (assq 'connection headers)))
+      (if (not p)
+          'unset
+          (let ((v (string-downcase (cdr p))))
+            (cond ((token-in? v "close") 'close)
+                  ((token-in? v "keep-alive") 'keep-alive)
+                  (else 'unset))))))
+
+  ;; a comma-separated token list, matched whole -- "close" must not be
+  ;; found inside "closeish" or a header value that merely mentions it
+  (define (token-in? v tok)
+    (let ((n (string-length v)) (m (string-length tok)))
+      (let loop ((i 0) (start 0))
+        (cond
+          ((> i n) #f)
+          ((or (= i n) (char=? (string-ref v i) #\,))
+           (let trim-l ((a start))
+             (cond
+               ((and (< a i) (char-whitespace? (string-ref v a))) (trim-l (+ a 1)))
+               (else
+                (let trim-r ((b i))
+                  (cond
+                    ((and (> b a) (char-whitespace? (string-ref v (- b 1))))
+                     (trim-r (- b 1)))
+                    ((and (= (- b a) m) (string=? (substring v a b) tok)) #t)
+                    (else (loop (+ i 1) (+ i 1)))))))))
+          (else (loop (+ i 1) start))))))
+
+  (define (reusable-response? headers version leftover)
+    (and (= leftover 0)
+         (case (connection-header-says headers)
+           ((close) #f)
+           ((keep-alive) #t)
+           (else (not (equal? version "HTTP/1.0"))))))
+
+  ;; finish: (disposition) -> void, called exactly once when the exchange
+  ;; ends. 'reuse means the connection is framed, drained and usable for
+  ;; another request; 'close means it must go. The loop no longer closes
+  ;; the socket itself -- the process that owns it decides, because with
+  ;; pooling that process outlives the request.
+  (define (client-loop c caller ref buf state timeout codec emit max-resp method
+                       deadline vbox progress finish)
+    ;; the peer's HTTP version, filled in when the head is parsed: HTTP/1.0
+    ;; defaults to close, 1.1 to keep-alive
+    (define (version) (unbox vbox))
+    (define (reply! r keep?)
+      (send caller (vector 'http-reply ref r))
+      (finish (if keep? 'reuse 'close)))
+    (define (err! msg) (send caller (vector 'http-error ref msg)) (finish 'close))
     ;; a crashing on-chunk handler must not rot in this loop: the typed
     ;; raise propagates to the process guards, which free the codec,
     ;; close the socket, and answer the caller with the message
@@ -538,6 +623,7 @@
                (let* ((head (inbuf-sub buf 0 (fx+ hend 2)))
                       (sl-end (or (find-crlf head 0) hend))
                       (status (parse-status-line head sl-end))
+                      (_ (set-box! vbox (parse-http-version head sl-end)))
                       (headers (parse-headers head (+ sl-end 2) hend))
                       (content-length (response-content-length headers))
                       (transfer-encoding (response-transfer-encoding headers)))
@@ -562,7 +648,13 @@
                    ;; S3 would block on a Content-Length body never sent.
                    ((or (eq? method 'HEAD) (fx= status 204) (fx= status 304)
                         (fx= status 101))
-                    (reply! (make-response status headers empty-bv))
+                    ;; 101 hands the connection to another protocol, so it
+                    ;; is never ours to reuse whatever the headers say
+                    (reply! (make-response status headers empty-bv)
+                            (and (not (fx= status 101))
+                                 (reusable-response?
+                                   headers (version)
+                                   (- (inbuf-length buf) (fx+ hend 4)))))
                     #f)
                    (else
                     ;; streaming: the head is consumed so body handling
@@ -587,7 +679,10 @@
            (if (>= (- (inbuf-length buf) body-start) len)
                (begin
                  (reply! (make-response (vector-ref state 1) (vector-ref state 2)
-                           (inbuf-sub buf body-start (+ body-start len))))
+                           (inbuf-sub buf body-start (+ body-start len)))
+                         (reusable-response?
+                           (vector-ref state 2) (version)
+                           (- (inbuf-length buf) (+ body-start len))))
                  #f)
                state)))
         ((eq? (vector-ref state 0) 'chunked)
@@ -597,7 +692,10 @@
              ((eq? r 'bad) (err! "bad chunked response") #f)
              ((eq? (vector-ref r 0) 'done)
               (reply! (make-response (vector-ref state 1) (vector-ref state 2)
-                        (vector-ref r 1)))
+                        (vector-ref r 1))
+                      (reusable-response?
+                        (vector-ref state 2) (version)
+                        (- (inbuf-length buf) (vector-ref r 2))))
               #f)
              (else (vector 'chunked (vector-ref state 1) (vector-ref state 2)
                            (vector-ref r 1) (vector-ref r 2) (vector-ref r 3))))))
@@ -610,7 +708,9 @@
            (if (= take remaining)
                (begin
                  (reply! (make-response (vector-ref state 1) (vector-ref state 2)
-                           empty-bv))
+                           empty-bv)
+                         (reusable-response? (vector-ref state 2) (version)
+                                             (inbuf-length buf)))
                  #f)
                (vector 'sclen (vector-ref state 1) (vector-ref state 2)
                        (- remaining take)))))
@@ -619,7 +719,9 @@
            ((bad) (err! "bad chunked response") #f)
            ((done)
             (reply! (make-response (vector-ref state 1) (vector-ref state 2)
-                      empty-bv))
+                      empty-bv)
+                    (reusable-response? (vector-ref state 2) (version)
+                                        (inbuf-length buf)))
             #f)
            (else state)))
         ((eq? (vector-ref state 0) 'seof)
@@ -646,25 +748,270 @@
                               "response timeout")))
           (`#(tcp-data ,raw)
             (let ((bv (if codec ((vector-ref codec 1) raw) raw)))
+              ;; The peer has said something about THIS request. After this
+              ;; point a failure is not a stale pooled connection -- the
+              ;; server was reached and may have acted -- so a retry would
+              ;; risk repeating the work.
+              (unless (zero? (bytevector-length bv)) (set-box! progress #t))
               (if (zero? (bytevector-length bv))   ; pure TLS records, no app data
-                  (client-loop c caller ref buf state timeout codec emit max-resp method deadline)
+                  (client-loop c caller ref buf state timeout codec emit max-resp method
+                               deadline vbox progress finish)
                   (begin
                     (inbuf-append! buf bv)
                     ;; with streaming consumption this caps the UNPARSED
                     ;; tail (e.g. one oversized chunk), not the stream total
                     (if (> (inbuf-length buf) max-resp)
                         (err! "response too large")
-                        (client-loop c caller ref buf state timeout codec emit max-resp method deadline))))))
+                        (client-loop c caller ref buf state timeout codec emit max-resp method
+                               deadline vbox progress finish))))))
           (`#(tcp-eof)
             (cond
+              ;; a body delimited by the close: there is nothing left to reuse
               ((and (vector? state) (eq? (vector-ref state 0) 'eof))
                (reply! (make-response (vector-ref state 1) (vector-ref state 2)
-                         (inbuf-sub buf (vector-ref state 3) (inbuf-length buf)))))
+                         (inbuf-sub buf (vector-ref state 3) (inbuf-length buf)))
+                       #f))
               ((and (vector? state) (eq? (vector-ref state 0) 'seof))
                (reply! (make-response (vector-ref state 1) (vector-ref state 2)
-                         empty-bv)))
+                         empty-bv)
+                       #f))
               (else (err! "connection closed early"))))
           (`#(tcp-error ,e) (err! "connection error"))))))
+
+  ;; ---- connection reuse --------------------------------------------------
+  ;;
+  ;; A pooled connection lives in its OWN process, which owns the socket for
+  ;; as long as the connection lasts. That is not a style choice: #(tcp-data
+  ;; bv) carries no connection identity (libuv delivery names the owning
+  ;; PROCESS, not the conn), so one process can own exactly one socket -- the
+  ;; same rule websocket.sc states. A registry holding sockets directly could
+  ;; not tell which of its idle connections had just closed.
+  ;;
+  ;; So: a keeper process per connection, and a registry that holds only
+  ;; pids. The keeper is also what makes idle connections safe. Servers close
+  ;; keep-alive connections all the time, and a keeper sitting in receive
+  ;; SEES that eof and takes itself out of the pool. Without it, staleness
+  ;; would only ever be discovered by a request failing.
+
+  (define pool-max-idle-per-origin 4)
+  (define pool-max-idle-total 64)
+  (define pool-idle-ms 30000)      ; how long an unused connection is kept
+
+  ;; Raise or lower the pool. #f leaves one alone, same shape as
+  ;; redis-set-limits! and node-set-limits!.
+  (define (http-client-pool! per-origin total idle-ms)
+    (define (check who v)
+      (unless (and (integer? v) (exact? v) (>= v 0))
+        (assertion-violation 'http-client-pool!
+          (string-append who " must be a nonnegative exact integer") v)))
+    (when per-origin (check "per-origin" per-origin)
+                     (set! pool-max-idle-per-origin per-origin))
+    (when total (check "total" total) (set! pool-max-idle-total total))
+    (when idle-ms (check "idle-ms" idle-ms) (set! pool-idle-ms idle-ms))
+    (void))
+
+  ;; counters, read by http-client-pool-stats
+  (define stat-reused 0)
+  (define stat-dialed 0)
+  (define stat-stale 0)
+  (define stat-retried 0)
+
+  (define registry-pid #f)
+  (define (registry)
+    (if (and registry-pid (process-alive? registry-pid))
+        registry-pid
+        ;; Interrupts off across the check and the spawn: two requests
+        ;; starting at once would otherwise each create a registry and the
+        ;; second would replace the first, orphaning every connection the
+        ;; first was holding.
+        (with-interrupts-disabled
+          (if (and registry-pid (process-alive? registry-pid))
+              registry-pid
+              (let ((p (spawn registry-loop)))
+                (set! registry-pid p)
+                p)))))
+
+  (define (registry-loop)
+    ;; origin -> list of (pid . monitor). The monitor handle is kept, not
+    ;; just the pid: a monitor taken and never released is a registration
+    ;; that accumulates for the life of the process, one per pooled
+    ;; connection ever created.
+    (let ((idle (make-hashtable string-hash string=?))
+          (total 0))
+      (define (entries origin) (hashtable-ref idle origin '()))
+      (define (find-entry origin pid) (assq pid (entries origin)))
+      (define (drop! origin pid)
+        (let ((xs (entries origin)))
+          (when (assq pid xs)
+            (set! total (- total 1))
+            (let ((rest (remp (lambda (e) (eq? (car e) pid)) xs)))
+              (if (null? rest)
+                  (hashtable-delete! idle origin)
+                  (hashtable-set! idle origin rest))))))
+      ;; demonitor, then drain a DOWN that was already delivered -- left
+      ;; behind it would sit in this mailbox forever, one per pooled
+      ;; connection ever handed out.
+      (define (release! origin pid)
+        (let ((e (find-entry origin pid)))
+          (when e
+            (demonitor (cdr e))
+            (receive (after 0 'ok) (`#(DOWN ,@pid ,reason) 'ok)))))
+      (define (all-pids)
+        (let ((vs (hashtable-values idle)) (acc '()))
+          (do ((i 0 (+ i 1))) ((= i (vector-length vs)) acc)
+            (set! acc (append (map car (vector-ref vs i)) acc)))))
+      (define (forget-everywhere! pid)
+        (let ((ks (hashtable-keys idle)))
+          (do ((i 0 (+ i 1))) ((= i (vector-length ks)))
+            (drop! (vector-ref ks i) pid))))
+      (let loop ()
+        (receive
+          (`#(hc-take ,origin ,ref ,from)
+            (let ((xs (entries origin)))
+              (if (null? xs)
+                  (send from (vector 'hc-took ref #f))
+                  (let ((p (car (car xs))))
+                    ;; handed out: it is the requester's business now
+                    (release! origin p)
+                    (drop! origin p)
+                    (send from (vector 'hc-took ref p)))))
+            (loop))
+          (`#(hc-put ,origin ,pid ,ref)
+            (let ((xs (entries origin)))
+              (cond
+                ((or (>= total pool-max-idle-total)
+                     (>= (length xs) pool-max-idle-per-origin))
+                 (send pid (vector 'hc-put-reply ref 'drop)))
+                (else
+                 ;; monitored while idle: a keeper killed outright (a
+                 ;; supervisor, an owner cleanup) sends no hc-gone, and a
+                 ;; dead pid handed to a later request is a wasted retry
+                 (hashtable-set! idle origin (cons (cons pid (monitor pid)) xs))
+                 (set! total (+ total 1))
+                 (send pid (vector 'hc-put-reply ref 'keep)))))
+            (loop))
+          (`#(hc-gone ,origin ,pid)
+            (release! origin pid)
+            (drop! origin pid)
+            (loop))
+          (`#(DOWN ,pid ,reason)
+            ;; the monitor is consumed by the DOWN itself, so only the
+            ;; bookkeeping is left to clear
+            (forget-everywhere! pid)
+            (loop))
+          (`#(hc-close-all ,ref ,from)
+            (for-each (lambda (p) (send p (vector 'hc-quit))) (all-pids))
+            (let ((ks (hashtable-keys idle)))
+              (do ((i 0 (+ i 1))) ((= i (vector-length ks)))
+                (let ((origin (vector-ref ks i)))
+                  (for-each (lambda (e) (release! origin (car e)))
+                            (entries origin)))))
+            (hashtable-clear! idle)
+            (set! total 0)
+            (send from (vector 'hc-close-all-reply ref 'ok))
+            (loop))
+          (`#(hc-stats ,ref ,from)
+            (send from
+              (vector 'hc-stats-reply ref
+                (list (cons 'idle total)
+                      (cons 'origins (vector-length (hashtable-keys idle)))
+                      (cons 'reused stat-reused)
+                      (cons 'dialed stat-dialed)
+                      (cons 'stale stat-stale)
+                      (cons 'retried stat-retried))))
+            (loop))))))
+
+  ;; Close every idle pooled connection now. For shutdown, and for tests that
+  ;; must not inherit a connection from an earlier case.
+  (define (http-client-close-idle!)
+    (let ((ref (gensym)))
+      (send (registry) (vector 'hc-close-all ref self))
+      (receive (after 5000 'timeout)
+        (`#(hc-close-all-reply ,@ref ,r) r))))
+
+  (define (http-client-pool-stats)
+    (let ((ref (gensym)))
+      (send (registry) (vector 'hc-stats ref self))
+      (receive (after 5000 (raise (vector 'http-client-error "pool stats timeout")))
+        (`#(hc-stats-reply ,@ref ,st) st))))
+
+  ;; Ask the registry for an idle connection to this origin.
+  (define (take-pooled! origin)
+    (let ((ref (gensym)))
+      (send (registry) (vector 'hc-take origin ref self))
+      (receive (after 5000 #f)
+        (`#(hc-took ,@ref ,p) p))))
+
+  ;; May this request be sent again after a pooled connection turned out to
+  ;; be already closed? Only when repeating it cannot repeat an effect: the
+  ;; idempotent methods, or anything with no body to resend.
+  (define (replayable? method body)
+    (or (memq method '(GET HEAD PUT DELETE OPTIONS TRACE))
+        (not body)
+        (and (bytevector? body) (zero? (bytevector-length body)))
+        (and (string? body) (zero? (string-length body)))))
+
+  ;; A connection's keeper. Owns c and the codec for the connection's whole
+  ;; life, serves one request at a time, and decides after each whether the
+  ;; connection may be kept.
+  ;;
+  ;; client-loop answers the KEEPER, not the original caller, and the keeper
+  ;; forwards. That hop is what lets a failure on a REUSED connection with
+  ;; nothing received be reported as 'stale rather than as an error: the
+  ;; request never reached a server that acted on it, so it can be retried
+  ;; on a fresh connection. On a freshly dialled connection the same failure
+  ;; is a real error and is passed through unchanged.
+  (define (keeper-serve c codec origin reused?
+                        ref real-caller req idle emit max-resp method deadline)
+    (let ((disp 'close)
+          (progress (box #f))
+          (vbox (box "HTTP/1.1"))
+          (buf (make-inbuf)))
+      (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f)
+      (client-loop c self ref buf 'head idle codec emit max-resp method
+                   deadline vbox progress (lambda (d) (set! disp d)))
+      ;; client-loop has already sent its answer to us
+      (receive (after 0 (void))
+        (`#(http-reply ,@ref ,r) (send real-caller (vector 'http-reply ref r)))
+        (`#(http-error ,@ref ,m)
+          (if (and reused? (not (unbox progress)))
+              (send real-caller (vector 'http-stale ref))
+              (send real-caller (vector 'http-error ref m)))))
+      disp))
+
+  (define (keeper-bye! c codec origin)
+    (send (registry) (vector 'hc-gone origin self))
+    (when codec ((vector-ref codec 2)))
+    (tcp-close! c))
+
+  (define (keeper-idle c codec origin)
+    ;; Offer ourselves to the pool; the registry decides whether it wants
+    ;; another idle connection for this origin.
+    (let ((r (gensym)))
+      (send (registry) (vector 'hc-put origin self r))
+      (receive (after 5000 (keeper-bye! c codec origin))
+        (`#(hc-put-reply ,@r ,d)
+          (if (eq? d 'keep)
+              (keeper-wait c codec origin)
+              (keeper-bye! c codec origin))))))
+
+  (define (keeper-wait c codec origin)
+    (receive (after (if (> pool-idle-ms 0) pool-idle-ms 1)
+                (keeper-bye! c codec origin))
+      (`#(hc-run ,ref ,real-caller ,req ,idle ,emit ,max-resp ,method ,deadline)
+        (set! stat-reused (+ stat-reused 1))
+        (let ((disp (keeper-serve c codec origin #t ref real-caller req idle
+                                  emit max-resp method deadline)))
+          (if (eq? disp 'reuse)
+              (keeper-idle c codec origin)
+              (keeper-bye! c codec origin))))
+      ;; The server closed, or spoke unbidden. Either way this connection is
+      ;; no longer a clean starting point, and noticing it HERE rather than
+      ;; on the next request is the whole reason a keeper sits in receive.
+      (`#(tcp-eof) (keeper-bye! c codec origin))
+      (`#(tcp-error ,e) (keeper-bye! c codec origin))
+      (`#(tcp-data ,bv) (keeper-bye! c codec origin))
+      (`#(hc-quit) (keeper-bye! c codec origin))))
 
   ;; ---- public API ------------------------------------------------------
 
@@ -693,6 +1040,23 @@
   ;;                                      (default 32 MiB); with on-chunk
   ;;                                      it bounds the unparsed tail, not
   ;;                                      the stream total
+  ;;   (reuse . #f)                       do not take or leave a pooled
+  ;;                                      connection for this request
+  ;;
+  ;; CONNECTIONS ARE REUSED by default: after a response that leaves the
+  ;; connection framed and drained, it is kept and offered to the next
+  ;; request for the same host/port/scheme. That saves a TCP handshake, and
+  ;; over TLS a full handshake, which usually dominates a small request.
+  ;; http-client-pool! sizes it; http-client-close-idle! empties it.
+  ;;
+  ;; A pooled connection can go stale: a server may close an idle keep-alive
+  ;; connection at any moment, and it may do so exactly between being handed
+  ;; out and being written to. When that happens with NOTHING received, the
+  ;; request never reached a server that could have acted on it, and it is
+  ;; retried once on a fresh connection -- but only for methods that are
+  ;; idempotent or carry no body. A POST that loses that race is reported
+  ;; rather than repeated: silently sending it twice is the one outcome
+  ;; worse than failing.
   (define (http-request method url . rest)
     (let* ((opts (if (pair? rest) (car rest) '()))
            (headers (let ((p (assq 'headers opts))) (if p (cdr p) '())))
@@ -700,7 +1064,11 @@
            (timeout (let ((p (assq 'timeout opts))) (if p (cdr p) default-timeout-ms)))
            (on-chunk (let ((p (assq 'on-chunk opts))) (and p (cdr p))))
            (max-resp (let ((p (assq 'max-response opts)))
-                       (if p (cdr p) max-response))))
+                       (if p (cdr p) max-response)))
+           (reuse? (let ((p (assq 'reuse opts))) (if p (and (cdr p) #t) #t)))
+           ;; internal: set by the stale retry so it dials rather than
+           ;; taking another connection that may be equally stale
+           (fresh-only? (and (assq '%fresh opts) #t)))
       (when on-chunk
         (unless (procedure? on-chunk)
           (fail "on-chunk must be a procedure")))
@@ -734,7 +1102,16 @@
                  ;; the caller's watchdog fired at timeout + 2000. Streaming
                  ;; keeps no total deadline (documented contract), so #f.
                  (deadline (and (not on-chunk) (+ (now-ms) timeout 2000)))
-                 (pid (spawn
+                 (origin (string-append (if tls? "https://" "http://")
+                                        host ":" (number->string port)))
+                 (req (build-request method host-header path headers body reuse?))
+                 ;; A pooled connection for this origin, if the registry has
+                 ;; one. Taken BEFORE the keeper is spawned, so a hit costs
+                 ;; no process at all.
+                 (pooled (and reuse? (not fresh-only?) (take-pooled! origin)))
+                 (pid (or
+                        pooled
+                        (spawn
                         (lambda ()
                           (define (setup-left)
                             (if deadline
@@ -775,14 +1152,17 @@
                                                     (raise e)))
                                         (when tls?
                                           (set! codec (https-connector c host (setup-left))))
-                                        (let ((req (build-request method host-header path headers body)))
-                                          (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f))
-                                        (client-loop c caller ref (make-inbuf) 'head idle codec
-                                                     on-chunk max-resp method deadline))))
+                                        (set! stat-dialed (+ stat-dialed 1))
+                                        (let ((disp (keeper-serve c codec origin #f ref caller
+                                                                  req idle on-chunk max-resp
+                                                                  method deadline)))
+                                          (if (and reuse? (eq? disp 'reuse))
+                                              (keeper-idle c codec origin)
+                                              (keeper-bye! c codec origin))))))
                                   (`#(tcp-connect-failed ,e)
                                     (send caller (vector 'http-error ref (uv-strerror e))))))
                               (`#(dns-failed ,e)
-                                (send caller (vector 'http-error ref "dns resolution failed"))))))))
+                                (send caller (vector 'http-error ref "dns resolution failed")))))))))
                  ;; A stream has no total deadline, so the caller must not
                  ;; outlive the connection process unprotected: if it dies
                  ;; without reporting (killed by a supervisor, or a raise
@@ -794,6 +1174,24 @@
             (define (release!)
               (demonitor mon)
               (receive (after 0 #f) (`#(DOWN ,@pid ,_) #t)))
+            ;; The pooled connection was already gone. Nothing was received,
+            ;; so no server acted on this request and it can be sent again --
+            ;; on a fresh connection, and only once.
+            (define (retry-fresh!)
+              (set! stat-stale (+ stat-stale 1))
+              (if (replayable? method body)
+                  (begin
+                    (set! stat-retried (+ stat-retried 1))
+                    ;; %fresh suppresses taking from the pool, so the retry
+                    ;; cannot pick up a second stale connection and loop
+                    (http-request method url (cons '(%fresh . #t) opts)))
+                  (raise (vector 'http-client-error
+                           "pooled connection was closed before any response; not retried because the request is not idempotent"))))
+            ;; a pooled keeper is already running: hand it the job. After
+            ;; the internal defines, which R6RS requires to come first.
+            (when pooled
+              (send pid (vector 'hc-run ref caller req idle on-chunk
+                                max-resp method deadline)))
             ;; The total deadline is enforced INSIDE the connection process
             ;; (see `deadline` above), which answers http-error and cleans up
             ;; after itself; on the ordinary timeout path this receive gets
@@ -811,11 +1209,16 @@
                         (release!)
                         (raise (vector 'http-client-error "request timeout")))
               (`#(http-reply ,@ref ,resp) (release!) resp)
+              (`#(http-stale ,@ref) (release!) (retry-fresh!))
               (`#(http-error ,@ref ,msg)
                 (release!)
                 (raise (vector 'http-client-error msg)))
               (`#(DOWN ,@pid ,reason)
-                (raise (vector 'http-client-error "connection process died")))))))))
+                ;; A pooled keeper that died without answering had already
+                ;; been closed by the server; nothing was sent to anyone.
+                (if pooled
+                    (retry-fresh!)
+                    (raise (vector 'http-client-error "connection process died"))))))))))
 
   (define (http-get url . rest)
     (apply http-request 'GET url rest))
