@@ -107,7 +107,7 @@
               (receive (after 2000 #f)
                 (`#(db-reply ,@r ,v) (and (vector? v)
                                           (eq? (vector-ref v 0) 'fake-rows))))))))
-      (send pool (vector 'db-close)))
+      (send pool (vector (quote db-quit))))
 
     ;; ---- a timed-out query must not execute later --------------------
     ;;
@@ -167,7 +167,86 @@
           (send pool (vector 'db-query "SELECT 2" r2 self))
           (check "pool still runs later queries"
             (receive (after 2000 #f) (`#(db-reply ,@r2 ,v) #t)))))
-      (send pool (vector 'db-close)))
+      (send pool (vector (quote db-quit))))
+
+    ;; ---- a queued QUERY whose caller dies --------------------------------
+    ;;
+    ;; The checkout path monitored its waiters; the plain query path did not,
+    ;; so the caller-death cleanup below -- which does filter pending jobs by
+    ;; caller -- never received the DOWN that would run it. A caller killed
+    ;; by its supervisor also never runs its own timeout cancel, so the
+    ;; statement stayed queued and executed whenever a connection freed up:
+    ;; an INSERT applied on behalf of a process long dead.
+    (let ((executed (box '())) (me self))
+      (let ((pool (spawn (lambda ()
+                           (sql-pool-loop 1
+                             (lambda (notify report-to ref)
+                               (bump!)
+                               (spawn
+                                 (lambda ()
+                                   (send report-to (vector 'db-up ref self 'ok))
+                                   (receive (`#(db-adopt) 'ok))
+                                   (let loop ()
+                                     (receive
+                                       (`#(db-query ,sql ,r ,from)
+                                         (set-box! executed
+                                                   (cons sql (unbox executed)))
+                                         (send from (vector 'db-reply r 'ok))
+                                         (send notify (vector 'db-idle self))
+                                         (loop))
+                                       (`#(db-stats ,r ,from)
+                                         (send from (vector 'db-stats-reply r #f))
+                                         (loop))
+                                       (`#(db-quit) 'done))))))
+                             cfg)))))
+        (sleep-ms 300)
+        ;; occupy the only connection with a lease so the next query queues
+        (let ((holder (spawn (lambda ()
+                               (sql-call-with-connection pool
+                                 (lambda (c)
+                                   (send me (vector 'held))
+                                   (receive (`#(release) 'ok)))
+                                 cfg)))))
+          (receive (after 2000 (void)) (`#(held) 'ok))
+          ;; a caller queues an effectful statement, then is killed
+          (let ((victim (spawn (lambda ()
+                                 (guard (e (#t (void)))
+                                   (sql-query pool "INSERT DEAD" cfg))))))
+            (sleep-ms 150)
+            (monitor victim)
+            (kill victim 'reaped)
+            (receive (after 2000 (void)) (`#(DOWN ,@victim ,_) 'ok)))
+          (sleep-ms 150)
+          (send holder (vector 'release)))
+        (sleep-ms 400)
+        (check "a dead caller's queued statement is never executed"
+          (null? (unbox executed)))
+        ;; and the pool still works
+        (check "the pool still serves live callers"
+          (eq? 'ok (sql-query pool "SELECT 1" cfg)))
+        (send pool (vector 'db-quit))))
+
+    ;; ---- a checkout for a caller that is ALREADY dead ---------------------
+    ;;
+    ;; monitor answers #f for a dead pid and delivers the DOWN at once. The
+    ;; pool leased a connection to it anyway, and that immediate DOWN then
+    ;; read as "a borrower died holding a transaction" -- destroying and
+    ;; rebuilding a connection nobody had ever touched.
+    (let ((spawned-before spawned))
+      (let ((pool (spawn (lambda () (sql-pool-loop 1 fake-spawn-conn! cfg)))))
+        (sleep-ms 300)
+        (let ((base (- spawned spawned-before)))
+          ;; a pid that is dead before the request reaches the pool
+          (let ((corpse (spawn (lambda () 'done))))
+            (sleep-ms 100)
+            (send pool (vector 'db-checkout (gensym) corpse))
+            (sleep-ms 400)
+            (check "a checkout from a dead caller destroys no connection"
+              (= base (- spawned spawned-before)))))
+        ;; the connection is still there and usable
+        (check "and the connection is still usable"
+          (vector? (sql-query pool "SELECT 1" cfg)))
+        (send pool (vector 'db-quit))))
 
     (sleep-ms 100)
     (if (zero? failures)

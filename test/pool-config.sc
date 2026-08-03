@@ -10,7 +10,8 @@
 ;;; without end. None announces itself -- each surfaces much later as "the
 ;;; service stopped responding", with nothing pointing at the cause.
 
-(import (chezscheme) (igropyr actor) (igropyr otp) (igropyr sqlpool))
+(import (chezscheme) (igropyr actor) (igropyr otp) (igropyr sqlpool)
+        (igropyr mysql) (igropyr postgresql))
 (define fails 0)
 (define (rejects? label thunk)
   (let ((ok (guard (e ((assertion-violation? e) #t) (#t #f)) (thunk) #f)))
@@ -29,6 +30,25 @@
     (rejects? "sql pool n=0"  (lambda () (sql-pool-loop 0 (lambda (a b c) #f) cfg)))
     (rejects? "sql pool n=-3" (lambda () (sql-pool-loop -3 (lambda (a b c) #f) cfg)))
     (rejects? "sql pool n=1.5"(lambda () (sql-pool-loop 1.5 (lambda (a b c) #f) cfg)))
+    ;; The three above call sql-pool-loop DIRECTLY, so the check runs in this
+    ;; process and raises here. That is not how an application creates a
+    ;; pool: mysql-pool and postgresql-pool spawn the loop and hand back a
+    ;; pid, so the same check ran inside a process the caller cannot see --
+    ;; a bad size returned a pid that died a moment later, and the mistake
+    ;; surfaced as a pool that answered nothing rather than as an error where
+    ;; it was written. These go through the public constructors.
+    (rejects? "mysql-pool n=0"
+      (lambda () (mysql-pool 0 "127.0.0.1" 3306 "u" "p")))
+    (rejects? "mysql-pool n=-1"
+      (lambda () (mysql-pool -1 "127.0.0.1" 3306 "u" "p")))
+    (rejects? "mysql-pool n=2.5"
+      (lambda () (mysql-pool 2.5 "127.0.0.1" 3306 "u" "p")))
+    (rejects? "postgresql-pool n=0"
+      (lambda () (postgresql-pool 0 "127.0.0.1" 5432 "u" "p")))
+    (rejects? "postgresql-pool n=-1"
+      (lambda () (postgresql-pool -1 "127.0.0.1" 5432 "u" "p")))
+    (rejects? "postgresql-pool n=2.5"
+      (lambda () (postgresql-pool 2.5 "127.0.0.1" 5432 "u" "p")))
     (if (zero? fails)
         (begin (display "pool config validation: all tests passed\n") (exit 0))
         (begin (display fails) (display " failures\n") (exit 1)))))
