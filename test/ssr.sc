@@ -159,6 +159,37 @@ function boom(j){ throw new Error('render failed'); }
         (let loop ((got 0)) (when (< got k) (receive (`#(nf ,_) (loop (+ got 1))))))
         (check "no-single-flight-each-renders" (= 4 (N)))))
 
+    ;; ---- invalidation and an in-flight render ---------------------------
+    ;; A render used to write its result into the cache unconditionally, so
+    ;; one that finished after an invalidate reinstated exactly the content
+    ;; the invalidate existed to remove, with a fresh TTL. A cache epoch now
+    ;; suppresses that write.
+    ;;
+    ;; The RACE itself is not reachable here and this does not claim to test
+    ;; it: with the memory backend there is no yield between the render and
+    ;; the put, so nothing can slip in between. It is reachable with the
+    ;; redis backend, where both park on the network. What IS tested is the
+    ;; cost of the mechanism -- one epoch for all keys means an invalidate
+    ;; can suppress an unrelated render's write, and that must cost a
+    ;; re-render and nothing else.
+    (let ((r (make-ssr bundle)))
+      (ssr-render r "render" '(("t" . "A")) '((key . "/e1")))
+      (let ((n1 (N)))
+        (ssr-invalidate! r "/other")
+        ;; /e1 is still cached: the invalidate was for another key
+        (check "an unrelated invalidate does not drop a cached entry"
+          (and (string=? (ssr-render r "render" '(("t" . "A")) '((key . "/e1")))
+                         "<h1>A</h1>")
+               (= n1 (N))))
+        ;; and an entry rendered after any number of invalidates is cached
+        (ssr-invalidate! r "/e2")
+        (ssr-render r "render" '(("t" . "B")) '((key . "/e2")))
+        (let ((n2 (N)))
+          (check "a render after an invalidate is still cached"
+            (and (string=? (ssr-render r "render" '(("t" . "B")) '((key . "/e2")))
+                           "<h1>B</h1>")
+                 (= n2 (N)))))))
+
     (if (zero? failures)
         (begin (display "ssr: all tests passed\n") (exit 0))
         (begin (display failures) (display " failures\n") (exit 1)))))

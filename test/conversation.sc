@@ -225,5 +225,38 @@
           (fail "runaway step ran to completion despite the TTL" v))
         (display "runaway step bounded by TTL ok\n")))))
 
+;; ...and the allowance must be the TTL, not whatever is left of a sampling
+;; cycle. The watchdog used to sample on a fixed period and decide from "has
+;; the step counter moved since my last look", which hands a step anything
+;; between almost nothing and almost twice the TTL depending on where it
+;; starts in that cycle.
+;;
+;; It takes TWO steps to construct. On the first sample the opening suspend!
+;; has just moved the counter, so that sample always sees progress; and a
+;; conversation parked longer than its TTL is reaped by suspend! itself, so
+;; the resume cannot simply be delayed. The second step parks before a
+;; sample (moving the counter again) and the third resumes just after one --
+;; and is then killed at the next, having run a fraction of its allowance.
+(let-values (((id2 first2)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (sleep-ms 100)
+                    (let ((b (suspend! (vector 'parked2 a))))
+                      (sleep-ms 600)          ; well inside the 1000 ms TTL
+                      (vector 'finished b))))
+                'go
+                1000)))
+  (let ((me self))
+    (sleep-ms 800)                            ; still parked, still alive
+    (conversation-resume! id2 'X)             ; step 2 runs 100 ms, parks again
+    (sleep-ms 900)                            ; just past a sampling point
+    (spawn (lambda () (send me (vector 'phase (conversation-resume! id2 'Y)))))
+    (receive (after 8000 (fail "phase-step" 'no-answer))
+      (`#(phase ,v)
+        (if (and (vector? v) (eq? (vector-ref v 0) 'finished))
+            (display "a step gets its whole TTL whatever the sampling phase ok\n")
+            (fail "a step well inside the TTL was cut short by sampling phase" v))))))
+
 (display "ALL CONVERSATION TESTS PASSED\n")
     (exit 0)))
