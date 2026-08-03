@@ -326,6 +326,68 @@
             (`#(q1 ,v) (loop (cons (cons 'q1 v) got) (+ n 1)))
             (`#(q2 ,v) (loop (cons (cons 'q2 v) got) (+ n 1))))))))
 
+;; ---- after the linger, 'gone must still not lie -------------------------
+;;
+;; 'gone is documented as the rollback guarantee, and for a conversation
+;; that DIED it is one. For one that COMPLETED it is false: the flow
+;; committed and then exited, and a caller told "rolled back" performs the
+;; whole thing again. The linger covers the window right after completion,
+;; but it holds a process; a tombstone is an id and an outcome, so it can
+;; outlast it cheaply.
+(let-values (((sid stok sfirst)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (vector 'committed a)))
+                'go
+                300)))                          ; short TTL -> short linger
+  (let-values (((r st) (conversation-resume! sid stok 'confirm)))
+    (unless (conversation-done? st) (fail "settled-setup" st)))
+  ;; wait out the linger
+  (sleep-ms 700)
+  (let-values (((state token reply) (conversation-peek sid)))
+    (unless (conversation-settled? state)
+      (fail "a completed conversation was reported as gone" state)))
+  (let-values (((r st) (conversation-resume! sid stok 'confirm)))
+    (unless (conversation-settled? st)
+      (fail "a resume after the linger was reported as gone" st)))
+  (display "after the linger a completed conversation is settled, not gone ok\n"))
+
+;; ...and one that DIED is still 'gone -- the guarantee that matters
+(let-values (((did dtok dfirst)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (raise 'flow-crashed)))
+                'go
+                300)))
+  (let-values (((r st) (conversation-resume! did dtok 'confirm)))
+    (unless (conversation-gone? st) (fail "crashed-flow-status" st)))
+  (sleep-ms 500)
+  (let-values (((state token reply) (conversation-peek did)))
+    (unless (conversation-gone? state)
+      (fail "a crashed conversation was reported as settled" state)))
+  (display "a conversation that died is still gone ok\n"))
+
+;; the record is bounded: past its age it forgets, and says so by
+;; answering 'gone again
+(let-values (((eid etok efirst)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (vector 'committed a)))
+                'go
+                200)))
+  (conversation-set-limits! #f 300)             ; forget after 300 ms
+  (let-values (((r st) (conversation-resume! eid etok 'confirm)))
+    (unless (conversation-done? st) (fail "expiry-setup" st)))
+  (sleep-ms 900)
+  (let-values (((state token reply) (conversation-peek eid)))
+    (unless (conversation-gone? state)
+      (fail "an expired tombstone still reported settled" state)))
+  (conversation-set-limits! #f 3600000)         ; put it back
+  (display "the completion record expires, and says gone again ok\n"))
+
 ;; ---- a parked conversation cannot be kept alive by poking it -----------
 ;;
 ;; The park used to arm `after ttl` afresh on every message, so a caller

@@ -120,7 +120,8 @@
 
 (library (igropyr conversation)
   (export conversation-start! conversation-resume! conversation-peek
-          conversation-gone? conversation-stale? conversation-done?)
+          conversation-gone? conversation-stale? conversation-done?
+          conversation-settled? conversation-set-limits!)
   (import (chezscheme) (igropyr actor)
           (only (igropyr libuv) now-ms)
           (only (igropyr node) node-self rsend monitor-node demonitor-node))
@@ -167,6 +168,81 @@
   ;; unique. It stays a string, which crosses a node link, JSON and a query
   ;; parameter unchanged.
   (define (conv-token!) (conv-hex/n! 8))
+
+  ;; ---- completed-conversation tombstones ---------------------------------
+  ;;
+  ;; 'gone means "no process here". For a conversation that DIED -- crashed,
+  ;; expired -- that is the rollback guarantee, because a dead process is a
+  ;; dropped connection and the database rolled back on its own. For one
+  ;; that COMPLETED it is false: the flow committed and then exited, and a
+  ;; caller told "rolled back" does the whole thing again.
+  ;;
+  ;; The linger covers the window just after completion, but it holds a
+  ;; whole process and the retained reply, so it cannot be long. A
+  ;; tombstone is an id and an outcome, so it can be: the answer is no
+  ;; longer available, but "this committed" is what a reconciling caller
+  ;; actually needs, and it is the opposite of what 'gone would have said.
+  ;;
+  ;; BOUNDED, by age and by count, because an unbounded record of every
+  ;; conversation that ever finished is a leak with a long fuse. Past
+  ;; either bound an entry is dropped and 'gone becomes ambiguous again --
+  ;; that is the honest limit of this mechanism, and the reason both bounds
+  ;; are settable.
+  (define tombstone-max 10000)
+  (define tombstone-ttl-ms 3600000)    ; one hour
+
+  (define tombstones (make-hashtable string-hash string=?))
+  (define tomb-front '())              ; oldest first
+  (define tomb-back '())               ; newest, reversed
+  (define tomb-n 0)
+
+  (define (tomb-pop-oldest!)
+    (when (null? tomb-front)
+      (set! tomb-front (reverse tomb-back))
+      (set! tomb-back '()))
+    (unless (null? tomb-front)
+      (let ((e (car tomb-front)))
+        (set! tomb-front (cdr tomb-front))
+        (set! tomb-n (- tomb-n 1))
+        (hashtable-delete! tombstones (car e)))))
+
+  (define (tomb-prune!)
+    (let loop ()
+      (when (> tomb-n 0)
+        (when (null? tomb-front)
+          (set! tomb-front (reverse tomb-back))
+          (set! tomb-back '()))
+        (let ((e (and (pair? tomb-front) (car tomb-front))))
+          (when (and e (or (> tomb-n tombstone-max)
+                           (> (- (now-ms) (cdr e)) tombstone-ttl-ms)))
+            (tomb-pop-oldest!)
+            (loop))))))
+
+  (define (tomb-record! id)
+    (unless (hashtable-contains? tombstones id)
+      (hashtable-set! tombstones id #t)
+      (set! tomb-back (cons (cons id (now-ms)) tomb-back))
+      (set! tomb-n (+ tomb-n 1)))
+    (tomb-prune!))
+
+  (define (tomb-settled? id)
+    (tomb-prune!)
+    (hashtable-contains? tombstones id))
+
+  ;; Size the record of completed conversations. #f leaves one alone.
+  (define (conversation-set-limits! max-entries ttl-ms)
+    (when max-entries
+      (unless (and (integer? max-entries) (exact? max-entries) (> max-entries 0))
+        (assertion-violation 'conversation-set-limits!
+          "max-entries must be a positive exact integer" max-entries))
+      (set! tombstone-max max-entries))
+    (when ttl-ms
+      (unless (and (integer? ttl-ms) (exact? ttl-ms) (> ttl-ms 0))
+        (assertion-violation 'conversation-set-limits!
+          "ttl-ms must be a positive exact integer" ttl-ms))
+      (set! tombstone-ttl-ms ttl-ms))
+    (tomb-prune!)
+    (void))
 
   ;; The id carries the owner node so a resume on any node reaches it:
   ;; "<node>~<hex>" when clustered, bare "<hex>" on a single node. The
@@ -558,6 +634,8 @@
                                      (send from
                                            (vector 'conv-reply ref2 #f 'stale)))
                                  (linger)))))))
+                     ;; the process goes, the fact that it FINISHED stays
+                     (tomb-record! id)
                      (unregister name)))))))
       (let ((m (monitor conv)))
         (receive
@@ -601,7 +679,11 @@
   (define (local-resume id token req)
     (let ((p (whereis (conversation-name id))))
       (if (not p)
-          (values #f 'gone)
+          ;; no process -- but did it FINISH, or die? The difference is the
+          ;; difference between "your transaction committed" and "it rolled
+          ;; back", and answering 'gone for both is how a committed
+          ;; transfer gets performed twice.
+          (values #f (if (tomb-settled? id) 'settled 'gone))
           (let ((ref (gensym))
                 (m (monitor p)))
             (send p (vector 'conv-step self ref token req))
@@ -610,7 +692,10 @@
                 (when m (demonitor m))
                 (flush-down! p)
                 (values reply status))
-              (`#(DOWN ,@p ,reason) (values #f 'gone)))))))
+              ;; the process died while we waited: it may have finished
+              ;; and lingered out in between, so ask the record
+              (`#(DOWN ,@p ,reason)
+                (values #f (if (tomb-settled? id) 'settled 'gone))))))))
 
   ;; What is this conversation waiting for, and what did it last say?
   ;;
@@ -643,7 +728,7 @@
   (define (local-peek id)
     (let ((p (whereis (conversation-name id))))
       (if (not p)
-          (values 'gone #f #f)
+          (values (if (tomb-settled? id) 'settled 'gone) #f #f)
           (let ((ref (gensym))
                 (m (monitor p)))
             (send p (vector 'conv-peek self ref))
@@ -652,7 +737,8 @@
                 (when m (demonitor m))
                 (flush-down! p)
                 (values state token reply))
-              (`#(DOWN ,@p ,reason) (values 'gone #f #f)))))))
+              (`#(DOWN ,@p ,reason)
+                (values (if (tomb-settled? id) 'settled 'gone) #f #f)))))))
 
   ;; Applied to the STATUS, never to the reply. A flow may return the
   ;; symbol 'gone as a perfectly ordinary answer; only the status carries
@@ -663,6 +749,12 @@
   ;; it. Distinguishing this from 'gone is what tells a caller whether the
   ;; transaction committed.
   (define (conversation-done? x) (eq? x 'done))
+
+  ;; The flow finished, but its answer is no longer retained -- the linger
+  ;; window closed and only the record of completion is left. For a
+  ;; transactional flow this is the OPPOSITE of 'gone: it committed. Read
+  ;; your own state for the details; do not resubmit.
+  (define (conversation-settled? x) (eq? x 'settled))
 
   ;; The request named a reply that is no longer the one being answered --
   ;; a duplicate, a retry, a second front end. It was NOT applied and will
