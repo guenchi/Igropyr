@@ -75,6 +75,7 @@
 (library (igropyr conversation)
   (export conversation-start! conversation-resume! conversation-gone?)
   (import (chezscheme) (igropyr actor)
+          (only (igropyr libuv) now-ms)
           (only (igropyr node) node-self rsend monitor-node demonitor-node))
 
   (define default-ttl-ms 300000)      ; 5 minutes
@@ -228,6 +229,14 @@
            ;; executing rather than parked waiting for the next request
            (step-box (box 0))
            (running-box (box #t))
+           ;; when the step now running actually began. The watchdog used
+           ;; to sample on a fixed period and decide from "has the counter
+           ;; moved since my last look", which gives a step anything from
+           ;; almost nothing to almost twice the TTL depending on where it
+           ;; starts in that cycle -- measured, a step killed 301 ms into a
+           ;; 2000 ms allowance. Sampling can stay periodic; the DECISION
+           ;; has to come from the clock.
+           (run-start-box (box (now-ms)))
            (conv
              (spawn
                (lambda ()
@@ -247,18 +256,19 @@
                  (let ((watched self))
                    (spawn
                      (lambda ()
-                       (let loop ((seen 0))
-                         (sleep-ms ttl)
-                         (let ((now (unbox step-box)))
+                       (let ((tick (max 50 (div ttl 4))))
+                         (let loop ()
+                           (sleep-ms tick)
                            (cond
                              ((not (process-alive? watched)) 'done)
-                             ;; advanced since the last look: still moving
-                             ((not (= now seen)) (loop now))
-                             ;; a whole TTL with no progress and not parked
-                             ;; in suspend! -- the step itself is stuck
-                             ((unbox running-box)
+                             ;; parked in suspend!: idle between rounds is
+                             ;; not what this bounds
+                             ((not (unbox running-box)) (loop))
+                             ;; running, and running for longer than one
+                             ;; step is allowed
+                             ((> (- (now-ms) (unbox run-start-box)) ttl)
                               (kill watched 'conversation-expired))
-                             (else (loop now))))))))
+                             (else (loop))))))))
                  (let ((who starter) (tag ref) (step 0))
                    ;; One resume per step. Two concurrent resumes -- a double
                    ;; click, a client retry, two front ends -- both land in
@@ -295,6 +305,7 @@
                        (`#(conv-step ,from ,ref2 ,r)
                          (set! who from) (set! tag ref2)
                          (set-box! running-box #t)  ; executing again
+                         (set-box! run-start-box (now-ms))
                          r)))
                    (let ((final (flow req suspend!)))
                      (unregister name)

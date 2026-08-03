@@ -269,14 +269,30 @@
   ;; render (non-raising) + cache on success -> (ok . text). Each call is one
   ;; actual engine render, so it bumps the render counter -- under single-flight
   ;; `misses` (cache misses) can exceed `renders` (followers miss but don't render).
+  ;; Bumped by every invalidate and clear. A render reads it before it
+  ;; starts and refuses to write its result if it changed meanwhile: the
+  ;; single-flight generation guarded only the PUBLISH, so an in-flight
+  ;; render still put its result into the cache after the entry it was
+  ;; producing had been dropped -- reinstating exactly the content the
+  ;; invalidation existed to remove, with a fresh TTL.
+  ;;
+  ;; One counter for all keys, not one per key. Invalidating A therefore
+  ;; also suppresses a concurrent render of B, which costs that render a
+  ;; re-run and can never serve anything stale. The other direction would
+  ;; not be worth the bookkeeping.
+  (define cache-epoch 0)
+  (define (bump-epoch!) (set! cache-epoch (+ cache-epoch 1)))
+
   (define (call+cache renders backend key fn json ttl)
     (set-box! renders (+ 1 (unbox renders)))
-    (let ((res (guard (e (#t (cons #f (flight-error-text e))))
+    (let ((epoch cache-epoch)
+          (res (guard (e (#t (cons #f (flight-error-text e))))
                  ;; bytes are the cache currency: skips a utf8->string of the
                  ;; render output on every miss, and lets a byte consumer send
                  ;; the memory-cache hit straight through with no re-encode
                  (let-values (((ok s) (qjs-call/bytes fn json))) (cons ok s)))))
-      (when (car res) (b-put backend key (cdr res) ttl))
+      (when (and (car res) (= epoch cache-epoch))
+        (b-put backend key (cdr res) ttl))
       res))
 
   (define (flight-error-text e)
@@ -378,8 +394,10 @@
     (let-values (((ok v) (apply ssr-try-render/bytes r fn props opt)))
       (if ok (values #t (utf8->string v)) (values #f v))))
 
-  (define (ssr-invalidate! r key) (b-drop (ssr-backend r) key))
-  (define (ssr-clear! r)          (b-clear (ssr-backend r)))
+  ;; The epoch bump goes FIRST. Dropping the entry and then bumping leaves
+  ;; a window in which a render that finished in between still writes.
+  (define (ssr-invalidate! r key) (bump-epoch!) (b-drop (ssr-backend r) key))
+  (define (ssr-clear! r)          (bump-epoch!) (b-clear (ssr-backend r)))
   (define (ssr-stats r)
     (cons (cons 'renders (unbox (ssr-renders r))) (b-stats (ssr-backend r))))
 )
