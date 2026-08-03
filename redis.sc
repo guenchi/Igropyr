@@ -298,13 +298,34 @@
       (send (vector-ref waiter 0)
             (vector 'redis-reply (vector-ref waiter 1) v))))
 
+  ;; The waiter queue is FIFO by protocol -- RESP replies come back in the
+  ;; order the commands went out, so a waiter cannot be reordered or removed.
+  ;; It used to be a plain list appended with (append waiters (list w)), which
+  ;; is O(N) per command: under a stalled Redis the queue grows and every
+  ;; further command pays for the whole backlog, so enqueueing alone becomes
+  ;; O(N^2). Same shape, and the same fix, as dpool's queue-rev.
+  ;;
+  ;; #(front back) with back reversed; order is (append front (reverse back)).
+  (define (wq-empty) (vector '() '()))
+  (define (wq-push q w) (vector (vector-ref q 0) (cons w (vector-ref q 1))))
+  (define (wq-null? q) (and (null? (vector-ref q 0)) (null? (vector-ref q 1))))
+  ;; normalise so front carries everything; amortised O(1) per element
+  (define (wq-norm q)
+    (if (null? (vector-ref q 0))
+        (vector (reverse (vector-ref q 1)) '())
+        q))
+  (define (wq-peek q) (car (vector-ref (wq-norm q) 0)))
+  (define (wq-pop q) (let ((n (wq-norm q)))
+                       (vector (cdr (vector-ref n 0)) (vector-ref n 1))))
+  (define (wq-list q) (append (vector-ref q 0) (reverse (vector-ref q 1))))
+
   (define (conn-loop c buf waiters parse-state)
     (receive
       (`#(redis-cmd ,args ,ref ,from)
         (if (eq? (conn-state c) 'open)
             (begin
               (tcp-write! c (encode-command args) #f)
-        (conn-loop c buf (append waiters (list (vector from ref #t))) parse-state))
+        (conn-loop c buf (wq-push waiters (vector from ref #t)) parse-state))
             (begin
               (send from (vector 'redis-reply ref connection-lost))
               (conn-loop c buf waiters parse-state))))
@@ -313,14 +334,14 @@
           (lambda (w) (when (and (eq? (vector-ref w 0) from)
                                  (eq? (vector-ref w 1) ref))
                         (vector-set! w 2 #f)))
-          waiters)
+          (wq-list waiters))
         (conn-loop c buf waiters parse-state))
       (`#(tcp-data ,bv)
         ;; Checked BEFORE the append: a reply that cannot legally be this
         ;; large is refused while it is still arriving, not after the bytes
         ;; have been taken.
         (if (> (+ (inbuf-length buf) (bytevector-length bv)) max-reply-buffer)
-            (protocol-fail c waiters "reply exceeds size limit")
+            (protocol-fail c (wq-list waiters) "reply exceeds size limit")
             (begin
               (inbuf-append! buf bv)
               (let drain ((waiters waiters) (state parse-state))
@@ -329,18 +350,18 @@
                                            (inbuf-length buf) state)))
                   (cond
                     ((eq? tag 'more) (conn-loop c buf waiters payload))
-                    ((eq? tag 'fatal) (protocol-fail c waiters payload))
+                    ((eq? tag 'fatal) (protocol-fail c (wq-list waiters) payload))
                     (else
                      (let ((v (vector-ref payload 0))
                            (next (vector-ref payload 1)))
-                       (when (pair? waiters) (reply-to! (car waiters) v))
+                       (unless (wq-null? waiters) (reply-to! (wq-peek waiters) v))
                        (inbuf-consume! buf next)
-                       (drain (if (pair? waiters) (cdr waiters) '()) #f)))))))))
+                       (drain (if (wq-null? waiters) waiters (wq-pop waiters)) #f)))))))))
       (`#(redis-quit)
-        (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
+        (for-each (lambda (w) (reply-to! w connection-lost)) (wq-list waiters))
         (tcp-close! c))
-      (`#(tcp-eof) (fail-all c buf waiters))
-      (`#(tcp-error ,e) (fail-all c buf waiters))))
+      (`#(tcp-eof) (fail-all c buf (wq-list waiters)))
+      (`#(tcp-error ,e) (fail-all c buf (wq-list waiters)))))
 
   ;; The connection dropped: fail everyone waiting, close the socket --
   ;; and KEEP SERVING. The redis-cmd clause above answers instantly with
@@ -352,7 +373,7 @@
   (define (fail-all c buf waiters)
     (for-each (lambda (w) (reply-to! w connection-lost)) waiters)
     (tcp-close! c)
-    (conn-loop c (make-inbuf) '() #f))
+    (conn-loop c (make-inbuf) (wq-empty) #f))
 
   ;; A malformed or oversized reply desynchronises the stream: there is no
   ;; point in the byte sequence that can be trusted as the start of the next
@@ -364,7 +385,7 @@
     (let ((e (vector 'redis-error (string-append "protocol error: " msg))))
       (for-each (lambda (w) (reply-to! w e)) waiters)
       (tcp-close! c)
-      (conn-loop c (make-inbuf) '() #f)))
+      (conn-loop c (make-inbuf) (wq-empty) #f)))
 
   ;; ---- public API ----------------------------------------------------------------
 
@@ -379,7 +400,7 @@
                        (`#(tcp-connected ,c)
                          (tcp-read-start! c)
                          (send caller (vector 'redis-up self 'ok))
-                          (conn-loop c (make-inbuf) '() #f))
+                          (conn-loop c (make-inbuf) (wq-empty) #f))
                        (`#(tcp-connect-failed ,e)
                          (send caller (vector 'redis-up self e))))))))
         (receive (after (+ connect-timeout-ms 1000)
