@@ -40,17 +40,34 @@
 
 (start-scheduler
   (lambda ()
-    (define c (make-s3-control `((account-id . "acct-123") (region . "us-east-1")
+    (define c (make-s3-control `((account-id . "123456789012") (region . "us-east-1")
                                  (access-key . "AKIAEXAMPLE") (secret . "secretexample")
                                  (endpoint . ,(string-append "http://127.0.0.1:" (number->string port))))))
     (app-listen app port '((workers . 2)))
     (sleep-ms 120)
 
+    ;; An account id is interpolated into the endpoint HOST, so a '/' or '@'
+    ;; in it moves the authority/path boundary and sends the request -- with
+    ;; its signed headers and body -- somewhere else entirely. It also goes
+    ;; into a header, where a control character splits the block. The real
+    ;; format is twelve decimal digits, so anything else is refused before
+    ;; any DNS or connection happens.
+    (for-each
+      (lambda (bad)
+        (check (string-append "account-id refused: " bad)
+          (guard (e ((assertion-violation? e) #t) (#t #f))
+            (make-s3-control `((account-id . ,bad) (region . "us-east-1")
+                               (access-key . "AK") (secret . "SK")))
+            #f)))
+      '("evil.example.com/x" "123456789012@evil.example" "acct-123"
+        "12345678901" "1234567890123" "12345678901a" "123456789012\r\nX: y"))
+
+
     ;; CreateJob
     (let ((job-id (s3-control-create-job c "<CreateJobRequest><Priority>10</Priority></CreateJobRequest>")))
       (check "create-jobid" (equal? job-id "job-abc-123"))
       (check "create-put"   (equal? (unbox last-method) "PUT"))
-      (check "create-account-header" (equal? (unbox last-account) "acct-123")))
+      (check "create-account-header" (equal? (unbox last-account) "123456789012")))
 
     ;; DescribeJob
     (let ((d (s3-control-describe-job c "job-abc-123")))
@@ -59,7 +76,7 @@
       (check "describe-total"     (= (cdr (assq 'total d)) 1000))
       (check "describe-succeeded" (= (cdr (assq 'succeeded d)) 600))
       (check "describe-failed"    (= (cdr (assq 'failed d)) 5))
-      (check "describe-account-header" (equal? (unbox last-account) "acct-123")))
+      (check "describe-account-header" (equal? (unbox last-account) "123456789012")))
 
     ;; error mapping: a non-2xx raises #(s3-control-error status message)
     (check "error-raise"

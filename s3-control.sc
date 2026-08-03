@@ -25,9 +25,30 @@
   (define-record-type (s3-control make-s3-control-raw s3-control?)
     (fields endpoint host account-id region access-key secret timeout))
 
+  ;; An AWS account id is twelve decimal digits, so this costs nothing to
+  ;; check and closes two holes at once.
+  ;;
+  ;; It is interpolated into the ENDPOINT HOST -- "https://<id>.s3-control..."
+  ;; -- and a '/' or '@' there moves the authority/path boundary, so a
+  ;; malformed tenant configuration or an id taken from external data sends
+  ;; the request, with its signed headers and body, to a host of the
+  ;; attacker's choosing. It also goes into the x-amz-account-id header,
+  ;; where a control character would split the header block.
+  ;;
+  ;; aws.sc and s3.sc already refuse a structured endpoint; this module did
+  ;; not, which is the whole of the difference.
+  (define (check-account-id! id)
+    (unless (and (string? id) (= 12 (string-length id))
+                 (let loop ((i 0))
+                   (or (= i 12)
+                       (and (char<=? #\0 (string-ref id i) #\9) (loop (+ i 1))))))
+      (assertion-violation 'make-s3-control
+        "account-id must be exactly 12 decimal digits" id)))
+
   (define (make-s3-control opts)
     (define (opt k d) (let ((p (assq k opts))) (if p (cdr p) d)))
     (let* ((account-id (opt 'account-id ""))
+           (_ (check-account-id! account-id))
            (region (opt 'region "us-east-1"))
            (endpoint (opt 'endpoint
                        (string-append "https://" account-id ".s3-control." region ".amazonaws.com"))))
