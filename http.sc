@@ -1381,6 +1381,17 @@
   (define (reader-loop* c srv buf started)
     (let ((hend (inbuf-find-header-end buf)))
       (cond
+        ;; SIZE FIRST. A complete header block used to be accepted whatever
+        ;; its size, because finding the terminator won the cond -- so the
+        ;; limit only ever caught a header still arriving, and a peer that
+        ;; sent the whole thing in one go was never checked at all. Measured:
+        ;; a 9 KiB header answered 200 against an 8 KiB limit.
+        ;;
+        ;; The block is bounded by hend, not by what else is buffered: a
+        ;; pipelined second request sitting behind this one is not part of
+        ;; this header, and charging it here would reject legitimate traffic.
+        ((and hend (> (+ hend 4) header-limit))
+         (quick-response! c 431 "Header Too Large"))
         (hend (have-header c srv buf hend))
         ((> (inbuf-length buf) header-limit)
          (quick-response! c 431 "Header Too Large"))
