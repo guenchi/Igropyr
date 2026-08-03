@@ -13,6 +13,7 @@
 ;;;     implement it and read the hex size lines as body content.
 
 (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+        (igropyr websocket)
         (igropyr express) (igropyr http-client))
 
 (define failures 0)
@@ -22,6 +23,17 @@
              (display "FAIL  ") (display label) (newline))))
 
 (define port 18778)
+
+;; Neither of the smuggling-shaped requests below may be ACCEPTED. A 400
+;; is one correct answer, a close without a reply is another; a 101 or a
+;; 200 is not.
+(define (rejected? text)
+  (and text
+       (or (= 0 (string-length text))            ; closed without answering
+           (and (>= (string-length text) 12)
+                (let ((code (substring text 9 12)))
+                  (and (not (string=? code "101"))
+                       (not (string=? code "200"))))))))
 
 (define (str-has? s sub)
   (let ((n (string-length s)) (m (string-length sub)))
@@ -66,6 +78,12 @@
           (res-write! res "hello-")
           (res-write! res "world")
           (res-end! res)))
+      ;; a WebSocket route, for the upgrade framing cases below
+      (app-ws app "/ws" (lambda (ws) (ws-close! ws)))
+      ;; a POST route that answers 200, so "refused" below cannot be
+      ;; satisfied by a 404 from routing -- which is what the first version
+      ;; of the HTTP/1.0-chunked case accidentally measured
+      (app-post app "/echo" (lambda (req res) (send-text! res "ok")))
       (app-listen app port)
       (sleep-ms 300)
 
@@ -115,6 +133,55 @@
         (display outcome) (newline)
         (check "a partial request is eventually reaped"
           (memq outcome '(answered closed))))
+
+      ;; ---- inbound framing the two ends could read differently ---------
+      ;;
+      ;; Both of these are request smuggling in miniature: a message whose
+      ;; boundary this server and something in front of it would place in
+      ;; different bytes.
+
+      ;; chunked is HTTP/1.1 framing (RFC 7230 3.3.1); an HTTP/1.0 request
+      ;; declaring it has no agreed message boundary at all
+      (raw-exchange! (string-append
+                       "POST /echo HTTP/1.0\r\nHost: x\r\n"
+                       "Transfer-Encoding: chunked\r\n\r\n"
+                       "5\r\nhello\r\n0\r\n\r\n") main)
+      (check "HTTP/1.0 + chunked is refused"
+        (rejected? (receive (after 9000 #f) (`#(raw ,t) t))))
+
+      ;; A 101 ends HTTP framing: everything after the header block is read
+      ;; as WebSocket frames. A request that also declares a body therefore
+      ;; has two readings, and those declared bytes went to the frame parser
+      ;; without ever being counted against body-limit.
+      (raw-exchange! (string-append
+                       "GET /ws HTTP/1.1\r\nHost: x\r\n"
+                       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Sec-WebSocket-Version: 13\r\n"
+                       "Content-Length: 5\r\n\r\nhello") main)
+      (check "an upgrade declaring a Content-Length is refused"
+        (rejected? (receive (after 9000 #f) (`#(raw ,t) t))))
+
+      (raw-exchange! (string-append
+                       "GET /ws HTTP/1.1\r\nHost: x\r\n"
+                       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Sec-WebSocket-Version: 13\r\n"
+                       "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n") main)
+      (check "an upgrade declaring a Transfer-Encoding is refused"
+        (rejected? (receive (after 9000 #f) (`#(raw ,t) t))))
+
+      ;; and a clean upgrade still works, so the guard did not just break
+      ;; WebSockets
+      (raw-exchange! (string-append
+                       "GET /ws HTTP/1.1\r\nHost: x\r\n"
+                       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Sec-WebSocket-Version: 13\r\n\r\n") main)
+      (let ((text (receive (after 9000 #f) (`#(raw ,t) t))))
+        (check "a clean upgrade still gets its 101"
+          (and text (>= (string-length text) 12)
+               (string=? (substring text 9 12) "101"))))
 
       (sleep-ms 100)
       (if (zero? failures)

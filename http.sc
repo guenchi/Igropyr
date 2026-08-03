@@ -1516,6 +1516,25 @@
                (quick-response! c 400 "Bad Request"))
               ((and (eq? te 'chunked) (not (eq? clen 'absent)))
                (quick-response! c 400 "Bad Request"))
+              ;; chunked is an HTTP/1.1 framing (RFC 7230 3.3.1). An
+              ;; HTTP/1.0 request declaring it is a request whose message
+              ;; boundary this server and an HTTP/1.0 intermediary would
+              ;; read differently -- which is the whole mechanism of
+              ;; request smuggling. The version check already exists for
+              ;; RESPONSES (see res-http10?); requests had none.
+              ((and (eq? te 'chunked) (equal? (vector-ref parsed 3) "HTTP/1.0"))
+               (quick-response! c 400 "Bad Request"))
+              ;; A 101 ends HTTP framing: everything after the header block
+              ;; is read as WebSocket frames. So a request that also
+              ;; DECLARES a body has two readings -- body then frames, or
+              ;; frames straight away -- and this server took the second
+              ;; without checking. The declared bytes were never collected,
+              ;; never counted against body-limit, and went to the frame
+              ;; parser instead. Refuse the ambiguity before the handshake.
+              ((and wskey resolver
+                    (or (not (eq? te 'absent))
+                        (and (not (eq? clen 'absent)) (not (eqv? clen 0)))))
+               (quick-response! c 400 "Bad Request"))
               ((and resolver (websocket-attempt? headers) (not wskey))
                (quick-response! c 400 "Bad WebSocket Handshake"))
               ;; websocket upgrade: resolve a session, shake hands, and
