@@ -23,7 +23,7 @@
 ;;; servers via auth-switch.
 
 (library (igropyr mysql)
-  (export mysql-connect mysql-pool mysql-query mysql-close!
+  (export mysql-connect mysql-pool mysql-query mysql-close! mysql-pool-stats
           mysql-transaction call-with-mysql-connection)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sqlpool)
           (igropyr buffer)
@@ -588,6 +588,12 @@
       ;; sit in the mailbox forever, slowing every later selective receive
       ;; (the same accumulation drain-stale! exists to prevent).
       (`#(db-query-cancel ,ref ,from) (serve-loop c buf notify))
+      ;; A single connection is not a pool and keeps none of its
+      ;; bookkeeping. Answering #f is what keeps the request from sitting
+      ;; here forever; mysql-pool-stats turns it into a clear error.
+      (`#(db-stats ,ref ,from)
+        (send from (vector 'db-stats-reply ref #f))
+        (serve-loop c buf notify))
       (`#(db-quit)
         (send-packet! c (bytevector 1) 0)          ; COM_QUIT
         (tcp-close! c))
@@ -745,4 +751,8 @@
     (sql-transaction pool proc cfg))
 
   (define (mysql-close! mc) (sql-close! mc))
+
+  ;; A snapshot of a pool: in-use, pending, checkout wait, query duration,
+  ;; timeout counts and more. See (igropyr sqlpool) for the full key list.
+  (define (mysql-pool-stats pool) (sql-pool-stats pool))
 )
