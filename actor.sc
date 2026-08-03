@@ -439,6 +439,14 @@
       (pcb-links-set! p2 (cons p1 (pcb-links p2)))))
 
   (define (link p)
+    ;; Validated OUTSIDE no-interrupts, as send already does. An accessor
+    ;; raising INSIDE the region skips its enable-interrupts, so the process
+    ;; carries a permanently disabled preemption timer: it cannot be
+    ;; preempted again, and one CPU loop then freezes the whole scheduler.
+    ;; An application that guards the error and continues -- (link (whereis
+    ;; 'missing)) is the obvious way in -- gets exactly that.
+    (unless (pcb? p)
+      (assertion-violation 'link "not a process" p))
     (unless (eq? p *self*)
       (no-interrupts
         (if (alive? p)
@@ -479,6 +487,8 @@
   ;; Terminate a process unconditionally (used by the supervisor to kill
   ;; stuck workers). Killing self never returns.
   (define (kill p reason)
+    (unless (pcb? p)                       ; see link: never raise inside
+      (assertion-violation 'kill "not a process" p))
     (if (eq? p *self*)
         (begin
           (disable-interrupts)

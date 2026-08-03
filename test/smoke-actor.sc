@@ -214,6 +214,29 @@
         (fail "dynamic-wind did not run exactly once around a yielding body")))
     (display "parameterize limitation + dynamic-wind contract ok\n")
 
+    ;; A bad pid must be refused BEFORE interrupts are disabled. Raising
+    ;; inside that region skips its enable-interrupts, so the process keeps
+    ;; a disabled preemption timer forever -- and one CPU loop in it then
+    ;; freezes the entire scheduler, since there is a single OS thread.
+    ;; An application that guards the error and carries on is the way in:
+    ;; (link (whereis 'missing)) hands link a #f.
+    (let ((me self))
+      (let ((victim (spawn (lambda ()
+                             ;; guard and continue, exactly as an application
+                             ;; that treats a missing name as recoverable would
+                             (guard (e (#t (void))) (link #f))
+                             (guard (e (#t (void))) (kill #f 'nope))
+                             (send me (vector 'survived))
+                             ;; now spin: if preemption was lost, nothing else
+                             ;; in this scheduler will ever run again
+                             (let loop ((n 0)) (loop (+ n 1)))))))
+        (receive (after 2000 (fail "bad-pid guard did not survive"))
+          (`#(survived) 'ok))
+        ;; the spinner is running; this only completes if it can be preempted
+        (sleep-ms 150)
+        (kill victim 'done)
+        (display "bad pid refused without losing preemption ok\n")))
+
     ;; 5. spawn&link + trap-exit turns a crash into an EXIT message
     (process-trap-exit #t)
     (spawn&link (lambda () (raise 'linked-crash)))
