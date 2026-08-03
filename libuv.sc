@@ -221,9 +221,15 @@
   ;; raw record field. The old owner's entry is left behind on purpose: it
   ;; becomes a stale candidate, which costs one failed re-check, whereas
   ;; forgetting to add the new one would skip a live resource at teardown.
+  ;; The field and the index entry are ONE step. A safe point between them
+  ;; is a window in which the new owner can die: uv-owner-died! for that pid
+  ;; then finds no entry and skips the resource, and the entry that arrives
+  ;; afterwards names a process already gone -- nothing will ever reclaim
+  ;; it. Same family as the enqueue-write! and conn-on-close! windows.
   (define (conn-set-owner! c owner)
-    (conn-set-owner-field! c owner)
-    (index-owner! owner 'conn (conn-handle c)))
+    (with-interrupts-disabled
+      (conn-set-owner-field! c owner)
+      (index-owner! owner 'conn (conn-handle c))))
 
   ;; Reclaim what a dead owner can no longer close itself. A killed
   ;; process does not run its dynamic-wind winders (see actor.sc @kill),
@@ -654,9 +660,12 @@
                  (uv-close handle on-close-entry))
                 (else
                  (let ((c (make-conn handle owner 'open #f)))
-                   (index-owner! owner 'conn handle)
-                   (uv-tcp-nodelay handle 1)
-                   (hashtable-set! conn-table handle c)
+                   ;; index and table together: an owner dying between them
+                   ;; is told about a conn that teardown cannot find
+                   (with-interrupts-disabled
+                     (index-owner! owner 'conn handle)
+                     (uv-tcp-nodelay handle 1)
+                     (hashtable-set! conn-table handle c))
                    (deliver owner (vector 'tcp-connected c)))))))))
       (void* int)
       void))
@@ -750,8 +759,9 @@
   (define (fs-start! path owner mode)
     (let* ((req (foreign-alloc fs-req-size))
            (op (make-fs-op owner path mode req 'open #f #f -1 0 0 '() 0 0)))
-      (hashtable-set! fs-table req op)
-      (index-owner! owner 'fs req)
+      (with-interrupts-disabled
+        (hashtable-set! fs-table req op)
+        (index-owner! owner 'fs req))
       (let ((r (uv-fs-open uv-loop req path O-RDONLY 0 on-fs-entry)))
         (when (< r 0)
           (uv-fs-req-cleanup req)
@@ -763,8 +773,9 @@
   (define (fs-start-fd! fd path owner mode)
     (let* ((req (foreign-alloc fs-req-size))
            (op (make-fs-op owner path mode req 'fstat #f #f fd 0 0 '() 0 0)))
-      (hashtable-set! fs-table req op)
-      (index-owner! owner 'fs req)
+      (with-interrupts-disabled
+        (hashtable-set! fs-table req op)
+        (index-owner! owner 'fs req))
       (start-fs-fstat! op req)
       op))
 
@@ -901,14 +912,15 @@
   (define (fs-count) (hashtable-size fs-table))
 
   (define (file-stream-own! op pid)
-    (fs-op-owner-set! op pid)
+    (with-interrupts-disabled
+      (fs-op-owner-set! op pid)
     ;; The INDEX has to learn about the move too, exactly as conn-set-owner!
     ;; does for connections. Setting only the field meant uv-owner-died! for
     ;; the new owner found nothing to reclaim: a pump killed mid-download
     ;; left its fd, its uv_fs_t and its 256 KiB foreign buffer rooted by
     ;; fs-table for the life of the VM, which is the leak the index exists
     ;; to prevent.
-    (index-owner! pid 'fs (fs-op-req op)))
+      (index-owner! pid 'fs (fs-op-req op))))
 
   (define (file-stream-read! op)
     (when (and (not (fs-op-aborted? op)) (eq? (fs-op-phase op) 'idle))

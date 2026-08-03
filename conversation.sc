@@ -301,6 +301,33 @@
                          (`#(conv-step ,from2 ,ref3 ,_)
                            (send from2 (vector 'conv-reply ref3 'busy))
                            (drain))))
+                     ;; WHAT THIS DOES NOT COVER, and cannot as written.
+                     ;;
+                     ;; The drain uses arrival order as a stand-in for "was
+                     ;; this sent against the reply you have read". That is
+                     ;; exact for anything already queued and wrong for a
+                     ;; duplicate that was sent during the previous step and
+                     ;; delayed past this point -- across a network, past a
+                     ;; forwarding hop -- which the next receive then takes
+                     ;; as a legitimate next step. The mirror error exists
+                     ;; too: a request that genuinely read the new reply can
+                     ;; be refused as 'busy if it lands inside the send/drain
+                     ;; window.
+                     ;;
+                     ;; Closing it needs a STEP TOKEN in the protocol: the
+                     ;; reply carries which step produced it, and a resume
+                     ;; presents the token it is answering. Arrival order
+                     ;; then stops being load-bearing. That changes what
+                     ;; conversation-start! returns and what
+                     ;; conversation-resume! accepts -- a breaking change to
+                     ;; the public API, which belongs in its own piece of
+                     ;; work rather than inside a fix.
+                     ;;
+                     ;; Until then: the failure direction is 'busy (safe --
+                     ;; the caller retries) for the mirror case, and a
+                     ;; skipped confirmation for the delayed-duplicate case.
+                     ;; A flow whose steps are not idempotent should carry
+                     ;; its own request id and check it.
                      (receive (after ttl (raise 'conversation-expired))
                        (`#(conv-step ,from ,ref2 ,r)
                          (set! who from) (set! tag ref2)
