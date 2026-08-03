@@ -207,38 +207,63 @@
   ;; ---- single-flight coordinator: a gen-server, key -> waiter pids ------
   (define (flight-init) (make-hashtable string-hash string=?))
 
+  ;; Monotone across the coordinator's life: identifies one round of a key,
+  ;; so a publish can be checked against the round that is actually live.
+  (define flight-generation 0)
+
   (define (flight-call msg from tbl)      ; claim -> 'leader | 'follower
     (case (vector-ref msg 0)
       ((claim)
-       ;; waiters are (who . ref): the ref makes each wait unique, so a
-       ;; publish that arrives after its follower gave up cannot be
-       ;; matched by a LATER flight round on the same key (which would
-       ;; hand back an arbitrarily stale render).
+       ;; An entry is #(generation waiters). waiters are (who . ref): the
+       ;; ref keeps a late publish from being matched by the caller's NEXT
+       ;; wait. The generation does the other half -- it keeps a late
+       ;; publish from an ABANDONED round from waking the waiters of the
+       ;; round that replaced it, which would hand them an arbitrarily
+       ;; stale render and delete the live round's entry underneath it.
+       ;; A ref cannot cover that: the waiters it would wake are new, and
+       ;; their refs are exactly the ones the stale publish carries no
+       ;; knowledge of.
        (let ((key (vector-ref msg 1)) (who (vector-ref msg 2))
              (ref (vector-ref msg 3)))
-         (if (hashtable-contains? tbl key)
-             (begin (hashtable-set! tbl key
-                      (cons (cons who ref) (hashtable-ref tbl key '())))
-                    (values 'follower tbl))
-             (begin (hashtable-set! tbl key '()) (values 'leader tbl)))))
+         (let ((e (hashtable-ref tbl key #f)))
+           (if e
+               (begin (hashtable-set! tbl key
+                        (vector (vector-ref e 0)
+                                (cons (cons who ref) (vector-ref e 1))))
+                      (values (cons 'follower (vector-ref e 0)) tbl))
+               (let ((g (begin (set! flight-generation (+ flight-generation 1))
+                               flight-generation)))
+                 (hashtable-set! tbl key (vector g '()))
+                 (values (cons 'leader g) tbl))))))
       (else (values 'bad-request tbl))))
 
   (define (flight-cast msg tbl)
     (case (vector-ref msg 0)
       ((publish)                          ; leader done: wake waiters, drop key
-       (let ((key (vector-ref msg 1)) (res (vector-ref msg 2)))
-         (for-each (lambda (w) (send (car w) (vector 'ssr-flight (cdr w) res)))
-                   (hashtable-ref tbl key '()))
-         (hashtable-delete! tbl key)))
+       (let* ((key (vector-ref msg 1)) (res (vector-ref msg 2))
+              (g (vector-ref msg 3))
+              (e (hashtable-ref tbl key #f)))
+         ;; Only the round that is still live may publish. A leader whose
+         ;; round was abandoned (its followers gave up and started a new
+         ;; one) still finishes and still publishes -- silently dropping
+         ;; that is the point, because waking the new round's waiters with
+         ;; the old round's render is how a caller receives content from
+         ;; before whatever invalidated the key.
+         (when (and e (= (vector-ref e 0) g))
+           (for-each (lambda (w) (send (car w) (vector 'ssr-flight (cdr w) res)))
+                     (vector-ref e 1))
+           (hashtable-delete! tbl key))))
       ((unclaim)                          ; a follower timed out (dead leader)
-       (let ((key (vector-ref msg 1)) (ref (vector-ref msg 2)))
-         (when (hashtable-contains? tbl key)
-           (let ((ws (remp (lambda (w) (eq? (cdr w) ref))
-                           (hashtable-ref tbl key '()))))
-             ;; last waiter gone with no publish -> the leader is stuck; drop
-             ;; the entry so the key isn't wedged in follower-forever mode
-             (if (null? ws) (hashtable-delete! tbl key)
-                 (hashtable-set! tbl key ws)))))))
+       (let ((key (vector-ref msg 1)) (ref (vector-ref msg 2))
+             (g (vector-ref msg 3)))
+         (let ((e (hashtable-ref tbl key #f)))
+           (when (and e (= (vector-ref e 0) g))
+             (let ((ws (remp (lambda (w) (eq? (cdr w) ref))
+                             (vector-ref e 1))))
+               ;; last waiter gone with no publish -> the leader is stuck; drop
+               ;; the entry so the key isn't wedged in follower-forever mode
+               (if (null? ws) (hashtable-delete! tbl key)
+                   (hashtable-set! tbl key (vector g ws)))))))))
     tbl)
 
   ;; render (non-raising) + cache on success -> (ok . text). Each call is one
@@ -270,16 +295,22 @@
           ;; ref can never match again, so it would linger forever
           (let drain () (receive (after 0 'done) (`#(ssr-flight ,r ,v) (drain))))
           (let* ((ref (gensym))
-                 (role (gen-server-call flight (vector 'claim key self ref))))
+                 ;; claim answers (role . generation): the generation names
+                 ;; THIS round, so a publish or unclaim from a round that has
+                 ;; since been abandoned is ignored rather than applied to
+                 ;; whatever round replaced it
+                 (claimed (gen-server-call flight (vector 'claim key self ref)))
+                 (role (car claimed))
+                 (gen (cdr claimed)))
             (if (eq? role 'leader)
                 (let* ((again (b-get backend key))       ; double-check
                        (res (if again (cons #t again)
                                 (call+cache rnd backend key fn json ttl))))
-                  (gen-server-cast flight (vector 'publish key res))
+                  (gen-server-cast flight (vector 'publish key res gen))
                   res)
                 (receive (after (ssr-flight-wait r)
                             ;; leader vanished -> render ourselves
-                            (gen-server-cast flight (vector 'unclaim key ref))
+                            (gen-server-cast flight (vector 'unclaim key ref gen))
                             (call+cache rnd backend key fn json ttl))
                   (`#(ssr-flight ,@ref ,res) res))))))))
 
