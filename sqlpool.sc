@@ -136,7 +136,22 @@
     ;; the dispatch time is what makes query DURATION observable, measured
     ;; from here to the connection's db-idle -- the pool never sees the reply
     ;; itself, which goes straight from the connection to the caller.
+    ;; -> #t if the job was dispatched.
+    ;;
+    ;; The caller is checked HERE, not only when the job was queued. The
+    ;; mailbox can hold a db-idle that arrived while the caller was alive
+    ;; and a DOWN behind it: processing them in order dispatches a statement
+    ;; for a process already known to be gone. This cannot make "alive" a
+    ;; durable property -- the caller may die immediately after the check --
+    ;; but it stops the pool acting on information it already has.
     (define (assign! c job)
+      (if (not (process-alive? (vector-ref job 2)))
+          (begin
+            (when (vector-ref job 4) (demonitor (vector-ref job 4)))
+            #f)
+          (assign!* c job)))
+
+    (define (assign!* c job)
       (let ((waited (- (now-ms) (vector-ref job 3))))
         (set! stat-queue-wait-total (+ stat-queue-wait-total waited))
         (when (> waited stat-queue-wait-max) (set! stat-queue-wait-max waited)))
@@ -148,7 +163,8 @@
       (hashtable-set! busy c (vector (vector-ref job 2) (vector-ref job 1)
                                      (now-ms)))
       (send c (vector 'db-query (vector-ref job 0)
-                      (vector-ref job 1) (vector-ref job 2))))
+                      (vector-ref job 1) (vector-ref job 2)))
+      #t)
     ;; A waiter is #(ref from mon). The monitor is taken WHEN THE REQUEST
     ;; ARRIVES, not when a connection is handed over, because the window in
     ;; between is real: a caller can die queued, and monitoring only at
@@ -174,7 +190,16 @@
     (define (waiter-queued-at w) (vector-ref w 3))
     ;; hand connection c to waiter w, carrying its existing monitor into the
     ;; lease record rather than taking a second one
+    ;; -> #t if the connection was leased. Same reasoning as assign!: a
+    ;; borrower that died after its request was queued must not be handed a
+    ;; connection, because the DOWN already on its way would then read as
+    ;; "died holding a transaction" and destroy a connection it never saw.
     (define (lease! c w)
+      (if (not (process-alive? (waiter-from w)))
+          (begin (demonitor (waiter-mon w)) #f)
+          (lease!* c w)))
+
+    (define (lease!* c w)
       (let ((waited (- (now-ms) (waiter-queued-at w))))
         (set! stat-checkout-wait-total (+ stat-checkout-wait-total waited))
         (when (> waited stat-checkout-wait-max)
@@ -182,7 +207,8 @@
       (set! stat-checkouts (+ stat-checkouts 1))
       (hashtable-set! leased c (vector (waiter-from w) (waiter-mon w)
                                        (waiter-ref w)))
-      (send (waiter-from w) (vector 'db-checkout-reply (waiter-ref w) c)))
+      (send (waiter-from w) (vector 'db-checkout-reply (waiter-ref w) c))
+      #t)
     (define (drop-lease! c entry)
       (demonitor (vector-ref entry 1))
       (hashtable-delete! leased c))
@@ -249,16 +275,33 @@
         ;; +/- 20%, so slots that failed together stop retrying in lockstep
         (let ((j (fxdiv base 5)))
           (max 100 (+ (- base j) (random (max 1 (* 2 j))))))))
+    ;; IDEMPOTENT. A connection can be handed back twice: it replies to its
+    ;; lessee, is preempted before sending db-idle, the lessee checks in
+    ;; first -- so the checkin frees it, and the late db-idle then finds it
+    ;; neither leased nor dying and frees it again. It landed in `idle`
+    ;; TWICE, two checkouts popped the same connection, and the second
+    ;; lease! overwrote the first lease record: that borrower's monitor was
+    ;; never released, its checkin could no longer find its lease, and its
+    ;; death no longer reclaimed a connection that may have held its open
+    ;; transaction.
     (define (make-available! c)
       (hashtable-delete! busy c)
-      (cond
-        ((and (pending?) (co-pending?))
-         (if co-turn
-             (begin (set! co-turn #f) (lease! c (pop-co!)))
-             (begin (set! co-turn #t) (assign! c (pop-pending!)))))
-        ((pending?) (assign! c (pop-pending!)))
-        ((co-pending?) (lease! c (pop-co!)))
-        (else (set! idle (cons c idle)))))
+      (when (memq c idle) (set! idle (remq c idle)))
+      ;; A dead requester at the head of a queue must not swallow the
+      ;; connection: assign!/lease! answer #f for one, and this keeps
+      ;; looking. Otherwise one reaped caller idles a connection while
+      ;; everyone behind it waits.
+      (let next ()
+        (cond
+          ((and (pending?) (co-pending?))
+           (if co-turn
+               (begin (set! co-turn #f)
+                      (or (lease! c (pop-co!)) (next)))
+               (begin (set! co-turn #t)
+                      (or (assign! c (pop-pending!)) (next)))))
+          ((pending?) (or (assign! c (pop-pending!)) (next)))
+          ((co-pending?) (or (lease! c (pop-co!)) (next)))
+          (else (set! idle (cons c idle))))))
     (sql-check-pool-size! 'sql-pool n)
     (do ((i 0 (+ i 1))) ((= i n)) (connect!))
     (let loop ()
@@ -266,10 +309,13 @@
         (`#(db-query ,sql ,ref ,from)
           (if (pair? idle)
               ;; dispatched at once: nothing to watch, the connection
-              ;; answers the caller directly
+              ;; answers the caller directly. assign! still checks the
+              ;; caller -- it may have died between sending this and the
+              ;; pool reaching it -- and puts the connection back if so.
               (let ((c (car idle)))
                 (set! idle (cdr idle))
-                (assign! c (vector sql ref from (now-ms) #f)))
+                (unless (assign! c (vector sql ref from (now-ms) #f))
+                  (set! idle (cons c idle))))
               ;; queued: watch the caller for as long as it is waiting.
               ;; monitor returns #f for a pid that is ALREADY dead (and
               ;; delivers the DOWN immediately), so that request is simply
@@ -308,7 +354,7 @@
               (if (pair? idle)
                   (let ((c (car idle)))
                     (set! idle (cdr idle))
-                    (lease! c w))
+                    (unless (lease! c w) (set! idle (cons c idle))))
                   (set! co-back (cons w co-back)))))
           (loop))
         (`#(db-checkin ,from ,c)
@@ -460,10 +506,31 @@
           ;; a borrower whose connection might carry an open transaction --
           ;; that mistake destroys and rebuilds a healthy connection the dead
           ;; caller never received. Its monitor died with it, so no demonitor.
-          (let ((mine? (lambda (w) (not (eq? (waiter-from w) pid)))))
+          ;; These waits ended too, and for the worst reason. Recording only
+          ;; the ones that ended in a reply or a timeout left the metrics
+          ;; blind to a pool so saturated that its callers are being reaped
+          ;; before they ever time out -- @kill runs no cancel, so nothing
+          ;; else would ever record them.
+          (let ((mine? (lambda (w)
+                         (if (eq? (waiter-from w) pid)
+                             (let ((waited (- (now-ms) (waiter-queued-at w))))
+                               (set! stat-checkout-wait-total
+                                     (+ stat-checkout-wait-total waited))
+                               (when (> waited stat-checkout-wait-max)
+                                 (set! stat-checkout-wait-max waited))
+                               #f)
+                             #t))))
             (set! co-front (filter mine? co-front))
             (set! co-back  (filter mine? co-back)))
-          (let ((mine? (lambda (job) (not (eq? (vector-ref job 2) pid)))))
+          (let ((mine? (lambda (job)
+                         (if (eq? (vector-ref job 2) pid)
+                             (let ((waited (- (now-ms) (vector-ref job 3))))
+                               (set! stat-queue-wait-total
+                                     (+ stat-queue-wait-total waited))
+                               (when (> waited stat-queue-wait-max)
+                                 (set! stat-queue-wait-max waited))
+                               #f)
+                             #t))))
             (set! pending-front (filter mine? pending-front))
             (set! pending-back  (filter mine? pending-back)))
           (cond

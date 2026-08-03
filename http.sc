@@ -725,11 +725,16 @@
   ;; head-only: #f -- normal response; #t -- suppress the body, declaring
   ;; the length of the body passed in; an integer -- suppress the body and
   ;; declare THAT length (a HEAD for a file too large to read into memory,
-  ;; where the size is known but the bytes must not be).
+  ;; where the size is known but the bytes must not be); 'unknown --
+  ;; suppress the body and send NO Content-Length, for a HEAD whose GET
+  ;; would have been chunked. RFC 7230 3.3.2: a HEAD response's
+  ;; Content-Length is what the GET would have sent, so when that is not
+  ;; known the field is omitted. Declaring 0 instead does not mean "unknown"
+  ;; to anyone -- it means the resource is empty.
   (define (write-response!* c status headers body ka head-only)
     (let* ((suppress-body? (or head-only (status-forbids-body? status)))
            (head
-              (if (status-forbids-length? status)
+              (if (or (status-forbids-length? status) (eq? head-only 'unknown))
                   (assemble-head status headers
                     (if ka keep-alive-tail close-tail))
                   (assemble-head status headers
@@ -904,8 +909,14 @@
               ;; no-op: a handler written as begin/write/end still terminates.
               (begin
                 (res-mode-set! r 'done)
+                ;; a STREAM's length is not known here -- the handler was
+                ;; about to produce it chunk by chunk -- so this HEAD says
+                ;; nothing about it rather than saying zero
                 (write-response!* c status headers
-                                  empty-bv (res-keep-alive? r) #t))
+                                  empty-bv (res-keep-alive? r)
+                                  (if (res-head-request? r)
+                                      'unknown
+                                      #t)))
               (let ((raw? (res-http10? r)))
                 (res-mode-set! r (if raw? 'streaming-raw 'streaming))
                 (tcp-write! c
@@ -1013,13 +1024,22 @@
   (define (res-end! r)
     (let ((mode (res-mode r)))
       (when (memq mode '(streaming streaming-raw))
-        (res-mode-set! r 'done)
+        ;; 'ending, not 'done: the terminator has not been WRITTEN yet, and
+        ;; this process is about to park waiting for its completion. Marking
+        ;; the response finished here meant res-spawn!'s watcher saw nothing
+        ;; in progress -- so a producer killed while parked on that write
+        ;; left the reader with neither next-request nor conn-closed, parked
+        ;; in await-streaming forever. res-streaming? counts 'ending as in
+        ;; progress; 'done is set below, when the write really is done.
+        (res-mode-set! r 'ending)
         (let* ((c (res-conn r))
                (owner (conn-owner c)))
           (if (eq? mode 'streaming-raw)
               ;; close-delimited: the close IS the end of the body, so
               ;; there is no terminator and the connection cannot be reused
-              (begin (tcp-close! c) (send owner (vector 'conn-closed)))
+              (begin (res-mode-set! r 'done)
+                     (tcp-close! c)
+                     (send owner (vector 'conn-closed)))
               ;; The terminator gets the same deadline as every other write.
               ;; It used to be fire-and-forget, which meant a peer that
               ;; stopped reading exactly here never triggered the callback --
@@ -1034,6 +1054,7 @@
                      (me self)
                      (finish!
                        (lambda (st)
+                         (res-mode-set! r 'done)
                          (if (and ka (>= st 0))
                              (send owner (vector 'next-request))
                              (begin
@@ -1233,8 +1254,14 @@
   ;; is the state where "already answered" is true but the request is NOT
   ;; over: the status line went out, the terminator did not, and the reader
   ;; is parked in await-streaming with no deadline.
+  ;; 'raw is res-begin-file!'s fixed-length stream and 'ending is res-end!
+  ;; waiting for its terminator to go out. Both are responses that have
+  ;; STARTED and not FINISHED, which is the whole question here, and leaving
+  ;; either out meant the watcher stood by while the client waited forever
+  ;; -- for the rest of a Content-Length it will never receive, or for a
+  ;; terminating chunk whose writer was killed mid-write.
   (define (res-streaming? r)
-    (and (memq (res-mode r) '(streaming streaming-raw)) #t))
+    (and (memq (res-mode r) '(streaming streaming-raw raw ending)) #t))
 
   ;; End a streamed response that cannot be completed.
   ;;
