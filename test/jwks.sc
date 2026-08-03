@@ -236,6 +236,9 @@
              (odd-h (base64url-encode
                       (string->utf8
                         "{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"deadbeefdeadbeef\"}")))
+             (odd-h-2 (base64url-encode
+                        (string->utf8
+                          "{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"feedfacefeedface\"}")))
              (d1 (let loop ((i 0))
                    (if (char=? (string-ref tok i) #\.) i (loop (+ i 1)))))
              (d2 (let loop ((i (+ d1 1)))
@@ -244,7 +247,14 @@
         (check "unknown kid refused"
           (not (jwks-verify (string-append odd-h rest) url)))
         (check "unknown kid refetches exactly once"
-          (= (+ before 1) fetches-a)))
+          (= (+ before 1) fetches-a))
+        ;; The header is untrusted and changing the kid is free. A second
+        ;; miss inside the cooldown must fail without another network fetch.
+        (let ((after-first fetches-a))
+          (check "second unknown kid refused"
+            (not (jwks-verify (string-append odd-h-2 rest) url)))
+          (check "unknown kid refresh is rate-limited"
+            (= after-first fetches-a))))
       (check "cache clear forces a refetch"
         (let ((before fetches-a))
           (jwks-cache-clear!)
