@@ -26,6 +26,7 @@
   (export mysql-connect mysql-pool mysql-query mysql-close!
           mysql-transaction call-with-mysql-connection)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sqlpool)
+          (igropyr buffer)
           (only (igropyr crypto) sha1 sha256 base64-decode))
 
   (define connect-timeout-ms 10000)
@@ -232,26 +233,34 @@
   ;; the auth handshake, query-timeout-ms while a query is in flight --
   ;; a server that stalls mid-handshake holds a connect worker for the
   ;; connect budget, not the query budget.
-  (define (next-packet! c bufbox timeout)
+  ;; The buffer is an (igropyr buffer) inbuf, as PostgreSQL's already was.
+  ;; It used to be a bytevector in a box, and every arriving TCP fragment
+  ;; copied the WHOLE accumulated buffer to append to it -- quadratic in the
+  ;; number of fragments, which for a legitimate near-16 MiB packet split
+  ;; into small segments is thousands of copies of a growing multi-megabyte
+  ;; bytevector, all of it garbage, on the one scheduler thread. An inbuf
+  ;; appends in amortized O(1) and consumes a packet in O(1).
+  (define (next-packet! c buf timeout)
     (let loop ()
-      (let ((buf (unbox bufbox)))
-        (if (>= (bytevector-length buf) 4)
-            (let* ((len (+ (bytevector-u8-ref buf 0)
-                           (fxsll (bytevector-u8-ref buf 1) 8)
-                           (fxsll (bytevector-u8-ref buf 2) 16)))
-                   (seq (bytevector-u8-ref buf 3))
-                   (total (+ 4 len)))
-              (if (>= (bytevector-length buf) total)
-                  (begin
-                    (set-box! bufbox (bv-sub buf total (bytevector-length buf)))
-                    (values (bv-sub buf 4 total) seq))
-                  (wait-data c bufbox loop timeout)))
-            (wait-data c bufbox loop timeout)))))
+      (if (>= (inbuf-length buf) 4)
+          (let* ((bv (inbuf-bv buf))
+                 (base (inbuf-start buf))
+                 (len (+ (bytevector-u8-ref bv base)
+                         (fxsll (bytevector-u8-ref bv (fx+ base 1)) 8)
+                         (fxsll (bytevector-u8-ref bv (fx+ base 2)) 16)))
+                 (seq (bytevector-u8-ref bv (fx+ base 3)))
+                 (total (+ 4 len)))
+            (if (>= (inbuf-length buf) total)
+                (let ((payload (inbuf-sub buf 4 total)))
+                  (inbuf-consume! buf total)
+                  (values payload seq))
+                (wait-data c buf loop timeout)))
+          (wait-data c buf loop timeout))))
 
-  (define (wait-data c bufbox k timeout)
+  (define (wait-data c buf k timeout)
     (receive (after timeout (mysql-fail -1 "server timeout"))
       (`#(tcp-data ,bv)
-        (set-box! bufbox (bv-append (unbox bufbox) bv))
+        (inbuf-append! buf bv)
         (k))
       (`#(tcp-eof) (mysql-fail -1 "connection closed by server"))
       (`#(tcp-error ,e) (mysql-fail -1 "connection error"))))
@@ -373,7 +382,7 @@
   ;; key (opts 'server-public-key, a PEM string) -- then we never trust a
   ;; key from the wire -- or explicitly opts in with 'allow-insecure-auth
   ;; (appropriate over TLS or a trusted local socket).
-  (define (full-auth! c bufbox password nonce seq opts)
+  (define (full-auth! c buf password nonce seq opts)
     (define pinned (assq-ref opts 'server-public-key))
     (define (encrypt-with n e)
       (let ((plain (bv-xor (bv-append (string->utf8 password) (bytevector 0))
@@ -385,7 +394,7 @@
          (encrypt-with n e)))
       ((assq-ref opts 'allow-insecure-auth)
        (send-packet! c (bytevector 2) seq)          ; request public key
-       (let-values (((p sq) (next-packet! c bufbox connect-timeout-ms)))
+       (let-values (((p sq) (next-packet! c buf connect-timeout-ms)))
          (unless (fx= (bytevector-u8-ref p 0) 1)
            (mysql-fail -1 "expected server public key"))
          (let-values (((n e) (parse-rsa-public-key
@@ -414,10 +423,10 @@
         (else (assertion-violation 'mysql-connect
                 "'connect-deadline-ms must be a positive exact integer" v)))))
 
-  (define (auth-loop! c bufbox user password nonce opts)
+  (define (auth-loop! c buf user password nonce opts)
     (let ((deadline (+ (now-ms) (connect-deadline opts))))
      (let loop ()
-      (let-values (((p seq) (next-packet! c bufbox (auth-wait-ms deadline))))
+      (let-values (((p seq) (next-packet! c buf (auth-wait-ms deadline))))
         (let ((b0 (bytevector-u8-ref p 0)))
           (cond
             ((fx= b0 0) 'ok)
@@ -429,7 +438,7 @@
                  ((fx= b1 4)                       ; full auth required
                   (if (= 0 (string-length password))
                       (begin (send-packet! c (bytevector 0) (+ seq 1)) (loop))
-                      (begin (full-auth! c bufbox password nonce (+ seq 1) opts)
+                      (begin (full-auth! c buf password nonce (+ seq 1) opts)
                              (loop))))
                  (else (mysql-fail -1 "unexpected auth data")))))
             ((fx= b0 #xFE)                         ; AuthSwitchRequest
@@ -453,8 +462,8 @@
                                                      plugin))))))
             (else (mysql-fail -1 "unexpected packet during auth"))))))))
 
-  (define (authenticate! c bufbox user password db opts)
-    (let-values (((p seq) (next-packet! c bufbox connect-timeout-ms)))
+  (define (authenticate! c buf user password db opts)
+    (let-values (((p seq) (next-packet! c buf connect-timeout-ms)))
       (let-values (((nonce plugin) (parse-handshake p)))
         (let ((token (cond
                        ((string=? plugin "caching_sha2_password")
@@ -465,7 +474,7 @@
                                               "unsupported auth plugin: " plugin))))))
           (send-packet! c (handshake-response user token db plugin) (+ seq 1))
           ;; full-auth path needs the nonce again
-          (auth-loop! c bufbox user password nonce opts)))))
+          (auth-loop! c buf user password nonce opts)))))
 
   ;; ---- queries ------------------------------------------------------------------------
 
@@ -487,9 +496,9 @@
 
   (define max-result-rows 1000000)
 
-  (define (run-query! c bufbox sql)
+  (define (run-query! c buf sql)
     (send-packet! c (bv-append (bytevector 3) (string->utf8 sql)) 0)
-    (let-values (((p seq) (next-packet! c bufbox query-timeout-ms)))
+    (let-values (((p seq) (next-packet! c buf query-timeout-ms)))
       (let ((b0 (bytevector-u8-ref p 0)))
         (cond
           ((fx= b0 0) (parse-ok p))
@@ -499,11 +508,11 @@
              ;; column definitions
              (let cols ((i 0) (names '()))
                (if (< i ncols)
-                   (let-values (((cp cs) (next-packet! c bufbox query-timeout-ms)))
+                   (let-values (((cp cs) (next-packet! c buf query-timeout-ms)))
                      (cols (+ i 1) (cons (column-name cp) names)))
                    (let ((names (reverse names)))
                      ;; EOF after columns
-                     (let-values (((ep es) (next-packet! c bufbox query-timeout-ms)))
+                     (let-values (((ep es) (next-packet! c buf query-timeout-ms)))
                        (unless (eof-packet? ep)
                          (mysql-fail -1 "expected EOF after columns")))
                      ;; rows until EOF
@@ -515,7 +524,7 @@
                      ;; torn down, which is the right trade against an OOM
                      ;; that takes every other connection with it.
                      (let rows ((acc '()) (n 0))
-                       (let-values (((rp rs) (next-packet! c bufbox query-timeout-ms)))
+                       (let-values (((rp rs) (next-packet! c buf query-timeout-ms)))
                          (cond
                            ((eof-packet? rp)
                             (vector 'rows names (reverse acc)))
@@ -556,16 +565,16 @@
   ;;
   ;; A connection whose owner is gone has nobody to serve and no way to be
   ;; reached, so it closes.
-  (define (serve-loop c bufbox notify)
+  (define (serve-loop c buf notify)
     (receive
       (`#(DOWN ,pid ,reason)
         (if (and notify (eq? pid notify))
             (begin (send-packet! c (bytevector 1) 0)   ; COM_QUIT
                    (tcp-close! c))
-            (serve-loop c bufbox notify)))
+            (serve-loop c buf notify)))
       (`#(db-query ,sql ,ref ,from)
         (let ((r (guard (e (#t (as-mysql-error e "query failed")))
-                   (run-query! c bufbox sql))))
+                   (run-query! c buf sql))))
           (send from (vector 'db-reply ref r))
           (if (transport-dead? r)
               (begin
@@ -573,18 +582,18 @@
                 (tcp-close! c))                   ; exit -> DOWN -> rebuild
               (begin
                 (when notify (send notify (vector 'db-idle self)))
-                (serve-loop c bufbox notify)))))
+                (serve-loop c buf notify)))))
       ;; sql-query sends this to whatever handle it was given when a call
       ;; times out; only a pool acts on it. Consume it here so it does not
       ;; sit in the mailbox forever, slowing every later selective receive
       ;; (the same accumulation drain-stale! exists to prevent).
-      (`#(db-query-cancel ,ref ,from) (serve-loop c bufbox notify))
+      (`#(db-query-cancel ,ref ,from) (serve-loop c buf notify))
       (`#(db-quit)
         (send-packet! c (bytevector 1) 0)          ; COM_QUIT
         (tcp-close! c))
       (`#(tcp-data ,bv)                            ; stray data between queries
-        (set-box! bufbox (bv-append (unbox bufbox) bv))
-        (serve-loop c bufbox notify))
+        (inbuf-append! buf bv)
+        (serve-loop c buf notify))
       (`#(tcp-eof) (tcp-close! c))
       (`#(tcp-error ,e) (tcp-close! c))))
 
@@ -593,15 +602,15 @@
   ;; timed out and moved on, or the pool was closed while we were still
   ;; authenticating -- close the socket and exit instead of holding an
   ;; authenticated connection forever.
-  (define (await-adoption c bufbox notify)
+  (define (await-adoption c buf notify)
     (receive (after connect-timeout-ms (tcp-close! c))
       (`#(db-adopt)
         (when notify (monitor notify))
-        (serve-loop c bufbox notify))
+        (serve-loop c buf notify))
       (`#(db-quit) (send-packet! c (bytevector 1) 0) (tcp-close! c))
       (`#(tcp-data ,bv)
-        (set-box! bufbox (bv-append (unbox bufbox) bv))
-        (await-adoption c bufbox notify))
+        (inbuf-append! buf bv)
+        (await-adoption c buf notify))
       (`#(tcp-eof) (tcp-close! c))
       (`#(tcp-error ,e) (tcp-close! c))))
 
@@ -633,12 +642,12 @@
                   (report! (vector 'mysql-error -1 (uv-strerror e))))
                 (`#(tcp-connected ,c)
                   (tcp-read-start! c)
-                  (let* ((bufbox (box empty-bv))
+                  (let* ((buf (make-inbuf))
                          (r (guard (e (#t (as-mysql-error e "connect failed")))
-                              (authenticate! c bufbox user password db opts)
+                              (authenticate! c buf user password db opts)
                               'ok)))
                     (if (eq? r 'ok)
-                        (begin (report! 'ok) (await-adoption c bufbox notify))
+                        (begin (report! 'ok) (await-adoption c buf notify))
                         (begin (tcp-close! c) (report! r)))))))))))
 
   ;; ---- pool + public API ---------------------------------------------------
