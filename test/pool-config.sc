@@ -49,6 +49,43 @@
       (lambda () (postgresql-pool -1 "127.0.0.1" 5432 "u" "p")))
     (rejects? "postgresql-pool n=2.5"
       (lambda () (postgresql-pool 2.5 "127.0.0.1" 5432 "u" "p")))
+    ;; retryable? is APPLICATION code called from the supervisor's own DOWN
+    ;; path, so a non-procedure there is a crash at the worst moment
+    (rejects? "retryable? not a procedure"
+      (lambda () (start-worker-pool 2 (lambda (t) t) (lambda (t i) t)
+                                    3 30000 5000 'not-a-procedure)))
+
+    ;; ...and one that RAISES must not take the supervisor with it. The
+    ;; supervisor is the one process whose death orphans every worker and
+    ;; the ticker, so a raise is read as "not retryable" -- the task has
+    ;; already crashed once, and a predicate that cannot answer is not a
+    ;; reason to run it again.
+    (let* ((failed (box #f))
+           (sup (start-worker-pool 1
+                  (lambda (t) (raise 'task-boom))
+                  (lambda (t info) (set-box! failed info))
+                  3 30000 5000
+                  (lambda (t) (raise 'retry-policy-boom)))))
+      (send sup (vector 'submit-task (vector 'task 1 #f #f)))
+      (sleep-ms 600)
+      (if (and (process-alive? sup) (unbox failed))
+          (display "  ok  a raising retryable? does not kill the supervisor\n")
+          (begin (set! fails (+ fails 1))
+                 (display "FAIL  a raising retryable? does not kill the supervisor")
+                 (display " (alive=") (display (process-alive? sup))
+                 (display " failed=") (display (and (unbox failed) #t))
+                 (display ")\n")))
+      ;; and it still serves afterwards
+      (let ((ran (box #f)))
+        (let ((sup2 (start-worker-pool 1
+                      (lambda (t) (set-box! ran #t))
+                      (lambda (t info) (void)))))
+          (send sup2 (vector 'submit-task (vector 'task 2 #f #f)))
+          (sleep-ms 300)
+          (if (unbox ran)
+              (display "  ok  a fresh pool still runs tasks\n")
+              (begin (set! fails (+ fails 1))
+                     (display "FAIL  a fresh pool still runs tasks\n"))))))
     (if (zero? fails)
         (begin (display "pool config validation: all tests passed\n") (exit 0))
         (begin (display fails) (display " failures\n") (exit 1)))))
