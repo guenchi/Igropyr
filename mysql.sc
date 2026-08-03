@@ -686,6 +686,12 @@
     (let ((db (if (pair? rest) (car rest) #f))
           (opts (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) '())))
       (reject-tls-opt! opts)
+      ;; A previous attempt from THIS process that timed out left its
+      ;; worker's late up-report behind; its ref can never match again, so
+      ;; it is immortal and every selective receive below scans past it. A
+      ;; process that reconnects in a loop and never runs a query had
+      ;; nothing else that would ever clear them.
+      (sql-drain-stale!)
       (let ((ref (gensym)))
         (start-connection host port user password db opts #f self ref)
         (receive (after (+ connect-timeout-ms 2000)
