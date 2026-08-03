@@ -270,6 +270,26 @@
                        (write! (bv-append
                                  (error-msg "08P01" "expected CopyFail")
                                  ready)))))
+               ;; a query that never finishes but never stalls: one row
+               ;; every 200 ms, forever. Only something that notices the
+               ;; owner's death can end this.
+               (if (and (>= (string-length sql) 4)
+                        (string=? (substring sql 0 4) "DRIP"))
+                   (begin
+                     (write! (smsg #\T (bv-append (u16 1)
+                               (cstr "a") (make-bytevector 18 0))))
+                     ;; ends the SERVER process too. Falling back into
+                     ;; query-loop! after the client is gone leaves this
+                     ;; process parked on a closed connection forever -- and
+                     ;; that leftover looked exactly like the client-side
+                     ;; leak the case is meant to detect.
+                     (let drip ()
+                       (receive (after 200
+                                   (write! (smsg #\D (bv-append (u16 1)
+                                             (u32 2) (string->utf8 "42"))))
+                                   (drip))
+                         (`#(tcp-eof) (tcp-close! c) (raise 'drip-done))
+                         (`#(tcp-error ,_) (tcp-close! c) (raise 'drip-done)))))
                (write-fragmented!
                  (bv-append
                    (smsg #\T (bv-append (u16 2)
@@ -279,7 +299,7 @@
                                (u32 2) (string->utf8 "42")
                                (u32 #xFFFFFFFF)))         ; -1 = NULL
                    (smsg #\C (cstr "SELECT 1"))
-                   ready)))
+                   ready))))
            (query-loop!)))
         ((#\X) (tcp-close! c))
         (else (tcp-close! c)))))
@@ -370,7 +390,7 @@
 
     (tcp-listen! "127.0.0.1" port 16
       (lambda (c)
-        (let ((pid (spawn (lambda () (serve-conn c)))))
+        (let ((pid (spawn (lambda () (guard (e (#t (void))) (serve-conn c))))))
           (conn-set-owner! c pid)
           (tcp-read-start! c))))
 
@@ -535,6 +555,41 @@
                      '((connect-deadline-ms . 300)))
       (check "a connect drains an earlier attempt's late up-report"
         (eq? 'gone (receive (after 0 'gone) (`#(db-up ,@planted ,p ,s) 'still-there)))))
+
+    ;; 7e. Killing the pool must abort a query that is in FLIGHT, not only
+    ;; free the connections that were idle.
+    ;;
+    ;; serve-loop watches for the owner's death between statements, but a
+    ;; running query is not between statements: inside the wire loop only
+    ;; TCP messages were matched, so against a server that keeps dripping
+    ;; rows the old query, its fd and its TLS session outlived the pool --
+    ;; and rebuilding the pool stacked a fresh set on top of them.
+    (sleep-ms 1500)
+    (let ((base-conns (conn-count)) (base-procs (process-count)) (me self))
+      (let ((pool (postgresql-pool 1 "127.0.0.1" port "user" scram-password "scram")))
+        (spawn (lambda ()
+                 (guard (e (#t (send me (vector 'q 'failed))))
+                   (postgresql-query pool "DRIP forever")
+                   (send me (vector 'q 'returned)))))
+        (sleep-ms 800)
+        (let ((busy (conn-count)))
+          (check "the query is in flight" (> busy base-conns))
+          (kill pool 'reaped)
+          ;; the caller of the aborted query must be told, not left parked
+          ;; for its own 60 s query timeout -- a process per killed pool
+          (let ((outcome (receive (after 4000 'never-answered) (`#(q ,v) v))))
+            (display "  [info] the in-flight caller: ") (display outcome) (newline)
+            (check "the caller of an aborted query is answered"
+              (memq outcome '(failed returned))))
+          (sleep-ms 500)
+          (display "  [info] conns ") (display base-conns) (display " -> ")
+          (display busy) (display " -> ") (display (conn-count))
+          (display ", processes ") (display base-procs) (display " -> ")
+          (display (process-count)) (newline)
+          (check "killing the pool aborts the running query"
+            (= (conn-count) base-conns))
+          (check "and leaves no process behind"
+            (<= (process-count) base-procs)))))
 
     ;; 8. invalid message length -> clean transport error, not an assertion
     (let ((e (connect-error "127.0.0.1" port "user" "x" "badlen")))
