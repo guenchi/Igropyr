@@ -327,6 +327,54 @@
             (`#(q1 ,v) (loop (cons (cons 'q1 v) got) (+ n 1)))
             (`#(q2 ,v) (loop (cons (cons 'q2 v) got) (+ n 1))))))))
 
+;; ---- what a KILLED step leaves behind -----------------------------------
+;;
+;; TTL expiry has two paths and only one of them raises. A conversation
+;; that sat PARKED too long is raised at, so the flow's guard runs. A STEP
+;; that overruns is KILLED -- which is what the watchdog is for, since a
+;; step stuck in a loop cannot be raised at -- and @kill discards
+;; dynamic-wind winders, so that guard does NOT run.
+;;
+;; A pooled database connection survives that: the pool rebuilds a
+;; connection whose borrower died, which drops the transaction. Anything
+;; held IN PROCESS does not. Here that is a hold on a balance, restored in
+;; a guard the kill skips: without the hook the money stays deducted for
+;; the life of the VM.
+;; The releaser is IDEMPOTENT and shared by both paths. The guard and the
+;; hook are normally exclusive, but a flow that raises just as the watchdog
+;; decides to kill it reaches both, and giving the hold back twice is a
+;; worse bug than never giving it back.
+(let* ((held (box 0))
+       (released (box #f))
+       (release! (lambda ()
+                   (unless (unbox released)
+                     (set-box! released #t)
+                     (set-box! held (- (unbox held) 100))))))
+  (let-values (((kid ktok kfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (set-box! held (+ (unbox held) 100))       ; the hold
+                    (guard (e (#t (release!) (raise e)))       ; never runs
+                      (let ((a (suspend! (vector 'held req))))
+                        (sleep-ms 5000)                        ; overruns
+                        (vector 'unreachable a))))
+                  'go
+                  300                                          ; TTL 300 ms
+                  values                                       ; request-key
+                  ;; runs AFTER the kill, in the watchdog's process, on
+                  ;; what the flow was holding -- reached through the box
+                  ;; it closed over, not through the dead stack
+                  release!)))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st) (conversation-resume! kid ktok 'go)))
+                 (send me (vector 'k r)))))
+      (receive (after 6000 (fail "killed-step" 'no-answer)) (`#(k ,v) 'ok))))
+  (sleep-ms 400)
+  (unless (= 0 (unbox held))
+    (fail "a killed step leaked its in-process hold" (unbox held)))
+  (display "an on-killed hook releases what a killed step held ok\n"))
+
 ;; ---- after the linger, 'gone must still not lie -------------------------
 ;;
 ;; 'gone is documented as the rollback guarantee, and for a conversation
