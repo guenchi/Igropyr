@@ -159,9 +159,22 @@
                          (else (jfail "bad escape" i)))))
                     (else (write-char ch p) (loop (+ i 1))))))))
           values))
+      ;; A number token is BOUNDED. Without a limit the whole run of digits
+      ;; goes to string->number, which builds an arbitrary-precision integer:
+      ;; measured, 262144 digits takes 4.5 SECONDS, and that is one request
+      ;; freezing the single scheduler thread for every other connection.
+      ;; The default body limit allows nearly a megabyte of digits, so a
+      ;; handful of requests occupies every worker indefinitely.
+      ;;
+      ;; 64 is past any legitimate JSON number: IEEE doubles carry 17
+      ;; significant digits, and even a nanosecond timestamp needs 19.
+      (define max-number-chars 64)
+
       (define (parse-number i)
         (let scan ((j (if (char=? (string-ref s i) #\-) (+ i 1) i))
                    (float? #f))
+          (when (> (- j i) max-number-chars)
+            (jfail "number too long" i))
           (if (and (< j n)
                    (let ((c (string-ref s j)))
                      (or (char-numeric? c)
@@ -170,6 +183,14 @@
                     (or float? (memv (string-ref s j) '(#\. #\e #\E))))
               (let ((v (string->number (substring s i j) 10)))
                 (unless v (jfail "bad number" i))
+                ;; An out-of-range exponent becomes +inf.0, which is a REAL
+                ;; and therefore passes any (real? v) guard downstream. jwt's
+                ;; expiry check was exactly such a guard: a correctly signed
+                ;; token carrying exp=1e999 got a non-finite expiry and never
+                ;; expired. JSON has no infinities, so refusing here is also
+                ;; the more faithful parse.
+                (when (and (real? v) (or (nan? v) (infinite? v)))
+                  (jfail "number is not finite" i))
                 (values (if (and float? (exact? v)) (exact->inexact v) v) j)))))
       ;; top level: one value, then only whitespace
       (let-values (((v end) (parse-value 0)))

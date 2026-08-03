@@ -27,6 +27,11 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/sexpr-http.sc
 "$scheme_bin" --script igropyr/test/sexpr-ws.sc
 "$scheme_bin" --script igropyr/test/jwt.sc
+# a hostile JSON number: what it may cost (an unbounded digit run went to
+# string->number and froze the scheduler for seconds) and what it may claim
+# (an out-of-range exponent became +inf.0, which passes any real? guard --
+# including the one on a JWT expiry)
+"$scheme_bin" --script igropyr/test/json-numbers.sc
 "$scheme_bin" --script igropyr/test/sigv4.sc
 "$scheme_bin" --script igropyr/test/blas.sc
 "$scheme_bin" --script igropyr/test/quickjs.sc

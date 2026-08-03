@@ -345,10 +345,13 @@
       ((list? a) (and (member expected a) #t))
       (else #f)))
 
+  ;; FINITE, not merely real -- see jwt.sc: +inf.0 is a real, so exp=1e999
+  ;; on a correctly signed token yields an expiry that never passes.
   (define (time-claim-ok? claims name pred)
     (let ((p (or (assoc name claims) (assq (string->symbol name) claims))))
       (or (not p)
-          (and (real? (cdr p)) (pred (cdr p))))))
+          (let ((v (cdr p)))
+            (and (real? v) (not (nan? v)) (not (infinite? v)) (pred v))))))
 
   ;; Tokens are attacker-supplied; a length bound keeps a hostile one from
   ;; being decoded and parsed before anything about it is known.
