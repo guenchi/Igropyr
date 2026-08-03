@@ -84,6 +84,29 @@
             (if r (count (+ n 1))
                 (check "all queued tasks drained through one slot" (= n 5))))))
 
+      ;; ---- the queue bound holds when a node comes BACK ------------------
+      ;;
+      ;; The bound used to apply only while no node was live, so a
+      ;; coordinator sitting on a backlog -- the tasks a node failure handed
+      ;; back, which cannot be dropped without breaking the at-least-once
+      ;; promise already made about them -- went on accepting new work the
+      ;; moment any node returned, on top of a queue already over budget.
+      ;;
+      ;; A pool whose only member is a node that does not exist queues
+      ;; everything, which is the state to fill.
+      (let ((pool (dpool-start '(nowhere) 'w-none '((max-queued . 3)))))
+        (let ((accepted 0) (rejected 0))
+          (let loop ((i 0))
+            (when (< i 6)
+              (guard (e (#t (set! rejected (+ rejected 1))))
+                (dpool-submit pool (vector 'work i))
+                (set! accepted (+ accepted 1)))
+              (loop (+ i 1))))
+          (display "  [info] with max-queued 3: ") (display accepted)
+          (display " accepted, ") (display rejected) (display " refused\n")
+          (check "the queue bound refuses work past its limit"
+            (and (<= accepted 3) (>= rejected 3)))))
+
       (sleep-ms 100)
       (if (zero? failures)
           (begin (display "dpool-slots: all tests passed\n") (exit 0))

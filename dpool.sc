@@ -222,16 +222,20 @@
         (assertion-violation 'dpool-start "members must be a list of node names" members))
       (let* ((opts (if (pair? rest) (car rest) '()))
              (default-mode (opt opts 'mode 'at-least-once))
+             (queue-cap (opt opts 'max-queued 10000))
              (coord-name (next-coord-name!)))
         (unless (memq default-mode '(at-least-once at-most-once))
           (assertion-violation 'dpool-start "bad mode" default-mode))
+        (unless (and (integer? queue-cap) (exact? queue-cap) (> queue-cap 0))
+          (assertion-violation 'dpool-start
+            "max-queued must be a positive exact integer" queue-cap))
         (let ((pid (spawn (lambda ()
-                            (coordinator self-node coord-name members worker-name)))))
+                            (coordinator self-node coord-name members worker-name queue-cap)))))
           ;; register so remote workers can rsend results back by name
           (register coord-name pid)
           (make-dpool pid default-mode)))))
 
-  (define (coordinator self-node coord-name members worker-name)
+  (define (coordinator self-node coord-name members worker-name queue-cap)
     ;; --- state ---
     (define live
       (filter (lambda (m) (or (eq? m self-node) (memq m (node-peers)))) members))
@@ -257,7 +261,10 @@
     ;; (max-stashed); the queue was the half that was not. Refusing is the
     ;; honest answer: the submitter learns now, rather than holding an id
     ;; for work nobody will ever run.
-    (define max-queued 10000)
+    ;; Configurable (dpool-start's 'max-queued) so the refusal can be
+    ;; exercised at all: a hard-coded ten thousand is not a limit any test
+    ;; can reach, which is how it went unverified.
+    (define max-queued queue-cap)
     (define next-id 0)
 
     (define (stash-result! id result)
@@ -284,6 +291,16 @@
              (set! rr (cdr rr))
              (if (memq n live) n (loop (fx- tries 1))))))))
 
+    ;; Requeueing is NOT bounded, and that is deliberate.
+    ;;
+    ;; A task reaching here from node-gone! or the offline drain was already
+    ;; accepted: the submitter holds an id and an at-least-once promise, and
+    ;; there is no longer any way to tell it otherwise. Dropping it to
+    ;; respect a queue bound would break the one guarantee this pool makes.
+    ;; What the bound governs instead is NEW work -- the submit clause
+    ;; refuses that while the backlog stands -- so the queue is bounded by
+    ;; what was in flight when the nodes went away, which is itself bounded
+    ;; by the slot accounting.
     (define (dispatch! id payload mode)
       (let ((node (pick-node!)))
         (if (not node)
@@ -367,7 +384,15 @@
           ;; Checked BEFORE an id is handed out: a submitter that receives an
           ;; id reasonably believes the task is accepted, and there would be
           ;; no way to tell it otherwise afterwards.
-          (if (and (null? live) (>= queued-n max-queued))
+          ;; The backlog counts whether or not a node happens to be live.
+          ;; Requiring both meant a coordinator sitting on a large queue --
+          ;; the tasks a node failure handed back, which cannot be dropped
+          ;; without breaking the at-least-once promise already made about
+          ;; them -- went on accepting NEW work as soon as any node
+          ;; returned, on top of a backlog already over budget. With a live
+          ;; node a submission does not queue at all, so this only bites
+          ;; when there is a real backlog, which is when it should.
+          (if (>= queued-n max-queued)
               (send from (vector 'dpool-rejected ref 'overloaded))
               (let ((id next-id))
                 (set! next-id (+ next-id 1))
