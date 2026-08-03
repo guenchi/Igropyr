@@ -166,9 +166,21 @@
       ;; The default body limit allows nearly a megabyte of digits, so a
       ;; handful of requests occupies every worker indefinitely.
       ;;
-      ;; 64 is past any legitimate JSON number: IEEE doubles carry 17
-      ;; significant digits, and even a nanosecond timestamp needs 19.
-      (define max-number-chars 64)
+      ;; 64 was chosen for what a NUMBER needs -- IEEE doubles carry 17
+      ;; significant digits, a nanosecond timestamp 19 -- and that was the
+      ;; wrong question for a general-purpose JSON parser. JSON integers are
+      ;; unbounded by the grammar, and applications really do send big ones:
+      ;; a uint256, the largest integer Ethereum and friends work in, is 78
+      ;; digits. Refusing those is a compatibility regression, not a defence.
+      ;;
+      ;; The right question is what a limit BUYS. Measured, string->number
+      ;; costs about 2 us at 64 digits, 28 us at 512, 91 us at 1024, and
+      ;; 1204 us at 4096 -- superlinear, which is why an unbounded run was a
+      ;; 4.5-second freeze at 262144. At 512 the worst a full 1 MiB body can
+      ;; buy is roughly 2000 numbers x 28 us, about 57 ms: the same order as
+      ;; other per-request work, and three orders below the freeze this
+      ;; guards against. So 512 keeps the defence and drops the regression.
+      (define max-number-chars 512)
 
       (define (parse-number i)
         (let scan ((j (if (char=? (string-ref s i) #\-) (+ i 1) i))

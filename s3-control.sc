@@ -45,11 +45,32 @@
       (assertion-violation 'make-s3-control
         "account-id must be exactly 12 decimal digits" id)))
 
+  ;; The region is interpolated into the endpoint HOST, exactly like the
+  ;; account id -- and validating one while leaving the other open made the
+  ;; check decorative. A "/" or "@" here moves the authority/path boundary,
+  ;; so "attacker.example/prefix" produces
+  ;;   https://123456789012.s3-control.attacker.example/prefix.amazonaws.com
+  ;; and the request -- with its Authorization header, its signed headers and
+  ;; its XML body -- goes to the attacker's authority. AWS region names are
+  ;; lowercase letters, digits and hyphens; nothing else is a region.
+  (define (check-region! r)
+    (unless (and (string? r) (> (string-length r) 0) (<= (string-length r) 64)
+                 (let loop ((i 0))
+                   (or (= i (string-length r))
+                       (let ((c (string-ref r i)))
+                         (and (or (char<=? #\a c #\z)
+                                  (char<=? #\0 c #\9)
+                                  (char=? c #\-))
+                              (loop (+ i 1)))))))
+      (assertion-violation 'make-s3-control
+        "region must be lowercase letters, digits and hyphens" r)))
+
   (define (make-s3-control opts)
     (define (opt k d) (let ((p (assq k opts))) (if p (cdr p) d)))
     (let* ((account-id (opt 'account-id ""))
            (_ (check-account-id! account-id))
            (region (opt 'region "us-east-1"))
+           (__ (check-region! region))
            (endpoint (opt 'endpoint
                        (string-append "https://" account-id ".s3-control." region ".amazonaws.com"))))
       (make-s3-control-raw endpoint (endpoint->host endpoint) account-id region

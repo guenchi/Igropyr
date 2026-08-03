@@ -37,9 +37,22 @@
 (check "negative" (= -17 (json-ref (string->json "{\"n\":-17}") "n")))
 (check "float" (< 3.13 (json-ref (string->json "{\"n\":3.14}") "n") 3.15))
 (check "exponent" (= 1e10 (json-ref (string->json "{\"n\":1e10}") "n")))
-;; nanosecond timestamps are 19 digits; the limit is 64
+;; nanosecond timestamps are 19 digits
 (check "nanosecond timestamp"
   (= 1722674400123456789 (json-ref (string->json "{\"n\":1722674400123456789}") "n")))
+
+;; A uint256 is 78 digits, and applications really do send them. The first
+;; limit here was 64 -- chosen for what a NUMBER needs (a double carries 17
+;; significant digits) rather than for what a general-purpose JSON parser
+;; must accept -- and it turned a defence into a compatibility regression.
+(let* ((u256 "115792089237316195423570985008687907853269984665640564039457584007913129639935")
+       (v (json-ref (string->json (string-append "{\"n\":" u256 "}")) "n")))
+  (check "a uint256 parses" (= v (string->number u256))))
+
+;; ...and the ceiling is still a ceiling. Measured: string->number costs
+;; ~2 us at 64 digits, 28 us at 512, 1204 us at 4096 -- superlinear, which
+;; is what made an unbounded run a 4.5-second freeze.
+(check "1000 digits is still refused" (refuses? (string-append "{\"n\":" (make-string 1000 #\9) "}")))
 
 ;; ---- non-finite -----------------------------------------------------------
 ;; An out-of-range exponent used to parse to +inf.0, which IS a real -- so it

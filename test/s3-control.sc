@@ -62,6 +62,27 @@
       '("evil.example.com/x" "123456789012@evil.example" "acct-123"
         "12345678901" "1234567890123" "12345678901a" "123456789012\r\nX: y"))
 
+    ;; The REGION is interpolated into the same host, and validating only the
+    ;; account id made that check decorative: "attacker.example/prefix" gives
+    ;;   https://123456789012.s3-control.attacker.example/prefix.amazonaws.com
+    ;; whose authority is the attacker's, and the request carries the
+    ;; Authorization header, the signed headers and the body there.
+    (for-each
+      (lambda (bad)
+        (check (string-append "region refused: " bad)
+          (guard (e ((assertion-violation? e) #t) (#t #f))
+            (make-s3-control `((account-id . "123456789012") (region . ,bad)
+                               (access-key . "AK") (secret . "SK")))
+            #f)))
+      '("attacker.example/prefix" "us-east-1@evil.example" "us-east-1/x"
+        "US-EAST-1" "us east 1" "us-east-1\r\nX: y" ""))
+    ;; and real regions still work
+    (check "a real region is accepted"
+      (guard (e (#t #f))
+        (make-s3-control '((account-id . "123456789012") (region . "eu-west-3")
+                           (access-key . "AK") (secret . "SK")))
+        #t))
+
 
     ;; CreateJob
     (let ((job-id (s3-control-create-job c "<CreateJobRequest><Priority>10</Priority></CreateJobRequest>")))

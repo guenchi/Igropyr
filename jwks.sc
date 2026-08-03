@@ -134,12 +134,22 @@
   ;; Idempotent, and a freed key fails cleanly rather than handing a NULL to
   ;; OpenSSL -- a double free of an EVP_PKEY corrupts the allocator, which is
   ;; a far worse failure than the leak this replaces.
+  ;; The read, the clear and the free are ONE step. Split across a safe
+  ;; point they are not idempotent at all: two processes both read the same
+  ;; non-zero pointer and both free it, which corrupts the allocator -- the
+  ;; exact failure the idempotence was added to prevent. The mirror window is
+  ;; as bad: cleared, then killed before the free, and the key leaks with no
+  ;; way left to reach it.
+  ;;
+  ;; EVP_PKEY_free is called INSIDE the region deliberately. It is a short
+  ;; native call and cannot yield, and moving it out would reopen the window.
   (define-checked (jwks-key-free! (k jwks-key?))
-    (let ((pk (jwks-key-pkey k)))
-      (unless (zero? pk)
-        (jwks-key-pkey-set! k 0)
-        (EVP_PKEY_free pk))
-      (void)))
+    (with-interrupts-disabled
+      (let ((pk (jwks-key-pkey k)))
+        (unless (zero? pk)
+          (jwks-key-pkey-set! k 0)
+          (EVP_PKEY_free pk))))
+    (void))
 
   (define (key-pkey/live k what)
     (let ((pk (jwks-key-pkey k)))
