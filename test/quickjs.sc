@@ -183,6 +183,27 @@ globalThis.evilThrow  = function(a){ throw { toString(){ for(;;){} } }; };
             (#t #f))
     (qjs-call "slugify" "z") #f))
 
+;; A value whose toString throws is a failed call like any other, and the
+;; header promises crash-only: the runtime goes. This path used to report
+;; the error while keeping the same heap -- which matters because reaching
+;; it means the bundle's own toString ran, and it could have written to a
+;; global before throwing. Keeping the runtime keeps that write, visible to
+;; every later request.
+(qjs-boot!
+  (string-append
+    "var leaked = 'clean';"
+    "function tainter(x){ return { toString: function(){"
+    "  leaked = 'tainted'; throw new Error('nope'); } }; }"
+    "function peek(x){ return leaked; }")
+  '((timeout-ms . 500) (mem-mb . 32)))
+(let ((gen0 (qjs-generation)))
+  (let-values (((ok s) (qjs-call "tainter" "")))
+    (check "tainting-call-not-ok" (not ok)))
+  (check "tainting-call-rebuilt" (> (qjs-generation) gen0))
+  ;; the rebuild is what makes this 'clean again
+  (check "global-write-did-not-survive" (equal? (qjs-call! "peek" "") "clean")))
+
+
 (if (zero? failures)
     (begin (display "quickjs: all tests passed\n") (exit 0))
     (begin (display failures) (display " failures\n") (exit 1)))
