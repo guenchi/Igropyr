@@ -81,7 +81,10 @@
 
   ;; node-name -> #(conn link-pid dialer-name)
   (define peers (make-eq-hashtable))
-  ;; node-name -> connector pid (owns the reconnect loop)
+  ;; node-name -> #(connector-pid host port). The endpoint is part of the
+  ;; value because a node keeps its name across a move: keyed on name
+  ;; alone, a connector for the OLD address counts as "already dialing"
+  ;; and retries it forever after the new one is published.
   (define connectors (make-eq-hashtable))
   ;; node-name -> list of watcher pids
   (define watchers (make-eq-hashtable))
@@ -740,19 +743,38 @@
       (assertion-violation 'node-connect! "call node-start! first" peer))
     (when (eq? peer self-name)
       (assertion-violation 'node-connect! "cannot connect to self" peer))
-    (atomically
-      (let ((p (hashtable-ref connectors peer #f)))
-        (unless (and p (process-alive? p))
-          (hashtable-set! connectors peer
-            (spawn (lambda () (connector peer host port)))))))
+    ;; Keyed by NAME, but the endpoint has to be part of the decision. A
+    ;; node that moves to a new address keeps its name -- that is what a
+    ;; rolling migration looks like -- and a connector keyed on name alone
+    ;; was considered "already dialing" forever, so it went on retrying the
+    ;; old host after the new one had been published. The link never came
+    ;; back, and nothing said why.
+    (let ((stale
+            (atomically
+              (let ((e (hashtable-ref connectors peer #f)))
+                (cond
+                  ;; already dialing this exact endpoint: leave it alone
+                  ((and e (process-alive? (vector-ref e 0))
+                        (string=? (vector-ref e 1) host)
+                        (equal? (vector-ref e 2) port))
+                   #f)
+                  (else
+                   (hashtable-set! connectors peer
+                     (vector (spawn (lambda () (connector peer host port)))
+                             host port))
+                   ;; a live connector for a DIFFERENT endpoint must stop,
+                   ;; or two of them dial the same name in parallel
+                   (and e (process-alive? (vector-ref e 0))
+                        (vector-ref e 0))))))))
+      (when stale (kill stale 'endpoint-changed)))
     (void))
 
   ;; Stop dialing and drop the live link, if any.
   (define (node-disconnect! peer)
     (let ((p (atomically
-               (let ((p (hashtable-ref connectors peer #f)))
+               (let ((e (hashtable-ref connectors peer #f)))
                  (hashtable-delete! connectors peer)
-                 p))))
+                 (and e (vector-ref e 0))))))
       (when (and p (process-alive? p)) (send p (vector 'node-stop))))
     (let ((e (peer-entry peer)))
       (when e (send (vector-ref e 1) (vector 'node-stop))))
