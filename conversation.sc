@@ -28,7 +28,13 @@
 ;;;               final-reply))))
 ;;;       req))
 ;;;
-;;;   (conversation-resume! id req)   ; -> reply, 'gone, or 'unreachable
+;;;   (conversation-resume! id req)   ; -> reply, 'busy, 'gone, 'unreachable
+;;;
+;;; 'busy: the conversation is mid-step and this request was sent against a
+;;; reply the caller had not yet seen -- a double click, a client retry, two
+;;; front ends. Taking it as the next step would advance the flow past a
+;;; reply nobody read, skipping a confirmation or applying one stage's
+;;; payload to the next. Retry after reading the reply that is on its way.
 ;;;
 ;;; Fault semantics (the transaction-ring contract):
 ;;;   - flow crashes, TTL expires, or the process dies for any reason
@@ -221,14 +227,39 @@
              (spawn
                (lambda ()
                  (register name self)
-                 (let ((who starter) (tag ref))
+                 (let ((who starter) (tag ref) (step 0))
+                   ;; One resume per step. Two concurrent resumes -- a double
+                   ;; click, a client retry, two front ends -- both land in
+                   ;; the mailbox; the first wakes this suspend! and the
+                   ;; SECOND was then consumed by the NEXT one. That request
+                   ;; never saw the reply in between, yet advanced the flow
+                   ;; past it: a confirmation step skipped, or one stage's
+                   ;; payload applied to the next. The per-caller ref cannot
+                   ;; help -- it says who to answer, not which step this is.
+                   ;;
+                   ;; Answering 'busy is the honest outcome: the conversation
+                   ;; is mid-step, and the caller can retry when it is not.
                    (define (suspend! reply)
+                     (set! step (+ step 1))
                      (send who (vector 'conv-reply tag reply))
+                     ;; Refuse anything that arrived WHILE THE STEP WAS
+                     ;; RUNNING, before waiting for the next one. Those
+                     ;; requests were sent against the previous reply and
+                     ;; their callers never saw this one; taking one as the
+                     ;; next step advances the flow past a reply its caller
+                     ;; never read -- a confirmation skipped, or one stage's
+                     ;; payload applied to the next. Draining first is what
+                     ;; makes the order right: everything already queued is
+                     ;; stale by definition, everything after this point was
+                     ;; sent in response to the reply just published.
+                     (let drain ()
+                       (receive (after 0 'done)
+                         (`#(conv-step ,from2 ,ref3 ,_)
+                           (send from2 (vector 'conv-reply ref3 'busy))
+                           (drain))))
                      (receive (after ttl (raise 'conversation-expired))
-                       (`#(conv-step ,from ,ref2 ,req2)
-                         (set! who from)
-                         (set! tag ref2)
-                         req2)))
+                       (`#(conv-step ,from ,ref2 ,r)
+                         (set! who from) (set! tag ref2) r)))
                    (let ((final (flow req suspend!)))
                      (unregister name)
                      (send who (vector 'conv-reply tag final))))))))

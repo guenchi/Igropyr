@@ -169,5 +169,37 @@
       (expect "crash rolls back"
         (json-ref (json-of (get "/balance")) "balance") 900))
 
-    (display "ALL CONVERSATION TESTS PASSED\n")
+    ;; Two concurrent resumes must not become two consecutive steps. A double
+;; click, a client retry or two front ends all produce this: both requests
+;; land in the mailbox, the first wakes the current suspend!, and the second
+;; used to be picked up by the NEXT one -- advancing the flow with a request
+;; whose caller never saw the reply in between. That is a confirmation step
+;; skipped, or one stage's payload applied to the next.
+(let-values (((id first)
+              (conversation-start!
+                (lambda (req suspend!)
+                  ;; Three stages, so the conversation is still ALIVE and
+                  ;; parked when the second resume arrives -- otherwise it
+                  ;; answers 'gone (the flow finished) and the test proves
+                  ;; nothing about concurrency.
+                  (let ((a (suspend! (vector 'after-first req))))
+                    (sleep-ms 200)          ; both resumes land during this
+                    (let ((b (suspend! (vector 'after-second a))))
+                      (vector 'final a b))))
+                'go)))
+  (let ((me self))
+    (spawn (lambda () (send me (vector 'r1 (conversation-resume! id 'A)))))
+    (sleep-ms 20)
+    (spawn (lambda () (send me (vector 'r2 (conversation-resume! id 'B)))))
+    (let loop ((got '()) (n 0))
+      (if (= n 2)
+          (let ((busy (filter (lambda (x) (eq? (cdr x) 'busy)) got)))
+            (unless (= 1 (length busy))
+              (fail "concurrent-resume: expected exactly one busy" got))
+            (display "concurrent resume -> one busy ok\n"))
+          (receive (after 4000 (fail "concurrent-resume timeout" got))
+            (`#(r1 ,v) (loop (cons (cons 'r1 v) got) (+ n 1)))
+            (`#(r2 ,v) (loop (cons (cons 'r2 v) got) (+ n 1))))))))
+
+(display "ALL CONVERSATION TESTS PASSED\n")
     (exit 0)))
