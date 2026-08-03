@@ -202,7 +202,11 @@
                                       (list (cons 'done #f)
                                             (cons 'cancelled #t)))))))
                           req
-                          15000)))                                      ; demo TTL 15s
+                          15000                                         ; demo TTL 15s
+                          ;; two retries of the same call are two different
+                          ;; request records; what makes them the same call
+                          ;; is the body
+                          (lambda (a b) (equal? (req-body a) (req-body b))))))
             ;; The token goes to the client and must come back with the
             ;; next request. It says WHICH reply is being answered, which is
             ;; what stops a double click or a retried request from advancing
@@ -217,20 +221,22 @@
 (app-post app "/transfer/:id"
   (lambda (req res)
     (let ((token (cond ((assoc "token" (req-query req)) => cdr) (else ""))))
-      (let-values (((r next) (conversation-resume! (req-param req "id") token req)))
+      ;; the STATUS decides, never the reply -- a flow may legitimately
+      ;; return the symbol 'gone as an ordinary answer
+      (let-values (((r status) (conversation-resume! (req-param req "id") token req)))
         (cond
-          ((conversation-gone? r)
+          ((conversation-gone? status)
            (set-status! res 410)
            (send-json! res (list (cons 'fault "gone") (cons 'rolled-back #t))))
           ;; 409: this request was NOT applied and will not be. It says
           ;; nothing about whether the request it duplicates succeeded --
           ;; read the current state rather than resubmitting.
-          ((conversation-stale? r)
+          ((conversation-stale? status)
            (set-status! res 409)
            (send-json! res (list (cons 'fault "stale")
                                  (cons 'applied #f))))
-          (next (send-json! res (cons (cons 'token next) r)))
-          (else (send-json! res r)))))))
+          ((conversation-done? status) (send-json! res r))
+          (else (send-json! res (cons (cons 'token status) r))))))))
 
 (app-get app "/transfer-balance"
   (lambda (req res)

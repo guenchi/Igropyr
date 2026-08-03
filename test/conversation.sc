@@ -102,23 +102,30 @@
            (crash? (assoc "crash" q)))
       (let-values (((id token reply)
                     (conversation-start! (transfer-flow amt (and crash? #t))
-                                         req ttl)))
+                                         req ttl
+                                         ;; over HTTP two retries are two
+                                         ;; different request records, so
+                                         ;; sameness is the body
+                                         (lambda (a b)
+                                           (equal? (req-body a) (req-body b))))))
         (send-json! res (cons (cons 'conv id)
                               (cons (cons 'token token) reply)))))))
 
 (app-post app "/t/:id"
   (lambda (req res)
     (let ((token (cond ((assoc "token" (req-query req)) => cdr) (else ""))))
-      (let-values (((r next) (conversation-resume! (req-param req "id") token req)))
+      ;; the STATUS decides, never the reply -- a flow may legitimately
+      ;; return the symbol 'gone as an ordinary answer
+      (let-values (((r status) (conversation-resume! (req-param req "id") token req)))
         (cond
-          ((conversation-gone? r)
+          ((conversation-gone? status)
            (set-status! res 410)
            (send-json! res (list (cons 'fault "gone"))))
-          ((conversation-stale? r)
+          ((conversation-stale? status)
            (set-status! res 409)
            (send-json! res (list (cons 'fault "stale"))))
-          (next (send-json! res (cons (cons 'token next) r)))
-          (else (send-json! res r)))))))
+          ((conversation-done? status) (send-json! res r))
+          (else (send-json! res (cons (cons 'token status) r))))))))
 
 (app-get app "/balance"
   (lambda (req res)
@@ -258,31 +265,66 @@
                       (vector 'final a b))))
                 'go)))
   (let ((me self))
-    ;; BOTH carry the same token, which is what a double click really is:
-    ;; two requests written against the same reply. The first consumes it;
-    ;; the second is refused however it is scheduled.
+    ;; Two callers holding the SAME token but asking DIFFERENT things. One
+    ;; wins; the other must be told 'stale, not handed the winner's answer.
+    ;;
+    ;; Replaying by token alone did exactly that: the caller who asked 'B
+    ;; received the result of 'A. In the transfer flow above, that is a
+    ;; caller who asked to cancel being told the transfer was confirmed.
     (spawn (lambda ()
-             (let-values (((r n) (conversation-resume! id token 'A)))
-               (send me (vector 'r1 r)))))
+             (let-values (((r st) (conversation-resume! id token 'A)))
+               (send me (vector 'r1 (cons r st))))))
     (sleep-ms 20)
     (spawn (lambda ()
-             (let-values (((r n) (conversation-resume! id token 'B)))
-               (send me (vector 'r2 r)))))
+             (let-values (((r st) (conversation-resume! id token 'B)))
+               (send me (vector 'r2 (cons r st))))))
     (let loop ((got '()) (n 0))
       (if (= n 2)
-          ;; Both are answered, and with the SAME answer: the second did not
-          ;; advance the flow, it replayed what the first produced. That is
-          ;; the whole contract -- a duplicate costs nothing and tells the
-          ;; truth. Two DIFFERENT replies would mean the flow ran twice.
-          (let ((vs (map cdr got)))
-            (unless (and (= 2 (length vs)) (equal? (car vs) (cadr vs)))
-              (fail "concurrent-resume: expected one answer replayed twice" got))
-            (when (memq 'stale vs)
-              (fail "concurrent-resume: a duplicate was refused rather than replayed" got))
-            (display "concurrent resume -> one step, answer replayed ok\n"))
+          (let* ((vs (map cdr got))
+                 (stales (filter (lambda (x) (eq? (cdr x) 'stale)) vs))
+                 (answered (filter (lambda (x) (not (eq? (cdr x) 'stale))) vs)))
+            (unless (= 1 (length stales))
+              (fail "concurrent-resume: expected exactly one stale" got))
+            (unless (= 1 (length answered))
+              (fail "concurrent-resume: expected exactly one answer" got))
+            ;; and the one that was answered got ITS OWN question's result
+            (unless (equal? (car (car answered)) (vector 'after-second 'A))
+              (fail "concurrent-resume: wrong answer delivered" got))
+            (display "two different questions, one token -> one wins, one stale ok\n"))
           (receive (after 4000 (fail "concurrent-resume timeout" got))
             (`#(r1 ,v) (loop (cons (cons 'r1 v) got) (+ n 1)))
             (`#(r2 ,v) (loop (cons (cons 'r2 v) got) (+ n 1))))))))
+
+;; ...and the SAME question repeated is replayed rather than refused --
+;; that is the lost-response case, and it is the whole reason replay
+;; exists.
+(let-values (((rid rtok rfirst)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'after-first req))))
+                    (sleep-ms 150)
+                    (let ((b (suspend! (vector 'after-second a))))
+                      (vector 'final a b))))
+                'go)))
+  (let ((me self))
+    (spawn (lambda ()
+             (let-values (((r st) (conversation-resume! rid rtok 'SAME)))
+               (send me (vector 'q1 (cons r st))))))
+    (sleep-ms 20)
+    (spawn (lambda ()
+             (let-values (((r st) (conversation-resume! rid rtok 'SAME)))
+               (send me (vector 'q2 (cons r st))))))
+    (let loop ((got '()) (n 0))
+      (if (= n 2)
+          (let ((vs (map cdr got)))
+            (when (memq 'stale (map cdr vs))
+              (fail "same question refused rather than replayed" got))
+            (unless (equal? (car (car vs)) (car (cadr vs)))
+              (fail "same question got two different answers" got))
+            (display "the same question twice -> one step, answer replayed ok\n"))
+          (receive (after 4000 (fail "replay timeout" got))
+            (`#(q1 ,v) (loop (cons (cons 'q1 v) got) (+ n 1)))
+            (`#(q2 ,v) (loop (cons (cons 'q2 v) got) (+ n 1))))))))
 
 ;; ---- peek: settling the question after 'unreachable ---------------------
 ;;
@@ -304,11 +346,12 @@
   ;; waiting to have answered
   (let-values (((state token reply) (conversation-peek pid)))
     (unless (eq? state 'parked) (fail "peek-parked-state" state))
-    (unless (eqv? token ptok) (fail "peek-parked-token" token))
+    (unless (equal? token ptok) (fail "peek-parked-token" token))
     (unless (equal? reply (vector 'parked 'go)) (fail "peek-parked-reply" reply)))
   ;; ...and it did NOT advance: the token still works
-  (let-values (((r next) (conversation-resume! pid ptok 'X)))
-    (unless (equal? r (vector 'final 'X)) (fail "peek-advanced-the-flow" r)))
+  (let-values (((r st) (conversation-resume! pid ptok 'X)))
+    (unless (equal? r (vector 'final 'X)) (fail "peek-advanced-the-flow" r))
+    (unless (conversation-done? st) (fail "peek-final-status" st)))
   ;; completed: peek reports the final answer, still inside the linger
   (let-values (((state token reply) (conversation-peek pid)))
     (unless (eq? state 'completed) (fail "peek-completed-state" state))
@@ -337,7 +380,7 @@
                 300)))                       ; TTL 300 ms
   (let ((me self))
     (spawn (lambda ()
-             (let-values (((r n) (conversation-resume! id tok 'X)))
+             (let-values (((r st) (conversation-resume! id tok 'X)))
                (send me (vector 'slow r)))))
     ;; the step overruns, so the watchdog must end the conversation rather
     ;; than let it run to completion
@@ -376,7 +419,7 @@
     (let-values (((r2 tok3) (conversation-resume! id2 tok2 'X)))
       (sleep-ms 900)                          ; just past a sampling point
       (spawn (lambda ()
-               (let-values (((r n) (conversation-resume! id2 tok3 'Y)))
+               (let-values (((r st) (conversation-resume! id2 tok3 'Y)))
                  (send me (vector 'phase r))))))
     (receive (after 8000 (fail "phase-step" 'no-answer))
       (`#(phase ,v)

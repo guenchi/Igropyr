@@ -36,9 +36,9 @@
     ;; 'gone. We have no evidence about a node we cannot contact, and 'gone
     ;; is a GUARANTEE that the transaction rolled back -- claiming it here
     ;; would invite a retry that duplicates a flow still running elsewhere.
-    (let-values (((r n) (conversation-resume! "nowhere~deadbeef" "deadbeef" 1)))
-      (unless (eq? 'unreachable r)
-        (fail! "unknown-owner-should-be-unreachable" r)))
+    (let-values (((r st) (conversation-resume! "nowhere~deadbeef" "deadbeef" 1)))
+      (unless (eq? 'unreachable st)
+        (fail! "unknown-owner-should-be-unreachable" st)))
     (display "resume to unknown owner -> unreachable ok\n")
 
     (spawn-child!)
@@ -94,7 +94,7 @@
 
           ;; an invented one is still refused
           (let-values (((rw tw) (conversation-resume! id "00000000deadbeef" 10)))
-            (unless (eq? rw 'stale) (fail! "cross-node-invented" rw)))
+            (unless (eq? tw 'stale) (fail! "cross-node-invented" tw)))
           (display "an invented token is refused across the link ok\n")
 
           (let-values (((r3 t3) (conversation-resume! id t2 'done)))
@@ -106,7 +106,7 @@
             ;; repeat -- which is the whole point of lingering: a client
             ;; whose final reply was lost gets it back rather than 'gone
             (let-values (((r4 t4) (conversation-resume! id "00000000deadbeef" 99)))
-              (unless (eq? r4 'stale) (fail! "resume-after-done" r4)))
+              (unless (eq? t4 'stale) (fail! "resume-after-done" t4)))
             (display "an invented token after completion -> stale ok\n")
 
             (let-values (((r5 t5) (conversation-resume! id t2 'done)))

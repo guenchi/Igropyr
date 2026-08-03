@@ -35,8 +35,10 @@
 ;;; with every reply, and the next request must present it; it is consumed
 ;;; the moment a request is accepted. Send it to the client alongside the
 ;;; reply (a field, a hidden input, a query parameter) and take it back with
-;;; the next request -- it is a small integer and crosses links and JSON
-;;; unchanged.
+;;; the next request -- it is an opaque hex STRING and crosses links, JSON
+;;; and a query parameter unchanged. Compared as a string: a number, or a
+;;; token that has been through a decoder that changed its type, is
+;;; 'stale.
 ;;;
 ;;; Without it the only thing distinguishing "the answer to what I just
 ;;; said" from "a duplicate of what you said before" is arrival order, and
@@ -118,7 +120,7 @@
 
 (library (igropyr conversation)
   (export conversation-start! conversation-resume! conversation-peek
-          conversation-gone? conversation-stale?)
+          conversation-gone? conversation-stale? conversation-done?)
   (import (chezscheme) (igropyr actor)
           (only (igropyr libuv) now-ms)
           (only (igropyr node) node-self rsend monitor-node demonitor-node))
@@ -127,10 +129,20 @@
 
   ;; CSPRNG conversation ids: resuming is authorization, so ids must be
   ;; unguessable (same reasoning as session sids)
+  ;; A SHORT READ FAILS. get-bytevector-n! can return fewer bytes than
+  ;; asked for, and the rest of a make-bytevector is zeros: ignoring the
+  ;; count still produced a full-length hex string, carrying however much
+  ;; less entropy the read happened to deliver. A secret that looks the
+  ;; right length and is not is worse than no secret at all, so this
+  ;; raises rather than returning something weaker than it appears.
   (define (conv-hex/n! n)
     (let ((bv (make-bytevector n)))
       (call-with-port (open-file-input-port "/dev/urandom")
-        (lambda (p) (get-bytevector-n! p bv 0 n)))
+        (lambda (p)
+          (let ((got (get-bytevector-n! p bv 0 n)))
+            (unless (eqv? got n)
+              (assertion-violation 'conversation
+                "short read from /dev/urandom" got)))))
       (apply string-append
         (map (lambda (i)
                (let ((h (number->string (bytevector-u8-ref bv i) 16)))
@@ -224,9 +236,9 @@
         (`#(conv-resume ,from-node ,reply-name ,ref ,id ,token ,req)
           (spawn
             (lambda ()
-              (let-values (((reply next) (local-resume id token req)))
+              (let-values (((reply status) (local-resume id token req)))
                 (rsend from-node reply-name
-                       (vector 'conv-forward-reply ref reply next)))))
+                       (vector 'conv-forward-reply ref reply status)))))
           (loop))
         (,_ (loop)))))
 
@@ -288,10 +300,10 @@
           ;; now -- from here they are indistinguishable.
           (if (rsend owner conv-router-name
                      (vector 'conv-resume (node-self) reply-name ref id token req))
-              (receive (after conv-forward-ttl-ms (values 'unreachable #f))
-                (`#(conv-forward-reply ,@ref ,reply ,next) (values reply next))
-                (`#(node-down ,@owner) (values 'unreachable #f)))
-              (values 'unreachable #f)))
+              (receive (after conv-forward-ttl-ms (values #f 'unreachable))
+                (`#(conv-forward-reply ,@ref ,reply ,status) (values reply status))
+                (`#(node-down ,@owner) (values #f 'unreachable)))
+              (values #f 'unreachable)))
         (lambda ()
           (demonitor-node owner)
           ;; demonitor-node does not retract a #(node-down ...) already
@@ -314,6 +326,24 @@
   (define (conversation-start! flow req . opts)
     (ensure-router!)
     (let* ((ttl (if (pair? opts) (car opts) default-ttl-ms))
+           ;; WHAT COUNTS AS THE SAME REQUEST, for replay.
+           ;;
+           ;; A repeat is replayed; a DIFFERENT question bearing the same
+           ;; token is not, because answering "cancel" with the result of
+           ;; someone else's "confirm" is worse than refusing. Deciding
+           ;; sameness needs to know what the request IS, and only the
+           ;; application does: over HTTP the resumed value is a request
+           ;; record, and two retries of the same call are two different
+           ;; records, so the default `equal?` never matches there.
+           ;;
+           ;; That default fails SAFE -- no match means 'stale, which is
+           ;; correct if unhelpful -- but an application that wants replay
+           ;; over HTTP must say what to compare, e.g.
+           ;;   (lambda (a b) (equal? (req-body a) (req-body b)))
+           (same-request?
+             (if (and (pair? opts) (pair? (cdr opts)) (cadr opts))
+                 (cadr opts)
+                 equal?))
            (id (conversation-id!))
            (name (conversation-name id))
            (starter self)
@@ -377,7 +407,7 @@
                  ;; same answer it would have received, rather than an error
                  ;; it cannot act on.
                  (let ((who starter) (tag ref) (step 0) (awaiting #f)
-                       (last-consumed #f) (last-reply #f))
+                       (last-consumed #f) (last-request #f) (last-reply #f))
                    ;; One resume per step. Two concurrent resumes -- a double
                    ;; click, a client retry, two front ends -- both land in
                    ;; the mailbox; the first wakes this suspend! and the
@@ -444,27 +474,41 @@
                              ;; the answer to the reply just published
                              ((and awaiting (string? token) (string=? token awaiting))
                               (set! last-consumed token)
+                              (set! last-request r)
                               (set! awaiting #f)       ; spent
                               (set! who from) (set! tag ref2)
                               (set-box! running-box #t)
                               (set-box! run-start-box (now-ms))
                               r)
-                             ;; a REPEAT of the request that got us here.
-                             ;; Hand back what it produced, with the token
-                             ;; that came with it -- exactly what the
-                             ;; original caller received. A client whose
-                             ;; reply was lost is then able to continue
-                             ;; instead of having to reconcile.
-                             ((and last-consumed (string? token) (string=? token last-consumed))
+                             ;; A REPEAT of the request that got us here --
+                             ;; the same token AND the same request. Hand
+                             ;; back what it produced, with the token that
+                             ;; came with it: exactly what the original
+                             ;; caller received, so a client whose reply was
+                             ;; lost can continue instead of reconciling.
+                             ;;
+                             ;; The REQUEST has to match, not just the
+                             ;; token. Two callers can hold the same token
+                             ;; and ask different things -- one confirms,
+                             ;; one cancels -- and replaying by token alone
+                             ;; answered the second with the first one's
+                             ;; result: the caller who asked to cancel was
+                             ;; told it was confirmed. A repeat means the
+                             ;; same question; a different question against
+                             ;; a spent token is a caller acting on
+                             ;; information that has moved on.
+                             ((and last-consumed (string? token)
+                                   (string=? token last-consumed)
+                                   (same-request? r last-request))
                               (send from (vector 'conv-reply ref2 last-reply awaiting))
                               (wait))
                              (else
-                              (send from (vector 'conv-reply ref2 'stale #f))
+                              (send from (vector 'conv-reply ref2 #f 'stale))
                               (wait)))))))
                    (let ((final (flow req suspend!)))
                      (set! last-reply final)
                      (set! awaiting #f)
-                     (send who (vector 'conv-reply tag final #f))
+                     (send who (vector 'conv-reply tag final 'done))
                      ;; LINGER, then unregister.
                      ;;
                      ;; Exiting here is what made a lost FINAL reply
@@ -490,20 +534,24 @@
                                  (send from (vector 'conv-peeked ref2
                                                     'completed #f last-reply))
                                  (linger))
-                               (`#(conv-step ,from ,ref2 ,token ,r)
-                                 (if (and last-consumed (string? token) (string=? token last-consumed))
+                               (`#(conv-step ,from ,ref2 ,token ,token2-request)
+                                 (if (and last-consumed (string? token)
+                                          (string=? token last-consumed)
+                                          (same-request? token2-request last-request))
                                      (send from
-                                           (vector 'conv-reply ref2 last-reply #f))
+                                           (vector 'conv-reply ref2 last-reply 'done))
                                      (send from
-                                           (vector 'conv-reply ref2 'stale #f)))
+                                           (vector 'conv-reply ref2 #f 'stale)))
                                  (linger)))))))
                      (unregister name)))))))
       (let ((m (monitor conv)))
         (receive
-          (`#(conv-reply ,@ref ,reply ,token)
+          ;; the first suspend! publishes a token, so `status` here is that
+          ;; token -- or 'done if the flow returned without suspending at all
+          (`#(conv-reply ,@ref ,reply ,status)
             (when m (demonitor m))
             (flush-down! conv)
-            (values id token reply))
+            (values id status reply))
           (`#(DOWN ,@conv ,reason)
             (raise (vector 'conversation-failed reason)))))))
 
@@ -520,19 +568,34 @@
   ;; Resume a conversation that lives on THIS node.
   ;; -> (values reply next-token), where next-token is #f when the
   ;; conversation is over ('gone, 'stale, or a final reply).
+  ;; -> (values reply status)
+  ;;
+  ;; STATUS IS THE ANSWER, reply is only data. A flow may legitimately
+  ;; return the symbol 'gone (or 'stale, or 'unreachable) as its final
+  ;; value, and putting the control outcome in the same position made that
+  ;; indistinguishable from process death -- telling a caller the
+  ;; transaction rolled back when it had just committed. The two live in
+  ;; different places now, and nothing a flow can return is examined for
+  ;; control meaning.
+  ;;
+  ;;   a token string -- the step ran; present it to continue
+  ;;   'done          -- the flow finished; reply is its final answer
+  ;;   'stale         -- not applied, and will not be; reply is #f
+  ;;   'gone          -- unreachable here; reply is #f
+  ;;   'unreachable   -- the owner node could not be reached; reply is #f
   (define (local-resume id token req)
     (let ((p (whereis (conversation-name id))))
       (if (not p)
-          (values 'gone #f)
+          (values #f 'gone)
           (let ((ref (gensym))
                 (m (monitor p)))
             (send p (vector 'conv-step self ref token req))
             (receive
-              (`#(conv-reply ,@ref ,reply ,next)
+              (`#(conv-reply ,@ref ,reply ,status)
                 (when m (demonitor m))
                 (flush-down! p)
-                (values reply next))
-              (`#(DOWN ,@p ,reason) (values 'gone #f)))))))
+                (values reply status))
+              (`#(DOWN ,@p ,reason) (values #f 'gone)))))))
 
   ;; What is this conversation waiting for, and what did it last say?
   ;;
@@ -576,7 +639,15 @@
                 (values state token reply))
               (`#(DOWN ,@p ,reason) (values 'gone #f #f)))))))
 
+  ;; Applied to the STATUS, never to the reply. A flow may return the
+  ;; symbol 'gone as a perfectly ordinary answer; only the status carries
+  ;; control meaning.
   (define (conversation-gone? x) (eq? x 'gone))
+
+  ;; The flow returned: reply is its final answer, and no token continues
+  ;; it. Distinguishing this from 'gone is what tells a caller whether the
+  ;; transaction committed.
+  (define (conversation-done? x) (eq? x 'done))
 
   ;; The request named a reply that is no longer the one being answered --
   ;; a duplicate, a retry, a second front end. It was NOT applied and will
