@@ -57,9 +57,20 @@
           (let loop ((state (init)))
             (receive
               (`#(gen-call ,from ,ref ,msg)
-                (let-values (((reply new-state) (handle-call msg from state)))
-                  (send from (vector 'gen-reply ref reply))
-                  (loop new-state)))
+                ;; Skip a call whose caller is already gone. A busy server
+                ;; queues work in its mailbox, and a caller can be killed
+                ;; while waiting -- a stuck worker reaped by its supervisor,
+                ;; say. Running it then applies effects nobody will observe,
+                ;; and the application's retry applies them again: one
+                ;; charge becomes two. A dead caller is a FACT, so this is
+                ;; safe; a caller that merely timed out is still running and
+                ;; indistinguishable from one still waiting, so that case is
+                ;; deliberately not guessed at here -- see gen-server-call.
+                (if (process-alive? from)
+                    (let-values (((reply new-state) (handle-call msg from state)))
+                      (send from (vector 'gen-reply ref reply))
+                      (loop new-state))
+                    (loop state)))
               (`#(gen-cast ,msg)
                 (loop (handle-cast msg state)))
               (other
@@ -87,6 +98,17 @@
       (demonitor m)
       (receive (after 0 'ok) (`#(DOWN ,@p ,reason) 'ok))))
 
+  ;; A TIMEOUT DOES NOT CANCEL THE CALL. The request is already in the
+  ;; server's mailbox and this side has no way to retract it; a caller that
+  ;; gave up is still running and looks exactly like one still waiting, so
+  ;; the server cannot tell them apart either. The handler may therefore run
+  ;; afterwards and apply its effects. Treat 'timeout as "outcome unknown",
+  ;; not as "did not happen": retrying a call with effects can apply them
+  ;; twice. Make such handlers idempotent, or carry a request id the server
+  ;; can deduplicate on.
+  ;;
+  ;; A caller that DIES is a different matter -- that is a fact, and the
+  ;; server skips those calls rather than acting for nobody.
   (define (gen-server-call srv msg . rest)
     (drain-stale-replies!)
     (let* ((timeout (if (pair? rest) (car rest) default-timeout-ms))
