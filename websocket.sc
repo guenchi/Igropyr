@@ -17,7 +17,8 @@
 (library (igropyr websocket)
   (export ws-accept-key ws-valid-client-key?
           make-ws make-ws-client ws? ws-conn
-          ws-recv ws-send-text! ws-send-binary! ws-close!)
+          ws-recv ws-send-text! ws-send-binary! ws-close!
+          ws-write-timeout!)
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv)
           (only (igropyr crypto) sha1 base64-encode base64-decode))
@@ -187,9 +188,48 @@
   (define (make-ws-client conn leftover)
     (make-ws-record conn (leftover->inbuf leftover) (box #f) #t))
 
+  ;; Same bound, and the same reasoning, as the HTTP streaming writes. A
+  ;; peer that stops reading fills the socket buffer, and a fire-and-forget
+  ;; write then encodes the frame, foreign-allocs a write block and queues
+  ;; it -- per send, without limit, in native memory the GC cannot see. That
+  ;; is the growth res-write! was given backpressure for; the WebSocket path
+  ;; had none, and a broadcast loop or an automatic pong stream reaches it
+  ;; just as easily.
+  (define default-ws-write-timeout-ms 30000)
+  (define ws-write-timeout-ms default-ws-write-timeout-ms)
+
+  ;; 0 = unbounded, for a port no untrusted peer can reach.
+  (define (ws-write-timeout! ms)
+    (unless (and (integer? ms) (exact? ms) (>= ms 0))
+      (assertion-violation 'ws-write-timeout!
+        "timeout must be a nonnegative exact integer (ms); 0 = unbounded" ms))
+    (set! ws-write-timeout-ms ms))
+
+  ;; -> #t once the bytes are away, #f if the peer never took them (the
+  ;; connection is closed then, since a half-written frame cannot resume).
+  ;; Callers already treat #f as "this socket is finished".
   (define (ws-send-frame! w op payload)
     (and (not (unbox (ws-closedbox w)))
-         (tcp-write! (ws-conn w) (encode-frame op payload (ws-client? w)) #f)))
+         (let ((c (ws-conn w)) (b (box 'pending)) (me self))
+           (tcp-write! c (encode-frame op payload (ws-client? w))
+             (lambda (st)
+               (case (unbox b)
+                 ((pending) (set-box! b st))
+                 ((abandoned) (void))
+                 (else (send me (vector 'ws-written st))))))
+           (let ((st (unbox b)))
+             (if (eq? st 'pending)
+                 (begin
+                   (set-box! b 'parked)
+                   (receive (after (if (zero? ws-write-timeout-ms)
+                                       'infinity ws-write-timeout-ms)
+                               (set-box! b 'abandoned)
+                               ;; a late completion may already be queued
+                               (receive (after 0 'ok) (`#(ws-written ,_) 'ok))
+                               (tcp-close! c)
+                               #f)
+                     (`#(ws-written ,st2) (>= st2 0))))
+                 (>= st 0))))))
 
   (define (ws-send-text! w s) (ws-send-frame! w 1 (string->utf8 s)))
   (define (ws-send-binary! w bv) (ws-send-frame! w 2 bv))

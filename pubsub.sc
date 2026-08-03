@@ -11,6 +11,24 @@
 ;;;   (publish 'room-1 "hi")          ; ... #(pub room-1 "hi")
 ;;;   (unsubscribe 'room-1)
 ;;;
+;;; NO BACKPRESSURE, by construction. publish never blocks: it hands each
+;;; subscriber a message and returns. A subscriber that is ALIVE but slow --
+;;; a WebSocket relay parked on a socket the peer has stopped reading is the
+;;; usual one -- therefore accumulates messages in its mailbox without any
+;;; bound, holding every payload. Death is handled (the server monitors each
+;;; subscriber and drops it); slowness is not, and the two look nothing
+;;; alike from here.
+;;;
+;;; This is deliberate rather than overlooked: what to do about a slow
+;;; subscriber is a POLICY question with no answer that suits every caller.
+;;; Blocking the publisher makes one slow consumer everyone's problem;
+;;; dropping loses messages a chat room may not tolerate but a metrics feed
+;;; would rather lose than queue; coalescing needs to know what "newer
+;;; supersedes older" means for the payload. So the framework does not
+;;; choose. A subscriber that can fall behind should bound ITSELF -- drain
+;;; with (receive (after 0 ...)) and drop or coalesce on its own terms, or
+;;; keep a counter and unsubscribe when it is too far behind.
+;;;
 ;;; Distribution: when (igropyr node) links are up, a publish is also
 ;;; forwarded ONE HOP to every directly-connected peer, whose pubsub
 ;;; server delivers it to its own local subscribers. This assumes a
