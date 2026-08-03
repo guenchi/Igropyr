@@ -1658,7 +1658,15 @@
                     (fail-task (unbox supbox) (unbox obox) task info))
                   (opt 'max-retries 3)
                   (opt 'stuck-ms 30000)
-                  (opt 'check-ms 5000)))
+                  (opt 'check-ms 5000)
+                  ;; Only a task that has NOT answered may be re-run. A
+                  ;; handler that responded and then raised -- in cleanup, in
+                  ;; logging, on a middleware's way back out -- has already
+                  ;; had its effects observed, and the claimed token means a
+                  ;; retry could not produce a response anyway. Re-running it
+                  ;; would repeat the writes it made while the client holds a
+                  ;; success it will never see corrected.
+                  (lambda (task) (not (unbox (vector-ref task 4))))))
            (host (opt 'host "0.0.0.0"))
            (srv (make-http-server sup hbox wsbox (now-ms) 0)))
       (unless (and (string? host) (> (string-length host) 0))

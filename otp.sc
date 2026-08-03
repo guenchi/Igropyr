@@ -36,15 +36,24 @@
   ;; requeueing an urgent task is fine). info is an alist:
   ;;   ((kind . crash|stuck) (reason . <exit reason>)
   ;;    (attempts . <executions>) (elapsed-ms . <last run's duration>))
-  ;; Optional trailing args: max-retries stuck-ms check-ms.
+  ;; Optional trailing args: max-retries stuck-ms check-ms retryable?.
+  ;;
+  ;; retryable? -- (task) -> boolean, default: everything is retryable.
+  ;; A crashed task is re-run only if this says so. Retrying assumes the
+  ;; task left no effect the world can already see; when it did, re-running
+  ;; repeats that effect. This pool cannot judge it -- what counts as a
+  ;; visible effect belongs to whoever defined the task -- so the question
+  ;; is asked rather than guessed. The HTTP layer answers it by checking
+  ;; whether the response token has been claimed.
   ;; Returns the supervisor pid; send it #(submit-task ,task).
   (define (start-worker-pool n run-task fail-task . opts)
     (let* ((max-retries (if (>= (length opts) 1) (car opts) default-max-retries))
            (stuck-ms (if (>= (length opts) 2) (cadr opts) default-stuck-ms))
-           (check-ms (if (>= (length opts) 3) (caddr opts) default-check-ms)))
+           (check-ms (if (>= (length opts) 3) (caddr opts) default-check-ms))
+           (retryable? (if (>= (length opts) 4) (list-ref opts 3) (lambda (t) #t))))
       (let ((sup (spawn (lambda ()
                           (supervisor n run-task fail-task
-                                      max-retries stuck-ms)))))
+                                      max-retries stuck-ms retryable?)))))
         (spawn (lambda () (ticker sup check-ms)))
         sup)))
 
@@ -62,7 +71,7 @@
             (send sup (vector 'task-completed (task-id-of task) self))
             (loop))))))
 
-  (define (supervisor n run-task fail-task max-retries stuck-ms)
+  (define (supervisor n run-task fail-task max-retries stuck-ms retryable?)
     (define idle '())
     (define busy (make-eq-hashtable))      ; worker pid -> (task . start-ms)
     (define stuck (make-eq-hashtable))     ; worker pid -> #t (kill in flight)
@@ -129,14 +138,21 @@
                 ;; no retry for stuck tasks; the worker is already dead,
                 ;; so the failure report describes a settled state
                 (give-up! task (fail-info 'stuck reason id elapsed))
-                (let ((a (+ 1 (hashtable-ref attempts id 0))))
-                  (if (> a max-retries)
-                      (give-up! task (fail-info 'crash reason id elapsed))
-                      (begin
-                        (hashtable-set! attempts id a)
-                        (if (null? idle)
-                            (push-front! task)
-                            (dispatch! task))))))))))
+                ;; A task that already produced a visible effect is NOT
+                ;; re-run, however many attempts remain: the crash happened
+                ;; after the effect, so retrying repeats it rather than
+                ;; retrying it. Report the failure instead, which is what
+                ;; the caller of a settled task can still act on.
+                (if (not (retryable? task))
+                    (give-up! task (fail-info 'crash reason id elapsed))
+                    (let ((a (+ 1 (hashtable-ref attempts id 0))))
+                      (if (> a max-retries)
+                          (give-up! task (fail-info 'crash reason id elapsed))
+                          (begin
+                            (hashtable-set! attempts id a)
+                            (if (null? idle)
+                                (push-front! task)
+                                (dispatch! task)))))))))))
 
     (define (check-stuck!)
       (let ((now (now-ms)))
