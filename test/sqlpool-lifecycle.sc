@@ -248,6 +248,59 @@
           (vector? (sql-query pool "SELECT 1" cfg)))
         (send pool (vector 'db-quit))))
 
+    ;; ---- a connection handed back twice ----------------------------------
+    ;;
+    ;; A leased connection replies to its lessee, then is preempted before
+    ;; sending db-idle. The lessee checks in first, so the checkin frees the
+    ;; connection -- and the late db-idle then finds it neither leased nor
+    ;; dying and frees it AGAIN. It was in `idle` twice, two checkouts got
+    ;; the same connection, and the second lease overwrote the first lease
+    ;; record: that borrower's monitor was never released, its checkin could
+    ;; no longer find its lease, and its death no longer reclaimed a
+    ;; connection that may have held its open transaction.
+    ;;
+    ;; The order is forced by sending db-idle by hand AFTER the checkin,
+    ;; which is exactly what that preemption produces.
+    (let ((pool (spawn (lambda () (sql-pool-loop 1 fake-spawn-conn! cfg))))
+          (me self))
+      (sleep-ms 300)
+      (let ((conn (box #f)))
+        (let ((holder (spawn (lambda ()
+                               (sql-call-with-connection pool
+                                 (lambda (c)
+                                   (set-box! conn c)
+                                   (send me (vector 'held))
+                                   (receive (`#(release) 'ok)))
+                                 cfg)))))
+          (receive (after 2000 (void)) (`#(held) 'ok))
+          (send holder (vector 'release))
+          (sleep-ms 200)
+          ;; the late db-idle, arriving after the checkin already freed it
+          (send pool (vector 'db-idle (unbox conn)))
+          (sleep-ms 200)
+          ;; If it is in idle twice, two checkouts get the SAME connection.
+          (let ((a (box #f)) (b (box #f)))
+            (spawn (lambda ()
+                     (sql-call-with-connection pool
+                       (lambda (c) (set-box! a c) (send me (vector 'got 'a))
+                                   (sleep-ms 400))
+                       cfg)))
+            (sleep-ms 100)
+            (spawn (lambda ()
+                     (sql-call-with-connection pool
+                       (lambda (c) (set-box! b c) (send me (vector 'got 'b))
+                                   (sleep-ms 50))
+                       cfg)))
+            (receive (after 2000 (void)) (`#(got ,x) x))
+            (sleep-ms 250)
+            (display "  [info] two concurrent checkouts got ")
+            (display (if (and (unbox a) (unbox b) (eq? (unbox a) (unbox b)))
+                         "the SAME connection" "different or one connection"))
+            (newline)
+            (check "one connection is never leased to two borrowers at once"
+              (not (and (unbox a) (unbox b) (eq? (unbox a) (unbox b))))))))
+      (send pool (vector 'db-quit)))
+
     (sleep-ms 100)
     (if (zero? failures)
         (begin (display "sqlpool-lifecycle: all tests passed\n") (exit 0))
