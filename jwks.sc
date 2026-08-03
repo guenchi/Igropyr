@@ -28,7 +28,7 @@
 ;;; Not implemented: ES256/EdDSA, encrypted PEM keys, JWKS x5c chains.
 
 (library (igropyr jwks)
-  (export jwks-load-key jwks-key-id jwks-document
+  (export jwks-load-key jwks-key-id jwks-key-free! jwks-document
           jwks-sign jwks-verify
           jwks-fetch! jwks-cache-clear!)
   (import (chezscheme) (igropyr checked) (igropyr util)
@@ -89,7 +89,7 @@
   ;; ---- key loading -------------------------------------------------------
 
   (define-record-type (jwks-key mk-jwks-key jwks-key?)
-    (fields pkey n-b64 e-b64 kid))
+    (fields (mutable pkey) n-b64 e-b64 kid))
 
   ;; kid = the first 16 hex characters of sha256(modulus). Deriving it from
   ;; the key rather than assigning one keeps it stable across restarts and
@@ -120,6 +120,32 @@
 
   (define-checked (jwks-key-id (k jwks-key?)) (jwks-key-kid k))
 
+  ;; The EVP_PKEY behind a loaded key is a native allocation that the record
+  ;; owns; nothing in Scheme collects it. A key loaded once at boot and held
+  ;; for the life of the process needs no call here -- that is ownership, not
+  ;; a leak. ROTATION is the case that needs it: every reload used to add a
+  ;; whole RSA private key to the native heap and keep it there.
+  ;;
+  ;; The caller must be finished with the key. OpenSSL will not tell us that,
+  ;; so this is the C ownership contract, unchanged: freeing a key another
+  ;; process is signing with is a use-after-free. Retire the key from wherever
+  ;; verifiers reach it first, then free it.
+  ;;
+  ;; Idempotent, and a freed key fails cleanly rather than handing a NULL to
+  ;; OpenSSL -- a double free of an EVP_PKEY corrupts the allocator, which is
+  ;; a far worse failure than the leak this replaces.
+  (define-checked (jwks-key-free! (k jwks-key?))
+    (let ((pk (jwks-key-pkey k)))
+      (unless (zero? pk)
+        (jwks-key-pkey-set! k 0)
+        (EVP_PKEY_free pk))
+      (void)))
+
+  (define (key-pkey/live k what)
+    (let ((pk (jwks-key-pkey k)))
+      (when (zero? pk) (jwks-fail (string-append what ": key already freed")))
+      pk))
+
   ;; The document to serve at /.well-known/jwks.json. Compute once and cache
   ;; it in the application: it only changes when the key does.
   (define-checked (jwks-document (k jwks-key?))
@@ -136,7 +162,7 @@
     (let ((ctx (EVP_MD_CTX_new)))
       (when (zero? ctx) (jwks-fail "EVP_MD_CTX_new failed"))
       (guard (e (#t (EVP_MD_CTX_free ctx) (raise e)))
-        (unless (fx= 1 (EVP_DigestSignInit ctx 0 (EVP_sha256) 0 (jwks-key-pkey k)))
+        (unless (fx= 1 (EVP_DigestSignInit ctx 0 (EVP_sha256) 0 (key-pkey/live k "sign")))
           (jwks-fail "EVP_DigestSignInit failed"))
         (unless (fx= 1 (EVP_DigestUpdate ctx input (bytevector-length input)))
           (jwks-fail "EVP_DigestUpdate failed"))

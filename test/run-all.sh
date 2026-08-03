@@ -66,6 +66,8 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/serving-hardening.sc
 # cookie attribute injection, HTTP/1.0 framing, slowloris deadline
 "$scheme_bin" --script igropyr/test/protocol-hardening.sc
+# a newline in the string handed to sse-send! must not become an SSE FIELD
+"$scheme_bin" --script igropyr/test/sse-framing.sc
 "$scheme_bin" --script igropyr/test/http-client-stream.sc
 "$scheme_bin" --script igropyr/test/ws-client-handshake.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
