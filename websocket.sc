@@ -381,13 +381,20 @@
                      ;; echoed; replying with an empty close made every
                      ;; clean shutdown look like "no status received".
                      (let ((n (bytevector-length payload)))
-                       (if (fx= n 0)
-                           (ws-close! w)
-                           (let ((code (fx+ (fxsll (bytevector-u8-ref payload 0) 8)
-                                            (bytevector-u8-ref payload 1))))
-                             (if (valid-close-code? code)
-                                 (ws-fail! w code)          ; echo it back
-                                 (ws-fail! w 1002)))))
+                       (cond
+                         ((fx= n 0) (ws-close! w))
+                         ;; A close payload is empty or AT LEAST two bytes
+                         ;; (RFC 6455 5.5.1); one byte is a protocol error,
+                         ;; and reading the code from it indexed past the
+                         ;; end of the bytevector -- an out-of-bounds read
+                         ;; driven straight from the wire.
+                         ((fx= n 1) (ws-fail! w 1002))
+                         (else
+                          (let ((code (fx+ (fxsll (bytevector-u8-ref payload 0) 8)
+                                           (bytevector-u8-ref payload 1))))
+                            (if (valid-close-code? code)
+                                (ws-fail! w code)           ; echo it back
+                                (ws-fail! w 1002))))))
                      (vector 'close))
                     ((0)                                    ; continuation frame
                      (cond

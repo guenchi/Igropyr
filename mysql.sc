@@ -169,8 +169,21 @@
 
   ;; ---- MySQL packet framing -----------------------------------------------------
 
+  ;; The length field is 24 bits. A payload of 0xFFFFFF or more needs the
+  ;; protocol's continuation split (0xFFFFFF-byte packets, a short one last),
+  ;; which this client does not implement -- and the receive side does not
+  ;; reassemble them either, so adding it here alone would not help.
+  ;;
+  ;; What it must NOT do is what it did: write the low 24 bits and send the
+  ;; whole payload anyway. The server then reads the wrong length, and every
+  ;; byte after it is misinterpreted as the next packet -- the connection is
+  ;; desynchronised rather than failed, which is far worse than a refusal.
+  (define max-packet-payload #xFFFFFF)
+
   (define (frame-packet payload seq)
     (let ((n (bytevector-length payload)))
+      (when (>= n max-packet-payload)
+        (mysql-fail -1 "packet payload exceeds the 16 MiB protocol limit"))
       (bv-append
         (bytevector (fxand n #xFF)
                     (fxand (fxsrl n 8) #xFF)
