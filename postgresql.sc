@@ -692,6 +692,11 @@
   ;; it already did (so the pool's DOWN handler does not send a second,
   ;; forever-unmatched reply), closes, and exits -- the pool's monitor
   ;; then rebuilds it.
+  ;; What an idle connection may hold before it is considered wedged. It is
+  ;; only ever reached by data nothing will consume -- notifications after a
+  ;; LISTEN, or a server talking out of turn.
+  (define max-idle-buffer 262144)
+
   (define (serve-loop c buf notify)
     (receive
       (`#(db-query ,q ,ref ,from)
@@ -725,7 +730,17 @@
         ;; a codec raise here (corrupted TLS record while idle) must still
         ;; free the session and the fd; the exit's DOWN makes a pool
         ;; rebuild the connection
-        (if (guard (e (#t #f)) (inbuf-append! buf (tx-decode c bv)) #t)
+        ;;
+        ;; And the buffer is BOUNDED here. An idle connection accumulates
+        ;; whatever the server sends without parsing it, and after a LISTEN
+        ;; that is a legitimate, unbounded stream: every NOTIFY from any
+        ;; other session arrives as a NotificationResponse nobody consumes.
+        ;; max-message-len does not apply -- it bounds one message, and
+        ;; these are individually small and endless. There is no delivery
+        ;; API for them yet, so the honest answer is to refuse rather than
+        ;; grow: the connection is dropped and the pool rebuilds it.
+        (if (and (guard (e (#t #f)) (inbuf-append! buf (tx-decode c bv)) #t)
+                 (<= (inbuf-length buf) max-idle-buffer))
             (serve-loop c buf notify)
             (tx-close! c)))
       (`#(tcp-eof) (tx-close! c))
