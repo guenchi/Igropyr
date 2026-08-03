@@ -100,22 +100,34 @@
            (amt (or (string->number (utf8->string (req-body req))) 0))
            (ttl (let ((p (assoc "ttl" q))) (if p (string->number (cdr p)) 300000)))
            (crash? (assoc "crash" q)))
-      (let-values (((id reply)
+      (let-values (((id token reply)
                     (conversation-start! (transfer-flow amt (and crash? #t))
                                          req ttl)))
-        (send-json! res (cons (cons 'conv id) reply))))))
+        (send-json! res (cons (cons 'conv id)
+                              (cons (cons 'token token) reply)))))))
 
 (app-post app "/t/:id"
   (lambda (req res)
-    (let ((r (conversation-resume! (req-param req "id") req)))
-      (if (conversation-gone? r)
-          (begin (set-status! res 410)
-                 (send-json! res (list (cons 'fault "gone"))))
-          (send-json! res r)))))
+    (let ((token (string->number
+                   (or (cond ((assoc "token" (req-query req)) => cdr) (else "")) ""))))
+      (let-values (((r next) (conversation-resume! (req-param req "id") token req)))
+        (cond
+          ((conversation-gone? r)
+           (set-status! res 410)
+           (send-json! res (list (cons 'fault "gone"))))
+          ((conversation-stale? r)
+           (set-status! res 409)
+           (send-json! res (list (cons 'fault "stale"))))
+          (next (send-json! res (cons (cons 'token next) r)))
+          (else (send-json! res r)))))))
 
 (app-get app "/balance"
   (lambda (req res)
     (send-json! res (list (cons 'balance (unbox account))))))
+
+;; the URL a client builds from what the previous reply handed it
+(define (step-url id token)
+  (string-append "/t/" id "?token=" (number->string token)))
 
 ;; ---- the dialogue -------------------------------------------------------------
 
@@ -126,26 +138,28 @@
 
     ;; full dialogue: hold, confirm, committed
     (let* ((r1 (json-of (post "/t" "100")))
-           (id (json-ref r1 "conv")))
+           (id (json-ref r1 "conv"))
+           (tok (json-ref r1 "token")))
       (expect "start holds" (json-ref (json-of (get "/balance")) "balance") 900)
-      (let ((r2 (json-of (post (string-append "/t/" id) "confirm"))))
+      (let ((r2 (json-of (post (step-url id tok) "confirm"))))
         (expect "confirm commits" (json-ref r2 "done") #t))
       (expect "balance after commit"
         (json-ref (json-of (get "/balance")) "balance") 900)
       ;; the conversation is over: a further resume is gone
-      (let ((r3 (post (string-append "/t/" id) "confirm")))
+      (let ((r3 (post (step-url id tok) "confirm")))
         (unless (string-contains? r3 "HTTP/1.1 410 ") (fail "resume after end" r3))
         (display "resume after end ok\n")))
 
     ;; cancel path rolls the hold back
     (let* ((r1 (json-of (post "/t" "100")))
-           (id (json-ref r1 "conv")))
-      (post (string-append "/t/" id) "cancel")
+           (id (json-ref r1 "conv"))
+           (tok (json-ref r1 "token")))
+      (post (step-url id tok) "cancel")
       (expect "cancel rolls back"
         (json-ref (json-of (get "/balance")) "balance") 900))
 
     ;; unknown id
-    (let ((r (post "/t/deadbeef" "confirm")))
+    (let ((r (post "/t/deadbeef?token=1" "confirm")))
       (unless (string-contains? r "HTTP/1.1 410 ") (fail "unknown id" r))
       (display "unknown id ok\n"))
 
@@ -156,18 +170,57 @@
       (sleep-ms 900)
       (expect "expiry rolls back"
         (json-ref (json-of (get "/balance")) "balance") 900)
-      (let ((r (post (string-append "/t/" id) "confirm")))
+      (let ((r (post (step-url id (json-ref r1 "token")) "confirm")))
         (unless (string-contains? r "HTTP/1.1 410 ") (fail "resume after expiry" r))
         (display "resume after expiry ok\n")))
 
     ;; crash inside a step: resume answers gone, hold rolled back
     (let* ((r1 (json-of (post "/t?crash=1" "100")))
            (id (json-ref r1 "conv")))
-      (let ((r (post (string-append "/t/" id) "confirm")))
+      (let ((r (post (step-url id (json-ref r1 "token")) "confirm")))
         (unless (string-contains? r "HTTP/1.1 410 ") (fail "crash in step" r))
         (display "crash in step ok\n"))
       (expect "crash rolls back"
         (json-ref (json-of (get "/balance")) "balance") 900))
+
+    ;; A REPEATED confirm -- the same request sent twice, which is what a
+    ;; double click or a client retry is -- must be refused, and must not
+    ;; move the money a second time. This is the case the whole token exists
+    ;; for: it is refused whether it arrives during the step or long after.
+    ;;
+    ;; Placed last, because a committed transfer changes the running balance
+    ;; every later assertion is written against.
+    (let* ((r1 (json-of (post "/t" "100")))
+           (id (json-ref r1 "conv"))
+           (tok (json-ref r1 "token")))
+      (let ((first (json-of (post (step-url id tok) "confirm"))))
+        (expect "the first confirm commits" (json-ref first "done") #t))
+      (let ((again (post (step-url id tok) "confirm")))
+        (unless (or (string-contains? again "HTTP/1.1 409 ")
+                    (string-contains? again "HTTP/1.1 410 "))
+          (fail "a repeated confirm was accepted" again))
+        (display "a repeated confirm is refused ok\n"))
+      ;; 900 was the balance before this transfer; one commit of 100 leaves
+      ;; 800, and a second would have left 700
+      (expect "and the balance moved once"
+        (json-ref (json-of (get "/balance")) "balance") 800))
+
+    ;; a resume with no token at all, or a made-up one, is refused
+    (let* ((r1 (json-of (post "/t" "100")))
+           (id (json-ref r1 "conv"))
+           (tok (json-ref r1 "token")))
+      (let ((no-token (post (string-append "/t/" id) "confirm")))
+        (unless (string-contains? no-token "HTTP/1.1 409 ")
+          (fail "a resume with no token was accepted" no-token)))
+      (let ((wrong (post (step-url id (+ tok 7)) "confirm")))
+        (unless (string-contains? wrong "HTTP/1.1 409 ")
+          (fail "a resume with a made-up token was accepted" wrong)))
+      (display "a missing or invented token is refused ok\n")
+      ;; the conversation is untouched and still finishes properly
+      (let ((r2 (json-of (post (step-url id tok) "cancel"))))
+        (expect "the real token still works" (json-ref r2 "done") #f))
+      (expect "and the cancel restored the hold"
+        (json-ref (json-of (get "/balance")) "balance") 800))
 
     ;; Two concurrent resumes must not become two consecutive steps. A double
 ;; click, a client retry or two front ends all produce this: both requests
@@ -175,7 +228,7 @@
 ;; used to be picked up by the NEXT one -- advancing the flow with a request
 ;; whose caller never saw the reply in between. That is a confirmation step
 ;; skipped, or one stage's payload applied to the next.
-(let-values (((id first)
+(let-values (((id token first)
               (conversation-start!
                 (lambda (req suspend!)
                   ;; Three stages, so the conversation is still ALIVE and
@@ -188,15 +241,22 @@
                       (vector 'final a b))))
                 'go)))
   (let ((me self))
-    (spawn (lambda () (send me (vector 'r1 (conversation-resume! id 'A)))))
+    ;; BOTH carry the same token, which is what a double click really is:
+    ;; two requests written against the same reply. The first consumes it;
+    ;; the second is refused however it is scheduled.
+    (spawn (lambda ()
+             (let-values (((r n) (conversation-resume! id token 'A)))
+               (send me (vector 'r1 r)))))
     (sleep-ms 20)
-    (spawn (lambda () (send me (vector 'r2 (conversation-resume! id 'B)))))
+    (spawn (lambda ()
+             (let-values (((r n) (conversation-resume! id token 'B)))
+               (send me (vector 'r2 r)))))
     (let loop ((got '()) (n 0))
       (if (= n 2)
-          (let ((busy (filter (lambda (x) (eq? (cdr x) 'busy)) got)))
-            (unless (= 1 (length busy))
-              (fail "concurrent-resume: expected exactly one busy" got))
-            (display "concurrent resume -> one busy ok\n"))
+          (let ((stale (filter (lambda (x) (eq? (cdr x) 'stale)) got)))
+            (unless (= 1 (length stale))
+              (fail "concurrent-resume: expected exactly one stale" got))
+            (display "concurrent resume -> one stale ok\n"))
           (receive (after 4000 (fail "concurrent-resume timeout" got))
             (`#(r1 ,v) (loop (cons (cons 'r1 v) got) (+ n 1)))
             (`#(r2 ,v) (loop (cons (cons 'r2 v) got) (+ n 1))))))))
@@ -207,7 +267,7 @@
 ;; conversation could hold its transaction or reservation indefinitely. The
 ;; pool's stuck-killer does not cover it; that reaps the worker waiting for
 ;; the reply, while the conversation is its own process.
-(let-values (((id first)
+(let-values (((id tok first)
               (conversation-start!
                 (lambda (req suspend!)
                   (let ((a (suspend! (vector 'parked req))))
@@ -216,7 +276,9 @@
                 'go
                 300)))                       ; TTL 300 ms
   (let ((me self))
-    (spawn (lambda () (send me (vector 'slow (conversation-resume! id 'X)))))
+    (spawn (lambda ()
+             (let-values (((r n) (conversation-resume! id tok 'X)))
+               (send me (vector 'slow r)))))
     ;; the step overruns, so the watchdog must end the conversation rather
     ;; than let it run to completion
     (receive (after 6000 (fail "runaway-step" 'no-answer))
@@ -237,7 +299,7 @@
 ;; the resume cannot simply be delayed. The second step parks before a
 ;; sample (moving the counter again) and the third resumes just after one --
 ;; and is then killed at the next, having run a fraction of its allowance.
-(let-values (((id2 first2)
+(let-values (((id2 tok2 first2)
               (conversation-start!
                 (lambda (req suspend!)
                   (let ((a (suspend! (vector 'parked req))))
@@ -249,9 +311,13 @@
                 1000)))
   (let ((me self))
     (sleep-ms 800)                            ; still parked, still alive
-    (conversation-resume! id2 'X)             ; step 2 runs 100 ms, parks again
-    (sleep-ms 900)                            ; just past a sampling point
-    (spawn (lambda () (send me (vector 'phase (conversation-resume! id2 'Y)))))
+    ;; each resume answers the reply it was handed, so the token comes from
+    ;; the previous round rather than being guessed
+    (let-values (((r2 tok3) (conversation-resume! id2 tok2 'X)))
+      (sleep-ms 900)                          ; just past a sampling point
+      (spawn (lambda ()
+               (let-values (((r n) (conversation-resume! id2 tok3 'Y)))
+                 (send me (vector 'phase r))))))
     (receive (after 8000 (fail "phase-step" 'no-answer))
       (`#(phase ,v)
         (if (and (vector? v) (eq? (vector-ref v 0) 'finished))

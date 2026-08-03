@@ -186,7 +186,7 @@
       (if (or (<= amt 0) (> amt (unbox account)))
           (begin (set-status! res 400)
                  (send-json! res (list (cons 'error "bad amount"))))
-          (let-values (((id reply)
+          (let-values (((id token reply)
                         (conversation-start!
                           (lambda (req suspend!)
                             (set-box! account (- (unbox account) amt))  ; hold
@@ -203,16 +203,35 @@
                                             (cons 'cancelled #t)))))))
                           req
                           15000)))                                      ; demo TTL 15s
-            (send-json! res (cons (cons 'conv id) reply)))))))
+            ;; The token goes to the client and must come back with the
+            ;; next request. It says WHICH reply is being answered, which is
+            ;; what stops a double click or a retried request from advancing
+            ;; the flow past a reply nobody read -- here, confirming a
+            ;; transfer the user never saw the amount for.
+            (send-json! res (cons (cons 'conv id)
+                                  (cons (cons 'token token) reply))))))))
 
+;; The token comes back as ?token=N. A request without it, or with an old
+;; one, is refused: it was written against a reply that is no longer the
+;; one being answered.
 (app-post app "/transfer/:id"
   (lambda (req res)
-    (let ((r (conversation-resume! (req-param req "id") req)))
-      (if (conversation-gone? r)
-          (begin (set-status! res 410)
-                 (send-json! res (list (cons 'fault "gone")
-                                       (cons 'rolled-back #t))))
-          (send-json! res r)))))
+    (let ((token (string->number
+                   (or (cond ((assoc "token" (req-query req)) => cdr) (else "")) ""))))
+      (let-values (((r next) (conversation-resume! (req-param req "id") token req)))
+        (cond
+          ((conversation-gone? r)
+           (set-status! res 410)
+           (send-json! res (list (cons 'fault "gone") (cons 'rolled-back #t))))
+          ;; 409: this request was NOT applied and will not be. It says
+          ;; nothing about whether the request it duplicates succeeded --
+          ;; read the current state rather than resubmitting.
+          ((conversation-stale? r)
+           (set-status! res 409)
+           (send-json! res (list (cons 'fault "stale")
+                                 (cons 'applied #f))))
+          (next (send-json! res (cons (cons 'token next) r)))
+          (else (send-json! res r)))))))
 
 (app-get app "/transfer-balance"
   (lambda (req res)

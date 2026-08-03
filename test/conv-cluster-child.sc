@@ -37,8 +37,11 @@
                       (vector 'final sum)
                       (loop (+ sum r) (suspend! (vector 'ack (+ sum r)))))))
               0))
-          (lambda (id first-reply)
-            (rsend 'a 'main (vector 'conv-id id first-reply))))))
+          ;; the token crosses the link with the id: a resume from another
+          ;; node has to name the reply it is answering, exactly as a local
+          ;; one does
+          (lambda (id token first-reply)
+            (rsend 'a 'main (vector 'conv-id id token first-reply))))))
 
     (let loop ()
       (receive
