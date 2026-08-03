@@ -8,7 +8,7 @@
 ;;;   - forwarded resume round-trips (ack sums accumulate correctly)
 ;;;   - the final reply crosses back
 ;;;   - resuming a completed conversation returns 'gone
-;;;   - resuming an id whose owner node is unknown returns 'gone at once
+;;;   - resuming an id whose owner node is unknown returns 'unreachable
 
 (import (chezscheme) (igropyr actor) (igropyr node) (igropyr conversation))
 
@@ -32,10 +32,14 @@
     (register 'main self)
     (monitor-node 'b)
 
-    ;; an id whose owner node we never heard of -> 'gone immediately
-    (unless (eq? 'gone (conversation-resume! "nowhere~deadbeef" 1))
-      (fail! "unknown-owner-not-gone"))
-    (display "resume to unknown owner -> gone ok\n")
+    ;; An id whose owner node we never heard of answers 'unreachable, not
+    ;; 'gone. We have no evidence about a node we cannot contact, and 'gone
+    ;; is a GUARANTEE that the transaction rolled back -- claiming it here
+    ;; would invite a retry that duplicates a flow still running elsewhere.
+    (unless (eq? 'unreachable (conversation-resume! "nowhere~deadbeef" 1))
+      (fail! "unknown-owner-should-be-unreachable"
+             (conversation-resume! "nowhere~deadbeef" 1)))
+    (display "resume to unknown owner -> unreachable ok\n")
 
     (spawn-child!)
     (receive (after 10000 (fail! "node-up-timeout")) (`#(node-up b) 'ok))

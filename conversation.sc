@@ -28,7 +28,7 @@
 ;;;               final-reply))))
 ;;;       req))
 ;;;
-;;;   (conversation-resume! id req)   ; -> reply, or 'gone
+;;;   (conversation-resume! id req)   ; -> reply, 'gone, or 'unreachable
 ;;;
 ;;; Fault semantics (the transaction-ring contract):
 ;;;   - flow crashes, TTL expires, or the process dies for any reason
@@ -36,6 +36,14 @@
 ;;;     returns 'gone. For a flow holding a database transaction, dead
 ;;;     process = dropped connection = the database itself rolled back:
 ;;;     'gone GUARANTEES the transaction did not commit.
+;;;   - 'unreachable is NOT that guarantee. A resume forwarded to another
+;;;     node answers it when the link went down or the forwarding wait
+;;;     expired: both prove that WE could not reach the owner, neither
+;;;     proves the owner died. Under a partition the conversation keeps
+;;;     running and may still commit. Treating it as 'gone and retrying is
+;;;     how a flow's effects get applied twice -- exactly what the ring
+;;;     exists to prevent. Retry only on 'gone; on 'unreachable the
+;;;     outcome is unknown, so reconcile rather than resubmit.
 ;;;   - TTL expiry raises 'conversation-expired inside the flow, so a
 ;;;     guard can roll back explicitly; re-raise (or don't catch) so the
 ;;;     process exits.
@@ -50,9 +58,9 @@
 ;;; reaches the right one: a resume that lands elsewhere (round-robin LB,
 ;;; a reconnect landing on a different node) is forwarded to the owner
 ;;; over the node mesh, concurrently -- one process per forwarded resume,
-;;; never a serial router. The owner node being gone (link down, crash)
-;;; yields 'gone, and that is honest: the process died, so its
-;;; transaction rolled back. Forwarded req and reply cross a link, so
+;;; never a serial router. A forward that cannot reach the owner node
+;;; yields 'unreachable, not 'gone: a broken link says nothing about
+;;; whether the process behind it died. Forwarded req and reply cross a link, so
 ;;; they must be extended-wire-safe (as with rsend / rcall). With one
 ;;; node (node-start! never called) the id has no prefix and every
 ;;; resume stays local -- no dependency on the distribution layer at
@@ -151,9 +159,20 @@
         (unless (whereis conv-router-name)
           (register conv-router-name (spawn conv-router-loop))))))
 
-  ;; Forward a resume to the owner node and wait for its reply. Owner
-  ;; link down (monitor-node) or timeout both mean 'gone -- honest,
-  ;; because a dead owner process rolled its transaction back.
+  ;; Forward a resume to the owner node and wait for its reply.
+  ;;
+  ;; Every failure here answers 'unreachable, NOT 'gone. A link that is
+  ;; down and a wait that expired both say the same thing -- we could not
+  ;; reach the owner -- and neither says the owner died. Under a partition
+  ;; the conversation is still running and can still commit, so calling that
+  ;; 'gone would hand the caller a rollback guarantee this layer cannot
+  ;; make, and a caller that retries on it duplicates the flow's effects.
+  ;;
+  ;; Only local-resume can answer 'gone, and only because it asks the
+  ;; registry ON THE OWNER'S OWN NODE: no entry there means the process
+  ;; really is gone, which for a flow holding a transaction means the
+  ;; connection dropped and the database rolled back. That is a fact about
+  ;; a process, not about a network.
   (define (forward-resume owner id req)
     (let ((reply-name (fresh-reply-name!))
           (ref (fresh-ref!)))
@@ -162,24 +181,25 @@
       (dynamic-wind
         (lambda () (void))
         (lambda ()
-          ;; rsend is #f when the owner link is already down -> 'gone at
-          ;; once (its process died, so its transaction rolled back);
-          ;; otherwise wait, and node-down mid-flight is the same 'gone.
+          ;; rsend is #f when the link is already down. That, a node-down
+          ;; mid-flight, and the forwarding TTL are all the same statement:
+          ;; unreachable. The owner may be dead, or may be committing right
+          ;; now -- from here they are indistinguishable.
           (if (rsend owner conv-router-name
                      (vector 'conv-resume (node-self) reply-name ref id req))
-              (receive (after conv-forward-ttl-ms 'gone)
+              (receive (after conv-forward-ttl-ms 'unreachable)
                 (`#(conv-forward-reply ,@ref ,reply) reply)
-                (`#(node-down ,@owner) 'gone))
-              'gone))
+                (`#(node-down ,@owner) 'unreachable))
+              'unreachable))
         (lambda ()
           (demonitor-node owner)
           ;; demonitor-node does not retract a #(node-down ...) already
           ;; delivered. Left behind, a LATER forward to the same owner --
           ;; after it rebooted -- would match that stale message at once
-          ;; and answer 'gone, which the contract says GUARANTEES no
-          ;; commit. The conversation would in fact be alive and holding
-          ;; an open transaction, so the client's retry would duplicate
-          ;; the flow's effects. Drain it.
+          ;; and answer 'unreachable at once for an owner that is in fact
+          ;; up -- turning a healthy forward into a false failure. Drain it.
+          ;; (This used to answer 'gone, which was worse: the caller was
+          ;; told the transaction had certainly rolled back.)
           (receive (after 0 'ok) (`#(node-down ,@owner) 'ok))
           (unregister reply-name)))))
 
