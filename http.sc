@@ -995,14 +995,41 @@
               ;; close-delimited: the close IS the end of the body, so
               ;; there is no terminator and the connection cannot be reused
               (begin (tcp-close! c) (send owner (vector 'conn-closed)))
-              (let ((ka (res-keep-alive? r)))
+              ;; The terminator gets the same deadline as every other write.
+              ;; It used to be fire-and-forget, which meant a peer that
+              ;; stopped reading exactly here never triggered the callback --
+              ;; so neither next-request nor conn-closed was ever sent, and
+              ;; the reader stayed in await-streaming, which has no deadline
+              ;; of its own. That path is the one abort-response! cannot
+              ;; cover: the handler did not crash, it FINISHED, so nothing
+              ;; was ever going to abort on its behalf. The connection, its
+              ;; write block and the reader process all stayed put.
+              (let* ((ka (res-keep-alive? r))
+                     (b (box 'pending))
+                     (me self)
+                     (finish!
+                       (lambda (st)
+                         (if (and ka (>= st 0))
+                             (send owner (vector 'next-request))
+                             (begin
+                               (tcp-close! c)
+                               (send owner (vector 'conn-closed)))))))
                 (tcp-write! c chunk-terminator
                   (lambda (st)
-                    (if (and ka (>= st 0))
-                        (send owner (vector 'next-request))
-                        (begin
-                          (tcp-close! c)
-                          (send owner (vector 'conn-closed)))))))))))) 
+                    (case (unbox b)
+                      ((pending) (set-box! b st))
+                      ((abandoned) (void))   ; see res-write!
+                      (else (send me (vector 'chunk-written st))))))
+                (let ((st (unbox b)))
+                  (if (eq? st 'pending)
+                      (begin
+                        (set-box! b 'parked)
+                        (let ((st2 (receive (after (write-wait-ms)
+                                               (abandon-write! b c)
+                                               -1)
+                                     (`#(chunk-written ,v) v))))
+                          (finish! st2)))
+                      (finish! st))))))))) 
 
   ;; ---- fixed-length streaming (large files) --------------------------------
 
