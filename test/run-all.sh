@@ -62,6 +62,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # ...and that wait must be bounded: a detached stream is not a pool
 # worker, so stuck-ms never covered the peer that stops reading
 "$scheme_bin" --script igropyr/test/stream-write-timeout.sc
+# five ways a stream can be abandoned (a raise after res-begin!, a producer
+# that crashes / forgets res-end! / is killed, a timed-out write): each must
+# end the request, or the reader waits in await-streaming forever
+"$scheme_bin" --script igropyr/test/stream-abandoned.sc
 # static/send-file! hardening (dotfiles, NUL, root) and HEAD framing
 "$scheme_bin" --script igropyr/test/serving-hardening.sc
 # cookie attribute injection, HTTP/1.0 framing, slowloris deadline

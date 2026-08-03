@@ -42,6 +42,7 @@
           res-begin-file! res-write-file! res-write-chunk! res-abort-file!
           res-conn res-req res-status res-headers res-keep-alive?
           res-head-request? res-send-head! res-answered?
+          res-streaming? res-abort! res-spawn!
           send-response! parse-query
           ;; Re-exported app-facing (igropyr actor) surface, so a core
           ;; application imports this library alone. Advanced primitives
@@ -859,7 +860,10 @@
   ;; chunks. Marks the request as responded (the supervisor fallback
   ;; stays away) and tells the reader to wait for the stream to finish.
   ;; A long stream should be detached from the pool worker:
-  ;;   (res-begin! r) (spawn (lambda () ... (res-write! r x) ... (res-end! r)))
+  ;;   (res-begin! r) (res-spawn! r (lambda () ... (res-write! r x) ... (res-end! r)))
+  ;; res-spawn! rather than a plain spawn: nothing else notices a detached
+  ;; producer that dies or returns without res-end!, and the reader waits
+  ;; for the stream with no deadline.
   (define chunked-keep-alive-tail
     "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n")
   (define chunked-close-tail
@@ -952,7 +956,17 @@
     (receive (after 0 'ok)
       (`#(chunk-written ,_) 'ok)
       (`#(file-written ,_) 'ok))
-    (tcp-close! c))
+    ;; Closing the handle is not enough to end the request. The reader is
+    ;; parked in await-streaming, which has NO deadline -- it waits for the
+    ;; response to finish or for the connection to say it is over. A local
+    ;; close produces no tcp-eof for us, so nothing woke it: the fd went
+    ;; away and the reader process and its buffer stayed, one per timed-out
+    ;; write, for the life of the server.
+    ;;
+    ;; abort-response! is the same signal for the same reason (a crash mid
+    ;; stream); a write that timed out is another way for a stream to end
+    ;; without its terminator.
+    (abort-response! c))
 
   (define (res-write! r data)
     (let ((bv (if (string? data) (string->utf8 data) data))
@@ -1215,6 +1229,57 @@
   ;; Content-Length, is exactly how HTTP says "this response is truncated",
   ;; and both framings the client accepts detect it by construction. The
   ;; reader is told so it can stop waiting.
+  ;; This response has begun a streamed body and has not finished it. That
+  ;; is the state where "already answered" is true but the request is NOT
+  ;; over: the status line went out, the terminator did not, and the reader
+  ;; is parked in await-streaming with no deadline.
+  (define (res-streaming? r)
+    (and (memq (res-mode r) '(streaming streaming-raw)) #t))
+
+  ;; End a streamed response that cannot be completed.
+  ;;
+  ;; There is no way to say "never mind" once the status line is out, so the
+  ;; only honest signal is to close: a chunked body without its terminating
+  ;; chunk, or a fixed-length one short of its Content-Length, is exactly how
+  ;; HTTP says the response was truncated, and the client detects it by
+  ;; construction. Sending nothing at all, which is what happened before,
+  ;; leaves the client waiting for a body that will never arrive.
+  (define (res-abort! r)
+    (abort-response! (res-conn r)))
+
+  ;; Detach a stream into its own process, the way res-begin!'s docstring
+  ;; recommends -- and clean up if it does not finish.
+  ;;
+  ;; A plain (spawn producer) is not linked to anything. The connection's
+  ;; owner is still the reader, so uv-owner-died! does not fire when the
+  ;; producer dies, the pool's abort path is not involved (the producer is
+  ;; not a pool worker), and the reader stays parked in await-streaming with
+  ;; no deadline. A producer that crashed after one chunk, or simply
+  ;; returned without calling res-end!, therefore left the client waiting on
+  ;; a truncated response for as long as it cared to wait, and left a green
+  ;; process and its buffer behind on the server. The framework recommended
+  ;; that shape, so the framework should make it safe.
+  ;;
+  ;; The watcher monitors rather than guards inside the producer, because a
+  ;; producer that is KILLED -- which is what a supervisor does to a stuck
+  ;; one -- discards its winders and would run no guard. Monitoring an
+  ;; already-dead pid delivers DOWN at once, so the narrow window between
+  ;; spawn and monitor is covered too.
+  ;;
+  ;; Only a stream still open is aborted: a producer that ended the response
+  ;; and then failed has already framed it correctly, and truncating a
+  ;; completed response would corrupt the next one on a kept-alive
+  ;; connection.
+  (define (res-spawn! r thunk)
+    (let ((p (spawn thunk)))
+      (spawn
+        (lambda ()
+          (monitor p)
+          (receive
+            (`#(DOWN ,@p ,reason)
+              (when (res-streaming? r) (res-abort! r))))))
+      p))
+
   (define (abort-response! c)
     (tcp-close! c)
     (let ((owner (conn-owner c)))

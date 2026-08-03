@@ -19,7 +19,7 @@
   (export spawn spawn&link send receive self
           link monitor demonitor process-trap-exit kill
           register unregister whereis
-          sleep-ms process-alive? process-id
+          sleep-ms process-alive? process-id process-count
           start-scheduler)
   (import (chezscheme) (igropyr libuv))
 
@@ -128,6 +128,14 @@
   ;; Roots every live pcb: a process parked in receive with no timeout
   ;; sits in no queue and would otherwise be collectable.
   (define process-table (make-eqv-hashtable))
+
+  ;; How many green processes are alive right now.
+  ;;
+  ;; A leaked process is invisible by nature: it is parked in a receive, so
+  ;; it burns nothing and shows up in no counter -- it only accumulates.
+  ;; Several of the leaks found in this system were of exactly that shape,
+  ;; and none of them could be asserted on from outside without this.
+  (define (process-count) (hashtable-size process-table))
   (define pid-counter 0)
   (define event-loop-pid #f)
 

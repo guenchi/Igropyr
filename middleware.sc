@@ -190,6 +190,19 @@
   ;; Let It Crash for the wrapped handlers -- a caught error answers a
   ;; structured 500 (or your 'handler), with no supervisor retry. If the
   ;; handler already responded, the fallback is dropped (token guard).
+  ;;
+  ;; A handler that raised AFTER res-begin! is a third case, and dropping
+  ;; the fallback was wrong for it. The status line is already out, so the
+  ;; 500 vanishes on the token guard -- but the response is not finished
+  ;; either: its terminator will never be written, and the reader is parked
+  ;; in await-streaming with no deadline. Because nothing crashed (this
+  ;; middleware caught it), the pool's abort path never ran either, so the
+  ;; connection stayed open, the fd allocated and the reader alive. A client
+  ;; could accumulate those on demand by hitting such a handler.
+  ;;
+  ;; Truncating is the only signal left, and it is the correct one: a
+  ;; chunked body without its terminating chunk is how HTTP says a response
+  ;; was cut short.
   (define (default-error-response e req res)
     (set-status! res 500)
     (send-json! res (list (cons 'error "internal server error"))))
@@ -198,7 +211,9 @@
     (let ((handle (opt (if (pair? rest) (car rest) '())
                        'handler default-error-response)))
       (lambda (req res next)
-        (guard (e (#t (handle e req res)))
+        (guard (e (#t (if (res-streaming? res)
+                          (res-abort! res)
+                          (handle e req res))))
           (next)))))
 
 )
