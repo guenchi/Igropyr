@@ -433,6 +433,16 @@
       (cond
         ;; a peer may not spend us without bound on trailers either
         ((fx> lines 64) 'bad)
+        ;; A TOTAL bound, not only a per-line one. This scan restarts from
+        ;; `start` every time a fragment arrives -- the resumable state
+        ;; carries the position of the last-chunk line, not a cursor inside
+        ;; the trailer -- so the work is quadratic in the number of
+        ;; fragments. With 64 lines of 4096 that was a 256 KiB section
+        ;; rescanned per byte: about 34 billion comparisons, tens of
+        ;; seconds, on the one scheduler thread. 8 KiB caps the same shape
+        ;; at ~33 million, spread over the arrivals, which is nothing. A
+        ;; trailer carries a checksum or two; nothing legitimate is near it.
+        ((fx> (fx- pos start) 8192) 'bad)
         ((crlf-at? buf pos) (fx+ pos 2))        ; blank line: section over
         (else
          (let ((bv (inbuf-bv buf)) (base (inbuf-start buf))
@@ -534,14 +544,24 @@
   ;; obviously cannot be followed by anything, and an error leaves the
   ;; framing in an unknown state. HTTP/1.0 defaults the other way (close
   ;; unless it says keep-alive), which matters behind an old proxy.
+  ;; EVERY Connection header, not the first. A field may be repeated and is
+  ;; equivalent to one field with the values joined by commas (RFC 7230
+  ;; 3.2.2), so assq read only the first line: a response saying
+  ;;   Connection: keep-alive
+  ;;   Connection: close
+  ;; was pooled. And "close" anywhere wins -- it is a refusal, and reading a
+  ;; refusal as permission is the direction that corrupts the next request.
   (define (connection-header-says headers)
-    (let ((p (assq 'connection headers)))
-      (if (not p)
-          'unset
-          (let ((v (string-downcase (cdr p))))
-            (cond ((token-in? v "close") 'close)
-                  ((token-in? v "keep-alive") 'keep-alive)
-                  (else 'unset))))))
+    (let loop ((hs headers) (seen 'unset))
+      (cond
+        ((null? hs) seen)
+        ((eq? (caar hs) 'connection)
+         (let ((v (string-downcase (cdar hs))))
+           (cond
+             ((token-in? v "close") 'close)          ; decisive, stop here
+             ((token-in? v "keep-alive") (loop (cdr hs) 'keep-alive))
+             (else (loop (cdr hs) seen)))))
+        (else (loop (cdr hs) seen)))))
 
   ;; a comma-separated token list, matched whole -- "close" must not be
   ;; found inside "closeish" or a header value that merely mentions it
@@ -563,12 +583,18 @@
                     (else (loop (+ i 1) (+ i 1)))))))))
           (else (loop (+ i 1) start))))))
 
+  ;; Only a version this client actually speaks may default to persistent.
+  ;; Excluding the exact string "HTTP/1.0" left everything else -- HTTP/0.9,
+  ;; HTTP/9.9, a garbage token -- defaulting to keep-alive, which is
+  ;; guessing about a peer whose framing rules are unknown. HTTP/1.1 is the
+  ;; only version whose default is persistent; anything else closes unless
+  ;; it explicitly says otherwise.
   (define (reusable-response? headers version leftover)
     (and (= leftover 0)
          (case (connection-header-says headers)
            ((close) #f)
-           ((keep-alive) #t)
-           (else (not (equal? version "HTTP/1.0"))))))
+           ((keep-alive) (equal? version "HTTP/1.1"))
+           (else (equal? version "HTTP/1.1")))))
 
   ;; finish: (disposition) -> void, called exactly once when the exchange
   ;; ends. 'reuse means the connection is framed, drained and usable for
@@ -576,7 +602,7 @@
   ;; the socket itself -- the process that owns it decides, because with
   ;; pooling that process outlives the request.
   (define (client-loop c caller ref buf state timeout codec emit max-resp method
-                       deadline vbox progress finish)
+                       deadline vbox progress last-chunk finish)
     ;; the peer's HTTP version, filled in when the head is parsed: HTTP/1.0
     ;; defaults to close, 1.1 to keep-alive
     (define (version) (unbox vbox))
@@ -601,6 +627,9 @@
     ;; where back pressure belongs -- a slow consumer should slow the
     ;; SENDER, not accumulate its output in memory.
     (define (emit! bv)
+      ;; A chunk reached the consumer: THAT is what the streaming idle clock
+      ;; measures. See the receive below.
+      (set-box! last-chunk (now-ms))
       (tcp-read-stop! c)
       (guard (e (#t (fail "on-chunk handler raised")))
         (emit bv))
@@ -751,9 +780,17 @@
         ;; runs. The caller's own timer is only a backstop against this
         ;; process wedging, and a kill from it no longer happens on the
         ;; ordinary slow-upstream path.
-        (receive (after (if deadline
-                            (min timeout (max 0 (- deadline (now-ms))))
-                            timeout)
+        ;; For a STREAM there is no deadline (documented), so the idle
+        ;; allowance is the only bound -- and it must measure idleness of
+        ;; PROGRESS, not of bytes. Re-arming it on every arriving segment
+        ;; meant an upstream could dribble bytes that never complete a
+        ;; chunk: on-chunk never fired, the request never timed out, and the
+        ;; connection was held for as long as the peer cared to keep typing.
+        (receive (after (cond
+                          (deadline (min timeout (max 0 (- deadline (now-ms)))))
+                          ((and emit (not (eq? timeout 'infinity)))
+                           (max 1 (- timeout (- (now-ms) (unbox last-chunk)))))
+                          (else timeout))
                     (err! (if (and deadline (>= (now-ms) deadline))
                               "request timeout"
                               "response timeout")))
@@ -766,7 +803,7 @@
               (unless (zero? (bytevector-length bv)) (set-box! progress #t))
               (if (zero? (bytevector-length bv))   ; pure TLS records, no app data
                   (client-loop c caller ref buf state timeout codec emit max-resp method
-                               deadline vbox progress finish)
+                               deadline vbox progress last-chunk finish)
                   (begin
                     (inbuf-append! buf bv)
                     ;; with streaming consumption this caps the UNPARSED
@@ -774,7 +811,13 @@
                     (if (> (inbuf-length buf) max-resp)
                         (err! "response too large")
                         (client-loop c caller ref buf state timeout codec emit max-resp method
-                               deadline vbox progress finish))))))
+                               deadline vbox progress last-chunk finish))))))
+          ;; The caller is gone. Everything after this point would be work
+          ;; for nobody -- and for a stream, work with no end: no total
+          ;; deadline, an on-chunk handler delivering into a dead process,
+          ;; and this process holding the socket and the TLS codec for as
+          ;; long as the upstream keeps sending.
+          (`#(DOWN ,dpid ,dreason) (err! "caller is gone"))
           (`#(tcp-eof)
             (cond
               ;; a body delimited by the close: there is nothing left to reuse
@@ -956,11 +999,19 @@
   ;; May this request be sent again after a pooled connection turned out to
   ;; be already closed? Only when repeating it cannot repeat an effect: the
   ;; idempotent methods, or anything with no body to resend.
+  ;; IDEMPOTENCE is the whole test. Treating "has no body" as replayable was
+  ;; wrong: a bodyless POST or PATCH -- POST /orders/42/ship, PATCH with the
+  ;; change in the path -- is an ordinary way to ask for an effect, and a
+  ;; server that performed it and then lost the connection before answering
+  ;; gets the request a second time. The stale check ("nothing was received")
+  ;; does not save it: nothing received means nothing was received, not that
+  ;; nothing was done.
+  ;;
+  ;; A body has nothing to do with it. It was in the rule because a body is
+  ;; the part that must be re-sendable, which is a necessary condition, not
+  ;; a sufficient one.
   (define (replayable? method body)
-    (or (memq method '(GET HEAD PUT DELETE OPTIONS TRACE))
-        (not body)
-        (and (bytevector? body) (zero? (bytevector-length body)))
-        (and (string? body) (zero? (string-length body)))))
+    (and (memq method '(GET HEAD PUT DELETE OPTIONS TRACE)) #t))
 
   ;; A connection's keeper. Owns c and the codec for the connection's whole
   ;; life, serves one request at a time, and decides after each whether the
@@ -974,13 +1025,29 @@
   ;; is a real error and is passed through unchanged.
   (define (keeper-serve c codec origin reused?
                         ref real-caller req idle emit max-resp method deadline)
-    (let ((disp 'close)
+    ;; Watch the caller for as long as we are working for it.
+    ;;
+    ;; The caller monitors this process; nothing monitored the caller. A
+    ;; stream has no total deadline by design, so a caller killed by its
+    ;; supervisor left this process holding the socket, the TLS codec and
+    ;; the on-chunk handler -- still running it, delivering to a process
+    ;; that no longer exists, for as long as the upstream kept sending. One
+    ;; such leak per killed subscriber.
+    ;;
+    ;; A monitor rather than a link: a link would kill this process without
+    ;; running the cleanup below, and the socket and codec would leak in a
+    ;; different way.
+    (let ((watch (monitor real-caller))
+          (disp 'close)
           (progress (box #f))
           (vbox (box "HTTP/1.1"))
+          ;; when the stream last delivered something; the request itself
+          ;; counts as the starting point
+          (last-chunk (box (now-ms)))
           (buf (make-inbuf)))
       (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f)
       (client-loop c self ref buf 'head idle codec emit max-resp method
-                   deadline vbox progress (lambda (d) (set! disp d)))
+                   deadline vbox progress last-chunk (lambda (d) (set! disp d)))
       ;; client-loop has already sent its answer to us
       (receive (after 0 (void))
         (`#(http-reply ,@ref ,r) (send real-caller (vector 'http-reply ref r)))
@@ -988,6 +1055,12 @@
           (if (and reused? (not (unbox progress)))
               (send real-caller (vector 'http-stale ref))
               (send real-caller (vector 'http-error ref m)))))
+      ;; release the watch, and drain a DOWN already delivered -- left
+      ;; behind it would be read by the idle receive below as this
+      ;; connection's own trouble
+      (when watch
+        (demonitor watch)
+        (receive (after 0 'ok) (`#(DOWN ,@real-caller ,reason) 'ok)))
       disp))
 
   (define (keeper-bye! c codec origin)
