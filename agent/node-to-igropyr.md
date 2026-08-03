@@ -102,6 +102,20 @@ Callers use `(gen-server-call pid msg)` (blocks for a reply, like `await service
 - **Claims key asymmetry**: `jwt-verify`/`token-guard` claims carry STRING
   keys (JSON convention — read with `json-ref`, which also accepts
   symbols); `session-guard`/`req-session` data carries SYMBOL keys (`assq`).
+- **`AsyncLocalStorage` / CLS ports to `req-set-local!`, NOT to
+  `make-parameter`.** The Scheme-looking translation is the wrong one:
+  `parameterize` gives no isolation between green processes, because Chez
+  implements it by swapping a GLOBAL cell and registering a winder to swap
+  it back, and the scheduler saves/restores winder lists without running
+  the hooks (correct for `dynamic-wind`, fatal here). Measured across one
+  yield: the process that set `alice` read back `bob`; the one that set
+  `bob` read back the default; one that never parameterized read `bob`. So
+  a request cannot even read back its own value, and every handler yields.
+  Node's `req.user = ...` / `res.locals` map to
+  `(req-set-local! req 'user u)` + `(req-local req 'user)`; anything
+  wider gets passed as an argument. Getting this wrong shows up as
+  occasional unexplained 401s under load, since a guard that reads the
+  wrong identity denies.
 - Body size in a handler is `(bytevector-length (req-body req))` — O(1)
   and exact, the body is fully buffered before dispatch. `content-length`
   is the client's declared value (a string). There is no per-route early

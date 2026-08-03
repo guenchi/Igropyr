@@ -154,6 +154,23 @@ compiler net here — tests must carry that weight.
   streaming; large downloads use res-begin-file! (backpressure)
 - **Responses are one-shot**: res-send! is token-guarded; a second send
   is silently ignored
+- **NEVER use make-parameter/parameterize for per-request state** — it
+  gives no isolation between green processes. Chez implements
+  parameterize by swapping a GLOBAL cell and registering a winder to
+  swap it back; the scheduler saves/restores each process's winder list
+  but never runs the hooks (right for dynamic-wind, whose after-thunk
+  must not fire on a yield). So the cell belongs to whoever wrote it
+  last. Measured across one yield: a process that set `alice` read back
+  `bob`; a process that set `bob` read back the DEFAULT; a process that
+  never parameterized anything read `bob`. Not merely a leak — a process
+  cannot read back its own binding, and every handler yields (any I/O
+  does). **Use `req-set-local!` / `req-local`** to hand a session or an
+  authenticated user to later middleware and the handler, or pass it as
+  an argument. There is no fix pending: running winders on a switch
+  breaks dynamic-wind, and saving values needs to enumerate live
+  parameters, which Chez does not expose. Symptom when you get it wrong:
+  an occasional unexplained 401 under concurrency, because a guard
+  reading the wrong identity usually denies
 - **req-header keys are lowercase symbols**: `(req-header req 'content-type)`
 - Paths/headers arrive percent-decoded; query is a (string . string) alist
 - **Claims key asymmetry (you WILL trip on this)**: jwt-verify /

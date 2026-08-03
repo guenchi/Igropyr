@@ -1446,6 +1446,46 @@ Middleware can pass data to downstream handlers via `req-local` and `req-set-loc
                  (send-text! res "Forbidden"))))))
 ```
 
+#### Why not `parameterize`?
+
+`make-parameter` is the obvious-looking alternative and it does **not** work
+here: it gives no isolation between concurrent requests.
+
+Chez implements `parameterize` by swapping a *global* cell and registering a
+winder to swap it back — printing one shows exactly that:
+
+```
+#[critical-winder #<procedure swap> #<procedure swap> ()]
+```
+
+The scheduler saves and restores each process's winder list across a context
+switch but never runs the hooks. That is right for `dynamic-wind`, whose
+after-thunk must not fire merely because a process yielded, and fatal for
+`parameterize`, whose entire mechanism *is* that hook. The cell belongs to
+whichever process wrote it last.
+
+Three processes, each setting or reading one parameter across a yield:
+
+| process | expected | actual |
+|---|---|---|
+| set `alice`, yield, read | `alice` | **`bob`** |
+| set `bob`, yield, read | `bob` | **`nobody`** |
+| never parameterized, read | `nobody` | **`bob`** |
+
+Note the second row: a process cannot read back *its own* binding. And the
+third: a process that never touched the parameter sees another's value. So it
+is not only a leak between requests — the binding means nothing at all once
+anything yields, and every handler yields, because any I/O does.
+
+There is no clean fix available. Running the winders on every switch would
+break `dynamic-wind`; saving and restoring the values instead would require
+enumerating every live parameter, which Chez does not expose. Use
+`req-set-local!` for request-scoped state, or pass the value as an argument.
+
+Nothing warns you if you get this wrong. A guard that reads the wrong identity
+usually *denies*, so the symptom is an occasional unexplained `401` under
+concurrency.
+
 ---
 
 ## Authentication
