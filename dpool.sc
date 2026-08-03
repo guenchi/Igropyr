@@ -249,6 +249,15 @@
     ;; on drain. A plain list appended per enqueue was O(n^2) under a
     ;; large backlog.
     (define queue-rev '())                     ; #(id payload mode)
+    (define queued-n 0)
+    ;; With every node offline nothing drains, and each queued entry holds a
+    ;; whole payload -- so an application that keeps submitting turns an
+    ;; outage into memory exhaustion, on the coordinator, which is the one
+    ;; process that has to survive to recover. Results are already bounded
+    ;; (max-stashed); the queue was the half that was not. Refusing is the
+    ;; honest answer: the submitter learns now, rather than holding an id
+    ;; for work nobody will ever run.
+    (define max-queued 10000)
     (define next-id 0)
 
     (define (stash-result! id result)
@@ -278,16 +287,37 @@
     (define (dispatch! id payload mode)
       (let ((node (pick-node!)))
         (if (not node)
-            (set! queue-rev (cons (vector id payload mode) queue-rev))
+            (begin
+              (set! queue-rev (cons (vector id payload mode) queue-rev))
+              (set! queued-n (+ queued-n 1)))
             (let ((token (random-token!)))
               (hashtable-set! inflight id (vector payload node mode token))
-              (unless (rsend node worker-name
-                             (vector 'dtask id self-node coord-name payload token))
-                ;; the link died between pick and send: drop the node and
-                ;; treat this task as hit by a node-down
-                (hashtable-delete! inflight id)
-                (set! live (remq node live))
-                (lost! id payload mode))))))
+              ;; rsend can RAISE, not merely answer #f: serialising the
+              ;; payload fails on a procedure, a port, or anything else
+              ;; outside the extended wire format. Unguarded that killed the
+              ;; coordinator -- after the submitter had already been handed a
+              ;; task id -- and every later submit then waited forever on a
+              ;; process that no longer existed. One bad payload took down
+              ;; the whole pool, which is a far larger blast radius than the
+              ;; one task deserved.
+              (let ((sent (guard (e (#t 'unsendable))
+                            (rsend node worker-name
+                                   (vector 'dtask id self-node coord-name
+                                           payload token)))))
+                (cond
+                  ((eq? sent 'unsendable)
+                   ;; not the node's fault and not retryable: reassigning it
+                   ;; elsewhere would fail identically. Fail this task only,
+                   ;; through the same path a worker-side failure takes, so
+                   ;; awaiters are answered and the outcome is stashed.
+                   (complete! id (vector 'task-error 'not-serializable)))
+                  ((not sent)
+                   ;; the link died between pick and send: drop the node and
+                   ;; treat this task as hit by a node-down
+                   (hashtable-delete! inflight id)
+                   (set! live (remq node live))
+                   (lost! id payload mode))
+                  (else (void))))))))
 
     ;; a task's node vanished: reassign (at-least-once) or fail it
     (define (lost! id payload mode)
@@ -313,6 +343,7 @@
     (define (drain-queue!)
       (let ((q (reverse queue-rev)))
         (set! queue-rev '())
+        (set! queued-n 0)
         (for-each (lambda (t) (dispatch! (vector-ref t 0) (vector-ref t 1)
                                          (vector-ref t 2)))
                   q)))
@@ -333,10 +364,15 @@
     (let loop ()
       (receive
         (`#(submit ,payload ,mode ,from ,ref)
-          (let ((id next-id))
-            (set! next-id (+ next-id 1))
-            (send from (vector 'dpool-submitted ref id))
-            (dispatch! id payload mode)))
+          ;; Checked BEFORE an id is handed out: a submitter that receives an
+          ;; id reasonably believes the task is accepted, and there would be
+          ;; no way to tell it otherwise afterwards.
+          (if (and (null? live) (>= queued-n max-queued))
+              (send from (vector 'dpool-rejected ref 'overloaded))
+              (let ((id next-id))
+                (set! next-id (+ next-id 1))
+                (send from (vector 'dpool-submitted ref id))
+                (dispatch! id payload mode))))
         (`#(await ,id ,from ,ref)
           (let ((r (hashtable-ref results id #f)))
             (if r
@@ -386,7 +422,10 @@
       (unless (memq mode '(at-least-once at-most-once))
         (assertion-violation 'dpool-submit "bad mode" mode))
       (send (dpool-pid pool) (vector 'submit payload mode self ref))
-      (receive (`#(dpool-submitted ,@ref ,id) id))))
+      (receive
+        (`#(dpool-submitted ,@ref ,id) id)
+        (`#(dpool-rejected ,@ref ,why)
+          (raise (vector 'dpool-error 'overloaded why))))))
 
   ;; Block for a task's result: the handler's return value, or a raised
   ;; #(dpool-error ,reason ,id) where reason is task-error | node-down |
