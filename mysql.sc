@@ -268,7 +268,15 @@
         (inbuf-append! buf bv)
         (k))
       (`#(tcp-eof) (mysql-fail -1 "connection closed by server"))
-      (`#(tcp-error ,e) (mysql-fail -1 "connection error"))))
+      (`#(tcp-error ,e) (mysql-fail -1 "connection error"))
+      ;; The owner died while we were mid-query. serve-loop watches for that
+      ;; between statements, but a query is not between statements: once
+      ;; inside the wire loop only TCP messages were matched, so against a
+      ;; server that keeps dripping data the old query, its fd and its TLS
+      ;; session outlived the pool indefinitely -- and rebuilding the pool
+      ;; stacked a fresh set on top. Failing here unwinds through the guards,
+      ;; which close the socket.
+      (`#(DOWN ,pid ,reason) (mysql-fail -1 "owner gone"))))
 
   ;; ---- length-encoded values -------------------------------------------------------
 

@@ -322,7 +322,15 @@
         (inbuf-append! buf (tx-decode c bv))
         (k))
       (`#(tcp-eof) (postgresql-fail 'transport "connection closed by server"))
-      (`#(tcp-error ,e) (postgresql-fail 'transport "connection error"))))
+      (`#(tcp-error ,e) (postgresql-fail 'transport "connection error"))
+      ;; The owner died while we were mid-query. serve-loop watches for that
+      ;; between statements, but a query is not between statements: once
+      ;; inside the wire loop only TCP messages were matched, so against a
+      ;; server that keeps dripping data the old query, its fd and its TLS
+      ;; session outlived the pool indefinitely -- and rebuilding the pool
+      ;; stacked a fresh set on top. Failing here unwinds through the guards,
+      ;; which close the socket.
+      (`#(DOWN ,pid ,reason) (postgresql-fail 'transport "owner gone"))))
 
   ;; During startup/auth the server may interleave NoticeResponse ('N')
   ;; messages (an auth hook warning, a standby notice); they are
