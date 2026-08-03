@@ -316,6 +316,24 @@
          (write! notice-msg)
          (when (scram-server! scram-password)
            (query-loop!)))
+        ;; A server that never finishes, but never stalls either: one
+        ;; NoticeResponse every 300 ms, forever. Every read completes well
+        ;; inside connect-timeout-ms, so the per-message timeout re-arms and
+        ;; never fires -- which is the point. Only a deadline on the whole
+        ;; conversation can end this, and without one the worker ran for the
+        ;; life of the process (and, in a pool, held its slot).
+        ((equal? db "notice-forever")
+         (write! notice-msg)
+         (write! (smsg #\R (bv-append (u32 10) (cstr "SCRAM-SHA-256")
+                                      (bytevector 0))))
+         ;; Stop when the client goes away, so what the counts measure
+         ;; afterwards is the CLIENT's worker and nothing else. A drip loop
+         ;; that ran forever kept its own process and socket alive and hid
+         ;; the one leaked worker inside its own noise.
+         (let drip ()
+           (receive (after 300 (write! notice-msg) (drip))
+             (`#(tcp-eof) (tcp-close! c))
+             (`#(tcp-error ,e) (tcp-close! c)))))
         ((equal? db "scram-cost")
          (write! (smsg #\R (bv-append (u32 10) (cstr "SCRAM-SHA-256")
                                       (bytevector 0))))
@@ -432,6 +450,43 @@
     (let ((conn (postgresql-connect "127.0.0.1" port "user" scram-password "notice")))
       (check "notice-during-auth-tolerated" #t)
       (postgresql-close! conn))
+
+    ;; 7b. A server that keeps the handshake alive forever with legal
+    ;; notices must still be given up on -- BY THE WORKER.
+    ;;
+    ;; The caller's own timeout is not the thing under test: postgresql-connect
+    ;; raises after connect-timeout-ms + 2 s whatever the worker does, so a
+    ;; test that measured the caller passes against the bug. The worker never
+    ;; reaches the adoption wait (that is after db-up, which never comes), so
+    ;; nothing else ended it: it ran, and held its socket, for the life of the
+    ;; process. In a POOL, where no caller times out at all, it also held its
+    ;; slot forever.
+    ;;
+    ;; So the assertion is on the worker: its process and its connection must
+    ;; be gone. 'connect-deadline-ms is set short to keep the test quick.
+    ;; settle first: an earlier case's connection still closing would drift
+    ;; the baseline and mask exactly the one leaked worker being looked for
+    (sleep-ms 1500)
+    (let* ((base-conns (conn-count))
+           (base-procs (process-count))
+           (t0 (now-ms))
+           (e (connect-error "127.0.0.1" port "user" scram-password "notice-forever"
+                             '((connect-deadline-ms . 3000))))
+           (caller-ms (- (now-ms) t0)))
+      (check "trickling-notices-connect-fails" (and e #t))
+      (display "  [info] caller gave up after ") (display caller-ms)
+      (display " ms; worker deadline 3000 ms\n")
+      ;; well past the deadline, so a bounded worker is certainly gone
+      (sleep-ms 2000)
+      (display "  [info] conns ") (display base-conns) (display " -> ")
+      (display (conn-count)) (display ", processes ") (display base-procs)
+      (display " -> ") (display (process-count)) (newline)
+      ;; EQUAL, not <=: the leak is exactly one worker and one connection,
+      ;; and a loose bound is what let this pass against the bug the first
+      ;; time it was written
+      (check "trickling-notices-releases-conn" (= (conn-count) base-conns))
+      (check "trickling-notices-releases-worker"
+        (= (process-count) base-procs)))
 
     ;; 8. invalid message length -> clean transport error, not an assertion
     (let ((e (connect-error "127.0.0.1" port "user" "x" "badlen")))

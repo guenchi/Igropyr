@@ -91,6 +91,20 @@
                 base64-encode base64-decode))
 
   (define connect-timeout-ms 10000)
+  ;; A ceiling on the WHOLE startup/auth conversation.
+  ;;
+  ;; connect-timeout-ms bounds each socket read and re-arms on every
+  ;; message, so it never ends the conversation: a server sending one
+  ;; NoticeResponse every nine seconds -- perfectly legal, and something a
+  ;; hostile or confused peer can keep up indefinitely -- held a connection
+  ;; worker forever. The single-connection caller gave up at twelve seconds
+  ;; and the worker kept running; a POOL worker never reported db-up at all,
+  ;; so it occupied its slot for the life of the process while the pool
+  ;; waited for a connection that was never coming.
+  ;;
+  ;; This is the same distinction the HTTP reader draws between a gap
+  ;; between segments and a deadline on the whole request.
+  (define connect-deadline-ms 30000)
   ;; RFC 5802 warns that a hostile server can DoS a client with an extreme
   ;; iteration count -- the client does the work the SERVER asks for.
   ;;
@@ -289,6 +303,14 @@
                   (wait-data c buf loop timeout))))
           (wait-data c buf loop timeout))))
 
+  ;; How long the next auth read may wait: never past the conversation's
+  ;; deadline, and never longer than one message is allowed to take.
+  (define (auth-wait-ms deadline)
+    (let ((left (- deadline (now-ms))))
+      (when (<= left 0)
+        (postgresql-fail 'transport "connect deadline exceeded"))
+      (max 1 (min connect-timeout-ms left))))
+
   (define (wait-data c buf k timeout)
     (receive (after timeout (postgresql-fail 'transport "server timeout"))
       (`#(tcp-data ,bv)
@@ -300,9 +322,9 @@
   ;; During startup/auth the server may interleave NoticeResponse ('N')
   ;; messages (an auth hook warning, a standby notice); they are
   ;; informational and must not fail the handshake.
-  (define (next-msg!/skip-notices c buf)
+  (define (next-msg!/skip-notices c buf deadline)
     (let loop ()
-      (let-values (((t p) (next-msg! c buf connect-timeout-ms)))
+      (let-values (((t p) (next-msg! c buf (auth-wait-ms deadline))))
         (if (fx= t (char->integer #\N))
             (loop)
             (values t p)))))
@@ -400,7 +422,7 @@
   ;;      Keyed on TLS BEING ACTIVE, not on having a hash, or a MITM
   ;;      with an unhashable certificate could downgrade us to "n".
   ;;   n  plaintext connection, no binding possible
-  (define (scram-auth! c buf user password sasl-payload max-iters)
+  (define (scram-auth! c buf user password sasl-payload max-iters deadline)
     (unless (scram-safe-password? password)
       (postgresql-fail 'transport
         (string-append
@@ -430,7 +452,7 @@
           (bv-append (cstr mech)
                      (u32 (string-length client-first))
                      (string->utf8 client-first)))
-        (let-values (((t p) (next-msg!/skip-notices c buf)))
+        (let-values (((t p) (next-msg!/skip-notices c buf deadline)))
           (unless (and (fx= t (char->integer #\R)) (= (read-u32-be p 0) 11))
             (if (fx= t (char->integer #\E))
                 (raise (error-response->fail p))
@@ -459,7 +481,7 @@
                 (send-msg! c MSG-PASSWORD
                   (string->utf8
                     (string-append final-noproof ",p=" (base64-encode proof))))
-                (let-values (((t2 p2) (next-msg!/skip-notices c buf)))
+                (let-values (((t2 p2) (next-msg!/skip-notices c buf deadline)))
                   (cond
                     ((and (fx= t2 (char->integer #\R)) (= (read-u32-be p2 0) 12))
                      (let ((v (attr (scram-attrs
@@ -488,18 +510,28 @@
           (assertion-violation 'postgresql-connect
             "'scram-max-iters must be a positive fixnum" v)))))
 
+  ;; 'connect-deadline-ms overrides the ceiling on the whole handshake.
+  (define (connect-deadline opts)
+    (let ((v (assq-ref opts 'connect-deadline-ms)))
+      (cond
+        ((not v) connect-deadline-ms)
+        ((and (integer? v) (exact? v) (> v 0)) v)
+        (else (assertion-violation 'postgresql-connect
+                "'connect-deadline-ms must be a positive exact integer" v)))))
+
   (define (authenticate! c buf user password db opts)
     (tx-write! c (startup-msg user db))
-    (let loop ()
-      (let-values (((t p) (next-msg! c buf connect-timeout-ms)))
+    (let ((deadline (+ (now-ms) (connect-deadline opts))))
+      (let loop ()
+        (let-values (((t p) (next-msg! c buf (auth-wait-ms deadline))))
         (case (integer->char t)
           ((#\R)
            (let ((code (read-u32-be p 0)))
              (cond
-               ((= code 0) (finish-startup! c buf))         ; AuthenticationOk
+               ((= code 0) (finish-startup! c buf deadline))  ; AuthenticationOk
                ((= code 10)                                 ; AuthenticationSASL
                 (scram-auth! c buf user password p
-                             (scram-iter-ceiling opts))
+                             (scram-iter-ceiling opts) deadline)
                 (loop))                                     ; then AuthenticationOk
                ((= code 3)                                  ; cleartext password
                 ;; the auth method is the SERVER's choice, i.e. an active
@@ -532,13 +564,13 @@
           ((#\E) (raise (error-response->fail p)))
           ((#\N) (loop))                                    ; NoticeResponse
           (else (postgresql-fail 'transport
-                  "unexpected message during authentication"))))))
+                  "unexpected message during authentication")))))))
 
   ;; After AuthenticationOk the server streams ParameterStatus/BackendKeyData
   ;; and notices; consume through the first ReadyForQuery ('Z').
-  (define (finish-startup! c buf)
+  (define (finish-startup! c buf deadline)
     (let loop ()
-      (let-values (((t p) (next-msg! c buf connect-timeout-ms)))
+      (let-values (((t p) (next-msg! c buf (auth-wait-ms deadline))))
         (case (integer->char t)
           ((#\Z) 'ok)
           ((#\E) (raise (error-response->fail p)))

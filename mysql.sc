@@ -29,6 +29,24 @@
           (only (igropyr crypto) sha1 sha256 base64-decode))
 
   (define connect-timeout-ms 10000)
+  ;; A ceiling on the WHOLE auth handshake.
+  ;;
+  ;; connect-timeout-ms bounds each socket read and re-arms on every packet,
+  ;; so it never ends the handshake: a server sending a legal AuthMoreData
+  ;; every nine seconds -- which a hostile or confused peer can keep up
+  ;; indefinitely -- held a connection worker forever. The single-connection
+  ;; caller gave up at twelve seconds and the worker kept running; a POOL
+  ;; worker never reported db-up at all, so it held its slot for the life of
+  ;; the process while the pool waited for a connection never coming.
+  (define connect-deadline-ms 30000)
+
+  ;; How long the next handshake read may wait: never past the handshake's
+  ;; deadline, and never longer than one packet is allowed to take.
+  (define (auth-wait-ms deadline)
+    (let ((left (- deadline (now-ms))))
+      (when (<= left 0)
+        (mysql-fail -1 "connect deadline exceeded"))
+      (max 1 (min connect-timeout-ms left))))
   (define query-timeout-ms 60000)
 
   ;; ---- bytevector helpers ------------------------------------------------
@@ -387,9 +405,19 @@
       (and p (cdr p))))
 
   ;; drive the auth conversation to an OK packet (or raise)
+  ;; 'connect-deadline-ms overrides the ceiling on the whole handshake.
+  (define (connect-deadline opts)
+    (let ((v (assq-ref opts 'connect-deadline-ms)))
+      (cond
+        ((not v) connect-deadline-ms)
+        ((and (integer? v) (exact? v) (> v 0)) v)
+        (else (assertion-violation 'mysql-connect
+                "'connect-deadline-ms must be a positive exact integer" v)))))
+
   (define (auth-loop! c bufbox user password nonce opts)
-    (let loop ()
-      (let-values (((p seq) (next-packet! c bufbox connect-timeout-ms)))
+    (let ((deadline (+ (now-ms) (connect-deadline opts))))
+     (let loop ()
+      (let-values (((p seq) (next-packet! c bufbox (auth-wait-ms deadline))))
         (let ((b0 (bytevector-u8-ref p 0)))
           (cond
             ((fx= b0 0) 'ok)
@@ -423,7 +451,7 @@
                   (loop))
                  (else (mysql-fail -1 (string-append "unsupported auth plugin: "
                                                      plugin))))))
-            (else (mysql-fail -1 "unexpected packet during auth")))))))
+            (else (mysql-fail -1 "unexpected packet during auth"))))))))
 
   (define (authenticate! c bufbox user password db opts)
     (let-values (((p seq) (next-packet! c bufbox connect-timeout-ms)))
