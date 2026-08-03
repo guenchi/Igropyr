@@ -78,6 +78,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # the whole-request deadline must span head AND body, not restart between
 "$scheme_bin" --script igropyr/test/request-deadline.sc
 "$scheme_bin" --script igropyr/test/http-client-stream.sc
+# connection reuse, counted at the SERVER (accepts vs requests served),
+# plus the cases that must NOT be pooled and the stale-handout retry
+"$scheme_bin" --script igropyr/test/http-client-keepalive.sc
 # a chunked response is not complete until its trailer section terminates:
 # declaring done at the 0 line accepted a truncated body as a success
 "$scheme_bin" --script igropyr/test/chunked-truncation.sc
