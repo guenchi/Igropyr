@@ -208,14 +208,23 @@
             (mutable steps)        ; completed suspends, for the watchdog
             running-box run-start-box))
 
+  ;; ENTERING 'running starts the clock; re-marking a phase that is already
+  ;; running does not. Computing a request key marks and restores the phase
+  ;; around itself, and inside an accepted step the phase it restores to IS
+  ;; 'running -- so a restore that restamped would refund whatever the key
+  ;; function had just spent, and a slow one would quietly hand the step a
+  ;; second full allowance of the very limit the watchdog is there to keep.
   (define (set-phase! st phase)
-    (step-state-phase-set! st phase)
-    (when (eq? phase 'running)
-      ;; TIMESTAMP BEFORE THE FLAG. The watchdog reads the flag and then the
-      ;; timestamp, so publishing them the other way round leaves a window
-      ;; in which it sees a step running against the PREVIOUS step's start.
-      (set-box! (step-state-run-start-box st) (now-ms)))
-    (set-box! (step-state-running-box st) (eq? phase 'running)))
+    (let ((entering (and (eq? phase 'running)
+                         (not (eq? (step-state-phase st) 'running)))))
+      (step-state-phase-set! st phase)
+      (when entering
+        ;; TIMESTAMP BEFORE THE FLAG. The watchdog reads the flag and then
+        ;; the timestamp, so publishing them the other way round leaves a
+        ;; window in which it sees a step running against the PREVIOUS
+        ;; step's start.
+        (set-box! (step-state-run-start-box st) (now-ms)))
+      (set-box! (step-state-running-box st) (eq? phase 'running))))
 
   (define (token=? a b)
     (and a b (string? a) (string? b) (string=? a b)))

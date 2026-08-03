@@ -554,6 +554,32 @@
           (fail "runaway step ran to completion despite the TTL" v))
         (display "runaway step bounded by TTL ok\n")))))
 
+;; ...and the key function is part of the step it belongs to. The key is
+;; application code -- it can be slow, it can hang -- and it runs after
+;; the step is already marked running. Restarting the clock when it
+;; finishes would hand the step a second full TTL, which is how a bound
+;; stops being a bound: any flow could double its allowance by keying its
+;; requests slowly. Here neither half exceeds the TTL on its own and the
+;; two together do, so only a step measured end to end is stopped.
+(let-values (((id tok first)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (sleep-ms 300)              ; under the TTL by itself
+                    (vector 'should-not-get-here a)))
+                'go
+                400                             ; TTL 400 ms
+                (lambda (r) (sleep-ms 300) r)))) ; also under it by itself
+  (let ((me self))
+    (spawn (lambda ()
+             (let-values (((r st) (conversation-resume! id tok 'X)))
+               (send me (vector 'slowkey r)))))
+    (receive (after 6000 (fail "slow-key-step" 'no-answer))
+      (`#(slowkey ,v)
+        (when (and (vector? v) (eq? (vector-ref v 0) 'should-not-get-here))
+          (fail "the key function's time was refunded to the step" v))
+        (display "a slow request key does not buy the step a second TTL ok\n")))))
+
 ;; ...and the allowance must be the TTL, not whatever is left of a sampling
 ;; cycle. The watchdog used to sample on a fixed period and decide from "has
 ;; the step counter moved since my last look", which hands a step anything
