@@ -18,7 +18,7 @@
 ;;; if configured, tells the client), while the conversation itself is
 ;;; bounded by its TTL.
 ;;;
-;;;   (define-values (id reply)
+;;;   (define-values (id token reply)
 ;;;     (conversation-start!
 ;;;       (lambda (req suspend!)
 ;;;         (let ((tx (begin-tx!)))          ; live state, held across rounds
@@ -28,13 +28,42 @@
 ;;;               final-reply))))
 ;;;       req))
 ;;;
-;;;   (conversation-resume! id req)   ; -> reply, 'busy, 'gone, 'unreachable
+;;;   (conversation-resume! id token req)
+;;;     ; -> (values reply next-token), or 'stale / 'gone / 'unreachable
 ;;;
-;;; 'busy: the conversation is mid-step and this request was sent against a
-;;; reply the caller had not yet seen -- a double click, a client retry, two
-;;; front ends. Taking it as the next step would advance the flow past a
-;;; reply nobody read, skipping a confirmation or applying one stage's
-;;; payload to the next. Retry after reading the reply that is on its way.
+;;; THE TOKEN NAMES THE REPLY BEING ANSWERED. A conversation hands one out
+;;; with every reply, and the next request must present it; it is consumed
+;;; the moment a request is accepted. Send it to the client alongside the
+;;; reply (a field, a hidden input, a query parameter) and take it back with
+;;; the next request -- it is a small integer and crosses links and JSON
+;;; unchanged.
+;;;
+;;; Without it the only thing distinguishing "the answer to what I just
+;;; said" from "a duplicate of what you said before" is arrival order, and
+;;; arrival order is not causality. A double click, a client retry or a
+;;; second front end sends two requests against the SAME reply; if the
+;;; duplicate is delayed -- a slower path, a forwarding hop, a busy
+;;; scheduler -- it arrives after the flow has moved on and is taken as the
+;;; next step. The flow then advances on input written before the reply it
+;;; claims to answer: a confirmation skipped, or one stage's payload applied
+;;; to the next. With the token the duplicate is refused however it is
+;;; scheduled, and a genuine answer is accepted however late it arrives.
+;;;
+;;; 'stale: this request named a reply that is no longer the one being
+;;; answered. It was NOT applied and will not be -- a fact about this
+;;; conversation, not a guess. It says nothing about whether the request it
+;;; duplicates succeeded: the step it was repeating may well have run for
+;;; whoever got there first. Read the current state; do not resubmit (there
+;;; is no valid token to resubmit with, which is the point).
+;;;
+;;; What 'stale does NOT give you is recovery from a LOST REPLY. A caller
+;;; whose response never arrived holds a spent token and can neither
+;;; advance nor learn the outcome; it has to reconcile out of band. Handing
+;;; back the reply that step already produced -- making resume idempotent,
+;;; the way payment APIs treat an idempotency key -- would cover that, at
+;;; the cost of retaining a reply per step. It is deliberately not done
+;;; here, and the token protocol makes it addable later without breaking
+;;; anything.
 ;;;
 ;;; Fault semantics (the transaction-ring contract):
 ;;;   - flow crashes, TTL expires, or the process dies for any reason
@@ -73,7 +102,8 @@
 ;;; run time.
 
 (library (igropyr conversation)
-  (export conversation-start! conversation-resume! conversation-gone?)
+  (export conversation-start! conversation-resume!
+          conversation-gone? conversation-stale?)
   (import (chezscheme) (igropyr actor)
           (only (igropyr libuv) now-ms)
           (only (igropyr node) node-self rsend monitor-node demonitor-node))
@@ -150,11 +180,12 @@
   (define (conv-router-loop)
     (let loop ()
       (receive
-        (`#(conv-resume ,from-node ,reply-name ,ref ,id ,req)
+        (`#(conv-resume ,from-node ,reply-name ,ref ,id ,token ,req)
           (spawn
             (lambda ()
-              (rsend from-node reply-name
-                     (vector 'conv-forward-reply ref (local-resume id req)))))
+              (let-values (((reply next) (local-resume id token req)))
+                (rsend from-node reply-name
+                       (vector 'conv-forward-reply ref reply next)))))
           (loop))
         (,_ (loop)))))
 
@@ -180,7 +211,7 @@
   ;; really is gone, which for a flow holding a transaction means the
   ;; connection dropped and the database rolled back. That is a fact about
   ;; a process, not about a network.
-  (define (forward-resume owner id req)
+  (define (forward-resume owner id token req)
     (let ((reply-name (fresh-reply-name!))
           (ref (fresh-ref!)))
       (register reply-name self)
@@ -193,11 +224,11 @@
           ;; unreachable. The owner may be dead, or may be committing right
           ;; now -- from here they are indistinguishable.
           (if (rsend owner conv-router-name
-                     (vector 'conv-resume (node-self) reply-name ref id req))
-              (receive (after conv-forward-ttl-ms 'unreachable)
-                (`#(conv-forward-reply ,@ref ,reply) reply)
-                (`#(node-down ,@owner) 'unreachable))
-              'unreachable))
+                     (vector 'conv-resume (node-self) reply-name ref id token req))
+              (receive (after conv-forward-ttl-ms (values 'unreachable #f))
+                (`#(conv-forward-reply ,@ref ,reply ,next) (values reply next))
+                (`#(node-down ,@owner) (values 'unreachable #f)))
+              (values 'unreachable #f)))
         (lambda ()
           (demonitor-node owner)
           ;; demonitor-node does not retract a #(node-down ...) already
@@ -269,7 +300,11 @@
                              ((> (- (now-ms) (unbox run-start-box)) ttl)
                               (kill watched 'conversation-expired))
                              (else (loop))))))))
-                 (let ((who starter) (tag ref) (step 0))
+                 ;; `awaiting` is the token the flow is currently waiting to
+                 ;; be answered with, or #f while a step is running. It is
+                 ;; the whole mechanism: a resume is accepted when it names
+                 ;; the reply it is answering, and refused otherwise.
+                 (let ((who starter) (tag ref) (step 0) (awaiting #f))
                    ;; One resume per step. Two concurrent resumes -- a double
                    ;; click, a client retry, two front ends -- both land in
                    ;; the mailbox; the first wakes this suspend! and the
@@ -283,66 +318,64 @@
                    ;; is mid-step, and the caller can retry when it is not.
                    (define (suspend! reply)
                      (set! step (+ step 1))
+                     (set! awaiting step)
                      (set-box! step-box step)
                      (set-box! running-box #f)      ; parked from here
-                     (send who (vector 'conv-reply tag reply))
-                     ;; Refuse anything that arrived WHILE THE STEP WAS
-                     ;; RUNNING, before waiting for the next one. Those
-                     ;; requests were sent against the previous reply and
-                     ;; their callers never saw this one; taking one as the
-                     ;; next step advances the flow past a reply its caller
-                     ;; never read -- a confirmation skipped, or one stage's
-                     ;; payload applied to the next. Draining first is what
-                     ;; makes the order right: everything already queued is
-                     ;; stale by definition, everything after this point was
-                     ;; sent in response to the reply just published.
-                     (let drain ()
-                       (receive (after 0 'done)
-                         (`#(conv-step ,from2 ,ref3 ,_)
-                           (send from2 (vector 'conv-reply ref3 'busy))
-                           (drain))))
-                     ;; WHAT THIS DOES NOT COVER, and cannot as written.
+                     ;; the reply carries the token that answers it
+                     (send who (vector 'conv-reply tag reply step))
+                     ;; A resume must name the reply it is answering.
                      ;;
-                     ;; The drain uses arrival order as a stand-in for "was
-                     ;; this sent against the reply you have read". That is
-                     ;; exact for anything already queued and wrong for a
-                     ;; duplicate that was sent during the previous step and
-                     ;; delayed past this point -- across a network, past a
-                     ;; forwarding hop -- which the next receive then takes
-                     ;; as a legitimate next step. The mirror error exists
-                     ;; too: a request that genuinely read the new reply can
-                     ;; be refused as 'busy if it lands inside the send/drain
-                     ;; window.
+                     ;; Arrival order used to stand in for that: everything
+                     ;; already queued when a reply went out was drained as
+                     ;; stale, and whatever came next was presumed to be the
+                     ;; answer. That is exact only while delivery is prompt
+                     ;; and ordered. A duplicate sent DURING the previous
+                     ;; step -- a double click, a client retry, a second
+                     ;; front end -- that was delayed past the drain (a
+                     ;; slower path, a forwarding hop, a busy scheduler)
+                     ;; arrived afterwards and was taken as the next step:
+                     ;; the flow advanced on input written before the reply
+                     ;; it claims to answer, skipping a confirmation or
+                     ;; applying one stage's payload to the next. Draining
+                     ;; cannot see that -- the message did not exist yet.
+                     ;; The mirror error was a genuine answer refused as
+                     ;; 'busy for landing inside the send/drain window.
                      ;;
-                     ;; Closing it needs a STEP TOKEN in the protocol: the
-                     ;; reply carries which step produced it, and a resume
-                     ;; presents the token it is answering. Arrival order
-                     ;; then stops being load-bearing. That changes what
-                     ;; conversation-start! returns and what
-                     ;; conversation-resume! accepts -- a breaking change to
-                     ;; the public API, which belongs in its own piece of
-                     ;; work rather than inside a fix.
+                     ;; The token settles both. It is consumed the moment a
+                     ;; request is accepted, so a second request bearing it
+                     ;; -- concurrent or late, it makes no difference -- is
+                     ;; refused, and a request that really did read the
+                     ;; reply is accepted whenever it arrives.
                      ;;
-                     ;; Until then: the failure direction is 'busy (safe --
-                     ;; the caller retries) for the mirror case, and a
-                     ;; skipped confirmation for the delayed-duplicate case.
-                     ;; A flow whose steps are not idempotent should carry
-                     ;; its own request id and check it.
-                     (receive (after ttl (raise 'conversation-expired))
-                       (`#(conv-step ,from ,ref2 ,r)
-                         (set! who from) (set! tag ref2)
-                         (set-box! running-box #t)  ; executing again
-                         (set-box! run-start-box (now-ms))
-                         r)))
+                     ;; 'stale means the request was NOT applied and will
+                     ;; not be. It is not replayed: keeping every step's
+                     ;; reply to hand one back would make resume idempotent,
+                     ;; which is a separate decision with a memory cost, and
+                     ;; one the token protocol makes addable later without
+                     ;; breaking anything.
+                     (let wait ()
+                       (receive (after ttl (raise 'conversation-expired))
+                         (`#(conv-step ,from ,ref2 ,token ,r)
+                           (if (and awaiting (eqv? token awaiting))
+                               (begin
+                                 (set! awaiting #f)   ; consumed
+                                 (set! who from) (set! tag ref2)
+                                 (set-box! running-box #t)
+                                 (set-box! run-start-box (now-ms))
+                                 r)
+                               (begin
+                                 (send from (vector 'conv-reply ref2 'stale #f))
+                                 (wait)))))))
                    (let ((final (flow req suspend!)))
                      (unregister name)
-                     (send who (vector 'conv-reply tag final))))))))
+                     ;; the flow is over: no token can answer this
+                     (send who (vector 'conv-reply tag final #f))))))))
       (let ((m (monitor conv)))
         (receive
-          (`#(conv-reply ,@ref ,reply)
+          (`#(conv-reply ,@ref ,reply ,token)
             (when m (demonitor m))
             (flush-down! conv)
-            (values id reply))
+            (values id token reply))
           (`#(DOWN ,@conv ,reason)
             (raise (vector 'conversation-failed reason)))))))
 
@@ -350,26 +383,38 @@
   ;; yields its reply. Returns 'gone when the conversation is over,
   ;; expired, or crashed -- for a transactional flow that means the
   ;; database already rolled back.
-  (define (conversation-resume! id req)
+  (define (conversation-resume! id token req)
     (let ((owner (conv-owner id)))
       (if (or (not owner) (eq? owner (node-self)))
-          (local-resume id req)
-          (forward-resume owner id req))))
+          (local-resume id token req)
+          (forward-resume owner id token req))))
 
   ;; Resume a conversation that lives on THIS node.
-  (define (local-resume id req)
+  ;; -> (values reply next-token), where next-token is #f when the
+  ;; conversation is over ('gone, 'stale, or a final reply).
+  (define (local-resume id token req)
     (let ((p (whereis (conversation-name id))))
       (if (not p)
-          'gone
+          (values 'gone #f)
           (let ((ref (gensym))
                 (m (monitor p)))
-            (send p (vector 'conv-step self ref req))
+            (send p (vector 'conv-step self ref token req))
             (receive
-              (`#(conv-reply ,@ref ,reply)
+              (`#(conv-reply ,@ref ,reply ,next)
                 (when m (demonitor m))
                 (flush-down! p)
-                reply)
-              (`#(DOWN ,@p ,reason) 'gone))))))
+                (values reply next))
+              (`#(DOWN ,@p ,reason) (values 'gone #f)))))))
 
   (define (conversation-gone? x) (eq? x 'gone))
+
+  ;; The request named a reply that is no longer the one being answered --
+  ;; a duplicate, a retry, a second front end. It was NOT applied and will
+  ;; not be, which is a fact about this conversation rather than a guess.
+  ;;
+  ;; It says nothing about whether the request it duplicates succeeded: the
+  ;; step it was trying to repeat may well have run for whoever got there
+  ;; first. A caller that reaches here should read the current state, not
+  ;; resubmit -- it has no valid token to resubmit with, which is the point.
+  (define (conversation-stale? x) (eq? x 'stale))
 )

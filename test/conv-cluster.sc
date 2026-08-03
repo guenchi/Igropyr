@@ -36,9 +36,9 @@
     ;; 'gone. We have no evidence about a node we cannot contact, and 'gone
     ;; is a GUARANTEE that the transaction rolled back -- claiming it here
     ;; would invite a retry that duplicates a flow still running elsewhere.
-    (unless (eq? 'unreachable (conversation-resume! "nowhere~deadbeef" 1))
-      (fail! "unknown-owner-should-be-unreachable"
-             (conversation-resume! "nowhere~deadbeef" 1)))
+    (let-values (((r n) (conversation-resume! "nowhere~deadbeef" 1 1)))
+      (unless (eq? 'unreachable r)
+        (fail! "unknown-owner-should-be-unreachable" r)))
     (display "resume to unknown owner -> unreachable ok\n")
 
     (spawn-child!)
@@ -46,9 +46,10 @@
     (display "handshake ok\n")
 
     (let* ((got (receive (after 10000 (fail! "conv-id-timeout"))
-                  (`#(conv-id ,id ,fr) (cons id fr))))
+                  (`#(conv-id ,id ,tk ,fr) (list id tk fr))))
            (id (car got))
-           (fr (cdr got)))
+           (tok0 (cadr got))
+           (fr (caddr got)))
       (unless (equal? fr (vector 'ack 0)) (fail! "first-reply" fr))
       ;; the id must actually carry b as its owner, else this proves nothing
       (unless (eq? 'b (string->symbol
@@ -58,19 +59,28 @@
         (fail! "id-not-owned-by-b" id))
       (display "forwarded conversation created, owner=b ok\n")
 
-      (let ((r (conversation-resume! id 5)))
-        (unless (equal? r (vector 'ack 5)) (fail! "resume-1" r)))
-      (let ((r (conversation-resume! id 10)))
-        (unless (equal? r (vector 'ack 15)) (fail! "resume-2" r)))
-      (display "cross-node resume round-trips ok\n")
+      ;; each round answers the reply it was handed, and the next token
+      ;; comes back over the link with it
+      (let-values (((r t1) (conversation-resume! id tok0 5)))
+        (unless (equal? r (vector 'ack 5)) (fail! "resume-1" r))
+        (let-values (((r2 t2) (conversation-resume! id t1 10)))
+          (unless (equal? r2 (vector 'ack 15)) (fail! "resume-2" r2))
+          (display "cross-node resume round-trips ok\n")
 
-      (let ((r (conversation-resume! id 'done)))
-        (unless (equal? r (vector 'final 15)) (fail! "resume-final" r)))
-      (display "cross-node final reply ok\n")
+          ;; a token already spent is refused ACROSS the link too -- this is
+          ;; where a duplicate is most likely, since a forwarded resume can
+          ;; be delayed by the network that carries it
+          (let-values (((rs ts) (conversation-resume! id t1 10)))
+            (unless (eq? rs 'stale) (fail! "cross-node-stale" rs)))
+          (display "a spent token is refused across the link ok\n")
 
-      (let ((r (conversation-resume! id 99)))
-        (unless (eq? r 'gone) (fail! "resume-after-done" r)))
-      (display "resume after completion -> gone ok\n"))
+          (let-values (((r3 t3) (conversation-resume! id t2 'done)))
+            (unless (equal? r3 (vector 'final 15)) (fail! "resume-final" r3))
+            (display "cross-node final reply ok\n")
+
+            (let-values (((r4 t4) (conversation-resume! id 99 99)))
+              (unless (eq? r4 'gone) (fail! "resume-after-done" r4)))
+            (display "resume after completion -> gone ok\n")))))
 
     (rsend 'b 'ctrl (vector 'quit))     ; let the owner exit promptly
     (sleep-ms 200)
