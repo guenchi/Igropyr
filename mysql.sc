@@ -257,8 +257,13 @@
                 (wait-data c buf loop timeout)))
           (wait-data c buf loop timeout))))
 
+  ;; timeout may be a NUMBER or a thunk. A thunk is what the handshake
+  ;; passes: computing the allowance once and re-arming it for every
+  ;; fragment leaves the deadline unchecked for the whole of one message,
+  ;; so a peer that dribbles a single message forever never trips it -- the
+  ;; same re-arming shape the deadline was added to replace, one level down.
   (define (wait-data c buf k timeout)
-    (receive (after timeout (mysql-fail -1 "server timeout"))
+    (receive (after (if (procedure? timeout) (timeout) timeout) (mysql-fail -1 "server timeout"))
       (`#(tcp-data ,bv)
         (inbuf-append! buf bv)
         (k))
@@ -382,7 +387,7 @@
   ;; key (opts 'server-public-key, a PEM string) -- then we never trust a
   ;; key from the wire -- or explicitly opts in with 'allow-insecure-auth
   ;; (appropriate over TLS or a trusted local socket).
-  (define (full-auth! c buf password nonce seq opts)
+  (define (full-auth! c buf password nonce seq opts deadline)
     (define pinned (assq-ref opts 'server-public-key))
     (define (encrypt-with n e)
       (let ((plain (bv-xor (bv-append (string->utf8 password) (bytevector 0))
@@ -394,7 +399,7 @@
          (encrypt-with n e)))
       ((assq-ref opts 'allow-insecure-auth)
        (send-packet! c (bytevector 2) seq)          ; request public key
-       (let-values (((p sq) (next-packet! c buf connect-timeout-ms)))
+       (let-values (((p sq) (next-packet! c buf (lambda () (auth-wait-ms deadline)))))
          (unless (fx= (bytevector-u8-ref p 0) 1)
            (mysql-fail -1 "expected server public key"))
          (let-values (((n e) (parse-rsa-public-key
@@ -423,10 +428,10 @@
         (else (assertion-violation 'mysql-connect
                 "'connect-deadline-ms must be a positive exact integer" v)))))
 
-  (define (auth-loop! c buf user password nonce opts)
-    (let ((deadline (+ (now-ms) (connect-deadline opts))))
+  (define (auth-loop! c buf user password nonce opts deadline)
+    (let ()
      (let loop ()
-      (let-values (((p seq) (next-packet! c buf (auth-wait-ms deadline))))
+      (let-values (((p seq) (next-packet! c buf (lambda () (auth-wait-ms deadline)))))
         (let ((b0 (bytevector-u8-ref p 0)))
           (cond
             ((fx= b0 0) 'ok)
@@ -438,7 +443,7 @@
                  ((fx= b1 4)                       ; full auth required
                   (if (= 0 (string-length password))
                       (begin (send-packet! c (bytevector 0) (+ seq 1)) (loop))
-                      (begin (full-auth! c buf password nonce (+ seq 1) opts)
+                      (begin (full-auth! c buf password nonce (+ seq 1) opts deadline)
                              (loop))))
                  (else (mysql-fail -1 "unexpected auth data")))))
             ((fx= b0 #xFE)                         ; AuthSwitchRequest
@@ -462,8 +467,15 @@
                                                      plugin))))))
             (else (mysql-fail -1 "unexpected packet during auth"))))))))
 
+  ;; The deadline is stamped HERE, at the first byte of the handshake, not
+  ;; once the greeting has been read. Reading the greeting with the
+  ;; per-packet timeout left the very first exchange unbounded -- a server
+  ;; sending one byte every nine seconds never trips it and holds a
+  ;; connecting slot forever, which is precisely what the deadline exists to
+  ;; stop. The RSA public-key read inside full-auth! escaped it the same way.
   (define (authenticate! c buf user password db opts)
-    (let-values (((p seq) (next-packet! c buf connect-timeout-ms)))
+    (let ((deadline (+ (now-ms) (connect-deadline opts))))
+     (let-values (((p seq) (next-packet! c buf (lambda () (auth-wait-ms deadline)))))
       (let-values (((nonce plugin) (parse-handshake p)))
         (let ((token (cond
                        ((string=? plugin "caching_sha2_password")
@@ -474,7 +486,7 @@
                                               "unsupported auth plugin: " plugin))))))
           (send-packet! c (handshake-response user token db plugin) (+ seq 1))
           ;; full-auth path needs the nonce again
-          (auth-loop! c buf user password nonce opts)))))
+          (auth-loop! c buf user password nonce opts deadline))))))
 
   ;; ---- queries ------------------------------------------------------------------------
 

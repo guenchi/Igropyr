@@ -88,12 +88,41 @@
 (define fragment-bytes (box 0))
 (define fragment-gap-ms (box 0))
 
+;; when set, the greeting is dribbled one byte at a time with a gap under
+;; the per-packet timeout -- the shape that never trips a re-arming timeout
+(define dribble-greeting (box #f))
+
 (define (start-server!)
   (tcp-listen! "127.0.0.1" port 16
     (lambda (c)
       (let ((pid
               (spawn
                 (lambda ()
+                  (if (unbox dribble-greeting)
+                      ;; never finishes, never stalls: every read completes
+                      ;; well inside the per-packet timeout, so only a
+                      ;; deadline on the whole handshake can end it
+                      (let ((g (packet greeting 0)))
+                        ;; the gap is a receive, not a sleep, so this side
+                        ;; goes away when the client does -- otherwise the
+                        ;; server's own connection and process are still
+                        ;; there at measurement time and hide the very thing
+                        ;; being measured
+                        (let drip ((i 0))
+                          (if (< i (bytevector-length g))
+                              (begin
+                                (tcp-write! c (let ((b (make-bytevector 1)))
+                                                (bytevector-u8-set! b 0
+                                                  (bytevector-u8-ref g i))
+                                                b)
+                                            #f)
+                                (receive (after 120 (drip (+ i 1)))
+                                  (`#(tcp-eof) (tcp-close! c))
+                                  (`#(tcp-error ,_) (tcp-close! c))))
+                              (receive (after 60000 (tcp-close! c))
+                                (`#(tcp-eof) (tcp-close! c))
+                                (`#(tcp-error ,_) (tcp-close! c))))))
+                      (begin
                   (tcp-write! c (packet greeting 0) #f)
                   ;; the client's handshake response; contents unchecked --
                   ;; test/mysql.sc covers real authentication against a real
@@ -145,7 +174,7 @@
                           (`#(tcp-eof) (tcp-close! c))
                           (`#(tcp-error ,_) (tcp-close! c)))))
                     (`#(tcp-eof) (tcp-close! c))
-                    (`#(tcp-error ,_) (tcp-close! c)))))))
+                    (`#(tcp-error ,_) (tcp-close! c)))))))))
         (conn-set-owner! c pid)
         (tcp-read-start! c)))
     0))
@@ -216,6 +245,41 @@
           (mysql-query conn (make-string (* 17 1024 1024) #\a))
           #f))
       (mysql-close! conn))
+
+    ;; ---- a greeting that never finishes -----------------------------------
+    ;; The handshake deadline was stamped after the greeting had been READ,
+    ;; so the very first exchange ran on the per-packet timeout -- which
+    ;; re-arms, and therefore never fires against a server that keeps
+    ;; sending. One byte every nine seconds held a connecting slot forever.
+    ;;
+    ;; The assertion is on the WORKER: the caller has its own timeout and
+    ;; would give up either way, so measuring the caller proves nothing.
+    (set-box! dribble-greeting #t)
+    (sleep-ms 300)
+    (let ((base-conns (conn-count)) (base-procs (process-count)))
+      (let* ((t0 (now-ms))
+             (_ (guard (e (#t 'expected))
+                  (mysql-connect "127.0.0.1" port "user" "pw" "db"
+                                 '((connect-deadline-ms . 2000)))
+                  (check "a dribbled greeting does not connect" #f)))
+             (ms (- (now-ms) t0)))
+        (display "  [info] caller returned after ") (display ms)
+        (display " ms; worker deadline 2000 ms\n")
+        ;; The caller's OWN timeout is connect-timeout-ms + 2000 = 12000, so
+        ;; a return at ~2000 can only come from the worker giving up on its
+        ;; deadline. Without the deadline reaching the greeting read it
+        ;; returns at ~9900 -- and the resource assertions below still pass,
+        ;; because by the time they are measured everything HAS been cleaned
+        ;; up. They say nothing about WHEN.
+        (check "the deadline bounds the greeting itself" (< ms 4000)))
+      ;; well past the deadline: a bounded worker is certainly gone
+      (sleep-ms 2500)
+      (display "  [info] conns ") (display base-conns) (display " -> ")
+      (display (conn-count)) (display ", processes ") (display base-procs)
+      (display " -> ") (display (process-count)) (newline)
+      (check "the worker gives up on the deadline" (= (conn-count) base-conns))
+      (check "and leaves no process behind" (= (process-count) base-procs)))
+    (set-box! dribble-greeting #f)
 
     (sleep-ms 200)
     (if (zero? failures)

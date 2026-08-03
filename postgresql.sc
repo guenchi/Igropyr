@@ -311,8 +311,13 @@
         (postgresql-fail 'transport "connect deadline exceeded"))
       (max 1 (min connect-timeout-ms left))))
 
+  ;; timeout may be a NUMBER or a thunk. A thunk is what the handshake
+  ;; passes: computing the allowance once and re-arming it for every
+  ;; fragment leaves the deadline unchecked for the whole of one message,
+  ;; so a peer that dribbles a single message forever never trips it -- the
+  ;; same re-arming shape the deadline was added to replace, one level down.
   (define (wait-data c buf k timeout)
-    (receive (after timeout (postgresql-fail 'transport "server timeout"))
+    (receive (after (if (procedure? timeout) (timeout) timeout) (postgresql-fail 'transport "server timeout"))
       (`#(tcp-data ,bv)
         (inbuf-append! buf (tx-decode c bv))
         (k))
@@ -324,7 +329,7 @@
   ;; informational and must not fail the handshake.
   (define (next-msg!/skip-notices c buf deadline)
     (let loop ()
-      (let-values (((t p) (next-msg! c buf (auth-wait-ms deadline))))
+      (let-values (((t p) (next-msg! c buf (lambda () (auth-wait-ms deadline)))))
         (if (fx= t (char->integer #\N))
             (loop)
             (values t p)))))
@@ -523,7 +528,7 @@
     (tx-write! c (startup-msg user db))
     (let ((deadline (+ (now-ms) (connect-deadline opts))))
       (let loop ()
-        (let-values (((t p) (next-msg! c buf (auth-wait-ms deadline))))
+        (let-values (((t p) (next-msg! c buf (lambda () (auth-wait-ms deadline)))))
         (case (integer->char t)
           ((#\R)
            (let ((code (read-u32-be p 0)))
@@ -570,7 +575,7 @@
   ;; and notices; consume through the first ReadyForQuery ('Z').
   (define (finish-startup! c buf deadline)
     (let loop ()
-      (let-values (((t p) (next-msg! c buf (auth-wait-ms deadline))))
+      (let-values (((t p) (next-msg! c buf (lambda () (auth-wait-ms deadline)))))
         (case (integer->char t)
           ((#\Z) 'ok)
           ((#\E) (raise (error-response->fail p)))
