@@ -127,15 +127,34 @@
 
   ;; CSPRNG conversation ids: resuming is authorization, so ids must be
   ;; unguessable (same reasoning as session sids)
-  (define (conv-hex!)
-    (let ((bv (make-bytevector 16)))
+  (define (conv-hex/n! n)
+    (let ((bv (make-bytevector n)))
       (call-with-port (open-file-input-port "/dev/urandom")
-        (lambda (p) (get-bytevector-n! p bv 0 16)))
+        (lambda (p) (get-bytevector-n! p bv 0 n)))
       (apply string-append
         (map (lambda (i)
                (let ((h (number->string (bytevector-u8-ref bv i) 16)))
                  (if (= (string-length h) 1) (string-append "0" h) h)))
-             (iota 16)))))
+             (iota n)))))
+
+  (define (conv-hex!) (conv-hex/n! 16))
+
+  ;; Step tokens come from the same source as ids, and for the same reason.
+  ;;
+  ;; A counter would have been enough to make arrival order stop being
+  ;; load-bearing -- that is all causality needs. But a token is presented
+  ;; as authorization to take a step, and a consecutive integer is one
+  ;; anybody holding the id can produce without ever having read a reply.
+  ;; The id is the capability, so this is not a new way in; it is the
+  ;; difference between "a wrong guess is impossible" and "a wrong guess is
+  ;; off by one". In a flow that moves money, that difference is the whole
+  ;; margin.
+  ;;
+  ;; Eight bytes, not sixteen: a token is scoped to one conversation and
+  ;; lives for one step, so it needs to be unguessable, not globally
+  ;; unique. It stays a string, which crosses a node link, JSON and a query
+  ;; parameter unchanged.
+  (define (conv-token!) (conv-hex/n! 8))
 
   ;; The id carries the owner node so a resume on any node reaches it:
   ;; "<node>~<hex>" when clustered, bare "<hex>" on a single node. The
@@ -372,12 +391,12 @@
                    ;; is mid-step, and the caller can retry when it is not.
                    (define (suspend! reply)
                      (set! step (+ step 1))
-                     (set! awaiting step)
+                     (set! awaiting (conv-token!))
                      (set! last-reply reply)
                      (set-box! step-box step)
                      (set-box! running-box #f)      ; parked from here
                      ;; the reply carries the token that answers it
-                     (send who (vector 'conv-reply tag reply step))
+                     (send who (vector 'conv-reply tag reply awaiting))
                      ;; A resume must name the reply it is answering.
                      ;;
                      ;; Arrival order used to stand in for that: everything
@@ -423,7 +442,7 @@
                          (`#(conv-step ,from ,ref2 ,token ,r)
                            (cond
                              ;; the answer to the reply just published
-                             ((and awaiting (eqv? token awaiting))
+                             ((and awaiting (string? token) (string=? token awaiting))
                               (set! last-consumed token)
                               (set! awaiting #f)       ; spent
                               (set! who from) (set! tag ref2)
@@ -436,7 +455,7 @@
                              ;; original caller received. A client whose
                              ;; reply was lost is then able to continue
                              ;; instead of having to reconcile.
-                             ((and last-consumed (eqv? token last-consumed))
+                             ((and last-consumed (string? token) (string=? token last-consumed))
                               (send from (vector 'conv-reply ref2 last-reply awaiting))
                               (wait))
                              (else
@@ -472,7 +491,7 @@
                                                     'completed #f last-reply))
                                  (linger))
                                (`#(conv-step ,from ,ref2 ,token ,r)
-                                 (if (and last-consumed (eqv? token last-consumed))
+                                 (if (and last-consumed (string? token) (string=? token last-consumed))
                                      (send from
                                            (vector 'conv-reply ref2 last-reply #f))
                                      (send from

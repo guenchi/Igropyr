@@ -108,8 +108,7 @@
 
 (app-post app "/t/:id"
   (lambda (req res)
-    (let ((token (string->number
-                   (or (cond ((assoc "token" (req-query req)) => cdr) (else "")) ""))))
+    (let ((token (cond ((assoc "token" (req-query req)) => cdr) (else ""))))
       (let-values (((r next) (conversation-resume! (req-param req "id") token req)))
         (cond
           ((conversation-gone? r)
@@ -127,7 +126,7 @@
 
 ;; the URL a client builds from what the previous reply handed it
 (define (step-url id token)
-  (string-append "/t/" id "?token=" (number->string token)))
+  (string-append "/t/" id "?token=" token))
 
 ;; ---- the dialogue -------------------------------------------------------------
 
@@ -161,7 +160,7 @@
       (expect "the replay moved no money"
         (json-ref (json-of (get "/balance")) "balance") 900)
       ;; a token that never belonged to this conversation is still refused
-      (let ((r4 (post (step-url id (+ tok 99)) "confirm")))
+      (let ((r4 (post (step-url id (string-append tok "aa")) "confirm")))
         (unless (string-contains? r4 "HTTP/1.1 409 ")
           (fail "an invented token after the end was accepted" r4))
         (display "replay after the end, invented token still refused ok\n")))
@@ -230,7 +229,7 @@
       (let ((no-token (post (string-append "/t/" id) "confirm")))
         (unless (string-contains? no-token "HTTP/1.1 409 ")
           (fail "a resume with no token was accepted" no-token)))
-      (let ((wrong (post (step-url id (+ tok 7)) "confirm")))
+      (let ((wrong (post (step-url id (string-append tok "ff")) "confirm")))
         (unless (string-contains? wrong "HTTP/1.1 409 ")
           (fail "a resume with a made-up token was accepted" wrong)))
       (display "a missing or invented token is refused ok\n")
