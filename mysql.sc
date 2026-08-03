@@ -718,6 +718,10 @@
     (let ((db (if (pair? rest) (car rest) #f))
           (opts (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) '())))
       (reject-tls-opt! opts)
+      ;; before the spawn: a bad size checked inside the pool process
+      ;; raises where the caller cannot see it, and this returns a pid
+      ;; that dies a moment later
+      (sql-check-pool-size! 'mysql-pool n)
       (spawn
         (lambda ()
           (sql-pool-loop n

@@ -161,7 +161,50 @@
         (check "a checkout timeout is counted"
           (= (+ before 1) (stat (sql-pool-stats pool) 'checkout-timeouts))))
 
-      (send pool (vector 'db-close)))
+      ;; ---- waits that ended in a TIMEOUT ---------------------------------
+      ;; Recording only the requests that eventually got a connection left
+      ;; these metrics blind to exactly the situation they exist for: a pool
+      ;; saturated enough that everything times out reported a maximum wait
+      ;; of zero, because nothing ever waited successfully.
+      ;;
+      ;; The waits are driven for real -- a request is queued behind a lease,
+      ;; left there, then cancelled the way sql-query and sql-checkout cancel
+      ;; on timeout.
+      (let ((me self))
+        (let ((holder (spawn (lambda ()
+                               (sql-call-with-connection pool
+                                 (lambda (c)
+                                   (send me (vector 'held))
+                                   (receive (`#(release) 'ok)))
+                                 cfg)))))
+          (receive (after 3000 'lost) (`#(held) 'ok))
+          ;; the TOTALS, not the maxima: a max cannot show a 400 ms wait
+          ;; when an earlier successful wait was longer, and asserting on
+          ;; one is a test that depends on the order of the cases above
+          (let ((qref (gensym)) (cref (gensym))
+                (q0 (stat (sql-pool-stats pool) 'queue-wait-ms-total))
+                (c0 (stat (sql-pool-stats pool) 'checkout-wait-ms-total)))
+            (send pool (vector 'db-query "SELECT waited" qref self))
+            (send pool (vector 'db-checkout cref self))
+            (sleep-ms 400)
+            ;; exactly what the client side sends when its timeout fires
+            (send pool (vector 'db-query-cancel qref self))
+            (send pool (vector 'db-checkout-cancel cref self))
+            (sleep-ms 150)
+            (let ((st (sql-pool-stats pool)))
+              (display "  [info] ~400 ms of waiting that timed out added ")
+              (display (- (stat st 'queue-wait-ms-total) q0))
+              (display " ms to queue-wait-total and ")
+              (display (- (stat st 'checkout-wait-ms-total) c0))
+              (display " ms to checkout-wait-total\n")
+              (check "a query that timed out still records its wait"
+                (>= (- (stat st 'queue-wait-ms-total) q0) 300))
+              (check "a checkout that timed out still records its wait"
+                (>= (- (stat st 'checkout-wait-ms-total) c0) 300))))
+          (send holder (vector 'release))
+          (sleep-ms 200)))
+
+      (send pool (vector (quote db-quit))))
 
     ;; ---- a lone connection is not a pool ----------------------------------
     ;; Asking one for pool statistics must be an error, not zeros: an

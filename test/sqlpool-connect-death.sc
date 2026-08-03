@@ -52,7 +52,10 @@
                     (send from (vector 'db-reply r (vector 'fake-rows sql)))
                     (send notify (vector 'db-idle self))
                     (loop))
-                  (`#(db-quit) 'done)))))))))
+                  (`#(db-stats ,r ,from)
+            (send from (vector 'db-stats-reply r #f))
+            (loop))
+          (`#(db-quit) 'done)))))))))
 
 (start-scheduler
   (lambda ()
@@ -66,6 +69,19 @@
 
       (check "and it did so by spawning replacements" (> spawned die-first))
 
+      ;; A worker that dies in the handshake failed to connect just as surely
+      ;; as one that reported a failure. Counting only the latter meant a
+      ;; driver crashing on every greeting reported connect-failures 0 while
+      ;; the pool never filled -- the one number an operator would look at,
+      ;; reading healthy.
+      (let ((st (sql-pool-stats pool)))
+        (display "  [info] connect-failures ")
+        (display (cdr (assq 'connect-failures st)))
+        (display " after ") (display die-first)
+        (display " handshake crashes\n")
+        (check "a crash before db-up counts as a connect failure"
+          (>= (cdr (assq 'connect-failures st)) die-first)))
+
       ;; The slot is a real slot afterwards, not a one-shot: a second query
       ;; must run on it too.
       (let ((r2 (gensym)))
@@ -73,7 +89,7 @@
         (check "the rebuilt connection serves later queries"
           (receive (after 3000 #f) (`#(db-reply ,@r2 ,v) #t))))
 
-      (send pool (vector 'db-close)))
+      (send pool (vector (quote db-quit))))
 
     (sleep-ms 100)
     (if (zero? failures)

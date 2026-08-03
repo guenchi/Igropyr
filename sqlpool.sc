@@ -33,7 +33,7 @@
 
 (library (igropyr sqlpool)
   (export make-sql-cfg
-          sql-pool-loop sql-query sql-drain-stale!
+          sql-pool-loop sql-query sql-drain-stale! sql-check-pool-size!
           sql-transaction sql-call-with-connection sql-close!
           sql-pool-stats)
   (import (chezscheme) (igropyr actor) (igropyr libuv))
@@ -48,6 +48,20 @@
   (define-record-type (sql-cfg make-sql-cfg sql-cfg?)
     (fields error? lost-err closed-err
             query-timeout-err checkout-timeout-err begin-sql))
+
+  ;; A negative or non-integer pool size never satisfies (= i n), so the
+  ;; startup loop spawns connection workers without end; nothing downstream
+  ;; would name it a configuration mistake, it presents as the database
+  ;; melting.
+  ;;
+  ;; Exported because checking it INSIDE the pool process is too late for the
+  ;; caller: mysql-pool and postgresql-pool spawn and hand back a pid, so a
+  ;; bad size did not raise where it was written -- it returned a pid that
+  ;; died a moment later, and the mistake surfaced as a pool that answered
+  ;; nothing. The drivers call this before they spawn.
+  (define (sql-check-pool-size! who n)
+    (unless (and (integer? n) (exact? n) (> n 0))
+      (assertion-violation who "pool size must be a positive exact integer" n)))
 
   ;; ---- pool ---------------------------------------------------------------
 
@@ -109,7 +123,15 @@
       (let ((pid (spawn-conn! me me (gensym))))
         (hashtable-set! connecting pid #t)
         (monitor pid)))
-    ;; a job is #(sql ref from queued-at)
+    ;; a job is #(sql ref from queued-at mon)
+    ;;
+    ;; The MONITOR is why the last slot exists. A queued single query was not
+    ;; monitored at all, so the caller-death cleanup below -- which does
+    ;; filter pending jobs by caller -- never received the DOWN that would
+    ;; run it. A caller killed by its supervisor also never runs its own
+    ;; timeout cancel, so the statement stayed queued and executed whenever
+    ;; a connection freed up: an INSERT applied for a process that had been
+    ;; dead for however long the pool was saturated.
     ;; A busy entry is #(caller ref started-ms). It used to be (caller . ref);
     ;; the dispatch time is what makes query DURATION observable, measured
     ;; from here to the connection's db-idle -- the pool never sees the reply
@@ -119,6 +141,10 @@
         (set! stat-queue-wait-total (+ stat-queue-wait-total waited))
         (when (> waited stat-queue-wait-max) (set! stat-queue-wait-max waited)))
       (set! stat-queries (+ stat-queries 1))
+      ;; it is dispatched: the pool no longer owes this caller anything it
+      ;; could act on, and a monitor left behind would make its later death
+      ;; look like a borrower dying with a lease
+      (when (vector-ref job 4) (demonitor (vector-ref job 4)))
       (hashtable-set! busy c (vector (vector-ref job 2) (vector-ref job 1)
                                      (now-ms)))
       (send c (vector 'db-query (vector-ref job 0)
@@ -134,8 +160,14 @@
     ;; It is also what reclaims a lease afterwards: the supervisor killing a
     ;; stuck worker discards its dynamic-wind winders (actor @kill), so the
     ;; checkin never runs and this monitor is the only path back.
+    ;; #f when the caller is already dead: monitor answers #f for a dead pid
+    ;; (and delivers the DOWN at once). Leasing to it anyway handed a healthy
+    ;; connection to a corpse, and the immediate DOWN then read as "a
+    ;; borrower died holding a transaction" -- destroying and rebuilding a
+    ;; connection nobody had ever touched.
     (define (make-waiter ref from)
-      (vector ref from (monitor from) (now-ms)))
+      (let ((m (monitor from)))
+        (and m (vector ref from m (now-ms)))))
     (define (waiter-ref w) (vector-ref w 0))
     (define (waiter-from w) (vector-ref w 1))
     (define (waiter-mon w) (vector-ref w 2))
@@ -227,23 +259,25 @@
         ((pending?) (assign! c (pop-pending!)))
         ((co-pending?) (lease! c (pop-co!)))
         (else (set! idle (cons c idle)))))
-    ;; Checked here, before the loop that consumes it: a negative or
-    ;; non-integer n never satisfies (= i n), so this spawns connection
-    ;; workers without end. Nothing downstream would name it a
-    ;; configuration mistake -- it presents as the database melting.
-    (unless (and (integer? n) (exact? n) (> n 0))
-      (assertion-violation 'sql-pool
-        "pool size must be a positive exact integer" n))
+    (sql-check-pool-size! 'sql-pool n)
     (do ((i 0 (+ i 1))) ((= i n)) (connect!))
     (let loop ()
       (receive
         (`#(db-query ,sql ,ref ,from)
-          (let ((job (vector sql ref from (now-ms))))
-            (if (pair? idle)
-                (let ((c (car idle)))
-                  (set! idle (cdr idle))
-                  (assign! c job))
-                (set! pending-back (cons job pending-back))))
+          (if (pair? idle)
+              ;; dispatched at once: nothing to watch, the connection
+              ;; answers the caller directly
+              (let ((c (car idle)))
+                (set! idle (cdr idle))
+                (assign! c (vector sql ref from (now-ms) #f)))
+              ;; queued: watch the caller for as long as it is waiting.
+              ;; monitor returns #f for a pid that is ALREADY dead (and
+              ;; delivers the DOWN immediately), so that request is simply
+              ;; not queued -- there is nobody to answer.
+              (let ((m (monitor from)))
+                (when m
+                  (set! pending-back
+                        (cons (vector sql ref from (now-ms) m) pending-back)))))
           (loop))
         (`#(db-idle ,c)
           ;; This is where a dispatched statement finishes, as far as the
@@ -270,11 +304,12 @@
           (loop))
         (`#(db-checkout ,ref ,from)
           (let ((w (make-waiter ref from)))
-            (if (pair? idle)
-                (let ((c (car idle)))
-                  (set! idle (cdr idle))
-                  (lease! c w))
-                (set! co-back (cons w co-back))))
+            (when w
+              (if (pair? idle)
+                  (let ((c (car idle)))
+                    (set! idle (cdr idle))
+                    (lease! c w))
+                  (set! co-back (cons w co-back)))))
           (loop))
         (`#(db-checkin ,from ,c)
           ;; only when c really is leased to `from` -- guards a stale or double
@@ -304,8 +339,23 @@
           ;; genuinely unknown -- that is documented on sql-query and is not
           ;; something a cancel can undo.)
           (set! stat-query-timeouts (+ stat-query-timeouts 1))
-          (let ((mine? (lambda (job) (not (and (eq? (vector-ref job 1) ref)
-                                               (eq? (vector-ref job 2) from))))))
+          ;; Record what this caller WAITED before giving up. Timing only the
+          ;; requests that eventually got a connection left the wait metrics
+          ;; blind to precisely the situation they exist for: a pool so
+          ;; saturated that everything times out reported a maximum wait of
+          ;; zero, because nothing ever waited successfully.
+          (let ((mine? (lambda (job)
+                         (if (and (eq? (vector-ref job 1) ref)
+                                  (eq? (vector-ref job 2) from))
+                             (let ((waited (- (now-ms) (vector-ref job 3))))
+                               (when (vector-ref job 4)
+                                 (demonitor (vector-ref job 4)))
+                               (set! stat-queue-wait-total
+                                     (+ stat-queue-wait-total waited))
+                               (when (> waited stat-queue-wait-max)
+                                 (set! stat-queue-wait-max waited))
+                               #f)
+                             #t))))
             (set! pending-front (filter mine? pending-front))
             (set! pending-back  (filter mine? pending-back)))
           (loop))
@@ -322,6 +372,13 @@
           (set! stat-checkout-timeouts (+ stat-checkout-timeouts 1))
           (let ((drop! (lambda (w)
                          (when (eq? (waiter-ref w) ref)
+                           ;; same as the query side: the wait that ended in
+                           ;; a timeout is the one worth knowing about
+                           (let ((waited (- (now-ms) (waiter-queued-at w))))
+                             (set! stat-checkout-wait-total
+                                   (+ stat-checkout-wait-total waited))
+                             (when (> waited stat-checkout-wait-max)
+                               (set! stat-checkout-wait-max waited)))
                            (demonitor (waiter-mon w)))
                          (not (eq? (waiter-ref w) ref)))))
             (set! co-front (filter drop! co-front))
@@ -449,6 +506,12 @@
             ;; next-backoff! exists to prevent.
             ((hashtable-contains? connecting pid)
              (hashtable-delete! connecting pid)
+             ;; A worker that dies in the handshake failed to connect just
+             ;; as surely as one that reported failure. Counting only the
+             ;; latter meant a driver crashing on every greeting showed
+             ;; connect-failures 0 while the pool never filled -- the one
+             ;; number an operator would look at, reading healthy.
+             (set! stat-connect-failures (+ stat-connect-failures 1))
              (let ((wait (next-backoff!)))
                (spawn (lambda ()
                         (sleep-ms wait)

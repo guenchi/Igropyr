@@ -1026,6 +1026,10 @@
   (define (postgresql-pool n host port user password . rest)
     (let-values (((db opts) (conn-args rest user)))
       (check-password! 'postgresql-pool password opts)
+      ;; before the spawn: a bad size checked inside the pool process
+      ;; raises where the caller cannot see it, and this returns a pid
+      ;; that dies a moment later
+      (sql-check-pool-size! 'postgresql-pool n)
       (spawn
         (lambda ()
           (sql-pool-loop n
