@@ -375,6 +375,21 @@
                    (string-contains? r "after"))
         (error 'http-protocol "streamed 204 carried a body or framing" r))
       (display "streamed 204 suppression ok\n"))
+    ;; A COMPLETE header block must still respect the limit. Finding the
+    ;; terminator used to win the cond outright, so the check only ever
+    ;; caught a header still ARRIVING -- a peer that sent the whole thing in
+    ;; one write was never measured against it. Before the fix a 9 KiB
+    ;; header answered 200 against an 8 KiB limit, which is the limit not
+    ;; applying to anyone who does not dribble.
+    (let ((r (raw-request
+               (string-append "GET /echo HTTP/1.1\r\nHost: x\r\nX-Big: "
+                              (make-string 9216 #\a)
+                              "\r\nConnection: close\r\n\r\n"))))
+      (unless (string-contains? r "431")
+        (error 'http-protocol "complete oversized header accepted"
+               (substring r 0 (min 40 (string-length r)))))
+      (display "complete oversized header refused ok\n"))
+
     ;; ---- configurable body-limit -----------------------------------
     ;; PROCESS-GLOBAL (last http-listen wins), so these run LAST: the
     ;; second listen lowers the limit for every server in this process.
