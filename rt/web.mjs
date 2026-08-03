@@ -124,7 +124,7 @@ const browserIO = () => ({
 export function runGoeteiaInline(text) {
     const body = String(text).replace(/^export /gm, '');
     const main = new Function(body + '\nreturn main;')();
-    main(browserIO());
+    return main(browserIO());
 }
 
 // The two-artifact entry: the wasm module when the engine has WasmGC,
@@ -138,8 +138,15 @@ export async function loadGoeteiaAuto(url, fallback = 'script[type="goeteia/js"]
     const forced = new URLSearchParams(location.search).get('goeteia') === 'js';
     if (!forced && hasWasmGC()) return loadGoeteia(url);
     if (/\.m?js([?#]|$)/.test(fallback)) {
-        const m = await import(new URL(fallback, location.href).href);
-        return m.main(browserIO());
+        // Evaluating the cached module namespace directly would reuse the
+        // generated kernel's module-scoped memory and FFI locals on every
+        // call.  Fetching still benefits from the browser's HTTP cache, but
+        // runGoeteiaInline creates a fresh runtime scope for each launch.
+        const href = new URL(fallback, location.href).href;
+        const response = await fetch(href);
+        if (!response.ok)
+            throw new Error(`Goeteia: ${href} not found`);
+        return runGoeteiaInline(await response.text());
     }
     const tag = document.querySelector(fallback);
     if (!tag) throw new Error('no Goeteia fallback on this page');
