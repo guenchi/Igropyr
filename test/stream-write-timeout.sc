@@ -67,6 +67,7 @@
       (receive (after 6000 (check "client connected" #f))
         (`#(client-sent ,c) (check "client connected and sent" #t)))
 
+
       ;; both halves are up and the writer is stalled mid-stream
       (sleep-ms 300)
       (set! live-conns (conn-count))
@@ -88,6 +89,21 @@
           ;; and this test would pass with the timeout removed
           (check "released no earlier than the deadline"
             (>= (cadr released) timeout-ms))))
+
+      ;; The TERMINATOR carries the same deadline (res-end!'s 0\r\n\r\n used
+      ;; to be fire-and-forget), but there is NO assertion for it here, and
+      ;; the honest reason is that I could not build one that discriminates.
+      ;; Reaching it requires every earlier write to succeed and the peer to
+      ;; stall exactly at the terminator: fill the buffer first and the
+      ;; preceding res-write! times out and closes the connection, so
+      ;; res-end! returns instantly on a closed conn (measured: 0 ms); write
+      ;; too little and nothing stalls at all. Both shapes pass whether or
+      ;; not the terminator is bounded, so neither is worth having.
+      ;;
+      ;; The fix is still right -- an unbounded write there leaves the reader
+      ;; in await-streaming, which has no deadline of its own, and
+      ;; abort-response! cannot help because the handler FINISHED rather than
+      ;; crashed -- but it is carried by inspection, not by this file.
 
       ;; A write that gave up must close the connection: a chunked or SSE
       ;; body cannot resume mid-chunk, so leaving it open would strand a
