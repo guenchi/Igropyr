@@ -330,6 +330,19 @@
   ;; in progress, or a new data frame mid-message), closes the socket with
   ;; the appropriate status code. Invalid UTF-8 in a text message is a
   ;; 1007 close (rather than a crash).
+  ;; ONE SESSION PER PROCESS. Socket data arrives as #(tcp-data bv) with no
+  ;; connection identity -- libuv's delivery names the owner process, not
+  ;; the conn -- so a process holding two sockets has ws-recv consume
+  ;; whichever one spoke first, and attribute it to whichever ws record it
+  ;; was asked about. Across tenants that is data delivered to the wrong
+  ;; session, and the other one then hangs waiting for bytes already eaten.
+  ;;
+  ;; Not fixed here on purpose: the fix is a connection identity in the
+  ;; tcp-data message, which is a libuv-level change touching every one of
+  ;; the ~54 consumers in this tree, and belongs in its own breaking change
+  ;; rather than smuggled into a bug fix. Meanwhile the rule is cheap to
+  ;; follow, and matches how the framework is built everywhere else: a
+  ;; connection is owned by one process. Spawn a process per session.
   (define (ws-recv w)
     (define (deliver op parts)
       (let ((body (bv-concat (reverse parts))))
