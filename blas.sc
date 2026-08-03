@@ -133,7 +133,21 @@
       (assertion-violation who "query shorter than dim float32s" query))
     (unless (and (bytevector? scores)
                  (>= (bytevector-length scores) (* n 4)))
-      (assertion-violation who "scores shorter than n float32s" scores)))
+      (assertion-violation who "scores shorter than n float32s" scores))
+    ;; The output must not be one of the inputs. CBLAS sgemv gives no
+    ;; guarantee about overlap between Y and X or A, so the native lane may
+    ;; overwrite bytes it has yet to read -- undefined behaviour, and in
+    ;; practice a silently wrong answer that depends on the BLAS build.
+    ;;
+    ;; It also means the two lanes would DISAGREE: the pure lane copies the
+    ;; query first, so it produces one answer where the native lane produces
+    ;; another, and a difference between lanes is the one thing this module
+    ;; must never have. Rejecting is the honest contract -- an aliased call
+    ;; has no defined result to return.
+    (when (or (eq? scores query) (eq? scores base))
+      (assertion-violation who
+        "scores must not be the same bytevector as query or base (sgemv makes no guarantee about overlapping Y and X/A)"
+        (if (eq? scores query) 'scores=query 'scores=base))))
 
   (define (blas-scores! base n dim query scores)
     (check-shapes! 'blas-scores! base n dim query scores)
