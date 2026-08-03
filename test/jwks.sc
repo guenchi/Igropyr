@@ -34,12 +34,16 @@
                            "/.well-known/jwks.json"))
 (define url-b (string-append "http://127.0.0.1:" (number->string port)
                              "/b/jwks.json"))
+(define delayed-url (string-append "http://127.0.0.1:" (number->string port)
+                                    "/delayed/jwks.json"))
 
 ;; how many times each document has actually been fetched -- the cache and
 ;; the kid-miss refetch are claims about NETWORK behaviour, so counting is
 ;; the only way to assert them
 (define fetches-a 0)
 (define fetches-b 0)
+(define delayed-fetches 0)
+(define test-owner #f)
 
 (define app (create-app))
 (app-get app "/.well-known/jwks.json"
@@ -52,9 +56,21 @@
     (set! fetches-b (+ fetches-b 1))
     (set-header! res "Content-Type" "application/json")
     (send-text! res (jwks-document key-b))))
+(app-get app "/delayed/jwks.json"
+  (lambda (req res)
+    (set! delayed-fetches (+ delayed-fetches 1))
+    ;; Hold the first reply until the test clears the cache. Later requests
+    ;; answer immediately, so a post-clear refetch is directly observable.
+    (when (= delayed-fetches 1)
+      (send test-owner (vector 'delayed-fetch-started self))
+      (receive (after 5000 (void))
+        (`#(release-delayed-fetch) (void))))
+    (set-header! res "Content-Type" "application/json")
+    (send-text! res (jwks-document key-a))))
 
 (start-scheduler
   (lambda ()
+    (set! test-owner self)
     (app-listen app port '((workers . 2)))
     (sleep-ms 200)
 
@@ -249,7 +265,29 @@
         (let ((before fetches-a))
           (jwks-cache-clear!)
           (jwks-verify tok url)
-          (= (+ before 1) fetches-a))))
+          (= (+ before 1) fetches-a)))
+
+      ;; A clear that races an older in-flight fetch must win. Otherwise the
+      ;; old completion silently repopulates the cache after clear! returns.
+      (jwks-cache-clear!)
+      (spawn
+        (lambda ()
+          (let ((ok (guard (e (#t #f)) (jwks-fetch! delayed-url) #t)))
+            (send test-owner (vector 'delayed-fetch-done ok)))))
+      (let ((server
+              (receive (after 5000 #f)
+                (`#(delayed-fetch-started ,pid) pid))))
+        (check "delayed fetch reached the server" (and server #t))
+        (when server
+          (jwks-cache-clear!)
+          (send server (vector 'release-delayed-fetch))
+          (check "in-flight fetch still returns to its caller"
+            (receive (after 5000 #f)
+              (`#(delayed-fetch-done ,ok) ok)))
+          (let ((before delayed-fetches))
+            (check "cache clear rejects an older fetch completion"
+              (and (jwks-verify tok delayed-url)
+                   (= (+ before 1) delayed-fetches)))))))
 
     (system (string-append "rm -rf " dir))
     (if (zero? failures)
