@@ -1162,7 +1162,16 @@
                 (on-failure req r (vector-ref task 5))))
             (unless (unbox token)
               (quick-response! c 500 "Internal Server Error" token)))
-          (begin
+          ;; Do not run a handler for a connection that is already gone.
+          ;; Workers are few, so a slow handler backs requests up in the
+          ;; supervisor's queue, and a client that disconnects (or a reader
+          ;; that reaped a slow one) leaves its task sitting there. Running
+          ;; it later means touching the database and any external service
+          ;; for a request nobody is waiting on -- and after an outage the
+          ;; whole stale backlog executes at once, which is the worst moment
+          ;; for it. Nothing can be answered on a closed connection anyway:
+          ;; every response path checks conn-state and quietly does nothing.
+          (when (eq? (conn-state c) 'open)
             (handler req r)
             ;; handler finished without responding: don't leave the client hanging
             (unless (unbox token)
@@ -1549,8 +1558,14 @@
         (if (> (inbuf-length buf) pipeline-limit)
             (tcp-close! c)                          ; peer over-pipelining
             (await-response c srv buf eof?)))
-      (`#(tcp-eof) (await-response c srv buf #t))
-      (`#(tcp-error ,e) (await-response c srv buf #t))))
+      ;; The client is gone. Close NOW rather than carrying eof? until the
+      ;; handler answers: the connection state is what tells the queued or
+      ;; running task that nobody is waiting, and every response path
+      ;; already no-ops on a closed conn. Waiting merely kept a task alive
+      ;; for a client that had left -- and after a backlog builds, the whole
+      ;; stale queue runs against the database for requests long abandoned.
+      (`#(tcp-eof) (tcp-close! c) 'done)
+      (`#(tcp-error ,e) (tcp-close! c) 'done)))
 
   ;; A streamed (chunked/SSE) response is in progress: wait without a
   ;; deadline. On client disconnect the reader closes and exits; the

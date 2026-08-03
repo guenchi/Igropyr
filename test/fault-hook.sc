@@ -27,6 +27,25 @@
   (exit 1))
 
 ;; Open a raw connection, send `text`, read until `marker` appears (or
+;; Open a connection, send `text`, and hand the conn back so the caller can
+;; decide when to close it -- which is the whole point for the disconnect
+;; case, where the client must vanish while its task is still queued.
+(define (raw-open port text)
+  (let ((caller self) (ref (gensym)))
+    (spawn
+      (lambda ()
+        (tcp-connect! "127.0.0.1" port self)
+        (receive (after 3000 (send caller (vector 'open-failed ref)))
+          (`#(tcp-connected ,c)
+            (tcp-read-start! c)
+            (tcp-write! c (string->utf8 text) #f)
+            (send caller (vector 'opened ref c))
+            ;; hold the process alive so the conn is not swept as ownerless
+            (receive (after 30000 'done))))))
+    (receive (after 5000 (fail "raw-open timeout" port))
+      (`#(opened ,@ref ,c) c)
+      (`#(open-failed ,@ref) (fail "raw-open connect failed" port)))))
+
 ;; the deadline passes), optionally send `text2` and wait for `marker2`.
 ;; Returns the accumulated response text.
 (define (raw-ring port text marker text2 marker2 timeout-ms)
@@ -72,6 +91,11 @@
     needles)
   (display label) (display " ok\n"))
 
+;; Runs of the handler behind a gate: it must NOT run for a client that
+;; already disconnected.
+(define abandoned-runs 0)
+(define gate-open (box #f))
+
 ;; How many times the answered-then-crashing handler actually ran. A retry
 ;; re-executes the WHOLE handler, so this counts business effects, not
 ;; responses -- the response can only happen once, the token sees to that.
@@ -88,6 +112,17 @@
     ;; answered, and only then something raises. Cleanup, logging, or a
     ;; middleware on its way back out; the bundled access logger writes
     ;; after (next) returns, so a broken log port is a real trigger.
+    ;; occupies the single worker until released
+    (app-get app "/gate"
+      (lambda (req res)
+        (let loop ()
+          (unless (unbox gate-open) (sleep-ms 20) (loop)))
+        (send-text! res "gated")))
+    ;; queues behind /gate; its client disconnects before it ever starts
+    (app-get app "/abandoned"
+      (lambda (req res)
+        (set! abandoned-runs (+ abandoned-runs 1))
+        (send-text! res "ran")))
     (app-get app "/answered-then-crash"
       (lambda (req res)
         (set! answered-crash-runs (+ answered-crash-runs 1))
@@ -111,6 +146,9 @@
             (cons 'on-failure (lambda (req res info) (raise 'bad-hook)))))
     ;; C: no hook -> default plain 500
     (app-listen (build-app) 18083 '((workers . 2)))
+    ;; D: ONE worker, so a second request provably queues rather than
+    ;; finding a free worker
+    (app-listen (build-app) 18084 '((workers . 1)))
     (sleep-ms 100)
 
     ;; crash envelope: retries exhausted -> structured JSON, keep-alive
@@ -120,6 +158,25 @@
       (expect-contains "crash envelope" r
         "HTTP/1.1 503 " "\"fault\":\"crash\"" "\"attempts\":4"
         "\"retryable\":true" "Connection: keep-alive"))
+
+    ;; A task whose client disconnected before it started must not run.
+    ;; Workers are few, so a slow handler backs requests up in the queue;
+    ;; running one later touches the database and any external service for
+    ;; a request nobody is waiting on, and after an outage the whole stale
+    ;; backlog fires at once.
+    (let ((c1 (raw-open 18084 "GET /gate HTTP/1.1\r\nHost: x\r\n\r\n"))
+          (c2 #f))
+      (sleep-ms 200)                       ; c1 now occupies the only worker
+      (set! c2 (raw-open 18084 "GET /abandoned HTTP/1.1\r\nHost: x\r\n\r\n"))
+      (sleep-ms 200)                       ; c2's task is queued behind it
+      (tcp-close! c2)                      ; the client gives up and leaves
+      (sleep-ms 600)                       ; let the server observe the EOF
+      (set-box! gate-open #t)              ; free the worker; the queue drains
+      (sleep-ms 800)
+      (unless (= abandoned-runs 0)
+        (fail "abandoned task still ran" abandoned-runs))
+      (tcp-close! c1)
+      (display "  ok  a disconnected client's queued task does not run\n"))
 
     ;; A handler that ANSWERED and then crashed must not be re-run. The
     ;; client already holds a success; re-running repeats whatever the
