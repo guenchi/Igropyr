@@ -1351,11 +1351,20 @@ when a request is accepted and compared with `equal?`; the default
 never matches for HTTP request records — so an HTTP flow passes
 `req-body`. The key is also all that is retained.
 
+If it raises, the request is `'stale`. Raising says the application
+cannot tell this request apart from another, and two requests it cannot
+tell apart must not replay each other's replies — that is the case
+`'stale` exists for. It is bounded like a step: it runs with the
+watchdog watching, so a key function that hangs does not park the
+conversation forever.
+
 **The token names the reply being answered.** A conversation hands one
 out with every reply and consumes it the moment a request is accepted.
 Send it to the client alongside the reply and take it back with the next
-request — it is a small integer, so it crosses JSON, a query string and
-a node link unchanged.
+request — it is a short hex string, so it crosses JSON, a query string
+and a node link unchanged. It is drawn from the system random source,
+not counted up: a token a caller can guess is a token it can queue
+ahead of, which is the whole mechanism gone.
 
 Without it, the only thing separating "the answer to what I just said"
 from "a duplicate of what you said before" is arrival order, and arrival
