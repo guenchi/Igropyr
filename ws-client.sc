@@ -151,35 +151,94 @@
                     extra-headers))
         "\r\n")))
 
-  ;; verify the 101 response: status 101 and a correct Accept header
-  ;; head-bv: the response's status line + headers, already extracted
+  (define (string-crlf-index s from)
+    (let ((n (string-length s)))
+      (let loop ((i from))
+        (cond ((>= (+ i 1) n) #f)
+              ((and (char=? (string-ref s i) #\return)
+                    (char=? (string-ref s (+ i 1)) #\newline)) i)
+              (else (loop (+ i 1)))))))
+
+  (define (trim-ows s)
+    (let ((n (string-length s)))
+      (let left ((start 0))
+        (if (and (< start n) (memv (string-ref s start) '(#\space #\tab)))
+            (left (+ start 1))
+            (let right ((end n))
+              (if (and (> end start)
+                       (memv (string-ref s (- end 1)) '(#\space #\tab)))
+                  (right (- end 1))
+                  (substring s start end)))))))
+
+  (define (valid-101-status-line? line)
+    (let ((sp1 (string-index line #\space 0)))
+      (and sp1
+           (string=? (substring line 0 sp1) "HTTP/1.1")
+           (let* ((start (+ sp1 1))
+                  (sp2 (string-index line #\space start))
+                  (end (or sp2 (string-length line))))
+             (string=? (substring line start end) "101")))))
+
+  ;; Parse the already bounded handshake header block into lowercase names.
+  ;; A malformed line invalidates the response instead of being skipped.
+  (define (parse-response-headers text start)
+    (let ((n (string-length text)))
+      (let loop ((pos start) (acc '()))
+        (cond
+          ((= pos n) (reverse acc))
+          (else
+           (let ((eol (string-crlf-index text pos)))
+             (and eol
+                  (let* ((line (substring text pos eol))
+                         (colon (string-index line #\: 0)))
+                    (and colon (> colon 0)
+                         (loop (+ eol 2)
+                           (cons (cons (string-downcase (substring line 0 colon))
+                                       (trim-ows
+                                         (substring line (+ colon 1)
+                                                    (string-length line))))
+                                 acc)))))))))))
+
+  (define (response-header-values headers name)
+    (let loop ((hs headers) (acc '()))
+      (cond ((null? hs) (reverse acc))
+            ((string=? (caar hs) name)
+             (loop (cdr hs) (cons (cdar hs) acc)))
+            (else (loop (cdr hs) acc)))))
+
+  (define (value-has-token? value wanted)
+    (let ((n (string-length value)))
+      (let loop ((start 0) (i 0))
+        (cond
+          ((= i n)
+           (string-ci=? (trim-ows (substring value start i)) wanted))
+          ((char=? (string-ref value i) #\,)
+           (or (string-ci=? (trim-ows (substring value start i)) wanted)
+               (loop (+ i 1) (+ i 1))))
+          (else (loop start (+ i 1)))))))
+
+  (define (header-has-token? headers name wanted)
+    (exists (lambda (value) (value-has-token? value wanted))
+            (response-header-values headers name)))
+
+  ;; RFC 6455 4.1: the response must be an HTTP/1.1 101 upgrade, nominate
+  ;; websocket/Upgrade in its token fields, and carry exactly one Accept
+  ;; field whose complete value proves possession of this request's key.
   (define (verify-response head-bv key)
-    (let* ((text (utf8->string head-bv))
-           (lower (string-downcase text))
-           ;; the header NAME is matched case-insensitively (HTTP), but
-           ;; the accept key itself is base64 and must match exactly --
-           ;; case-folding it would accept digests that differ from the
-           ;; one this handshake proves
-           (expected (ws-accept-key key))
-           (label "sec-websocket-accept:"))
-      (and (let ((sp (string-index text #\space 0)))
-             (and sp (>= (string-length text) (+ sp 4))
-                  (string=? (substring text (+ sp 1) (+ sp 4)) "101")))
-           (let ((n (string-length lower)) (ln (string-length label)))
-             (let search ((i 0))
-               (cond
-                 ((> (+ i ln) n) #f)
-                 ((string=? (substring lower i (+ i ln)) label)
-                  ;; skip OWS after the colon, then compare exactly
-                  (let skip ((j (+ i ln)))
-                    (cond
-                      ((and (< j n) (memv (string-ref text j) '(#\space #\tab)))
-                       (skip (+ j 1)))
-                      (else
-                       (let ((e (+ j (string-length expected))))
-                         (and (<= e (string-length text))
-                              (string=? (substring text j e) expected)))))))
-                 (else (search (+ i 1)))))))))
+    (guard (e (#t #f))
+      (let* ((text (utf8->string head-bv))
+             (status-end (string-crlf-index text 0)))
+        (and status-end
+             (valid-101-status-line? (substring text 0 status-end))
+             (let ((headers (parse-response-headers text (+ status-end 2))))
+               (and headers
+                    (header-has-token? headers "upgrade" "websocket")
+                    (header-has-token? headers "connection" "upgrade")
+                    (let ((accepts
+                           (response-header-values
+                             headers "sec-websocket-accept")))
+                      (and (= (length accepts) 1)
+                           (string=? (car accepts) (ws-accept-key key))))))))))
 
   (define max-handshake-header 16384)   ; cap on the 101 response headers
 
