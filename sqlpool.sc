@@ -150,6 +150,13 @@
         ((pending?) (assign! c (pop-pending!)))
         ((co-pending?) (lease! c (pop-co!)))
         (else (set! idle (cons c idle)))))
+    ;; Checked here, before the loop that consumes it: a negative or
+    ;; non-integer n never satisfies (= i n), so this spawns connection
+    ;; workers without end. Nothing downstream would name it a
+    ;; configuration mistake -- it presents as the database melting.
+    (unless (and (integer? n) (exact? n) (> n 0))
+      (assertion-violation 'sql-pool
+        "pool size must be a positive exact integer" n))
     (do ((i 0 (+ i 1))) ((= i n)) (connect!))
     (let loop ()
       (receive

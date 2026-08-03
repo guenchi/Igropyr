@@ -46,11 +46,32 @@
   ;; is asked rather than guessed. The HTTP layer answers it by checking
   ;; whether the response token has been claimed.
   ;; Returns the supervisor pid; send it #(submit-task ,task).
+  ;; Every one of these fails SILENTLY when it is out of range, which is
+  ;; why they are checked at startup rather than trusted. n = 0 starts a
+  ;; listener that accepts requests and queues them forever; a negative
+  ;; check-ms kills the ticker at once, so stuck-worker detection simply
+  ;; disappears while the pool goes on looking healthy; check-ms = 0 spins.
+  ;; None of them announces itself, so a misconfiguration surfaces much
+  ;; later as "the service stopped responding" with nothing to point at.
+  (define (check-pos who what v)
+    (unless (and (integer? v) (exact? v) (> v 0))
+      (assertion-violation who
+        (string-append what " must be a positive exact integer") v)))
+  (define (check-nonneg who what v)
+    (unless (and (integer? v) (exact? v) (>= v 0))
+      (assertion-violation who
+        (string-append what " must be a nonnegative exact integer") v)))
+
   (define (start-worker-pool n run-task fail-task . opts)
     (let* ((max-retries (if (>= (length opts) 1) (car opts) default-max-retries))
            (stuck-ms (if (>= (length opts) 2) (cadr opts) default-stuck-ms))
            (check-ms (if (>= (length opts) 3) (caddr opts) default-check-ms))
            (retryable? (if (>= (length opts) 4) (list-ref opts 3) (lambda (t) #t))))
+      (check-pos 'start-worker-pool "workers" n)
+      ;; 0 retries is meaningful (run once, never retry); negative is not
+      (check-nonneg 'start-worker-pool "max-retries" max-retries)
+      (check-pos 'start-worker-pool "stuck-ms" stuck-ms)
+      (check-pos 'start-worker-pool "check-ms" check-ms)
       (let ((sup (spawn (lambda ()
                           (supervisor n run-task fail-task
                                       max-retries stuck-ms retryable?)))))
