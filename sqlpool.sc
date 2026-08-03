@@ -22,6 +22,10 @@
 ;;;   #(db-conn-dead ,self)         to its pool when it replied a transport
 ;;;                                 error and is about to exit
 ;;;   #(db-up ,ref ,self ,status)   reported by a connecting worker
+;;;   #(db-stats ,ref ,from)        -> #(db-stats-reply ,ref #f); a single
+;;;                                 connection keeps no pool bookkeeping,
+;;;                                 and answering is what stops the request
+;;;                                 sitting in its mailbox forever
 ;;;
 ;;; Drivers keep their public error shapes: the engine takes the error
 ;;; VALUES it must produce and a predicate for recognizing an error
@@ -30,8 +34,9 @@
 (library (igropyr sqlpool)
   (export make-sql-cfg
           sql-pool-loop sql-query sql-drain-stale!
-          sql-transaction sql-call-with-connection sql-close!)
-  (import (chezscheme) (igropyr actor))
+          sql-transaction sql-call-with-connection sql-close!
+          sql-pool-stats)
+  (import (chezscheme) (igropyr actor) (igropyr libuv))
 
   (define query-timeout-ms 60000)
   (define checkout-timeout-ms 60000)   ; how long a caller parks for a free lease
@@ -104,9 +109,18 @@
       (let ((pid (spawn-conn! me me (gensym))))
         (hashtable-set! connecting pid #t)
         (monitor pid)))
-    ;; a job is #(sql ref from)
+    ;; a job is #(sql ref from queued-at)
+    ;; A busy entry is #(caller ref started-ms). It used to be (caller . ref);
+    ;; the dispatch time is what makes query DURATION observable, measured
+    ;; from here to the connection's db-idle -- the pool never sees the reply
+    ;; itself, which goes straight from the connection to the caller.
     (define (assign! c job)
-      (hashtable-set! busy c (cons (vector-ref job 2) (vector-ref job 1)))
+      (let ((waited (- (now-ms) (vector-ref job 3))))
+        (set! stat-queue-wait-total (+ stat-queue-wait-total waited))
+        (when (> waited stat-queue-wait-max) (set! stat-queue-wait-max waited)))
+      (set! stat-queries (+ stat-queries 1))
+      (hashtable-set! busy c (vector (vector-ref job 2) (vector-ref job 1)
+                                     (now-ms)))
       (send c (vector 'db-query (vector-ref job 0)
                       (vector-ref job 1) (vector-ref job 2))))
     ;; A waiter is #(ref from mon). The monitor is taken WHEN THE REQUEST
@@ -120,13 +134,20 @@
     ;; It is also what reclaims a lease afterwards: the supervisor killing a
     ;; stuck worker discards its dynamic-wind winders (actor @kill), so the
     ;; checkin never runs and this monitor is the only path back.
-    (define (make-waiter ref from) (vector ref from (monitor from)))
+    (define (make-waiter ref from)
+      (vector ref from (monitor from) (now-ms)))
     (define (waiter-ref w) (vector-ref w 0))
     (define (waiter-from w) (vector-ref w 1))
     (define (waiter-mon w) (vector-ref w 2))
+    (define (waiter-queued-at w) (vector-ref w 3))
     ;; hand connection c to waiter w, carrying its existing monitor into the
     ;; lease record rather than taking a second one
     (define (lease! c w)
+      (let ((waited (- (now-ms) (waiter-queued-at w))))
+        (set! stat-checkout-wait-total (+ stat-checkout-wait-total waited))
+        (when (> waited stat-checkout-wait-max)
+          (set! stat-checkout-wait-max waited)))
+      (set! stat-checkouts (+ stat-checkouts 1))
       (hashtable-set! leased c (vector (waiter-from w) (waiter-mon w)
                                        (waiter-ref w)))
       (send (waiter-from w) (vector 'db-checkout-reply (waiter-ref w) c)))
@@ -154,6 +175,39 @@
     ;; both are non-empty, so a sustained stream of one kind cannot starve
     ;; the other past its timeout
     (define co-turn #f)
+    ;; ---- statistics ------------------------------------------------------
+    ;;
+    ;; A saturated pool and a slow database look identical from outside: both
+    ;; present as slow requests. What tells them apart is where the time goes
+    ;; -- waiting for a connection, or running the statement -- and nothing
+    ;; here made that observable. Callers could not size a pool, could not
+    ;; tell a leak (in-use never returns to zero) from load, and saw timeouts
+    ;; only as individual raises with no rate behind them.
+    ;;
+    ;; Latencies are kept as total + max + count rather than a histogram: the
+    ;; mean falls out of total/count, the max is the tail that actually hurts,
+    ;; and both are one fixnum add on the hot path.
+    ;;
+    ;; QUERY DURATION is measured from dispatch to the connection's db-idle,
+    ;; because the pool never sees the reply -- that goes straight from the
+    ;; connection to the caller. It therefore excludes queue wait, which is
+    ;; reported separately and is the number that matters when sizing.
+    (define stat-queries 0)              ; statements dispatched
+    (define stat-query-timeouts 0)       ; callers that gave up (db-query-cancel)
+    (define stat-checkouts 0)            ; leases granted
+    (define stat-checkout-timeouts 0)    ; callers that gave up waiting
+    (define stat-connects 0)             ; workers that came up
+    (define stat-connect-failures 0)
+    (define stat-connections-lost 0)     ; live connections that died
+    (define stat-queue-wait-total 0)     ; ms a statement spent queued
+    (define stat-queue-wait-max 0)
+    (define stat-checkout-wait-total 0)  ; ms a borrower spent waiting
+    (define stat-checkout-wait-max 0)
+    (define stat-query-total 0)          ; ms dispatch -> db-idle
+    (define stat-query-max 0)
+    (define stat-completed 0)            ; the count behind stat-query-total
+    (define started-at (now-ms))
+
     ;; grows 1s -> 2 -> 4 ... to a ceiling; reset by any successful connect
     (define backoff-ms 0)
     (define max-backoff-ms 30000)
@@ -184,7 +238,7 @@
     (let loop ()
       (receive
         (`#(db-query ,sql ,ref ,from)
-          (let ((job (vector sql ref from)))
+          (let ((job (vector sql ref from (now-ms))))
             (if (pair? idle)
                 (let ((c (car idle)))
                   (set! idle (cdr idle))
@@ -192,6 +246,14 @@
                 (set! pending-back (cons job pending-back))))
           (loop))
         (`#(db-idle ,c)
+          ;; This is where a dispatched statement finishes, as far as the
+          ;; pool can see it: the reply itself went straight to the caller.
+          (let ((e (hashtable-ref busy c #f)))
+            (when e
+              (let ((took (- (now-ms) (vector-ref e 2))))
+                (set! stat-completed (+ stat-completed 1))
+                (set! stat-query-total (+ stat-query-total took))
+                (when (> took stat-query-max) (set! stat-query-max took)))))
           ;; a leased connection pings idle after each of its transaction
           ;; queries -- ignore those, it stays with its lessee; likewise skip
           ;; a connection we are tearing down.
@@ -241,6 +303,7 @@
           ;; connection the statement is in flight and its outcome is
           ;; genuinely unknown -- that is documented on sql-query and is not
           ;; something a cancel can undo.)
+          (set! stat-query-timeouts (+ stat-query-timeouts 1))
           (let ((mine? (lambda (job) (not (and (eq? (vector-ref job 1) ref)
                                                (eq? (vector-ref job 2) from))))))
             (set! pending-front (filter mine? pending-front))
@@ -256,6 +319,7 @@
           ;; demonitor the pool keeps watching a caller it no longer owes
           ;; anything, and that caller's eventual death lands in the
           ;; borrower-died case with no lease to find
+          (set! stat-checkout-timeouts (+ stat-checkout-timeouts 1))
           (let ((drop! (lambda (w)
                          (when (eq? (waiter-ref w) ref)
                            (demonitor (waiter-mon w)))
@@ -272,6 +336,7 @@
           (if (eq? status 'ok)
               (begin
                 (send pid (vector 'db-adopt))
+                (set! stat-connects (+ stat-connects 1))
                 (set! backoff-ms 0)          ; a success clears the penalty
                 (make-available! pid))
               ;; Failed connect: retry with EXPONENTIAL BACKOFF. A fixed one
@@ -285,13 +350,52 @@
               ;;
               ;; Jittered, so a pool whose slots failed together does not
               ;; reconnect in lockstep forever after.
-              (let ((wait (next-backoff!)))
-                (spawn (lambda ()
-                         (sleep-ms wait)
-                         (send me (vector 'pool-reconnect))))))
+              (begin
+                (set! stat-connect-failures (+ stat-connect-failures 1))
+                (let ((wait (next-backoff!)))
+                  (spawn (lambda ()
+                           (sleep-ms wait)
+                           (send me (vector 'pool-reconnect)))))))
           (loop))
         (`#(pool-reconnect)
           (connect!)
+          (loop))
+        (`#(db-stats ,ref ,from)
+          (send from
+            (vector 'db-stats-reply ref
+              (list
+                ;; gauges: what the pool looks like right now
+                (cons 'size n)
+                (cons 'idle (length idle))
+                (cons 'busy (hashtable-size busy))
+                (cons 'leased (hashtable-size leased))
+                ;; what a caller means by "in use": running a statement or
+                ;; held for a transaction. A pool whose in-use never falls
+                ;; back to zero under no load is leaking leases, and that is
+                ;; not visible from either number alone.
+                (cons 'in-use (+ (hashtable-size busy) (hashtable-size leased)))
+                (cons 'connecting (hashtable-size connecting))
+                (cons 'dying (hashtable-size dying))
+                (cons 'pending (+ (length pending-front) (length pending-back)))
+                (cons 'checkout-pending (+ (length co-front) (length co-back)))
+                ;; counters since the pool started
+                (cons 'queries stat-queries)
+                (cons 'queries-completed stat-completed)
+                (cons 'query-timeouts stat-query-timeouts)
+                (cons 'checkouts stat-checkouts)
+                (cons 'checkout-timeouts stat-checkout-timeouts)
+                (cons 'connects stat-connects)
+                (cons 'connect-failures stat-connect-failures)
+                (cons 'connections-lost stat-connections-lost)
+                ;; latency: total + max, with the count above them, so the
+                ;; mean is total/count and the tail is not averaged away
+                (cons 'queue-wait-ms-total stat-queue-wait-total)
+                (cons 'queue-wait-ms-max stat-queue-wait-max)
+                (cons 'checkout-wait-ms-total stat-checkout-wait-total)
+                (cons 'checkout-wait-ms-max stat-checkout-wait-max)
+                (cons 'query-ms-total stat-query-total)
+                (cons 'query-ms-max stat-query-max)
+                (cons 'uptime-ms (- (now-ms) started-at)))))
           (loop))
         (`#(DOWN ,pid ,reason)
           ;; First: a caller that died while still QUEUED holds nothing. Drop
@@ -328,11 +432,13 @@
                  (hashtable-ref leased pid #f) (hashtable-ref dying pid #f))
              (set! idle (remq pid idle))
              (hashtable-delete! dying pid)
+             (set! stat-connections-lost (+ stat-connections-lost 1))
              (let ((entry (hashtable-ref busy pid #f)))
                (hashtable-delete! busy pid)
                (when entry
-                 (send (car entry)
-                       (vector 'db-reply (cdr entry) (sql-cfg-lost-err cfg)))))
+                 (send (vector-ref entry 0)
+                       (vector 'db-reply (vector-ref entry 1)
+                               (sql-cfg-lost-err cfg)))))
              (let ((e (hashtable-ref leased pid #f)))
                (when e (drop-lease! pid e)))
              (connect!))
@@ -398,7 +504,28 @@
         (`#(db-checkout-failed ,r ,e) (loop))
         ;; a lone driver connect that timed out leaves the worker's late
         ;; up-report behind (its per-attempt ref never matches again)
-        (`#(db-up ,r ,p ,s) (loop)))))
+        (`#(db-up ,r ,p ,s) (loop))
+        (`#(db-stats-reply ,r ,st) (loop)))))
+
+  ;; A snapshot of the pool: an alist of gauges, counters and latency
+  ;; totals. See the db-stats clause in the loop for what each key means.
+  ;;
+  ;; POOL ONLY. A lone connection answers #(db-stats-reply ,ref #f), which
+  ;; raises here -- it is not a degenerate pool, it has none of this
+  ;; bookkeeping, and reporting zeros would be worse than refusing: an
+  ;; operator reading `in-use 0` would conclude the connection was free.
+  ;; The reply exists so the request cannot sit in a connection's mailbox
+  ;; forever, which is the failure mode a bare timeout would have left.
+  (define (sql-pool-stats pool)
+    (drain-stale!)
+    (let ((ref (gensym)))
+      (send pool (vector 'db-stats ref self))
+      (receive (after 5000 (raise 'sql-pool-stats-timeout))
+        (`#(db-stats-reply ,@ref ,st)
+          (or st
+              (assertion-violation 'sql-pool-stats
+                "not a pool -- a single connection keeps no pool statistics"
+                pool))))))
 
   ;; Run one SQL statement on a connection or a pool; blocks only the
   ;; calling green process. The per-call ref (a fresh gensym) is echoed in

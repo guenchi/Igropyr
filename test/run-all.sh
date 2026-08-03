@@ -132,6 +132,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # a connection worker that dies BEFORE reporting db-up is in none of the
 # pool's tables; its DOWN used to match no branch and the slot was lost
 "$scheme_bin" --script igropyr/test/sqlpool-connect-death.sc
+# pool statistics: every number checked against a situation the test
+# constructs (saturation, a timed statement, a lease waited on, both
+# timeout paths), not merely read back
+"$scheme_bin" --script igropyr/test/sqlpool-stats.sc
 # mysql option validation (no server needed, always runs)
 "$scheme_bin" --script igropyr/test/mysql-opts.sc
 # mysql wire-level, against an in-process fake server (always runs): the

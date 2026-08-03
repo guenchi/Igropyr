@@ -82,7 +82,7 @@
 
 (library (igropyr postgresql)
   (export postgresql-connect postgresql-pool postgresql-query
-          postgresql-execute postgresql-close!
+          postgresql-execute postgresql-close! postgresql-pool-stats
           postgresql-transaction call-with-postgresql-connection)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr buffer)
           (igropyr sqlpool)
@@ -789,6 +789,12 @@
       ;; sit in the mailbox forever, slowing every later selective receive
       ;; (the same accumulation drain-stale! exists to prevent).
       (`#(db-query-cancel ,ref ,from) (serve-loop c buf notify))
+      ;; A single connection is not a pool and keeps none of its
+      ;; bookkeeping. Answering #f is what keeps the request from sitting
+      ;; here forever; postgresql-pool-stats turns it into a clear error.
+      (`#(db-stats ,ref ,from)
+        (send from (vector 'db-stats-reply ref #f))
+        (serve-loop c buf notify))
       (`#(db-quit)
         ;; best-effort Terminate: over TLS the encrypt can fail when the
         ;; session already saw close_notify -- the close must run anyway,
@@ -1098,4 +1104,8 @@
     (sql-transaction pool proc cfg))
 
   (define (postgresql-close! mc) (sql-close! mc))
+
+  ;; A snapshot of a pool: in-use, pending, checkout wait, query duration,
+  ;; timeout counts and more. See (igropyr sqlpool) for the full key list.
+  (define (postgresql-pool-stats pool) (sql-pool-stats pool))
 )
