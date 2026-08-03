@@ -321,10 +321,11 @@
 
   (define (conn-loop c buf waiters parse-state)
     (receive
-      (`#(redis-cmd ,args ,ref ,from)
+      ;; already-encoded bytes: see `redis` on why encoding is not done here
+      (`#(redis-cmd ,payload ,ref ,from)
         (if (eq? (conn-state c) 'open)
             (begin
-              (tcp-write! c (encode-command args) #f)
+              (tcp-write! c payload #f)
         (conn-loop c buf (wq-push waiters (vector from ref #t)) parse-state))
             (begin
               (send from (vector 'redis-reply ref connection-lost))
@@ -417,9 +418,22 @@
   ;; ref (a gensym) is echoed in the reply; on timeout the connection is
   ;; told to drop the still-pending reply, and the ref match means even a
   ;; reply already in the mailbox cannot be read by a later call.
+  ;; Encoding happens in the CALLER's process, before anything is sent.
+  ;;
+  ;; It used to happen inside the connection actor, unguarded, so an argument
+  ;; of a type arg->bv does not accept -- a list, a record, #f from a lookup
+  ;; that missed -- raised there and killed the connection. The waiters were
+  ;; that actor's local state and died with it, so every caller already in
+  ;; flight sat until its own 30 s timeout, later callers sent to a dead pid
+  ;; and waited 30 s too, and one caller's type error had taken down a
+  ;; connection shared by the whole application.
+  ;;
+  ;; Encoding here makes it what it is: an error in the process that made
+  ;; it, raised at the call, with the connection untouched.
   (define (redis rc . args)
-    (let ((ref (gensym)))
-      (send rc (vector 'redis-cmd args ref self))
+    (let ((payload (encode-command args))
+          (ref (gensym)))
+      (send rc (vector 'redis-cmd payload ref self))
       (receive (after reply-timeout-ms
                   (send rc (vector 'redis-cancel ref self))
                   (raise (vector 'redis-error "reply timeout")))

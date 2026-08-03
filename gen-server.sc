@@ -113,17 +113,30 @@
     (drain-stale-replies!)
     (let* ((timeout (if (pair? rest) (car rest) default-timeout-ms))
            (p (resolve srv))
-           (ref (next-ref!))
-           (m (monitor p)))
-      (send p (vector 'gen-call self ref msg))
-      (receive (after timeout
-                  (release-monitor! m p)
-                  (raise (vector 'gen-server-error 'timeout msg)))
-        (`#(gen-reply ,@ref ,reply)
-          (release-monitor! m p)
-          reply)
-        (`#(DOWN ,@p ,reason)
-          (raise (vector 'gen-server-error 'server-died reason))))))
+           (ref (next-ref!)))
+      ;; Calling yourself cannot work and never could: the request lands in
+      ;; this process's own mailbox and this process then waits for a reply
+      ;; that only its own loop can produce -- and its loop is right here,
+      ;; inside the handler, waiting. It is a deadlock with no way out, and
+      ;; the way it FAILED hid that: the default timeout made it a 'timeout
+      ;; error five seconds later, usually killing the server, and a timeout
+      ;; of 'infinity parked the server for good.
+      ;;
+      ;; Answering immediately turns an unexplained stall into the mistake it
+      ;; is. A handler that wants its own service should call the plain
+      ;; procedure the handler calls, not route back through the mailbox.
+      (when (eq? p self)
+        (raise (vector 'gen-server-error 'calling-self msg)))
+      (let ((m (monitor p)))
+        (send p (vector 'gen-call self ref msg))
+        (receive (after timeout
+                    (release-monitor! m p)
+                    (raise (vector 'gen-server-error 'timeout msg)))
+          (`#(gen-reply ,@ref ,reply)
+            (release-monitor! m p)
+            reply)
+          (`#(DOWN ,@p ,reason)
+            (raise (vector 'gen-server-error 'server-died reason)))))))
 
   (define (gen-server-cast srv msg)
     (send (resolve srv) (vector 'gen-cast msg)))
