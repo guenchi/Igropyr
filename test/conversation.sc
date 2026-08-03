@@ -326,6 +326,33 @@
             (`#(q1 ,v) (loop (cons (cons 'q1 v) got) (+ n 1)))
             (`#(q2 ,v) (loop (cons (cons 'q2 v) got) (+ n 1))))))))
 
+;; ---- a parked conversation cannot be kept alive by poking it -----------
+;;
+;; The park used to arm `after ttl` afresh on every message, so a caller
+;; repeating a spent or invented token slightly more often than the TTL
+;; kept the conversation parked forever -- holding whatever it holds, an
+;; open transaction included. The watchdog cannot help: it deliberately
+;; ignores a parked conversation, because idling between rounds is not
+;; what it bounds.
+(let-values (((kid ktok kfirst)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (vector 'final a)))
+                'go
+                600)))                          ; TTL 600 ms
+  ;; poke it with an invented token every 200 ms for well over one TTL
+  (let poke ((i 0))
+    (when (< i 6)
+      (conversation-resume! kid "00000000deadbeef" 'noise)
+      (sleep-ms 200)
+      (poke (+ i 1))))
+  ;; the park has run out: the conversation is gone, not still holding
+  (let-values (((state token reply) (conversation-peek kid)))
+    (unless (eq? state 'gone)
+      (fail "a parked conversation was kept alive by repeated pokes" state)))
+  (display "repeated stale requests do not extend the park ok\n"))
+
 ;; ---- peek: settling the question after 'unreachable ---------------------
 ;;
 ;; 'unreachable is not a rollback guarantee and never can be -- a broken

@@ -457,8 +457,17 @@
                      ;; which is a separate decision with a memory cost, and
                      ;; one the token protocol makes addable later without
                      ;; breaking anything.
-                     (let wait ()
-                       (receive (after ttl (raise 'conversation-expired))
+                     ;; ONE deadline for the whole park, not one per
+                     ;; message. Recomputing `after ttl` on every loop meant
+                     ;; a caller repeating a spent or invented token less
+                     ;; often than the TTL kept the conversation parked
+                     ;; forever -- holding its open transaction -- and the
+                     ;; watchdog could not help, because it deliberately
+                     ;; ignores a parked conversation.
+                     (let ((park-until (+ (now-ms) ttl)))
+                      (let wait ()
+                       (receive (after (max 1 (- park-until (now-ms)))
+                                   (raise 'conversation-expired))
                          ;; READ-ONLY. Answers what this conversation is
                          ;; waiting for without advancing it, which is the
                          ;; only way a caller who got 'unreachable can ever
@@ -477,8 +486,14 @@
                               (set! last-request r)
                               (set! awaiting #f)       ; spent
                               (set! who from) (set! tag ref2)
-                              (set-box! running-box #t)
+                              ;; TIMESTAMP FIRST. The watchdog reads
+                              ;; running-box and then run-start-box; setting
+                              ;; running first leaves a window in which it
+                              ;; sees a step running against the PREVIOUS
+                              ;; step's start time, and kills a step that
+                              ;; has had no allowance at all.
                               (set-box! run-start-box (now-ms))
+                              (set-box! running-box #t)
                               r)
                              ;; A REPEAT of the request that got us here --
                              ;; the same token AND the same request. Hand
@@ -504,7 +519,7 @@
                               (wait))
                              (else
                               (send from (vector 'conv-reply ref2 #f 'stale))
-                              (wait)))))))
+                              (wait))))))))
                    (let ((final (flow req suspend!)))
                      (set! last-reply final)
                      (set! awaiting #f)
