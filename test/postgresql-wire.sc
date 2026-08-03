@@ -515,6 +515,27 @@
           (check "killed-pool-releases-processes"
             (<= (process-count) base-procs)))))
 
+    ;; 7d. A process that reconnects in a loop must not accumulate the late
+    ;; up-reports of its own timed-out attempts.
+    ;;
+    ;; Each timed-out connect leaves its worker's #(db-up ref ...) in this
+    ;; mailbox. The ref is a fresh gensym per attempt, so it can never match
+    ;; again: the message is immortal, and every selective receive afterwards
+    ;; scans past all of them. sql-query drains them, but a reconnect manager
+    ;; or supervisor that only ever calls connect never ran one.
+    ;;
+    ;; Timing this proves nothing -- a handful of stale messages costs
+    ;; microseconds to scan, and enough of them to measure would take
+    ;; thousands of timed-out connects. So the stale message is PLANTED and
+    ;; then looked for: exactly the shape a real one has, and its absence
+    ;; afterwards is the drain, directly observed.
+    (let ((planted (gensym)))
+      (send self (vector 'db-up planted self 'ok))
+      (connect-error "127.0.0.1" port "user" scram-password "notice-forever"
+                     '((connect-deadline-ms . 300)))
+      (check "a connect drains an earlier attempt's late up-report"
+        (eq? 'gone (receive (after 0 'gone) (`#(db-up ,@planted ,p ,s) 'still-there)))))
+
     ;; 8. invalid message length -> clean transport error, not an assertion
     (let ((e (connect-error "127.0.0.1" port "user" "x" "badlen")))
       (check "invalid-length-clean-error"

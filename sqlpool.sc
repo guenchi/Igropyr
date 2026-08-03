@@ -29,7 +29,7 @@
 
 (library (igropyr sqlpool)
   (export make-sql-cfg
-          sql-pool-loop sql-query
+          sql-pool-loop sql-query sql-drain-stale!
           sql-transaction sql-call-with-connection sql-close!)
   (import (chezscheme) (igropyr actor))
 
@@ -382,6 +382,14 @@
   ;; cancel). Drain them here, or a long-lived process that suffers
   ;; timeouts accumulates immortal messages that slow every later
   ;; selective-receive scan.
+  ;; Exported because the DRIVERS need it too: a single-connection connect
+  ;; that times out leaves its worker's late up-report in the caller's
+  ;; mailbox, and a long-lived process that reconnects in a loop -- a
+  ;; supervisor, a reconnect manager -- never calls sql-query, so nothing
+  ;; ever cleared them. They are immortal (the per-attempt ref can never
+  ;; match again) and every later selective receive scans past all of them.
+  (define sql-drain-stale! (lambda () (drain-stale!)))
+
   (define (drain-stale!)
     (let loop ()
       (receive (after 0 'done)
