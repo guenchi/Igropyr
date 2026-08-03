@@ -134,6 +134,12 @@
     ;; The streaming writers are a separate path to the same wire, and the
     ;; one where a bodyless status is easiest to get wrong: announcing
     ;; chunked and then sending the terminator is itself a body.
+    ;; a plain streaming route: Express routes HEAD here too, so this is
+    ;; what a HEAD against a streaming handler actually runs
+    ((string=? (req-path req) "/streamed")
+     (res-begin! res)
+     (res-write! res "streamed-body-bytes")
+     (res-end! res))
     ((string=? (req-path req) "/stream204")
      (set-status! res 204)
      (res-begin! res)
@@ -337,6 +343,23 @@
                    (not (string-contains? r "forbidden-body-304")))
         (error 'http-protocol "304 desynchronised the connection" r))
       (display "304 keep-alive framing ok\n"))
+    ;; HEAD against a STREAMING handler. res-send! and the static file path
+    ;; both suppress the body for HEAD; the streaming API did not, and sent
+    ;; chunk framing that a conforming client stops before -- so those bytes
+    ;; became the head of the next response on a kept-alive connection.
+    ;; Pipelining a GET behind it is what makes that visible.
+    (let ((r (raw-request
+               (string-append
+                 "HEAD /streamed HTTP/1.1\r\nHost: x\r\n\r\n"
+                 "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+                 "Connection: close\r\n\r\nafter"))))
+      (unless (and (string-contains? r "HTTP/1.1 200 ")
+                   (not (string-contains? r "streamed-body-bytes"))
+                   (not (string-contains? r "Transfer-Encoding"))
+                   (string-contains? r "after"))
+        (error 'http-protocol "HEAD on a streaming route sent a body" r))
+      (display "HEAD streaming suppression ok\n"))
+
     ;; res-begin!/res-write!/res-end! on a bodyless status: no chunked
     ;; framing may be announced and the handler's writes must vanish, with
     ;; the connection still usable afterwards.
