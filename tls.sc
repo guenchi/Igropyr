@@ -44,7 +44,7 @@
 (library (igropyr tls)
   (export tls-enable! tls-establish!)
   (import (chezscheme) (igropyr actor) (igropyr platform)
-          (only (igropyr libuv) tcp-write! conn-on-close!)
+          (only (igropyr libuv) tcp-write! conn-on-close! now-ms)
           (only (igropyr http-client) set-https-connector!))
 
   ;; ---- shared objects ---------------------------------------------------
@@ -273,18 +273,24 @@
 
         ;; drive the handshake: flush whatever each step produced, wait
         ;; for more ciphertext when OpenSSL wants it
+        ;; ABSOLUTE deadline, not a per-segment budget: this receive re-arms
+        ;; on every record, so a peer that dribbles one just inside the
+        ;; window holds the process, the connection and this SSL session
+        ;; open indefinitely at no cost to itself.
+        (let ((deadline (+ (now-ms) timeout)))
         (let handshake ()
           (let ((r (SSL_do_handshake ssl)))
             (flush-out! c wbio)
             (unless (= r 1)
               (if (= (SSL_get_error ssl r) SSL_ERROR_WANT_READ)
-                  (receive (after timeout (fail! "tls handshake timeout"))
+                  (receive (after (max 1 (- deadline (now-ms)))
+                              (fail! "tls handshake timeout"))
                     (`#(tcp-data ,bv)
                       (BIO_write rbio bv (bytevector-length bv))
                       (handshake))
                     (`#(tcp-eof) (fail! "connection closed during tls handshake"))
                     (`#(tcp-error ,e) (fail! "connection error during tls handshake")))
-                  (fail! (tls-reason "tls handshake failed"))))))
+                  (fail! (tls-reason "tls handshake failed")))))))
 
         ;; ---- established: hand back the codec --------------------------
         (let ((scratch (make-bytevector 16384)))

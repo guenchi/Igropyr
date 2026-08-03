@@ -244,7 +244,18 @@
 
   ;; read until the response headers are complete (resumable scan --
   ;; no rescans-from-zero as segments arrive), then verify
-  (define (await-handshake c key buf)
+  ;; deadline is an ABSOLUTE time, not a per-segment budget. The receive
+  ;; below re-arms on every arrival, so a peer that dribbles one byte just
+  ;; inside the window holds this process and its connection open forever
+  ;; at no cost to itself -- slowloris, against a client. The server bounds
+  ;; the same shape with request-deadline-ms for the same reason.
+  (define (await-handshake c key buf deadline)
+    (let ((left (- deadline (now-ms))))
+      (if (<= left 0)
+          (begin (tcp-close! c) (fail "handshake timeout"))
+          (await-handshake* c key buf deadline left))))
+
+  (define (await-handshake* c key buf deadline left)
     (let ((hend (inbuf-find-header-end buf)))
       (cond
         (hend
@@ -255,11 +266,11 @@
         ((> (inbuf-length buf) max-handshake-header)
          (tcp-close! c) (fail "handshake header too large"))
         (else
-         (receive (after connect-timeout-ms
+         (receive (after left
                      (tcp-close! c) (fail "handshake timeout"))
            (`#(tcp-data ,bv)
              (inbuf-append! buf bv)
-             (await-handshake c key buf))
+             (await-handshake c key buf deadline))
            (`#(tcp-eof) (tcp-close! c) (fail "connection closed during handshake"))
            (`#(tcp-error ,e) (tcp-close! c) (fail "connection error")))))))
 
@@ -300,7 +311,8 @@
                 (tcp-read-start! c)
                 (let ((key (make-ws-key)))
                   (tcp-write! c (handshake-request host path key extra-headers) #f)
-                  (await-handshake c key (make-inbuf))))
+                  (await-handshake c key (make-inbuf)
+                                   (+ (now-ms) connect-timeout-ms))))
               (`#(tcp-connect-failed ,e) (fail (uv-strerror e)))))
           (`#(dns-failed ,e) (fail "dns resolution failed"))))))
 )
