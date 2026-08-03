@@ -103,6 +103,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # a bad command argument must be refused in the CALLER; encoding it inside
 # the connection actor killed a connection shared by the whole application
 "$scheme_bin" --script igropyr/test/redis-bad-arg.sc
+# a file stream whose owner changes must still be reclaimed: the owner
+# INDEX is what teardown consults, and moving only the field leaked the fd
+"$scheme_bin" --script igropyr/test/fs-owner-transfer.sc
 "$scheme_bin" --script igropyr/test/static-stream.sc
 "$scheme_bin" --script igropyr/test/static-cache-capacity.sc
 # one file must be one cache entry: self-skips on a case-sensitive

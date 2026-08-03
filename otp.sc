@@ -72,6 +72,9 @@
       (check-nonneg 'start-worker-pool "max-retries" max-retries)
       (check-pos 'start-worker-pool "stuck-ms" stuck-ms)
       (check-pos 'start-worker-pool "check-ms" check-ms)
+      (unless (procedure? retryable?)
+        (assertion-violation 'start-worker-pool
+          "retryable? must be a procedure of one argument" retryable?))
       (let ((sup (spawn (lambda ()
                           (supervisor n run-task fail-task
                                       max-retries stuck-ms retryable?)))))
@@ -164,7 +167,14 @@
                 ;; after the effect, so retrying repeats it rather than
                 ;; retrying it. Report the failure instead, which is what
                 ;; the caller of a settled task can still act on.
-                (if (not (retryable? task))
+                ;; The predicate is APPLICATION code, called from the
+                ;; supervisor's own DOWN path. An exception from it used to
+                ;; take the supervisor down with it -- and the supervisor is
+                ;; the one process whose death orphans every worker and the
+                ;; ticker. A raise is read as "not retryable": the task has
+                ;; already crashed once, and a predicate that cannot answer
+                ;; is not a reason to run it again.
+                (if (not (guard (e (#t #f)) (and (retryable? task) #t)))
                     (give-up! task (fail-info 'crash reason id elapsed))
                     (let ((a (+ 1 (hashtable-ref attempts id 0))))
                       (if (> a max-retries)
