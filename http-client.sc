@@ -406,6 +406,10 @@
              (cond
                ((= size 0) 'done)               ; final chunk; trailers ignored
                ((< (inbuf-length buf) (+ eol 2 size 2)) 'more)
+               ;; Validate the delimiter before exposing the chunk. The
+               ;; accumulating decoder already enforces this; streaming
+               ;; must not emit bytes from a malformed response first.
+               ((not (crlf-at? buf (+ eol 2 size))) 'bad)
                (else
                 (emit! (inbuf-sub buf (+ eol 2) (+ eol 2 size)))
                 (inbuf-consume! buf (+ eol 2 size 2))
