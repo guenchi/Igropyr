@@ -105,9 +105,10 @@
                                          req ttl
                                          ;; over HTTP two retries are two
                                          ;; different request records, so
-                                         ;; sameness is the body
-                                         (lambda (a b)
-                                           (equal? (req-body a) (req-body b))))))
+                                         ;; what identifies the call is its
+                                         ;; body -- and the body is all that
+                                         ;; gets retained
+                                         req-body)))
         (send-json! res (cons (cons 'conv id)
                               (cons (cons 'token token) reply)))))))
 

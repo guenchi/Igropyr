@@ -346,6 +346,11 @@
         (lambda ()
           (demonitor-node owner)
           (receive (after 0 'ok) (`#(node-down ,@owner) 'ok))
+          ;; and the answer itself, if it landed after we gave up. Left
+          ;; behind it sits in this process's mailbox -- a pool worker's,
+          ;; reused for unrelated work -- where a later broad receive can
+          ;; read it as its own.
+          (receive (after 0 'ok) (`#(conv-peek-reply ,@ref ,a ,b ,c) 'ok))
           (unregister reply-name)))))
 
   ;; Forward a resume to the owner node and wait for its reply.
@@ -390,6 +395,8 @@
           ;; (This used to answer 'gone, which was worse: the caller was
           ;; told the transaction had certainly rolled back.)
           (receive (after 0 'ok) (`#(node-down ,@owner) 'ok))
+          ;; same for a reply that arrived after we stopped waiting
+          (receive (after 0 'ok) (`#(conv-forward-reply ,@ref ,a ,b) 'ok))
           (unregister reply-name)))))
 
   ;; Start a conversation. flow: (lambda (req suspend!) ... final-reply).
@@ -402,7 +409,7 @@
   (define (conversation-start! flow req . opts)
     (ensure-router!)
     (let* ((ttl (if (pair? opts) (car opts) default-ttl-ms))
-           ;; WHAT COUNTS AS THE SAME REQUEST, for replay.
+           ;; WHAT IDENTIFIES A REQUEST, for replay.
            ;;
            ;; A repeat is replayed; a DIFFERENT question bearing the same
            ;; token is not, because answering "cancel" with the result of
@@ -410,16 +417,28 @@
            ;; sameness needs to know what the request IS, and only the
            ;; application does: over HTTP the resumed value is a request
            ;; record, and two retries of the same call are two different
-           ;; records, so the default `equal?` never matches there.
+           ;; records, so a bare equal? never matches there.
            ;;
-           ;; That default fails SAFE -- no match means 'stale, which is
-           ;; correct if unhelpful -- but an application that wants replay
-           ;; over HTTP must say what to compare, e.g.
-           ;;   (lambda (a b) (equal? (req-body a) (req-body b)))
-           (same-request?
+           ;; A KEY function, not a comparator, and the difference is not
+           ;; cosmetic. The key is computed ONCE, when the request is
+           ;; accepted, inside the step's own bounded window; comparison is
+           ;; then plain equal? on the key. A comparator would have been
+           ;; application code run at REPLAY time -- while the conversation
+           ;; is parked, where the watchdog deliberately does not look --
+           ;; so one that blocked would have held an open transaction
+           ;; indefinitely, one that raised would have killed the
+           ;; conversation and turned a committed flow into 'gone, and one
+           ;; that returned any non-#f value at all would have authorized
+           ;; the replay. And the key is what is RETAINED: retaining the
+           ;; request itself keeps a body, and whatever it references, alive
+           ;; for the rest of the conversation.
+           ;;
+           ;;   (lambda (r) (req-body r))     ; over HTTP
+           ;;   values                        ; plain data, the default
+           (request-key
              (if (and (pair? opts) (pair? (cdr opts)) (cadr opts))
                  (cadr opts)
-                 equal?))
+                 values))
            (id (conversation-id!))
            (name (conversation-name id))
            (starter self)
@@ -483,7 +502,7 @@
                  ;; same answer it would have received, rather than an error
                  ;; it cannot act on.
                  (let ((who starter) (tag ref) (step 0) (awaiting #f)
-                       (last-consumed #f) (last-request #f) (last-reply #f))
+                       (last-consumed #f) (last-key #f) (last-reply #f))
                    ;; One resume per step. Two concurrent resumes -- a double
                    ;; click, a client retry, two front ends -- both land in
                    ;; the mailbox; the first wakes this suspend! and the
@@ -495,6 +514,26 @@
                    ;;
                    ;; Answering 'busy is the honest outcome: the conversation
                    ;; is mid-step, and the caller can retry when it is not.
+                   ;; Compute an incoming request's key and compare it.
+                   ;;
+                   ;; This is the one place application code still runs at
+                   ;; replay time -- the incoming request has to be reduced
+                   ;; to a key before it can be compared -- so it is bounded
+                   ;; and it fails safe. `running` is marked while it runs
+                   ;; so the watchdog covers a key function that hangs, and
+                   ;; a raise is read as "not the same request", which sends
+                   ;; the caller to 'stale rather than handing it somebody
+                   ;; else's answer.
+                   (define (same-key? r)
+                     (let ((ok (box #f)) (k (box #f)))
+                       (set-box! run-start-box (now-ms))
+                       (set-box! running-box #t)
+                       (guard (e (#t (void)))
+                         (set-box! k (request-key r))
+                         (set-box! ok #t))
+                       (set-box! running-box #f)
+                       (and (unbox ok) (equal? (unbox k) last-key))))
+
                    (define (suspend! reply)
                      (set! step (+ step 1))
                      (set! awaiting (conv-token!))
@@ -559,7 +598,6 @@
                              ;; the answer to the reply just published
                              ((and awaiting (string? token) (string=? token awaiting))
                               (set! last-consumed token)
-                              (set! last-request r)
                               (set! awaiting #f)       ; spent
                               (set! who from) (set! tag ref2)
                               ;; TIMESTAMP FIRST. The watchdog reads
@@ -570,6 +608,10 @@
                               ;; has had no allowance at all.
                               (set-box! run-start-box (now-ms))
                               (set-box! running-box #t)
+                              ;; the key is application code, so it is
+                              ;; computed HERE -- inside the running window
+                              ;; the watchdog bounds -- not at replay time
+                              (set! last-key (request-key r))
                               r)
                              ;; A REPEAT of the request that got us here --
                              ;; the same token AND the same request. Hand
@@ -590,7 +632,7 @@
                              ;; information that has moved on.
                              ((and last-consumed (string? token)
                                    (string=? token last-consumed)
-                                   (same-request? r last-request))
+                                   (same-key? r))
                               (send from (vector 'conv-reply ref2 last-reply awaiting))
                               (wait))
                              (else
@@ -599,6 +641,13 @@
                    (let ((final (flow req suspend!)))
                      (set! last-reply final)
                      (set! awaiting #f)
+                     ;; RECORDED BEFORE THE LINGER, not after. The linger
+                     ;; can die -- a kill, a key function that raises -- and
+                     ;; a resume waiting on that death reads it as 'gone,
+                     ;; which claims the transaction rolled back. It had
+                     ;; already committed the moment the flow returned, so
+                     ;; that is when the fact is written down.
+                     (tomb-record! id)
                      (send who (vector 'conv-reply tag final 'done))
                      ;; LINGER, then unregister.
                      ;;
@@ -628,14 +677,12 @@
                                (`#(conv-step ,from ,ref2 ,token ,token2-request)
                                  (if (and last-consumed (string? token)
                                           (string=? token last-consumed)
-                                          (same-request? token2-request last-request))
+                                          (same-key? token2-request))
                                      (send from
                                            (vector 'conv-reply ref2 last-reply 'done))
                                      (send from
                                            (vector 'conv-reply ref2 #f 'stale)))
                                  (linger)))))))
-                     ;; the process goes, the fact that it FINISHED stays
-                     (tomb-record! id)
                      (unregister name)))))))
       (let ((m (monitor conv)))
         (receive
