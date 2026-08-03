@@ -201,5 +201,29 @@
             (`#(r1 ,v) (loop (cons (cons 'r1 v) got) (+ n 1)))
             (`#(r2 ,v) (loop (cons (cons 'r2 v) got) (+ n 1))))))))
 
+;; The TTL must bound a RUNNING step, not only time parked in suspend!.
+;; A step that runs long -- slow I/O, a wait that never returns, a CPU loop
+;; -- leaves that receive entirely, and nothing else was counting: the
+;; conversation could hold its transaction or reservation indefinitely. The
+;; pool's stuck-killer does not cover it; that reaps the worker waiting for
+;; the reply, while the conversation is its own process.
+(let-values (((id first)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (sleep-ms 3000)          ; far past the TTL below
+                    (vector 'should-not-get-here a)))
+                'go
+                300)))                       ; TTL 300 ms
+  (let ((me self))
+    (spawn (lambda () (send me (vector 'slow (conversation-resume! id 'X)))))
+    ;; the step overruns, so the watchdog must end the conversation rather
+    ;; than let it run to completion
+    (receive (after 6000 (fail "runaway-step" 'no-answer))
+      (`#(slow ,v)
+        (when (and (vector? v) (eq? (vector-ref v 0) 'should-not-get-here))
+          (fail "runaway step ran to completion despite the TTL" v))
+        (display "runaway step bounded by TTL ok\n")))))
+
 (display "ALL CONVERSATION TESTS PASSED\n")
     (exit 0)))
