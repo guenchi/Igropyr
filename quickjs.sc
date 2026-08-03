@@ -379,10 +379,20 @@
                         (js-free! r-buf)
                         (if s
                             (begin (set! deadline 0) (values #t s))
-                            ;; not string-coercible: JS_ToCStringLen2 left a
-                            ;; pending exception -> drain it and report
+                            ;; Not string-coercible: JS_ToCStringLen2 left a
+                            ;; pending exception. REBUILD, like any other
+                            ;; failed call -- the header promises crash-only,
+                            ;; and this path had been reporting the error
+                            ;; while keeping the same heap and generation.
+                            ;;
+                            ;; It matters more than it looks: reaching here
+                            ;; means the bundle's own toString or valueOf
+                            ;; ran and threw, and it could have written to a
+                            ;; global first. Keeping the runtime keeps that
+                            ;; write, visible to every later request.
                             (let ((msg (read-exception)))
                               (set! deadline 0)
+                              (guard (e (#t #f)) (boot-locked!))
                               (values #f msg))))))))))))))))
 
   ;; -> (values ok? string):     result HTML/text as a Scheme string on #t.
