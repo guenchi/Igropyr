@@ -117,7 +117,7 @@
 ;;; run time.
 
 (library (igropyr conversation)
-  (export conversation-start! conversation-resume!
+  (export conversation-start! conversation-resume! conversation-peek
           conversation-gone? conversation-stale?)
   (import (chezscheme) (igropyr actor)
           (only (igropyr libuv) now-ms)
@@ -195,6 +195,13 @@
   (define (conv-router-loop)
     (let loop ()
       (receive
+        (`#(conv-peek-fwd ,from-node ,reply-name ,ref ,id)
+          (spawn
+            (lambda ()
+              (let-values (((state token reply) (local-peek id)))
+                (rsend from-node reply-name
+                       (vector 'conv-peek-reply ref state token reply)))))
+          (loop))
         (`#(conv-resume ,from-node ,reply-name ,ref ,id ,token ,req)
           (spawn
             (lambda ()
@@ -211,6 +218,28 @@
       (with-interrupts-disabled
         (unless (whereis conv-router-name)
           (register conv-router-name (spawn conv-router-loop))))))
+
+  ;; Forward a peek, with the same failure semantics as a forwarded resume:
+  ;; anything that is not an answer is 'unreachable, never 'gone.
+  (define (forward-peek owner id)
+    (let ((reply-name (fresh-reply-name!))
+          (ref (fresh-ref!)))
+      (register reply-name self)
+      (monitor-node owner)
+      (dynamic-wind
+        (lambda () (void))
+        (lambda ()
+          (if (rsend owner conv-router-name
+                     (vector 'conv-peek-fwd (node-self) reply-name ref id))
+              (receive (after conv-forward-ttl-ms (values 'unreachable #f #f))
+                (`#(conv-peek-reply ,@ref ,state ,token ,reply)
+                  (values state token reply))
+                (`#(node-down ,@owner) (values 'unreachable #f #f)))
+              (values 'unreachable #f #f)))
+        (lambda ()
+          (demonitor-node owner)
+          (receive (after 0 'ok) (`#(node-down ,@owner) 'ok))
+          (unregister reply-name)))))
 
   ;; Forward a resume to the owner node and wait for its reply.
   ;;
@@ -381,6 +410,16 @@
                      ;; breaking anything.
                      (let wait ()
                        (receive (after ttl (raise 'conversation-expired))
+                         ;; READ-ONLY. Answers what this conversation is
+                         ;; waiting for without advancing it, which is the
+                         ;; only way a caller who got 'unreachable can ever
+                         ;; find out what happened: a link that came back is
+                         ;; not permission to resubmit, and resubmitting is
+                         ;; how a flow's effects get applied twice.
+                         (`#(conv-peek ,from ,ref2)
+                           (send from (vector 'conv-peeked ref2
+                                              'parked awaiting last-reply))
+                           (wait))
                          (`#(conv-step ,from ,ref2 ,token ,r)
                            (cond
                              ;; the answer to the reply just published
@@ -428,6 +467,10 @@
                          (let ((left (- until (now-ms))))
                            (when (> left 0)
                              (receive (after left 'done)
+                               (`#(conv-peek ,from ,ref2)
+                                 (send from (vector 'conv-peeked ref2
+                                                    'completed #f last-reply))
+                                 (linger))
                                (`#(conv-step ,from ,ref2 ,token ,r)
                                  (if (and last-consumed (eqv? token last-consumed))
                                      (send from
@@ -471,6 +514,48 @@
                 (flush-down! p)
                 (values reply next))
               (`#(DOWN ,@p ,reason) (values 'gone #f)))))))
+
+  ;; What is this conversation waiting for, and what did it last say?
+  ;;
+  ;; -> (values state token last-reply)
+  ;;      'parked    -- present `token` to continue; last-reply is the
+  ;;                    reply it is waiting to have answered
+  ;;      'completed -- the flow returned; last-reply is its final answer
+  ;;                    and no token continues it
+  ;;      'gone      -- not reachable here (died, expired, or its linger
+  ;;                    window closed)
+  ;;      'unreachable -- the owner node could not be reached; nothing is
+  ;;                    known, exactly as for a resume
+  ;;
+  ;; This exists because 'unreachable is not a rollback guarantee and never
+  ;; can be: a broken link says nothing about the process behind it. A
+  ;; caller left holding that answer had no way to ever settle the
+  ;; question -- and the one thing it must not do is resubmit, which is how
+  ;; a flow's effects get applied twice. Asking is the alternative.
+  ;;
+  ;; It NEVER advances the flow. A peek that arrives while a step is
+  ;; RUNNING is answered when that step parks, so it can take as long as
+  ;; the step does (bounded by the TTL). Reconciliation is not on a
+  ;; latency path; taking the answer early would mean guessing.
+  (define (conversation-peek id)
+    (let ((owner (conv-owner id)))
+      (if (or (not owner) (eq? owner (node-self)))
+          (local-peek id)
+          (forward-peek owner id))))
+
+  (define (local-peek id)
+    (let ((p (whereis (conversation-name id))))
+      (if (not p)
+          (values 'gone #f #f)
+          (let ((ref (gensym))
+                (m (monitor p)))
+            (send p (vector 'conv-peek self ref))
+            (receive
+              (`#(conv-peeked ,@ref ,state ,token ,reply)
+                (when m (demonitor m))
+                (flush-down! p)
+                (values state token reply))
+              (`#(DOWN ,@p ,reason) (values 'gone #f #f)))))))
 
   (define (conversation-gone? x) (eq? x 'gone))
 
