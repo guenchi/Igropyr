@@ -1290,7 +1290,9 @@ express cannot happen.
                           (let ((req2 (suspend! confirm-page-data)))
                             (commit! tx)
                             done-data))))
-                    req)))
+                    req
+                    300000
+                    req-body)))          ; what identifies a retry
       ;; the token goes to the client and must come back with the next request
       (send-json! res (cons (cons 'conv id)
                             (cons (cons 'token token) reply))))))
@@ -1299,26 +1301,55 @@ express cannot happen.
   (lambda (req res)
     (let ((token (string->number
                    (cond ((assoc "token" (req-query req)) => cdr) (else "")))))
-      (let-values (((r next) (conversation-resume! (req-param req "id") token req)))
+      ;; the STATUS decides, never the reply
+      (let-values (((r status) (conversation-resume! (req-param req "id") token req)))
         (cond
-          ((conversation-gone? r)
+          ((conversation-gone? status)             ; died: rolled back
            (set-status! res 410)
            (send-json! res '((fault . "gone") (rolled-back . #t))))
-          ((conversation-stale? r)                 ; a duplicate or a retry
+          ((conversation-settled? status)          ; finished; answer not kept
+           (set-status! res 409)
+           (send-json! res '((fault . "settled") (committed . #t))))
+          ((conversation-stale? status)            ; a different question
            (set-status! res 409)
            (send-json! res '((fault . "stale") (applied . #f))))
-          (next (send-json! res (cons (cons 'token next) r)))
-          (else (send-json! res r)))))))
+          ((conversation-done? status) (send-json! res r))
+          (else (send-json! res (cons (cons 'token status) r))))))))
 ```
 
-API: `(conversation-start! flow req [ttl-ms])` spawns the flow and
-returns `(values id token first-reply)`; inside the flow,
+API: `(conversation-start! flow req [ttl-ms [request-key]])` spawns the
+flow and returns `(values id token first-reply)`; inside the flow,
 `(suspend! reply)` answers the current round and parks until the next
 `(conversation-resume! id token req)`, which returns
-`(values next-reply next-token)` — or `'stale`, `'gone`,
-`'unreachable`. The flow's return value is the final reply; the process
-then exits. Default TTL 300 000 ms; expiry raises
+`(values reply status)`. Default TTL 300 000 ms; expiry raises
 `'conversation-expired` inside the flow so a `guard` can roll back.
+
+**The status is the answer; the reply is only data.** A flow may
+legitimately return the symbol `'gone` as its final value, so control
+outcomes never share a position with it:
+
+| status | meaning |
+|---|---|
+| a token string | the step ran — present it to continue |
+| `'done` | the flow finished; `reply` is its final answer |
+| `'settled` | it finished, but the answer is no longer retained |
+| `'stale` | not applied, and will not be |
+| `'gone` | it died or expired — for a transactional flow, rolled back |
+| `'unreachable` | the owner node could not be reached; nothing is known |
+
+`conversation-done?`, `conversation-settled?`, `conversation-stale?` and
+`conversation-gone?` are applied to the *status*.
+
+`(conversation-peek id)` asks what a conversation is waiting for without
+advancing it — `(values state token last-reply)`, with the same states.
+It is what a caller does after an `'unreachable`, once the link is back,
+instead of resubmitting.
+
+`request-key` says what identifies a request, for replay. It is computed
+when a request is accepted and compared with `equal?`; the default
+`values` compares the request itself, which is right for plain data and
+never matches for HTTP request records — so an HTTP flow passes
+`req-body`. The key is also all that is retained.
 
 **The token names the reply being answered.** A conversation hands one
 out with every reply and consumes it the moment a request is accepted.
@@ -1355,16 +1386,23 @@ this conversation, unlike `'unreachable`. It says nothing about whether
 the request it duplicates succeeded. Read the current state; do not
 resubmit, and note there is no valid token to resubmit with.
 
-**Completion lingers.** After the flow returns, the conversation stays
-reachable for one more TTL and can still replay that final reply.
-Exiting at once was a live double-charge path: the client's final
-confirm commits, the reply is lost, the retry meets a process that no
-longer exists and is told `'gone` — which this library documents as *the
-transaction rolled back*. The client believes the transfer failed and
-performs it again. The cost is one parked process per completed
-conversation until the window closes; past it, `'gone` can no longer
-tell a flow that died from one that finished long ago, so size the TTL
-to cover the retry window your clients actually use.
+**Completion lingers, and then leaves a record.** After the flow
+returns, the conversation stays reachable for one more TTL and can still
+replay that final reply. Exiting at once was a live double-charge path:
+the client's final confirm commits, the reply is lost, the retry meets a
+process that no longer exists and is told `'gone` — which this library
+documents as *the transaction rolled back*. The client believes the
+transfer failed and performs it again.
+
+The linger holds a whole process, so it cannot be long. A tombstone is
+an id and an outcome, so it can be: past the linger a completed
+conversation answers `'settled` rather than `'gone` — the answer is no
+longer available, but *it committed* is what a reconciling caller needs,
+and it is the opposite of what `'gone` would have said. Bounded by age
+and count through `conversation-set-limits!`, because an unbounded
+record of everything that ever finished is a leak with a long fuse; past
+either bound the entry is dropped and `'gone` is ambiguous again. Size
+both to cover the retry window your clients actually use.
 
 The conversation never touches the connection: pool workers stay the
 protocol adapters, parking until the flow replies, so the pool's
