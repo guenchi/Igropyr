@@ -545,8 +545,24 @@
   ;; forever-unmatched reply), closes, and exits -- the pool's monitor
   ;; then rebuilds it, rather than the dead connection returning to the
   ;; idle set.
+  ;; An adopted connection watches its OWNER.
+  ;;
+  ;; The pool monitors its connections, not the other way round, and a
+  ;; monitor is one-directional: when the pool was killed or died of an
+  ;; internal error, actor cleanup dropped the monitoring relationships and
+  ;; left every connection actor running, each holding an fd and, over TLS,
+  ;; a live session. Only an orderly db-quit ever closed them. Recreating
+  ;; the pool then stacked a second full set on top of the first.
+  ;;
+  ;; A connection whose owner is gone has nobody to serve and no way to be
+  ;; reached, so it closes.
   (define (serve-loop c bufbox notify)
     (receive
+      (`#(DOWN ,pid ,reason)
+        (if (and notify (eq? pid notify))
+            (begin (send-packet! c (bytevector 1) 0)   ; COM_QUIT
+                   (tcp-close! c))
+            (serve-loop c bufbox notify)))
       (`#(db-query ,sql ,ref ,from)
         (let ((r (guard (e (#t (as-mysql-error e "query failed")))
                    (run-query! c bufbox sql))))
@@ -579,7 +595,9 @@
   ;; authenticated connection forever.
   (define (await-adoption c bufbox notify)
     (receive (after connect-timeout-ms (tcp-close! c))
-      (`#(db-adopt) (serve-loop c bufbox notify))
+      (`#(db-adopt)
+        (when notify (monitor notify))
+        (serve-loop c bufbox notify))
       (`#(db-quit) (send-packet! c (bytevector 1) 0) (tcp-close! c))
       (`#(tcp-data ,bv)
         (set-box! bufbox (bv-append (unbox bufbox) bv))

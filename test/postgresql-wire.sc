@@ -488,6 +488,33 @@
       (check "trickling-notices-releases-worker"
         (= (process-count) base-procs)))
 
+    ;; 7c. Killing the pool must take its connections with it.
+    ;;
+    ;; The pool monitors its connections; a monitor is one-directional, so
+    ;; when the pool died every connection actor kept running with its fd
+    ;; (and, over TLS, its session). Only an orderly db-quit closed them,
+    ;; and a pool that was killed never sends one. Recreating the pool then
+    ;; stacked a second full set on top of the first.
+    (sleep-ms 1500)
+    (let ((base-conns (conn-count))
+          (base-procs (process-count)))
+      (let ((pool (postgresql-pool 2 "127.0.0.1" port "user" scram-password "scram")))
+        ;; wait until both connections are actually up and serving
+        (postgresql-query pool "SELECT 1")
+        (sleep-ms 500)
+        (let ((busy-conns (conn-count)))
+          (check "pool-connections-established" (> busy-conns base-conns))
+          (kill pool 'reaped)
+          (sleep-ms 1500)
+          (display "  [info] conns ") (display base-conns) (display " -> ")
+          (display busy-conns) (display " -> ") (display (conn-count))
+          (display ", processes ") (display base-procs) (display " -> ")
+          (display (process-count)) (newline)
+          (check "killed-pool-releases-connections"
+            (= (conn-count) base-conns))
+          (check "killed-pool-releases-processes"
+            (<= (process-count) base-procs)))))
+
     ;; 8. invalid message length -> clean transport error, not an assertion
     (let ((e (connect-error "127.0.0.1" port "user" "x" "badlen")))
       (check "invalid-length-clean-error"
