@@ -36,7 +36,7 @@
     ;; 'gone. We have no evidence about a node we cannot contact, and 'gone
     ;; is a GUARANTEE that the transaction rolled back -- claiming it here
     ;; would invite a retry that duplicates a flow still running elsewhere.
-    (let-values (((r n) (conversation-resume! "nowhere~deadbeef" 1 1)))
+    (let-values (((r n) (conversation-resume! "nowhere~deadbeef" "deadbeef" 1)))
       (unless (eq? 'unreachable r)
         (fail! "unknown-owner-should-be-unreachable" r)))
     (display "resume to unknown owner -> unreachable ok\n")
@@ -65,7 +65,7 @@
       ;; back, instead of resubmitting.
       (let-values (((st tk rp) (conversation-peek id)))
         (unless (eq? st 'parked) (fail! "cross-node-peek-state" st))
-        (unless (eqv? tk tok0) (fail! "cross-node-peek-token" tk))
+        (unless (equal? tk tok0) (fail! "cross-node-peek-token" tk))
         (unless (equal? rp (vector 'ack 0)) (fail! "cross-node-peek-reply" rp)))
       (display "peek across the link reports the parked step ok\n")
 
@@ -89,11 +89,11 @@
           ;; that means (ack 15) again rather than (ack 25).
           (let-values (((rs ts) (conversation-resume! id t1 10)))
             (unless (equal? rs (vector 'ack 15)) (fail! "cross-node-replay" rs))
-            (unless (eqv? ts t2) (fail! "cross-node-replay-token" ts)))
+            (unless (equal? ts t2) (fail! "cross-node-replay-token" ts)))
           (display "a spent token replays across the link ok\n")
 
           ;; an invented one is still refused
-          (let-values (((rw tw) (conversation-resume! id 999 10)))
+          (let-values (((rw tw) (conversation-resume! id "00000000deadbeef" 10)))
             (unless (eq? rw 'stale) (fail! "cross-node-invented" rw)))
           (display "an invented token is refused across the link ok\n")
 
@@ -105,7 +105,7 @@
             ;; window it can still tell an invented token apart from a
             ;; repeat -- which is the whole point of lingering: a client
             ;; whose final reply was lost gets it back rather than 'gone
-            (let-values (((r4 t4) (conversation-resume! id 99 99)))
+            (let-values (((r4 t4) (conversation-resume! id "00000000deadbeef" 99)))
               (unless (eq? r4 'stale) (fail! "resume-after-done" r4)))
             (display "an invented token after completion -> stale ok\n")
 

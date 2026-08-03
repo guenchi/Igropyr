@@ -216,8 +216,7 @@
 ;; one being answered.
 (app-post app "/transfer/:id"
   (lambda (req res)
-    (let ((token (string->number
-                   (or (cond ((assoc "token" (req-query req)) => cdr) (else "")) ""))))
+    (let ((token (cond ((assoc "token" (req-query req)) => cdr) (else ""))))
       (let-values (((r next) (conversation-resume! (req-param req "id") token req)))
         (cond
           ((conversation-gone? r)
