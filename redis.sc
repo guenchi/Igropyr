@@ -430,7 +430,23 @@
   ;;
   ;; Encoding here makes it what it is: an error in the process that made
   ;; it, raised at the call, with the connection untouched.
+  ;; A reply that arrived just as this caller gave up is still delivered:
+  ;; the connection had already queued it when the cancel was sent. Its ref
+  ;; keeps a later call from mis-reading it, but nothing removed it, so a
+  ;; long-lived process that suffers timeouts accumulated immortal replies
+  ;; -- possibly large bulk values or arrays -- that every later selective
+  ;; receive walks past. sqlpool and gen-server both drain at entry for the
+  ;; same reason; this did not.
+  ;;
+  ;; A call is synchronous within one green process, so anything present at
+  ;; ENTRY is by construction such a leftover: draining here is race-free.
+  (define (drain-stale-replies!)
+    (let loop ()
+      (receive (after 0 'done)
+        (`#(redis-reply ,r ,v) (loop)))))
+
   (define (redis rc . args)
+    (drain-stale-replies!)
     (let ((payload (encode-command args))
           (ref (gensym)))
       (send rc (vector 'redis-cmd payload ref self))

@@ -110,7 +110,18 @@
       (check (string-append "n-over-int32-rejected " tag)
         (rejects? (lambda () (f base #x80000000 dim query scores))))
       (check (string-append "dim-over-int32-rejected " tag)
-        (rejects? (lambda () (f base n #x80000000 query scores))))))
+        (rejects? (lambda () (f base n #x80000000 query scores))))
+      ;; The output buffer must not be one of the inputs. CBLAS sgemv gives
+      ;; no guarantee about overlap between Y and X or A, so the native lane
+      ;; may overwrite bytes it has yet to read. Both lanes reject, because
+      ;; the pure one copying the query first would otherwise make the two
+      ;; lanes DISAGREE on the same call -- and a difference between lanes is
+      ;; the one thing this module must not have.
+      (let ((sq (make-bytevector (* (max n dim) 4) 0)))
+        (check (string-append "scores-aliasing-query-rejected " tag)
+          (rejects? (lambda () (f base n dim sq sq))))
+        (check (string-append "scores-aliasing-base-rejected " tag)
+          (rejects? (lambda () (f base n dim query base)))))))
   (list (cons blas-scores! "(blas-scores!)")
         (cons blas-scores-pure! "(blas-scores-pure!)")))
 

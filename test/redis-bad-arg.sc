@@ -84,6 +84,23 @@
                  (equal? "OK" (redis r "PING")))))
         (list '(1 2) #f #t (vector 1 2) car))
 
+      ;; ---- a late reply must not become a permanent mailbox resident ----
+      ;; A reply that arrives just as the caller gives up is still delivered;
+      ;; its ref keeps a later call from mis-reading it, but nothing removed
+      ;; it. In a long-lived process each timeout left one behind forever --
+      ;; possibly a large bulk value -- for every later selective receive to
+      ;; walk past.
+      ;;
+      ;; Timing this proves nothing at test scale, so the leftover is
+      ;; PLANTED in exactly the shape a real one has, and its absence after
+      ;; the next call is the drain, directly observed.
+      (let ((planted (gensym)))
+        (send self (vector 'redis-reply planted "a late one"))
+        (redis r "PING")
+        (check "a call drains an earlier call's late reply"
+          (eq? 'gone (receive (after 0 'gone)
+                       (`#(redis-reply ,@planted ,v) 'still-there)))))
+
       (redis-close! r))
 
     (sleep-ms 100)
