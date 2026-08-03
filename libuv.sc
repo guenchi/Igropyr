@@ -960,12 +960,28 @@
       (fill-data! data-ptr)
       (foreign-set! 'void* buf-ptr 0 data-ptr)
       (foreign-set! 'unsigned-64 buf-ptr 8 len)
-      (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
-        (if (< r 0)
-            (begin (foreign-free block) (when on-done (on-done r)) #f)
-            (begin
-              (hashtable-set! write-table block
-                (or on-done (lambda (status) (void))))
+      ;; PUBLISH BEFORE SUBMITTING. uv-write can complete before it returns
+      ;; (a fast loopback write), and the callback looks the block up in
+      ;; write-table -- so registering afterwards is a race the writer
+      ;; loses: the completion finds nothing, frees the block, and the
+      ;; writer then registers a freed address that nothing will ever
+      ;; answer. Upstream that is a stream, a node send or a database
+      ;; operation parked forever.
+      ;;
+      ;; Registering first cannot leak: the only way out without a
+      ;; completion is uv-write failing, and that path removes the entry
+      ;; again. The whole publish/submit pair is interrupt-free so the
+      ;; callback cannot observe a half-built state.
+      (with-interrupts-disabled
+        (hashtable-set! write-table block
+          (or on-done (lambda (status) (void))))
+        (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
+          (if (< r 0)
+              (begin
+                (hashtable-delete! write-table block)
+                (foreign-free block)
+                (when on-done (on-done r))
+                #f)
               #t)))))
 
   ;; Write a sequence of bytevectors as one response. Small writes take
@@ -1064,9 +1080,18 @@
   ;; The thunk runs in libuv callback context: it must not yield, park,
   ;; or raise (a raise here would unwind into C; it is swallowed).
   (define (conn-on-close! c thunk)
-    (if (eq? (conn-state c) 'closed)
-        (thunk)
-        (conn-set-cleanup! c thunk)))
+    ;; The state test and the store must be ONE operation. Between them the
+    ;; close completion can run, and then the thunk is filed on a conn that
+    ;; will never close again -- so it never runs at all, which for the TLS
+    ;; user of this hook means a leaked SSL session, exactly what it exists
+    ;; to prevent. Running it here instead is correct: the resource is gone,
+    ;; so the cleanup is due now.
+    (let ((run-now?
+            (with-interrupts-disabled
+              (if (eq? (conn-state c) 'closed)
+                  #t
+                  (begin (conn-set-cleanup! c thunk) #f)))))
+      (when run-now? (thunk))))
 
   (define (tcp-close! c)
     (when (and (eq? (conn-state c) 'open)
