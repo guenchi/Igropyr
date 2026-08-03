@@ -143,7 +143,7 @@
   (define-record-type (conn make-conn conn?)
     (fields
       (immutable handle conn-handle)             ; foreign address of uv_tcp_t
-      (mutable owner conn-owner conn-set-owner!) ; pid of the reader process
+      (mutable owner conn-owner conn-set-owner-field!) ; pid of the reader process
       (mutable state conn-state conn-set-state!) ; open | closing | closed
       ;; one thunk, run exactly once when the handle's close completes --
       ;; see conn-on-close! below for why cleanup hangs off the conn
@@ -170,6 +170,36 @@
   (define deliver (lambda (owner msg) (void)))
   (define (uv-set-deliver! proc) (set! deliver proc))
 
+  ;; owner pid -> list of resources it may own. This is an INDEX, not the
+  ;; truth: entries are added when ownership is established and never
+  ;; removed on release, so the list is a superset and every candidate is
+  ;; re-checked against the real owner before anything is closed. That
+  ;; asymmetry is deliberate -- a stale entry costs one failed check, while
+  ;; a MISSING entry would silently skip a resource that had to be freed,
+  ;; and conn-set-owner! is exported, so ownership can move at any time.
+  ;;
+  ;; It exists because uv-owner-died! runs on EVERY process death, and
+  ;; scanning four global tables there made each death cost O(all open
+  ;; connections): measured at 34.5 us with none and 67.5 us with 6000, so
+  ;; a busy server paid for its own concurrency on every request that
+  ;; ended. The two quantities that grow under load were multiplying.
+  (define owner-index (make-eq-hashtable))
+
+  (define (index-owner! owner kind key)
+    (when owner
+      (hashtable-set! owner-index owner
+        (cons (cons kind key) (hashtable-ref owner-index owner '())))))
+
+  ;; Ownership is public and mutable -- an application hands a conn to the
+  ;; process that will read it, and may hand it on again. The index has to
+  ;; learn about every such move, so the setter is the hook rather than the
+  ;; raw record field. The old owner's entry is left behind on purpose: it
+  ;; becomes a stale candidate, which costs one failed re-check, whereas
+  ;; forgetting to add the new one would skip a live resource at teardown.
+  (define (conn-set-owner! c owner)
+    (conn-set-owner-field! c owner)
+    (index-owner! owner 'conn (conn-handle c)))
+
   ;; Reclaim what a dead owner can no longer close itself. A killed
   ;; process does not run its dynamic-wind winders (see actor.sc @kill),
   ;; so a handler killed mid-download would otherwise leak its open fd,
@@ -178,39 +208,44 @@
   ;; layer calls this from its process-teardown path.
   (define (uv-owner-died! owner)
     (with-interrupts-disabled
-      ;; Close established sockets. conn-table is the GC root for both the
-      ;; Scheme record and libuv handle, so leaving one here leaks an fd for
-      ;; the lifetime of the VM.
-      (vector-for-each
-        (lambda (handle)
-          (let ((c (hashtable-ref conn-table handle #f)))
-            (when (and c (eq? (conn-owner c) owner)) (tcp-close! c))))
-        (hashtable-keys conn-table))
-      ;; A connect request cannot be synchronously cancelled on every
-      ;; supported libuv. Clear its owner instead; on-connect then closes a
-      ;; late successful handle rather than registering it for a dead pid.
-      (vector-for-each
-        (lambda (req)
-          (let ((entry (hashtable-ref connect-table req #f)))
-            (when (and entry (eq? (cdr entry) owner)) (set-cdr! entry #f))))
-        (hashtable-keys connect-table))
-      ;; DNS has no handle to close. Suppress its eventual delivery while
-      ;; retaining the request entry so the callback still frees it. Do NOT
-      ;; "simplify" this into a hashtable-delete!: on-getaddrinfo runs either
-      ;; way and does the foreign-free, so dropping the key here only loses
-      ;; the record that this request is still outstanding. Setting #f is
-      ;; safe because both delivery sites are guarded by (when owner ...).
-      (vector-for-each
-        (lambda (req)
-          (when (eq? (hashtable-ref getaddrinfo-table req #f) owner)
-            (hashtable-set! getaddrinfo-table req #f)))
-        (hashtable-keys getaddrinfo-table))
-      (vector-for-each
-        (lambda (req)
-          (let ((op (hashtable-ref fs-table req #f)))
-            (when (and op (eq? (fs-op-owner op) owner))
-              (file-stream-close! op))))
-        (hashtable-keys fs-table))))
+      (let ((owned (hashtable-ref owner-index owner '())))
+        (hashtable-delete! owner-index owner)
+        (for-each
+          (lambda (entry)
+            (let ((kind (car entry)) (key (cdr entry)))
+              (case kind
+                ;; conn-table is the GC root for both the Scheme record and
+                ;; the libuv handle, so leaving one here leaks an fd for the
+                ;; lifetime of the VM. Re-check the owner: the index may name
+                ;; a conn this process handed on to someone else.
+                ((conn)
+                 (let ((c (hashtable-ref conn-table key #f)))
+                   (when (and c (eq? (conn-owner c) owner)) (tcp-close! c))))
+                ;; A connect request cannot be synchronously cancelled on
+                ;; every supported libuv. Clear its owner instead; on-connect
+                ;; then closes a late successful handle rather than
+                ;; registering it for a dead pid.
+                ((connect)
+                 (let ((e (hashtable-ref connect-table key #f)))
+                   (when (and e (eq? (cdr e) owner)) (set-cdr! e #f))))
+                ;; DNS has no handle to close. Suppress its eventual delivery
+                ;; while RETAINING the request entry so the callback still
+                ;; frees it. Do NOT "simplify" this into a hashtable-delete!:
+                ;; on-getaddrinfo runs either way and does the foreign-free,
+                ;; so dropping the key here only loses the record that this
+                ;; request is still outstanding. Setting #f is safe because
+                ;; both delivery sites are guarded by (when owner ...).
+                ((dns)
+                 (when (eq? (hashtable-ref getaddrinfo-table key #f) owner)
+                   (hashtable-set! getaddrinfo-table key #f)))
+                ;; an fs op holds an open fd, a 256 KiB foreign chunk buffer
+                ;; and the uv_fs_t; fs-table roots them, so the GC cannot help
+                ((fs)
+                 (let ((op (hashtable-ref fs-table key #f)))
+                   (when (and op (eq? (fs-op-owner op) owner))
+                     (file-stream-close! op))))
+                (else (void)))))
+          owned))))
 
   ;; live listeners: handle address -> accept hook, one entry per
   ;; tcp-listen!. Keyed dispatch (not a single global) so several
@@ -592,6 +627,7 @@
                  (uv-close handle on-close-entry))
                 (else
                  (let ((c (make-conn handle owner 'open #f)))
+                   (index-owner! owner 'conn handle)
                    (uv-tcp-nodelay handle 1)
                    (hashtable-set! conn-table handle c)
                    (deliver owner (vector 'tcp-connected c)))))))))
@@ -688,6 +724,7 @@
     (let* ((req (foreign-alloc fs-req-size))
            (op (make-fs-op owner path mode req 'open #f #f -1 0 0 '() 0 0)))
       (hashtable-set! fs-table req op)
+      (index-owner! owner 'fs req)
       (let ((r (uv-fs-open uv-loop req path O-RDONLY 0 on-fs-entry)))
         (when (< r 0)
           (uv-fs-req-cleanup req)
@@ -700,6 +737,7 @@
     (let* ((req (foreign-alloc fs-req-size))
            (op (make-fs-op owner path mode req 'fstat #f #f fd 0 0 '() 0 0)))
       (hashtable-set! fs-table req op)
+      (index-owner! owner 'fs req)
       (start-fs-fstat! op req)
       op))
 
@@ -850,6 +888,7 @@
   (define (dns-resolve! host owner)
     (let ((req (foreign-alloc getaddrinfo-req-size)))
       (hashtable-set! getaddrinfo-table req owner)
+      (index-owner! owner 'dns req)
       (let ((r (uv-getaddrinfo uv-loop req on-getaddrinfo-entry host 0 0)))
         (when (< r 0)
           (hashtable-delete! getaddrinfo-table req)
@@ -871,6 +910,7 @@
           (req (foreign-alloc connect-req-size)))
       (check 'uv-tcp-init (uv-tcp-init uv-loop h))
       (hashtable-set! connect-table req (cons h owner))
+      (index-owner! owner 'connect req)
       (let ((r (uv-tcp-connect req h sockaddr-buf on-connect-entry)))
         (when (< r 0)
           (hashtable-delete! connect-table req)
