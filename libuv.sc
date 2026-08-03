@@ -17,7 +17,7 @@
           file-stream-open! file-stream-open-under!
           file-stream-read! file-stream-close!
           file-stream-own! file-stream-raw! file-stream-chunk-ptr
-          tcp-read-start! tcp-write! tcp-writev! tcp-write-foreign!
+          tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
           conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
           conn-on-close!
@@ -948,6 +948,22 @@
   (define (tcp-read-start! c)
     (when (eq? (conn-state c) 'open)
       (uv-read-start (conn-handle c) on-alloc-entry on-read-entry)))
+
+  ;; Stop delivering #(tcp-data ...), so the kernel's receive window closes
+  ;; and the PEER is slowed down.
+  ;;
+  ;; Without this the loop reads as fast as the peer sends and copies every
+  ;; segment into an unbounded actor mailbox, so a consumer that is slower
+  ;; than its producer accumulates raw bytes in memory instead of exerting
+  ;; back pressure -- and before any parser limit applies, because those
+  ;; run on bytes that have already been queued. An actor mailbox is not a
+  ;; substitute for the kernel's flow control.
+  ;;
+  ;; Safe to call when reads are already stopped, and on a closed conn.
+  (define (tcp-read-stop! c)
+    (when (eq? (conn-state c) 'open)
+      (uv-read-stop (conn-handle c)))
+    (void))
 
   ;; Queue `len` bytes for an async write. fill-data! copies them into
   ;; the foreign data area. Allocates one block [uv_write_t][uv_buf_t]
