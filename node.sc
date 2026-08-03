@@ -224,6 +224,17 @@
 
   ;; one frame: decimal length, newline, body. Serialized here, written
   ;; as one writev, so frames from different processes never interleave.
+  ;; Raise unless datum is representable on the wire. Serializing and
+  ;; discarding is the honest test: the whitelist lives in
+  ;; sexpr->string-extended, and a second copy of it here would be a second
+  ;; thing to keep in step.
+  (define (wire-check who datum)
+    (guard (e (#t (assertion-violation who
+                    "message contains data outside the wire whitelist"
+                    datum)))
+      (sexpr->string-extended datum)
+      (void)))
+
   (define (write-frame! c datum)
     (let* ((body (string->utf8 (sexpr->string-extended datum)))
            (head (string->utf8
@@ -811,6 +822,15 @@
   (define (rsend node reg-name msg)
     (cond
       ((eq? node self-name)
+       ;; The same contract as a remote send, including on this node. It
+       ;; used to skip the check, so a payload outside the wire whitelist
+       ;; -- a procedure, a port -- was DELIVERED here and refused
+       ;; everywhere else: the same task succeeded or failed depending on
+       ;; which node a round-robin happened to pick. A contract that holds
+       ;; only when the scheduler cooperates is not a contract, and the
+       ;; local case is exactly where such a payload gets written and
+       ;; never noticed.
+       (wire-check 'rsend msg)
        (let ((p (whereis reg-name)))
          (and p (begin (send p msg) #t))))
       ((live-entry node)

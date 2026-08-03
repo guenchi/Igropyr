@@ -268,5 +268,24 @@
     (unless (eq? #f (rsend 'b 'svc 'x)) (fail! "rsend-after-down"))
     (display "node-down + remote-down(noconnection) + rsend #f ok\n")
 
+    ;; The wire whitelist holds on THIS node too. rsend used to skip the
+    ;; check for its own node name, so a payload no peer would accept -- a
+    ;; procedure, a port -- was delivered locally and refused everywhere
+    ;; else: the same task succeeded or failed depending on which node a
+    ;; round robin happened to pick, and the local case is exactly where
+    ;; such a payload gets written and never noticed.
+    (register 'wire-probe self)
+    (let ((delivered (box #f)))
+      (spawn (lambda ()
+               (receive (after 1000 'done)
+                 (`#(got ,x) (set-box! delivered #t)))))
+      (unless (guard (e (#t #t)) (rsend (node-self) 'wire-probe (vector 'got car)) #f)
+        (fail! "local rsend accepted a procedure payload"))
+      ;; ...and an ordinary payload still goes through
+      (unless (rsend (node-self) 'wire-probe (vector 'got "text"))
+        (fail! "local rsend refused a wire-safe payload"))
+      (receive (after 500 'done) (`#(got ,x) 'ok)))
+    (display "local rsend enforces the wire whitelist ok\n")
+
     (display "ALL NODE TESTS PASSED\n")
     (exit 0)))
