@@ -171,6 +171,49 @@
         (fail "dead process retained a registered alias")))
     (display "registry rebinding ok\n")
 
+    ;; parameterize gives NO per-process isolation, and this pins that as a
+    ;; known limitation rather than leaving it to be rediscovered. Chez
+    ;; implements it by swapping a global cell and registering a winder to
+    ;; swap it back; @yield saves and restores winder lists without running
+    ;; them (right for dynamic-wind, whose after-thunk must not fire on a
+    ;; yield), so the cell belongs to whoever wrote it last.
+    ;;
+    ;; Asserted as the OBSERVED behaviour, not the desirable one: if a future
+    ;; scheduler change makes parameters process-local this test fails and
+    ;; should be replaced by its opposite -- and if someone "fixes" it by
+    ;; running the winders on every switch, the dynamic-wind case below
+    ;; catches that instead.
+    (let ((param (make-parameter 'nobody))
+          (me self))
+      (spawn (lambda ()
+               (parameterize ((param 'first))
+                 (sleep-ms 20)
+                 (send me (vector 'param-saw 'inside-own-body (param))))))
+      (spawn (lambda ()
+               (sleep-ms 10)
+               (parameterize ((param 'second))
+                 (sleep-ms 30)
+                 (send me (vector 'param-done)))))
+      (let loop ((seen #f) (done #f))
+        (unless (and seen done)
+          (receive (after 3000 (fail "parameterize probe timed out"))
+            (`#(param-saw ,_ ,val)
+              ;; its own binding is NOT what it reads back
+              (when (eq? val 'first)
+                (fail "parameters became process-local -- update this test"))
+              (loop #t done))
+            (`#(param-done) (loop seen #t))))))
+    ;; ...while dynamic-wind keeps its contract across the same yields: the
+    ;; after-thunk runs on normal exit, and NOT merely because we yielded.
+    (let ((log '()))
+      (dynamic-wind
+        (lambda () (set! log (cons 'in log)))
+        (lambda () (sleep-ms 20))
+        (lambda () (set! log (cons 'out log))))
+      (unless (equal? (reverse log) '(in out))
+        (fail "dynamic-wind did not run exactly once around a yielding body")))
+    (display "parameterize limitation + dynamic-wind contract ok\n")
+
     ;; 5. spawn&link + trap-exit turns a crash into an EXIT message
     (process-trap-exit #t)
     (spawn&link (lambda () (raise 'linked-crash)))

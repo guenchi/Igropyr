@@ -325,6 +325,17 @@
   ;; #f (park: blocked in receive, or dead). The running process is
   ;; never queue-linked -- it was dequeued when it was scheduled -- so
   ;; the #f case has nothing to remove.
+  ;; The winder list is SAVED AND RESTORED per process, never run. That is
+  ;; the right call for dynamic-wind -- an after-thunk must not fire merely
+  ;; because its process yielded -- but it is why (make-parameter) gives no
+  ;; per-process isolation: Chez implements parameterize by swapping a
+  ;; GLOBAL cell and registering a winder to swap it back, so with the hooks
+  ;; unrun the cell belongs to whichever process wrote it last. A process
+  ;; then cannot even read back its own binding across a yield. Documented in
+  ;; the README under "Dynamic state and parameterize"; there is no clean fix
+  ;; (running the winders would break dynamic-wind, and saving the values
+  ;; instead would need to enumerate every live parameter, which Chez does
+  ;; not expose). Applications wanting request-scoped state use req-local.
   (define (@yield where waketime disable-count)
     (when (alive? *self*)
       (pcb-winders-set! *self* (#%$current-winders))

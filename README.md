@@ -285,6 +285,13 @@ defaults):
 | `(req-query req)` | query string as an alist of strings |
 | `(req-header req 'content-type)` | header value (keys are lowercase symbols), or `#f` |
 | `(req-body req)` | request body as a bytevector |
+| `(req-local req key)` | value stashed on this request by earlier middleware, or `#f` |
+| `(req-set-local! req key val)` | stash a value for later middleware and the handler |
+
+`req-local` is how middleware hands something to the handler — a session, an
+authenticated user, a tenant. Use it rather than a `parameterize`d global:
+parameters do **not** isolate concurrent requests here, for the reason in
+[Dynamic state and `parameterize`](#dynamic-state-and-parameterize).
 
 ### Response helpers
 
@@ -935,6 +942,44 @@ These apply to pooled routes (the default); nothing to configure:
   the service recovers by itself within ~35 s.
 - **Slow clients**: each connection is owned by its own reader process; a
   half-sent request parks only that reader and is reaped after 30 s.
+
+## Dynamic state and `parameterize`
+
+**`make-parameter` does not give you per-request state.** Reach for
+`req-set-local!` / `req-local` instead, or pass the value as an argument.
+
+Chez implements `parameterize` by swapping a *global* cell and registering a
+winder to swap it back — printing one shows it plainly:
+
+```
+#[critical-winder #<procedure swap> #<procedure swap> ()]
+``` The scheduler saves and restores each process's winder
+list across a switch but never runs the hooks — correct for `dynamic-wind`,
+whose after-thunk must not fire merely because a process yielded, and wrong for
+`parameterize`, whose whole mechanism *is* that hook. Whoever wrote the cell
+last owns it, for everyone.
+
+Three processes, each either setting or reading one parameter across a yield:
+
+| process | expected | actual |
+|---|---|---|
+| set `alice`, yield, read | `alice` | **`bob`** |
+| set `bob`, yield, read | `bob` | **`nobody`** |
+| never parameterized, read | `nobody` | **`bob`** |
+
+Note the middle row: a process cannot even read back *its own* binding. And the
+last: a process that never touched the parameter sees another's value. So the
+failure is not only a leak between requests — it is that the binding means
+nothing at all once anything yields, and every handler yields (any I/O does).
+
+There is no clean fix available. Running the winders on every switch would
+break `dynamic-wind`; saving and restoring the values instead would require
+enumerating every live parameter, which Chez does not expose. So this is a
+documented limitation rather than a bug to be filed.
+
+Nothing warns you. A guard that reads the wrong identity usually *denies*, so
+the visible symptom is an occasional unexplained `401` under concurrency —
+which is a rough thing to chase, and the reason this section exists.
 
 ## Runtime introspection and graceful shutdown
 
