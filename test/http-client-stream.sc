@@ -267,6 +267,41 @@
         (tcp-read-start! c)))
     0))
 
+;; A hostile upstream can make METADATA huge while staying inside the body
+;; cap. Both of these were bounded only by max-response (32 MiB), so the
+;; client would copy the text out and hand it to string->number -- work that
+;; is neither cheap nor preemptible on the single scheduler thread.
+(define meta-port 18101)
+(define (start-oversize-meta-server!)
+  (tcp-listen! "0.0.0.0" meta-port 16
+    (lambda (c)
+      (let ((pid (spawn
+                   (lambda ()
+                     (receive
+                       (`#(tcp-data ,bv)
+                         (let* ((req (guard (e (#t "")) (utf8->string bv)))
+                                (resp
+                                 (if (str-has? req " /bigchunkline ")
+                                     ;; a chunk-size line of 64 KiB of
+                                     ;; extension, well inside max-response
+                                     (string-append
+                                       "HTTP/1.1 200 OK\r\n"
+                                       "Transfer-Encoding: chunked\r\n\r\n"
+                                       "3;" (make-string 65536 #\a) "\r\nabc\r\n0\r\n\r\n")
+                                     ;; a header block of 64 KiB
+                                     (string-append
+                                       "HTTP/1.1 200 OK\r\n"
+                                       "X-Big: " (make-string 65536 #\b) "\r\n"
+                                       "Content-Length: 2\r\n\r\nhi"))))
+                           (tcp-write! c (string->utf8 resp) #f))
+                         (sleep-ms 60)
+                         (tcp-close! c))
+                       (`#(tcp-eof) (tcp-close! c))
+                       (`#(tcp-error ,e) (tcp-close! c)))))))
+        (conn-set-owner! c pid)
+        (tcp-read-start! c)))
+    0))
+
 ;; ---- tests -----------------------------------------------------------------
 
 (start-scheduler
@@ -277,6 +312,7 @@
     (start-head-server!)
     (start-interim-server!)
     (start-framing-server!)
+    (start-oversize-meta-server!)
     (sleep-ms 100)
 
     ;; chunked (SSE) streaming: one emit per wire chunk, in order,
@@ -360,6 +396,23 @@
       (equal? (client-error-message
                 (lambda () (http-get (string-append framing-base "/te-unsupported"))))
               "invalid Transfer-Encoding"))
+
+    ;; Metadata has its own ceilings, independent of the body cap. Raising
+    ;; max-response for a large download must not raise these with it.
+    (check "oversized response head refused"
+      (equal? (client-error-message
+                (lambda ()
+                  (http-get (string-append "http://127.0.0.1:"
+                                           (number->string meta-port) "/bighead")
+                            '((max-response . 33554432)))))
+              "response head too large"))
+    (check "oversized chunk-size line refused"
+      (equal? (client-error-message
+                (lambda ()
+                  (http-get (string-append "http://127.0.0.1:"
+                                           (number->string meta-port) "/bigchunkline")
+                            '((max-response . 33554432)))))
+              "bad chunked response"))
 
     ;; timeout 0 = no idle limit: a slow drip still completes
     (let-values (((b collect) (collector)))

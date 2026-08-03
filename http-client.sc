@@ -62,6 +62,22 @@
                                       ; guard); per-request override via
                                       ; the (max-response . bytes) opt
 
+  ;; max-response bounds the BODY, and it was doing double duty as the only
+  ;; bound on metadata as well -- so a hostile upstream could send a header
+  ;; block, a Content-Length or a chunk-size line approaching 32 MiB, and
+  ;; this client would copy it out, split it into strings, intern symbols
+  ;; and hand the result to string->number. Runtime primitives over
+  ;; megabyte-long numerals are neither cheap nor preemptible, and there is
+  ;; one scheduler thread. The coupling also ran the wrong way: raising
+  ;; max-response for a legitimately large download raised the metadata
+  ;; ceiling with it.
+  ;;
+  ;; These match the server's own limits (header-limit, chunk-line-limit).
+  ;; That is the right reference point -- what the server refuses to
+  ;; receive is what a client has no reason to accept.
+  (define max-response-head 8192)     ; whole status line + header block
+  (define chunk-line-limit 4096)      ; one chunk-size line, extensions included
+
   ;; ---- TLS hook ---------------------------------------------------------
   ;;
   ;; (igropyr tls) registers a connector: (lambda (conn host timeout) codec)
@@ -342,6 +358,14 @@
     (let ((bv (inbuf-bv buf)) (base (inbuf-start buf)) (n (inbuf-length buf)))
       (let scan ((i pos))
         (cond
+          ;; Bound the LINE, not just the body. Without this the scan runs
+          ;; to whatever the peer sends, and the text between pos and the
+          ;; CRLF -- up to max-response -- is copied out, substring'd and
+          ;; handed to string->number in base 16. A megabyte-long numeral is
+          ;; neither cheap nor preemptible, and there is one scheduler
+          ;; thread. Checked before the more-bytes test so an oversized line
+          ;; is refused as it grows, not once it happens to complete.
+          ((fx> (fx- i pos) chunk-line-limit) 'bad)
           ((fx>= (fx+ i 1) n) #f)
           ((and (fx= (bytevector-u8-ref bv (fx+ base i)) 13)
                 (fx= (bytevector-u8-ref bv (fx+ base (fx+ i 1))) 10))
@@ -446,7 +470,12 @@
         ((eq? state 'head)
          (let ((hend (inbuf-find-header-end buf)))
            (if (not hend)
-               'head
+               ;; still accumulating: refuse a head block that has already
+               ;; outgrown its ceiling rather than waiting for the terminator
+               ;; that a hostile upstream may never send
+               (if (> (inbuf-length buf) max-response-head)
+                   (begin (err! "response head too large") #f)
+                   'head)
                ;; the head block is copied out once (small); the line
                ;; helpers below work on that standalone bytevector
                (let* ((head (inbuf-sub buf 0 (fx+ hend 2)))
