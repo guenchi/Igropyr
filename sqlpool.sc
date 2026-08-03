@@ -140,6 +140,15 @@
     ;; both are non-empty, so a sustained stream of one kind cannot starve
     ;; the other past its timeout
     (define co-turn #f)
+    ;; grows 1s -> 2 -> 4 ... to a ceiling; reset by any successful connect
+    (define backoff-ms 0)
+    (define max-backoff-ms 30000)
+    (define (next-backoff!)
+      (let ((base (if (= backoff-ms 0) 1000 (min (* 2 backoff-ms) max-backoff-ms))))
+        (set! backoff-ms base)
+        ;; +/- 20%, so slots that failed together stop retrying in lockstep
+        (let ((j (fxdiv base 5)))
+          (max 100 (+ (- base j) (random (max 1 (* 2 j))))))))
     (define (make-available! c)
       (hashtable-delete! busy c)
       (cond
@@ -248,11 +257,23 @@
           (if (eq? status 'ok)
               (begin
                 (send pid (vector 'db-adopt))
+                (set! backoff-ms 0)          ; a success clears the penalty
                 (make-available! pid))
-              ;; failed connect: retry after a delay
-              (spawn (lambda ()
-                       (sleep-ms 1000)
-                       (send me (vector 'pool-reconnect)))))
+              ;; Failed connect: retry with EXPONENTIAL BACKOFF. A fixed one
+              ;; second is right for a database that is restarting and wrong
+              ;; for one that will never accept us -- a bad password, a
+              ;; missing database, an expired certificate, an unsupported
+              ;; auth plugin. Those retried once per second per slot forever,
+              ;; and for PostgreSQL each attempt runs a pure-Scheme PBKDF2,
+              ;; so a large pool against a wrong password is a CPU load on
+              ;; the one OS thread rather than a background annoyance.
+              ;;
+              ;; Jittered, so a pool whose slots failed together does not
+              ;; reconnect in lockstep forever after.
+              (let ((wait (next-backoff!)))
+                (spawn (lambda ()
+                         (sleep-ms wait)
+                         (send me (vector 'pool-reconnect))))))
           (loop))
         (`#(pool-reconnect)
           (connect!)
