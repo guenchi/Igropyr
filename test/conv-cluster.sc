@@ -67,20 +67,37 @@
           (unless (equal? r2 (vector 'ack 15)) (fail! "resume-2" r2))
           (display "cross-node resume round-trips ok\n")
 
-          ;; a token already spent is refused ACROSS the link too -- this is
-          ;; where a duplicate is most likely, since a forwarded resume can
-          ;; be delayed by the network that carries it
+          ;; A token already spent REPLAYS across the link too -- and this
+          ;; is where a duplicate is most likely, because the network
+          ;; carrying the forward is exactly what delays it. The answer
+          ;; must be the one that token produced, not a second run: here
+          ;; that means (ack 15) again rather than (ack 25).
           (let-values (((rs ts) (conversation-resume! id t1 10)))
-            (unless (eq? rs 'stale) (fail! "cross-node-stale" rs)))
-          (display "a spent token is refused across the link ok\n")
+            (unless (equal? rs (vector 'ack 15)) (fail! "cross-node-replay" rs))
+            (unless (eqv? ts t2) (fail! "cross-node-replay-token" ts)))
+          (display "a spent token replays across the link ok\n")
+
+          ;; an invented one is still refused
+          (let-values (((rw tw) (conversation-resume! id 999 10)))
+            (unless (eq? rw 'stale) (fail! "cross-node-invented" rw)))
+          (display "an invented token is refused across the link ok\n")
 
           (let-values (((r3 t3) (conversation-resume! id t2 'done)))
             (unless (equal? r3 (vector 'final 15)) (fail! "resume-final" r3))
             (display "cross-node final reply ok\n")
 
+            ;; the conversation LINGERS after completing, so within that
+            ;; window it can still tell an invented token apart from a
+            ;; repeat -- which is the whole point of lingering: a client
+            ;; whose final reply was lost gets it back rather than 'gone
             (let-values (((r4 t4) (conversation-resume! id 99 99)))
-              (unless (eq? r4 'gone) (fail! "resume-after-done" r4)))
-            (display "resume after completion -> gone ok\n")))))
+              (unless (eq? r4 'stale) (fail! "resume-after-done" r4)))
+            (display "an invented token after completion -> stale ok\n")
+
+            (let-values (((r5 t5) (conversation-resume! id t2 'done)))
+              (unless (equal? r5 (vector 'final 15))
+                (fail! "final-replay-across-link" r5)))
+            (display "the final reply replays across the link ok\n")))))
 
     (rsend 'b 'ctrl (vector 'quit))     ; let the owner exit promptly
     (sleep-ms 200)

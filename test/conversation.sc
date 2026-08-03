@@ -145,10 +145,26 @@
         (expect "confirm commits" (json-ref r2 "done") #t))
       (expect "balance after commit"
         (json-ref (json-of (get "/balance")) "balance") 900)
-      ;; the conversation is over: a further resume is gone
-      (let ((r3 (post (step-url id tok) "confirm")))
-        (unless (string-contains? r3 "HTTP/1.1 410 ") (fail "resume after end" r3))
-        (display "resume after end ok\n")))
+      ;; The conversation is over, and repeating the request that ended it
+      ;; REPLAYS its answer rather than reporting 'gone.
+      ;;
+      ;; This is the case that matters most with money in it. Exiting at
+      ;; once meant a client whose final reply was lost retried, met a
+      ;; process that no longer existed, and was told 'gone -- which this
+      ;; library documents as "the transaction rolled back". For a flow
+      ;; that had just committed that is false, and a client acting on it
+      ;; performs the whole transfer again.
+      (let ((r3 (json-of (post (step-url id tok) "confirm"))))
+        (expect "a repeated final request replays its answer"
+          (json-ref r3 "done") #t))
+      ;; ...and it replayed rather than re-running: the balance moved once
+      (expect "the replay moved no money"
+        (json-ref (json-of (get "/balance")) "balance") 900)
+      ;; a token that never belonged to this conversation is still refused
+      (let ((r4 (post (step-url id (+ tok 99)) "confirm")))
+        (unless (string-contains? r4 "HTTP/1.1 409 ")
+          (fail "an invented token after the end was accepted" r4))
+        (display "replay after the end, invented token still refused ok\n")))
 
     ;; cancel path rolls the hold back
     (let* ((r1 (json-of (post "/t" "100")))
@@ -184,9 +200,13 @@
         (json-ref (json-of (get "/balance")) "balance") 900))
 
     ;; A REPEATED confirm -- the same request sent twice, which is what a
-    ;; double click or a client retry is -- must be refused, and must not
-    ;; move the money a second time. This is the case the whole token exists
-    ;; for: it is refused whether it arrives during the step or long after.
+    ;; double click or a client retry is -- is ANSWERED, with the answer the
+    ;; first one produced, and must not move the money a second time.
+    ;;
+    ;; Both halves matter. Refusing would also protect the money, but it
+    ;; leaves a client whose reply was lost unable to learn the outcome;
+    ;; replaying gives it the reply it lost. What must never happen is the
+    ;; step running twice.
     ;;
     ;; Placed last, because a committed transfer changes the running balance
     ;; every later assertion is written against.
@@ -195,11 +215,9 @@
            (tok (json-ref r1 "token")))
       (let ((first (json-of (post (step-url id tok) "confirm"))))
         (expect "the first confirm commits" (json-ref first "done") #t))
-      (let ((again (post (step-url id tok) "confirm")))
-        (unless (or (string-contains? again "HTTP/1.1 409 ")
-                    (string-contains? again "HTTP/1.1 410 "))
-          (fail "a repeated confirm was accepted" again))
-        (display "a repeated confirm is refused ok\n"))
+      (let ((again (json-of (post (step-url id tok) "confirm"))))
+        (expect "a repeated confirm replays the same answer"
+          (json-ref again "done") #t))
       ;; 900 was the balance before this transfer; one commit of 100 leaves
       ;; 800, and a second would have left 700
       (expect "and the balance moved once"
@@ -253,10 +271,16 @@
                (send me (vector 'r2 r)))))
     (let loop ((got '()) (n 0))
       (if (= n 2)
-          (let ((stale (filter (lambda (x) (eq? (cdr x) 'stale)) got)))
-            (unless (= 1 (length stale))
-              (fail "concurrent-resume: expected exactly one stale" got))
-            (display "concurrent resume -> one stale ok\n"))
+          ;; Both are answered, and with the SAME answer: the second did not
+          ;; advance the flow, it replayed what the first produced. That is
+          ;; the whole contract -- a duplicate costs nothing and tells the
+          ;; truth. Two DIFFERENT replies would mean the flow ran twice.
+          (let ((vs (map cdr got)))
+            (unless (and (= 2 (length vs)) (equal? (car vs) (cadr vs)))
+              (fail "concurrent-resume: expected one answer replayed twice" got))
+            (when (memq 'stale vs)
+              (fail "concurrent-resume: a duplicate was refused rather than replayed" got))
+            (display "concurrent resume -> one step, answer replayed ok\n"))
           (receive (after 4000 (fail "concurrent-resume timeout" got))
             (`#(r1 ,v) (loop (cons (cons 'r1 v) got) (+ n 1)))
             (`#(r2 ,v) (loop (cons (cons 'r2 v) got) (+ n 1))))))))

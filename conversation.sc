@@ -49,21 +49,36 @@
 ;;; to the next. With the token the duplicate is refused however it is
 ;;; scheduled, and a genuine answer is accepted however late it arrives.
 ;;;
-;;; 'stale: this request named a reply that is no longer the one being
-;;; answered. It was NOT applied and will not be -- a fact about this
-;;; conversation, not a guess. It says nothing about whether the request it
-;;; duplicates succeeded: the step it was repeating may well have run for
-;;; whoever got there first. Read the current state; do not resubmit (there
-;;; is no valid token to resubmit with, which is the point).
+;;; A REPEAT IS ANSWERED, NOT REFUSED. Presenting the token that was just
+;;; spent hands back the reply it produced, together with the token that
+;;; came with it -- exactly what the original caller received. So a double
+;;; click, a client retry or a lost response all end the same way: the step
+;;; ran once, and everyone who asked gets the answer to what they asked.
+;;; This is what an idempotency key buys in a payment API, and it is the
+;;; half that refusing cannot give: a caller whose reply was lost would
+;;; otherwise be unable to either advance or learn the outcome.
 ;;;
-;;; What 'stale does NOT give you is recovery from a LOST REPLY. A caller
-;;; whose response never arrived holds a spent token and can neither
-;;; advance nor learn the outcome; it has to reconcile out of band. Handing
-;;; back the reply that step already produced -- making resume idempotent,
-;;; the way payment APIs treat an idempotency key -- would cover that, at
-;;; the cost of retaining a reply per step. It is deliberately not done
-;;; here, and the token protocol makes it addable later without breaking
-;;; anything.
+;;; Only the LAST step is replayable -- one reply is retained, not a
+;;; history. A token older than that is 'stale: its answer is long
+;;; superseded, and keeping every step's reply would be unbounded memory
+;;; for a case nobody can act on anyway.
+;;;
+;;; 'stale: the token belongs to no step this conversation can still answer.
+;;; The request was NOT applied and will not be -- a fact about this
+;;; conversation, not a guess. It says nothing about whether the request it
+;;; duplicates succeeded. Read the current state; do not resubmit (there is
+;;; no valid token to resubmit with, which is the point).
+;;;
+;;; AFTER THE FLOW RETURNS the conversation LINGERS for one more TTL, still
+;;; reachable, still able to replay that final reply. Exiting at once is
+;;; what made a lost final reply dangerous: the client retries, the process
+;;; is gone, and the resume answers 'gone -- which this library documents
+;;; as "the transaction rolled back". For a flow that had just COMMITTED
+;;; that is false, and a client acting on it performs the whole thing
+;;; again. The cost is one parked process per completed conversation until
+;;; the window closes. Past it, 'gone can no longer tell a flow that died
+;;; from one that finished long ago, so size the TTL to cover the retry
+;;; window your clients actually use.
 ;;;
 ;;; Fault semantics (the transaction-ring contract):
 ;;;   - flow crashes, TTL expires, or the process dies for any reason
@@ -304,7 +319,17 @@
                  ;; be answered with, or #f while a step is running. It is
                  ;; the whole mechanism: a resume is accepted when it names
                  ;; the reply it is answering, and refused otherwise.
-                 (let ((who starter) (tag ref) (step 0) (awaiting #f))
+                 ;; awaiting     -- the token that advances from here, or #f
+                 ;;                 while a step is running
+                 ;; last-consumed -- the token most recently accepted
+                 ;; last-reply    -- what accepting it produced
+                 ;;
+                 ;; The last two are what make a repeat IDEMPOTENT: a request
+                 ;; bearing the token that was already spent is handed the
+                 ;; same answer it would have received, rather than an error
+                 ;; it cannot act on.
+                 (let ((who starter) (tag ref) (step 0) (awaiting #f)
+                       (last-consumed #f) (last-reply #f))
                    ;; One resume per step. Two concurrent resumes -- a double
                    ;; click, a client retry, two front ends -- both land in
                    ;; the mailbox; the first wakes this suspend! and the
@@ -319,6 +344,7 @@
                    (define (suspend! reply)
                      (set! step (+ step 1))
                      (set! awaiting step)
+                     (set! last-reply reply)
                      (set-box! step-box step)
                      (set-box! running-box #f)      ; parked from here
                      ;; the reply carries the token that answers it
@@ -356,20 +382,60 @@
                      (let wait ()
                        (receive (after ttl (raise 'conversation-expired))
                          (`#(conv-step ,from ,ref2 ,token ,r)
-                           (if (and awaiting (eqv? token awaiting))
-                               (begin
-                                 (set! awaiting #f)   ; consumed
-                                 (set! who from) (set! tag ref2)
-                                 (set-box! running-box #t)
-                                 (set-box! run-start-box (now-ms))
-                                 r)
-                               (begin
-                                 (send from (vector 'conv-reply ref2 'stale #f))
-                                 (wait)))))))
+                           (cond
+                             ;; the answer to the reply just published
+                             ((and awaiting (eqv? token awaiting))
+                              (set! last-consumed token)
+                              (set! awaiting #f)       ; spent
+                              (set! who from) (set! tag ref2)
+                              (set-box! running-box #t)
+                              (set-box! run-start-box (now-ms))
+                              r)
+                             ;; a REPEAT of the request that got us here.
+                             ;; Hand back what it produced, with the token
+                             ;; that came with it -- exactly what the
+                             ;; original caller received. A client whose
+                             ;; reply was lost is then able to continue
+                             ;; instead of having to reconcile.
+                             ((and last-consumed (eqv? token last-consumed))
+                              (send from (vector 'conv-reply ref2 last-reply awaiting))
+                              (wait))
+                             (else
+                              (send from (vector 'conv-reply ref2 'stale #f))
+                              (wait)))))))
                    (let ((final (flow req suspend!)))
-                     (unregister name)
-                     ;; the flow is over: no token can answer this
-                     (send who (vector 'conv-reply tag final #f))))))))
+                     (set! last-reply final)
+                     (set! awaiting #f)
+                     (send who (vector 'conv-reply tag final #f))
+                     ;; LINGER, then unregister.
+                     ;;
+                     ;; Exiting here is what made a lost FINAL reply
+                     ;; dangerous: the client retries, the process is gone,
+                     ;; the resume answers 'gone -- which this library
+                     ;; documents as "the transaction rolled back". For a
+                     ;; flow that had just COMMITTED that is false, and a
+                     ;; client acting on it does the whole thing again.
+                     ;;
+                     ;; Staying reachable for one more TTL lets that retry
+                     ;; be answered with the final reply it lost. The cost
+                     ;; is one parked process per completed conversation
+                     ;; until the window closes; the TTL is reused because
+                     ;; it is already the caller's statement of how long
+                     ;; this dialogue may take.
+                     (set-box! running-box #f)
+                     (let ((until (+ (now-ms) ttl)))
+                       (let linger ()
+                         (let ((left (- until (now-ms))))
+                           (when (> left 0)
+                             (receive (after left 'done)
+                               (`#(conv-step ,from ,ref2 ,token ,r)
+                                 (if (and last-consumed (eqv? token last-consumed))
+                                     (send from
+                                           (vector 'conv-reply ref2 last-reply #f))
+                                     (send from
+                                           (vector 'conv-reply ref2 'stale #f)))
+                                 (linger)))))))
+                     (unregister name)))))))
       (let ((m (monitor conv)))
         (receive
           (`#(conv-reply ,@ref ,reply ,token)
