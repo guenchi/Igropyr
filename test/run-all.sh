@@ -81,6 +81,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # a chunked response is not complete until its trailer section terminates:
 # declaring done at the 0 line accepted a truncated body as a success
 "$scheme_bin" --script igropyr/test/chunked-truncation.sc
+# a slow on-chunk handler must slow the SERVER: without stopping reads the
+# event loop fills an unbounded mailbox with raw bytes no limit applies to
+"$scheme_bin" --script igropyr/test/client-read-backpressure.sc
 "$scheme_bin" --script igropyr/test/ws-client-handshake.sc
 "$scheme_bin" --script igropyr/test/http-protocol.sc
 # RESP parsing, both against a fake server so neither needs a live redis:

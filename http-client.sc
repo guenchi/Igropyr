@@ -502,9 +502,24 @@
     ;; a crashing on-chunk handler must not rot in this loop: the typed
     ;; raise propagates to the process guards, which free the codec,
     ;; close the socket, and answer the caller with the message
+    ;;
+    ;; Reads are STOPPED around the handler. The handler is called
+    ;; synchronously from this loop, and a handler that does real work --
+    ;; a database write, a disk write, anything that parks -- lets the
+    ;; scheduler run while the event loop keeps reading the socket as fast
+    ;; as the server sends. Those segments land as raw #(tcp-data ...) in
+    ;; this process's mailbox, which is unbounded, and none of the response
+    ;; limits apply to them: max-resp counts bytes the parser has seen, and
+    ;; the parser has not run yet.
+    ;;
+    ;; Stopping reads closes the kernel's receive window instead, which is
+    ;; where back pressure belongs -- a slow consumer should slow the
+    ;; SENDER, not accumulate its output in memory.
     (define (emit! bv)
+      (tcp-read-stop! c)
       (guard (e (#t (fail "on-chunk handler raised")))
-        (emit bv)))
+        (emit bv))
+      (tcp-read-start! c))
     ;; drive the parser as far as the buffered bytes allow; replies (or
     ;; errors) and returns #f, or returns the state to keep waiting in
     (define (step state)
