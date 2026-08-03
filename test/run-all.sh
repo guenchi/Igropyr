@@ -38,6 +38,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # separate process: bind! resolves the library once per process, so the
 # refusal cannot be tested after a successful boot in the same one
 "$scheme_bin" --script igropyr/test/quickjs-require-ng.sc
+# with BOTH upstream builds on the loader path, the ng one must be chosen:
+# picking bellard fails the boot, and falling through would mix two ABIs
+"$scheme_bin" --script igropyr/test/quickjs-so-order.sc
 "$scheme_bin" --script igropyr/test/ssr.sc
 "$scheme_bin" --script igropyr/test/s3.sc
 "$scheme_bin" --script igropyr/test/aws.sc

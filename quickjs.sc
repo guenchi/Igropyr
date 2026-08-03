@@ -84,17 +84,37 @@
                 ;; libquickjs, quickjs-ng ships libqjs. FreeBSD's packages
                 ;; install either straight under lib/, not in a quickjs/
                 ;; subdirectory.
-                (list "libquickjs.dylib" "libquickjs.so"
-                      "libqjs.dylib" "libqjs.so"
-                      "/opt/homebrew/lib/quickjs/libquickjs.dylib"
+                ;;
+                ;; libqjs FIRST, everywhere. This driver requires quickjs-ng
+                ;; (see the JS_FreeValue check in bind!), and on a machine
+                ;; carrying both builds the old order dlopened bellard's
+                ;; libquickjs first. That fails the bind -- and it fails it
+                ;; AFTER the library is in the process's global symbol
+                ;; namespace, where Chez's foreign-procedure resolves from.
+                ;; Falling through to the next candidate would then be worse
+                ;; than stopping: JS_NewRuntime would still resolve to the
+                ;; first library loaded while JS_FreeValue came from the
+                ;; second, which is a mixed-ABI free on every value. The only
+                ;; safe order is to look for the right one first.
+                ;; Grouped by LIBRARY, not by how the name is written: EVERY
+                ;; libqjs candidate, bare and absolute, comes before the
+                ;; first libquickjs one. Interleaving them is not enough and
+                ;; was measured not to be -- a bare "libqjs.dylib" does not
+                ;; resolve where the library lives outside the dynamic
+                ;; loader's default path (/opt/homebrew/lib on macOS), so a
+                ;; bare "libquickjs.dylib" sitting anywhere on the search
+                ;; path still won.
+                (list "libqjs.dylib" "libqjs.so"
                       "/opt/homebrew/lib/libqjs.dylib"
-                      "/usr/local/lib/libquickjs.so"
-                      "/usr/local/lib/libquickjs.so.0"
                       "/usr/local/lib/libqjs.so"
                       "/usr/local/lib/libqjs.so.0"
+                      "/usr/lib/libqjs.so"
+                      "libquickjs.dylib" "libquickjs.so"
+                      "/opt/homebrew/lib/quickjs/libquickjs.dylib"
+                      "/usr/local/lib/libquickjs.so"
+                      "/usr/local/lib/libquickjs.so.0"
                       "/usr/local/lib/quickjs/libquickjs.so"
                       "/usr/lib/libquickjs.so"
-                      "/usr/lib/libqjs.so"
                       "/usr/lib/quickjs/libquickjs.so")))
       (set! so-loaded #t)))
 
@@ -144,7 +164,14 @@
       ;; Refuse loudly here rather than silently taking a different path.
       (unless (foreign-entry? "JS_FreeValue")
         (assertion-violation 'qjs-boot!
-          "this QuickJS build does not export JS_FreeValue (quickjs-ng 0.15+ required; bellard/quickjs makes it inline)"))
+          (string-append
+            "this QuickJS build does not export JS_FreeValue (quickjs-ng "
+            "0.15+ required; bellard/quickjs makes it inline). The library "
+            "found is most likely bellard's libquickjs; install quickjs-ng "
+            "(libqjs) or point IGROPYR_LIBQUICKJS_SO at it. Loading another "
+            "candidate instead is not attempted on purpose: this one is "
+            "already in the global symbol namespace, so the result would be "
+            "one library's functions with another's ABI")))
       (set! _free-value
         (foreign-procedure "JS_FreeValue" (void* (& JSValue)) void))
       (set! bound #t)))
