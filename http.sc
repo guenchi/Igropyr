@@ -86,11 +86,21 @@
   ;; slow SSE consumer takes: one parked relay per client, forever, while
   ;; whatever feeds it keeps queueing into an unbounded mailbox.
   ;;
-  ;; Deliberately generous. This is not a liveness timer for the STREAM --
-  ;; an SSE connection with nothing to say is normal and costs no write --
-  ;; it bounds a single write whose bytes the kernel will not take. A mobile
-  ;; peer on a bad link still drains a chunk well inside this.
-  (define default-write-timeout-ms 120000)
+  ;; Same 30 s as read-timeout-ms, and for the same reason: that bounds a
+  ;; peer who will not SEND, this one a peer who will not READ, and there is
+  ;; no case for being more patient with the second. It also matches the
+  ;; pool's stuck-ms, so a detached stream is now bounded exactly like the
+  ;; pooled handler it was detached from -- detaching was an accidental hole,
+  ;; not a deliberately laxer path, so the two should not differ.
+  ;;
+  ;; This is NOT a liveness timer for the stream: an SSE connection with
+  ;; nothing to say is normal and costs no write. Only a write whose bytes
+  ;; the kernel refuses can expire, which means the peer's receive window has
+  ;; been shut the whole time -- a live consumer drains a chunk in
+  ;; milliseconds, and even a bad mobile link in seconds. Whatever feeds the
+  ;; stream keeps queueing for this long, so the value is also the ceiling on
+  ;; that backlog.
+  (define default-write-timeout-ms 30000)
   (define write-timeout-ms default-write-timeout-ms)
 
   ;; Process-global, like the other ceilings here. 0 restores the old

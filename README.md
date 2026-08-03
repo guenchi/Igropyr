@@ -434,7 +434,7 @@ bytevector; returns `#f` if the client is gone), and `res-end!`.
 `res-write!` waits for each chunk to reach the peer, so a producer runs at
 the client's pace rather than queueing chunks in memory. That wait is
 bounded: a write whose bytes the peer never accepts gives up after
-`write-timeout-ms` (default 120 s), closes the connection, and returns
+`write-timeout-ms` (default 30 s), closes the connection, and returns
 `#f` — which is already the "stop the loop" answer every producer handles,
 so no caller changes.
 
@@ -451,7 +451,15 @@ mailbox.
 
 This is not a liveness timer for the stream. An SSE connection with nothing
 to say is normal and costs no write; only a write whose bytes the kernel
-will not take can expire.
+will not take can expire — which means the peer's receive window has been
+shut for the whole period. A live consumer drains a chunk in milliseconds,
+and a bad mobile link in seconds.
+
+The default matches `read-timeout-ms`, which bounds a peer that will not
+*send*, and the pool's `stuck-ms`, so a detached stream is bounded exactly
+like the pooled handler it was detached from. Whatever feeds the stream
+keeps queueing for this long, so the value is also the ceiling on that
+backlog.
 
 ## JSON
 
