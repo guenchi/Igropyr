@@ -589,11 +589,18 @@
   ;; guessing about a peer whose framing rules are unknown. HTTP/1.1 is the
   ;; only version whose default is persistent; anything else closes unless
   ;; it explicitly says otherwise.
+  ;; 1.1 defaults to persistent; 1.0 is persistent only when it SAYS so --
+  ;; which is the original keep-alive mechanism and perfectly valid, so
+  ;; refusing it (as an over-tight "1.1 only" rule did) throws away every
+  ;; reuse against an HTTP/1.0 peer that asked for it. A version this
+  ;; client does not speak is never persistent, explicit or not: its
+  ;; framing rules are unknown, and that is not a thing to guess about.
   (define (reusable-response? headers version leftover)
     (and (= leftover 0)
          (case (connection-header-says headers)
            ((close) #f)
-           ((keep-alive) (equal? version "HTTP/1.1"))
+           ((keep-alive) (or (equal? version "HTTP/1.1")
+                             (equal? version "HTTP/1.0")))
            (else (equal? version "HTTP/1.1")))))
 
   ;; finish: (disposition) -> void, called exactly once when the exchange
@@ -905,11 +912,18 @@
       ;; demonitor, then drain a DOWN that was already delivered -- left
       ;; behind it would sit in this mailbox forever, one per pooled
       ;; connection ever handed out.
+      ;;
+      ;; -> #t if that DOWN was there, which is the registry finding out the
+      ;; keeper is DEAD. Swallowing it silently and handing the pid out
+      ;; anyway was worse than not monitoring at all: the requester got a
+      ;; connection already known to be gone, and a non-idempotent request
+      ;; then failed without a byte of it having been written.
       (define (release! origin pid)
         (let ((e (find-entry origin pid)))
-          (when e
-            (demonitor (cdr e))
-            (receive (after 0 'ok) (`#(DOWN ,@pid ,reason) 'ok)))))
+          (and e
+               (begin
+                 (demonitor (cdr e))
+                 (receive (after 0 #f) (`#(DOWN ,@pid ,reason) #t))))))
       (define (all-pids)
         (let ((vs (hashtable-values idle)) (acc '()))
           (do ((i 0 (+ i 1))) ((= i (vector-length vs)) acc)
@@ -921,14 +935,25 @@
       (let loop ()
         (receive
           (`#(hc-take ,origin ,ref ,from)
-            (let ((xs (entries origin)))
-              (if (null? xs)
-                  (send from (vector 'hc-took ref #f))
-                  (let ((p (car (car xs))))
-                    ;; handed out: it is the requester's business now
-                    (release! origin p)
-                    (drop! origin p)
-                    (send from (vector 'hc-took ref p)))))
+            ;; Keep looking past keepers that turn out to be dead, and do
+            ;; not hand one to a requester that is already gone -- that
+            ;; would strand a live socket outside the registry, invisible to
+            ;; both the statistics and http-client-close-idle!, until its
+            ;; own idle timer eventually fired.
+            (let scan ()
+              (let ((xs (entries origin)))
+                (cond
+                  ((null? xs) (send from (vector 'hc-took ref #f)))
+                  ((not (process-alive? from))
+                   (send from (vector 'hc-took ref #f)))   ; discarded; the
+                                                           ; keeper stays pooled
+                  (else
+                   (let* ((p (car (car xs)))
+                          (dead? (release! origin p)))
+                     (drop! origin p)
+                     (if (or dead? (not (process-alive? p)))
+                         (scan)
+                         (send from (vector 'hc-took ref p))))))))
             (loop))
           (`#(hc-put ,origin ,pid ,ref)
             (let ((xs (entries origin)))
@@ -945,7 +970,7 @@
                  (send pid (vector 'hc-put-reply ref 'keep)))))
             (loop))
           (`#(hc-gone ,origin ,pid)
-            (release! origin pid)
+            (release! origin pid)                ; its DOWN, if any, drained
             (drop! origin pid)
             (loop))
           (`#(DOWN ,pid ,reason)
@@ -1069,6 +1094,25 @@
     (tcp-close! c))
 
   (define (keeper-idle c codec origin)
+    ;; The peer may already have closed. A server that answers and closes
+    ;; queues tcp-data and then tcp-eof; client-loop consumes the data,
+    ;; declares the response reusable and returns, and the eof is still
+    ;; sitting in this mailbox. Offering the connection then advertises one
+    ;; that is already gone: the next request is handed it, gets a DOWN, and
+    ;; -- if it is not idempotent -- fails without ever having been written.
+    ;;
+    ;; So look before offering. Anything at all on the socket at this point
+    ;; means the connection is not a clean starting point: an eof or error
+    ;; obviously, and unsolicited data just as much.
+    (let ((dirty (receive (after 0 #f)
+                   (`#(tcp-eof) #t)
+                   (`#(tcp-error ,e) #t)
+                   (`#(tcp-data ,bv) #t))))
+      (if dirty
+          (keeper-bye! c codec origin)
+          (keeper-offer c codec origin))))
+
+  (define (keeper-offer c codec origin)
     ;; Offer ourselves to the pool; the registry decides whether it wants
     ;; another idle connection for this origin.
     (let ((r (gensym)))
