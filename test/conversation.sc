@@ -506,6 +506,70 @@
       (fail "a finished conversation ran its on-killed hook" (unbox releases)))
     (display "a slow key during the linger does not re-release ok\n")))
 
+;; ---- a flow that returned inside its TTL is never reported gone ----------
+;;
+;; Between a flow returning and its completion being published there were
+;; four separate writes, and the deadline can fall inside them: the watchdog
+;; then found a step still marked running and past its allowance, killed a
+;; conversation that had ALREADY COMMITTED, and left no tombstone -- so the
+;; caller was told 'gone, which this library documents as a rollback
+;; guarantee. Committing and then being told it did not happen is the one
+;; outcome nothing else here is worth anything without.
+;;
+;; The flow returns with almost none of its allowance left, so the
+;; publication and the deadline land on top of each other.
+(let ((committed (box #f)))
+  (let-values (((wid wtok wfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (sleep-ms 380)            ; inside a 400ms TTL, just
+                      (set-box! committed #t)   ; "commit"
+                      (vector 'committed a)))
+                  'go
+                  400)))
+    (let-values (((r st) (conversation-resume! wid wtok 'confirm)))
+      (unless (unbox committed)
+        (fail "the flow did not reach its commit" st))
+      (when (conversation-gone? st)
+        (fail "a flow that committed inside its TTL was reported rolled back" st))
+      (unless (or (conversation-done? st) (conversation-settled? st))
+        (fail "a committed flow was neither done nor settled" st)))
+    ;; ...and it must still say so afterwards
+    (let-values (((state token reply) (conversation-peek wid)))
+      (when (conversation-gone? state)
+        (fail "a committed conversation later reported rolled back" state)))
+    (display "a flow that returns inside its TTL is never gone ok\n")))
+
+;; ---- a small TTL is still a TTL ------------------------------------------
+;;
+;; What this pins: a step far past a TTL below the watchdog's poll floor is
+;; still killed.
+;;
+;; It does NOT pin the floor change itself. Separating the two needs a step
+;; that lands inside the gap between the TTL and the old 50ms floor -- a
+;; five millisecond window with a 40ms TTL -- and an assertion with five
+;; milliseconds of margin is a coin toss reported as a result. The floor now
+;; never outlasts the thing it watches, which is free and correct; it is not
+;; claimed as tested.
+(let-values (((tid ttok tfirst)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (sleep-ms 300)              ; far past a 40ms TTL
+                    (vector 'should-not-get-here a)))
+                'go
+                40)))
+  (let ((me self))
+    (spawn (lambda ()
+             (let-values (((r st) (conversation-resume! tid ttok 'X)))
+               (send me (vector 'tiny r)))))
+    (receive (after 5000 (fail "tiny-ttl" 'no-answer))
+      (`#(tiny ,v)
+        (when (and (vector? v) (eq? (vector-ref v 0) 'should-not-get-here))
+          (fail "a step outran a TTL below the watchdog's floor" v))
+        (display "a TTL below the poll floor is still enforced ok\n")))))
+
 ;; ---- a resume long after the park deadline does not advance -------------
 ;;
 ;; What this pins is the ordinary case: the window closed, the flow was
