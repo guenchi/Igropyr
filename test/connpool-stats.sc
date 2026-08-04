@@ -1,5 +1,5 @@
 #!chezscheme
-;;; (igropyr sqlpool) statistics, against FAKE connection workers.
+;;; (igropyr connpool) statistics, against FAKE connection workers.
 ;;;
 ;;; A saturated pool and a slow database look identical from outside: both
 ;;; present as slow requests. What separates them is where the time went --
@@ -15,7 +15,7 @@
 ;;; timeout paths are driven for real. A stats call that only asserted "the
 ;;; keys are present" would pass against a pool that reported zeros.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sqlpool))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr connpool))
 
 (define failures 0)
 (define (check label ok)
@@ -24,7 +24,7 @@
              (display "FAIL  ") (display label) (newline))))
 
 (define cfg
-  (make-sql-cfg
+  (make-connpool-cfg
     (lambda (r) (and (vector? r) (eq? (vector-ref r 0) 'fake-error)))
     (vector 'fake-error "lost")
     (vector 'fake-error "closed")
@@ -40,31 +40,31 @@
 (define (fake-spawn-conn! notify report-to ref)
   (spawn
     (lambda ()
-      (send report-to (vector 'db-up ref self 'ok))
-      (receive (`#(db-adopt) 'ok))
+      (send report-to (vector 'pool-up ref self 'ok))
+      (receive (`#(pool-adopt) 'ok))
       (let loop ()
         (receive
-          (`#(db-query ,sql ,r ,from)
+          (`#(pool-request ,sql ,r ,from)
             (when (and (string? sql) (>= (string-length sql) 4)
                        (string=? (substring sql 0 4) "SLOW"))
               (sleep-ms 300))
-            (send from (vector 'db-reply r (vector 'fake-rows sql)))
-            (send notify (vector 'db-idle self))
+            (send from (vector 'pool-reply r (vector 'fake-rows sql)))
+            (send notify (vector 'pool-idle self))
             (loop))
           ;; part of the driver contract: a lone connection answers #f, so
           ;; the request cannot sit here forever
-          (`#(db-stats ,r ,from)
-            (send from (vector 'db-stats-reply r #f))
+          (`#(pool-stats ,r ,from)
+            (send from (vector 'pool-stats-reply r #f))
             (loop))
-          (`#(db-quit) 'done))))))
+          (`#(pool-quit) 'done))))))
 
 (start-scheduler
   (lambda ()
-    (let ((pool (spawn (lambda () (sql-pool-loop 1 fake-spawn-conn! cfg)))))
+    (let ((pool (spawn (lambda () (connpool-loop 1 fake-spawn-conn! cfg)))))
       (sleep-ms 300)
 
       ;; ---- an idle pool ---------------------------------------------------
-      (let ((st (sql-pool-stats pool)))
+      (let ((st (connpool-stats pool)))
         (check "size is the configured size" (= 1 (stat st 'size)))
         (check "an idle pool has its connection idle" (= 1 (stat st 'idle)))
         (check "nothing in use" (= 0 (stat st 'in-use)))
@@ -73,8 +73,8 @@
         (check "no queries yet" (= 0 (stat st 'queries))))
 
       ;; ---- a query, timed -------------------------------------------------
-      (sql-query pool "SLOW SELECT 1" cfg)
-      (let ((st (sql-pool-stats pool)))
+      (connpool-call pool "SLOW SELECT 1" cfg)
+      (let ((st (connpool-stats pool)))
         (check "the query was counted" (= 1 (stat st 'queries)))
         (check "and completed" (= 1 (stat st 'queries-completed)))
         ;; the worker slept 300 ms: the measurement must bracket that, which
@@ -92,12 +92,12 @@
       ;; The single connection is occupied for 300 ms; two more queries must
       ;; queue behind it, and the pool must say so WHILE they are queued.
       (let ((me self))
-        (spawn (lambda () (sql-query pool "SLOW A" cfg) (send me (vector 'q 'a))))
+        (spawn (lambda () (connpool-call pool "SLOW A" cfg) (send me (vector 'q 'a))))
         (sleep-ms 60)
-        (spawn (lambda () (sql-query pool "SLOW B" cfg) (send me (vector 'q 'b))))
-        (spawn (lambda () (sql-query pool "SLOW C" cfg) (send me (vector 'q 'c))))
+        (spawn (lambda () (connpool-call pool "SLOW B" cfg) (send me (vector 'q 'b))))
+        (spawn (lambda () (connpool-call pool "SLOW C" cfg) (send me (vector 'q 'c))))
         (sleep-ms 60)
-        (let ((st (sql-pool-stats pool)))
+        (let ((st (connpool-stats pool)))
           (check "the running query shows as in use" (= 1 (stat st 'in-use)))
           (check "the queued ones show as pending" (= 2 (stat st 'pending)))
           (display "  [info] in-use ") (display (stat st 'in-use))
@@ -105,7 +105,7 @@
         ;; let them drain
         (let drain ((i 0)) (when (< i 3) (receive (after 5000 'lost) (`#(q ,x) x))
                                          (drain (+ i 1))))
-        (let ((st (sql-pool-stats pool)))
+        (let ((st (connpool-stats pool)))
           (check "queue wait was measured for the ones that waited"
             (> (stat st 'queue-wait-ms-max) 200))
           (display "  [info] queue-wait-ms-max ")
@@ -116,30 +116,30 @@
       ;; ---- leases: in-use, checkout wait ----------------------------------
       (let ((me self))
         (let ((holder (spawn (lambda ()
-                               (sql-call-with-connection pool
+                               (connpool-lease pool
                                  (lambda (c)
                                    (send me (vector 'held))
                                    (receive (`#(release) 'ok)))
                                  cfg)))))
           (receive (after 3000 'lost) (`#(held) 'ok))
-          (let ((st (sql-pool-stats pool)))
+          (let ((st (connpool-stats pool)))
             (check "a lease shows as leased" (= 1 (stat st 'leased)))
             (check "and counts as in use" (= 1 (stat st 'in-use)))
             (check "the lease was counted" (= 1 (stat st 'checkouts))))
 
           ;; a second borrower must wait behind it
           (spawn (lambda ()
-                   (sql-call-with-connection pool
+                   (connpool-lease pool
                      (lambda (c) (send me (vector 'second))) cfg)))
           (sleep-ms 250)
-          (let ((st (sql-pool-stats pool)))
+          (let ((st (connpool-stats pool)))
             (check "a waiting borrower shows as checkout-pending"
               (= 1 (stat st 'checkout-pending))))
 
           (send holder (vector 'release))
           (receive (after 3000 'lost) (`#(second) 'ok))
           (sleep-ms 100)
-          (let ((st (sql-pool-stats pool)))
+          (let ((st (connpool-stats pool)))
             (check "its wait was measured"
               (> (stat st 'checkout-wait-ms-max) 150))
             (display "  [info] checkout-wait-ms-max ")
@@ -148,18 +148,18 @@
             (check "nothing left in use" (= 0 (stat st 'in-use))))))
 
       ;; ---- timeouts -------------------------------------------------------
-      ;; Both timeout paths tell the pool (db-query-cancel / db-checkout-cancel)
+      ;; Both timeout paths tell the pool (pool-request-cancel / pool-checkout-cancel)
       ;; so it can drop the request; those are exactly the events to count.
-      (let ((before (stat (sql-pool-stats pool) 'query-timeouts)))
-        (send pool (vector 'db-query-cancel (gensym) self))
+      (let ((before (stat (connpool-stats pool) 'query-timeouts)))
+        (send pool (vector 'pool-request-cancel (gensym) self))
         (sleep-ms 100)
         (check "a query timeout is counted"
-          (= (+ before 1) (stat (sql-pool-stats pool) 'query-timeouts))))
-      (let ((before (stat (sql-pool-stats pool) 'checkout-timeouts)))
-        (send pool (vector 'db-checkout-cancel (gensym) self))
+          (= (+ before 1) (stat (connpool-stats pool) 'query-timeouts))))
+      (let ((before (stat (connpool-stats pool) 'checkout-timeouts)))
+        (send pool (vector 'pool-checkout-cancel (gensym) self))
         (sleep-ms 100)
         (check "a checkout timeout is counted"
-          (= (+ before 1) (stat (sql-pool-stats pool) 'checkout-timeouts))))
+          (= (+ before 1) (stat (connpool-stats pool) 'checkout-timeouts))))
 
       ;; ---- waits that ended in a TIMEOUT ---------------------------------
       ;; Recording only the requests that eventually got a connection left
@@ -168,11 +168,11 @@
       ;; of zero, because nothing ever waited successfully.
       ;;
       ;; The waits are driven for real -- a request is queued behind a lease,
-      ;; left there, then cancelled the way sql-query and sql-checkout cancel
+      ;; left there, then cancelled the way connpool-call and connpool-checkout cancel
       ;; on timeout.
       (let ((me self))
         (let ((holder (spawn (lambda ()
-                               (sql-call-with-connection pool
+                               (connpool-lease pool
                                  (lambda (c)
                                    (send me (vector 'held))
                                    (receive (`#(release) 'ok)))
@@ -182,16 +182,16 @@
           ;; when an earlier successful wait was longer, and asserting on
           ;; one is a test that depends on the order of the cases above
           (let ((qref (gensym)) (cref (gensym))
-                (q0 (stat (sql-pool-stats pool) 'queue-wait-ms-total))
-                (c0 (stat (sql-pool-stats pool) 'checkout-wait-ms-total)))
-            (send pool (vector 'db-query "SELECT waited" qref self))
-            (send pool (vector 'db-checkout cref self))
+                (q0 (stat (connpool-stats pool) 'queue-wait-ms-total))
+                (c0 (stat (connpool-stats pool) 'checkout-wait-ms-total)))
+            (send pool (vector 'pool-request "SELECT waited" qref self))
+            (send pool (vector 'pool-checkout cref self))
             (sleep-ms 400)
             ;; exactly what the client side sends when its timeout fires
-            (send pool (vector 'db-query-cancel qref self))
-            (send pool (vector 'db-checkout-cancel cref self))
+            (send pool (vector 'pool-request-cancel qref self))
+            (send pool (vector 'pool-checkout-cancel cref self))
             (sleep-ms 150)
-            (let ((st (sql-pool-stats pool)))
+            (let ((st (connpool-stats pool)))
               (display "  [info] ~400 ms of waiting that timed out added ")
               (display (- (stat st 'queue-wait-ms-total) q0))
               (display " ms to queue-wait-total and ")
@@ -204,7 +204,7 @@
           (send holder (vector 'release))
           (sleep-ms 200)))
 
-      (send pool (vector (quote db-quit))))
+      (send pool (vector (quote pool-quit))))
 
     ;; ---- a lone connection is not a pool ----------------------------------
     ;; Asking one for pool statistics must be an error, not zeros: an
@@ -213,14 +213,14 @@
     ;; that connection's mailbox forever, which is why there is a reply at
     ;; all rather than a bare timeout here.
     (let ((conn (fake-spawn-conn! self self (gensym))))
-      (send conn (vector 'db-adopt))
+      (send conn (vector 'pool-adopt))
       (check "a lone connection refuses pool statistics"
         (guard (e ((assertion-violation? e) #t) (#t #f))
-          (sql-pool-stats conn)
+          (connpool-stats conn)
           #f))
-      (send conn (vector 'db-quit)))
+      (send conn (vector 'pool-quit)))
 
     (sleep-ms 100)
     (if (zero? failures)
-        (begin (display "sqlpool-stats: all tests passed\n") (exit 0))
+        (begin (display "connpool-stats: all tests passed\n") (exit 0))
         (begin (display failures) (display " failures\n") (exit 1)))))

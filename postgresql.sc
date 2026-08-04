@@ -9,13 +9,13 @@
 ;;; at a time.
 ;;;
 ;;;   (define db (postgresql-connect "127.0.0.1" 5432 "user" "password" "db"))
-;;;   (postgresql-query db "SELECT id, name FROM users")
+;;;   (postgreconnpool-call db "SELECT id, name FROM users")
 ;;;     ;; -> #(rows ("id" "name") (("1" "Alice") ("2" "Bob")))
-;;;   (postgresql-query db "INSERT INTO users (name) VALUES ('Eve')")
+;;;   (postgreconnpool-call db "INSERT INTO users (name) VALUES ('Eve')")
 ;;;     ;; -> #(ok 1)                          ; affected rows
 ;;;   (postgresql-execute db "SELECT name FROM users WHERE id = $1" 2)
 ;;;     ;; -> #(rows ("name") (("Bob")))       ; server-side parameter binding
-;;;   (postgresql-close! db)
+;;;   (postgreconnpool-close! db)
 ;;;
 ;;; postgresql-execute runs one statement over the extended query protocol
 ;;; (Parse/Bind/Execute): parameters are sent out-of-band as $1..$n values,
@@ -23,7 +23,7 @@
 ;;; injection through a value is impossible -- prefer it over string
 ;;; concatenation whenever a statement takes runtime values. Parameters may
 ;;; be strings, numbers, #f (SQL NULL) or bytevectors (raw text-format
-;;; bytes). Unlike postgresql-query it accepts exactly one statement.
+;;; bytes). Unlike postgreconnpool-call it accepts exactly one statement.
 ;;;
 ;;; Values arrive as strings (the wire text format); NULL is #f. The
 ;;; connection asks for client_encoding UTF8 at startup, so text is
@@ -81,11 +81,11 @@
 ;;; only over a trusted network or a local socket.
 
 (library (igropyr postgresql)
-  (export postgresql-connect postgresql-pool postgresql-query
-          postgresql-execute postgresql-close! postgresql-pool-stats
+  (export postgresql-connect postgresql-pool postgreconnpool-call
+          postgresql-execute postgreconnpool-close! postgreconnpool-stats
           postgresql-transaction call-with-postgresql-connection)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr buffer)
-          (igropyr sqlpool)
+          (igropyr connpool)
           (only (igropyr crypto)
                 sha256 hmac-sha256 pbkdf2-hmac-sha256
                 base64-encode base64-decode))
@@ -98,7 +98,7 @@
   ;; NoticeResponse every nine seconds -- perfectly legal, and something a
   ;; hostile or confused peer can keep up indefinitely -- held a connection
   ;; worker forever. The single-connection caller gave up at twelve seconds
-  ;; and the worker kept running; a POOL worker never reported db-up at all,
+  ;; and the worker kept running; a POOL worker never reported pool-up at all,
   ;; so it occupied its slot for the life of the process while the pool
   ;; waited for a connection that was never coming.
   ;;
@@ -125,7 +125,7 @@
   ;; what the server may say, not what an attacker may.
   (define default-scram-max-iters 100000)
   ;; per-socket-read clock while a QUERY is in flight (the caller-facing
-  ;; query timeout is (igropyr sqlpool)'s own, same value); auth-phase
+  ;; query timeout is (igropyr connpool)'s own, same value); auth-phase
   ;; reads use connect-timeout-ms instead, so a server that stalls
   ;; mid-handshake holds a connect worker for the connect budget, not
   ;; the query budget.
@@ -333,14 +333,14 @@
       (`#(DOWN ,pid ,reason) (postgresql-fail 'transport "owner gone"))
       ;; A TEARDOWN has to reach us HERE as well. The pool reclaims a
       ;; connection whose borrower died by marking it dying and sending
-      ;; db-quit -- @kill discards dynamic-wind winders, so the pool's
+      ;; pool-quit -- @kill discards dynamic-wind winders, so the pool's
       ;; monitor is the only path back -- and a receive matching only the
       ;; socket left that message in the mailbox until the statement
       ;; finished. Against a server that has stopped answering, that is the
       ;; whole query timeout, and for all of it the connection is marked
       ;; dying: neither lent out nor rebuilt. Failing here takes the same
       ;; route a transport error already takes.
-      (`#(db-quit)
+      (`#(pool-quit)
         (postgresql-fail 'transport "connection closed while a query was in flight"))))
 
   ;; During startup/auth the server may interleave NoticeResponse ('N')
@@ -757,9 +757,9 @@
 
   ;; ---- connection process ------------------------------------------------
 
-  ;; notify (a pid or #f): told #(db-idle ,self) after each finished query,
+  ;; notify (a pid or #f): told #(pool-idle ,self) after each finished query,
   ;; so a pool can hand this connection its next task (the db-* message
-  ;; contract is (igropyr sqlpool)'s). Replies carry the caller's ref so a
+  ;; contract is (igropyr connpool)'s). Replies carry the caller's ref so a
   ;; late reply cannot be mis-read by that caller's next query. On a
   ;; transport error the connection replies to its caller, tells the pool
   ;; it already did (so the pool's DOWN handler does not send a second,
@@ -776,12 +776,12 @@
   ;; monitor is one-directional: when the pool was killed or died of an
   ;; internal error, actor cleanup dropped the monitoring relationships and
   ;; left every connection actor running, each holding an fd and, over TLS,
-  ;; a live session. Only an orderly db-quit ever closed them. Recreating
+  ;; a live session. Only an orderly pool-quit ever closed them. Recreating
   ;; the pool then stacked a second full set on top of the first.
   ;;
   ;; A connection whose owner is gone has nobody to serve and no way to be
   ;; reached, so it closes. Terminate is best-effort for the same reason as
-  ;; in db-quit below.
+  ;; in pool-quit below.
   (define (owner-gone! c)
     (guard (e (#t (void)))
       (send-msg! c MSG-TERMINATE empty-bv))
@@ -793,7 +793,7 @@
         (if (and notify (eq? pid notify))
             (owner-gone! c)
             (serve-loop c buf notify)))
-      (`#(db-query ,q ,ref ,from)
+      (`#(pool-request ,q ,ref ,from)
         ;; q is a plain SQL string (simple protocol) or (sql . params)
         ;; with params pre-converted by postgresql-execute (extended).
         (let ((r (guard (e (#t (as-postgresql-error e "query failed")))
@@ -814,25 +814,25 @@
           ;; The cost of this order is a two-send window in which a kill
           ;; would leave the caller with no reply at all rather than a
           ;; duplicate one. That is a narrower window and a milder failure.
-                (when notify (send notify (vector 'db-conn-dead self)))
-                (send from (vector 'db-reply ref r))
+                (when notify (send notify (vector 'pool-conn-dead self)))
+                (send from (vector 'pool-reply ref r))
                 (tx-close! c))                  ; exit -> DOWN -> rebuild
               (begin
-                (send from (vector 'db-reply ref r))
-                (when notify (send notify (vector 'db-idle self)))
+                (send from (vector 'pool-reply ref r))
+                (when notify (send notify (vector 'pool-idle self)))
                 (serve-loop c buf notify)))))
-      ;; sql-query sends this to whatever handle it was given when a call
+      ;; connpool-call sends this to whatever handle it was given when a call
       ;; times out; only a pool acts on it. Consume it here so it does not
       ;; sit in the mailbox forever, slowing every later selective receive
       ;; (the same accumulation drain-stale! exists to prevent).
-      (`#(db-query-cancel ,ref ,from) (serve-loop c buf notify))
+      (`#(pool-request-cancel ,ref ,from) (serve-loop c buf notify))
       ;; A single connection is not a pool and keeps none of its
       ;; bookkeeping. Answering #f is what keeps the request from sitting
-      ;; here forever; postgresql-pool-stats turns it into a clear error.
-      (`#(db-stats ,ref ,from)
-        (send from (vector 'db-stats-reply ref #f))
+      ;; here forever; postgreconnpool-stats turns it into a clear error.
+      (`#(pool-stats ,ref ,from)
+        (send from (vector 'pool-stats-reply ref #f))
         (serve-loop c buf notify))
-      (`#(db-quit)
+      (`#(pool-quit)
         ;; best-effort Terminate: over TLS the encrypt can fail when the
         ;; session already saw close_notify -- the close must run anyway,
         ;; or the fd and the SSL session leak
@@ -860,17 +860,17 @@
       (`#(tcp-error ,e) (tx-close! c))))
 
   ;; After reporting up, wait to be adopted (the pool or the connecting
-  ;; caller answers with db-adopt). If nobody adopts -- the caller timed
+  ;; caller answers with pool-adopt). If nobody adopts -- the caller timed
   ;; out and moved on, or the pool was closed while we were still
   ;; authenticating -- close the socket and exit instead of holding an
   ;; authenticated connection forever.
   (define (await-adoption c buf notify)
     (receive (after connect-timeout-ms (tx-close! c))
-      (`#(db-adopt)
+      (`#(pool-adopt)
         (when notify (monitor notify))
         (serve-loop c buf notify))
-      (`#(db-quit)
-        (guard (e (#t (void)))                   ; see serve-loop's db-quit
+      (`#(pool-quit)
+        (guard (e (#t (void)))                   ; see serve-loop's pool-quit
           (send-msg! c MSG-TERMINATE empty-bv))
         (tx-close! c))
       (`#(tcp-data ,bv)
@@ -952,7 +952,7 @@
       (else
        (call-with-string-output-port (lambda (p) (write e p))))))
 
-  ;; spawn a connection worker; reports #(db-up ,ref ,self status) to
+  ;; spawn a connection worker; reports #(pool-up ,ref ,self status) to
   ;; report-to -- ref lets the receiver ignore a stale report from an
   ;; earlier, timed-out attempt -- then waits for adoption and serves
   ;; queries (notifying `notify` when idle). Every failure path closes the
@@ -963,7 +963,7 @@
     (spawn
       (lambda ()
         (define (report! status)
-          (send report-to (vector 'db-up ref self status)))
+          (send report-to (vector 'pool-up ref self status)))
         (let ((started (guard (e (#t (as-postgresql-error e "connect failed")))
                          (tcp-connect! host port self)
                          'ok)))
@@ -995,12 +995,12 @@
                               (begin (tx-close! t) (report! r)))))))))))))
 
   ;; ---- pool + public API ---------------------------------------------------
-  ;; The pool, lease and transaction machinery is (igropyr sqlpool), shared
+  ;; The pool, lease and transaction machinery is (igropyr connpool), shared
   ;; with (igropyr mysql); this driver contributes the wire protocol above
   ;; and its error shapes below.
 
   (define cfg
-    (make-sql-cfg
+    (make-connpool-cfg
       (lambda (r) (and (vector? r) (eq? (vector-ref r 0) 'postgresql-error)))
       (vector 'postgresql-error 'transport "connection lost")
       (vector 'postgresql-error 'transport "pool closed")
@@ -1043,7 +1043,7 @@
       ;; so it is immortal and every selective receive below scans past
       ;; it. A process that reconnects in a loop and never runs a query
       ;; had nothing else that would ever clear them.
-      (sql-drain-stale!)
+      (connpool-drain-stale!)
       (let ((ref (gensym)))
         (start-connection host port user password db opts #f self ref)
         (receive (after (+ connect-timeout-ms 2000)
@@ -1051,13 +1051,13 @@
                     ;; its socket by itself; the ref keeps its late up-report
                     ;; from ever being mistaken for another connect's.
                     (raise (vector 'postgresql-error 'transport "connect timeout")))
-          (`#(db-up ,@ref ,pid ,status)
+          (`#(pool-up ,@ref ,pid ,status)
             (if (eq? status 'ok)
-                (begin (send pid (vector 'db-adopt)) pid)
+                (begin (send pid (vector 'pool-adopt)) pid)
                 (raise status)))))))
 
-  ;; Pool of n connections; returns the dispatcher, which postgresql-query
-  ;; and postgresql-close! accept exactly like a single connection. Usable
+  ;; Pool of n connections; returns the dispatcher, which postgreconnpool-call
+  ;; and postgreconnpool-close! accept exactly like a single connection. Usable
   ;; immediately: queries queue until connections come up. Same optional
   ;; db + options as postgresql-connect.
   (define (postgresql-pool n host port user password . rest)
@@ -1066,10 +1066,10 @@
       ;; before the spawn: a bad size checked inside the pool process
       ;; raises where the caller cannot see it, and this returns a pid
       ;; that dies a moment later
-      (sql-check-pool-size! 'postgresql-pool n)
+      (connpool-check-size! 'postgresql-pool n)
       (spawn
         (lambda ()
-          (sql-pool-loop n
+          (connpool-loop n
             (lambda (notify report-to ref)
               (start-connection host port user password db opts
                                 notify report-to ref))
@@ -1078,7 +1078,7 @@
   ;; Run one SQL statement; blocks only the calling green process. A
   ;; 'timeout error means the statement's outcome is UNKNOWN -- it may
   ;; still execute on the server.
-  (define (postgresql-query mc sql) (sql-query mc sql cfg))
+  (define (postgreconnpool-call mc sql) (connpool-call mc sql cfg))
 
   ;; Convert one parameter to its wire form (text-format bytes, or #f for
   ;; NULL). Runs in the CALLER, before anything reaches the connection
@@ -1114,7 +1114,7 @@
   ;; Run ONE statement with $1..$n parameters over the extended query
   ;; protocol. Values never touch the SQL text, so they need no quoting
   ;; and cannot inject. Same result shapes and timeout semantics as
-  ;; postgresql-query.
+  ;; postgreconnpool-call.
   (define (postgresql-execute mc sql . params)
     ;; Bind carries the parameter count as an Int16: 65535 is the
     ;; protocol's hard limit. Reject beyond it HERE -- inside the
@@ -1124,16 +1124,16 @@
       (assertion-violation 'postgresql-execute
         "too many parameters (PostgreSQL allows at most 65535)"
         (length params)))
-    (sql-query mc (cons sql (map param->wire params)) cfg))
+    (connpool-call mc (cons sql (map param->wire params)) cfg))
 
   ;; Borrow one whole connection from a POOL for the extent of proc, then
   ;; return it -- even if proc raises or exits non-locally. proc receives the
-  ;; connection process; run postgresql-query on THAT connection and no other
+  ;; connection process; run postgreconnpool-call on THAT connection and no other
   ;; caller's query can interleave. Requires a postgresql-pool. Don't send
   ;; queries (or a second checkout) to the pool itself while holding a
   ;; connection.
   (define (call-with-postgresql-connection pool proc)
-    (sql-call-with-connection pool proc cfg))
+    (connpool-lease pool proc cfg))
 
   ;; Run proc inside a transaction on a borrowed pool connection: BEGIN,
   ;; then COMMIT if proc returns normally, or ROLLBACK if it escapes.
@@ -1144,9 +1144,9 @@
   (define (postgresql-transaction pool proc)
     (sql-transaction pool proc cfg))
 
-  (define (postgresql-close! mc) (sql-close! mc))
+  (define (postgreconnpool-close! mc) (connpool-close! mc))
 
   ;; A snapshot of a pool: in-use, pending, checkout wait, query duration,
-  ;; timeout counts and more. See (igropyr sqlpool) for the full key list.
-  (define (postgresql-pool-stats pool) (sql-pool-stats pool))
+  ;; timeout counts and more. See (igropyr connpool) for the full key list.
+  (define (postgreconnpool-stats pool) (connpool-stats pool))
 )

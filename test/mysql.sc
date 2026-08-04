@@ -63,22 +63,22 @@
                  (write e) (display ")\n")
                  (exit 0)))
         ;; a lone connect proves reachability + auth before we build the pool
-        (mysql-close! (mysql-connect host port user pass db opts))
+        (myconnpool-close! (mysql-connect host port user pass db opts))
         (mysql-pool 4 host port user pass db opts)))
 
     ;; ---- fresh table --------------------------------------------------------
-    (mysql-query pool (string-append "DROP TABLE IF EXISTS " table))
-    (mysql-query pool
+    (myconnpool-call pool (string-append "DROP TABLE IF EXISTS " table))
+    (myconnpool-call pool
       (string-append "CREATE TABLE " table
         " (id INT PRIMARY KEY, val INT NOT NULL) ENGINE=InnoDB"))
-    (mysql-query pool (string-append "INSERT INTO " table " (id,val) VALUES (1,0)"))
+    (myconnpool-call pool (string-append "INSERT INTO " table " (id,val) VALUES (1,0)"))
 
     ;; ---- 1. commit persists -------------------------------------------------
     (mysql-transaction pool
       (lambda (c)
-        (mysql-query c (string-append "UPDATE " table " SET val=7 WHERE id=1"))))
+        (myconnpool-call c (string-append "UPDATE " table " SET val=7 WHERE id=1"))))
     (check "commit-persists"
-      (= 7 (scalar-num (mysql-query pool
+      (= 7 (scalar-num (myconnpool-call pool
              (string-append "SELECT val FROM " table " WHERE id=1")))))
 
     ;; ---- 2. escape rolls back, and the connection comes back to the pool -----
@@ -86,30 +86,30 @@
       (guard (e (#t #t))
         (mysql-transaction pool
           (lambda (c)
-            (mysql-query c (string-append "UPDATE " table " SET val=999 WHERE id=1"))
+            (myconnpool-call c (string-append "UPDATE " table " SET val=999 WHERE id=1"))
             (raise 'boom)))
         #f))                                   ; should not reach here
     (check "rollback-reverted"
-      (= 7 (scalar-num (mysql-query pool
+      (= 7 (scalar-num (myconnpool-call pool
              (string-append "SELECT val FROM " table " WHERE id=1")))))
     ;; the connection that ran the rolled-back txn must be reusable
     (check "pool-alive-after-rollback"
-      (= 1 (scalar-num (mysql-query pool "SELECT 1"))))
+      (= 1 (scalar-num (myconnpool-call pool "SELECT 1"))))
 
     ;; ---- 3. FOR UPDATE serialises concurrent writers (no lost updates) -------
     ;;    N transactions each do  SELECT val FOR UPDATE; UPDATE val = val+1.
     ;;    On a pool smaller than N this also exercises checkout queueing.
-    (mysql-query pool (string-append "UPDATE " table " SET val=0 WHERE id=1"))
+    (myconnpool-call pool (string-append "UPDATE " table " SET val=0 WHERE id=1"))
     (let ((n 20) (p3 (mysql-pool 3 host port user pass db opts)))
       (do ((i 0 (+ i 1))) ((= i n))
         (spawn (lambda ()
           (mysql-transaction p3
             (lambda (c)
               (let ((v (scalar-num
-                         (mysql-query c
+                         (myconnpool-call c
                            (string-append "SELECT val FROM " table
                                           " WHERE id=1 FOR UPDATE")))))
-                (mysql-query c
+                (myconnpool-call c
                   (string-append "UPDATE " table " SET val="
                     (number->string (+ v 1)) " WHERE id=1")))))
           (send main (vector 'done)))))
@@ -117,19 +117,19 @@
         (when (< k n)
           (receive (after 20000 (fail "concurrency: workers did not finish"))
             (`#(done) (loop (+ k 1))))))
-      (mysql-close! p3)
+      (myconnpool-close! p3)
       (check "for-update-no-lost-updates"
-        (= n (scalar-num (mysql-query pool
+        (= n (scalar-num (myconnpool-call pool
                (string-append "SELECT val FROM " table " WHERE id=1"))))))
 
     ;; ---- 4. no connection leak: far more transactions than pool size --------
     (let ((m 40))
       (let loop ((i 0))
         (when (< i m)
-          (mysql-transaction pool (lambda (c) (mysql-query c "SELECT 1")))
+          (mysql-transaction pool (lambda (c) (myconnpool-call c "SELECT 1")))
           (loop (+ i 1))))
       (check "no-leak-sequential"
-        (= 1 (scalar-num (mysql-query pool "SELECT 1")))))
+        (= 1 (scalar-num (myconnpool-call pool "SELECT 1")))))
 
     ;; ---- 5. a borrower killed mid-transaction is reclaimed + rebuilt --------
     ;;    Pool of 1: the victim holds the ONLY connection with an open
@@ -141,7 +141,7 @@
              (spawn (lambda ()
                (mysql-transaction p1
                  (lambda (c)
-                   (mysql-query c "SELECT 1")      ; open txn, hold the conn
+                   (myconnpool-call c "SELECT 1")      ; open txn, hold the conn
                    (send main (vector 'holding))
                    (receive (`#(never) 'unreached))))))))  ; park forever
         (receive (after 5000 (fail "reclaim: victim never acquired the connection"))
@@ -151,12 +151,12 @@
           (equal? 42
             (guard (e (#t #f))
               (mysql-transaction p1
-                (lambda (c) (scalar-num (mysql-query c "SELECT 42"))))))))
-      (mysql-close! p1))
+                (lambda (c) (scalar-num (myconnpool-call c "SELECT 42"))))))))
+      (myconnpool-close! p1))
 
     ;; ---- done ---------------------------------------------------------------
-    (mysql-query pool (string-append "DROP TABLE IF EXISTS " table))
-    (mysql-close! pool)
+    (myconnpool-call pool (string-append "DROP TABLE IF EXISTS " table))
+    (myconnpool-close! pool)
     (sleep-ms 50)
     (if (zero? failures)
         (begin (display "mysql: all transaction tests passed\n") (exit 0))

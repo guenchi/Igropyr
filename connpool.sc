@@ -1,41 +1,63 @@
 #!chezscheme
-;;; (igropyr sqlpool) -- shared connection-pool engine for the SQL drivers.
+;;; (igropyr connpool) -- a pool of connections to something that is not us.
 ;;;
-;;; (igropyr mysql) and (igropyr postgresql) share one architecture: a
-;;; green process per connection serving queries from its mailbox, a
-;;; fixed pool behind a dispatcher, whole-connection leases for
-;;; transactions, and monitors for crash reclaim. The machinery is
-;;; subtle -- checkout-cancel races, reclaim of a borrower killed
-;;; mid-transaction (dynamic-wind winders are discarded by @kill, so
-;;; only the pool's monitor runs), adoption of workers that finish
-;;; connecting after their pool or caller is gone -- and a fix landing
-;;; in one duplicated copy but not the other would be a silent
-;;; correctness bug. This library is the single copy.
+;;; Every driver here has the same architecture: a green process per
+;;; connection serving requests from its mailbox, a fixed pool behind a
+;;; dispatcher, whole-connection leases, and monitors for crash reclaim.
+;;; The machinery is subtle -- checkout-cancel races, reclaim of a
+;;; borrower killed mid-lease (dynamic-wind winders are discarded by
+;;; @kill, so only the pool's monitor runs), adoption of workers that
+;;; finish connecting after their pool or caller is gone, refusing to
+;;; re-lend a connection already on its way out -- and a fix landing in
+;;; one duplicated copy but not the other would be a silent correctness
+;;; bug. This library is the single copy.
 ;;;
-;;; The engine is protocol-blind: the wire protocol, authentication and
+;;; It was written for (igropyr mysql) and (igropyr postgresql) and was
+;;; called sqlpool. What it actually models is narrower than SQL and
+;;; wider: a scarce EXCLUSIVE resource whose work happens on the far side
+;;; of a socket, borrowed for the length of one request. (igropyr qjspool)
+;;; -- QuickJS renders in worker processes -- is the third driver, and
+;;; needed one generalization to fit (the deadlines moved from module
+;;; constants into the config, because a minute is right for a database
+;;; and wrong for a render) and nothing else.
+;;;
+;;; The engine is PROTOCOL-BLIND: the wire protocol, authentication and
 ;;; result parsing stay in each driver. The message contract a driver's
 ;;; connection process must speak:
 ;;;
-;;;   #(db-query ,sql ,ref ,from)   run sql, then #(db-reply ,ref ,r) to from
-;;;   #(db-adopt) / #(db-quit)      adoption handshake / shutdown
-;;;   #(db-idle ,self)              to its pool after each finished query
-;;;   #(db-conn-dead ,self)         to its pool when it replied a transport
-;;;                                 error and is about to exit
-;;;   #(db-up ,ref ,self ,status)   reported by a connecting worker
-;;;   #(db-stats ,ref ,from)        -> #(db-stats-reply ,ref #f); a single
-;;;                                 connection keeps no pool bookkeeping,
-;;;                                 and answering is what stops the request
-;;;                                 sitting in its mailbox forever
+;;;   #(pool-request ,req ,ref ,from)  do req, then #(pool-reply ,ref ,r) to from
+;;;   #(pool-adopt) / #(pool-quit)     adoption handshake / shutdown
+;;;   #(pool-idle ,self)               to its pool after each finished request
+;;;   #(pool-conn-dead ,self)          to its pool BEFORE it replies a transport
+;;;                                    error, so the mark arrives before the
+;;;                                    check-in that reply sets off
+;;;   #(pool-up ,ref ,self ,status)    reported by a connecting worker
+;;;   #(pool-stats ,ref ,from)         -> #(pool-stats-reply ,ref #f); a single
+;;;                                    connection keeps no pool bookkeeping,
+;;;                                    and answering is what stops the request
+;;;                                    sitting in its mailbox forever
+;;;
+;;; A connection must also answer pool-quit and pool-request-cancel WHILE
+;;; IT IS WAITING for the far side. A receive that matches only the socket
+;;; strands both: the pool cannot reclaim it and the caller cannot
+;;; abandon it, and the connection sits marked-dying and un-rebuilt for as
+;;; long as its own deadline allows.
 ;;;
 ;;; Drivers keep their public error shapes: the engine takes the error
 ;;; VALUES it must produce and a predicate for recognizing an error
 ;;; reply, bundled in a config record built once per driver.
+;;;
+;;; sql-transaction is the one SQL-shaped thing left here, and it stays
+;;; because the alternative is worse: it is built on checkout + request +
+;;; check-in-or-check-in-broken, and that kill-safety is exactly the
+;;; reasoning this file exists to keep in one copy. Everything below it
+;;; is blind to what the connections are.
 
-(library (igropyr sqlpool)
-  (export make-sql-cfg
-          sql-pool-loop sql-query sql-drain-stale! sql-check-pool-size!
-          sql-transaction sql-call-with-connection sql-close!
-          sql-pool-stats)
+(library (igropyr connpool)
+  (export make-connpool-cfg
+          connpool-loop connpool-call connpool-drain-stale! connpool-check-size!
+          sql-transaction connpool-lease connpool-close!
+          connpool-stats)
   (import (chezscheme) (igropyr actor) (igropyr libuv))
 
   (define default-query-ms 60000)
@@ -47,7 +69,7 @@
   ;; that opens a transaction ("BEGIN" / "START TRANSACTION");
   ;; query-ms/checkout-ms: how long a caller waits for a reply, and for a
   ;; free connection, before giving up.
-  (define-record-type (sql-cfg make-cfg sql-cfg?)
+  (define-record-type (connpool-cfg make-cfg connpool-cfg?)
     (fields error? lost-err closed-err
             query-timeout-err checkout-timeout-err begin-sql
             query-ms checkout-ms))
@@ -62,7 +84,7 @@
   ;; is a property of the resource, not of the pooling: two pools of
   ;; different things in one process need different ones, and a module-level
   ;; constant can only give them the same.
-  (define (make-sql-cfg error? lost-err closed-err
+  (define (make-connpool-cfg error? lost-err closed-err
                         query-timeout-err checkout-timeout-err begin-sql
                         . rest)
     (define (arg i default)
@@ -72,10 +94,10 @@
               (else (car r)))))
     (let ((q (arg 0 default-query-ms)) (c (arg 1 default-checkout-ms)))
       (unless (and (integer? q) (exact? q) (> q 0))
-        (assertion-violation 'make-sql-cfg
+        (assertion-violation 'make-connpool-cfg
           "query timeout must be a positive exact integer (ms)" q))
       (unless (and (integer? c) (exact? c) (> c 0))
-        (assertion-violation 'make-sql-cfg
+        (assertion-violation 'make-connpool-cfg
           "checkout timeout must be a positive exact integer (ms)" c))
       (make-cfg error? lost-err closed-err
                 query-timeout-err checkout-timeout-err begin-sql q c)))
@@ -90,7 +112,7 @@
   ;; bad size did not raise where it was written -- it returned a pid that
   ;; died a moment later, and the mistake surfaced as a pool that answered
   ;; nothing. The drivers call this before they spawn.
-  (define (sql-check-pool-size! who n)
+  (define (connpool-check-size! who n)
     (unless (and (integer? n) (exact? n) (> n 0))
       (assertion-violation who "pool size must be a positive exact integer" n)))
 
@@ -103,9 +125,9 @@
   ;; mid-query gets cfg's lost-err exactly once.
   ;;
   ;; spawn-conn!: (notify report-to ref) -> connection worker pid; the
-  ;; worker must report #(db-up ,ref ,self ,status) and then wait for
-  ;; #(db-adopt) before serving.
-  (define (sql-pool-loop n spawn-conn! cfg)
+  ;; worker must report #(pool-up ,ref ,self ,status) and then wait for
+  ;; #(pool-adopt) before serving.
+  (define (connpool-loop n spawn-conn! cfg)
     (define me self)
     (define idle '())
     (define busy (make-eq-hashtable))   ; conn pid -> (caller-pid . ref)
@@ -138,7 +160,7 @@
       (let ((x (car co-front)))
         (set! co-front (cdr co-front))
         x))
-    ;; Workers that have been spawned but have not yet reported #(db-up ...).
+    ;; Workers that have been spawned but have not yet reported #(pool-up ...).
     ;; They are in NO other table, so without this set a worker that dies
     ;; before reporting -- a crash in the driver, a connect error killing the
     ;; actor, a supervisor kill -- matched none of the DOWN branches below and
@@ -146,7 +168,7 @@
     ;; is empty while every caller queues behind connections that no longer
     ;; exist and will never be rebuilt.
     ;;
-    ;; A worker that reports failure and then exits is removed here at db-up
+    ;; A worker that reports failure and then exits is removed here at pool-up
     ;; time, because it has already scheduled its own backed-off retry; only
     ;; the ones that never reported are rebuilt from DOWN.
     (define connecting (make-eq-hashtable))
@@ -175,12 +197,12 @@
     ;; dead for however long the pool was saturated.
     ;; A busy entry is #(caller ref started-ms). It used to be (caller . ref);
     ;; the dispatch time is what makes query DURATION observable, measured
-    ;; from here to the connection's db-idle -- the pool never sees the reply
+    ;; from here to the connection's pool-idle -- the pool never sees the reply
     ;; itself, which goes straight from the connection to the caller.
     ;; -> #t if the job was dispatched.
     ;;
     ;; The caller is checked HERE, not only when the job was queued. The
-    ;; mailbox can hold a db-idle that arrived while the caller was alive
+    ;; mailbox can hold a pool-idle that arrived while the caller was alive
     ;; and a DOWN behind it: processing them in order dispatches a statement
     ;; for a process already known to be gone. This cannot make "alive" a
     ;; durable property -- the caller may die immediately after the check --
@@ -203,7 +225,7 @@
       (when (vector-ref job 4) (demonitor (vector-ref job 4)))
       (hashtable-set! busy c (vector (vector-ref job 2) (vector-ref job 1)
                                      (now-ms)))
-      (send c (vector 'db-query (vector-ref job 0)
+      (send c (vector 'pool-request (vector-ref job 0)
                       (vector-ref job 1) (vector-ref job 2)))
       #t)
     ;; A waiter is #(ref from mon). The monitor is taken WHEN THE REQUEST
@@ -248,7 +270,7 @@
       (set! stat-checkouts (+ stat-checkouts 1))
       (hashtable-set! leased c (vector (waiter-from w) (waiter-mon w)
                                        (waiter-ref w)))
-      (send (waiter-from w) (vector 'db-checkout-reply (waiter-ref w) c))
+      (send (waiter-from w) (vector 'pool-checkout-reply (waiter-ref w) c))
       #t)
     (define (drop-lease! c entry)
       (demonitor (vector-ref entry 1))
@@ -287,12 +309,12 @@
     ;; mean falls out of total/count, the max is the tail that actually hurts,
     ;; and both are one fixnum add on the hot path.
     ;;
-    ;; QUERY DURATION is measured from dispatch to the connection's db-idle,
+    ;; QUERY DURATION is measured from dispatch to the connection's pool-idle,
     ;; because the pool never sees the reply -- that goes straight from the
     ;; connection to the caller. It therefore excludes queue wait, which is
     ;; reported separately and is the number that matters when sizing.
     (define stat-queries 0)              ; statements dispatched
-    (define stat-query-timeouts 0)       ; callers that gave up (db-query-cancel)
+    (define stat-query-timeouts 0)       ; callers that gave up (pool-request-cancel)
     (define stat-checkouts 0)            ; leases granted
     (define stat-checkout-timeouts 0)    ; callers that gave up waiting
     (define stat-connects 0)             ; workers that came up
@@ -302,7 +324,7 @@
     (define stat-queue-wait-max 0)
     (define stat-checkout-wait-total 0)  ; ms a borrower spent waiting
     (define stat-checkout-wait-max 0)
-    (define stat-query-total 0)          ; ms dispatch -> db-idle
+    (define stat-query-total 0)          ; ms dispatch -> pool-idle
     (define stat-query-max 0)
     (define stat-completed 0)            ; the count behind stat-query-total
     (define started-at (now-ms))
@@ -317,8 +339,8 @@
         (let ((j (fxdiv base 5)))
           (max 100 (+ (- base j) (random (max 1 (* 2 j))))))))
     ;; IDEMPOTENT. A connection can be handed back twice: it replies to its
-    ;; lessee, is preempted before sending db-idle, the lessee checks in
-    ;; first -- so the checkin frees it, and the late db-idle then finds it
+    ;; lessee, is preempted before sending pool-idle, the lessee checks in
+    ;; first -- so the checkin frees it, and the late pool-idle then finds it
     ;; neither leased nor dying and frees it again. It landed in `idle`
     ;; TWICE, two checkouts popped the same connection, and the second
     ;; lease! overwrote the first lease record: that borrower's monitor was
@@ -343,11 +365,11 @@
           ((pending?) (or (assign! c (pop-pending!)) (next)))
           ((co-pending?) (or (lease! c (pop-co!)) (next)))
           (else (set! idle (cons c idle))))))
-    (sql-check-pool-size! 'sql-pool n)
+    (connpool-check-size! 'sql-pool n)
     (do ((i 0 (+ i 1))) ((= i n)) (connect!))
     (let loop ()
       (receive
-        (`#(db-query ,sql ,ref ,from)
+        (`#(pool-request ,sql ,ref ,from)
           (if (pair? idle)
               ;; dispatched at once: nothing to watch, the connection
               ;; answers the caller directly. assign! still checks the
@@ -366,7 +388,7 @@
                   (set! pending-back
                         (cons (vector sql ref from (now-ms) m) pending-back)))))
           (loop))
-        (`#(db-idle ,c)
+        (`#(pool-idle ,c)
           ;; This is where a dispatched statement finishes, as far as the
           ;; pool can see it: the reply itself went straight to the caller.
           (let ((e (hashtable-ref busy c #f)))
@@ -381,7 +403,7 @@
           (unless (or (hashtable-ref leased c #f) (hashtable-ref dying c #f))
             (make-available! c))
           (loop))
-        (`#(db-conn-dead ,c)
+        (`#(pool-conn-dead ,c)
           ;; the connection already sent the transport-error reply to its
           ;; caller and is about to exit: clear the busy entry so the DOWN
           ;; below does not send a duplicate reply, and mark it dying so
@@ -389,7 +411,7 @@
           (hashtable-delete! busy c)
           (hashtable-set! dying c #t)
           (loop))
-        (`#(db-checkout ,ref ,from)
+        (`#(pool-checkout ,ref ,from)
           (let ((w (make-waiter ref from)))
             (when w
               (if (pair? idle)
@@ -398,7 +420,7 @@
                     (unless (lease! c w) (set! idle (cons c idle))))
                   (set! co-back (cons w co-back)))))
           (loop))
-        (`#(db-checkin ,from ,c)
+        (`#(pool-checkin ,from ,c)
           ;; only when c really is leased to `from` -- guards a stale or double
           ;; checkin (e.g. after the connection already died and was rebuilt).
           (let ((e (hashtable-ref leased c #f)))
@@ -413,12 +435,12 @@
               ;; timeout for a reply nobody would send. The connection's own
               ;; DOWN cleans up afterwards, far too late to help.
               ;;
-              ;; db-idle already refuses for the same reason; this is the
+              ;; pool-idle already refuses for the same reason; this is the
               ;; other way back into the idle set.
               (unless (hashtable-ref dying c #f)
                 (make-available! c))))
           (loop))
-        (`#(db-checkin-broken ,from ,c)
+        (`#(pool-checkin-broken ,from ,c)
           ;; the lessee could not clean the connection (e.g. ROLLBACK failed):
           ;; drop the lease and destroy+rebuild it rather than ever lending a
           ;; possibly-open transaction to the next caller. Atomic here (single
@@ -427,15 +449,15 @@
             (when (and e (eq? (vector-ref e 0) from))
               (drop-lease! c e)
               (hashtable-set! dying c #t)
-              (send c (vector 'db-quit))))       ; -> DOWN -> rebuild (case 2)
+              (send c (vector 'pool-quit))))       ; -> DOWN -> rebuild (case 2)
           (loop))
-        (`#(db-query-cancel ,ref ,from)
+        (`#(pool-request-cancel ,ref ,from)
           ;; A query timed out. If it is STILL QUEUED it has not been sent
           ;; anywhere, so dropping it is exact: the caller has already been
           ;; told the call failed, and executing it later would apply a write
           ;; the application believes never happened. (Once assigned to a
           ;; connection the statement is in flight and its outcome is
-          ;; genuinely unknown -- that is documented on sql-query and is not
+          ;; genuinely unknown -- that is documented on connpool-call and is not
           ;; something a cancel can undo.)
           (set! stat-query-timeouts (+ stat-query-timeouts 1))
           ;; Record what this caller WAITED before giving up. Timing only the
@@ -458,7 +480,7 @@
             (set! pending-front (filter mine? pending-front))
             (set! pending-back  (filter mine? pending-back)))
           (loop))
-        (`#(db-checkout-cancel ,ref ,from)
+        (`#(pool-checkout-cancel ,ref ,from)
           ;; a checkout timed out: drop its still-queued request so a freed
           ;; connection is never leased to a borrower that has moved on. If the
           ;; pool already leased one to it (raced the timeout), reclaim exactly
@@ -487,11 +509,11 @@
               (drop-lease! (car hit) (cdr hit))
               (make-available! (car hit))))
           (loop))
-        (`#(db-up ,ref ,pid ,status)
+        (`#(pool-up ,ref ,pid ,status)
           (hashtable-delete! connecting pid)
           (if (eq? status 'ok)
               (begin
-                (send pid (vector 'db-adopt))
+                (send pid (vector 'pool-adopt))
                 (set! stat-connects (+ stat-connects 1))
                 (set! backoff-ms 0)          ; a success clears the penalty
                 (hashtable-set! up-at pid (now-ms))
@@ -517,9 +539,9 @@
         (`#(pool-reconnect)
           (connect!)
           (loop))
-        (`#(db-stats ,ref ,from)
+        (`#(pool-stats ,ref ,from)
           (send from
-            (vector 'db-stats-reply ref
+            (vector 'pool-stats-reply ref
               (list
                 ;; gauges: what the pool looks like right now
                 (cons 'size n)
@@ -600,7 +622,7 @@
                     (lambda (hit)
                       (drop-lease! (car hit) (cdr hit))
                       (hashtable-set! dying (car hit) #t)
-                      (send (car hit) (vector 'db-quit)))
+                      (send (car hit) (vector 'pool-quit)))
                     hits)))
             ;; (2) a connection died (idle, mid single-query, leased, or one we
             ;; are already tearing down). Fail any waiting single-query caller,
@@ -623,8 +645,8 @@
                  (hashtable-delete! busy pid)
                  (when entry
                    (send (vector-ref entry 0)
-                         (vector 'db-reply (vector-ref entry 1)
-                                 (sql-cfg-lost-err cfg)))))
+                         (vector 'pool-reply (vector-ref entry 1)
+                                 (connpool-cfg-lost-err cfg)))))
                (let ((e (hashtable-ref leased pid #f)))
                  (when e (drop-lease! pid e)))
                (if stillborn
@@ -653,34 +675,34 @@
                         (sleep-ms wait)
                         (send me (vector 'pool-reconnect)))))))
           (loop))
-        (`#(db-quit)
-          (for-each (lambda (c) (send c (vector 'db-quit))) idle)
+        (`#(pool-quit)
+          (for-each (lambda (c) (send c (vector 'pool-quit))) idle)
           (vector-for-each
-            (lambda (c) (send c (vector 'db-quit)))
+            (lambda (c) (send c (vector 'pool-quit)))
             (hashtable-keys busy))
           (vector-for-each
-            (lambda (c) (send c (vector 'db-quit)))
+            (lambda (c) (send c (vector 'pool-quit)))
             (hashtable-keys leased))
           ;; connections still authenticating self-terminate: nobody adopts
           ;; them once this process is gone. Queued callers get an error now
           ;; instead of parking until their timeouts.
-          (let ((closed (sql-cfg-closed-err cfg)))
+          (let ((closed (connpool-cfg-closed-err cfg)))
             (for-each
               (lambda (job)
                 (send (vector-ref job 2)
-                      (vector 'db-reply (vector-ref job 1) closed)))
+                      (vector 'pool-reply (vector-ref job 1) closed)))
               (append pending-front (reverse pending-back)))
             (for-each
               (lambda (req)
                 (send (waiter-from req)
-                      (vector 'db-checkout-failed (waiter-ref req) closed)))
+                      (vector 'pool-checkout-failed (waiter-ref req) closed)))
               (append co-front (reverse co-back))))
           'done))))
 
   ;; ---- caller-side operations ---------------------------------------------
 
   ;; These operations are strictly synchronous within one green process,
-  ;; so any db-reply / db-checkout-reply / db-checkout-failed sitting in
+  ;; so any pool-reply / pool-checkout-reply / pool-checkout-failed sitting in
   ;; the mailbox at ENTRY is by construction stale -- the late answer to
   ;; an earlier call that timed out (its gensym ref can never be matched
   ;; again, and a stale checkout's lease was already reclaimed by the
@@ -690,39 +712,39 @@
   ;; Exported because the DRIVERS need it too: a single-connection connect
   ;; that times out leaves its worker's late up-report in the caller's
   ;; mailbox, and a long-lived process that reconnects in a loop -- a
-  ;; supervisor, a reconnect manager -- never calls sql-query, so nothing
+  ;; supervisor, a reconnect manager -- never calls connpool-call, so nothing
   ;; ever cleared them. They are immortal (the per-attempt ref can never
   ;; match again) and every later selective receive scans past all of them.
-  (define sql-drain-stale! (lambda () (drain-stale!)))
+  (define connpool-drain-stale! (lambda () (drain-stale!)))
 
   (define (drain-stale!)
     (let loop ()
       (receive (after 0 'done)
-        (`#(db-reply ,r ,v) (loop))
-        (`#(db-checkout-reply ,r ,conn) (loop))
-        (`#(db-checkout-failed ,r ,e) (loop))
+        (`#(pool-reply ,r ,v) (loop))
+        (`#(pool-checkout-reply ,r ,conn) (loop))
+        (`#(pool-checkout-failed ,r ,e) (loop))
         ;; a lone driver connect that timed out leaves the worker's late
         ;; up-report behind (its per-attempt ref never matches again)
-        (`#(db-up ,r ,p ,s) (loop))
-        (`#(db-stats-reply ,r ,st) (loop)))))
+        (`#(pool-up ,r ,p ,s) (loop))
+        (`#(pool-stats-reply ,r ,st) (loop)))))
 
   ;; A snapshot of the pool: an alist of gauges, counters and latency
-  ;; totals. See the db-stats clause in the loop for what each key means.
+  ;; totals. See the pool-stats clause in the loop for what each key means.
   ;;
-  ;; POOL ONLY. A lone connection answers #(db-stats-reply ,ref #f), which
+  ;; POOL ONLY. A lone connection answers #(pool-stats-reply ,ref #f), which
   ;; raises here -- it is not a degenerate pool, it has none of this
   ;; bookkeeping, and reporting zeros would be worse than refusing: an
   ;; operator reading `in-use 0` would conclude the connection was free.
   ;; The reply exists so the request cannot sit in a connection's mailbox
   ;; forever, which is the failure mode a bare timeout would have left.
-  (define (sql-pool-stats pool)
+  (define (connpool-stats pool)
     (drain-stale!)
     (let ((ref (gensym)))
-      (send pool (vector 'db-stats ref self))
-      (receive (after 5000 (raise 'sql-pool-stats-timeout))
-        (`#(db-stats-reply ,@ref ,st)
+      (send pool (vector 'pool-stats ref self))
+      (receive (after 5000 (raise 'connpool-stats-timeout))
+        (`#(pool-stats-reply ,@ref ,st)
           (or st
-              (assertion-violation 'sql-pool-stats
+              (assertion-violation 'connpool-stats
                 "not a pool -- a single connection keeps no pool statistics"
                 pool))))))
 
@@ -731,50 +753,50 @@
   ;; the reply, so a late reply after a timeout will not be matched by the
   ;; caller's next query. A timed-out statement's outcome is UNKNOWN -- it
   ;; may still execute on the server.
-  (define (sql-query h sql cfg)
+  (define (connpool-call h sql cfg)
     (drain-stale!)
     (let ((ref (gensym)))
-      (send h (vector 'db-query sql ref self))
-      (receive (after (sql-cfg-query-ms cfg)
-                  ;; symmetric with sql-checkout: tell the pool to drop the
+      (send h (vector 'pool-request sql ref self))
+      (receive (after (connpool-cfg-query-ms cfg)
+                  ;; symmetric with connpool-checkout: tell the pool to drop the
                   ;; request if it is still queued. A statement left behind
                   ;; runs whenever the pool recovers -- long after the caller
                   ;; was told it failed -- so a write the application gave up
                   ;; on still lands. Harmless against a lone connection, which
                   ;; ignores the message.
-                  (send h (vector 'db-query-cancel ref self))
-                  (raise (sql-cfg-query-timeout-err cfg)))
-        (`#(db-reply ,@ref ,r)
-          (if ((sql-cfg-error? cfg) r) (raise r) r)))))
+                  (send h (vector 'pool-request-cancel ref self))
+                  (raise (connpool-cfg-query-timeout-err cfg)))
+        (`#(pool-reply ,@ref ,r)
+          (if ((connpool-cfg-error? cfg) r) (raise r) r)))))
 
   ;; Ask the pool for a dedicated connection and park until one is free (or
   ;; raise cfg's checkout-timeout-err -- the pool is saturated, nothing is
   ;; broken). Internal: callers use the with-connection / transaction
   ;; wrappers, which guarantee checkin.
-  (define (sql-checkout pool cfg)
+  (define (connpool-checkout pool cfg)
     (drain-stale!)
     (let ((ref (gensym)))
-      (send pool (vector 'db-checkout ref self))
-      (receive (after (sql-cfg-checkout-ms cfg)
+      (send pool (vector 'pool-checkout ref self))
+      (receive (after (connpool-cfg-checkout-ms cfg)
                   ;; tell the pool to drop (or reclaim) this request --
                   ;; otherwise a connection freed after the timeout is leased
                   ;; to us and never checked in, bleeding the pool.
-                  (send pool (vector 'db-checkout-cancel ref self))
-                  (raise (sql-cfg-checkout-timeout-err cfg)))
-        (`#(db-checkout-reply ,@ref ,conn) conn)
-        (`#(db-checkout-failed ,@ref ,err) (raise err)))))
+                  (send pool (vector 'pool-checkout-cancel ref self))
+                  (raise (connpool-cfg-checkout-timeout-err cfg)))
+        (`#(pool-checkout-reply ,@ref ,conn) conn)
+        (`#(pool-checkout-failed ,@ref ,err) (raise err)))))
 
   ;; ROLLBACK on a borrowed connection without parking a full query timeout
   ;; when the connection is already dead: monitor it, so a dead process
   ;; answers with an immediate DOWN instead of 60 seconds of silence.
   ;; -> #t when the connection cannot be returned clean.
-  (define (sql-rollback! conn cfg)
+  (define (connpool-rollback! conn cfg)
     (let ((m (monitor conn)) (ref (gensym)))
       (let ((broken
              (guard (e (#t #t))
-               (send conn (vector 'db-query "ROLLBACK" ref self))
-               (receive (after (sql-cfg-query-ms cfg) #t)
-                 (`#(db-reply ,@ref ,r) ((sql-cfg-error? cfg) r))
+               (send conn (vector 'pool-request "ROLLBACK" ref self))
+               (receive (after (connpool-cfg-query-ms cfg) #t)
+                 (`#(pool-reply ,@ref ,r) ((connpool-cfg-error? cfg) r))
                  (`#(DOWN ,@conn ,reason) #t)))))
         (when m
           (demonitor m)
@@ -789,32 +811,32 @@
   ;; Don't send queries (or a second checkout) to the pool itself while
   ;; holding a connection: an exhausted pool deadlocks the former and delays
   ;; the latter.
-  (define (sql-call-with-connection pool proc cfg)
-    (let ((conn (sql-checkout pool cfg)))
+  (define (connpool-lease pool proc cfg)
+    (let ((conn (connpool-checkout pool cfg)))
       (dynamic-wind
         (lambda () (void))
         (lambda () (proc conn))
-        (lambda () (send pool (vector 'db-checkin self conn))))))
+        (lambda () (send pool (vector 'pool-checkin self conn))))))
 
   ;; Run proc inside a transaction on a borrowed pool connection: cfg's
   ;; begin-sql first, then COMMIT if proc returns normally, or ROLLBACK if
   ;; it escapes. Returns proc's value. Self-manages the lease (rather than
-  ;; sql-call-with-connection) so the single return message can be checkin
+  ;; connpool-lease) so the single return message can be checkin
   ;; OR checkin-broken -- no second checkin racing the discard. Kill-safety:
   ;; if the borrower is killed the winders are discarded, no message is
   ;; sent, and the pool's monitor reclaims + rebuilds the connection, so a
   ;; half-open transaction is never handed to the next caller.
   (define (sql-transaction pool proc cfg)
-    (let ((conn (sql-checkout pool cfg)))
+    (let ((conn (connpool-checkout pool cfg)))
       (let ((committed #f) (broken #f))
         (dynamic-wind
           (lambda () (void))
           (lambda ()
             ;; inside the wind: if the BEGIN itself fails, the after-clause
             ;; still runs, so the lease is always returned.
-            (sql-query conn (sql-cfg-begin-sql cfg) cfg)
+            (connpool-call conn (connpool-cfg-begin-sql cfg) cfg)
             (let ((r (proc conn)))
-              (sql-query conn "COMMIT" cfg)
+              (connpool-call conn "COMMIT" cfg)
               (set! committed #t)
               r))
           (lambda ()
@@ -822,14 +844,14 @@
               ;; roll back; if ROLLBACK fails (or the connection is dead)
               ;; the transaction may still be open, so flag the connection
               ;; for discard instead of returning it dirty.
-              (set! broken (sql-rollback! conn cfg)))
-            (send pool (vector (if broken 'db-checkin-broken 'db-checkin)
+              (set! broken (connpool-rollback! conn cfg)))
+            (send pool (vector (if broken 'pool-checkin-broken 'pool-checkin)
                                self conn)))))))
 
   ;; Close a pool (or a lone connection). Leased connections are quit
   ;; immediately: a transaction still in flight on one will time out on
   ;; its next statement -- close the pool only after its borrowers are
   ;; done.
-  (define (sql-close! h)
-    (send h (vector 'db-quit)))
+  (define (connpool-close! h)
+    (send h (vector 'pool-quit)))
 )

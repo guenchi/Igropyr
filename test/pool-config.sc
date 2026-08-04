@@ -10,7 +10,7 @@
 ;;; without end. None announces itself -- each surfaces much later as "the
 ;;; service stopped responding", with nothing pointing at the cause.
 
-(import (chezscheme) (igropyr actor) (igropyr otp) (igropyr sqlpool)
+(import (chezscheme) (igropyr actor) (igropyr otp) (igropyr connpool)
         (igropyr mysql) (igropyr postgresql))
 (define fails 0)
 (define (rejects? label thunk)
@@ -18,7 +18,7 @@
     (if ok (begin (display "  ok  ") (display label) (newline))
         (begin (set! fails (+ fails 1))
                (display "FAIL  ") (display label) (newline)))))
-(define cfg (make-sql-cfg (lambda (r) #f) 'l 'c 'q 'k "BEGIN"))
+(define cfg (make-connpool-cfg (lambda (r) #f) 'l 'c 'q 'k "BEGIN"))
 (start-scheduler
   (lambda ()
     (rejects? "workers=0"    (lambda () (start-worker-pool 0 (lambda (t) t) (lambda (t i) t))))
@@ -27,10 +27,10 @@
     (rejects? "max-retries=-1" (lambda () (start-worker-pool 2 (lambda (t) t) (lambda (t i) t) -1)))
     (rejects? "stuck-ms=0"   (lambda () (start-worker-pool 2 (lambda (t) t) (lambda (t i) t) 3 0)))
     (rejects? "check-ms=-5"  (lambda () (start-worker-pool 2 (lambda (t) t) (lambda (t i) t) 3 30000 -5)))
-    (rejects? "sql pool n=0"  (lambda () (sql-pool-loop 0 (lambda (a b c) #f) cfg)))
-    (rejects? "sql pool n=-3" (lambda () (sql-pool-loop -3 (lambda (a b c) #f) cfg)))
-    (rejects? "sql pool n=1.5"(lambda () (sql-pool-loop 1.5 (lambda (a b c) #f) cfg)))
-    ;; The three above call sql-pool-loop DIRECTLY, so the check runs in this
+    (rejects? "sql pool n=0"  (lambda () (connpool-loop 0 (lambda (a b c) #f) cfg)))
+    (rejects? "sql pool n=-3" (lambda () (connpool-loop -3 (lambda (a b c) #f) cfg)))
+    (rejects? "sql pool n=1.5"(lambda () (connpool-loop 1.5 (lambda (a b c) #f) cfg)))
+    ;; The three above call connpool-loop DIRECTLY, so the check runs in this
     ;; process and raises here. That is not how an application creates a
     ;; pool: mysql-pool and postgresql-pool spawn the loop and hand back a
     ;; pid, so the same check ran inside a process the caller cannot see --
