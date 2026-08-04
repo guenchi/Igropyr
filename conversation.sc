@@ -226,12 +226,18 @@
         (set-box! (step-state-run-start-box st) (now-ms)))
       (set-box! (step-state-running-box st) (eq? phase 'running))
       ;; ...AND THE FLAGS BEFORE THE WAKE-UP, for the same reason one line
-      ;; up. Waking the watchdog first meant it could read the flag before
-      ;; this process had set it, find nothing running, and go back to
-      ;; waiting -- and no second notification is ever sent for that step,
-      ;; so it silently fell back to the poll floor. Measured on a 20ms
-      ;; TTL: 24ms to the kill when the flags are published first, 53ms
-      ;; when the notification is.
+      ;; up. Waking the watchdog first lets it read the flag before this
+      ;; process has set it, find nothing running, and go back to waiting
+      ;; -- and no second notification is ever sent for that step, so the
+      ;; bound falls back to the poll floor.
+      ;;
+      ;; HOW NARROW THAT IS, stated because it was once overstated here:
+      ;; send enqueues without yielding, so the watchdog cannot run
+      ;; between these forms unless this process is preempted inside the
+      ;; two set-box! calls or the now-ms call. Reverting the order alone
+      ;; measures the same 22-26ms as this one over a thousand trials.
+      ;; The 53ms belongs to LOSING the notification, which is a different
+      ;; mutation and is what the latency test actually pins.
       (when entering
         (let ((w (unbox (step-state-watch-box st))))
           (when w (send w (vector 'conv-step-started)))))))
@@ -881,9 +887,34 @@
                        ;; every ttl for a small ttl -- a thousand wake-ups a
                        ;; second for a 1ms allowance, on the one thread that
                        ;; runs everything.
-                       (let ((tick (max 50 (div ttl 4))))
+                       ;; ARMED, not merely running -- the same reads
+                       ;; overrun? makes, minus the clock, and the reason
+                       ;; they have to be the same: sleeping to the
+                       ;; deadline is only worth doing when a kill can
+                       ;; come of it. Waking on "running" alone meant that
+                       ;; a settled conversation computing a key during
+                       ;; its linger held running-box true with its
+                       ;; deadline already past, so the sleep collapsed to
+                       ;; its 1ms floor and overrun? refused every time:
+                       ;; a thousand wake-ups a second, on the one thread
+                       ;; that runs everything, for as long as the linger
+                       ;; lasted. Measured at 436 of them in one existing
+                       ;; case.
+                       ;;
+                       ;; NOT PINNED BY A TEST, and here is why: a 1ms
+                       ;; timer is cheap enough that nine hundred extra
+                       ;; wake-ups do not move anything a test can read.
+                       ;; A compute-bound process alongside the linger
+                       ;; measured the same throughput either way over
+                       ;; three runs each. The cost is real and the fix
+                       ;; is a condition already written one screen down;
+                       ;; what is missing is an observable, not a reason.
+                       (let ((tick (max 50 (div ttl 4)))
+                             (armed? (lambda ()
+                                       (and (unbox running-box)
+                                            (not (unbox settled-box))))))
                          (let loop ()
-                           (if (unbox running-box)
+                           (if (armed?)
                                (sleep-ms
                                  (max 1 (- (+ (unbox run-start-box) ttl 1)
                                            (now-ms))))
@@ -913,8 +944,7 @@
                            ;; the region.
                            (let ((overrun?
                                   (lambda ()
-                                    (and (unbox running-box)
-                                         (not (unbox settled-box))
+                                    (and (armed?)
                                          (> (- (now-ms) (unbox run-start-box))
                                             ttl)))))
                            (cond

@@ -488,25 +488,39 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                         (tcp-write! ca h #f)        ; a partial frame: window opens
                         ;; a SECOND connection asks for a 700ms render; the
                         ;; worker is off the air for its duration
-                        (let ((mine self))
+                        ;; THE COMPETING RENDER IS ASSERTED, not assumed.
+                        ;; Every failure path here used to be (void), so a
+                        ;; port collision or a worker that had not come up
+                        ;; turned the only probe of this behaviour into a
+                        ;; tautology -- green, silent, and testing nothing.
+                        (let ((rival self))
                           (spawn (lambda ()
                                    (tcp-connect! "127.0.0.1" carry-port self)
-                                   (receive (after 3000 (void))
-                                     (`#(tcp-connect-failed ,e) (void))
+                                   (receive (after 3000
+                                              (send rival (vector 'rival 'no-connect)))
+                                     (`#(tcp-connect-failed ,e)
+                                       (send rival (vector 'rival 'no-connect)))
                                      (`#(tcp-connected ,cb)
                                        (tcp-read-start! cb)
                                        (tcp-write! cb (qframe 8 "slow" "{}") #f)
-                                       (receive (after 5000 (void))
-                                         (`#(tcp-data ,bv) (void))
-                                         (`#(tcp-eof) (void))
-                                         (`#(tcp-error ,e) (void))))))))
+                                       (receive (after 5000
+                                                  (send rival (vector 'rival 'no-answer)))
+                                         (`#(tcp-data ,bv)
+                                           (send rival (vector 'rival 'rendered)))
+                                         (`#(tcp-eof)
+                                           (send rival (vector 'rival 'eof)))
+                                         (`#(tcp-error ,e)
+                                           (send rival (vector 'rival 'err)))))))))
                         (sleep-ms 150)              ; well inside the 400ms window
                         (tcp-write! ca rest #f)
-                        (let wait ((acc (make-bytevector 0)))
-                          (if (>= (count-frames acc) 1)
-                              (send me (vector 'punct 'answered))
-                              (receive (after 6000 (send me (vector 'punct 'timeout)))
-                                (`#(tcp-data ,bv) (wait (bv-append acc bv)))
+                        (let wait ((acc (make-bytevector 0)) (rival #f))
+                          (if (and rival (>= (count-frames acc) 1))
+                              (send me (vector 'punct (if (eq? rival 'rendered)
+                                                          'answered
+                                                          (cons 'rival rival))))
+                              (receive (after 8000 (send me (vector 'punct 'timeout)))
+                                (`#(rival ,r) (wait acc r))
+                                (`#(tcp-data ,bv) (wait (bv-append acc bv) rival))
                                 (`#(tcp-eof) (send me (vector 'punct 'closed)))
                                 (`#(tcp-error ,e)
                                   (send me (vector 'punct 'closed))))))))))) 
@@ -533,14 +547,16 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
             ;; caller in the queue, whose request then goes to a pid that
             ;; is already exiting.
             ;;
-            ;; HALF OF THAT IS STRUCTURAL and half is not. Reporting idle
-            ;; while retiring is now unreachable -- the send sits in the
-            ;; other arm -- and this probe would red if it came back. The
-            ;; remaining route is the borrower own check-in racing the
-            ;; news of the death, which needs the scheduler to preempt
-            ;; between two sends; that ordering is not pinned by any test
-            ;; here, because nothing outside the connection can make that
-            ;; preemption happen.
+            ;; WHAT THIS PROBE DOES NOT PIN, stated because an earlier
+            ;; version of this comment claimed the opposite and was wrong:
+            ;; putting the retiring `pool-idle` send back changes nothing
+            ;; observable, because a qjspool connection is LEASED, so that
+            ;; message finds no busy entry and does nothing at all. Nor is
+            ;; the reply-before-conn-dead ordering pinned: it needs the
+            ;; scheduler to preempt between two sends, which nothing
+            ;; outside the connection can make happen. What is pinned is
+            ;; below -- that retirement actually occurs, that the pool is
+            ;; told, and that it is not billed as a failure.
             (let ((rp (qjspool (list (cons "127.0.0.1" good-port))
                                '((render-timeout-ms . 2000)
                                  (checkout-timeout-ms . 4000)
@@ -559,13 +575,129 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                                (= bad 0))
                         (when (> bad 0)
                           (display "  [info] retirement losses: ")
-                          (write (cons bad why)) (newline)))
+                          (write (cons bad why)) (newline))
+                        ;; ...AND THAT ANY OF IT HAPPENED. Asserting only
+                        ;; that twelve callers were answered cannot tell a
+                        ;; connection that retires and hands over cleanly
+                        ;; from one that never retires at all -- ignoring
+                        ;; the cap outright passed this probe. The count
+                        ;; is what makes the feature observable, and it
+                        ;; must land under retired, not under lost: a
+                        ;; scheduled stand-down billed as a failure is the
+                        ;; number an operator uses to decide whether the
+                        ;; peer is flaky.
+                        (let* ((st (qjspool-stats rp))
+                               (ret (cond ((assq 'connections-retired st) => cdr)
+                                          (else 0)))
+                               (lost (cond ((assq 'connections-lost st) => cdr)
+                                           (else 0))))
+                          (check "a capped connection actually retires, once per render"
+                                 (>= ret (- n 2)))
+                          (check "a scheduled retirement is not booked as a connection lost"
+                                 (= lost 0))
+                          (display "  [info] retired ") (write ret)
+                          (display " lost ") (write lost) (newline)))
                       (receive (after 20000
                                  (fail "retirement probe never finished" got bad))
                         (`#(retire ,k ,v)
                           (if k (loop (+ got 1) bad why)
                               (loop (+ got 1) (+ bad 1) v)))))))
               (qjspool-close! rp))
+
+            ;; ---- a punctual request split across two reads ---------------
+            ;;
+            ;; The probe above completes its frame in one read. TCP does
+            ;; not promise that: the read buffer is 64KiB and a segment
+            ;; boundary can fall anywhere, so a request delivered whole
+            ;; and in time still arrives in pieces. Keeping the old
+            ;; deadline for a read that completed no frame closed the
+            ;; connection on the FIRST of those pieces and threw away a
+            ;; request that was never late.
+            (let ((me self))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" carry-port self)
+                  (receive (after 3000 (send me (vector 'split 'no-connect)))
+                    (`#(tcp-connect-failed ,e) (send me (vector 'split 'no-connect)))
+                    (`#(tcp-connected ,ca)
+                      (tcp-read-start! ca)
+                      ;; BIGGER THAN ONE READ, so the split is structural
+                      ;; rather than a race: libuv hands up at most 64KiB
+                      ;; per callback, so a 192KiB request cannot arrive
+                      ;; in fewer than three, however the peer wrote it.
+                      (let* ((big (make-string 196608 #\x))
+                             (fa (qframe 9 "hello"
+                                         (string-append "{\"name\":\"" big "\"}")))
+                             (n (bytevector-length fa))
+                             (p1 (make-bytevector 6))
+                             (p3 (make-bytevector (- n 6))))
+                        (bytevector-copy! fa 0 p1 0 6)
+                        (bytevector-copy! fa 6 p3 0 (- n 6))
+                        (tcp-write! ca p1 #f)          ; the window opens
+                        (spawn (lambda ()
+                                 (tcp-connect! "127.0.0.1" carry-port self)
+                                 (receive (after 3000 (void))
+                                   (`#(tcp-connect-failed ,e) (void))
+                                   (`#(tcp-connected ,cb)
+                                     (tcp-read-start! cb)
+                                     (tcp-write! cb (qframe 10 "slow" "{}") #f)
+                                     (receive (after 5000 (void))
+                                       (`#(tcp-data ,bv) (void))
+                                       (`#(tcp-eof) (void))
+                                       (`#(tcp-error ,e) (void)))))))
+                        (sleep-ms 120)
+                        ;; written whole and well inside the window; the
+                        ;; worker is mid-render and sees none of it until
+                        ;; afterwards, by which time the window has passed
+                        ;; AND the first read it gets cannot complete the
+                        ;; frame however punctual the peer was
+                        (tcp-write! ca p3 #f)
+                        (let wait ((acc (make-bytevector 0)))
+                          (if (>= (count-frames acc) 1)
+                              (send me (vector 'split 'answered))
+                              (receive (after 8000 (send me (vector 'split 'timeout)))
+                                (`#(tcp-data ,bv) (wait (bv-append acc bv)))
+                                (`#(tcp-eof) (send me (vector 'split 'closed)))
+                                (`#(tcp-error ,e)
+                                  (send me (vector 'split 'closed)))))))))))
+              (receive (after 12000 (fail "split-request probe never answered"))
+                (`#(split ,r)
+                  (check "a punctual request split across two reads is answered"
+                         (eq? r 'answered))
+                  (unless (eq? r 'answered)
+                    (display "  [info] split request: ") (write r) (newline)))))
+
+            ;; ---- the cap is checked where it is given --------------------
+            ;;
+            ;; Deleting the validation outright changed nothing anywhere,
+            ;; which is what an unchecked public option looks like.
+            (let ((bad (lambda (v)
+                         (guard (e (#t 'raised))
+                           (let ((p (qjspool (list (cons "127.0.0.1" good-port))
+                                             (list (cons 'max-requests-per-connection v)))))
+                             (qjspool-close! p)
+                             'accepted)))))
+              (check "a cap of zero is refused" (eq? (bad 0) 'raised))
+              (check "a negative cap is refused" (eq? (bad -1) 'raised))
+              (check "an inexact cap is refused" (eq? (bad 2.0) 'raised))
+              ;; 2^32 ids, the first of them 0, so 2^32 requests fit and
+              ;; 2^32+1 does not
+              (check "a cap wider than the id field is refused"
+                     (eq? (bad #x100000001) 'raised))
+              (check "a cap of exactly the id space is allowed"
+                     (eq? (bad #x100000000) 'accepted)))
+
+            ;; A LONE CONNECTION CANNOT BE RECYCLED. Nothing rebuilds it,
+            ;; so a cap it appears to accept would brick the handle at the
+            ;; cap instead of recycling it -- which is what it did.
+            (check "a lone connection refuses a cap it cannot honour"
+                   (eq? (guard (e (#t 'raised))
+                          (let ((h (qjspool-connect
+                                     "127.0.0.1" good-port
+                                     '((max-requests-per-connection . 2)))))
+                            (qjspool-close! h)
+                            'accepted))
+                        'raised))
 
             ;; ---- a worker that is not there ------------------------------
             ;; The pool must answer, not hang: an endpoint nobody is
