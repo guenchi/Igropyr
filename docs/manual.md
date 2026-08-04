@@ -3204,6 +3204,9 @@ the engine.
   - `(max-entries . 1024)` — memory-backend size cap
   - `(single-flight . #t)` — collapse a cold-key herd (see below)
   - `(quickjs . <opts>)` — passed to `qjs-boot!` (`timeout-ms`, `mem-mb`, …)
+  - `(engine . <qjspool>)` — render in worker **processes** instead of on
+    this thread (see [Renders out of process](#renders-out-of-process)).
+    In this mode `bundle` is not evaluated here at all: the workers own it.
 - `(ssr-render r fn props [opts]) → html` — cached render; raises a JS
   error on a **miss** (failures are never cached). `props` is any Scheme
   value (JSON-encoded) or a string (passed raw as the JSON argument).
@@ -3242,6 +3245,79 @@ props in, HTML out, no side effects (the JS heap is shared across calls, so
 do not accumulate per-request state in globals). A JS throw / timeout / OOM
 is handled by the shim (crash-only rebuild + wall-clock deadline);
 `ssr-render` re-raises it (let-it-crash) and does not cache the failure.
+
+### Renders out of process
+
+The cache makes a render **rare**. It does not make one cheap, and it does
+not bound how many happen at once.
+
+A `qjs-call` runs on the scheduler's own OS thread with interrupts
+disabled. Its deadline bounds one call, but while that call runs nothing
+else in the process runs: no accepts, no reads, no timers — and no
+watchdog, because every watchdog here is a green process too, so the HTTP
+pool's stuck-worker killer is stopped along with the thing it exists to
+protect. A render that reaches the deadline costs the whole node its
+availability, and the crash-only rebuild that follows re-evaluates the
+bundle on the same thread with ten times the call budget. Misses for
+*different* keys stack: single-flight collapses repeats of one key, not a
+wave of distinct ones — which is exactly what a deploy, an `ssr-clear!`,
+or a batch of TTL expiries produces.
+
+That cannot be fixed from the inside. Aborting a render is cooperative —
+the interrupt handler can only ask, and the engine polls it only in its
+interpreter loop, so a long C builtin overruns it — and the runtime that
+would enforce a wall clock is the one being blocked. Only something
+*outside* the call can bound it.
+
+`(igropyr qjspool)` moves the engine to the far side of a socket, which
+makes a render structurally identical to a query: an exclusive resource,
+borrowed for one request, whose work happens elsewhere. It is the same
+pool engine the SQL drivers use — checkout, deadlines, monitor reclaim,
+rebuild on death, statistics — with a wire protocol on top.
+
+```sh
+# one worker process per parallel render; loopback only
+scheme --script igropyr/qjs-worker.sc 127.0.0.1 9701 site.js timeout-ms=1500 &
+scheme --script igropyr/qjs-worker.sc 127.0.0.1 9702 site.js timeout-ms=1500 &
+```
+
+```scheme
+(import (igropyr qjspool) (igropyr ssr))
+
+(define pool (qjspool '(("127.0.0.1" . 9701) ("127.0.0.1" . 9702))
+                      '((render-timeout-ms . 1500)
+                        (checkout-timeout-ms . 500))))
+
+;; the bundle now lives in the workers, so make-ssr is given none
+(define r (make-ssr "" `((engine . ,pool))))
+
+(send-html! res (ssr-render r "renderPost" props '((key . "/blog/42"))))
+```
+
+A runaway render now blocks its own worker process and nothing else: the
+caller's deadline is an ordinary parked receive, the scheduler keeps
+running, and the pool discards and rebuilds the connection.
+
+- `(qjspool endpoints [opts]) → pool` — one connection per endpoint.
+  `opts`: `(render-timeout-ms . 5000)`, `(checkout-timeout-ms . 2000)`.
+- `(qjspool-render pool fn json) → (values ok? html-or-error-text)` — and
+  `qjspool-render/bytes` for raw UTF-8. Same contract as `qjs-call/bytes`:
+  a JS throw, a timeout and a dead worker all arrive as `(values #f text)`.
+- `(qjspool-connect host port [opts]) → pool` — a single connection, no
+  pool behind it.
+- `(qjspool-stats pool)`, `(qjspool-close! pool)`.
+
+**One connection per worker.** A worker is single-threaded and holds one
+engine, so two connections to the same worker serialize inside it. Size
+the pool by the endpoint *list*; parallel renders come from running more
+worker processes, not from a bigger pool against one.
+
+**What this does not do.** Nothing starts, stops or kills a worker — they
+are supervised like a database is. A worker wedged in a runaway render
+stays wedged; what is guaranteed is that the *caller* is not, and that the
+other endpoints keep serving. There is also **no authentication**: whoever
+reaches the port can call any function the bundle exports, so workers
+belong on `127.0.0.1`.
 
 ---
 
