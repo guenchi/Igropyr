@@ -167,27 +167,52 @@
 
   ;; Boot the engine and listen. Returns the listener handle; the caller
   ;; runs the actor loop (qjs-worker.sc does both).
+  ;; How long a HALF-DELIVERED request may stay half-delivered. Also read
+  ;; from the boot options, so a caller (and the test) can shorten it.
+  (define default-partial-frame-ms 30000)
+
   (define (qjs-worker-serve! host port bundle . rest)
-    (let ((qopts (if (pair? rest) (car rest) '())))
+    (let* ((qopts (if (pair? rest) (car rest) '()))
+           (partial-ms (cond ((assq 'partial-frame-ms qopts) => cdr)
+                             (else default-partial-frame-ms))))
+      (unless (and (integer? partial-ms) (exact? partial-ms) (> partial-ms 0))
+        (assertion-violation 'qjs-worker-serve!
+          "partial-frame-ms must be a positive exact integer" partial-ms))
       (qjs-boot! bundle qopts)
       (tcp-listen! host port 128
         (lambda (c)
           ;; libuv callback context: spawn + register only, no yielding
-          (let ((pid (spawn (lambda () (worker-conn-loop c (make-inbuf))))))
+          (let ((pid (spawn (lambda ()
+                              (worker-conn-loop c (make-inbuf) partial-ms)))))
             (conn-set-owner! c pid)
             (tcp-read-start! c))))))
 
-  (define (worker-conn-loop c buf)
-    (receive
-      (`#(tcp-data ,bv)
-        (inbuf-append! buf bv)
-        ;; a framing error is not recoverable on this connection: we no
-        ;; longer know where the next request starts
-        (if (guard (e (#t #f)) (answer-all! c buf) #t)
-            (worker-conn-loop c buf)
-            (tcp-close! c)))
-      (`#(tcp-eof) (tcp-close! c))
-      (`#(tcp-error ,e) (tcp-close! c))))
+  ;; A HALF-DELIVERED frame gets a deadline; an idle connection does not.
+  ;; Those are different silences. A pooled connection is legitimately idle
+  ;; for as long as its caller has nothing to render, and closing it would
+  ;; tear down healthy connections on a timer. Silence in the MIDDLE of a
+  ;; frame is nobody's normal behaviour: it holds a process, a file
+  ;; descriptor and everything already received -- and since a length
+  ;; prefix up to the cap is accepted before its body arrives, a peer can
+  ;; park most of a frame's worth of buffer per connection and simply stop,
+  ;; without ever sending a FIN that would end it.
+  (define (worker-conn-loop c buf partial-ms)
+    (define (on-data bv)
+      (inbuf-append! buf bv)
+      ;; a framing error is not recoverable on this connection: we no
+      ;; longer know where the next request starts
+      (if (guard (e (#t #f)) (answer-all! c buf) #t)
+          (worker-conn-loop c buf partial-ms)
+          (tcp-close! c)))
+    (if (> (inbuf-length buf) 0)
+        (receive (after partial-ms (tcp-close! c))
+          (`#(tcp-data ,bv) (on-data bv))
+          (`#(tcp-eof) (tcp-close! c))
+          (`#(tcp-error ,e) (tcp-close! c)))
+        (receive
+          (`#(tcp-data ,bv) (on-data bv))
+          (`#(tcp-eof) (tcp-close! c))
+          (`#(tcp-error ,e) (tcp-close! c)))))
 
   ;; Every whole request the buffer holds, answered in order. A client that
   ;; pipelines gets its replies in the order it asked; the pool never does,
@@ -225,7 +250,7 @@
   ;; wedged in a runaway render never replies and never closes the socket,
   ;; so without it this process would wait forever and the pool would count
   ;; the connection busy for the life of the node.
-  (define (read-response c buf deadline-ms)
+  (define (read-response c buf deadline-ms ref)
     (let ((f (take-frame! buf)))
       (if f
           ;; ONE request is outstanding, so one response is all there can
@@ -244,7 +269,7 @@
                 (raise (qjs-err "render timed out"))
                 (receive (after left (raise (qjs-err "render timed out")))
                   (`#(tcp-data ,bv) (inbuf-append! buf bv)
-                    (read-response c buf deadline-ms))
+                    (read-response c buf deadline-ms ref))
                   (`#(tcp-eof) (raise (qjs-err "worker closed the connection")))
                   (`#(tcp-error ,e) (raise (qjs-err (uv-strerror e))))
                   ;; A TEARDOWN HAS TO REACH US HERE. The pool sends db-quit
@@ -260,6 +285,33 @@
                   ;; Raising hands this to the same path a transport failure
                   ;; takes: reply, tell the pool, close, exit, be rebuilt.
                   (`#(db-quit) (raise (qjs-err "connection shut down mid-render")))
+                  ;; THE CALLER GAVE UP. Its deadline and this one are
+                  ;; ordered only by a margin -- the caller's starts when it
+                  ;; posts the request, ours when the request is written --
+                  ;; so which fires first is a matter of degree, not of
+                  ;; protocol. When the caller's does, it releases its lease
+                  ;; and the pool is free to hand this connection to someone
+                  ;; else while the worker is still rendering for nobody,
+                  ;; and whatever it eventually writes lands in the middle
+                  ;; of the next exchange.
+                  ;;
+                  ;; The worker cannot be told to stop and there is no
+                  ;; knowing when it will finish, so the connection goes --
+                  ;; which is what would have happened anyway had our own
+                  ;; deadline been the one to fire.
+                  ;;
+                  ;; NOT COVERED BY A TEST, deliberately: producing this
+                  ;; sequence on demand means making the caller's deadline
+                  ;; expire before the connection's, and the library sets
+                  ;; both -- the caller's is the larger by construction.
+                  ;; What makes it reachable in production is that they are
+                  ;; measured from different instants and the margin
+                  ;; between them is finite, so a stall long enough (a
+                  ;; blocking FFI call, a large collection) inverts them.
+                  ;; Reaching it from a test would mean exposing the
+                  ;; connection pid, which is worth less than the clause.
+                  (`#(db-query-cancel ,@ref ,from)
+                    (raise (qjs-err "caller gave up on this render")))
                   ;; the pool itself died: nobody can adopt or reach us again
                   (`#(DOWN ,pid ,reason)
                     (raise (qjs-err "render pool went away mid-render")))))))))
@@ -275,10 +327,15 @@
           (else (raise (qjs-err "unknown response status")))))))
 
   ;; req is (fn . json)
-  (define (render-on! c buf req render-ms)
-    (guard (e (#t (as-qjs-error e "render failed")))
-      (tcp-write! c (encode-request (car req) (cdr req)) #f)
-      (read-response c buf (+ (now-ms) render-ms))))
+  ;; The deadline is stamped BEFORE the request is encoded, not after.
+  ;; Encoding is proportional to the props, so charging it to the margin
+  ;; between this deadline and the caller's is charging it to the one
+  ;; thing that keeps their order predictable.
+  (define (render-on! c buf req render-ms ref)
+    (let ((deadline (+ (now-ms) render-ms)))
+      (guard (e (#t (as-qjs-error e "render failed")))
+        (tcp-write! c (encode-request (car req) (cdr req)) #f)
+        (read-response c buf deadline ref))))
 
   ;; An adopted connection watches its owner: the pool monitors its
   ;; connections and not the other way round, so a pool that died would
@@ -291,7 +348,7 @@
             (tcp-close! c)
             (serve-loop c buf notify render-ms)))
       (`#(db-query ,req ,ref ,from)
-        (let ((r (render-on! c buf req render-ms)))
+        (let ((r (render-on! c buf req render-ms ref)))
           (if (qjs-error? r)
               (begin
           ;; THE POOL FIRST, then the caller. Telling the caller first
