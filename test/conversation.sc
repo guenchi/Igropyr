@@ -577,6 +577,33 @@
           (fail "a step outran a TTL below the watchdog's floor" v))
         (display "a TTL below the poll floor is still enforced ok\n")))))
 
+;; ---- a satisfied caller is not answered twice ---------------------------
+;;
+;; The reply destination used to persist after it had been answered, so a
+;; flow whose guard swallows 'conversation-expired and parks again sent its
+;; next reply to the caller that finished rounds ago. Nothing reads those,
+;; and in a reused pool worker's mailbox they accumulate one per round --
+;; each one scanned past by every later selective receive.
+(let ((me self))
+  (let-values (((oid otok ofirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (let loop ((r req))
+                      (loop (guard (e (#t 'swallowed))
+                              (suspend! (vector 'ask r))))))
+                  'go
+                  200)))
+    ;; ofirst was this process's answer; the flow now expires and re-parks
+    ;; several times on its own
+    (sleep-ms 900)
+    ;; nothing more may have arrived for the exchange already settled
+    (let ((extra (let drain ((n 0))
+                   (receive (after 0 n)
+                     (`#(conv-reply ,r ,reply ,status) (drain (+ n 1)))))))
+      (unless (= 0 extra)
+        (fail "a settled caller received further replies" extra))
+      (display "a caller that was already answered is not answered again ok\n"))))
+
 ;; ---- a resume long after the park deadline does not advance -------------
 ;;
 ;; What this pins is the ordinary case: the window closed, the flow was

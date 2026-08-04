@@ -206,7 +206,7 @@
             (mutable key)          ; key of the request that was accepted
             (mutable reply)        ; what accepting it produced
             (mutable steps)        ; completed suspends, for the watchdog
-            running-box run-start-box))
+            running-box run-start-box watch-box))
 
   ;; ENTERING 'running starts the clock; re-marking a phase that is already
   ;; running does not. Computing a request key marks and restores the phase
@@ -217,6 +217,9 @@
   (define (set-phase! st phase)
     (let ((entering (and (eq? phase 'running)
                          (not (eq? (step-state-phase st) 'running)))))
+      (when entering
+        (let ((w (unbox (step-state-watch-box st))))
+          (when w (send w (vector 'conv-step-started)))))
       (step-state-phase-set! st phase)
       (when entering
         ;; TIMESTAMP BEFORE THE FLAG. The watchdog reads the flag and then
@@ -825,6 +828,14 @@
            ;; set when the flow returns: from then on nothing the watchdog
            ;; sees is a step that overran, whatever marks the phase running
            (settled-box (box #f))
+           ;; the watchdog, so entering running can WAKE it instead of
+           ;; being noticed by a poll. Polling fast enough to catch the
+           ;; start of a step meant polling every ttl for a small ttl --
+           ;; a conversation with a 1ms allowance woke its watchdog a
+           ;; thousand times a second while parked, and a few of those
+           ;; crowd out everything else on the one thread. Being told is
+           ;; both cheaper and sharper than looking more often.
+           (watch-box (box #f))
            (conv
              (spawn
                (lambda ()
@@ -842,7 +853,8 @@
                  ;; is not killed for being slow between rounds; what it
                  ;; bounds is one step.
                  (let ((watched self))
-                   (spawn
+                   (set-box! watch-box
+                     (spawn
                      (lambda ()
                        ;; Parked, poll; RUNNING, sleep until that step's
                        ;; own deadline. A fixed tick made the bound
@@ -855,17 +867,21 @@
                        ;; is harmless: every wake re-reads the phase and
                        ;; the start time, so a step that began meanwhile
                        ;; simply gets its own deadline computed next.
-                       ;; ...and never longer than the TTL itself. A floor
-                       ;; of 50ms against a smaller TTL meant the watchdog
-                       ;; was still asleep from the parked phase while a
-                       ;; whole step ran and finished past its allowance.
-                       (let ((tick (min ttl (max 50 (div ttl 4)))))
+                       ;; The parked wait is a RECEIVE, not a sleep: a step
+                       ;; starting says so, and the poll behind it is only a
+                       ;; backstop for the window before this box is set.
+                       ;; Chasing the start by polling faster meant polling
+                       ;; every ttl for a small ttl -- a thousand wake-ups a
+                       ;; second for a 1ms allowance, on the one thread that
+                       ;; runs everything.
+                       (let ((tick (max 50 (div ttl 4))))
                          (let loop ()
-                           (sleep-ms
-                             (if (unbox running-box)
+                           (if (unbox running-box)
+                               (sleep-ms
                                  (max 1 (- (+ (unbox run-start-box) ttl 1)
-                                           (now-ms)))
-                                 tick))
+                                           (now-ms))))
+                               (receive (after tick 'tick)
+                                 (`#(conv-step-started) 'started)))
                            ;; DECIDE AND KILL AS ONE ACT.
                            ;;
                            ;; Three reads and a kill with interrupts open is
@@ -918,10 +934,11 @@
                                 (when (and killed on-killed)
                                   ;; the flow's winders did not run; this is
                                   ;; the only chance to release what it held
-                                  (guard (e (#t (void))) (on-killed))))))))))))
+                                  (guard (e (#t (void))) (on-killed)))))))))))))
                  (let ((who starter) (tag ref)
                        (st (make-step-state 'running #f #f #f #f 0
-                                            running-box run-start-box)))
+                                            running-box run-start-box
+                                            watch-box)))
 
                    ;; The one place application code is run on an incoming
                    ;; request. It is bounded -- the phase is marked running,
@@ -950,8 +967,17 @@
                      (set-box! step-box (step-state-steps st))
                      (set-phase! st 'parked)
                      ;; the reply carries the token that answers it
-                     (send who (vector 'conv-reply tag reply
-                                       (step-state-awaiting st)))
+                     ;; ONE SHOT. The destination is whoever is waiting
+                     ;; right now, and once answered there is nobody. A
+                     ;; flow whose guard swallows 'conversation-expired and
+                     ;; parks again would otherwise send its next reply to
+                     ;; the caller that finished rounds ago -- a message
+                     ;; nothing will ever read, accumulating in a pool
+                     ;; worker's mailbox for every round it does that.
+                     (when who
+                       (send who (vector 'conv-reply tag reply
+                                         (step-state-awaiting st)))
+                       (set! who #f) (set! tag #f))
                      (serve-steps! st (+ (now-ms) ttl) safe-key
                        (lambda (from ref2 token r)
                          (step-state-consumed-set! st token)
@@ -998,7 +1024,9 @@
                        (set-box! settled-box #t)
                        (tomb-insert! id))
                      (tomb-prune!)
-                     (send who (vector 'conv-reply tag final 'done))
+                     (when who
+                       (send who (vector 'conv-reply tag final 'done))
+                       (set! who #f) (set! tag #f))
                      ;; LINGER, then unregister.
                      ;;
                      ;; Exiting here is what made a lost FINAL reply
