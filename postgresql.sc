@@ -330,7 +330,18 @@
       ;; session outlived the pool indefinitely -- and rebuilding the pool
       ;; stacked a fresh set on top. Failing here unwinds through the guards,
       ;; which close the socket.
-      (`#(DOWN ,pid ,reason) (postgresql-fail 'transport "owner gone"))))
+      (`#(DOWN ,pid ,reason) (postgresql-fail 'transport "owner gone"))
+      ;; A TEARDOWN has to reach us HERE as well. The pool reclaims a
+      ;; connection whose borrower died by marking it dying and sending
+      ;; db-quit -- @kill discards dynamic-wind winders, so the pool's
+      ;; monitor is the only path back -- and a receive matching only the
+      ;; socket left that message in the mailbox until the statement
+      ;; finished. Against a server that has stopped answering, that is the
+      ;; whole query timeout, and for all of it the connection is marked
+      ;; dying: neither lent out nor rebuilt. Failing here takes the same
+      ;; route a transport error already takes.
+      (`#(db-quit)
+        (postgresql-fail 'transport "connection closed while a query was in flight"))))
 
   ;; During startup/auth the server may interleave NoticeResponse ('N')
   ;; messages (an auth hook warning, a standby notice); they are

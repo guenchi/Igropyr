@@ -92,6 +92,11 @@
 ;; the per-packet timeout -- the shape that never trips a re-arming timeout
 (define dribble-greeting (box #f))
 
+;; when set, the handshake completes and then NOTHING is ever answered:
+;; the shape a hung server has, and the only one in which a connection's
+;; own deadline is far away when the pool wants it back
+(define mute-queries (box #f))
+
 (define (start-server!)
   (tcp-listen! "127.0.0.1" port 16
     (lambda (c)
@@ -131,6 +136,11 @@
                     (`#(tcp-data ,_)
                       (tcp-write! c (packet ok-packet 2) #f)
                       (let serve ()
+                        (if (unbox mute-queries)
+                        ;; reads the query and answers nothing, ever
+                        (receive (after 60000 (tcp-close! c))
+                          (`#(tcp-eof) (tcp-close! c))
+                          (`#(tcp-error ,_) (tcp-close! c)))
                         (receive (after 20000 (tcp-close! c))
                           (`#(tcp-data ,_)
                             (let* ((value (make-string (unbox big-value-bytes) #\x))
@@ -172,7 +182,7 @@
                                       (write-frag end)))))
                               (serve)))
                           (`#(tcp-eof) (tcp-close! c))
-                          (`#(tcp-error ,_) (tcp-close! c)))))
+                          (`#(tcp-error ,_) (tcp-close! c))))))
                     (`#(tcp-eof) (tcp-close! c))
                     (`#(tcp-error ,_) (tcp-close! c)))))))))
         (conn-set-owner! c pid)
@@ -183,6 +193,36 @@
   (lambda ()
     (start-server!)
     (sleep-ms 200)
+
+    ;; ---- a teardown must reach a connection that is mid-query -------------
+    ;;
+    ;; The pool reclaims a connection whose borrower died by sending it
+    ;; db-quit: @kill discards dynamic-wind winders, so no check-in runs and
+    ;; the pool's monitor is the only path back. A connection waiting for a
+    ;; server that has stopped answering matched only TCP messages, so that
+    ;; db-quit sat in its mailbox for the whole query timeout -- a MINUTE by
+    ;; default -- and for all of it the pool had the connection marked dying:
+    ;; neither lent out nor rebuilt. One reaped caller, one connection out of
+    ;; the pool for a minute.
+    ;;
+    ;; Measured against the connection's own deadline, which is what would
+    ;; otherwise end it: this must take a fraction of that, not all of it.
+    (set-box! mute-queries #t)
+    (let ((conn (mysql-connect "127.0.0.1" port "user" "pw" "db"))
+          (me self))
+      (let ((m (monitor conn)))
+        (spawn (lambda () (guard (e (#t 'ok)) (mysql-query conn "SELECT never"))))
+        (sleep-ms 200)
+        (let ((t0 (now-ms)))
+          (send conn (vector 'db-quit))
+          (let ((took (receive (after 5000 #f)
+                        (`#(DOWN ,@conn ,reason) (- (now-ms) t0)))))
+            (check "db-quit reaches a connection waiting on a silent server"
+                   (and took (< took 3000)))
+            (display (string-append "  [info] mid-query db-quit honoured after "
+                                    (if took (number->string took) "never")
+                                    "ms (the query deadline is 60000)\n"))))))
+    (set-box! mute-queries #f)
 
     ;; ---- the handshake and a small result --------------------------------
     (set-box! big-value-bytes 8)

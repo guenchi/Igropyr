@@ -258,6 +258,12 @@
          (query-loop!))
         ((#\Q)
          (let ((sql (utf8->string (bv-sub p 0 (find-u8 p 0 0)))))
+           ;; a query this server never answers: the shape a hung server
+           ;; has, and the only one in which the connection's own deadline
+           ;; is still far away when the pool wants the connection back
+           (when (and (>= (string-length sql) 6)
+                      (string=? (substring sql 0 6) "SILENT"))
+             (let hush () (fill!) (hush)))
            (if (and (>= (string-length sql) 4)
                     (string=? (substring sql 0 4) "COPY"))
                (begin
@@ -393,6 +399,30 @@
         (let ((pid (spawn (lambda () (guard (e (#t (void))) (serve-conn c))))))
           (conn-set-owner! c pid)
           (tcp-read-start! c))))
+
+    ;; 0. a teardown must reach a connection that is mid-query.
+    ;;
+    ;; The pool reclaims a connection whose borrower died by sending it
+    ;; db-quit: @kill discards dynamic-wind winders, so no check-in runs and
+    ;; the pool's monitor is the only path back. A connection waiting on a
+    ;; server that has stopped answering matched only TCP messages, so that
+    ;; db-quit sat in its mailbox for the whole query timeout -- a MINUTE by
+    ;; default -- and for all of it the pool had it marked dying: neither
+    ;; lent out nor rebuilt. One reaped caller, one connection gone for a
+    ;; minute.
+    (let ((conn (postgresql-connect "127.0.0.1" port "user" scram-password "scram"))
+          (me self))
+      (let ((m (monitor conn)))
+        (spawn (lambda () (guard (e (#t 'ok)) (postgresql-query conn "SILENT"))))
+        (sleep-ms 200)
+        (let ((t0 (now-ms)))
+          (send conn (vector 'db-quit))
+          (let ((took (receive (after 5000 #f)
+                        (`#(DOWN ,@conn ,reason) (- (now-ms) t0)))))
+            (check "mid-query-db-quit" (and took (< took 3000)))
+            (display (string-append "  [info] mid-query db-quit honoured after "
+                                    (if took (number->string took) "never")
+                                    "ms (the query deadline is 60000)\n"))))))
 
     ;; 1. SCRAM against the server-side verifier (binds the driver's math),
     ;;    plus client_encoding announcement (server rejects without it)

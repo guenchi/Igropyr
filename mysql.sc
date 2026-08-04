@@ -276,7 +276,17 @@
       ;; session outlived the pool indefinitely -- and rebuilding the pool
       ;; stacked a fresh set on top. Failing here unwinds through the guards,
       ;; which close the socket.
-      (`#(DOWN ,pid ,reason) (mysql-fail -1 "owner gone"))))
+      (`#(DOWN ,pid ,reason) (mysql-fail -1 "owner gone"))
+      ;; A TEARDOWN has to reach us HERE as well. The pool reclaims a
+      ;; connection whose borrower died by marking it dying and sending
+      ;; db-quit -- @kill discards dynamic-wind winders, so the pool's
+      ;; monitor is the only path back -- and a receive matching only the
+      ;; socket left that message in the mailbox until the statement
+      ;; finished. Against a server that has stopped answering, that is the
+      ;; whole query timeout, and for all of it the connection is marked
+      ;; dying: neither lent out nor rebuilt. Failing here takes the same
+      ;; route a transport error already takes.
+      (`#(db-quit) (mysql-fail -1 "connection closed while a query was in flight"))))
 
   ;; ---- length-encoded values -------------------------------------------------------
 
