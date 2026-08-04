@@ -444,6 +444,68 @@
               (display "a wedged cleanup is killed and the caller is answered ok\n")
               (fail "a wedged cleanup left the caller with a live conversation" st)))))))
 
+;; ---- a spent token against a flow that re-parks is stale ----------------
+;;
+;; What this actually pins: a flow whose guard swallows 'conversation-expired
+;; and parks again is answerable, and the token from before that expiry is
+;; refused rather than applied. The conversation has already expired and
+;; re-parked by the time the resume arrives, so the token is simply spent.
+;;
+;; It does NOT cover the reply the deadline re-check now sends before
+;; expiring. Reaching that needs the step to arrive after the deadline but
+;; before the conversation is next scheduled -- the same race the re-check
+;; itself is documented as untestable for. The reply is defence on that
+;; path: without it the sender waits in a receive with no deadline at all.
+(let ((rounds (box 0)))
+  (let-values (((sid stok sfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (let loop ((r req))
+                      (set-box! rounds (+ 1 (unbox rounds)))
+                      (loop (guard (e (#t 'swallowed))   ; eats the expiry
+                              (suspend! (vector 'ask r))))))
+                  'go
+                  300)))
+    (let ((me self))
+      (sleep-ms 500)                       ; the park window has closed
+      (spawn (lambda ()
+               (let-values (((r st) (conversation-resume! sid stok 'LATE)))
+                 (send me (vector 'answered st)))))
+      (receive (after 4000 (fail "a late step was dropped without an answer" sid))
+        (`#(answered ,st)
+          (unless (conversation-stale? st)
+            (fail "a late step was not answered stale" st))
+          (display "a spent token against a re-parking flow is stale ok\n"))))))
+
+;; ---- a completed conversation is not a step that overran ----------------
+;;
+;; Computing a request key marks the phase running, and it does that during
+;; the LINGER too. A slow key function on a replay could therefore bring the
+;; watchdog down on a conversation that had committed and finished: its own
+;; guard had already run, so the on-killed hook released a second time. Only
+;; the flow's own idempotence was hiding that.
+(let ((releases (box 0)))
+  (let-values (((cid ctok cfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (vector 'committed a)))
+                  'go
+                  400
+                  (lambda (r)                       ; slow key, only on replay
+                    (if (eq? r 'REPLAY) (sleep-ms 900) (void))
+                    r)
+                  (lambda () (set-box! releases (+ 1 (unbox releases)))))))
+    (let-values (((r st) (conversation-resume! cid ctok 'confirm)))
+      (unless (conversation-done? st) (fail "completed-setup" st)))
+    ;; a replay whose key is slow enough to look like an overrunning step
+    (let-values (((r2 st2) (conversation-resume! cid ctok 'REPLAY)))
+      (void))
+    (sleep-ms 300)
+    (unless (= 0 (unbox releases))
+      (fail "a finished conversation ran its on-killed hook" (unbox releases)))
+    (display "a slow key during the linger does not re-release ok\n")))
+
 ;; ---- a resume long after the park deadline does not advance -------------
 ;;
 ;; What this pins is the ordinary case: the window closed, the flow was
@@ -514,10 +576,11 @@
       (fail "a crashed conversation was reported as settled" state)))
   (display "a conversation that died is still gone ok\n"))
 
-;; MUST RUN BEFORE ANY RECORD IS PRUNED. What it pins is the horizon's
-;; STARTING value -- process start -- and the moment a prune discards
-;; anything the horizon moves up to that entry's age, which would answer
-;; this case for the wrong reason.
+;; What this pins is the PRE-INCARNATION FORMAT: an id with no incarnation
+;; field at all reads as unknown. It does NOT reach the horizon comparison
+;; -- conv-created-at returns #f before ever looking at a timestamp -- and
+;; an earlier version of this comment claimed it did. The horizon itself is
+;; pinned separately, below.
 ;; An id from BEFORE this incarnation is outside what this process can
 ;; speak for. A restart erases the completion records but not the ids the
 ;; clients are holding, and answering 'gone for those is the same lie the
@@ -528,7 +591,76 @@
   (let-values (((state token reply) (conversation-peek ancient)))
     (unless (conversation-unknown? state)
       (fail "an id older than this process was not reported unknown" state)))
-  (display "an id older than this incarnation -> unknown ok\n"))
+  (display "an id in the pre-incarnation format -> unknown ok\n"))
+
+;; THE HORIZON ITSELF. Same incarnation as this run -- so the comparison is
+;; actually reached -- and a timestamp older than anything this process
+;; would still have a record of. Every other 'unknown case in this file is
+;; answered before the horizon is consulted, so without this one the
+;; comparison has no test at all.
+(let* ((real (let-values (((hid htok hfirst)
+                           (conversation-start!
+                             (lambda (req suspend!) 'done) 'go 300)))
+               hid))
+       (len (string-length real))
+       (dot (let loop ((i 0))
+              (cond ((= i len) #f)
+                    ((char=? (string-ref real i) #\.) i)
+                    (else (loop (+ i 1))))))
+       (dash (and dot (let loop ((i (+ dot 1)))
+                        (cond ((= i len) #f)
+                              ((char=? (string-ref real i) #\-) i)
+                              (else (loop (+ i 1)))))))
+       ;; "1" ms into this machine's uptime: this run's incarnation, a
+       ;; timestamp far below its horizon
+       (ancient (and dot dash
+                     (string-append (substring real 0 (+ dot 1))
+                                    "1"
+                                    (substring real dash len)))))
+  (unless ancient (fail "could not build a same-incarnation ancient id" real))
+  (let-values (((state token reply) (conversation-peek ancient)))
+    (when (conversation-gone? state)
+      (fail "an id older than the horizon was reported as rolled back" state))
+    (unless (conversation-unknown? state)
+      (fail "an id older than the horizon was not reported unknown" state)))
+  (display "a same-incarnation id older than the horizon -> unknown ok\n"))
+
+;; Tokens from different steps can never be equal, and that is a property
+;; of the token rather than of a list this conversation keeps. Nothing else
+;; in this file looks at a token's SHAPE, so without this the step number
+;; could be dropped and every test would stay green -- uniqueness would
+;; quietly go back to being a 64-bit coincidence.
+(let ((seen '()))
+  (let-values (((tid ttok tfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (let loop ((i 0) (r req))
+                      (if (>= i 4)
+                          'done
+                          (loop (+ i 1) (suspend! (vector 'round i))))))
+                  'go
+                  4000)))
+    (let step ((tok ttok) (i 0))
+      (when (and tok (string? tok) (< i 4))
+        (when (member tok seen)
+          (fail "a token repeated an earlier one" tok))
+        (set! seen (cons tok seen))
+        (let-values (((r st) (conversation-resume! tid tok 'next)))
+          (step (and (string? st) st) (+ i 1)))))
+    ;; every token must name its step, which is what makes them unequal
+    ;; whatever the random half happens to be
+    (for-each
+      (lambda (tok)
+        (let ((dash (let loop ((j 0))
+                      (cond ((= j (string-length tok)) #f)
+                            ((char=? (string-ref tok j) #\-) j)
+                            (else (loop (+ j 1)))))))
+          (unless (and dash (> dash 0))
+            (fail "a token does not name its step" tok))))
+      seen)
+    (unless (= 4 (length seen))
+      (fail "expected four tokens" (length seen)))
+    (display "tokens name their step, and no two steps share one ok\n")))
 
 ;; ...and an id from ANOTHER incarnation is unknown however NEW it looks.
 ;;

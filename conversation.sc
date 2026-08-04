@@ -319,7 +319,24 @@
                 ;; wait, and a message cannot be inside a window it arrived
                 ;; after just because nobody had looked yet.
                 (if (>= (now-ms) deadline)
-                    (on-expire)
+                    ;; ANSWER IT FIRST. Expiring without a word leaves the
+                    ;; sender in local-resume's receive, which waits for a
+                    ;; reply or a DOWN and has neither deadline nor default
+                    ;; -- so a flow whose guard swallows 'conversation-expired
+                    ;; and parks again holds that caller for as long as it
+                    ;; cares to. 'stale is also the true answer whatever the
+                    ;; flow does next: this request was not applied and will
+                    ;; not be.
+                    ;;
+                    ;; NOT COVERED BY A TEST, and for the same reason the
+                    ;; re-check itself is not: reaching it needs a step to
+                    ;; arrive after the deadline but before the conversation
+                    ;; is next scheduled. A test that merely waits past the
+                    ;; deadline finds a conversation that has already expired
+                    ;; on its own, and exercises the ordinary stale path.
+                    (begin
+                      (send from (vector 'conv-reply ref2 #f 'stale))
+                      (on-expire))
                 (case (classify st token (lambda () (safe-key r)))
                   ((advance) (on-advance from ref2 token r))
                   ((replay)
@@ -775,6 +792,9 @@
            ;; 2000 ms allowance. Sampling can stay periodic; the DECISION
            ;; has to come from the clock.
            (run-start-box (box (now-ms)))
+           ;; set when the flow returns: from then on nothing the watchdog
+           ;; sees is a step that overran, whatever marks the phase running
+           (settled-box (box #f))
            (conv
              (spawn
                (lambda ()
@@ -822,8 +842,18 @@
                              ((> (- (now-ms) (unbox run-start-box)) ttl)
                               (kill watched 'conversation-expired)
                               ;; the flow's winders did not run; this is
-                              ;; the only chance to release what it held
-                              (when on-killed
+                              ;; the only chance to release what it held.
+                              ;;
+                              ;; UNLESS THE FLOW ALREADY RETURNED. Computing
+                              ;; a request key marks the phase running, and
+                              ;; it does that during the linger too -- so a
+                              ;; slow key function on a replay could bring
+                              ;; the watchdog down on a conversation that had
+                              ;; committed and finished. Its own guard has
+                              ;; run; releasing again is the double release
+                              ;; the hook is written to avoid, and only the
+                              ;; flow's own idempotence was hiding it.
+                              (when (and on-killed (not (unbox settled-box)))
                                 (guard (e (#t (void))) (on-killed))))
                              (else (loop))))))))
                  (let ((who starter) (tag ref)
@@ -890,6 +920,7 @@
                      (step-state-reply-set! st final)
                      (step-state-awaiting-set! st #f)
                      (set-phase! st 'completed)
+                     (set-box! settled-box #t)
                      (tomb-record! id)
                      (send who (vector 'conv-reply tag final 'done))
                      ;; LINGER, then unregister.
