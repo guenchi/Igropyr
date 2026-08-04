@@ -223,7 +223,12 @@
       (inbuf-append! buf bv)
       ;; a framing error is not recoverable on this connection: we no
       ;; longer know where the next request starts
-      (let ((before (inbuf-length buf)))
+      ;; The window for anything left over starts HERE, before the complete
+      ;; frames in this same read are answered. Taking it afterwards let a
+      ;; peer that pipelines slow renders ahead of its partial tail hold
+      ;; that tail for the renders' duration on top of its own allowance.
+      (let ((before (inbuf-length buf))
+            (arrived (now-ms)))
         (if (guard (e (#t #f)) (answer-all! c buf) #t)
             (let* ((rest (inbuf-length buf))
                    ;; A FRAME WAS CONSUMED, so whatever is left over is a
@@ -237,7 +242,7 @@
                    (consumed (< rest before))
                    (deadline (cond ((= rest 0) #f)
                                    ((or consumed (not since))
-                                    (+ (now-ms) partial-ms))
+                                    (+ arrived partial-ms))
                                    (else since))))
               (cond
                 ((= rest 0) (worker-conn-loop* c buf partial-ms #f))
@@ -435,7 +440,16 @@
                 (when notify (send notify (vector 'pool-idle self)))
                 ;; the id ADVANCES: the next request must not be answerable
                 ;; by a frame belonging to this one
-                (serve-loop* c buf notify render-ms (+ next-id 1))))))
+                ;; wrapped to the width of the field it travels in. An
+                ;; unbounded counter encoded into u32 raises once it passes
+                ;; the range -- about 50 days at a thousand renders a second
+                ;; on one connection, and for a lone connection that is
+                ;; permanent, since nothing rebuilds it. Only one request is
+                ;; outstanding at a time, and any exchange whose outcome is
+                ;; in doubt destroys the stream, so a wrapped id can never
+                ;; meet an older one still in flight.
+                (serve-loop* c buf notify render-ms
+                             (modulo (+ next-id 1) #x100000000))))))
       ;; connpool-call sends this to whatever handle it was given when a call
       ;; times out; only a pool acts on it. Consumed here so it does not sit
       ;; in the mailbox slowing every later selective receive.
