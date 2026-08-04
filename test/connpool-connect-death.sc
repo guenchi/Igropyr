@@ -50,7 +50,7 @@
                 (receive
                   (`#(pool-request ,sql ,r ,from)
                     (send from (vector 'pool-reply r (vector 'fake-rows sql)))
-                    (send notify (vector 'pool-idle self))
+                    (send notify (vector 'pool-idle self r))
                     (loop))
                   (`#(pool-stats ,r ,from)
             (send from (vector 'pool-stats-reply r #f))

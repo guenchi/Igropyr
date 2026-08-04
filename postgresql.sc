@@ -819,7 +819,7 @@
                 (tx-close! c))                  ; exit -> DOWN -> rebuild
               (begin
                 (send from (vector 'pool-reply ref r))
-                (when notify (send notify (vector 'pool-idle self)))
+                (when notify (send notify (vector 'pool-idle self ref)))
                 (serve-loop c buf notify)))))
       ;; connpool-call sends this to whatever handle it was given when a call
       ;; times out; only a pool acts on it. Consume it here so it does not

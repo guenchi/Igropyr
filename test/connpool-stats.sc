@@ -49,7 +49,7 @@
                        (string=? (substring sql 0 4) "SLOW"))
               (sleep-ms 300))
             (send from (vector 'pool-reply r (vector 'fake-rows sql)))
-            (send notify (vector 'pool-idle self))
+            (send notify (vector 'pool-idle self r))
             (loop))
           ;; part of the driver contract: a lone connection answers #f, so
           ;; the request cannot sit here forever

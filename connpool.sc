@@ -27,7 +27,10 @@
 ;;;
 ;;;   #(pool-request ,req ,ref ,from)  do req, then #(pool-reply ,ref ,r) to from
 ;;;   #(pool-adopt) / #(pool-quit)     adoption handshake / shutdown
-;;;   #(pool-idle ,self)               to its pool after each finished request
+;;;   #(pool-idle ,self ,ref)         to its pool after each finished request,
+;;;                                    naming the one it just finished -- a late
+;;;                                    idle must not free a connection that has
+;;;                                    since been given something else
 ;;;   #(pool-conn-dead ,self)          to its pool BEFORE it replies a transport
 ;;;                                    error, so the mark arrives before the
 ;;;                                    check-in that reply sets off
@@ -418,23 +421,34 @@
                   (set! pending-back
                         (cons (vector sql ref from (now-ms) m) pending-back)))))
           (loop))
-        (`#(pool-idle ,c)
+        (`#(pool-idle ,c ,done-ref)
           ;; a finished request is the first evidence that this endpoint
           ;; works, and the only evidence worth clearing the penalty for
           (set! backoff-ms 0)
-          ;; This is where a dispatched statement finishes, as far as the
-          ;; pool can see it: the reply itself went straight to the caller.
+          ;; IT MUST NAME THE REQUEST IT FINISHED.
+          ;;
+          ;; A connection sends its reply and then this message, and can be
+          ;; preempted between the two. A borrower that checks in during
+          ;; that gap frees the connection, the pool dispatches the next
+          ;; queued request to it, and the LATE idle then arrived against
+          ;; somebody else's busy entry -- clearing it, crediting the wrong
+          ;; request with the duration, and handing the connection out a
+          ;; second time while the request it was just given is still in
+          ;; its mailbox. Two callers, one connection.
+          ;;
+          ;; A ref that does not match the current dispatch is stale and is
+          ;; ignored. No entry at all means the connection is leased (its
+          ;; lessee's check-in is what frees it) or already accounted for.
           (let ((e (hashtable-ref busy c #f)))
-            (when e
+            (when (and e (eq? (vector-ref e 1) done-ref))
               (let ((took (- (now-ms) (vector-ref e 2))))
                 (set! stat-completed (+ stat-completed 1))
                 (set! stat-query-total (+ stat-query-total took))
-                (when (> took stat-query-max) (set! stat-query-max took)))))
-          ;; a leased connection pings idle after each of its transaction
-          ;; queries -- ignore those, it stays with its lessee; likewise skip
-          ;; a connection we are tearing down.
-          (unless (or (hashtable-ref leased c #f) (hashtable-ref dying c #f))
-            (make-available! c))
+                (when (> took stat-query-max) (set! stat-query-max took)))
+              ;; likewise skip a connection we are tearing down
+              (unless (or (hashtable-ref leased c #f)
+                          (hashtable-ref dying c #f))
+                (make-available! c))))
           (loop))
         (`#(pool-conn-dead ,c)
           ;; the connection already sent the transport-error reply to its
