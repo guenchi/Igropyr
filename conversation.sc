@@ -335,7 +335,15 @@
                     ;; deadline finds a conversation that has already expired
                     ;; on its own, and exercises the ordinary stale path.
                     (begin
-                      (send from (vector 'conv-reply ref2 #f 'stale))
+                      ;; ...but only while a reply is what the sender would
+                      ;; otherwise never get. In the LINGER the expiry just
+                      ;; returns, the process exits, and the caller's monitor
+                      ;; turns that into 'settled off the tombstone -- which
+                      ;; carries the one thing a client that lost its final
+                      ;; reply needs to know: it committed. Answering 'stale
+                      ;; first is true but poorer, and it wins the race.
+                      (unless (eq? (step-state-phase st) 'completed)
+                        (send from (vector 'conv-reply ref2 #f 'stale)))
                       (on-expire))
                 (case (classify st token (lambda () (safe-key r)))
                   ((advance) (on-advance from ref2 token r))
@@ -730,6 +738,16 @@
   ;; Optional trailing argument: ttl-ms (default 300000).
   (define (conversation-start! flow req . opts)
     (ensure-router!)
+    ;; A ttl that is not a positive exact integer reaches receive's `after`
+    ;; and raises THERE -- inside the conversation process, after it has
+    ;; already handed back an id and a token. The caller sees a healthy
+    ;; start and a 'gone on its next resume, with nothing anywhere saying
+    ;; why. Checked here, where it was written.
+    (when (pair? opts)
+      (let ((t (car opts)))
+        (unless (and (integer? t) (exact? t) (> t 0))
+          (assertion-violation 'conversation-start!
+            "ttl-ms must be a positive exact integer" t))))
     (let* ((ttl (if (pair? opts) (car opts) default-ttl-ms))
            ;; WHAT IDENTIFIES A REQUEST, for replay.
            ;;
@@ -848,30 +866,59 @@
                                  (max 1 (- (+ (unbox run-start-box) ttl 1)
                                            (now-ms)))
                                  tick))
+                           ;; DECIDE AND KILL AS ONE ACT.
+                           ;;
+                           ;; Three reads and a kill with interrupts open is
+                           ;; not a decision, it is four of them. Between
+                           ;; "still running" and the kill the flow can
+                           ;; return, publish, and enter its linger -- and
+                           ;; the kill then lands on a conversation that has
+                           ;; COMMITTED, taking the linger with it. The
+                           ;; final reply that linger exists to preserve is
+                           ;; gone, and every later retry gets 'settled with
+                           ;; no answer instead of the answer.
+                           ;;
+                           ;; A flow that already returned is never a step
+                           ;; that overran, so settled-box gates the KILL and
+                           ;; not merely the hook: computing a request key
+                           ;; marks the phase running during the linger too,
+                           ;; and a slow key on a replay would otherwise
+                           ;; still bring the watchdog down on a finished
+                           ;; conversation. It holds nothing by then.
+                           ;;
+                           ;; on-killed is application code and runs OUTSIDE
+                           ;; the region.
+                           (let ((overrun?
+                                  (lambda ()
+                                    (and (unbox running-box)
+                                         (not (unbox settled-box))
+                                         (> (- (now-ms) (unbox run-start-box))
+                                            ttl)))))
                            (cond
                              ((not (process-alive? watched)) 'done)
-                             ;; parked in suspend!: idle between rounds is
-                             ;; not what this bounds
-                             ((not (unbox running-box)) (loop))
-                             ;; running, and running for longer than one
-                             ;; step is allowed
-                             ((> (- (now-ms) (unbox run-start-box)) ttl)
-                              (kill watched 'conversation-expired)
-                              ;; the flow's winders did not run; this is
-                              ;; the only chance to release what it held.
-                              ;;
-                              ;; UNLESS THE FLOW ALREADY RETURNED. Computing
-                              ;; a request key marks the phase running, and
-                              ;; it does that during the linger too -- so a
-                              ;; slow key function on a replay could bring
-                              ;; the watchdog down on a conversation that had
-                              ;; committed and finished. Its own guard has
-                              ;; run; releasing again is the double release
-                              ;; the hook is written to avoid, and only the
-                              ;; flow's own idempotence was hiding it.
-                              (when (and on-killed (not (unbox settled-box)))
-                                (guard (e (#t (void))) (on-killed))))
-                             (else (loop))))))))
+                             ((not (overrun?)) (loop))
+                             (else
+                              ;; ONE GRACE TICK. The atom below cannot cover
+                              ;; the gap between a flow RETURNING and this
+                              ;; process reaching its publication: nothing
+                              ;; in the system records that a flow is on its
+                              ;; way back. A millisecond is enough for that
+                              ;; process to be scheduled, and it moves the
+                              ;; bound from ttl to ttl+1ms rather than
+                              ;; leaving a committed transaction to be
+                              ;; killed and reported rolled back.
+                              (sleep-ms 1)
+                              (let ((killed
+                                     (with-interrupts-disabled
+                                       (and (process-alive? watched)
+                                            (overrun?)
+                                            (begin
+                                              (kill watched 'conversation-expired)
+                                              #t)))))
+                                (when (and killed on-killed)
+                                  ;; the flow's winders did not run; this is
+                                  ;; the only chance to release what it held
+                                  (guard (e (#t (void))) (on-killed))))))))))))
                  (let ((who starter) (tag ref)
                        (st (make-step-state 'running #f #f #f #f 0
                                             running-box run-start-box)))

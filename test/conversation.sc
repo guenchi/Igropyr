@@ -504,6 +504,13 @@
     (sleep-ms 300)
     (unless (= 0 (unbox releases))
       (fail "a finished conversation ran its on-killed hook" (unbox releases)))
+    ;; The kill is gated on the same flag, not just the hook -- but that
+    ;; cannot be asserted here and no test can assert it: the linger window
+    ;; IS the ttl, so a key slow enough to look like an overrunning step is
+    ;; also slow enough to outlast the linger. The conversation ends either
+    ;; way, and the two reasons are indistinguishable from outside. What is
+    ;; observable, and what this pins, is that a finished flow's hook does
+    ;; not run a second time.
     (display "a slow key during the linger does not re-release ok\n")))
 
 ;; ---- a flow that returned inside its TTL is never reported gone ----------
@@ -711,17 +718,26 @@
         (set! seen (cons tok seen))
         (let-values (((r st) (conversation-resume! tid tok 'next)))
           (step (and (string? st) st) (+ i 1)))))
-    ;; every token must name its step, which is what makes them unequal
-    ;; whatever the random half happens to be
-    (for-each
-      (lambda (tok)
-        (let ((dash (let loop ((j 0))
-                      (cond ((= j (string-length tok)) #f)
-                            ((char=? (string-ref tok j) #\-) j)
-                            (else (loop (+ j 1)))))))
-          (unless (and dash (> dash 0))
-            (fail "a token does not name its step" tok))))
-      seen)
+    ;; The PREFIXES must differ, not merely the whole tokens. Whole-token
+    ;; distinctness is satisfied by the random half alone, so an assertion
+    ;; that only checks that would pass with the step number replaced by a
+    ;; constant -- which is exactly the property being claimed.
+    (let ((prefixes
+           (map (lambda (tok)
+                  (let ((dash (let loop ((j 0))
+                                (cond ((= j (string-length tok)) #f)
+                                      ((char=? (string-ref tok j) #\-) j)
+                                      (else (loop (+ j 1)))))))
+                    (unless (and dash (> dash 0))
+                      (fail "a token does not name its step" tok))
+                    (substring tok 0 dash)))
+                seen)))
+      (let dup ((rest prefixes))
+        (unless (null? rest)
+          (when (member (car rest) (cdr rest))
+            (fail "two steps issued tokens with the same step number"
+                  (car rest)))
+          (dup (cdr rest)))))
     (unless (= 4 (length seen))
       (fail "expected four tokens" (length seen)))
     (display "tokens name their step, and no two steps share one ok\n")))
