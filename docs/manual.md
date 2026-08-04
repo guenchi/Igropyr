@@ -1335,13 +1335,46 @@ outcomes never share a position with it:
 | `'settled` | it finished, but the answer is no longer retained |
 | `'stale` | not applied, and will not be |
 | `'gone` | it died or expired — for a transactional flow, rolled back |
+| `'unknown` | it is not here and this node cannot say whether it committed |
 | `'unreachable` | the owner node could not be reached; nothing is known |
 
-`conversation-done?`, `conversation-settled?`, `conversation-stale?` and
-`conversation-gone?` are applied to the *status*.
+`conversation-done?`, `conversation-settled?`, `conversation-stale?`,
+`conversation-gone?` and `conversation-unknown?` are applied to the
+*status*.
 
-`(conversation-peek id)` asks what a conversation is waiting for without
-advancing it — `(values state token last-reply)`, with the same states.
+**`'unknown` is not `'gone`.** `'gone` promises a rollback, and that
+promise needs a premise: *would this node still have the completion
+record?* Past the age limit, past the count limit, or on the other side
+of a restart the answer is no — and the same absence then means nothing
+at all. An id carries the time it was made
+(`<node>~<base36 ms>-<hex>`, or without the node prefix on a single
+node) and the record carries a **horizon**: how far back this node
+remembers, starting at process start and moving up whenever an entry is
+discarded. No record and an id newer than the horizon is `'gone`;
+otherwise `'unknown`.
+
+`'unknown` licenses one thing less than `'gone`: **do not resubmit**.
+Reconcile against your own state, which is where the truth still is. It
+appears exactly where `'gone` used to be a guess — including for a
+fabricated id, which this node cannot tell from a real one it has
+forgotten.
+
+**Answering `'unknown` yourself.** `conversation-resume!` and
+`conversation-peek` take an optional predicate — `(conversation-resume!
+id token req settled?)` — consulted *only* when the answer would be
+`'unknown`: `#t` gives `'settled`, `#f` gives `'gone`, and anything else,
+including a raise, leaves `'unknown` standing. It is applied on the
+asking node, so it covers a forwarded resume too.
+
+This is where an application that wrote the conversation id **in the same
+transaction as the effect** hands the library the truth. That is also the
+only fix for the one case the horizon cannot cover: a flow that commits
+and then dies before returning leaves no record, and inside the horizon
+that reads as `'gone`. Nothing the library can observe distinguishes it;
+a marker in the transaction can.
+
+`(conversation-peek id [settled?])` asks what a conversation is waiting
+for without advancing it — `(values state token last-reply)`, with the same states.
 It is what a caller does after an `'unreachable`, once the link is back,
 instead of resubmitting.
 
@@ -1410,8 +1443,10 @@ longer available, but *it committed* is what a reconciling caller needs,
 and it is the opposite of what `'gone` would have said. Bounded by age
 and count through `conversation-set-limits!`, because an unbounded
 record of everything that ever finished is a leak with a long fuse; past
-either bound the entry is dropped and `'gone` is ambiguous again. Size
-both to cover the retry window your clients actually use.
+either bound the entry is dropped — and the answer becomes `'unknown`
+rather than a `'gone` it can no longer support. Size both to cover the
+retry window your clients actually use; past it, callers get an honest
+"I cannot say" instead of a confident wrong answer.
 
 The conversation never touches the connection: pool workers stay the
 protocol adapters, parking until the flow replies, so the pool's
