@@ -462,7 +462,17 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                   (unless (eq? r 'all)
                     (display "  [info] carried tail: ") (write r) (newline)))))
 
-            ;; ---- an in-time frame is not charged for someone else's render
+            ;; ---- a frame completed under someone else's render -----------
+            ;;
+            ;; WEAKER THAN IT LOOKS, and named for what it shows. The
+            ;; intent was to pin that a peer which delivered in time is
+            ;; not refused because its window passed inside another
+            ;; connection's render. Instrumentation says the reader is
+            ;; never reached in that state at all -- the connection's own
+            ;; timer closes it first and its arrived bytes are never
+            ;; delivered -- so what this actually pins is the ordinary
+            ;; case: a frame that completes while the worker is busy is
+            ;; still answered afterwards.
             ;;
             ;; A render stops the whole worker, so one connection's window
             ;; can pass entirely inside another connection's render. The
@@ -526,7 +536,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                                   (send me (vector 'punct 'closed))))))))))) 
               (receive (after 12000 (fail "punctual-peer probe never answered"))
                 (`#(punct ,r)
-                  (check "a frame that arrived in time is answered even when a render outlasted its window"
+                  (check "a frame completed while another connection was rendering is answered"
                          (eq? r 'answered))
                   (unless (eq? r 'answered)
                     (display "  [info] punctual peer: ") (write r) (newline)))))
@@ -604,15 +614,14 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                               (loop (+ got 1) (+ bad 1) v)))))))
               (qjspool-close! rp))
 
-            ;; ---- a punctual request split across two reads ---------------
+            ;; ---- a request bigger than one read --------------------------
             ;;
             ;; The probe above completes its frame in one read. TCP does
-            ;; not promise that: the read buffer is 64KiB and a segment
-            ;; boundary can fall anywhere, so a request delivered whole
-            ;; and in time still arrives in pieces. Keeping the old
-            ;; deadline for a read that completed no frame closed the
-            ;; connection on the FIRST of those pieces and threw away a
-            ;; request that was never late.
+            ;; not promise that, and libuv hands up at most 64KiB per
+            ;; callback, so a 192KiB request cannot arrive in fewer than
+            ;; three. What this pins is reassembly across them. It does
+            ;; NOT pin anything about deadlines: measured, every one of
+            ;; those reads lands inside the window.
             (let ((me self))
               (spawn
                 (lambda ()
@@ -634,17 +643,37 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                         (bytevector-copy! fa 0 p1 0 6)
                         (bytevector-copy! fa 6 p3 0 (- n 6))
                         (tcp-write! ca p1 #f)          ; the window opens
-                        (spawn (lambda ()
-                                 (tcp-connect! "127.0.0.1" carry-port self)
-                                 (receive (after 3000 (void))
-                                   (`#(tcp-connect-failed ,e) (void))
-                                   (`#(tcp-connected ,cb)
-                                     (tcp-read-start! cb)
-                                     (tcp-write! cb (qframe 10 "slow" "{}") #f)
-                                     (receive (after 5000 (void))
-                                       (`#(tcp-data ,bv) (void))
-                                       (`#(tcp-eof) (void))
-                                       (`#(tcp-error ,e) (void)))))))
+                        ;; AND IS READ BEFORE THE RENDER STARTS. Without
+                        ;; that there is no carried-in deadline at all and
+                        ;; the probe proves nothing -- it needs the worker
+                        ;; to have seen the prefix while it was still idle.
+                        ;; A short wait is not a proof, but it is the
+                        ;; ordering the rest of this depends on, so it is
+                        ;; at least stated.
+                        (sleep-ms 40)
+                        ;; ...AND THE COMPETING RENDER IS ASSERTED. Its
+                        ;; failure paths were all silent, which is exactly
+                        ;; the tautology fixed in the probe above: with no
+                        ;; render straddling the window, every read lands
+                        ;; inside it and the frame is answered whether the
+                        ;; rule under test is there or not.
+                        (let ((rival self))
+                          (spawn (lambda ()
+                                   (tcp-connect! "127.0.0.1" carry-port self)
+                                   (receive (after 3000
+                                              (send rival (vector 'rival 'no-connect)))
+                                     (`#(tcp-connect-failed ,e)
+                                       (send rival (vector 'rival 'no-connect)))
+                                     (`#(tcp-connected ,cb)
+                                       (tcp-read-start! cb)
+                                       (tcp-write! cb (qframe 10 "slow" "{}") #f)
+                                       (receive (after 5000
+                                                  (send rival (vector 'rival 'no-answer)))
+                                         (`#(tcp-data ,bv)
+                                           (send rival (vector 'rival 'rendered)))
+                                         (`#(tcp-eof) (send rival (vector 'rival 'eof)))
+                                         (`#(tcp-error ,e)
+                                           (send rival (vector 'rival 'err)))))))))
                         (sleep-ms 120)
                         ;; written whole and well inside the window; the
                         ;; worker is mid-render and sees none of it until
@@ -652,20 +681,95 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                         ;; AND the first read it gets cannot complete the
                         ;; frame however punctual the peer was
                         (tcp-write! ca p3 #f)
-                        (let wait ((acc (make-bytevector 0)))
-                          (if (>= (count-frames acc) 1)
-                              (send me (vector 'split 'answered))
-                              (receive (after 8000 (send me (vector 'split 'timeout)))
-                                (`#(tcp-data ,bv) (wait (bv-append acc bv)))
+                        (let wait ((acc (make-bytevector 0)) (rival #f))
+                          (if (and rival (>= (count-frames acc) 1))
+                              (send me (vector 'split (if (eq? rival 'rendered)
+                                                          'answered
+                                                          (cons 'rival rival))))
+                              (receive (after 9000 (send me (vector 'split 'timeout)))
+                                (`#(rival ,r) (wait acc r))
+                                (`#(tcp-data ,bv) (wait (bv-append acc bv) rival))
                                 (`#(tcp-eof) (send me (vector 'split 'closed)))
                                 (`#(tcp-error ,e)
                                   (send me (vector 'split 'closed)))))))))))
               (receive (after 12000 (fail "split-request probe never answered"))
                 (`#(split ,r)
-                  (check "a punctual request split across two reads is answered"
+                  (check "a request larger than one read is reassembled and answered"
                          (eq? r 'answered))
                   (unless (eq? r 'answered)
                     (display "  [info] split request: ") (write r) (newline)))))
+
+            ;; ---- a half frame dies on its deadline, busy worker or not ---
+            ;;
+            ;; A peer that keeps the worker busy sees its own window pass
+            ;; inside someone else's render, and sends junk bytes after it
+            ;; in the hope that a reader which could not have looked
+            ;; sooner will forgive them. It gets nothing: the connection
+            ;; is closed at the first render boundary after its deadline,
+            ;; and the late bytes are never even delivered to it. Four
+            ;; rounds of trying, and the close lands at the first one.
+            ;;
+            ;; This is the case a forgiving reader would have gotten
+            ;; wrong, so it stays as the guard on ever adding one.
+            (let ((me self))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" carry-port self)
+                  (receive (after 3000 (send me (vector 'renew 'no-connect)))
+                    (`#(tcp-connect-failed ,e) (send me (vector 'renew 'no-connect)))
+                    (`#(tcp-connected ,ca)
+                      (tcp-read-start! ca)
+                      (let ((fa (qframe 11 "hello" "{\"name\":\"L\"}"))
+                            (t0 (now-ms))
+                            (rounds 4))
+                        ;; a prefix and nothing else, ever
+                        (tcp-write! ca (let ((h (make-bytevector 4)))
+                                         (bytevector-copy! fa 0 h 0 4)
+                                         h)
+                                    #f)
+                        (spawn
+                          (lambda ()
+                            ;; each round: a render that STRADDLES the
+                            ;; window (starts inside it, ends after it),
+                            ;; then one junk byte while the worker is
+                            ;; still inside that render
+                            (let round ((k 0))
+                              (when (< k rounds)
+                                (sleep-ms 250)
+                                (let ((mine self))
+                                  (spawn (lambda ()
+                                           (tcp-connect! "127.0.0.1" carry-port self)
+                                           (receive (after 2000 (void))
+                                             (`#(tcp-connect-failed ,e) (void))
+                                             (`#(tcp-connected ,cb)
+                                               (tcp-read-start! cb)
+                                               (tcp-write! cb (qframe (+ 20 k) "slow" "{}") #f)
+                                               (receive (after 3000 (void))
+                                                 (`#(tcp-data ,bv) (void))
+                                                 (`#(tcp-eof) (void))
+                                                 (`#(tcp-error ,e) (void))))))))
+                                (sleep-ms 50)
+                                (guard (e (#t (void)))
+                                  (tcp-write! ca (let ((b (make-bytevector 1)))
+                                                   (bytevector-u8-set! b 0 7)
+                                                   b)
+                                              #f))
+                                (sleep-ms 700)
+                                (round (+ k 1))))))
+                        (let wait ()
+                          (receive (after 12000 (send me (vector 'renew 'never-closed)))
+                            (`#(tcp-data ,bv) (wait))
+                            (`#(tcp-eof) (send me (vector 'renew (- (now-ms) t0))))
+                            (`#(tcp-error ,e)
+                              (send me (vector 'renew (- (now-ms) t0)))))))))))
+              (receive (after 20000 (fail "late-byte probe never answered"))
+                (`#(renew ,r)
+                  ;; one straddling render is ~950ms; four rounds of
+                  ;; renewal ran past 3s in the version that forgave them
+                  (check "a half frame is closed on its deadline whatever else the worker is doing"
+                         (and (number? r) (< r 2000)))
+                  (display "  [info] half frame closed after ") (write r)
+                  (display "ms\n"))))
 
             ;; ---- the cap is checked where it is given --------------------
             ;;

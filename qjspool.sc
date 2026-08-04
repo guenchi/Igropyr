@@ -266,16 +266,28 @@
       ;; deadline, and is closed by the check BELOW on the very same read.
       ;; What the check up here changed was only the case where the frame
       ;; IS whole -- a real request, refused.
-      ;; WHETHER WE WERE THE ONE RUNNING LATE, decided before the parse
-      ;; because the parse moves the clock. Reaching here with a deadline
-      ;; already past can only mean the worker was blocked: an idle one
-      ;; sits in a receive whose timer closes the connection at the
-      ;; deadline, and a buffer whose window has already run out is closed
-      ;; at the top of the loop without receiving at all. So these bytes
-      ;; were delivered while nobody could look at them, whenever they
-      ;; actually arrived.
-      (let ((late? (and since (>= (now-ms) since)))
-            (before (inbuf-length buf)))
+      ;; WHAT IS NOT HERE, and why. Two rounds of review reported that a
+      ;; deadline can pass inside another connection's render, so that a
+      ;; peer which delivered its bytes in time meets a reader that has
+      ;; already given up on it -- and machinery went in to forgive such a
+      ;; read, then to forgive only the rest of a delivery already in hand
+      ;; so a peer could not renew indefinitely by dribbling.
+      ;;
+      ;; Instrumenting the branch says that state never occurs: across the
+      ;; whole suite -- straddling renders, 192KiB split deliveries, junk
+      ;; bytes sent after a window closed -- this reader was reached with
+      ;; an expired deadline exactly ZERO times. A connection whose window
+      ;; runs out while the runtime is blocked is closed by its own timer
+      ;; or at the top of the loop; its already-arrived bytes are never
+      ;; delivered to it. The forgiving machinery was answering a question
+      ;; this runtime does not ask, and it is gone rather than carried
+      ;; untested in the read path.
+      ;;
+      ;; If the scheduler ever delivers libuv reads ahead of expired
+      ;; timers, this becomes live again and the argument above is the one
+      ;; to reach for -- along with the fact that forgiving a read is not
+      ;; the same as forgiving a frame.
+      (let ((before (inbuf-length buf)))
         (if (guard (e (#t #f)) (answer-all! c buf) #t)
             (let* ((rest (inbuf-length buf))
                    ;; A FRAME WAS CONSUMED, so whatever is left over is a
@@ -287,19 +299,8 @@
                    ;; delivered in between. Our own client never pipelines,
                    ;; but answer-all! exists for clients that do.
                    (consumed (< rest before))
-                   ;; A LATE READ BUYS A FRESH WINDOW EVEN IF IT COMPLETED
-                   ;; NOTHING. TCP splits where it likes and the read
-                   ;; buffer is 64KiB, so a large request delivered whole
-                   ;; and in time still arrives as several messages; the
-                   ;; first of them completes no frame, and keeping the
-                   ;; old deadline closed the connection on it and threw
-                   ;; away the rest of a request that was never late.
-                   ;; Forgiving the read, not the frame, is what makes the
-                   ;; two indistinguishable cases -- split delivery and a
-                   ;; deadline spent inside someone else's render -- come
-                   ;; out the same way.
                    (deadline (cond ((= rest 0) #f)
-                                   ((or consumed late? (not since))
+                                   ((or consumed (not since))
                                     (+ (now-ms) partial-ms))
                                    (else since))))
               (cond
@@ -670,7 +671,7 @@
                    (else default-max-requests))))
       (unless (and (integer? v) (exact? v) (> v 0) (<= v default-max-requests))
         (assertion-violation who
-          "max-requests-per-connection must be a positive exact integer no greater than #xffffffff" v))
+          "max-requests-per-connection must be a positive exact integer no greater than #x100000000" v))
       v))
 
   (define (opt-ms opts key default who)
@@ -715,6 +716,12 @@
   ;; One connection to one worker, with no pool behind it. Mainly for tests
   ;; and for a process that renders rarely: it has no queueing, no rebuild
   ;; and no statistics, and a dead worker makes it permanently useless.
+  ;;
+  ;; That last part is also its ceiling: ids are u32 and cannot wrap
+  ;; without an ABA, so this handle stops working after 2^32 renders and
+  ;; nothing brings it back. Refusing max-requests-per-connection below
+  ;; makes the fast way of reaching that state noisy rather than silent;
+  ;; it does not remove the ceiling, which is inherent to having no pool.
   (define (qjspool-connect host port . rest)
     (let* ((opts (if (pair? rest) (car rest) '()))
            (render-ms (opt-ms opts 'render-timeout-ms default-render-ms 'qjspool-connect))
