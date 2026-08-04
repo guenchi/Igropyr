@@ -3299,13 +3299,23 @@ caller's deadline is an ordinary parked receive, the scheduler keeps
 running, and the pool discards and rebuilds the connection.
 
 - `(qjspool endpoints [opts]) → pool` — one connection per endpoint.
-  `opts`: `(render-timeout-ms . 5000)`, `(checkout-timeout-ms . 2000)`.
+  `opts`: `(checkout-timeout-ms . 2000)` — how long to wait for a *free*
+  worker before giving up, and `(render-timeout-ms . 5000)` — how long the
+  render itself may then take. Two deadlines, because the two are
+  different problems: waiting for a worker means the pool is saturated and
+  nothing is wrong, so shed early rather than hold an HTTP worker for the
+  length of a render that has not started.
 - `(qjspool-render pool fn json) → (values ok? html-or-error-text)` — and
   `qjspool-render/bytes` for raw UTF-8. Same contract as `qjs-call/bytes`:
   a JS throw, a timeout and a dead worker all arrive as `(values #f text)`.
 - `(qjspool-connect host port [opts]) → pool` — a single connection, no
   pool behind it.
-- `(qjspool-stats pool)`, `(qjspool-close! pool)`.
+- `(qjspool-stats pool)`, `(qjspool-close! pool)`. A render is a lease, so
+  it is counted under `checkouts`, and `checkout-wait-ms-*` is the wait for
+  a free worker — the number that says whether to run more of them.
+  `queries` and `query-ms-*` stay **zero**: the pool hands the worker over
+  and the reply goes straight to the caller, so the pool never sees the
+  render. Measure render duration at the call site.
 
 **One connection per worker.** A worker is single-threaded and holds one
 engine, so two connections to the same worker serialize inside it. Size
