@@ -194,6 +194,68 @@
     (start-server!)
     (sleep-ms 200)
 
+    ;; ---- the POOL path, against the fake server ---------------------------
+    ;;
+    ;; Everything else in this file drives a single connection, so until now
+    ;; nothing anywhere exercised this driver's pool messages -- pool-up,
+    ;; pool-adopt, pool-idle, pool-conn-dead. The only test that would have
+    ;; is test/mysql.sc, which needs a real server and skips by default, so
+    ;; renaming any of those four would have gone unnoticed on every machine
+    ;; that runs the suite. (postgresql-wire.sc has driven its pool all
+    ;; along; this side simply never did.)
+    ;;
+    ;; A pool of two, a query through it, and the teardown check: a pool
+    ;; that is killed must take its connections with it. The pool monitors
+    ;; its connections and not the other way round, so a killed pool once
+    ;; left every connection running and holding an fd, and rebuilding the
+    ;; pool stacked a second set on top of the first.
+    ;; the reply-shape boxes start at 0, and a fragment size of 0 means the
+    ;; fake server never finishes writing: set them before asking it anything
+    (set-box! big-value-bytes 8)
+    (set-box! fragment-bytes 65536)
+    (set-box! fragment-gap-ms 0)
+    (sleep-ms 300)
+    (let ((base-conns (conn-count)) (base-procs (process-count)))
+      ;; ONE connection and several queries, so the pool has to RECYCLE it.
+      ;; A pool of two answering one query proves nothing: the second
+      ;; connection is idle anyway, so a broken pool-idle -- the message a
+      ;; connection sends to say it is free again -- would go unnoticed.
+      ;; Here the second query cannot be served until the first connection
+      ;; comes back, so the message is load-bearing.
+      (let ((pool (mysql-pool 1 "127.0.0.1" port "user" "pw" "db")))
+        (let loop ((i 0))
+          (when (< i 3)
+            (let ((r (mysql-query pool "SELECT v")))
+              (unless (and (vector? r) (eq? (vector-ref r 0) 'rows))
+                (check "a pooled query came back" #f)))
+            (loop (+ i 1))))
+        ;; "the answers came back" is not the assertion. With the recycle
+        ;; message broken they still come back: the connection sits busy
+        ;; forever, the fake server drops it on its own idle timeout, the
+        ;; pool rebuilds, and the queued query goes to the new connection --
+        ;; twenty seconds per query, by way of two dead connections. What
+        ;; must hold is that ONE connection served all three and none of
+        ;; them had to die for it.
+        (let ((st (mysql-pool-stats pool)))
+          (define (g k) (cond ((assq k st) => cdr) (else -1)))
+          (check "the pool saw all three queries finish" (= 3 (g 'queries-completed)))
+          (check "and did not have to lose a connection to serve them"
+                 (= 0 (g 'connections-lost)))
+          (check "nothing is left waiting" (= 0 (g 'pending))))
+        (sleep-ms 400)
+        (let ((busy (conn-count)))
+          (check "the pool opened connections" (> busy base-conns))
+          (kill pool 'reaped)
+          (sleep-ms 1200)
+          (display "  [info] pool conns ") (display base-conns)
+          (display " -> ") (display busy) (display " -> ")
+          (display (conn-count)) (display ", processes ") (display base-procs)
+          (display " -> ") (display (process-count)) (newline)
+          (check "a killed pool releases its connections"
+                 (= (conn-count) base-conns))
+          (check "a killed pool releases its processes"
+                 (<= (process-count) base-procs)))))
+
     ;; ---- a teardown must reach a connection that is mid-query -------------
     ;;
     ;; The pool reclaims a connection whose borrower died by sending it
