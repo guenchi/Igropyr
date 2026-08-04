@@ -223,14 +223,27 @@
       (inbuf-append! buf bv)
       ;; a framing error is not recoverable on this connection: we no
       ;; longer know where the next request starts
-      (if (guard (e (#t #f)) (answer-all! c buf) #t)
-          (let ((left-over (> (inbuf-length buf) 0)))
-            (cond
-              ((not left-over) (worker-conn-loop* c buf partial-ms #f))
-              ((and since (>= (now-ms) since)) (tcp-close! c))
-              (else (worker-conn-loop* c buf partial-ms
-                      (or since (+ (now-ms) partial-ms))))))
-          (tcp-close! c)))
+      (let ((before (inbuf-length buf)))
+        (if (guard (e (#t #f)) (answer-all! c buf) #t)
+            (let* ((rest (inbuf-length buf))
+                   ;; A FRAME WAS CONSUMED, so whatever is left over is a
+                   ;; DIFFERENT half frame and gets a window of its own.
+                   ;; Keying the reset on "the buffer emptied" instead meant
+                   ;; a peer that always keeps a partial tail -- which is
+                   ;; what pipelining looks like -- was closed at the first
+                   ;; frame's deadline however many complete frames it had
+                   ;; delivered in between. Our own client never pipelines,
+                   ;; but answer-all! exists for clients that do.
+                   (consumed (< rest before))
+                   (deadline (cond ((= rest 0) #f)
+                                   ((or consumed (not since))
+                                    (+ (now-ms) partial-ms))
+                                   (else since))))
+              (cond
+                ((= rest 0) (worker-conn-loop* c buf partial-ms #f))
+                ((>= (now-ms) deadline) (tcp-close! c))
+                (else (worker-conn-loop* c buf partial-ms deadline))))
+            (tcp-close! c))))
     (if (> (inbuf-length buf) 0)
         (let ((left (- (or since (+ (now-ms) partial-ms)) (now-ms))))
           (if (<= left 0)

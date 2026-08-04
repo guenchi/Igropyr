@@ -138,7 +138,30 @@
     ;; so one borrower holding several leases (nested checkouts) never
     ;; clobbers its own bookkeeping.
     (define leased (make-eq-hashtable))       ; conn pid -> #(borrower mon ref)
-    (define dying (make-eq-hashtable))        ; conn pid -> #t (being torn down)
+    (define dying (make-eq-hashtable))        ; conn pid -> 'teardown | 'transport
+
+    ;; 'teardown WINS, whichever arrives second.
+    ;;
+    ;; The two marks are written from different places and the last writer
+    ;; used to win, so each of them could erase the other:
+    ;;
+    ;;   the pool tears a connection down (pool-quit) while it is mid
+    ;;   request; every driver answers pool-quit as a TRANSPORT failure, so
+    ;;   the connection then reports pool-conn-dead and the pool's own
+    ;;   decision became 'transport -- a healthy connection the pool asked
+    ;;   to go now looks stillborn, and the backoff it triggers is
+    ;;   pool-wide and doubles. A supervisor reaping stuck borrowers walked
+    ;;   an entirely healthy pool up toward the ceiling;
+    ;;
+    ;;   and the other way, a check-in-broken arriving after a transport
+    ;;   failure turned it into "the pool asked for this" and rebuilt with
+    ;;   NO backoff -- the spin the backoff exists to stop.
+    ;;
+    ;; A connection the pool told to quit is the pool's decision no matter
+    ;; what the connection says on its way out, so that mark stands.
+    (define (mark-dying! c why)
+      (unless (eq? (hashtable-ref dying c #f) 'teardown)
+        (hashtable-set! dying c why)))
     (define pending-front '())
     (define pending-back '())
     (define (pending?) (or (pair? pending-front) (pair? pending-back)))
@@ -419,7 +442,8 @@
           ;; backoff entirely -- the very hot loop that backoff exists to
           ;; stop, reintroduced by marking the connection dying before the
           ;; DOWN that classifies it.
-          (hashtable-set! dying c 'transport)
+          ;; ...but never DOWNGRADE a mark the pool made itself. See mark-dying!.
+          (mark-dying! c 'transport)
           (loop))
         (`#(pool-checkout ,ref ,from)
           (let ((w (make-waiter ref from)))
@@ -458,7 +482,7 @@
           (let ((e (hashtable-ref leased c #f)))
             (when (and e (eq? (vector-ref e 0) from))
               (drop-lease! c e)
-              (hashtable-set! dying c 'teardown)   ; the pool's decision
+              (mark-dying! c 'teardown)            ; the pool's decision
               (send c (vector 'pool-quit))))       ; -> DOWN -> rebuild (case 2)
           (loop))
         (`#(pool-request-cancel ,ref ,from)
@@ -517,7 +541,12 @@
           (let ((hit (lease-by-ref ref from)))
             (when hit
               (drop-lease! (car hit) (cdr hit))
-              (make-available! (car hit))))
+              ;; the THIRD way back into the idle set, and it needed the
+              ;; same guard as the other two: a connection the pool already
+              ;; knows is going must not be handed to the next caller just
+              ;; because the borrower it was leased to gave up first.
+              (unless (hashtable-ref dying (car hit) #f)
+                (make-available! (car hit)))))
           (loop))
         (`#(pool-up ,ref ,pid ,status)
           (hashtable-delete! connecting pid)
@@ -637,7 +666,7 @@
                   (for-each
                     (lambda (hit)
                       (drop-lease! (car hit) (cdr hit))
-                      (hashtable-set! dying (car hit) 'teardown)
+                      (mark-dying! (car hit) 'teardown)
                       (send (car hit) (vector 'pool-quit)))
                     hits)))
             ;; (2) a connection died (idle, mid single-query, leased, or one we
