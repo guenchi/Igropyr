@@ -246,6 +246,16 @@
           ((conversation-gone? status)
            (set-status! res 410)
            (send-json! res (list (cons 'fault "gone") (cons 'rolled-back #t))))
+          ;; NOT 410, and note the absent rolled-back: this node cannot
+          ;; say whether the transaction committed -- its record aged out,
+          ;; was pushed out by newer ones, or belonged to an earlier
+          ;; incarnation of this process. The one thing a client must not
+          ;; do with this answer is resubmit; reconcile against your own
+          ;; state, which is where the truth still is.
+          ((conversation-unknown? status)
+           (set-status! res 409)
+           (send-json! res (list (cons 'fault "unknown")
+                                 (cons 'resubmit #f))))
           ;; 409: this request was NOT applied and will not be. It says
           ;; nothing about whether the request it duplicates succeeded --
           ;; read the current state rather than resubmitting.

@@ -122,6 +122,13 @@
           ((conversation-gone? status)
            (set-status! res 410)
            (send-json! res (list (cons 'fault "gone"))))
+          ;; NOT 410. 410 says the transaction rolled back, and this
+          ;; answer cannot support that: the conversation is not here and
+          ;; this node no longer has a record either way. The one thing a
+          ;; client must not do with it is resubmit.
+          ((conversation-unknown? status)
+           (set-status! res 409)
+           (send-json! res (list (cons 'fault "unknown"))))
           ((conversation-stale? status)
            (set-status! res 409)
            (send-json! res (list (cons 'fault "stale"))))
@@ -181,10 +188,15 @@
       (expect "cancel rolls back"
         (json-ref (json-of (get "/balance")) "balance") 900))
 
-    ;; unknown id
+    ;; An id this node never issued is NOT the same as one it knows rolled
+    ;; back. It cannot tell a fabricated id from a real one whose record it
+    ;; has since forgotten, so it says so: 409 unknown, not 410 gone.
+    ;; Claiming a rollback here is how a committed transfer gets performed
+    ;; twice by a client that trusted the claim.
     (let ((r (post "/t/deadbeef?token=1" "confirm")))
-      (unless (string-contains? r "HTTP/1.1 410 ") (fail "unknown id" r))
-      (display "unknown id ok\n"))
+      (unless (string-contains? r "HTTP/1.1 409 ") (fail "unknown id" r))
+      (unless (string-contains? r "unknown") (fail "unknown id fault" r))
+      (display "an id this node cannot speak for -> unknown, not gone ok\n"))
 
     ;; expiry: abandon the dialogue; the guard restores the hold
     (let* ((r1 (json-of (post "/t?ttl=400" "100")))
@@ -502,8 +514,28 @@
       (fail "a crashed conversation was reported as settled" state)))
   (display "a conversation that died is still gone ok\n"))
 
-;; the record is bounded: past its age it forgets, and says so by
-;; answering 'gone again
+;; MUST RUN BEFORE ANY RECORD IS PRUNED. What it pins is the horizon's
+;; STARTING value -- process start -- and the moment a prune discards
+;; anything the horizon moves up to that entry's age, which would answer
+;; this case for the wrong reason.
+;; An id from BEFORE this incarnation is outside what this process can
+;; speak for. A restart erases the completion records but not the ids the
+;; clients are holding, and answering 'gone for those is the same lie the
+;; expiry case makes: the transaction may well have committed just before
+;; the restart. The horizon starts at process start, so this is free --
+;; the id below is well-formed and simply older than this process.
+(let ((ancient "1-00112233445566778899aabbccddeeff"))   ; no node prefix: this test runs single-node
+  (let-values (((state token reply) (conversation-peek ancient)))
+    (unless (conversation-unknown? state)
+      (fail "an id older than this process was not reported unknown" state)))
+  (display "an id older than this incarnation -> unknown ok\n"))
+
+;; The record is bounded, and past its age this node stops being able to
+;; speak for the conversation at all. It used to answer 'gone there --
+;; which this library documents as "the transaction rolled back" -- for a
+;; conversation that had COMMITTED and whose only evidence it had just
+;; discarded. The honest answer is 'unknown: not here, and no longer
+;; knowable from here.
 (let-values (((eid etok efirst)
               (conversation-start!
                 (lambda (req suspend!)
@@ -516,10 +548,12 @@
     (unless (conversation-done? st) (fail "expiry-setup" st)))
   (sleep-ms 900)
   (let-values (((state token reply) (conversation-peek eid)))
-    (unless (conversation-gone? state)
-      (fail "an expired tombstone still reported settled" state)))
+    (when (conversation-gone? state)
+      (fail "a forgotten conversation was reported as rolled back" state))
+    (unless (conversation-unknown? state)
+      (fail "a forgotten conversation was not reported unknown" state)))
   (conversation-set-limits! #f 3600000)         ; put it back
-  (display "the completion record expires, and says gone again ok\n"))
+  (display "the completion record expires, and says unknown -- not gone ok\n"))
 
 ;; ---- a parked conversation cannot be kept alive by poking it -----------
 ;;
@@ -581,10 +615,32 @@
     (unless (equal? reply (vector 'final 'X)) (fail "peek-completed-reply" reply)))
   (display "peek reports parked / completed without advancing ok\n"))
 
-;; an id nobody knows is 'gone, not an error
+;; An id nobody knows is an ANSWER, not an error -- and the answer is
+;; 'unknown. This node cannot tell a fabricated id from a real one whose
+;; record it has forgotten, and 'gone would claim it could.
 (let-values (((state token reply) (conversation-peek "deadbeef")))
-  (unless (eq? state 'gone) (fail "peek-unknown-id" state)))
-(display "peek on an unknown id -> gone ok\n")
+  (unless (eq? state 'unknown) (fail "peek-unknown-id" state)))
+(display "peek on an id this node cannot speak for -> unknown ok\n")
+
+;; ...but 'gone must NOT collapse into 'unknown. A conversation whose id
+;; this node minted, in this incarnation, inside the retention window, and
+;; which left no completion record, really did not complete: the record
+;; would still be here if it had. That is the case 'gone exists for, and
+;; the change above must not have swallowed it.
+(let-values (((gid gtok gfirst)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (suspend! (vector 'parked req))
+                  (raise 'boom))                   ; dies without completing
+                'go
+                300)))
+  (let-values (((r st) (conversation-resume! gid gtok 'confirm)))
+    (when (conversation-unknown? st)
+      (fail "a conversation this node can speak for was reported unknown" st))
+    (unless (conversation-gone? st) (fail "died-not-gone" st)))
+  (display "an id minted here, inside the window, still says gone ok\n"))
+
+
 
 ;; The TTL must bound a RUNNING step, not only time parked in suspend!.
 ;; A step that runs long -- slow I/O, a wait that never returns, a CPU loop
