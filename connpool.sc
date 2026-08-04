@@ -445,7 +445,13 @@
                 (set! stat-completed (+ stat-completed 1))
                 (set! stat-query-total (+ stat-query-total took))
                 (when (> took stat-query-max) (set! stat-query-max took)))
-              ;; likewise skip a connection we are tearing down
+              ;; Neither of these can be true here, and saying so is the
+              ;; point: a connection is only ever marked dying while it is
+              ;; leased or already off the books, and every route back into
+              ;; the idle set refuses a dying one -- so a dying connection
+              ;; can never hold a busy entry to match this ref against. The
+              ;; guard stays as the statement of that invariant rather than
+              ;; as a live branch.
               (unless (or (hashtable-ref leased c #f)
                           (hashtable-ref dying c #f))
                 (make-available! c))))

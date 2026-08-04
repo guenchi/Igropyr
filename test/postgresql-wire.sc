@@ -593,6 +593,32 @@
     ;; running query is not between statements: inside the wire loop only
     ;; TCP messages were matched, so against a server that keeps dripping
     ;; rows the old query, its fd and its TLS session outlived the pool --
+    ;; ---- ONE connection, several queries: the pool has to RECYCLE it ----
+    ;;
+    ;; Every pooled case here sends a single query, so nothing drove the
+    ;; recycle path and the message that carries it -- pool-idle -- was
+    ;; covered by nothing on this side. Mutating it out of this driver left
+    ;; the whole suite green while the mysql one failed, which is the shape
+    ;; of a gap rather than of a passing test.
+    ;;
+    ;; The assertion is not "the answers came back". They come back with
+    ;; the recycle message broken too, by way of the connection dying and
+    ;; being rebuilt. What is asserted is that ONE connection served all
+    ;; three and none of them had to die for it.
+    (sleep-ms 500)
+    (let ((pool (postgresql-pool 1 "127.0.0.1" port "user" scram-password "scram")))
+      (let loop ((i 0))
+        (when (< i 3)
+          (let ((r (postgresql-query pool "SELECT anything")))
+            (unless (and (vector? r) (eq? (vector-ref r 0) 'rows))
+              (check "a pooled query came back" #f)))
+          (loop (+ i 1))))
+      (let ((st (postgresql-pool-stats pool)))
+        (define (g k) (cond ((assq k st) => cdr) (else -1)))
+        (check "pool-recycles-one-connection" (= 3 (g 'queries-completed)))
+        (check "pool-recycle-loses-nothing" (= 0 (g 'connections-lost))))
+      (postgresql-close! pool))
+
     ;; and rebuilding the pool stacked a fresh set on top of them.
     (sleep-ms 1500)
     (let ((base-conns (conn-count)) (base-procs (process-count)) (me self))

@@ -223,12 +223,23 @@
       (inbuf-append! buf bv)
       ;; a framing error is not recoverable on this connection: we no
       ;; longer know where the next request starts
-      ;; The window for anything left over starts HERE, before the complete
-      ;; frames in this same read are answered. Taking it afterwards let a
-      ;; peer that pipelines slow renders ahead of its partial tail hold
-      ;; that tail for the renders' duration on top of its own allowance.
-      (let ((before (inbuf-length buf))
-            (arrived (now-ms)))
+      ;; The window for anything left over starts when the renders in this
+      ;; same read are DONE, not when the bytes arrived.
+      ;;
+      ;; Starting it at arrival was the previous attempt, and it is worse:
+      ;; the renders are synchronous, so a peer that pipelines two slow
+      ;; requests with a partial tail behind them has its whole window
+      ;; consumed before the tail is ever looked at -- measured against a
+      ;; real worker, a tail that arrived with two 700ms renders got 0ms
+      ;; and the connection was closed the instant the second answer went
+      ;; out. That is a well-behaved pipelining client being cut off, which
+      ;; is the thing answer-all! exists to support.
+      ;;
+      ;; What the arrival stamp was meant to stop -- a peer extending its
+      ;; tail's life by sending slow work ahead of it -- costs that peer
+      ;; real render time it asked for, and the buffer is bounded by the
+      ;; frame cap either way. The liveness bug is the concrete one.
+      (let ((before (inbuf-length buf)))
         (if (guard (e (#t #f)) (answer-all! c buf) #t)
             (let* ((rest (inbuf-length buf))
                    ;; A FRAME WAS CONSUMED, so whatever is left over is a
@@ -242,7 +253,7 @@
                    (consumed (< rest before))
                    (deadline (cond ((= rest 0) #f)
                                    ((or consumed (not since))
-                                    (+ arrived partial-ms))
+                                    (+ (now-ms) partial-ms))
                                    (else since))))
               (cond
                 ((= rest 0) (worker-conn-loop* c buf partial-ms #f))
