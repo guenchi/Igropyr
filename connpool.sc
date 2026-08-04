@@ -780,7 +780,18 @@
   ;; may still execute on the server.
   (define (connpool-call h sql cfg)
     (drain-stale!)
-    (let ((ref (gensym)))
+    (let ((ref (gensym))
+          ;; WATCH THE HANDLE. A pooled call is answered when its
+          ;; connection dies -- the pool holds the caller and the ref in
+          ;; `busy` and sends lost-err. A call on a LEASED connection is in
+          ;; no such table: the pool has nothing to answer with, and this
+          ;; caller had no way to learn the connection was gone. It waited
+          ;; out the whole query deadline for a reply from a dead process.
+          ;;
+          ;; monitor answers #f for a pid that is already dead and delivers
+          ;; the DOWN at once, so this also covers a connection that died
+          ;; between the checkout and here.
+          (m (monitor h)))
       (send h (vector 'pool-request sql ref self))
       (receive (after (connpool-cfg-query-ms cfg)
                   ;; symmetric with connpool-checkout: tell the pool to drop the
@@ -790,9 +801,15 @@
                   ;; on still lands. Harmless against a lone connection, which
                   ;; ignores the message.
                   (send h (vector 'pool-request-cancel ref self))
+                  (when m (demonitor m) (flush-down! h))
                   (raise (connpool-cfg-query-timeout-err cfg)))
         (`#(pool-reply ,@ref ,r)
-          (if ((connpool-cfg-error? cfg) r) (raise r) r)))))
+          (when m (demonitor m) (flush-down! h))
+          (if ((connpool-cfg-error? cfg) r) (raise r) r))
+        ;; the handle is gone: for a leased connection that is the whole
+        ;; answer, and for a pool it is one too
+        (`#(DOWN ,@h ,reason)
+          (raise (connpool-cfg-lost-err cfg))))))
 
   ;; Ask the pool for a dedicated connection and park until one is free (or
   ;; raise cfg's checkout-timeout-err -- the pool is saturated, nothing is

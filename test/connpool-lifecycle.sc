@@ -68,6 +68,37 @@
             (loop))
           (`#(pool-quit) 'done))))))
 
+;; Reports up, is adopted, and then reports a TRANSPORT failure before
+;; exiting -- which is what a driver does when its socket dies on the
+;; first request. The pool marks it dying on that message, and reading any
+;; dying mark as "the pool decided this" exempted it from the backoff.
+(define transport-dead-spawns 0)
+(define transport-dead-at '())
+(define (transport-dead-spawn-conn! notify report-to ref)
+  (set! transport-dead-spawns (+ transport-dead-spawns 1))
+  (set! transport-dead-at (cons (now-ms) transport-dead-at))
+  (spawn
+    (lambda ()
+      (send report-to (vector 'pool-up ref self 'ok))
+      (receive (`#(pool-adopt) 'ok))
+      (send notify (vector 'pool-conn-dead self))
+      'gone)))
+
+;; Comes up and serves, but EXITS instead of answering -- what a connection
+;; that dies while leased looks like to the borrower holding it.
+(define (vanishing-spawn-conn! notify report-to ref)
+  (spawn
+    (lambda ()
+      (send report-to (vector 'pool-up ref self 'ok))
+      (receive (`#(pool-adopt) 'ok))
+      (let loop ()
+        (receive
+          (`#(pool-request ,sql ,r ,from) 'gone)      ; no reply, just exit
+          (`#(pool-quit) 'done)
+          (`#(pool-stats ,r ,from)
+            (send from (vector 'pool-stats-reply r #f))
+            (loop)))))))
+
 ;; A stand-in that reports up, is adopted, and dies at once -- what a peer
 ;; that accepts and then drops the connection looks like from in here.
 (define stillborn-spawns 0)
@@ -407,6 +438,67 @@
                               "accepts and closes: "
                               (number->string stillborn-spawns) "\n"))
       (send pool (vector 'pool-quit)))
+
+    ;; ---- a TRANSPORT failure is not the pool's own decision ---------------
+    ;;
+    ;; The connection tells the pool it is dead before it replies, which
+    ;; marks it dying; the DOWN handler then read any dying mark as "the
+    ;; pool tore this down on purpose" and rebuilt it with no delay. So a
+    ;; peer that accepts and fails on its first request was back in the hot
+    ;; reconnect loop the backoff exists to stop -- through a mark the
+    ;; connection itself had set.
+    (set! transport-dead-spawns 0)
+    (set! transport-dead-at '())
+    (let ((pool (spawn (lambda () (connpool-loop 1 transport-dead-spawn-conn! cfg)))))
+      (sleep-ms 7000)   ; long enough for 1s, 2s, 4s to be distinguishable
+      (check "a connection that reports a transport failure at once is backed off"
+             (< transport-dead-spawns 8))
+      ;; ...and the interval GROWS. Clearing the penalty the moment a
+      ;; connection reported up meant each failure erased the history of
+      ;; the one before it, so the backoff never left its first step.
+      (let ((ts (reverse transport-dead-at)))
+        (if (< (length ts) 3)
+            (display "  [info] too few rebuilds to compare intervals\n")
+            (let ((first-gap (- (cadr ts) (car ts)))
+                  (last-gap (- (list-ref ts (- (length ts) 1))
+                               (list-ref ts (- (length ts) 2)))))
+              (display (string-append "  [info] rebuild gaps: first "
+                                      (number->string first-gap) "ms, last "
+                                      (number->string last-gap) "ms over "
+                                      (number->string (length ts)) " attempts\n"))
+              (check "and the backoff escalates rather than repeating its first step"
+                     (> last-gap (* 3/2 first-gap))))))
+      (send pool (vector 'pool-quit)))
+
+    ;; ---- a leased connection that dies answers its borrower ---------------
+    ;;
+    ;; A pooled call is answered when its connection dies: the pool holds
+    ;; the caller and the ref and sends the lost error. A call on a LEASED
+    ;; connection is in no such table -- the pool has nothing to answer
+    ;; with -- so the borrower waited out its entire query timeout for a
+    ;; reply from a process that had already exited.
+    (let ((short (make-connpool-cfg
+                   (lambda (r) (and (vector? r) (eq? (vector-ref r 0) 'fake-error)))
+                   (vector 'fake-error "lost")
+                   (vector 'fake-error "closed")
+                   (vector 'fake-error "query timeout")
+                   (vector 'fake-error "checkout timeout")
+                   "BEGIN"
+                   5000       ; the query deadline this must NOT wait out
+                   1000)))
+      (let ((pool (spawn (lambda () (connpool-loop 1 vanishing-spawn-conn! short)))))
+        (sleep-ms 300)
+        (let* ((t0 (now-ms))
+               (r (guard (e (#t e))
+                    (connpool-lease pool
+                      (lambda (conn) (connpool-call conn 'anything short))
+                      short)))
+               (took (- (now-ms) t0)))
+          (check "a borrower learns at once that its connection died"
+                 (and (vector? r) (< took 2000)))
+          (display (string-append "  [info] leased connection death reported after "
+                                  (number->string took) "ms (the query deadline is 5000)\n")))
+        (send pool (vector 'pool-quit))))
 
     ;; ---- the deadlines belong to the CONFIG -------------------------------
     ;;
