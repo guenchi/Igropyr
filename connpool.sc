@@ -389,6 +389,9 @@
                         (cons (vector sql ref from (now-ms) m) pending-back)))))
           (loop))
         (`#(pool-idle ,c)
+          ;; a finished request is the first evidence that this endpoint
+          ;; works, and the only evidence worth clearing the penalty for
+          (set! backoff-ms 0)
           ;; This is where a dispatched statement finishes, as far as the
           ;; pool can see it: the reply itself went straight to the caller.
           (let ((e (hashtable-ref busy c #f)))
@@ -409,7 +412,14 @@
           ;; below does not send a duplicate reply, and mark it dying so
           ;; the DOWN still rebuilds it.
           (hashtable-delete! busy c)
-          (hashtable-set! dying c #t)
+          ;; WHY it is dying, not merely that it is. A connection that
+          ;; reported a transport failure is not one this pool decided to
+          ;; discard, and treating the two the same let a peer that accepts
+          ;; and then fails on its first request bypass the stillborn
+          ;; backoff entirely -- the very hot loop that backoff exists to
+          ;; stop, reintroduced by marking the connection dying before the
+          ;; DOWN that classifies it.
+          (hashtable-set! dying c 'transport)
           (loop))
         (`#(pool-checkout ,ref ,from)
           (let ((w (make-waiter ref from)))
@@ -448,7 +458,7 @@
           (let ((e (hashtable-ref leased c #f)))
             (when (and e (eq? (vector-ref e 0) from))
               (drop-lease! c e)
-              (hashtable-set! dying c #t)
+              (hashtable-set! dying c 'teardown)   ; the pool's decision
               (send c (vector 'pool-quit))))       ; -> DOWN -> rebuild (case 2)
           (loop))
         (`#(pool-request-cancel ,ref ,from)
@@ -515,7 +525,13 @@
               (begin
                 (send pid (vector 'pool-adopt))
                 (set! stat-connects (+ stat-connects 1))
-                (set! backoff-ms 0)          ; a success clears the penalty
+                ;; NOT here. Coming up is provisional -- a peer that accepts
+                ;; and then drops gets this far every time, and clearing the
+                ;; penalty here meant each stillborn connection erased the
+                ;; history of the one before it: the backoff never left its
+                ;; first step, however many times the cycle repeated. What
+                ;; clears it is a connection that has actually SERVED
+                ;; something (see pool-idle).
                 (hashtable-set! up-at pid (now-ms))
                 (make-available! pid))
               ;; Failed connect: retry with EXPONENTIAL BACKOFF. A fixed one
@@ -621,7 +637,7 @@
                   (for-each
                     (lambda (hit)
                       (drop-lease! (car hit) (cdr hit))
-                      (hashtable-set! dying (car hit) #t)
+                      (hashtable-set! dying (car hit) 'teardown)
                       (send (car hit) (vector 'pool-quit)))
                     hits)))
             ;; (2) a connection died (idle, mid single-query, leased, or one we
@@ -633,7 +649,11 @@
              ;; read before the deletes below: a connection WE tore down on
              ;; purpose (a broken checkin) is not a peer problem and is
              ;; rebuilt at once however short its life was
-             (let* ((deliberate (and (hashtable-ref dying pid #f) #t))
+             ;; only the POOL's own decision counts as deliberate. A
+             ;; connection that reported a transport failure died of a peer
+             ;; problem, and if it did so within its first second it never
+             ;; really connected -- the backoff is for exactly that.
+             (let* ((deliberate (eq? (hashtable-ref dying pid #f) 'teardown))
                     (born (hashtable-ref up-at pid #f))
                     (stillborn (and (not deliberate) born
                                     (< (- (now-ms) born) min-lifetime-ms))))
@@ -716,6 +736,11 @@
   ;; ever cleared them. They are immortal (the per-attempt ref can never
   ;; match again) and every later selective receive scans past all of them.
   (define connpool-drain-stale! (lambda () (drain-stale!)))
+
+  ;; consume a DOWN that raced the reply, so it cannot rot in the mailbox
+  ;; of a caller that gets reused (a pool worker, a supervisor)
+  (define (flush-down! p)
+    (receive (after 0 'ok) (`#(DOWN ,@p ,r) 'ok)))
 
   (define (drain-stale!)
     (let loop ()
@@ -811,12 +836,28 @@
   ;; Don't send queries (or a second checkout) to the pool itself while
   ;; holding a connection: an exhausted pool deadlocks the former and delays
   ;; the latter.
-  (define (connpool-lease pool proc cfg)
-    (let ((conn (connpool-checkout pool cfg)))
+  ;; broken-on-escape?: when proc leaves NON-LOCALLY, hand the connection
+  ;; back as broken rather than clean. That matters wherever an escape
+  ;; means the request may still be running on the far side -- a call that
+  ;; gave up on its deadline is exactly that. A plain check-in there races
+  ;; the connection's own reaction to the cancel: the pool can free and
+  ;; re-lend a connection that is still serving the caller who left, and
+  ;; the next borrower's request goes to a process about to exit.
+  ;;
+  ;; Off by default, because for SQL an escape is usually just a statement
+  ;; error and the connection is perfectly good.
+  (define (connpool-lease pool proc cfg . rest)
+    (let ((conn (connpool-checkout pool cfg))
+          (broken-on-escape? (and (pair? rest) (car rest)))
+          (clean #f))
       (dynamic-wind
         (lambda () (void))
-        (lambda () (proc conn))
-        (lambda () (send pool (vector 'pool-checkin self conn))))))
+        (lambda () (let ((r (proc conn))) (set! clean #t) r))
+        (lambda ()
+          (send pool (vector (if (or clean (not broken-on-escape?))
+                                 'pool-checkin
+                                 'pool-checkin-broken)
+                             self conn))))))
 
   ;; Run proc inside a transaction on a borrowed pool connection: cfg's
   ;; begin-sql first, then COMMIT if proc returns normally, or ROLLBACK if
