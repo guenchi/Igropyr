@@ -132,7 +132,7 @@
 (library (igropyr conversation)
   (export conversation-start! conversation-resume! conversation-peek
           conversation-gone? conversation-stale? conversation-done?
-          conversation-settled? conversation-set-limits!)
+          conversation-settled? conversation-unknown? conversation-set-limits!)
   (import (chezscheme) (igropyr actor)
           (only (igropyr libuv) now-ms)
           (only (igropyr node) node-self rsend monitor-node demonitor-node))
@@ -358,6 +358,28 @@
   (define tomb-back '())               ; newest, reversed
   (define tomb-n 0)
 
+  ;; HOW FAR BACK THIS NODE REMEMBERS.
+  ;;
+  ;; "No process and no record" was read as "it never completed", and that
+  ;; reading needs a premise nobody was checking: WOULD I STILL HAVE THE
+  ;; RECORD? Past the age limit, past the count limit, or on the other side
+  ;; of a restart, the answer is no -- and the same absence then meant
+  ;; nothing at all while still being reported as 'gone, which this library
+  ;; documents as "the transaction rolled back". A committed transfer told
+  ;; that is performed again.
+  ;;
+  ;; Initialised to THIS PROCESS'S START, so every conversation older than
+  ;; this incarnation is outside what it can speak for. That is the restart
+  ;; case, and it costs nothing.
+  (define tomb-horizon (now-ms))
+  (define (raise-horizon! t)
+    (when (> t tomb-horizon) (set! tomb-horizon t)))
+
+  ;; -> #t when an absent record really does mean "never completed"
+  (define (tomb-remembers? id)
+    (let ((born (conv-created-at id)))
+      (and born (> born tomb-horizon))))
+
   (define (tomb-pop-oldest!)
     (when (null? tomb-front)
       (set! tomb-front (reverse tomb-back))
@@ -366,6 +388,9 @@
       (let ((e (car tomb-front)))
         (set! tomb-front (cdr tomb-front))
         (set! tomb-n (- tomb-n 1))
+        ;; forgetting this one is what moves the horizon: from here on,
+        ;; anything at least this old is something we cannot speak for
+        (raise-horizon! (cdr e))
         (hashtable-delete! tombstones (car e)))))
 
   ;; ALL THREE OF THESE RUN WITH INTERRUPTS DISABLED. They are pure memory
@@ -417,12 +442,60 @@
     (tomb-prune!)
     (void))
 
-  ;; The id carries the owner node so a resume on any node reaches it:
-  ;; "<node>~<hex>" when clustered, bare "<hex>" on a single node. The
-  ;; hex stays unguessable either way; the node prefix is not a secret.
+  ;; The id carries the owner node so a resume on any node reaches it, and
+  ;; the time it was created so this node can tell whether it would still
+  ;; remember the conversation:
+  ;;
+  ;;   "<node>~<base36 ms>-<hex>"  clustered
+  ;;   "<base36 ms>-<hex>"         single node
+  ;;
+  ;; The hex stays unguessable; neither the node prefix nor the timestamp
+  ;; is a secret, and neither is load-bearing for authorization -- see
+  ;; conv-created-at for what the timestamp is FOR.
+  (define (ms->b36 n)
+    (let loop ((n n) (acc '()))
+      (if (= n 0)
+          (if (null? acc) "0" (list->string acc))
+          (loop (div n 36)
+                (cons (string-ref "0123456789abcdefghijklmnopqrstuvwxyz"
+                                  (mod n 36))
+                      acc)))))
+
+  (define (b36->ms s)
+    (let ((n (string-length s)))
+      (and (> n 0)
+           (let loop ((i 0) (acc 0))
+             (if (= i n)
+                 acc
+                 (let* ((c (string-ref s i))
+                        (d (cond ((and (char>=? c #\0) (char<=? c #\9))
+                                  (- (char->integer c) (char->integer #\0)))
+                                 ((and (char>=? c #\a) (char<=? c #\z))
+                                  (+ 10 (- (char->integer c) (char->integer #\a))))
+                                 (else #f))))
+                   (and d (loop (+ i 1) (+ (* acc 36) d)))))))))
+
   (define (conversation-id!)
-    (let ((hex (conv-hex!)) (n (node-self)))
-      (if n (string-append (symbol->string n) "~" hex) hex)))
+    (let ((hex (conv-hex!)) (n (node-self))
+          (stamp (ms->b36 (now-ms))))
+      (if n
+          (string-append (symbol->string n) "~" stamp "-" hex)
+          (string-append stamp "-" hex))))
+
+  ;; When this id was made, or #f if it does not say. #f is what every id
+  ;; minted before this format existed reads as, and it is treated exactly
+  ;; like "older than anything I remember" -- the safe direction.
+  (define (conv-created-at id)
+    (let* ((len (string-length id))
+           (start (let loop ((i 0))
+                    (cond ((= i len) 0)
+                          ((char=? (string-ref id i) #\~) (+ i 1))
+                          (else (loop (+ i 1))))))
+           (dash (let loop ((i start))
+                   (cond ((= i len) #f)
+                         ((char=? (string-ref id i) #\-) i)
+                         (else (loop (+ i 1)))))))
+      (and dash (b36->ms (substring id start dash)))))
 
   ;; owner node of an id, or #f (bare id -> single node, always local)
   (define (conv-owner id)
@@ -837,6 +910,19 @@
   ;;   'stale         -- not applied, and will not be; reply is #f
   ;;   'gone          -- unreachable here; reply is #f
   ;;   'unreachable   -- the owner node could not be reached; reply is #f
+  ;; WHAT AN ABSENCE MEANS. One place, because it is one rule: a record
+  ;; says 'settled; no record says 'gone only while this node would still
+  ;; have had the record, and 'unknown otherwise.
+  ;;
+  ;; 'unknown appears exactly where 'gone used to be a guess. It is not a
+  ;; degradation: the answer was already unreliable there, and a caller
+  ;; that acts on "rolled back" when the truth is "committed" performs the
+  ;; transaction twice.
+  (define (settled-or-lost id)
+    (cond ((tomb-settled? id) 'settled)
+          ((tomb-remembers? id) 'gone)
+          (else 'unknown)))
+
   (define (local-resume id token req)
     (let ((p (whereis (conversation-name id))))
       (if (not p)
@@ -844,7 +930,7 @@
           ;; difference between "your transaction committed" and "it rolled
           ;; back", and answering 'gone for both is how a committed
           ;; transfer gets performed twice.
-          (values #f (if (tomb-settled? id) 'settled 'gone))
+          (values #f (settled-or-lost id))
           (let ((ref (gensym))
                 (m (monitor p)))
             (send p (vector 'conv-step self ref token req))
@@ -856,7 +942,7 @@
               ;; the process died while we waited: it may have finished
               ;; and lingered out in between, so ask the record
               (`#(DOWN ,@p ,reason)
-                (values #f (if (tomb-settled? id) 'settled 'gone))))))))
+                (values #f (settled-or-lost id))))))))
 
   ;; What is this conversation waiting for, and what did it last say?
   ;;
@@ -889,7 +975,7 @@
   (define (local-peek id)
     (let ((p (whereis (conversation-name id))))
       (if (not p)
-          (values (if (tomb-settled? id) 'settled 'gone) #f #f)
+          (values (settled-or-lost id) #f #f)
           (let ((ref (gensym))
                 (m (monitor p)))
             (send p (vector 'conv-peek self ref))
@@ -899,12 +985,23 @@
                 (flush-down! p)
                 (values state token reply))
               (`#(DOWN ,@p ,reason)
-                (values (if (tomb-settled? id) 'settled 'gone) #f #f)))))))
+                (values (settled-or-lost id) #f #f)))))))
 
   ;; Applied to the STATUS, never to the reply. A flow may return the
   ;; symbol 'gone as a perfectly ordinary answer; only the status carries
   ;; control meaning.
   (define (conversation-gone? x) (eq? x 'gone))
+
+  ;; Neither confirmed. The conversation is not here and this node cannot
+  ;; say whether it ever completed -- its record has aged out, been pushed
+  ;; out by newer ones, or belonged to an earlier incarnation of this
+  ;; process. DO NOT RESUBMIT: that is the one action this answer cannot
+  ;; license. Reconcile against your own state instead, which is the only
+  ;; place the truth still is.
+  ;;
+  ;; Everywhere this now appears, 'gone was previously returned as though
+  ;; it were a rollback guarantee it could not support.
+  (define (conversation-unknown? x) (eq? x 'unknown))
 
   ;; The flow returned: reply is its final answer, and no token continues
   ;; it. Distinguishing this from 'gone is what tells a caller whether the
