@@ -107,6 +107,31 @@
       (send notify (vector 'pool-conn-dead self))
       'gone)))
 
+;; Reports a TRANSPORT failure to the pool and then keeps running, so the
+;; borrower's own broken check-in can arrive AFTER that report. This is the
+;; mirror of the teardown case: here the peer failed first and the pool's
+;; quit is a consequence, so the transport verdict must stand.
+(define transport-first-spawns 0)
+(define transport-first-at '())
+(define (transport-then-linger-spawn-conn! notify report-to ref)
+  (set! transport-first-spawns (+ transport-first-spawns 1))
+  (set! transport-first-at (cons (now-ms) transport-first-at))
+  (spawn
+    (lambda ()
+      (send report-to (vector 'pool-up ref self 'ok))
+      (receive (`#(pool-adopt) 'ok))
+      (let loop ()
+        (receive
+          (`#(pool-request ,sql ,r ,from)
+            (send notify (vector 'pool-conn-dead self))   ; transport, FIRST
+            (send from (vector 'pool-reply r (vector 'fake-error "lost")))
+            (sleep-ms 250)                                ; ...then linger
+            'gone)
+          (`#(pool-quit) 'done)
+          (`#(pool-stats ,r ,from)
+            (send from (vector 'pool-stats-reply r #f))
+            (loop)))))))
+
 ;; Comes up and serves, but EXITS instead of answering -- what a connection
 ;; that dies while leased looks like to the borrower holding it.
 (define (vanishing-spawn-conn! notify report-to ref)
@@ -524,6 +549,40 @@
                (>= teardown-spawns 2))
         (display (string-append "  [info] rebuilds 700ms after a reaped borrower: "
                                 (number->string teardown-spawns) "\n")))
+      (send pool (vector 'pool-quit)))
+
+    ;; ---- ...and a transport failure keeps its verdict -----------------
+    ;;
+    ;; The mirror sequence. The connection fails on its own and reports it;
+    ;; the borrower then raises and, because the render path returns a
+    ;; connection BROKEN when the call escapes, the pool hears a check-in
+    ;; -broken for the same connection. Letting that overwrite the earlier
+    ;; verdict made the death look like the pool's own decision and rebuilt
+    ;; with no backoff at all -- the spin the backoff exists to stop.
+    (set! transport-first-spawns 0)
+    (set! transport-first-at '())
+    (let ((pool (spawn (lambda () (connpool-loop 1 transport-then-linger-spawn-conn! cfg)))))
+      (sleep-ms 300)
+      ;; a lease whose body raises: the after-thunk sends check-in-broken
+      (guard (e (#t 'expected))
+        (connpool-lease pool
+          (lambda (conn) (connpool-call conn 'anything cfg))
+          cfg
+          #t))                                  ; broken-on-escape
+      (sleep-ms 2200)
+      ;; ONE death, so counting rebuilds proves nothing -- nobody asks for a
+      ;; second lease, so no second failure follows however it was
+      ;; classified. What separates the two verdicts is the DELAY before the
+      ;; replacement appears: a peer problem is backed off ~1s, the pool's
+      ;; own decision is rebuilt at once.
+      (let ((ts (reverse transport-first-at)))
+        (if (< (length ts) 2)
+            (fail "no replacement connection was built" (length ts))
+            (let ((gap (- (cadr ts) (car ts))))
+              (check "a transport failure is not reclassified by a later broken check-in"
+                     (> gap 700))
+              (display (string-append "  [info] replacement after a transport failure: "
+                                      (number->string gap) "ms\n")))))
       (send pool (vector 'pool-quit)))
 
     ;; ---- a leased connection that dies answers its borrower ---------------
