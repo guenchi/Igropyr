@@ -38,16 +38,47 @@
           sql-pool-stats)
   (import (chezscheme) (igropyr actor) (igropyr libuv))
 
-  (define query-timeout-ms 60000)
-  (define checkout-timeout-ms 60000)   ; how long a caller parks for a free lease
+  (define default-query-ms 60000)
+  (define default-checkout-ms 60000)   ; how long a caller parks for a free lease
 
   ;; error?: (r) -> is this reply the driver's error vector;
   ;; lost-err/closed-err/query-timeout-err/checkout-timeout-err: the
   ;; driver's error values for those events; begin-sql: the statement
-  ;; that opens a transaction ("BEGIN" / "START TRANSACTION").
-  (define-record-type (sql-cfg make-sql-cfg sql-cfg?)
+  ;; that opens a transaction ("BEGIN" / "START TRANSACTION");
+  ;; query-ms/checkout-ms: how long a caller waits for a reply, and for a
+  ;; free connection, before giving up.
+  (define-record-type (sql-cfg make-cfg sql-cfg?)
     (fields error? lost-err closed-err
-            query-timeout-err checkout-timeout-err begin-sql))
+            query-timeout-err checkout-timeout-err begin-sql
+            query-ms checkout-ms))
+
+  ;; The deadlines are OPTIONAL and default to a minute. A minute is the
+  ;; right order of magnitude for a database and the wrong one for a
+  ;; resource whose work is measured in milliseconds -- and this engine is
+  ;; no longer only for databases. A driver that needs its own passes them;
+  ;; the SQL drivers do not, so their calls are unchanged.
+  ;;
+  ;; They belong to the config rather than to the library because a deadline
+  ;; is a property of the resource, not of the pooling: two pools of
+  ;; different things in one process need different ones, and a module-level
+  ;; constant can only give them the same.
+  (define (make-sql-cfg error? lost-err closed-err
+                        query-timeout-err checkout-timeout-err begin-sql
+                        . rest)
+    (define (arg i default)
+      (let loop ((r rest) (i i))
+        (cond ((null? r) default)
+              ((> i 0) (loop (cdr r) (- i 1)))
+              (else (car r)))))
+    (let ((q (arg 0 default-query-ms)) (c (arg 1 default-checkout-ms)))
+      (unless (and (integer? q) (exact? q) (> q 0))
+        (assertion-violation 'make-sql-cfg
+          "query timeout must be a positive exact integer (ms)" q))
+      (unless (and (integer? c) (exact? c) (> c 0))
+        (assertion-violation 'make-sql-cfg
+          "checkout timeout must be a positive exact integer (ms)" c))
+      (make-cfg error? lost-err closed-err
+                query-timeout-err checkout-timeout-err begin-sql q c)))
 
   ;; A negative or non-integer pool size never satisfies (= i n), so the
   ;; startup loop spawns connection workers without end; nothing downstream
@@ -666,7 +697,7 @@
     (drain-stale!)
     (let ((ref (gensym)))
       (send h (vector 'db-query sql ref self))
-      (receive (after query-timeout-ms
+      (receive (after (sql-cfg-query-ms cfg)
                   ;; symmetric with sql-checkout: tell the pool to drop the
                   ;; request if it is still queued. A statement left behind
                   ;; runs whenever the pool recovers -- long after the caller
@@ -686,7 +717,7 @@
     (drain-stale!)
     (let ((ref (gensym)))
       (send pool (vector 'db-checkout ref self))
-      (receive (after checkout-timeout-ms
+      (receive (after (sql-cfg-checkout-ms cfg)
                   ;; tell the pool to drop (or reclaim) this request --
                   ;; otherwise a connection freed after the timeout is leased
                   ;; to us and never checked in, bleeding the pool.
@@ -704,7 +735,7 @@
       (let ((broken
              (guard (e (#t #t))
                (send conn (vector 'db-query "ROLLBACK" ref self))
-               (receive (after query-timeout-ms #t)
+               (receive (after (sql-cfg-query-ms cfg) #t)
                  (`#(db-reply ,@ref ,r) ((sql-cfg-error? cfg) r))
                  (`#(DOWN ,@conn ,reason) #t)))))
         (when m

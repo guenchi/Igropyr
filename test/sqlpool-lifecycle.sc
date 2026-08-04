@@ -10,7 +10,7 @@
 ;;; times out WHILE QUEUED was invisible to the pool: nothing monitored it
 ;;; until it was handed a connection.
 
-(import (chezscheme) (igropyr actor) (igropyr sqlpool))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sqlpool))
 
 (define failures 0)
 (define (check label ok)
@@ -47,6 +47,19 @@
             (send notify (vector 'db-idle self))
             (loop))
           (`#(db-quit) 'done))))))
+
+;; A stand-in that comes up and then never answers anything: what is left
+;; when only a deadline can end the call.
+(define (mute-spawn-conn! notify report-to ref)
+  (spawn
+    (lambda ()
+      (send report-to (vector 'db-up ref self 'ok))
+      (receive (`#(db-adopt) 'ok))
+      (let loop ()
+        (receive
+          (`#(db-quit) 'done)
+          (`#(db-query ,sql ,r ,from) (loop))     ; swallowed on purpose
+          (`#(db-query-cancel ,r ,from) (loop)))))))
 
 (start-scheduler
   (lambda ()
@@ -300,6 +313,48 @@
             (check "one connection is never leased to two borrowers at once"
               (not (and (unbox a) (unbox b) (eq? (unbox a) (unbox b))))))))
       (send pool (vector 'db-quit)))
+
+    ;; ---- the deadlines belong to the CONFIG -------------------------------
+    ;;
+    ;; They used to be two constants in the library, so every pool in a
+    ;; process waited a minute -- the right order of magnitude for a
+    ;; database and the wrong one for anything whose work is measured in
+    ;; milliseconds. What is pinned here is that a config's own deadlines
+    ;; are the ones that fire, measured rather than assumed: against the
+    ;; module constants these two calls would return after a MINUTE, and
+    ;; the assertions below would never be reached inside the suite.
+    (let ((short (make-sql-cfg
+                   (lambda (r) (and (vector? r) (eq? (vector-ref r 0) 'fake-error)))
+                   (vector 'fake-error "lost")
+                   (vector 'fake-error "closed")
+                   (vector 'fake-error "query timeout")
+                   (vector 'fake-error "checkout timeout")
+                   "BEGIN"
+                   300      ; query
+                   200)))   ; checkout
+      (let ((pool (spawn (lambda () (sql-pool-loop 1 mute-spawn-conn! short)))))
+        (sleep-ms 200)
+        ;; a connection that never answers: only the deadline can end this
+        (let* ((t0 (now-ms))
+               (r (guard (e (#t e)) (sql-query pool 'anything short)))
+               (took (- (now-ms) t0)))
+          (check "a query gives up on the config's deadline, not the library's"
+                 (and (vector? r) (equal? (vector-ref r 1) "query timeout")
+                      (< took 3000)))
+          (display (string-append "  [info] query timeout fired after "
+                                  (number->string took) "ms (configured 300)\n")))
+        ;; the one connection is now busy forever, so a checkout must queue
+        ;; and then give up on ITS configured deadline
+        (let* ((t0 (now-ms))
+               (r (guard (e (#t e))
+                    (sql-call-with-connection pool (lambda (c) 'unreachable) short)))
+               (took (- (now-ms) t0)))
+          (check "a checkout gives up on the config's deadline too"
+                 (and (vector? r) (equal? (vector-ref r 1) "checkout timeout")
+                      (< took 3000)))
+          (display (string-append "  [info] checkout timeout fired after "
+                                  (number->string took) "ms (configured 200)\n")))
+        (send pool (vector 'db-quit))))
 
     (sleep-ms 100)
     (if (zero? failures)
