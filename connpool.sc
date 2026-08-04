@@ -140,7 +140,7 @@
     (define leased (make-eq-hashtable))       ; conn pid -> #(borrower mon ref)
     (define dying (make-eq-hashtable))        ; conn pid -> 'teardown | 'transport
 
-    ;; 'teardown WINS, whichever arrives second.
+    ;; FIRST WRITER WINS -- whoever noticed first says what this is.
     ;;
     ;; The two marks are written from different places and the last writer
     ;; used to win, so each of them could erase the other:
@@ -157,10 +157,17 @@
     ;;   failure turned it into "the pool asked for this" and rebuilt with
     ;;   NO backoff -- the spin the backoff exists to stop.
     ;;
-    ;; A connection the pool told to quit is the pool's decision no matter
-    ;; what the connection says on its way out, so that mark stands.
+    ;; Neither "last wins" nor "teardown wins" is right, because the two
+    ;; sequences are mirror images and each rule breaks the other one:
+    ;; in the first the pool acted on a HEALTHY connection and the transport
+    ;; report is an artifact of its own pool-quit; in the second the peer
+    ;; failed first and the pool's quit is a CONSEQUENCE. What tells them
+    ;; apart is which came first, and that is exactly what first-write-wins
+    ;; records. It is also order-independent in the sense that matters: the
+    ;; order it depends on is causal, not the order two messages happen to
+    ;; be drained in.
     (define (mark-dying! c why)
-      (unless (eq? (hashtable-ref dying c #f) 'teardown)
+      (unless (hashtable-ref dying c #f)
         (hashtable-set! dying c why)))
     (define pending-front '())
     (define pending-back '())
