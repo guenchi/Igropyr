@@ -401,6 +401,64 @@
     (fail "a killed step leaked its in-process hold" (unbox held)))
   (display "an on-killed hook releases what a killed step held ok\n"))
 
+
+;; ---- a cleanup that blocks is still on the clock -------------------------
+;;
+;; The park TTL expires by RAISING into the flow, and what that raise
+;; reaches is application code: the guard that gives back whatever the flow
+;; was holding. While the phase still said "parked" the watchdog skipped
+;; the process for as long as that cleanup ran, so a rollback that blocked
+;; -- a resource manager that never answers, a lock nobody releases -- left
+;; a conversation alive, registered, and never coming back. A caller waits
+;; for a reply or for a DOWN and would have had neither, forever.
+(let ((released (box #f)))
+  (let-values (((bid btok bfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (guard (e (#t (receive (after 60000 'never))))   ; wedges
+                      (suspend! (vector 'parked req))))
+                  'go
+                  300)))                            ; TTL 300 ms
+    (let ((me self))
+      ;; nobody resumes: the park expires and the wedged guard runs
+      (sleep-ms 500)
+      (spawn (lambda ()
+               (let-values (((r st) (conversation-resume! bid btok 'anything)))
+                 (send me (vector 'answered st)))))
+      (receive (after 4000 (fail "a caller waited forever on a wedged cleanup" bid))
+        (`#(answered ,st)
+          (if (or (conversation-gone? st) (conversation-settled? st)
+                  (conversation-stale? st))
+              (display "a wedged cleanup is killed and the caller is answered ok\n")
+              (fail "a wedged cleanup left the caller with a live conversation" st)))))))
+
+;; ---- a resume long after the park deadline does not advance -------------
+;;
+;; What this pins is the ordinary case: the window closed, the flow was
+;; raised into, and the conversation is gone -- nothing can revive it.
+;;
+;; It does NOT cover the boundary the deadline re-check in serve-steps!
+;; exists for: a resume that arrives microseconds after the deadline while
+;; the conversation is still queued to run, where a receive would answer
+;; the message in its mailbox before consulting its timer. Constructing
+;; that means winning a race against the scheduler on purpose; the guard
+;; is cheap and correct, and is not claimed as tested.
+(let ((advanced (box #f)))
+  (let-values (((lid ltok lfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (set-box! advanced #t)
+                      (vector 'advanced a)))
+                  'go
+                  300)))
+    ;; sent well after the park deadline
+    (sleep-ms 700)
+    (let-values (((r st) (conversation-resume! lid ltok 'LATE)))
+      (if (unbox advanced)
+          (fail "a resume after the park deadline was applied" st)
+          (display "a resume after the park deadline is not applied ok\n")))))
+
 ;; ---- after the linger, 'gone must still not lie -------------------------
 ;;
 ;; 'gone is documented as the rollback guarantee, and for a conversation
