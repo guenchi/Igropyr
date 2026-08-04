@@ -79,6 +79,18 @@
 ;;; malformed or oversized frame is a transport failure, and that discards
 ;;; the connection -- a stream whose framing is in doubt cannot be trusted
 ;;; with the next reply.
+;;;
+;;; WHAT partial-frame-ms ACTUALLY BOUNDS. It is measured from when this
+;;; process got to LOOK at the bytes, not from when they reached the
+;;; socket, and it is checked between renders rather than during one. A
+;;; render is a synchronous FFI call that stops the whole runtime, so
+;;; bytes arriving while one is in flight are not timestamped, are not
+;;; read, and cannot start a clock -- and the render already running when
+;;; a deadline passes finishes. Real arrival time would need an entry
+;;; layer that the engine cannot block, which means another process again.
+;;; The bound is therefore approximate by construction: it stops a peer
+;;; from parking a half frame indefinitely, which is what it is for, and
+;;; it is not a wall clock.
 
 (library (igropyr qjspool)
   (export qjs-worker-serve!
@@ -239,8 +251,16 @@
       ;; tail's life by sending slow work ahead of it -- costs that peer
       ;; real render time it asked for, and the buffer is bounded by the
       ;; frame cap either way. The liveness bug is the concrete one.
+      ;; An already-expired tail is refused BEFORE anything else runs. A
+      ;; receive answers a message that is already in its mailbox before it
+      ;; consults its timer, so bytes that complete the frame after the
+      ;; deadline beat the timer that should have closed the connection --
+      ;; and if they empty the buffer the deadline is cleared and the
+      ;; expiry is never observed at all.
+      (if (and since (>= (now-ms) since))
+          (tcp-close! c)
       (let ((before (inbuf-length buf)))
-        (if (guard (e (#t #f)) (answer-all! c buf) #t)
+        (if (guard (e (#t #f)) (answer-all! c buf since) #t)
             (let* ((rest (inbuf-length buf))
                    ;; A FRAME WAS CONSUMED, so whatever is left over is a
                    ;; DIFFERENT half frame and gets a window of its own.
@@ -259,7 +279,7 @@
                 ((= rest 0) (worker-conn-loop* c buf partial-ms #f))
                 ((>= (now-ms) deadline) (tcp-close! c))
                 (else (worker-conn-loop* c buf partial-ms deadline))))
-            (tcp-close! c))))
+            (tcp-close! c)))))
     (if (> (inbuf-length buf) 0)
         (let ((left (- (or since (+ (now-ms) partial-ms)) (now-ms))))
           (if (<= left 0)
@@ -277,12 +297,26 @@
   ;; pipelines gets its replies in the order it asked; the pool never does,
   ;; but a protocol that only works for one outstanding request would fail
   ;; obscurely for anything else that speaks it.
-  (define (answer-all! c buf)
+  ;; `until` is the deadline of a partial tail ALREADY carried into this
+  ;; read, or #f. A synchronous render cannot be interrupted, but the next
+  ;; one need not be started: a peer that puts several slow requests ahead
+  ;; of its partial tail would otherwise keep that tail alive for a render
+  ;; apiece past its deadline.
+  ;;
+  ;; It does nothing on the read that CREATES the tail -- there is no
+  ;; deadline yet, because whether a tail exists is only known once the
+  ;; complete frames have been taken out. Learning it earlier means walking
+  ;; the buffer's length fields before executing anything, which is a
+  ;; second parse of every request to bound a case whose cost is renders
+  ;; the peer asked for and paid for. The tail is bounded from the next
+  ;; read onward, which is where a pipelining peer spends its time.
+  (define (answer-all! c buf until)
     (let loop ()
-      (let ((f (take-frame! buf)))
-        (when f
-          (tcp-write! c (answer f) #f)
-          (loop)))))
+      (unless (and until (>= (now-ms) until))
+        (let ((f (take-frame! buf)))
+          (when f
+            (tcp-write! c (answer f) #f)
+            (loop))))))
 
   (define (answer body)
     (let ((n (bytevector-length body)))
@@ -451,16 +485,23 @@
                 (when notify (send notify (vector 'pool-idle self ref)))
                 ;; the id ADVANCES: the next request must not be answerable
                 ;; by a frame belonging to this one
-                ;; wrapped to the width of the field it travels in. An
-                ;; unbounded counter encoded into u32 raises once it passes
-                ;; the range -- about 50 days at a thousand renders a second
-                ;; on one connection, and for a lone connection that is
-                ;; permanent, since nothing rebuilds it. Only one request is
-                ;; outstanding at a time, and any exchange whose outcome is
-                ;; in doubt destroys the stream, so a wrapped id can never
-                ;; meet an older one still in flight.
-                (serve-loop* c buf notify render-ms
-                             (modulo (+ next-id 1) #x100000000))))))
+                ;; RETIRED rather than wrapped. The field is u32, so an
+                ;; unbounded counter eventually cannot be encoded at all --
+                ;; about fifty days at a thousand renders a second, and
+                ;; permanent for a lone connection, since nothing rebuilds
+                ;; it. Wrapping fixes that and buys an ABA: a worker that
+                ;; held on to an old response could replay it four billion
+                ;; requests later against an id that now means something
+                ;; else, and the check that exists to catch exactly that
+                ;; would pass it. Ending the connection instead keeps ids
+                ;; unique for the life of a stream, which is the property
+                ;; the check is written on. It costs one reconnect per four
+                ;; billion renders.
+                (if (>= next-id #xffffffff)
+                    (begin
+                      (when notify (send notify (vector 'pool-conn-dead self)))
+                      (tcp-close! c))
+                    (serve-loop* c buf notify render-ms (+ next-id 1)))))))
       ;; connpool-call sends this to whatever handle it was given when a call
       ;; times out; only a pool acts on it. Consumed here so it does not sit
       ;; in the mailbox slowing every later selective receive.
