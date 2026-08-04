@@ -404,7 +404,19 @@
           (let ((e (hashtable-ref leased c #f)))
             (when (and e (eq? (vector-ref e 0) from))
               (drop-lease! c e)
-              (make-available! c)))
+              ;; ...and a connection the pool already knows is going does
+              ;; NOT go back into rotation. A driver that hits a transport
+              ;; error tells its caller and tells the pool, and the caller's
+              ;; check-in can arrive between the two: the pool then lent out
+              ;; a connection that was about to exit, and that borrower's
+              ;; statement went nowhere while it waited out its whole query
+              ;; timeout for a reply nobody would send. The connection's own
+              ;; DOWN cleans up afterwards, far too late to help.
+              ;;
+              ;; db-idle already refuses for the same reason; this is the
+              ;; other way back into the idle set.
+              (unless (hashtable-ref dying c #f)
+                (make-available! c))))
           (loop))
         (`#(db-checkin-broken ,from ,c)
           ;; the lessee could not clean the connection (e.g. ROLLBACK failed):
