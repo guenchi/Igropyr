@@ -63,6 +63,7 @@ function spin(j){ for(;;){} }
 
 (define good-port 19731)
 (define spin-port 19732)
+(define half-port 19733)
 
 (define (write-bundle!)
   (when (file-exists? bundle-path) (delete-file bundle-path))
@@ -79,6 +80,10 @@ function spin(j){ for(;;){} }
   (system (string-append "scheme --script igropyr/qjs-worker.sc 127.0.0.1 "
                          (number->string port) " " bundle-path
                          " timeout-ms=" (number->string timeout-ms)
+                         ;; short enough to be observable: the default is
+                         ;; half a minute, which is right in production and
+                         ;; useless in a test
+                         " partial-frame-ms=1200"
                          " >/dev/null 2>&1 & echo $! > " (pid-file name))))
 
 (define (kill-worker! name)
@@ -102,8 +107,9 @@ function spin(j){ for(;;){} }
 (start-scheduler
   (lambda ()
     (write-bundle!)
-    (kill-worker! "good") (kill-worker! "spin")
+    (kill-worker! "good") (kill-worker! "spin") (kill-worker! "half")
     (spawn-worker! "good" good-port 800)
+    (spawn-worker! "half" half-port 800)
     (spawn-worker! "spin" spin-port 60000)   ; long engine deadline: the
                                              ; CALLER's timeout is what must
                                              ; end a runaway render here
@@ -192,6 +198,41 @@ function spin(j){ for(;;){} }
                 (check "a throwing render surfaces through ssr" (not k)))
               (qjspool-close! pool))
 
+            ;; ---- a request that stops halfway ---------------------------
+            ;;
+            ;; A length prefix is accepted before its body arrives, so a
+            ;; peer can announce a frame, send part of it and simply stop
+            ;; -- no FIN, no error, nothing the worker would react to. That
+            ;; held a process, a file descriptor and everything already
+            ;; received for as long as the peer cared to keep the socket
+            ;; open. IDLE is different and must stay unlimited: a pooled
+            ;; connection is legitimately silent between renders, and the
+            ;; checks above would fail if silence alone closed it.
+            (let ((me self))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" half-port self)
+                  (receive (after 3000 (send me (vector 'half 'no-connect)))
+                    (`#(tcp-connect-failed ,e) (send me (vector 'half 'no-connect)))
+                    (`#(tcp-connected ,c)
+                      (tcp-read-start! c)
+                      ;; announces ten bytes, sends one, then waits
+                      (let ((bv (make-bytevector 5 0)))
+                        (bytevector-u8-set! bv 3 10)
+                        (tcp-write! c bv #f))
+                      (let ((t0 (now-ms)))
+                        (receive (after 6000 (send me (vector 'half 'never)))
+                          (`#(tcp-eof) (send me (vector 'half (- (now-ms) t0))))
+                          (`#(tcp-error ,e)
+                            (send me (vector 'half (- (now-ms) t0))))))))))
+              (receive (after 9000 (fail "half-frame probe never answered"))
+                (`#(half ,r)
+                  (check "a request that stops halfway does not hold the worker"
+                         (and (number? r) (< r 5000)))
+                  (display (string-append "  [info] half-delivered frame dropped after "
+                                          (if (number? r) (number->string r) "never")
+                                          "ms (configured 1200)\n")))))
+
             ;; ---- a worker that is not there ------------------------------
             ;; The pool must answer, not hang: an endpoint nobody is
             ;; listening on is the ordinary state during a deploy.
@@ -248,6 +289,7 @@ function spin(j){ for(;;){} }
                 (qjspool-close! spool)))))
       (kill-worker! "good")
       (kill-worker! "spin")
+      (kill-worker! "half")
       (when (file-exists? bundle-path) (delete-file bundle-path))
       (if (= failures 0)
           (display "qjspool: all tests passed\n")
