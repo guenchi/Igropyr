@@ -853,16 +853,29 @@
   ;; wrappers, which guarantee checkin.
   (define (connpool-checkout pool cfg)
     (drain-stale!)
-    (let ((ref (gensym)))
+    (let ((ref (gensym))
+          ;; WATCH THE POOL. Without this a dead pool is indistinguishable
+          ;; from a busy one: no reply can come, so the caller waits out the
+          ;; whole checkout deadline -- a minute for the SQL drivers -- and
+          ;; is then told the pool is SATURATED, which is a different fault
+          ;; with a different remedy. connpool-call already watches its
+          ;; handle; this is the other half of the lease path.
+          (m (monitor pool)))
       (send pool (vector 'pool-checkout ref self))
       (receive (after (connpool-cfg-checkout-ms cfg)
                   ;; tell the pool to drop (or reclaim) this request --
                   ;; otherwise a connection freed after the timeout is leased
                   ;; to us and never checked in, bleeding the pool.
                   (send pool (vector 'pool-checkout-cancel ref self))
+                  (when m (demonitor m) (flush-down! pool))
                   (raise (connpool-cfg-checkout-timeout-err cfg)))
-        (`#(pool-checkout-reply ,@ref ,conn) conn)
-        (`#(pool-checkout-failed ,@ref ,err) (raise err)))))
+        (`#(pool-checkout-reply ,@ref ,conn)
+          (when m (demonitor m) (flush-down! pool))
+          conn)
+        (`#(pool-checkout-failed ,@ref ,err)
+          (when m (demonitor m) (flush-down! pool))
+          (raise err))
+        (`#(DOWN ,@pool ,reason) (raise (connpool-cfg-lost-err cfg))))))
 
   ;; ROLLBACK on a borrowed connection without parking a full query timeout
   ;; when the connection is already dead: monitor it, so a dead process

@@ -615,6 +615,38 @@
                                   (number->string took) "ms (the query deadline is 5000)\n")))
         (send pool (vector 'pool-quit))))
 
+    ;; ---- a dead pool is not a busy one -------------------------------------
+    ;;
+    ;; A checkout waits for a reply that a dead pool can never send, so the
+    ;; caller sat out the whole checkout deadline -- a minute for the SQL
+    ;; drivers -- and was then told the pool was SATURATED. That is a
+    ;; different fault with a different remedy: one says "run more
+    ;; connections", the other says "your pool is gone".
+    (let ((slow (make-connpool-cfg
+                  (lambda (r) (and (vector? r) (eq? (vector-ref r 0) 'fake-error)))
+                  (vector 'fake-error "lost")
+                  (vector 'fake-error "closed")
+                  (vector 'fake-error "query timeout")
+                  (vector 'fake-error "checkout timeout")
+                  "BEGIN"
+                  5000
+                  5000)))            ; the checkout deadline this must NOT wait out
+      (let ((pool (spawn (lambda () (connpool-loop 1 fake-spawn-conn! slow)))))
+        (sleep-ms 200)
+        (kill pool 'reaped)
+        (sleep-ms 100)
+        (let* ((t0 (now-ms))
+               (r (guard (e (#t e))
+                    (connpool-lease pool (lambda (c) 'unreachable) slow)))
+               (took (- (now-ms) t0)))
+          (check "a checkout against a dead pool fails at once"
+                 (and (vector? r) (< took 2000)))
+          (check "...and says the connection was lost, not that the pool is full"
+                 (and (vector? r) (equal? (vector-ref r 1) "lost")))
+          (display (string-append "  [info] dead pool reported after "
+                                  (number->string took)
+                                  "ms (the checkout deadline is 5000)\n")))))
+
     ;; ---- the deadlines belong to the CONFIG -------------------------------
     ;;
     ;; They used to be two constants in the library, so every pool in a
