@@ -134,6 +134,7 @@
 ;; quit is a consequence, so the transport verdict must stand.
 (define transport-first-spawns 0)
 (define transport-first-at '())
+(define transport-died-at '())
 (define (transport-then-linger-spawn-conn! notify report-to ref)
   (set! transport-first-spawns (+ transport-first-spawns 1))
   (set! transport-first-at (cons (now-ms) transport-first-at))
@@ -144,6 +145,11 @@
       (let loop ()
         (receive
           (`#(pool-request ,sql ,r ,from)
+            ;; stamped where the DEATH is, so the gap below measures
+            ;; death -> replacement. Stamping at spawn folded the test's own
+            ;; settle time into it, which left the assertion only about
+            ;; 400ms of real discrimination on a 700ms threshold.
+            (set! transport-died-at (cons (now-ms) transport-died-at))
             (send notify (vector 'pool-conn-dead self))   ; transport, FIRST
             (send from (vector 'pool-reply r (vector 'fake-error "lost")))
             (sleep-ms 250)                                ; ...then linger
@@ -530,8 +536,11 @@
       ;; connection reported up meant each failure erased the history of
       ;; the one before it, so the backoff never left its first step.
       (let ((ts (reverse transport-dead-at)))
+        ;; too few samples is a FAILED measurement, not a silent pass: the
+        ;; assertion below simply disappears, and a slower machine reaches
+        ;; that state without anything saying the case stopped testing.
         (if (< (length ts) 3)
-            (display "  [info] too few rebuilds to compare intervals\n")
+            (check "enough rebuilds to compare backoff intervals" #f)
             (let ((first-gap (- (cadr ts) (car ts)))
                   (last-gap (- (list-ref ts (- (length ts) 1))
                                (list-ref ts (- (length ts) 2)))))
@@ -586,6 +595,7 @@
     ;; with no backoff at all -- the spin the backoff exists to stop.
     (set! transport-first-spawns 0)
     (set! transport-first-at '())
+    (set! transport-died-at '())
     (let ((pool (spawn (lambda () (connpool-loop 1 transport-then-linger-spawn-conn! cfg)))))
       (sleep-ms 300)
       ;; a lease whose body raises: the after-thunk sends check-in-broken
@@ -600,10 +610,11 @@
       ;; classified. What separates the two verdicts is the DELAY before the
       ;; replacement appears: a peer problem is backed off ~1s, the pool's
       ;; own decision is rebuilt at once.
-      (let ((ts (reverse transport-first-at)))
-        (if (< (length ts) 2)
-            (fail "no replacement connection was built" (length ts))
-            (let ((gap (- (cadr ts) (car ts))))
+      (let ((ts (reverse transport-first-at))
+            (died (reverse transport-died-at)))
+        (if (or (< (length ts) 2) (null? died))
+            (check "a replacement connection was built at all" #f)
+            (let ((gap (- (cadr ts) (car died))))
               (check "a transport failure is not reclassified by a later broken check-in"
                      (> gap 700))
               (display (string-append "  [info] replacement after a transport failure: "
