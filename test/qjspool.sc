@@ -16,6 +16,7 @@
 ;;; present, because the worker process cannot boot an engine without one.
 
 (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr qjspool)
+        (only (igropyr ssr) make-ssr ssr-render ssr-try-render ssr-invalidate! ssr-stats)
         (only (igropyr quickjs) qjs-boot! qjs-call/bytes))
 
 ;; (igropyr quickjs) is the pure-Scheme binding: it needs a stock shared
@@ -48,8 +49,14 @@
 (define (check label c) (if c (ok label) (fail label)))
 
 (define bundle-path "/tmp/igropyr-qjspool-bundle.js")
+;; N counts renders IN THE WORKER, so a cache hit is provable from here:
+;; on a hit the counter must not have advanced, which no amount of
+;; inspecting the caller's own bookkeeping could show.
 (define bundle "
+var N = 0;
 function hello(j){ var p = JSON.parse(j); return '<h1>' + p.name + '</h1>'; }
+function counted(j){ N++; var p = JSON.parse(j); return '<p>' + p.t + '</p>'; }
+function count(j){ return String(N); }
 function boom(j){ throw new Error('render blew up'); }
 function spin(j){ for(;;){} }
 ")
@@ -144,6 +151,40 @@ function spin(j){ for(;;){} }
                          (>= q 4)))
                 (check "nothing is left in use once the renders are done"
                        (equal? (cond ((assq 'in-use st) => cdr) (else #f)) 0)))
+              (qjspool-close! pool))
+
+            ;; ---- (igropyr ssr) in front of the pool ----------------------
+            ;; The cache has to sit in front of the WORKERS exactly as it sat
+            ;; in front of the in-process engine: a hit must not reach them
+            ;; at all. Proven from the worker's own render counter, which is
+            ;; the only witness that cannot be faked by the caller's stats.
+            (let* ((pool (qjspool (list (cons "127.0.0.1" good-port))
+                                  '((render-timeout-ms . 2000))))
+                   (r (make-ssr "" (list (cons 'engine pool)))))
+              (define (worker-renders)
+                (let-values (((k v) (qjspool-render pool "count" "{}")))
+                  (and k (string->number v))))
+              (let ((before (worker-renders)))
+                (let ((a (ssr-render r "counted" '(("t" . "one"))
+                                     '((key . "/k1"))))
+                      (b (ssr-render r "counted" '(("t" . "one"))
+                                     '((key . "/k1")))))
+                  (check "ssr renders through the worker pool"
+                         (and (string=? a "<p>one</p>") (string=? b a)))
+                  (check "the second call was a cache HIT, not a second render"
+                         (= (- (worker-renders) before) 1))
+                  (let ((st (ssr-stats r)))
+                    (check "and ssr counted it as a hit"
+                           (equal? (cond ((assq 'hits st) => cdr) (else #f)) 1)))))
+              ;; an invalidation must reach the workers again
+              (let ((before (worker-renders)))
+                (ssr-invalidate! r "/k1")
+                (ssr-render r "counted" '(("t" . "one")) '((key . "/k1")))
+                (check "after an invalidation the worker renders again"
+                       (= (- (worker-renders) before) 1)))
+              ;; a JS throw must surface without being cached
+              (let-values (((k v) (ssr-try-render r "boom" '() '((key . "/bad")))))
+                (check "a throwing render surfaces through ssr" (not k)))
               (qjspool-close! pool))
 
             ;; ---- a worker that is not there ------------------------------

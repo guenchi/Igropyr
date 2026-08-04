@@ -53,6 +53,18 @@
 ;;; Keys default to sha256(fn+props); pass (key . "...") -- typically the URL
 ;;; -- so hits skip prop hashing. One ssr per process (make-ssr reboots the
 ;;; one engine; a second bundle would replace the first).
+;;;
+;;; Where the render RUNS (make-ssr opt (engine . ...)):
+;;;   omitted   in this process, on the scheduler's thread. A miss blocks
+;;;             everything for the render's duration -- see the qjs-call
+;;;             note above -- which the cache makes rare but does not bound.
+;;;   <qjspool> in worker PROCESSES. A miss then blocks only the calling
+;;;             green process, so a wave of misses for different keys costs
+;;;             latency instead of the node's availability. `bundle` is not
+;;;             evaluated here at all in this mode: the workers own it.
+;;;
+;;;   (define p (qjspool '(("127.0.0.1" . 9701) ("127.0.0.1" . 9702))))
+;;;   (define r (make-ssr "" `((engine . ,p))))   ; bundle lives in the workers
 
 (library (igropyr ssr)
   (export make-ssr ssr-render ssr-render/bytes ssr-try-render ssr-try-render/bytes
@@ -60,6 +72,7 @@
   (import (chezscheme)
           (igropyr actor) (igropyr libuv) (igropyr gen-server)
           (only (igropyr quickjs) qjs-boot! qjs-call/bytes)
+          (only (igropyr qjspool) qjspool? qjspool-render/bytes qjspool-timeout-ms)
           (only (igropyr json) json->string)
           (only (igropyr crypto) sha256 bytevector->hex)
           (only (igropyr redis) redis))
@@ -283,14 +296,28 @@
   (define cache-epoch 0)
   (define (bump-epoch!) (set! cache-epoch (+ cache-epoch 1)))
 
-  (define (call+cache renders backend key fn json ttl)
+  ;; WHERE THE RENDER HAPPENS. The in-process engine and a pool of worker
+  ;; processes answer the same question the same way -- (values ok?
+  ;; bytes-or-error-text) -- so everything above this line is identical for
+  ;; both and the choice is one field of the ssr record.
+  ;;
+  ;; They are not equivalent, and the difference is not about speed. An
+  ;; in-process render blocks the scheduler for its whole duration, so a
+  ;; miss storm is an availability event; a pooled one blocks only the
+  ;; calling green process. See the header of (igropyr qjspool).
+  (define (render-with engine fn json)
+    (if engine
+        (qjspool-render/bytes engine fn json)
+        (qjs-call/bytes fn json)))
+
+  (define (call+cache renders backend key fn json ttl engine)
     (set-box! renders (+ 1 (unbox renders)))
     (let ((epoch cache-epoch)
           (res (guard (e (#t (cons #f (flight-error-text e))))
                  ;; bytes are the cache currency: skips a utf8->string of the
                  ;; render output on every miss, and lets a byte consumer send
                  ;; the memory-cache hit straight through with no re-encode
-                 (let-values (((ok s) (qjs-call/bytes fn json))) (cons ok s)))))
+                 (let-values (((ok s) (render-with engine fn json))) (cons ok s)))))
       (when (and (car res) (= epoch cache-epoch))
         (b-put backend key (cdr res) ttl))
       res))
@@ -303,9 +330,9 @@
   ;; the miss path: single-flight around call+cache. -> (ok . text)
   (define (render-miss r fn json key)
     (let ((flight (ssr-flight r)) (backend (ssr-backend r)) (ttl (ssr-ttl r))
-          (rnd (ssr-renders r)))
+          (rnd (ssr-renders r)) (eng (ssr-engine r)))
       (if (not flight)
-          (call+cache rnd backend key fn json ttl)
+          (call+cache rnd backend key fn json ttl eng)
           (begin
           ;; drop the late answer to any earlier round we abandoned: its
           ;; ref can never match again, so it would linger forever
@@ -321,36 +348,52 @@
             (if (eq? role 'leader)
                 (let* ((again (b-get backend key))       ; double-check
                        (res (if again (cons #t again)
-                                (call+cache rnd backend key fn json ttl))))
+                                (call+cache rnd backend key fn json ttl eng))))
                   (gen-server-cast flight (vector 'publish key res gen))
                   res)
                 (receive (after (ssr-flight-wait r)
                             ;; leader vanished -> render ourselves
                             (gen-server-cast flight (vector 'unclaim key ref gen))
-                            (call+cache rnd backend key fn json ttl))
+                            (call+cache rnd backend key fn json ttl eng))
                   (`#(ssr-flight ,@ref ,res) res))))))))
 
-  ;; ---- public ssr: #(backend ttl flight) -------------------------------
+  ;; ---- public ssr: #(backend ttl flight wait renders engine) ------------
+  ;;
+  ;; (engine . <a qjspool>) renders in WORKER PROCESSES instead of on this
+  ;; thread. Then `bundle` is not evaluated here at all -- the workers own
+  ;; it, and were this process to boot a second copy of the engine it would
+  ;; be paying for a runtime nothing would ever call. Everything else about
+  ;; the cache, single-flight and invalidation is unchanged: what moves is
+  ;; only where the miss is served.
   (define (make-ssr bundle . opt)
     (let* ((opts (if (pair? opt) (car opt) '()))
            (ttl  (opt-ref opts 'ttl-ms default-ttl-ms))
            (cap  (opt-ref opts 'max-entries default-cap))
            (qopts (opt-ref opts 'quickjs '()))
+           (engine (opt-ref opts 'engine #f))
            ;; a follower must wait AT LEAST the leader's own render deadline,
            ;; or it would time out mid-render and start the very herd that
            ;; single-flight exists to prevent (quickjs timeout-ms default 2000)
-           (wait (+ (opt-ref qopts 'timeout-ms 2000) flight-wait-margin-ms))
+           (wait (+ (if engine
+                        (qjspool-timeout-ms engine)
+                        (opt-ref qopts 'timeout-ms 2000))
+                    flight-wait-margin-ms))
            (backend (make-backend (opt-ref opts 'cache 'memory) cap))
            (flight (and (opt-ref opts 'single-flight #t)
                         (gen-server-start flight-init flight-call flight-cast))))
-      (qjs-boot! bundle qopts)          ; process-global engine; one per process
-      (vector backend ttl flight wait (box 0))))
+      (when (and engine (not (qjspool? engine)))
+        (assertion-violation 'make-ssr
+          "the engine option takes a render pool from (igropyr qjspool)" engine))
+      (unless engine
+        (qjs-boot! bundle qopts))       ; process-global engine; one per process
+      (vector backend ttl flight wait (box 0) engine)))
 
   (define (ssr-backend r)     (vector-ref r 0))
   (define (ssr-ttl r)         (vector-ref r 1))
   (define (ssr-flight r)      (vector-ref r 2))
   (define (ssr-flight-wait r) (vector-ref r 3))
   (define (ssr-renders r)     (vector-ref r 4))
+  (define (ssr-engine r)      (vector-ref r 5))
 
   ;; a STRING props is the raw JSON arg (caller guarantees it is valid JSON);
   ;; any other Scheme value is JSON-encoded
