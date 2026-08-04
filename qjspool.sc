@@ -343,8 +343,10 @@
   ;; The handle carries its config because the deadlines are per-pool: two
   ;; pools of different things in one process do not share a timeout, and
   ;; the render path wants seconds where a database wants a minute.
+  ;; pooled?: a POOL answers db-checkout, a lone connection does not -- and
+  ;; asking one for a lease is a wait that ends only in a timeout.
   (define-record-type (qjs-pool make-qjs-pool qjspool?)
-    (fields handle cfg render-ms))
+    (fields handle cfg render-ms checkout-ms pooled?))
 
   (define (make-cfg render-ms checkout-ms)
     (make-sql-cfg
@@ -406,7 +408,7 @@
                   (start-connection (car e) (cdr e) render-ms
                                     notify report-to ref)))
               cfg)))
-        cfg render-ms)))
+        cfg render-ms checkout-ms #t)))
 
   ;; One connection to one worker, with no pool behind it. Mainly for tests
   ;; and for a process that renders rarely: it has no queueing, no rebuild
@@ -425,7 +427,7 @@
           (`#(db-up ,@ref ,pid ,status)
             (if (eq? status 'ok)
                 (begin (send pid (vector 'db-adopt))
-                       (make-qjs-pool pid cfg render-ms))
+                       (make-qjs-pool pid cfg render-ms checkout-ms #f))
                 (raise status)))))))
 
   (define (check-pool who p)
@@ -447,20 +449,51 @@
     ;; condition from below alike -- and both come out as TEXT, which is
     ;; what the contract promises.
     (guard (e (#t (values #f (qjs-error-text (as-qjs-error e "render failed")))))
-      (let ((r (sql-query (qjs-pool-handle p) (cons fn props) (qjs-pool-cfg p))))
+      (let ((r (render-through p (cons fn props))))
         (values (car r) (cdr r)))))
+
+  ;; TWO deadlines, because a render has two ways to be slow and they call
+  ;; for different answers. Waiting for a free worker means the pool is
+  ;; saturated and nothing is wrong: give up early and shed the request,
+  ;; rather than hold an http worker for the length of a render that has
+  ;; not started. Waiting for the render itself is the render being slow.
+  ;;
+  ;; Borrowing the worker also matches what it is: single-threaded, one
+  ;; engine, one render at a time. Sending renders as queued statements
+  ;; would let the pool interleave them onto a connection that is already
+  ;; busy from its own point of view.
+  ;;
+  ;; A lone connection has no pool to lease from, so it takes the direct
+  ;; path; there is nothing to be saturated.
+  (define (render-through p req)
+    (let ((h (qjs-pool-handle p)) (cfg (qjs-pool-cfg p)))
+      (if (qjs-pool-pooled? p)
+          (sql-call-with-connection h (lambda (conn) (sql-query conn req cfg)) cfg)
+          (sql-query h req cfg))))
 
   ;; the same, decoded to a string on success
   (define (qjspool-render p fn props)
     (let-values (((ok v) (qjspool-render/bytes p fn props)))
       (if ok (values #t (utf8->string v)) (values #f v))))
 
-  ;; the caller-side deadline, so a coordinator that waits on a render
-  ;; (single-flight, say) can wait at least as long as the render may take
+  ;; The longest a render can take before it gives up: waiting for a free
+  ;; worker, then rendering. A coordinator that waits on somebody else's
+  ;; render (single-flight, say) has to allow at least this, or it times
+  ;; out mid-render and starts the herd it was there to prevent.
   (define (qjspool-timeout-ms p)
     (check-pool 'qjspool-timeout-ms p)
-    (+ (qjs-pool-render-ms p) 1000))
+    (+ (if (qjs-pool-pooled? p) (qjs-pool-checkout-ms p) 0)
+       (qjs-pool-render-ms p) 1000))
 
+  ;; The pool's own numbers. A render is a LEASE, so it is counted under
+  ;; `checkouts`, and `checkout-wait-ms-*` is the time spent waiting for a
+  ;; free worker -- the number that says whether to run more of them.
+  ;;
+  ;; `queries` and `query-ms-*` stay ZERO here, and that is not a gap in
+  ;; the bookkeeping: the pool hands the worker over and the render's reply
+  ;; goes straight from the connection to the caller, so the pool never
+  ;; sees it. Render DURATION therefore has to be measured at the call
+  ;; site; nothing in the pool is in a position to know it.
   (define (qjspool-stats p)
     (check-pool 'qjspool-stats p)
     (sql-pool-stats (qjs-pool-handle p)))

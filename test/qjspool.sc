@@ -146,8 +146,13 @@ function spin(j){ for(;;){} }
               (let ((st (qjspool-stats pool)))
                 (check "the pool reports its size"
                        (equal? (cond ((assq 'size st) => cdr) (else #f)) 1))
-                (check "the pool counted the renders it dispatched"
-                       (let ((q (cond ((assq 'queries st) => cdr) (else 0))))
+                ;; renders are LEASES, so they are counted as checkouts.
+                ;; `queries` stays zero on purpose: the pool hands over the
+                ;; worker and the render's reply goes straight back to the
+                ;; caller, so the pool never sees it (the same reason a
+                ;; leased SQL connection's statements are invisible to it).
+                (check "the pool counted the renders as checkouts"
+                       (let ((q (cond ((assq 'checkouts st) => cdr) (else 0))))
                          (>= q 4)))
                 (check "nothing is left in use once the renders are done"
                        (equal? (cond ((assq 'in-use st) => cdr) (else #f)) 0)))
