@@ -274,6 +274,84 @@ function spin(j){ for(;;){} }
                                           (if (number? r) (number->string r) "never")
                                           "ms (deadline 1200, a byte every 400)\n")))))
 
+            ;; ---- two whole requests in ONE write are both answered --------
+            ;;
+            ;; This is worker-side behaviour, so it needs the real worker
+            ;; and a raw client: the pool never writes two requests without
+            ;; reading between them. There was a version that stopped
+            ;; answering once a carried-in tail's deadline had passed, and
+            ;; it stopped with a COMPLETE frame still in the buffer -- the
+            ;; loop then treated that buffer as a partial tail and waited
+            ;; for bytes that were never coming, so a request that arrived
+            ;; whole was never rendered and never answered.
+            (let ((me self))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" good-port self)
+                  (receive (after 3000 (send me (vector 'pair 'no-connect)))
+                    (`#(tcp-connect-failed ,e) (send me (vector 'pair 'no-connect)))
+                    (`#(tcp-connected ,c)
+                      (tcp-read-start! c)
+                      (let* ((frame
+                              (lambda (id fn json)
+                                (let* ((f (string->utf8 fn)) (j (string->utf8 json))
+                                       (fl (bytevector-length f))
+                                       (jl (bytevector-length j))
+                                       (n (+ 4 2 fl jl))
+                                       (bv (make-bytevector (+ 4 n))))
+                                  (bytevector-u32-set! bv 0 n (endianness big))
+                                  (bytevector-u32-set! bv 4 id (endianness big))
+                                  (bytevector-u16-set! bv 8 fl (endianness big))
+                                  (bytevector-copy! f 0 bv 10 fl)
+                                  (bytevector-copy! j 0 bv (+ 10 fl) jl)
+                                  bv)))
+                             (a (frame 0 "hello" "{\"name\":\"A\"}"))
+                             (b (frame 1 "hello" "{\"name\":\"B\"}"))
+                             (both (make-bytevector (+ (bytevector-length a)
+                                                       (bytevector-length b)))))
+                        ;; ONE write: the worker sees both frames in one read
+                        (bytevector-copy! a 0 both 0 (bytevector-length a))
+                        (bytevector-copy! b 0 both (bytevector-length a)
+                                          (bytevector-length b))
+                        (tcp-write! c both #f))
+                      ;; Both answers must come back -- counted as FRAMES,
+                      ;; not as messages: two replies written back to back
+                      ;; usually arrive in a single read, so counting
+                      ;; tcp-data would say one and be wrong about it.
+                      (let wait ((acc (make-bytevector 0)))
+                        (let* ((n (bytevector-length acc))
+                               (frames
+                                (let scan ((i 0) (k 0))
+                                  (if (> (+ i 4) n)
+                                      k
+                                      (let ((len (bytevector-u32-ref
+                                                   acc i (endianness big))))
+                                        (if (> (+ i 4 len) n)
+                                            k
+                                            (scan (+ i 4 len) (+ k 1))))))))
+                          (if (>= frames 2)
+                              (send me (vector 'pair 'both))
+                              (receive (after 3000 (send me (vector 'pair frames)))
+                                (`#(tcp-data ,bv)
+                                  (let ((more (make-bytevector
+                                                (+ n (bytevector-length bv)))))
+                                    (bytevector-copy! acc 0 more 0 n)
+                                    (bytevector-copy! bv 0 more n
+                                                      (bytevector-length bv))
+                                    (wait more)))
+                                (`#(tcp-eof) (send me (vector 'pair frames)))
+                                (`#(tcp-error ,e)
+                                  (send me (vector 'pair frames)))))))))))
+              (receive (after 8000 (fail "pipelined probe never answered"))
+                (`#(pair ,r)
+                  (check "two whole requests in one write are both answered"
+                         (eq? r 'both))
+                  (display (string-append "  [info] pipelined pair: "
+                                          (if (eq? r 'both) "both answered"
+                                              (string-append "only "
+                                                (number->string r)))
+                                          "\n")))))
+
             ;; ---- a worker that is not there ------------------------------
             ;; The pool must answer, not hang: an endpoint nobody is
             ;; listening on is the ordinary state during a deploy.

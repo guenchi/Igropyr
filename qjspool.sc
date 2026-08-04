@@ -260,7 +260,7 @@
       (if (and since (>= (now-ms) since))
           (tcp-close! c)
       (let ((before (inbuf-length buf)))
-        (if (guard (e (#t #f)) (answer-all! c buf since) #t)
+        (if (guard (e (#t #f)) (answer-all! c buf) #t)
             (let* ((rest (inbuf-length buf))
                    ;; A FRAME WAS CONSUMED, so whatever is left over is a
                    ;; DIFFERENT half frame and gets a window of its own.
@@ -297,26 +297,26 @@
   ;; pipelines gets its replies in the order it asked; the pool never does,
   ;; but a protocol that only works for one outstanding request would fail
   ;; obscurely for anything else that speaks it.
-  ;; `until` is the deadline of a partial tail ALREADY carried into this
-  ;; read, or #f. A synchronous render cannot be interrupted, but the next
-  ;; one need not be started: a peer that puts several slow requests ahead
-  ;; of its partial tail would otherwise keep that tail alive for a render
-  ;; apiece past its deadline.
+  ;; EVERY complete frame is answered. There was a version that stopped on
+  ;; the tail's deadline, so that a peer queueing slow renders ahead of its
+  ;; tail could not buy it a render apiece -- and it dropped requests: the
+  ;; loop stopped with a COMPLETE frame still in the buffer, the caller
+  ;; then treated that buffer as a partial tail and waited for bytes that
+  ;; were never coming, and a legitimate request was never rendered, never
+  ;; answered, and eventually closed on a deadline it had nothing to do
+  ;; with. Silently dropping a request that arrived in time is worse than
+  ;; the thing that guard was for, whose whole cost is renders the peer
+  ;; asked for and paid for.
   ;;
-  ;; It does nothing on the read that CREATES the tail -- there is no
-  ;; deadline yet, because whether a tail exists is only known once the
-  ;; complete frames have been taken out. Learning it earlier means walking
-  ;; the buffer's length fields before executing anything, which is a
-  ;; second parse of every request to bound a case whose cost is renders
-  ;; the peer asked for and paid for. The tail is bounded from the next
-  ;; read onward, which is where a pipelining peer spends its time.
-  (define (answer-all! c buf until)
+  ;; What bounds a tail is the check BEFORE this runs: a tail carried in
+  ;; from an earlier read whose deadline has already passed ends the
+  ;; connection without anything being processed at all.
+  (define (answer-all! c buf)
     (let loop ()
-      (unless (and until (>= (now-ms) until))
-        (let ((f (take-frame! buf)))
-          (when f
-            (tcp-write! c (answer f) #f)
-            (loop))))))
+      (let ((f (take-frame! buf)))
+        (when f
+          (tcp-write! c (answer f) #f)
+          (loop)))))
 
   (define (answer body)
     (let ((n (bytevector-length body)))
