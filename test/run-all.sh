@@ -42,6 +42,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # picking bellard fails the boot, and falling through would mix two ABIs
 "$scheme_bin" --script igropyr/test/quickjs-so-order.sc
 "$scheme_bin" --script igropyr/test/ssr.sc
+# the render protocol against fake workers: needs no libquickjs, so unlike
+# the test below it runs on every host, and it is where the wire's failure
+# modes live (dribbled, oversized, silent, truncated, unsolicited)
+"$scheme_bin" --script igropyr/test/qjspool-wire.sc
 # spawns real worker PROCESSES: the point of the library is that a render
 # which never returns cannot stop this scheduler, and that is only provable
 # with the engine on the other side of a socket

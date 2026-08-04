@@ -284,9 +284,13 @@
         (send from (vector 'db-stats-reply ref #f))
         (serve-loop c buf notify render-ms))
       (`#(db-quit) (tcp-close! c))
-      (`#(tcp-data ,bv)                            ; stray data between renders
-        (inbuf-append! buf bv)
-        (serve-loop c buf notify render-ms))
+      ;; Bytes arriving BETWEEN renders have no meaning in this protocol: a
+      ;; worker speaks only when asked, and nothing is outstanding here.
+      ;; They are evidence the stream is already out of step -- buffering
+      ;; them would carry the desync into the next render's reply, and a
+      ;; peer that dribbles forever would grow this buffer without bound.
+      ;; Dropping the connection costs a rebuild; the pool does that anyway.
+      (`#(tcp-data ,bv) (tcp-close! c))
       (`#(tcp-eof) (tcp-close! c))
       (`#(tcp-error ,e) (tcp-close! c))))
 
@@ -299,7 +303,8 @@
         (when notify (monitor notify))
         (serve-loop c buf notify render-ms))
       (`#(db-quit) (tcp-close! c))
-      (`#(tcp-data ,bv) (inbuf-append! buf bv) (await-adoption c buf notify render-ms))
+      ;; likewise before adoption: nothing has been asked yet
+      (`#(tcp-data ,bv) (tcp-close! c))
       (`#(tcp-eof) (tcp-close! c))
       (`#(tcp-error ,e) (tcp-close! c))))
 
