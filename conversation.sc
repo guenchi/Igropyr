@@ -909,10 +909,21 @@
                        ;; three runs each. The cost is real and the fix
                        ;; is a condition already written one screen down;
                        ;; what is missing is an observable, not a reason.
+                       ;; ARMED MEANS RUNNING, full stop. A running phase
+                       ;; always has a deadline, and settling does not
+                       ;; change that: safe-key marks the phase running so
+                       ;; a key function that hangs is this process's
+                       ;; problem, and the linger -- when replays actually
+                       ;; arrive -- is settled by definition. Asking for
+                       ;; unsettled here excused exactly the case the mark
+                       ;; was put there for, and a hung key took the
+                       ;; conversation, its caller and every later request
+                       ;; to that id with it.
+                       ;;
+                       ;; What settling does change is whether anything is
+                       ;; owed on the way out: see the hook below.
                        (let ((tick (max 50 (div ttl 4)))
-                             (armed? (lambda ()
-                                       (and (unbox running-box)
-                                            (not (unbox settled-box))))))
+                             (armed? (lambda () (unbox running-box))))
                          (let loop ()
                            (if (armed?)
                                (sleep-ms
@@ -982,7 +993,21 @@
                                 ;; VM while its caller waits in a receive
                                 ;; that has no deadline.
                                 (if killed
-                                    (when on-killed
+                                    ;; ...BUT ONLY IF NOTHING SETTLED. A
+                                    ;; killed flow's winders did not run,
+                                    ;; so its compensation is this
+                                    ;; process's last act -- unless the
+                                    ;; flow already committed and it was
+                                    ;; something after it that overran, in
+                                    ;; which case releasing what it took
+                                    ;; would undo work that succeeded.
+                                    ;; Killing a settled conversation
+                                    ;; costs only its linger: its value is
+                                    ;; published and its tombstone
+                                    ;; written, so a replay falls back to
+                                    ;; the record and is told 'settled.
+                                    (when (and on-killed
+                                               (not (unbox settled-box)))
                                       ;; the flow's winders did not run;
                                       ;; this is the only chance to release
                                       ;; what it held
