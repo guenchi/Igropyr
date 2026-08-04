@@ -150,6 +150,16 @@
     ;; time, because it has already scheduled its own backed-off retry; only
     ;; the ones that never reported are rebuilt from DOWN.
     (define connecting (make-eq-hashtable))
+    ;; conn pid -> when it reported up. A connection that dies almost at
+    ;; once did not really connect: the peer accepted and then dropped it --
+    ;; a database refusing on max_connections, one that requires TLS, a
+    ;; proxy draining, a worker that is listening but useless. Case (2)
+    ;; below rebuilt those with no delay at all, so a pool aimed at such a
+    ;; peer span its rebuild loop at full speed: measured at 38k
+    ;; connect/close cycles in three seconds, on the one OS thread, churning
+    ;; a file descriptor each time. That is not a rebuild, it is a spin.
+    (define up-at (make-eq-hashtable))
+    (define min-lifetime-ms 1000)
     (define (connect!)
       (let ((pid (spawn-conn! me me (gensym))))
         (hashtable-set! connecting pid #t)
@@ -472,6 +482,7 @@
                 (send pid (vector 'db-adopt))
                 (set! stat-connects (+ stat-connects 1))
                 (set! backoff-ms 0)          ; a success clears the penalty
+                (hashtable-set! up-at pid (now-ms))
                 (make-available! pid))
               ;; Failed connect: retry with EXPONENTIAL BACKOFF. A fixed one
               ;; second is right for a database that is restarting and wrong
@@ -585,18 +596,33 @@
             ;; already scheduled their own retry, so they fall through here.
             ((or (memq pid idle) (hashtable-contains? busy pid)
                  (hashtable-ref leased pid #f) (hashtable-ref dying pid #f))
-             (set! idle (remq pid idle))
-             (hashtable-delete! dying pid)
-             (set! stat-connections-lost (+ stat-connections-lost 1))
-             (let ((entry (hashtable-ref busy pid #f)))
-               (hashtable-delete! busy pid)
-               (when entry
-                 (send (vector-ref entry 0)
-                       (vector 'db-reply (vector-ref entry 1)
-                               (sql-cfg-lost-err cfg)))))
-             (let ((e (hashtable-ref leased pid #f)))
-               (when e (drop-lease! pid e)))
-             (connect!))
+             ;; read before the deletes below: a connection WE tore down on
+             ;; purpose (a broken checkin) is not a peer problem and is
+             ;; rebuilt at once however short its life was
+             (let* ((deliberate (and (hashtable-ref dying pid #f) #t))
+                    (born (hashtable-ref up-at pid #f))
+                    (stillborn (and (not deliberate) born
+                                    (< (- (now-ms) born) min-lifetime-ms))))
+               (hashtable-delete! up-at pid)
+               (set! idle (remq pid idle))
+               (hashtable-delete! dying pid)
+               (set! stat-connections-lost (+ stat-connections-lost 1))
+               (let ((entry (hashtable-ref busy pid #f)))
+                 (hashtable-delete! busy pid)
+                 (when entry
+                   (send (vector-ref entry 0)
+                         (vector 'db-reply (vector-ref entry 1)
+                                 (sql-cfg-lost-err cfg)))))
+               (let ((e (hashtable-ref leased pid #f)))
+                 (when e (drop-lease! pid e)))
+               (if stillborn
+                   ;; the same jittered backoff a failed connect gets: this
+                   ;; IS a failed connect, it just failed after the accept
+                   (let ((wait (next-backoff!)))
+                     (spawn (lambda ()
+                              (sleep-ms wait)
+                              (send me (vector 'pool-reconnect)))))
+                   (connect!))))
             ;; (3) a worker that died while still connecting, without ever
             ;; reporting. Nothing scheduled a retry for it, so this slot is
             ;; rebuilt here -- backed off, because dying during connect is a
