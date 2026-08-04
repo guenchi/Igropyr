@@ -42,6 +42,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # picking bellard fails the boot, and falling through would mix two ABIs
 "$scheme_bin" --script igropyr/test/quickjs-so-order.sc
 "$scheme_bin" --script igropyr/test/ssr.sc
+# spawns real worker PROCESSES: the point of the library is that a render
+# which never returns cannot stop this scheduler, and that is only provable
+# with the engine on the other side of a socket
+"$scheme_bin" --script igropyr/test/qjspool.sc
 "$scheme_bin" --script igropyr/test/s3.sc
 "$scheme_bin" --script igropyr/test/aws.sc
 "$scheme_bin" --script igropyr/test/s3-control.sc
