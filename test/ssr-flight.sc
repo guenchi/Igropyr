@@ -41,11 +41,12 @@
 (define (sub bv from n)
   (let ((out (make-bytevector n))) (bytevector-copy! bv from out 0 n) out))
 
-(define (frame status body)
-  (let* ((n (+ 1 (bytevector-length body))) (bv (make-bytevector (+ 4 n))))
+(define (frame id status body)
+  (let* ((n (+ 4 1 (bytevector-length body))) (bv (make-bytevector (+ 4 n))))
     (put-u32! bv 0 n)
-    (bytevector-u8-set! bv 4 status)
-    (bytevector-copy! body 0 bv 5 (bytevector-length body))
+    (put-u32! bv 4 id)
+    (bytevector-u8-set! bv 8 status)
+    (bytevector-copy! body 0 bv 9 (bytevector-length body))
     bv))
 
 (define (take-request! buf)
@@ -54,9 +55,10 @@
          (and (>= (inbuf-length buf) (+ 4 n))
               (let ((body (inbuf-sub buf 4 (+ 4 n))))
                 (inbuf-consume! buf (+ 4 n))
-                (let ((fl (get-u16 body 0)))
-                  (cons (utf8->string (sub body 2 fl))
-                        (utf8->string (sub body (+ 2 fl) (- n 2 fl))))))))))
+                (let ((id (get-u32 body 0)) (fl (get-u16 body 4)))
+                  (list id
+                        (utf8->string (sub body 6 fl))
+                        (utf8->string (sub body (+ 6 fl) (- n 6 fl))))))))))
 
 ;; how long the worker takes, and how many renders it has served: the
 ;; counter is the only witness of what actually reached an engine
@@ -80,8 +82,9 @@
                                    (sleep-ms (unbox delay-ms)))
                                  (set-box! served (+ 1 (unbox served)))
                                  (tcp-write! c
-                                   (frame 0 (string->utf8
-                                              (string-append "<" (cdr req) ">")))
+                                   (frame (car req) 0
+                                          (string->utf8
+                                            (string-append "<" (caddr req) ">")))
                                    #f))
                                (loop)))
                            (`#(tcp-eof) (tcp-close! c))

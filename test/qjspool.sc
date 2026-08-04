@@ -233,6 +233,47 @@ function spin(j){ for(;;){} }
                                           (if (number? r) (number->string r) "never")
                                           "ms (configured 1200)\n")))))
 
+            ;; ---- ...and dribbling does not renew that deadline -----------
+            ;;
+            ;; A timeout re-armed on every arrival is an INACTIVITY timer,
+            ;; and inactivity is not what needs bounding: a peer sending one
+            ;; byte just under the interval keeps the same half frame -- and
+            ;; its process, its descriptor and most of a frame's worth of
+            ;; buffer -- alive for as long as it cares to. The deadline is
+            ;; taken once, when the buffer stops being empty.
+            (let ((me self))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" half-port self)
+                  (receive (after 3000 (send me (vector 'drib 'no-connect)))
+                    (`#(tcp-connect-failed ,e) (send me (vector 'drib 'no-connect)))
+                    (`#(tcp-connected ,c)
+                      (tcp-read-start! c)
+                      (let ((bv (make-bytevector 5 0)))
+                        (bytevector-u8-set! bv 3 40)      ; announces 40 bytes
+                        (tcp-write! c bv #f))
+                      (let ((t0 (now-ms)))
+                        ;; one byte every 400ms against a 1200ms deadline:
+                        ;; three arrivals inside every window, indefinitely
+                        (spawn (lambda ()
+                                 (let drip ((i 0))
+                                   (when (< i 12)
+                                     (sleep-ms 400)
+                                     (guard (e (#t 'gone))
+                                       (tcp-write! c (make-bytevector 1 65) #f))
+                                     (drip (+ i 1))))))
+                        (receive (after 8000 (send me (vector 'drib 'never)))
+                          (`#(tcp-eof) (send me (vector 'drib (- (now-ms) t0))))
+                          (`#(tcp-error ,e)
+                            (send me (vector 'drib (- (now-ms) t0))))))))))
+              (receive (after 11000 (fail "dribble probe never answered"))
+                (`#(drib ,r)
+                  (check "dribbling bytes does not renew the half-frame deadline"
+                         (and (number? r) (< r 4000)))
+                  (display (string-append "  [info] dribbled half-frame dropped after "
+                                          (if (number? r) (number->string r) "never")
+                                          "ms (deadline 1200, a byte every 400)\n")))))
+
             ;; ---- a worker that is not there ------------------------------
             ;; The pool must answer, not hang: an endpoint nobody is
             ;; listening on is the ordinary state during a deploy.
