@@ -446,12 +446,18 @@
   (define (tomb-prune!)
     (let loop () (when (tomb-pop-one-if-stale!) (loop))))
 
+  ;; The INSERT alone, for a caller that already holds interrupts. Splitting
+  ;; it out is what lets a conversation publish its completion -- phase,
+  ;; running flag and tombstone -- as one indivisible act; the prune loop
+  ;; stays outside, where it belongs.
+  (define (tomb-insert! id)
+    (unless (hashtable-contains? tombstones id)
+      (hashtable-set! tombstones id #t)
+      (set! tomb-back (cons (cons id (now-ms)) tomb-back))
+      (set! tomb-n (+ tomb-n 1))))
+
   (define (tomb-record! id)
-    (with-interrupts-disabled
-      (unless (hashtable-contains? tombstones id)
-        (hashtable-set! tombstones id #t)
-        (set! tomb-back (cons (cons id (now-ms)) tomb-back))
-        (set! tomb-n (+ tomb-n 1))))
+    (with-interrupts-disabled (tomb-insert! id))
     (tomb-prune!))
 
   (define (tomb-settled? id)
@@ -519,7 +525,13 @@
   ;;
   ;; So the timestamp is only ever compared within the run that wrote it.
   ;; The incarnation says which run that was; anything else is 'unknown.
-  (define incarnation (conv-hex/n! 4))
+  ;; 128 bits, not 32. A new run that happens to draw the same value as an
+  ;; old one adopts that run's ids as its own, and after a host reboot --
+  ;; where the clock has restarted low -- their timestamps read as newer
+  ;; than this run's horizon: 'gone, for conversations that may have
+  ;; committed. At 32 bits the birthday bound puts that at one percent
+  ;; after about nine thousand restarts, which a long-lived service reaches.
+  (define incarnation (conv-hex/n! 16))
 
   (define (conversation-id!)
     (let ((hex (conv-hex!)) (n (node-self))
@@ -825,7 +837,11 @@
                        ;; is harmless: every wake re-reads the phase and
                        ;; the start time, so a step that began meanwhile
                        ;; simply gets its own deadline computed next.
-                       (let ((tick (max 50 (div ttl 4))))
+                       ;; ...and never longer than the TTL itself. A floor
+                       ;; of 50ms against a smaller TTL meant the watchdog
+                       ;; was still asleep from the parked phase while a
+                       ;; whole step ran and finished past its allowance.
+                       (let ((tick (min ttl (max 50 (div ttl 4)))))
                          (let loop ()
                            (sleep-ms
                              (if (unbox running-box)
@@ -917,11 +933,24 @@
                          (raise 'conversation-expired))))
 
                    (let ((final (flow req suspend!)))
-                     (step-state-reply-set! st final)
-                     (step-state-awaiting-set! st #f)
-                     (set-phase! st 'completed)
-                     (set-box! settled-box #t)
-                     (tomb-record! id)
+                     ;; ONE INDIVISIBLE ACT. The watchdog reads the running
+                     ;; flag and the clock; between a flow returning and its
+                     ;; completion being published there were four separate
+                     ;; writes, and the deadline can fall inside them. The
+                     ;; watchdog then found a step still marked running and
+                     ;; past its allowance, killed a conversation that had
+                     ;; ALREADY COMMITTED, and left no tombstone -- so the
+                     ;; caller was told 'gone, which this library documents
+                     ;; as a rollback guarantee. Committing and then being
+                     ;; told it did not happen is the one outcome none of
+                     ;; the rest of this file is worth anything without.
+                     (with-interrupts-disabled
+                       (step-state-reply-set! st final)
+                       (step-state-awaiting-set! st #f)
+                       (set-phase! st 'completed)
+                       (set-box! settled-box #t)
+                       (tomb-insert! id))
+                     (tomb-prune!)
                      (send who (vector 'conv-reply tag final 'done))
                      ;; LINGER, then unregister.
                      ;;
