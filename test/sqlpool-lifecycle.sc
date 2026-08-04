@@ -48,6 +48,17 @@
             (loop))
           (`#(db-quit) 'done))))))
 
+;; A stand-in that reports up, is adopted, and dies at once -- what a peer
+;; that accepts and then drops the connection looks like from in here.
+(define stillborn-spawns 0)
+(define (stillborn-spawn-conn! notify report-to ref)
+  (set! stillborn-spawns (+ stillborn-spawns 1))
+  (spawn
+    (lambda ()
+      (send report-to (vector 'db-up ref self 'ok))
+      (receive (`#(db-adopt) 'ok))
+      'gone)))
+
 ;; A stand-in that comes up and then never answers anything: what is left
 ;; when only a deadline can end the call.
 (define (mute-spawn-conn! notify report-to ref)
@@ -312,6 +323,28 @@
             (newline)
             (check "one connection is never leased to two borrowers at once"
               (not (and (unbox a) (unbox b) (eq? (unbox a) (unbox b))))))))
+      (send pool (vector 'db-quit)))
+
+    ;; ---- a connection that dies at once is a FAILED CONNECT ---------------
+    ;;
+    ;; The peer accepted and then dropped it: a database refusing on
+    ;; max_connections, one that requires TLS, a proxy draining, a worker
+    ;; that is listening but useless. Rebuilding those with no delay is not
+    ;; a rebuild, it is a spin -- measured at 38k connect/close cycles in
+    ;; three seconds against a socket that accepted and closed, on the one
+    ;; OS thread, churning a file descriptor each time.
+    ;;
+    ;; The bound here is deliberately loose. What it has to separate is
+    ;; "backed off" from "as fast as the machine will go", and those differ
+    ;; by four orders of magnitude.
+    (set! stillborn-spawns 0)
+    (let ((pool (spawn (lambda () (sql-pool-loop 1 stillborn-spawn-conn! cfg)))))
+      (sleep-ms 1500)
+      (check "a connection that dies at once is retried with backoff"
+             (< stillborn-spawns 12))
+      (display (string-append "  [info] rebuilds in 1.5s against a peer that "
+                              "accepts and closes: "
+                              (number->string stillborn-spawns) "\n"))
       (send pool (vector 'db-quit)))
 
     ;; ---- the deadlines belong to the CONFIG -------------------------------
