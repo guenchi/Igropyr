@@ -85,7 +85,7 @@ Independent libraries:
 
 - **WebSocket (websocket.sc)**: RFC 6455 codec, handshake, frame masking, fragmentation, ping/pong. Each socket is a green process that calls a user session handler.
 
-- **JSON, gen-server, pubsub, Redis, MySQL, PostgreSQL**: Standalone libraries with no interdependencies (except JSON uses Scheme primitives, gen-server uses actor, pubsub uses gen-server+actor, redis/mysql/postgresql use actor+uv; MySQL and PostgreSQL share the `(igropyr sqlpool)` connection-pool engine).
+- **JSON, gen-server, pubsub, Redis, MySQL, PostgreSQL**: Standalone libraries with no interdependencies (except JSON uses Scheme primitives, gen-server uses actor, pubsub uses gen-server+actor, redis/mysql/postgresql use actor+uv; MySQL, PostgreSQL and the render pool share the `(igropyr connpool)` connection-pool engine).
 
 ### Data Flow: An HTTP Request
 
@@ -2263,7 +2263,7 @@ From the HTTP perspective, the database query is non-blocking: the worker's proc
 
 ### PostgreSQL
 
-The PostgreSQL client speaks protocol 3.0 and follows the same design as MySQL: one green process per connection, queries synchronous (the caller parks until the reply), the PostgreSQL request-response protocol serialized through the connection's mailbox. It shares the same `(igropyr sqlpool)` connection-pool engine, so pooling, transactions and self-healing behave identically.
+The PostgreSQL client speaks protocol 3.0 and follows the same design as MySQL: one green process per connection, queries synchronous (the caller parks until the reply), the PostgreSQL request-response protocol serialized through the connection's mailbox. It shares the same `(igropyr connpool)` connection-pool engine, so pooling, transactions and self-healing behave identically.
 
 #### Basic Usage
 
@@ -2377,11 +2377,13 @@ For applications with many concurrent workers, use `postgresql-pool` instead of 
 - `client_encoding` is pinned to `UTF8` and cannot be changed.
 - `COPY FROM STDIN` is refused via `CopyFail` (it surfaces as a server error); `COPY TO STDOUT` raises `0A000`.
 
-### The `(igropyr sqlpool)` Engine
+### The `(igropyr connpool)` Engine
 
 This subsection is for authors building a **third** SQL driver; applications never touch it directly.
 
-`(igropyr mysql)` and `(igropyr postgresql)` sit on one shared engine, `(igropyr sqlpool)`. It owns the whole pool architecture — a fixed pool of connections behind a dispatcher, whole-connection leases for transactions, and monitor-based crash reclaim — while staying **protocol-blind**: the wire protocol, authentication and result parsing stay in each driver. Keeping it a single copy means a fix to a subtle race (checkout-cancel, reclaim of a borrower killed mid-transaction, adoption of a worker that finished connecting after its pool is gone) can never land in one driver but not the other.
+`(igropyr mysql)`, `(igropyr postgresql)` and `(igropyr qjspool)` sit on one shared engine, `(igropyr connpool)`. It owns the whole pool architecture — a fixed pool of connections behind a dispatcher, whole-connection leases, and monitor-based crash reclaim — while staying **protocol-blind**: the wire protocol, authentication and result parsing stay in each driver. Keeping it a single copy means a fix to a subtle race (checkout-cancel, reclaim of a borrower killed mid-lease, adoption of a worker that finished connecting after its pool is gone, refusing to re-lend a connection already on its way out) can never land in one driver but not the others.
+
+It was written for the two SQL drivers and was called `sqlpool`. What it models is both narrower than SQL and wider: a scarce **exclusive** resource whose work happens on the far side of a socket, borrowed for the length of one request. Adding the render pool as a third driver needed exactly one generalization — the deadlines moved from module constants into the per-driver config, because a minute is right for a database and wrong for a render — and nothing else.
 
 Exports:
 
