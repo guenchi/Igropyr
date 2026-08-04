@@ -606,6 +606,55 @@
         (fail "a settled caller received further replies" extra))
       (display "a caller that was already answered is not answered again ok\n"))))
 
+;; ---- a key that hangs during the linger is still bounded ----------------
+;;
+;; safe-key marks the phase running precisely so that a key function
+;; which never returns is the watchdog's problem. That only held while
+;; the conversation was unsettled: the kill also asked for NOT settled,
+;; and the linger -- when replays actually arrive -- is settled by
+;; definition. A hung key there took the conversation, its caller, and
+;; every later request to that id with it, for the life of the VM.
+;;
+;; Killing a settled conversation costs nothing: its value is published
+;; and its tombstone written, so the caller falls back to the record and
+;; is told 'settled. What must NOT happen is the compensation running --
+;; the flow committed.
+(let ((released (box 0)))
+  (let-values (((hid htok hfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (vector 'committed a)))
+                  'go
+                  120
+                  (lambda (r)                     ; hangs, only on replay
+                    (if (eq? r 'HANG) (sleep-ms 60000) (void))
+                    r)
+                  (lambda () (set-box! released (+ 1 (unbox released)))))))
+    (let-values (((r st) (conversation-resume! hid htok 'confirm)))
+      (unless (conversation-done? st) (fail "hung-key setup" st)))
+    ;; ...and now a replay whose key never comes back
+    (let ((me self))
+      (spawn (lambda ()
+               (let* ((t0 (now-ms)))
+                 (let-values (((r2 st2)
+                               (guard (e (#t (values 'raised 'raised)))
+                                 (conversation-resume! hid htok 'HANG))))
+                   (send me (vector 'hung (- (now-ms) t0) st2))))))
+      (receive (after 8000
+                 (fail "a hung key during the linger was never bounded" 'no-answer))
+        (`#(hung ,took ,status)
+          (when (> took 4000)
+            (fail "a hung key was bounded only by its own sleep" took))
+          (unless (memq status '(settled done raised))
+            (fail "a replay past a hung key got the wrong answer" status))
+          (sleep-ms 200)
+          (unless (= 0 (unbox released))
+            (fail "a committed flow was compensated for a hung key"
+                  (unbox released)))
+          (display (string-append "a key that hangs after settling is bounded ("
+                                  (number->string took) "ms) ok\n")))))))
+
 ;; ---- the kill happens ON TIME, not eventually ---------------------------
 ;;
 ;; Every other watchdog case here asserts only that the sentinel value did
@@ -635,37 +684,61 @@
             (fail "a runaway step ran to completion" v))
           (set-box! kill-latency took))))))
 
-;; THE BEST OF SEVERAL, not one measurement. now-ms is a wall clock, so a
-;; collection or a host pause lands inside `took` and would fail a run
-;; whose behaviour was right. Losing the notification costs every trial
-;; the poll floor, so a single trial under it is enough to show the
-;; notification arrived -- while no single slow trial can condemn it.
-(let ((best (unbox kill-latency)))
-  (do ((i 0 (+ i 1))) ((= i 2))
-    (let ((ttl 20))
+;; MEASURED FROM THE STEP, and only when there was one.
+;;
+;; Timing from the caller's side measures two things it should not. A
+;; resume that arrives after the park deadline is refused outright, and
+;; the 2000ms step never starts -- an all-but-instant answer that would
+;; have become the best sample and proved nothing. And the watchdog's
+;; poll is already part-elapsed when a step begins, so what a caller
+;; sees on the polling path is the REMAINDER of a 50ms wait, which can
+;; be almost nothing. Both are removed by starting the clock in the step
+;; itself: from there the notification path costs about the TTL, and the
+;; poll path cannot cost less than the floor minus the park window the
+;; step had to start inside.
+;;
+;; Best of several, because now-ms is a wall clock and a collection
+;; lands in the measurement; a lost notification costs EVERY trial, so
+;; one good sample is enough to show it arrived and no slow one can
+;; condemn it.
+(let ((best (unbox kill-latency))
+      (samples 0))
+  (do ((i 0 (+ i 1))) ((= i 3))
+    (let ((ttl 20)
+          (started (box #f)))
       (let-values (((kid ktok kfirst)
                     (conversation-start!
                       (lambda (req suspend!)
                         (let ((a (suspend! (vector 'parked req))))
+                          (set-box! started (now-ms))
                           (sleep-ms 2000)
                           (vector 'should-not-get-here a)))
                       'go
                       ttl)))
         (let ((me self))
           (spawn (lambda ()
-                   (let* ((t0 (now-ms)))
-                     (let-values (((r st) (conversation-resume! kid ktok 'X)))
-                       (send me (vector 'latency (- (now-ms) t0) r))))))
+                   (let-values (((r st) (conversation-resume! kid ktok 'X)))
+                     (send me (vector 'latency (now-ms) r)))))
           (receive (after 6000 (void))
-            (`#(latency ,took ,v)
-              (when (< took best) (set! best took))))))))
-  ;; told: ~ttl. Noticed on the poll: the floor is 50ms, and a lost
-  ;; notification costs it on every trial.
-  (unless (< best 45)
+            (`#(latency ,at ,v)
+              (when (and (vector? v) (eq? (vector-ref v 0) 'should-not-get-here))
+                (fail "a runaway step ran to completion" v))
+              ;; no step, no sample: the resume was refused and the thing
+              ;; being timed never happened
+              (when (unbox started)
+                (set! samples (+ samples 1))
+                (let ((took (- at (unbox started))))
+                  (when (< took best) (set! best took))))))))))
+  (when (= samples 0)
+    (fail "no trial started a step: nothing was timed" samples))
+  ;; told: ttl plus the grace. Noticed on the poll: the floor is 50 and
+  ;; the step had to begin inside a 20ms park window, so 30 is the least
+  ;; it can cost measured from the step.
+  (unless (< best 30)
     (fail "the kill waited for a poll instead of being told" best))
-  (display (string-append "a runaway step is stopped in "
+  (display (string-append "a runaway step is stopped "
                           (number->string best)
-                          "ms on a 20ms TTL (best of 3) ok\n")))
+                          "ms after it started, on a 20ms TTL ok\n")))
 
 ;; ---- a step that lands inside the grace tick is NOT killed --------------
 ;;
@@ -708,14 +781,60 @@
   (unless (= both 0)
     (fail "a flow that returned its value also had its compensation run"
           (list both n)))
-  ;; ...and the grace period is what makes that possible. Without it the
-  ;; decision is retaken in the same instant it was made, so every step
-  ;; that was running at the sample dies -- 20 of 20, against 3 to 9 with
-  ;; the millisecond in place.
-  (unless (< killed n)
-    (fail "every overrunning step was killed: the grace tick bought nothing"
-          killed))
   (display (string-append "a committed flow is never also released ("
+                          (number->string killed) "/"
+                          (number->string n) " killed) ok\n")))
+
+;; ...AND THE GRACE PERIOD IS WHAT BUYS THAT, measured where the answer is
+;; not a coin toss. Two milliseconds past the allowance, a step that is
+;; still running when the watchdog first looks has almost always finished
+;; by the time it looks again: 0 of 25 killed here, against 25 of 25 with
+;; the millisecond removed. Four milliseconds past, both numbers climb and
+;; the gap closes -- which is why the case above uses that value for the
+;; exclusivity property and this one does not: an assertion on a rate has
+;; to sit somewhere the rate is flat, or a host that oversleeps by one
+;; millisecond fails it on correct code.
+;; THE STEP PARKS rather than finishing outright, because that is the
+;; case the re-check still protects: a flow that suspended has not
+;; settled, so killing it DOES run its compensation -- work released for
+;; a conversation that was healthy and waiting. A flow that finished is
+;; covered by the exclusivity property above and by nothing here.
+(let* ((ttl 20)
+       (d (+ ttl 2))
+       (n 20)
+       (killed 0))
+  (do ((i 0 (+ i 1))) ((= i n))
+    (let ((released (box #f)))
+      (guard (e (#t (void)))
+        (let-values (((gid gtok gfirst)
+                      (conversation-start!
+                        (lambda (req suspend!)
+                          (sleep-ms d)
+                          (let ((a (suspend! (vector 'parked 'x))))
+                            (vector 'done a)))
+                        'go
+                        ttl
+                        (lambda (x) x)
+                        (lambda () (set-box! released #t)))))
+          ;; finish it at once, so the park deadline is not what ends it
+          (guard (e (#t (void)))
+            (let-values (((r st) (conversation-resume! gid gtok 'go)))
+              (void)))))
+      (sleep-ms 40)
+      (when (unbox released) (set! killed (+ killed 1)))))
+  ;; WHAT THIS SEPARATES AND WHAT IT DOES NOT. Removing the grace
+  ;; entirely kills all 40 of 40 here against 0 of 40 with it, which is
+  ;; the assertion below. Removing only the re-check INSIDE the grace is
+  ;; separated much less: 3 of 40 against 0, rising to 40 against 18 two
+  ;; milliseconds further out, where a host that oversleeps by one
+  ;; millisecond would fail the tighter bound on correct code. Every
+  ;; point on that curve moves together under a host shift, so no rate
+  ;; threshold pins it. It is left uncovered rather than covered by
+  ;; something that would fire on a slower machine.
+  (unless (< killed (div n 2))
+    (fail "a step that parked during the grace tick was killed anyway"
+          killed))
+  (display (string-append "the grace tick spares a step that parks in it ("
                           (number->string killed) "/"
                           (number->string n) " killed) ok\n")))
 
@@ -761,12 +880,15 @@
   (unless (= hits 0)
     (fail "a later step ran unbounded after the watchdog declined to kill"
           hits))
-  ;; ...AND THE SWEEP HAS TO HAVE SWEPT SOMETHING. Every trial whose first
-  ;; step was killed proves nothing about a second step, because there was
-  ;; none. If they were all killed, `hits = 0` is vacuous and this run says
-  ;; nothing at all -- which is a failure of the test, not a pass.
+  ;; ...AND SOME TRIAL HAS TO HAVE HAD A SECOND STEP. This is weaker than
+  ;; it looks and is labelled for what it is: a trial that survived its
+  ;; first step did not necessarily go through the decline branch, so this
+  ;; rules out only the emptiest way for `hits = 0` to mean nothing. What
+  ;; the branch was actually entered by, measured with instrumentation, is
+  ;; roughly a third of the trials at the middle of the sweep and none at
+  ;; either end -- which no assertion here can see.
   (when (= survived 0)
-    (fail "no trial got past its first step: the sweep proved nothing"
+    (fail "no trial got past its first step: nothing had a second step"
           survived))
   (display "the watchdog keeps watching after declining to kill ok\n"))
 
