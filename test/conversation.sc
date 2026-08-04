@@ -530,6 +530,80 @@
       (fail "an id older than this process was not reported unknown" state)))
   (display "an id older than this incarnation -> unknown ok\n"))
 
+;; ...and an id from ANOTHER incarnation is unknown however NEW it looks.
+;;
+;; now-ms is uv_hrtime: monotonic, with an origin nobody promises anything
+;; about. Across a host reboot it starts over near zero, so an id minted
+;; before the reboot carries a LARGER number than the fresh horizon and
+;; would read as "newer than anything I have forgotten" -- 'gone, for a
+;; conversation that may well have committed. Comparing timestamps only
+;; within the run that wrote them is what makes the horizon mean anything.
+(let ((from-another-run "deadbeef.zzzzzzzzzz-00112233445566778899aabbccddeeff"))
+  (let-values (((state token reply) (conversation-peek from-another-run)))
+    (when (conversation-gone? state)
+      (fail "an id from another incarnation was reported as rolled back" state))
+    (unless (conversation-unknown? state)
+      (fail "an id from another incarnation was not reported unknown" state)))
+  (display "an id from another incarnation -> unknown, however new it looks ok\n"))
+
+;; A timestamp field nobody would ever mint is not parsed at all. Exact
+;; integers in Chez do not overflow, they GROW: a few million base36 digits
+;; would be multiplied one at a time into an ever larger bignum, and a
+;; single lookup would occupy a worker for as long as that takes.
+;; Built from a REAL id, so it carries this run's own incarnation and gets
+;; past that check -- otherwise the incarnation mismatch refuses it first
+;; and the length bound is never reached.
+(let* ((absurd-id-from
+        (lambda (real)
+          (let* ((len (string-length real))
+                 (dot (let loop ((i 0))
+                        (cond ((= i len) #f)
+                              ((char=? (string-ref real i) #\.) i)
+                              (else (loop (+ i 1))))))
+                 (dash (and dot (let loop ((i (+ dot 1)))
+                                  (cond ((= i len) #f)
+                                        ((char=? (string-ref real i) #\-) i)
+                                        (else (loop (+ i 1))))))))
+            (and dot dash
+                 (string-append (substring real 0 (+ dot 1))
+                                (make-string 200000 #\z)
+                                (substring real dash len))))))
+       (probe (let-values (((pid ptok pfirst)
+                            (conversation-start!
+                              (lambda (req suspend!) 'done) 'go 300)))
+                pid))
+       (absurd (or (absurd-id-from probe)
+                   (fail "could not build an absurd id from" probe))))
+  (let* ((t0 (now-ms))
+         (r (guard (e (#t 'raised))
+              (let-values (((state token reply) (conversation-peek absurd)))
+                state)))
+         (took (- (now-ms) t0)))
+    (unless (or (eq? r 'unknown) (eq? r 'raised))
+      (fail "an absurd id was not refused" r))
+    (when (> took 500)
+      (fail "an absurd id was parsed rather than refused" took))
+    (display (string-append "a 200k-digit timestamp is refused in "
+                            (number->string took) "ms ok\n"))))
+
+;; A predicate that answers with no value, or with several, is not a raise
+;; -- so a guard wrapped only around the call let the wrong-number-of-values
+;; condition escape into the caller and take the whole public call down,
+;; instead of leaving 'unknown standing.
+(let ((forgotten "1-00112233445566778899aabbccddeeff"))
+  (for-each
+    (lambda (bad)
+      (let ((r (guard (e (#t 'escaped))
+                 (let-values (((state token reply)
+                               (conversation-peek forgotten bad)))
+                   state))))
+        (unless (eq? r 'unknown)
+          (fail "a predicate with the wrong value count escaped" r))))
+    (list (lambda (id) (values))
+          (lambda (id) (values #t #f))
+          (lambda (id) (values 1 2 3))))
+  (display "a predicate answering with no value or several leaves unknown ok\n"))
+
 ;; The record is bounded, and past its age this node stops being able to
 ;; speak for the conversation at all. It used to answer 'gone there --
 ;; which this library documents as "the transaction rolled back" -- for a

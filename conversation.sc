@@ -206,7 +206,6 @@
             (mutable key)          ; key of the request that was accepted
             (mutable reply)        ; what accepting it produced
             (mutable steps)        ; completed suspends, for the watchdog
-            (mutable issued)       ; every token handed out by this dialogue
             running-box run-start-box))
 
   ;; ENTERING 'running starts the clock; re-marking a phase that is already
@@ -230,8 +229,8 @@
   (define (token=? a b)
     (and a b (string? a) (string? b) (string=? a b)))
 
-  ;; The next token, guaranteed different from EVERY token this
-  ;; conversation has issued -- not merely from the one just spent.
+  ;; The next token, different from every token this conversation has
+  ;; issued -- BY CONSTRUCTION, because it names the step it belongs to.
   ;;
   ;; Excluding only the previous one left the invariant probabilistic where
   ;; it mattered: a token repeating one from two steps back becomes the
@@ -241,11 +240,15 @@
   ;; sender receives that step's reply. Sixty-four random bits make it
   ;; unlikely; the list makes it impossible, and the list is one entry per
   ;; suspend of one conversation.
-  (define (fresh-token issued)
-    (let loop ((t (conv-token!)))
-      (if (memp (lambda (x) (token=? t x)) issued)
-          (loop (conv-token!))
-          t)))
+  ;; Keeping every issued token in a list made uniqueness a property of
+  ;; MEMORY: unbounded for a long dialogue, and quadratic because each new
+  ;; token scanned the whole history. A step number in the token makes it a
+  ;; property of the token itself -- two steps cannot collide however many
+  ;; there have been -- and costs one small string. The random half is
+  ;; unchanged and is still what makes a token unguessable; the step number
+  ;; is not a secret and was never doing that work.
+  (define (fresh-token step)
+    (string-append (ms->b36 step) "-" (conv-token!)))
 
   ;; THE RULES. key-of is a thunk, so an invented token costs no application
   ;; code at all: only a request that already matched the spent token is
@@ -401,18 +404,30 @@
   ;; and the first then drops whatever moved up, which is a YOUNGER record
   ;; still inside both limits. The transaction it belonged to answers
   ;; 'gone afterwards, and 'gone is documented as "rolled back".
-  (define (tomb-prune!)
+  ;; One POP is atomic; the sweep is not. Holding interrupts across the
+  ;; whole loop -- a list reversal plus every expired entry, with a limit
+  ;; the caller sets and nothing in the source bounding it -- stops the
+  ;; event loop, every step and every watchdog for as long as it runs,
+  ;; while the clock those watchdogs read keeps moving. A step could come
+  ;; back from that already past its deadline and still publish.
+  ;;
+  ;; -> #t if it removed one, so the caller can come back for the next
+  ;; with interrupts on in between.
+  (define (tomb-pop-one-if-stale!)
     (with-interrupts-disabled
-    (let loop ()
-      (when (> tomb-n 0)
-        (when (null? tomb-front)
-          (set! tomb-front (reverse tomb-back))
-          (set! tomb-back '()))
-        (let ((e (and (pair? tomb-front) (car tomb-front))))
-          (when (and e (or (> tomb-n tombstone-max)
-                           (> (- (now-ms) (cdr e)) tombstone-ttl-ms)))
-            (tomb-pop-oldest!)
-            (loop)))))))
+      (and (> tomb-n 0)
+           (begin
+             (when (null? tomb-front)
+               (set! tomb-front (reverse tomb-back))
+               (set! tomb-back '()))
+             (let ((e (and (pair? tomb-front) (car tomb-front))))
+               (and e
+                    (or (> tomb-n tombstone-max)
+                        (> (- (now-ms) (cdr e)) tombstone-ttl-ms))
+                    (begin (tomb-pop-oldest!) #t)))))))
+
+  (define (tomb-prune!)
+    (let loop () (when (tomb-pop-one-if-stale!) (loop))))
 
   (define (tomb-record! id)
     (with-interrupts-disabled
@@ -475,27 +490,59 @@
                                  (else #f))))
                    (and d (loop (+ i 1) (+ (* acc 36) d)))))))))
 
+  ;; WHICH RUN OF THIS PROCESS MINTED IT.
+  ;;
+  ;; now-ms is uv_hrtime: monotonic, with an origin nobody promises
+  ;; anything about. Within one process it is exactly what a horizon needs.
+  ;; Across a HOST REBOOT it starts over near zero, so an id minted before
+  ;; the reboot carries a LARGER number than the new horizon and reads as
+  ;; "newer than anything I have forgotten" -- 'gone, for a conversation
+  ;; that may well have committed. That is the reading this whole change
+  ;; exists to remove, arrived at from the other side.
+  ;;
+  ;; So the timestamp is only ever compared within the run that wrote it.
+  ;; The incarnation says which run that was; anything else is 'unknown.
+  (define incarnation (conv-hex/n! 4))
+
   (define (conversation-id!)
     (let ((hex (conv-hex!)) (n (node-self))
           (stamp (ms->b36 (now-ms))))
       (if n
-          (string-append (symbol->string n) "~" stamp "-" hex)
-          (string-append stamp "-" hex))))
+          (string-append (symbol->string n) "~" incarnation "." stamp "-" hex)
+          (string-append incarnation "." stamp "-" hex))))
 
-  ;; When this id was made, or #f if it does not say. #f is what every id
-  ;; minted before this format existed reads as, and it is treated exactly
-  ;; like "older than anything I remember" -- the safe direction.
+  ;; When this id was made, or #f if THIS RUN cannot say. #f covers an id
+  ;; from another incarnation, an id in the pre-incarnation format, and an
+  ;; id that is simply malformed -- all of which are treated the same way,
+  ;; as "older than anything I remember", which is the safe direction.
+  ;;
+  ;; The timestamp field is length-capped before it is converted. Exact
+  ;; integers do not overflow in Chez, they GROW: a few million base36
+  ;; digits from a stranger would otherwise be multiplied one at a time
+  ;; into an ever larger bignum, which is a whole worker for one lookup.
+  ;; Twelve digits covers any value uv_hrtime will produce.
+  (define max-stamp-chars 12)
+
   (define (conv-created-at id)
     (let* ((len (string-length id))
            (start (let loop ((i 0))
                     (cond ((= i len) 0)
                           ((char=? (string-ref id i) #\~) (+ i 1))
                           (else (loop (+ i 1))))))
-           (dash (let loop ((i start))
-                   (cond ((= i len) #f)
-                         ((char=? (string-ref id i) #\-) i)
-                         (else (loop (+ i 1)))))))
-      (and dash (b36->ms (substring id start dash)))))
+           (dot (let loop ((i start))
+                  (cond ((= i len) #f)
+                        ((char=? (string-ref id i) #\.) i)
+                        ((char=? (string-ref id i) #\-) #f)   ; no incarnation
+                        (else (loop (+ i 1))))))
+           (dash (and dot
+                      (let loop ((i (+ dot 1)))
+                        (cond ((= i len) #f)
+                              ((char=? (string-ref id i) #\-) i)
+                              (else (loop (+ i 1))))))))
+      (and dot dash
+           (string=? (substring id start dot) incarnation)
+           (<= (- dash (+ dot 1)) max-stamp-chars)
+           (b36->ms (substring id (+ dot 1) dash)))))
 
   ;; owner node of an id, or #f (bare id -> single node, always local)
   (define (conv-owner id)
@@ -780,7 +827,7 @@
                                 (guard (e (#t (void))) (on-killed))))
                              (else (loop))))))))
                  (let ((who starter) (tag ref)
-                       (st (make-step-state 'running #f #f #f #f 0 '()
+                       (st (make-step-state 'running #f #f #f #f 0
                                             running-box run-start-box)))
 
                    ;; The one place application code is run on an incoming
@@ -804,10 +851,8 @@
 
                    (define (suspend! reply)
                      (step-state-steps-set! st (+ 1 (step-state-steps st)))
-                     (let ((t (fresh-token (step-state-issued st))))
-                       (step-state-issued-set! st
-                         (cons t (step-state-issued st)))
-                       (step-state-awaiting-set! st t))
+                     (step-state-awaiting-set! st
+                       (fresh-token (step-state-steps st)))
                      (step-state-reply-set! st reply)
                      (set-box! step-box (step-state-steps st))
                      (set-phase! st 'parked)
@@ -906,10 +951,19 @@
   ;; down either.
   (define (resolve-unknown id status settled?)
     (if (and settled? (eq? status 'unknown))
-        (let ((v (guard (e (#t 'unknown)) (settled? id))))
-          (cond ((eq? v #t) 'settled)
-                ((eq? v #f) 'gone)
-                (else 'unknown)))
+        ;; call-with-values and a variadic consumer, both INSIDE the guard.
+        ;; A predicate that returns no value or several is not a raise, so
+        ;; it escaped a guard that only wrapped the call: the wrong-number
+        ;; -of-values condition was signalled when the result met a
+        ;; single-value binding, outside the handler, and took the whole
+        ;; public call down instead of leaving 'unknown standing.
+        (guard (e (#t 'unknown))
+          (call-with-values
+            (lambda () (settled? id))
+            (lambda v
+              (cond ((and (pair? v) (null? (cdr v)) (eq? (car v) #t)) 'settled)
+                    ((and (pair? v) (null? (cdr v)) (eq? (car v) #f)) 'gone)
+                    (else 'unknown)))))
         status))
 
   (define (opt-settled? rest who)
