@@ -352,12 +352,16 @@
     (define stat-checkout-timeouts 0)    ; callers that gave up waiting
     (define stat-connects 0)             ; workers that came up
     (define stat-connect-failures 0)
-    (define stat-connections-lost 0)     ; live connections that DIED
-    ;; ...as against stood down on schedule. Rolling a retirement into the
-    ;; loss count makes a pool recycling exactly as told look like one
-    ;; whose peer keeps dropping it, and that number is what an operator
-    ;; reads to tell those apart.
+    ;; THREE WAYS A LIVE CONNECTION ENDS, counted apart because the number
+    ;; an operator reads to decide whether a peer is flaky must not have
+    ;; the other two mixed into it. Lost is the peer's doing; retired is
+    ;; the connection standing down on schedule; discarded is this pool
+    ;; deciding to drop one -- a lease that escaped broken, or a borrower
+    ;; that died holding it. The same three names drive the backoff a few
+    ;; hundred lines down, and are read from the same place.
+    (define stat-connections-lost 0)
     (define stat-connections-retired 0)
+    (define stat-connections-discarded 0)
     (define stat-queue-wait-total 0)     ; ms a statement spent queued
     (define stat-queue-wait-max 0)
     (define stat-checkout-wait-total 0)  ; ms a borrower spent waiting
@@ -655,6 +659,7 @@
                 (cons 'connect-failures stat-connect-failures)
                 (cons 'connections-lost stat-connections-lost)
                 (cons 'connections-retired stat-connections-retired)
+                (cons 'connections-discarded stat-connections-discarded)
                 ;; latency: total + max, with the count above them, so the
                 ;; mean is total/count and the tail is not averaged away
                 (cons 'queue-wait-ms-total stat-queue-wait-total)
@@ -735,6 +740,7 @@
              ;; few lines down, so anything that wants to know why has to
              ;; ask here.
              (let* ((why (hashtable-ref dying pid #f))
+                    ;; deliberate = not the peer's doing, so no backoff
                     (deliberate (memq why '(teardown retired)))
                     (born (hashtable-ref up-at pid #f))
                     (stillborn (and (not deliberate) born
@@ -742,9 +748,13 @@
                (hashtable-delete! up-at pid)
                (set! idle (remq pid idle))
                (hashtable-delete! dying pid)
-               (if (eq? why 'retired)
-                   (set! stat-connections-retired (+ stat-connections-retired 1))
-                   (set! stat-connections-lost (+ stat-connections-lost 1)))
+               (case why
+                 ((retired)
+                  (set! stat-connections-retired (+ stat-connections-retired 1)))
+                 ((teardown)
+                  (set! stat-connections-discarded (+ stat-connections-discarded 1)))
+                 (else
+                  (set! stat-connections-lost (+ stat-connections-lost 1))))
                (let ((entry (hashtable-ref busy pid #f)))
                  (hashtable-delete! busy pid)
                  (when entry
