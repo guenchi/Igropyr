@@ -391,7 +391,7 @@
   (lambda ()
     (define (connect-error . args)        ; -> the raised error vector or #f
       (guard (e (#t e))
-        (postgreconnpool-close! (apply postgresql-connect args))
+        (postgresql-close! (apply postgresql-connect args))
         #f))
 
     (tcp-listen! "127.0.0.1" port 16
@@ -413,7 +413,7 @@
     (let ((conn (postgresql-connect "127.0.0.1" port "user" scram-password "scram"))
           (me self))
       (let ((m (monitor conn)))
-        (spawn (lambda () (guard (e (#t 'ok)) (postgreconnpool-call conn "SILENT"))))
+        (spawn (lambda () (guard (e (#t 'ok)) (postgresql-query conn "SILENT"))))
         (sleep-ms 200)
         (let ((t0 (now-ms)))
           (send conn (vector 'pool-quit))
@@ -429,15 +429,15 @@
     (let ((conn (postgresql-connect "127.0.0.1" port "user" scram-password "scram")))
       (check "scram-auth-verified" #t)
       ;; 2. fragmented T/D/C/Z reassembly + NULL column
-      (let ((r (postgreconnpool-call conn "SELECT anything")))
+      (let ((r (postgresql-query conn "SELECT anything")))
         (check "fragmented-rows"
           (equal? r (vector 'rows '("a" "b") '(("42" #f))))))
       ;; 3. COPY FROM STDIN -> CopyFail -> server SQL error, connection
       ;;    stays framed and usable
       (check "copy-in-refused-sqlstate"
         (guard (e (#t (and (vector? e) (equal? (vector-ref e 1) "57014"))))
-          (postgreconnpool-call conn "COPY t FROM STDIN") #f))
-      (let ((r (postgreconnpool-call conn "SELECT again")))
+          (postgresql-query conn "COPY t FROM STDIN") #f))
+      (let ((r (postgresql-query conn "SELECT again")))
         (check "usable-after-copy-error"
           (equal? r (vector 'rows '("a" "b") '(("42" #f))))))
       ;; extended protocol: the server echoes the Bind parameters back,
@@ -467,10 +467,10 @@
           (apply postgresql-execute conn "SELECT 1"
                  (vector->list (make-vector 65536 1)))
           #f))
-      (let ((r (postgreconnpool-call conn "SELECT after-overflow")))
+      (let ((r (postgresql-query conn "SELECT after-overflow")))
         (check "usable-after-param-overflow"
           (equal? r (vector 'rows '("a" "b") '(("42" #f))))))
-      (postgreconnpool-close! conn))
+      (postgresql-close! conn))
 
     ;; 4. wrong password -> SQLSTATE 28P01 from the server verifier
     (let ((e (connect-error "127.0.0.1" port "user" "wrong" "scram")))
@@ -494,12 +494,12 @@
     (let ((conn (postgresql-connect "127.0.0.1" port "user" clear-password
                                     "cleartext" '((allow-cleartext-auth . #t)))))
       (check "cleartext-opt-in-works" #t)
-      (postgreconnpool-close! conn))
+      (postgresql-close! conn))
 
     ;; 7. notices during auth are informational, not fatal
     (let ((conn (postgresql-connect "127.0.0.1" port "user" scram-password "notice")))
       (check "notice-during-auth-tolerated" #t)
-      (postgreconnpool-close! conn))
+      (postgresql-close! conn))
 
     ;; 7b. A server that keeps the handshake alive forever with legal
     ;; notices must still be given up on -- BY THE WORKER.
@@ -550,7 +550,7 @@
           (base-procs (process-count)))
       (let ((pool (postgresql-pool 2 "127.0.0.1" port "user" scram-password "scram")))
         ;; wait until both connections are actually up and serving
-        (postgreconnpool-call pool "SELECT 1")
+        (postgresql-query pool "SELECT 1")
         (sleep-ms 500)
         (let ((busy-conns (conn-count)))
           (check "pool-connections-established" (> busy-conns base-conns))
@@ -599,7 +599,7 @@
       (let ((pool (postgresql-pool 1 "127.0.0.1" port "user" scram-password "scram")))
         (spawn (lambda ()
                  (guard (e (#t (send me (vector 'q 'failed))))
-                   (postgreconnpool-call pool "DRIP forever")
+                   (postgresql-query pool "DRIP forever")
                    (send me (vector 'q 'returned)))))
         (sleep-ms 800)
         (let ((busy (conn-count)))

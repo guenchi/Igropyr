@@ -18,6 +18,10 @@ export CHEZSCHEMELIBDIRS=.
 export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
 
 "$scheme_bin" --script igropyr/test/import-all.sc
+# the names applications import, each named ONE BY ONE: a rename that
+# rewrites a substring inside them moves every use with every definition,
+# so nothing else in the suite would notice
+"$scheme_bin" --script igropyr/test/public-names.sc
 IGROPYR_CONTRACTS=full "$scheme_bin" --script igropyr/test/checked-full.sc
 env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/smoke-actor.sc

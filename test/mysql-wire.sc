@@ -211,7 +211,7 @@
     (let ((conn (mysql-connect "127.0.0.1" port "user" "pw" "db"))
           (me self))
       (let ((m (monitor conn)))
-        (spawn (lambda () (guard (e (#t 'ok)) (myconnpool-call conn "SELECT never"))))
+        (spawn (lambda () (guard (e (#t 'ok)) (mysql-query conn "SELECT never"))))
         (sleep-ms 200)
         (let ((t0 (now-ms)))
           (send conn (vector 'pool-quit))
@@ -229,12 +229,12 @@
     (set-box! fragment-bytes 65536)
     (set-box! fragment-gap-ms 0)
     (let ((conn (mysql-connect "127.0.0.1" port "user" "pw" "db")))
-      (let ((r (myconnpool-call conn "SELECT v")))
+      (let ((r (mysql-query conn "SELECT v")))
         (check "handshake completes and a result set parses"
           (and (vector? r) (eq? (vector-ref r 0) 'rows)))
         (check "the row value survives"
           (equal? '(("xxxxxxxx")) (vector-ref r 2))))
-      (myconnpool-close! conn))
+      (mysql-close! conn))
 
     ;; ---- reassembly across fragment boundaries ---------------------------
     ;; 8 MiB arriving in 256 separate reads. This is the case the buffer
@@ -260,7 +260,7 @@
     (set-box! fragment-gap-ms 1)
     (let ((conn (mysql-connect "127.0.0.1" port "user" "pw" "db")))
       (let* ((t0 (now-ms))
-             (r (myconnpool-call conn "SELECT v"))
+             (r (mysql-query conn "SELECT v"))
              (ms (- (now-ms) t0)))
         (check "a fragmented multi-megabyte reply parses"
           (and (vector? r) (eq? (vector-ref r 0) 'rows)
@@ -268,7 +268,7 @@
                   (string-length (car (car (vector-ref r 2)))))))
         (display "  [info] 8 MiB in 256 fragments: ") (display ms)
         (display " ms (quadratic reassembly measured 411 ms; see above)\n"))
-      (myconnpool-close! conn))
+      (mysql-close! conn))
 
     ;; ---- a packet the length field cannot describe ------------------------
     ;; 16 MiB and above needs the protocol's continuation split, which this
@@ -282,9 +282,9 @@
     (let ((conn (mysql-connect "127.0.0.1" port "user" "pw" "db")))
       (check "an oversized query is refused, not truncated"
         (guard (e (#t #t))
-          (myconnpool-call conn (make-string (* 17 1024 1024) #\a))
+          (mysql-query conn (make-string (* 17 1024 1024) #\a))
           #f))
-      (myconnpool-close! conn))
+      (mysql-close! conn))
 
     ;; ---- a greeting that never finishes -----------------------------------
     ;; The handshake deadline was stamped after the greeting had been READ,
