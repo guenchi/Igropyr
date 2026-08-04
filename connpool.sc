@@ -380,7 +380,24 @@
     ;; never released, its checkin could no longer find its lease, and its
     ;; death no longer reclaimed a connection that may have held its open
     ;; transaction.
+    ;; THE ONE GATE BACK INTO ROTATION.
+    ;;
+    ;; "a connection already on its way out is never lent again" is one
+    ;; rule, and it used to be written three times -- once at each caller,
+    ;; a round apiece as each route was noticed separately, with a fourth
+    ;; route left unguarded because it happened not to need it. A rule kept
+    ;; at its callers is a rule the next caller silently opts out of. It
+    ;; lives here now, so every route in is covered by construction.
+    (define (conn-dead! c why)
+      (hashtable-delete! busy c)
+      (when (memq c idle) (set! idle (remq c idle)))
+      (mark-dying! c why))
+
     (define (make-available! c)
+      (unless (hashtable-ref dying c #f)
+        (make-available!* c)))
+
+    (define (make-available!* c)
       (hashtable-delete! busy c)
       (when (memq c idle) (set! idle (remq c idle)))
       ;; A dead requester at the head of a queue must not swallow the
@@ -445,23 +462,34 @@
                 (set! stat-completed (+ stat-completed 1))
                 (set! stat-query-total (+ stat-query-total took))
                 (when (> took stat-query-max) (set! stat-query-max took)))
-              ;; Neither of these can be true here, and saying so is the
-              ;; point: a connection is only ever marked dying while it is
-              ;; leased or already off the books, and every route back into
-              ;; the idle set refuses a dying one -- so a dying connection
-              ;; can never hold a busy entry to match this ref against. The
-              ;; guard stays as the statement of that invariant rather than
-              ;; as a live branch.
-              (unless (or (hashtable-ref leased c #f)
-                          (hashtable-ref dying c #f))
+              ;; a leased connection reports idle after each of its
+              ;; lessee's own queries; that is not the connection becoming
+              ;; free, the lessee's check-in is. A dying one is refused by
+              ;; make-available! itself.
+              (unless (hashtable-ref leased c #f)
                 (make-available! c))))
+          (loop))
+        ;; WHY, when the connection knows. A connection that is standing
+        ;; down on schedule -- because it has answered as many requests as
+        ;; its protocol lets it number, or as many as its owner allows --
+        ;; is not reporting a peer problem, and classifying it as one made
+        ;; every planned recycle pay the backoff meant for a peer that
+        ;; accepts and then fails. The two-field form is the older one and
+        ;; still means 'transport'.
+        (`#(pool-conn-dead ,c ,why)
+          (conn-dead! c (if (memq why '(transport retired)) why 'transport))
           (loop))
         (`#(pool-conn-dead ,c)
           ;; the connection already sent the transport-error reply to its
           ;; caller and is about to exit: clear the busy entry so the DOWN
           ;; below does not send a duplicate reply, and mark it dying so
           ;; the DOWN still rebuilds it.
-          (hashtable-delete! busy c)
+          ;; conn-dead! also takes it out of the idle set, which is a
+          ;; separate place it can be sitting: a connection whose caller
+          ;; checked in before this message arrived is idle, not busy, and
+          ;; clearing only the busy entry left it in rotation while marked
+          ;; dying -- the one state the guard in make-available! cannot
+          ;; help with, because the connection never passes that gate again.
           ;; WHY it is dying, not merely that it is. A connection that
           ;; reported a transport failure is not one this pool decided to
           ;; discard, and treating the two the same let a peer that accepts
@@ -470,7 +498,7 @@
           ;; stop, reintroduced by marking the connection dying before the
           ;; DOWN that classifies it.
           ;; ...but never DOWNGRADE a mark the pool made itself. See mark-dying!.
-          (mark-dying! c 'transport)
+          (conn-dead! c 'transport)
           (loop))
         (`#(pool-checkout ,ref ,from)
           (let ((w (make-waiter ref from)))
@@ -487,19 +515,7 @@
           (let ((e (hashtable-ref leased c #f)))
             (when (and e (eq? (vector-ref e 0) from))
               (drop-lease! c e)
-              ;; ...and a connection the pool already knows is going does
-              ;; NOT go back into rotation. A driver that hits a transport
-              ;; error tells its caller and tells the pool, and the caller's
-              ;; check-in can arrive between the two: the pool then lent out
-              ;; a connection that was about to exit, and that borrower's
-              ;; statement went nowhere while it waited out its whole query
-              ;; timeout for a reply nobody would send. The connection's own
-              ;; DOWN cleans up afterwards, far too late to help.
-              ;;
-              ;; pool-idle already refuses for the same reason; this is the
-              ;; other way back into the idle set.
-              (unless (hashtable-ref dying c #f)
-                (make-available! c))))
+              (make-available! c)))
           (loop))
         (`#(pool-checkin-broken ,from ,c)
           ;; the lessee could not clean the connection (e.g. ROLLBACK failed):
@@ -568,12 +584,7 @@
           (let ((hit (lease-by-ref ref from)))
             (when hit
               (drop-lease! (car hit) (cdr hit))
-              ;; the THIRD way back into the idle set, and it needed the
-              ;; same guard as the other two: a connection the pool already
-              ;; knows is going must not be handed to the next caller just
-              ;; because the borrower it was leased to gave up first.
-              (unless (hashtable-ref dying (car hit) #f)
-                (make-available! (car hit)))))
+              (make-available! (car hit))))
           (loop))
         (`#(pool-up ,ref ,pid ,status)
           (hashtable-delete! connecting pid)
@@ -709,7 +720,13 @@
              ;; connection that reported a transport failure died of a peer
              ;; problem, and if it did so within its first second it never
              ;; really connected -- the backoff is for exactly that.
-             (let* ((deliberate (eq? (hashtable-ref dying pid #f) 'teardown))
+             ;; a RETIREMENT is deliberate too: the connection stood down
+             ;; on schedule, so its short life is not evidence of a peer
+             ;; that cannot hold one up, and making it wait out the
+             ;; stillborn backoff would charge every planned recycle for a
+             ;; failure that did not happen.
+             (let* ((deliberate (memq (hashtable-ref dying pid #f)
+                                      '(teardown retired)))
                     (born (hashtable-ref up-at pid #f))
                     (stillborn (and (not deliberate) born
                                     (< (- (now-ms) born) min-lifetime-ms))))
