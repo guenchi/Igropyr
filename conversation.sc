@@ -206,6 +206,7 @@
             (mutable key)          ; key of the request that was accepted
             (mutable reply)        ; what accepting it produced
             (mutable steps)        ; completed suspends, for the watchdog
+            (mutable issued)       ; every token handed out by this dialogue
             running-box run-start-box))
 
   ;; ENTERING 'running starts the clock; re-marking a phase that is already
@@ -229,16 +230,22 @@
   (define (token=? a b)
     (and a b (string? a) (string? b) (string=? a b)))
 
-  ;; The next token, guaranteed different from the one just spent.
-  ;; classify reads 'advance before 'replay, and that order is only
-  ;; unambiguous while the two tokens differ: were a new token to repeat
-  ;; the consumed one, the retry of the request that was already accepted
-  ;; would be read as the answer to the NEXT reply. Sixty-four random bits
-  ;; will not collide -- but a rule's precondition should hold because it
-  ;; is enforced, not because it is unlikely.
-  (define (fresh-token unlike)
+  ;; The next token, guaranteed different from EVERY token this
+  ;; conversation has issued -- not merely from the one just spent.
+  ;;
+  ;; Excluding only the previous one left the invariant probabilistic where
+  ;; it mattered: a token repeating one from two steps back becomes the
+  ;; live `awaiting`, and a delayed copy of the request that carried it the
+  ;; first time then classifies as 'advance -- before the request key is
+  ;; ever computed. An old payload is applied to a later step and its
+  ;; sender receives that step's reply. Sixty-four random bits make it
+  ;; unlikely; the list makes it impossible, and the list is one entry per
+  ;; suspend of one conversation.
+  (define (fresh-token issued)
     (let loop ((t (conv-token!)))
-      (if (token=? t unlike) (loop (conv-token!)) t)))
+      (if (memp (lambda (x) (token=? t x)) issued)
+          (loop (conv-token!))
+          t)))
 
   ;; THE RULES. key-of is a thunk, so an invented token costs no application
   ;; code at all: only a request that already matched the spent token is
@@ -300,6 +307,16 @@
                                    (step-state-reply st)))
                 (loop))
               (`#(conv-step ,from ,ref2 ,token ,r)
+                ;; THE DEADLINE IS CHECKED AGAIN HERE. A receive answers a
+                ;; matching message that is already in the mailbox before
+                ;; it consults its timer, so a step that arrived after the
+                ;; deadline -- while this process was waiting its turn to
+                ;; run -- was advanced instead of expiring. The park TTL is
+                ;; the caller's statement of how long this dialogue may
+                ;; wait, and a message cannot be inside a window it arrived
+                ;; after just because nobody had looked yet.
+                (if (>= (now-ms) deadline)
+                    (on-expire)
                 (case (classify st token (lambda () (safe-key r)))
                   ((advance) (on-advance from ref2 token r))
                   ((replay)
@@ -312,7 +329,7 @@
                    (loop))
                   (else
                    (send from (vector 'conv-reply ref2 #f 'stale))
-                   (loop)))))))))
+                   (loop))))))))))
 
   ;; ---- completed-conversation tombstones ---------------------------------
   ;;
@@ -351,7 +368,16 @@
         (set! tomb-n (- tomb-n 1))
         (hashtable-delete! tombstones (car e)))))
 
+  ;; ALL THREE OF THESE RUN WITH INTERRUPTS DISABLED. They are pure memory
+  ;; and never yield, and the alternative is a race with teeth: prune reads
+  ;; the oldest entry, checks its age, and then calls a pop that re-reads
+  ;; the head. Two conversations completing at once could interleave there
+  ;; -- the second prune drops the entry the first had just approved of,
+  ;; and the first then drops whatever moved up, which is a YOUNGER record
+  ;; still inside both limits. The transaction it belonged to answers
+  ;; 'gone afterwards, and 'gone is documented as "rolled back".
   (define (tomb-prune!)
+    (with-interrupts-disabled
     (let loop ()
       (when (> tomb-n 0)
         (when (null? tomb-front)
@@ -361,18 +387,20 @@
           (when (and e (or (> tomb-n tombstone-max)
                            (> (- (now-ms) (cdr e)) tombstone-ttl-ms)))
             (tomb-pop-oldest!)
-            (loop))))))
+            (loop)))))))
 
   (define (tomb-record! id)
-    (unless (hashtable-contains? tombstones id)
-      (hashtable-set! tombstones id #t)
-      (set! tomb-back (cons (cons id (now-ms)) tomb-back))
-      (set! tomb-n (+ tomb-n 1)))
+    (with-interrupts-disabled
+      (unless (hashtable-contains? tombstones id)
+        (hashtable-set! tombstones id #t)
+        (set! tomb-back (cons (cons id (now-ms)) tomb-back))
+        (set! tomb-n (+ tomb-n 1))))
     (tomb-prune!))
 
   (define (tomb-settled? id)
     (tomb-prune!)
-    (hashtable-contains? tombstones id))
+    (with-interrupts-disabled
+      (hashtable-contains? tombstones id)))
 
   ;; Size the record of completed conversations. #f leaves one alone.
   (define (conversation-set-limits! max-entries ttl-ms)
@@ -646,9 +674,24 @@
                  (let ((watched self))
                    (spawn
                      (lambda ()
+                       ;; Parked, poll; RUNNING, sleep until that step's
+                       ;; own deadline. A fixed tick made the bound
+                       ;; ttl + tick rather than ttl: a step could overrun
+                       ;; by most of a tick and finish between samples,
+                       ;; and it was accepted -- reply sent, effects kept
+                       ;; -- because the next sample saw nothing running.
+                       ;; Waking at the deadline itself removes the
+                       ;; granularity from the guarantee. Sleeping too long
+                       ;; is harmless: every wake re-reads the phase and
+                       ;; the start time, so a step that began meanwhile
+                       ;; simply gets its own deadline computed next.
                        (let ((tick (max 50 (div ttl 4))))
                          (let loop ()
-                           (sleep-ms tick)
+                           (sleep-ms
+                             (if (unbox running-box)
+                                 (max 1 (- (+ (unbox run-start-box) ttl 1)
+                                           (now-ms)))
+                                 tick))
                            (cond
                              ((not (process-alive? watched)) 'done)
                              ;; parked in suspend!: idle between rounds is
@@ -664,7 +707,7 @@
                                 (guard (e (#t (void))) (on-killed))))
                              (else (loop))))))))
                  (let ((who starter) (tag ref)
-                       (st (make-step-state 'running #f #f #f #f 0
+                       (st (make-step-state 'running #f #f #f #f 0 '()
                                             running-box run-start-box)))
 
                    ;; The one place application code is run on an incoming
@@ -688,8 +731,10 @@
 
                    (define (suspend! reply)
                      (step-state-steps-set! st (+ 1 (step-state-steps st)))
-                     (step-state-awaiting-set! st
-                       (fresh-token (step-state-consumed st)))
+                     (let ((t (fresh-token (step-state-issued st))))
+                       (step-state-issued-set! st
+                         (cons t (step-state-issued st)))
+                       (step-state-awaiting-set! st t))
                      (step-state-reply-set! st reply)
                      (set-box! step-box (step-state-steps st))
                      (set-phase! st 'parked)
@@ -706,7 +751,22 @@
                          ;; running window the watchdog bounds
                          (step-state-key-set! st (safe-key r))
                          r)
-                       (lambda () (raise 'conversation-expired))))
+                       ;; RUNNING AGAIN BEFORE THE RAISE. What this raise
+                       ;; reaches is application code -- the guard that
+                       ;; rolls back what the flow was holding -- and while
+                       ;; the phase said 'parked the watchdog skipped it,
+                       ;; so a rollback that blocked left a process that was
+                       ;; alive, registered, and never coming back. Callers
+                       ;; wait for a reply or a DOWN and would have had
+                       ;; neither, forever.
+                       ;;
+                       ;; Entering running restamps the clock, so cleanup
+                       ;; gets a TTL of its own rather than the remains of
+                       ;; the step's. That is the right allowance: it is a
+                       ;; different piece of work.
+                       (lambda ()
+                         (set-phase! st 'running)
+                         (raise 'conversation-expired))))
 
                    (let ((final (flow req suspend!)))
                      (step-state-reply-set! st final)
