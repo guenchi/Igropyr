@@ -886,11 +886,49 @@
   ;; yields its reply. Returns 'gone when the conversation is over,
   ;; expired, or crashed -- for a transactional flow that means the
   ;; database already rolled back.
-  (define (conversation-resume! id token req)
-    (let ((owner (conv-owner id)))
-      (if (or (not owner) (eq? owner (node-self)))
-          (local-resume id token req)
-          (forward-resume owner id token req))))
+  ;; TURNING 'unknown BACK INTO AN ANSWER.
+  ;;
+  ;; 'unknown is honest and useless: the caller is told not to resubmit and
+  ;; left to reconcile. The only construction that can do better is the one
+  ;; payment systems already use -- write the conversation id in the SAME
+  ;; transaction as the effect -- because then the truth is durable, atomic
+  ;; with the thing it describes, and outlives both the record and the
+  ;; process. This is the hole that lets the library ask.
+  ;;
+  ;; It is applied on the ASKING node, not the owner: a predicate is a
+  ;; closure and does not cross a link, and the database it consults is the
+  ;; application's, which is the same database from either side. So it
+  ;; covers the forwarded case without any of it having to travel.
+  ;;
+  ;; #t -> 'settled, #f -> 'gone, anything else (or a raise) leaves
+  ;; 'unknown. A predicate that fails must not turn an honest "I cannot
+  ;; say" into a confident wrong answer, and it must not take the caller
+  ;; down either.
+  (define (resolve-unknown id status settled?)
+    (if (and settled? (eq? status 'unknown))
+        (let ((v (guard (e (#t 'unknown)) (settled? id))))
+          (cond ((eq? v #t) 'settled)
+                ((eq? v #f) 'gone)
+                (else 'unknown)))
+        status))
+
+  (define (opt-settled? rest who)
+    (if (pair? rest)
+        (let ((f (car rest)))
+          (unless (procedure? f)
+            (assertion-violation who
+              "settled? must be a procedure of one argument (the id)" f))
+          f)
+        #f))
+
+  (define (conversation-resume! id token req . rest)
+    (let ((owner (conv-owner id))
+          (settled? (opt-settled? rest 'conversation-resume!)))
+      (let-values (((r status)
+                    (if (or (not owner) (eq? owner (node-self)))
+                        (local-resume id token req)
+                        (forward-resume owner id token req))))
+        (values r (resolve-unknown id status settled?)))))
 
   ;; Resume a conversation that lives on THIS node.
   ;; -> (values reply next-token), where next-token is #f when the
@@ -966,11 +1004,14 @@
   ;; RUNNING is answered when that step parks, so it can take as long as
   ;; the step does (bounded by the TTL). Reconciliation is not on a
   ;; latency path; taking the answer early would mean guessing.
-  (define (conversation-peek id)
-    (let ((owner (conv-owner id)))
-      (if (or (not owner) (eq? owner (node-self)))
-          (local-peek id)
-          (forward-peek owner id))))
+  (define (conversation-peek id . rest)
+    (let ((owner (conv-owner id))
+          (settled? (opt-settled? rest 'conversation-peek)))
+      (let-values (((state token reply)
+                    (if (or (not owner) (eq? owner (node-self)))
+                        (local-peek id)
+                        (forward-peek owner id))))
+        (values (resolve-unknown id state settled?) token reply))))
 
   (define (local-peek id)
     (let ((p (whereis (conversation-name id))))

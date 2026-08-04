@@ -622,6 +622,54 @@
   (unless (eq? state 'unknown) (fail "peek-unknown-id" state)))
 (display "peek on an id this node cannot speak for -> unknown ok\n")
 
+;; ---- an application that kept its own record answers for itself --------
+;;
+;; 'unknown is honest and useless on its own. The construction that does
+;; better is the one payment systems already use: write the conversation id
+;; in the SAME transaction as the effect, so the truth is durable and
+;; atomic with the thing it describes. The optional predicate is where the
+;; library asks. A predicate that fails must leave 'unknown standing --
+;; turning "I cannot say" into a confident wrong answer is the failure this
+;; whole change exists to remove.
+(let ((forgotten "1-00112233445566778899aabbccddeeff"))
+  (let-values (((state token reply)
+                (conversation-peek forgotten (lambda (id) #t))))
+    (unless (conversation-settled? state)
+      (fail "a durable record of completion was not believed" state)))
+  (let-values (((state token reply)
+                (conversation-peek forgotten (lambda (id) #f))))
+    (unless (conversation-gone? state)
+      (fail "a durable record of NON-completion was not believed" state)))
+  (let-values (((state token reply)
+                (conversation-peek forgotten (lambda (id) (raise 'db-down)))))
+    (unless (conversation-unknown? state)
+      (fail "a failing predicate did not leave unknown standing" state)))
+  (let-values (((state token reply)
+                (conversation-peek forgotten (lambda (id) 'no-idea))))
+    (unless (conversation-unknown? state)
+      (fail "an inconclusive predicate did not leave unknown standing" state)))
+  (display "a durable completion record answers what the node cannot ok\n"))
+
+;; and it is consulted ONLY for 'unknown: a status the node can stand
+;; behind is never second-guessed by application code
+(let ((asked (box 0)))
+  (let-values (((gid gtok gfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (suspend! (vector 'parked req))
+                    (raise 'boom))
+                  'go
+                  300)))
+    (let-values (((r st) (conversation-resume! gid gtok 'confirm
+                                               (lambda (id)
+                                                 (set-box! asked (+ 1 (unbox asked)))
+                                                 #t))))
+      (unless (conversation-gone? st) (fail "died-not-gone-with-predicate" st))
+      (unless (= 0 (unbox asked))
+        (fail "the predicate was consulted for a status the node knows"
+              (unbox asked))))
+    (display "the predicate is asked only where the node cannot say ok\n")))
+
 ;; ...but 'gone must NOT collapse into 'unknown. A conversation whose id
 ;; this node minted, in this incarnation, inside the retention window, and
 ;; which left no completion record, really did not complete: the record
