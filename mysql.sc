@@ -7,11 +7,11 @@
 ;;; are queued in the connection's mailbox and run one at a time.
 ;;;
 ;;;   (define db (mysql-connect "127.0.0.1" 3306 "user" "password" "dbname"))
-;;;   (myconnpool-call db "SELECT id, name FROM users")
+;;;   (mysql-query db "SELECT id, name FROM users")
 ;;;     ;; -> #(rows ("id" "name") (("1" "Alice") ("2" "Bob")))
-;;;   (myconnpool-call db "INSERT INTO users (name) VALUES ('Eve')")
+;;;   (mysql-query db "INSERT INTO users (name) VALUES ('Eve')")
 ;;;     ;; -> #(ok 1 3)                     ; affected rows, last insert id
-;;;   (myconnpool-close! db)
+;;;   (mysql-close! db)
 ;;;
 ;;; Values arrive as strings (MySQL text protocol); NULL is #f.
 ;;; Errors raise #(mysql-error ,code ,message) in the caller.
@@ -23,7 +23,7 @@
 ;;; servers via auth-switch.
 
 (library (igropyr mysql)
-  (export mysql-connect mysql-pool myconnpool-call myconnpool-close! myconnpool-stats
+  (export mysql-connect mysql-pool mysql-query mysql-close! mysql-pool-stats
           mysql-transaction call-with-mysql-connection)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr connpool)
           (igropyr buffer)
@@ -633,7 +633,7 @@
       (`#(pool-request-cancel ,ref ,from) (serve-loop c buf notify))
       ;; A single connection is not a pool and keeps none of its
       ;; bookkeeping. Answering #f is what keeps the request from sitting
-      ;; here forever; myconnpool-stats turns it into a clear error.
+      ;; here forever; mysql-pool-stats turns it into a clear error.
       (`#(pool-stats ,ref ,from)
         (send from (vector 'pool-stats-reply ref #f))
         (serve-loop c buf notify))
@@ -753,8 +753,8 @@
                 (begin (send pid (vector 'pool-adopt)) pid)
                 (raise status)))))))
 
-  ;; Pool of n connections; returns the dispatcher, which myconnpool-call
-  ;; and myconnpool-close! accept exactly like a single connection. Usable
+  ;; Pool of n connections; returns the dispatcher, which mysql-query
+  ;; and mysql-close! accept exactly like a single connection. Usable
   ;; immediately: queries queue until connections come up. Same optional
   ;; db + options as mysql-connect.
   (define (mysql-pool n host port user password . rest)
@@ -776,11 +776,11 @@
   ;; Run one SQL statement; blocks only the calling green process. A
   ;; timed-out statement's outcome is UNKNOWN -- it may still execute on
   ;; the server.
-  (define (myconnpool-call mc sql) (connpool-call mc sql cfg))
+  (define (mysql-query mc sql) (connpool-call mc sql cfg))
 
   ;; Borrow one whole connection from a POOL for the extent of proc, then
   ;; return it -- even if proc raises or exits non-locally. proc receives
-  ;; the connection process; run myconnpool-call on THAT connection and no
+  ;; the connection process; run mysql-query on THAT connection and no
   ;; other caller's query can interleave, which is what makes a
   ;; multi-statement transaction correct. Requires a mysql-pool. Don't
   ;; send queries (or a second checkout) to the pool itself while holding
@@ -797,9 +797,9 @@
   (define (mysql-transaction pool proc)
     (sql-transaction pool proc cfg))
 
-  (define (myconnpool-close! mc) (connpool-close! mc))
+  (define (mysql-close! mc) (connpool-close! mc))
 
   ;; A snapshot of a pool: in-use, pending, checkout wait, query duration,
   ;; timeout counts and more. See (igropyr connpool) for the full key list.
-  (define (myconnpool-stats pool) (connpool-stats pool))
+  (define (mysql-pool-stats pool) (connpool-stats pool))
 )

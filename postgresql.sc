@@ -9,13 +9,13 @@
 ;;; at a time.
 ;;;
 ;;;   (define db (postgresql-connect "127.0.0.1" 5432 "user" "password" "db"))
-;;;   (postgreconnpool-call db "SELECT id, name FROM users")
+;;;   (postgresql-query db "SELECT id, name FROM users")
 ;;;     ;; -> #(rows ("id" "name") (("1" "Alice") ("2" "Bob")))
-;;;   (postgreconnpool-call db "INSERT INTO users (name) VALUES ('Eve')")
+;;;   (postgresql-query db "INSERT INTO users (name) VALUES ('Eve')")
 ;;;     ;; -> #(ok 1)                          ; affected rows
 ;;;   (postgresql-execute db "SELECT name FROM users WHERE id = $1" 2)
 ;;;     ;; -> #(rows ("name") (("Bob")))       ; server-side parameter binding
-;;;   (postgreconnpool-close! db)
+;;;   (postgresql-close! db)
 ;;;
 ;;; postgresql-execute runs one statement over the extended query protocol
 ;;; (Parse/Bind/Execute): parameters are sent out-of-band as $1..$n values,
@@ -23,7 +23,7 @@
 ;;; injection through a value is impossible -- prefer it over string
 ;;; concatenation whenever a statement takes runtime values. Parameters may
 ;;; be strings, numbers, #f (SQL NULL) or bytevectors (raw text-format
-;;; bytes). Unlike postgreconnpool-call it accepts exactly one statement.
+;;; bytes). Unlike postgresql-query it accepts exactly one statement.
 ;;;
 ;;; Values arrive as strings (the wire text format); NULL is #f. The
 ;;; connection asks for client_encoding UTF8 at startup, so text is
@@ -81,8 +81,8 @@
 ;;; only over a trusted network or a local socket.
 
 (library (igropyr postgresql)
-  (export postgresql-connect postgresql-pool postgreconnpool-call
-          postgresql-execute postgreconnpool-close! postgreconnpool-stats
+  (export postgresql-connect postgresql-pool postgresql-query
+          postgresql-execute postgresql-close! postgresql-pool-stats
           postgresql-transaction call-with-postgresql-connection)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr buffer)
           (igropyr connpool)
@@ -828,7 +828,7 @@
       (`#(pool-request-cancel ,ref ,from) (serve-loop c buf notify))
       ;; A single connection is not a pool and keeps none of its
       ;; bookkeeping. Answering #f is what keeps the request from sitting
-      ;; here forever; postgreconnpool-stats turns it into a clear error.
+      ;; here forever; postgresql-pool-stats turns it into a clear error.
       (`#(pool-stats ,ref ,from)
         (send from (vector 'pool-stats-reply ref #f))
         (serve-loop c buf notify))
@@ -1056,8 +1056,8 @@
                 (begin (send pid (vector 'pool-adopt)) pid)
                 (raise status)))))))
 
-  ;; Pool of n connections; returns the dispatcher, which postgreconnpool-call
-  ;; and postgreconnpool-close! accept exactly like a single connection. Usable
+  ;; Pool of n connections; returns the dispatcher, which postgresql-query
+  ;; and postgresql-close! accept exactly like a single connection. Usable
   ;; immediately: queries queue until connections come up. Same optional
   ;; db + options as postgresql-connect.
   (define (postgresql-pool n host port user password . rest)
@@ -1078,7 +1078,7 @@
   ;; Run one SQL statement; blocks only the calling green process. A
   ;; 'timeout error means the statement's outcome is UNKNOWN -- it may
   ;; still execute on the server.
-  (define (postgreconnpool-call mc sql) (connpool-call mc sql cfg))
+  (define (postgresql-query mc sql) (connpool-call mc sql cfg))
 
   ;; Convert one parameter to its wire form (text-format bytes, or #f for
   ;; NULL). Runs in the CALLER, before anything reaches the connection
@@ -1114,7 +1114,7 @@
   ;; Run ONE statement with $1..$n parameters over the extended query
   ;; protocol. Values never touch the SQL text, so they need no quoting
   ;; and cannot inject. Same result shapes and timeout semantics as
-  ;; postgreconnpool-call.
+  ;; postgresql-query.
   (define (postgresql-execute mc sql . params)
     ;; Bind carries the parameter count as an Int16: 65535 is the
     ;; protocol's hard limit. Reject beyond it HERE -- inside the
@@ -1128,7 +1128,7 @@
 
   ;; Borrow one whole connection from a POOL for the extent of proc, then
   ;; return it -- even if proc raises or exits non-locally. proc receives the
-  ;; connection process; run postgreconnpool-call on THAT connection and no other
+  ;; connection process; run postgresql-query on THAT connection and no other
   ;; caller's query can interleave. Requires a postgresql-pool. Don't send
   ;; queries (or a second checkout) to the pool itself while holding a
   ;; connection.
@@ -1144,9 +1144,9 @@
   (define (postgresql-transaction pool proc)
     (sql-transaction pool proc cfg))
 
-  (define (postgreconnpool-close! mc) (connpool-close! mc))
+  (define (postgresql-close! mc) (connpool-close! mc))
 
   ;; A snapshot of a pool: in-use, pending, checkout wait, query duration,
   ;; timeout counts and more. See (igropyr connpool) for the full key list.
-  (define (postgreconnpool-stats pool) (connpool-stats pool))
+  (define (postgresql-pool-stats pool) (connpool-stats pool))
 )
