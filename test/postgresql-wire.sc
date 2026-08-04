@@ -391,7 +391,7 @@
   (lambda ()
     (define (connect-error . args)        ; -> the raised error vector or #f
       (guard (e (#t e))
-        (postgresql-close! (apply postgresql-connect args))
+        (postgreconnpool-close! (apply postgresql-connect args))
         #f))
 
     (tcp-listen! "127.0.0.1" port 16
@@ -403,24 +403,24 @@
     ;; 0. a teardown must reach a connection that is mid-query.
     ;;
     ;; The pool reclaims a connection whose borrower died by sending it
-    ;; db-quit: @kill discards dynamic-wind winders, so no check-in runs and
+    ;; pool-quit: @kill discards dynamic-wind winders, so no check-in runs and
     ;; the pool's monitor is the only path back. A connection waiting on a
     ;; server that has stopped answering matched only TCP messages, so that
-    ;; db-quit sat in its mailbox for the whole query timeout -- a MINUTE by
+    ;; pool-quit sat in its mailbox for the whole query timeout -- a MINUTE by
     ;; default -- and for all of it the pool had it marked dying: neither
     ;; lent out nor rebuilt. One reaped caller, one connection gone for a
     ;; minute.
     (let ((conn (postgresql-connect "127.0.0.1" port "user" scram-password "scram"))
           (me self))
       (let ((m (monitor conn)))
-        (spawn (lambda () (guard (e (#t 'ok)) (postgresql-query conn "SILENT"))))
+        (spawn (lambda () (guard (e (#t 'ok)) (postgreconnpool-call conn "SILENT"))))
         (sleep-ms 200)
         (let ((t0 (now-ms)))
-          (send conn (vector 'db-quit))
+          (send conn (vector 'pool-quit))
           (let ((took (receive (after 5000 #f)
                         (`#(DOWN ,@conn ,reason) (- (now-ms) t0)))))
-            (check "mid-query-db-quit" (and took (< took 3000)))
-            (display (string-append "  [info] mid-query db-quit honoured after "
+            (check "mid-query-pool-quit" (and took (< took 3000)))
+            (display (string-append "  [info] mid-query pool-quit honoured after "
                                     (if took (number->string took) "never")
                                     "ms (the query deadline is 60000)\n"))))))
 
@@ -429,15 +429,15 @@
     (let ((conn (postgresql-connect "127.0.0.1" port "user" scram-password "scram")))
       (check "scram-auth-verified" #t)
       ;; 2. fragmented T/D/C/Z reassembly + NULL column
-      (let ((r (postgresql-query conn "SELECT anything")))
+      (let ((r (postgreconnpool-call conn "SELECT anything")))
         (check "fragmented-rows"
           (equal? r (vector 'rows '("a" "b") '(("42" #f))))))
       ;; 3. COPY FROM STDIN -> CopyFail -> server SQL error, connection
       ;;    stays framed and usable
       (check "copy-in-refused-sqlstate"
         (guard (e (#t (and (vector? e) (equal? (vector-ref e 1) "57014"))))
-          (postgresql-query conn "COPY t FROM STDIN") #f))
-      (let ((r (postgresql-query conn "SELECT again")))
+          (postgreconnpool-call conn "COPY t FROM STDIN") #f))
+      (let ((r (postgreconnpool-call conn "SELECT again")))
         (check "usable-after-copy-error"
           (equal? r (vector 'rows '("a" "b") '(("42" #f))))))
       ;; extended protocol: the server echoes the Bind parameters back,
@@ -467,10 +467,10 @@
           (apply postgresql-execute conn "SELECT 1"
                  (vector->list (make-vector 65536 1)))
           #f))
-      (let ((r (postgresql-query conn "SELECT after-overflow")))
+      (let ((r (postgreconnpool-call conn "SELECT after-overflow")))
         (check "usable-after-param-overflow"
           (equal? r (vector 'rows '("a" "b") '(("42" #f))))))
-      (postgresql-close! conn))
+      (postgreconnpool-close! conn))
 
     ;; 4. wrong password -> SQLSTATE 28P01 from the server verifier
     (let ((e (connect-error "127.0.0.1" port "user" "wrong" "scram")))
@@ -494,12 +494,12 @@
     (let ((conn (postgresql-connect "127.0.0.1" port "user" clear-password
                                     "cleartext" '((allow-cleartext-auth . #t)))))
       (check "cleartext-opt-in-works" #t)
-      (postgresql-close! conn))
+      (postgreconnpool-close! conn))
 
     ;; 7. notices during auth are informational, not fatal
     (let ((conn (postgresql-connect "127.0.0.1" port "user" scram-password "notice")))
       (check "notice-during-auth-tolerated" #t)
-      (postgresql-close! conn))
+      (postgreconnpool-close! conn))
 
     ;; 7b. A server that keeps the handshake alive forever with legal
     ;; notices must still be given up on -- BY THE WORKER.
@@ -507,7 +507,7 @@
     ;; The caller's own timeout is not the thing under test: postgresql-connect
     ;; raises after connect-timeout-ms + 2 s whatever the worker does, so a
     ;; test that measured the caller passes against the bug. The worker never
-    ;; reaches the adoption wait (that is after db-up, which never comes), so
+    ;; reaches the adoption wait (that is after pool-up, which never comes), so
     ;; nothing else ended it: it ran, and held its socket, for the life of the
     ;; process. In a POOL, where no caller times out at all, it also held its
     ;; slot forever.
@@ -542,7 +542,7 @@
     ;;
     ;; The pool monitors its connections; a monitor is one-directional, so
     ;; when the pool died every connection actor kept running with its fd
-    ;; (and, over TLS, its session). Only an orderly db-quit closed them,
+    ;; (and, over TLS, its session). Only an orderly pool-quit closed them,
     ;; and a pool that was killed never sends one. Recreating the pool then
     ;; stacked a second full set on top of the first.
     (sleep-ms 1500)
@@ -550,7 +550,7 @@
           (base-procs (process-count)))
       (let ((pool (postgresql-pool 2 "127.0.0.1" port "user" scram-password "scram")))
         ;; wait until both connections are actually up and serving
-        (postgresql-query pool "SELECT 1")
+        (postgreconnpool-call pool "SELECT 1")
         (sleep-ms 500)
         (let ((busy-conns (conn-count)))
           (check "pool-connections-established" (> busy-conns base-conns))
@@ -568,10 +568,10 @@
     ;; 7d. A process that reconnects in a loop must not accumulate the late
     ;; up-reports of its own timed-out attempts.
     ;;
-    ;; Each timed-out connect leaves its worker's #(db-up ref ...) in this
+    ;; Each timed-out connect leaves its worker's #(pool-up ref ...) in this
     ;; mailbox. The ref is a fresh gensym per attempt, so it can never match
     ;; again: the message is immortal, and every selective receive afterwards
-    ;; scans past all of them. sql-query drains them, but a reconnect manager
+    ;; scans past all of them. connpool-call drains them, but a reconnect manager
     ;; or supervisor that only ever calls connect never ran one.
     ;;
     ;; Timing this proves nothing -- a handful of stale messages costs
@@ -580,11 +580,11 @@
     ;; then looked for: exactly the shape a real one has, and its absence
     ;; afterwards is the drain, directly observed.
     (let ((planted (gensym)))
-      (send self (vector 'db-up planted self 'ok))
+      (send self (vector 'pool-up planted self 'ok))
       (connect-error "127.0.0.1" port "user" scram-password "notice-forever"
                      '((connect-deadline-ms . 300)))
       (check "a connect drains an earlier attempt's late up-report"
-        (eq? 'gone (receive (after 0 'gone) (`#(db-up ,@planted ,p ,s) 'still-there)))))
+        (eq? 'gone (receive (after 0 'gone) (`#(pool-up ,@planted ,p ,s) 'still-there)))))
 
     ;; 7e. Killing the pool must abort a query that is in FLIGHT, not only
     ;; free the connections that were idle.
@@ -599,7 +599,7 @@
       (let ((pool (postgresql-pool 1 "127.0.0.1" port "user" scram-password "scram")))
         (spawn (lambda ()
                  (guard (e (#t (send me (vector 'q 'failed))))
-                   (postgresql-query pool "DRIP forever")
+                   (postgreconnpool-call pool "DRIP forever")
                    (send me (vector 'q 'returned)))))
         (sleep-ms 800)
         (let ((busy (conn-count)))

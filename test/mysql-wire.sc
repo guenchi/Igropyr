@@ -197,10 +197,10 @@
     ;; ---- a teardown must reach a connection that is mid-query -------------
     ;;
     ;; The pool reclaims a connection whose borrower died by sending it
-    ;; db-quit: @kill discards dynamic-wind winders, so no check-in runs and
+    ;; pool-quit: @kill discards dynamic-wind winders, so no check-in runs and
     ;; the pool's monitor is the only path back. A connection waiting for a
     ;; server that has stopped answering matched only TCP messages, so that
-    ;; db-quit sat in its mailbox for the whole query timeout -- a MINUTE by
+    ;; pool-quit sat in its mailbox for the whole query timeout -- a MINUTE by
     ;; default -- and for all of it the pool had the connection marked dying:
     ;; neither lent out nor rebuilt. One reaped caller, one connection out of
     ;; the pool for a minute.
@@ -211,15 +211,15 @@
     (let ((conn (mysql-connect "127.0.0.1" port "user" "pw" "db"))
           (me self))
       (let ((m (monitor conn)))
-        (spawn (lambda () (guard (e (#t 'ok)) (mysql-query conn "SELECT never"))))
+        (spawn (lambda () (guard (e (#t 'ok)) (myconnpool-call conn "SELECT never"))))
         (sleep-ms 200)
         (let ((t0 (now-ms)))
-          (send conn (vector 'db-quit))
+          (send conn (vector 'pool-quit))
           (let ((took (receive (after 5000 #f)
                         (`#(DOWN ,@conn ,reason) (- (now-ms) t0)))))
-            (check "db-quit reaches a connection waiting on a silent server"
+            (check "pool-quit reaches a connection waiting on a silent server"
                    (and took (< took 3000)))
-            (display (string-append "  [info] mid-query db-quit honoured after "
+            (display (string-append "  [info] mid-query pool-quit honoured after "
                                     (if took (number->string took) "never")
                                     "ms (the query deadline is 60000)\n"))))))
     (set-box! mute-queries #f)
@@ -229,12 +229,12 @@
     (set-box! fragment-bytes 65536)
     (set-box! fragment-gap-ms 0)
     (let ((conn (mysql-connect "127.0.0.1" port "user" "pw" "db")))
-      (let ((r (mysql-query conn "SELECT v")))
+      (let ((r (myconnpool-call conn "SELECT v")))
         (check "handshake completes and a result set parses"
           (and (vector? r) (eq? (vector-ref r 0) 'rows)))
         (check "the row value survives"
           (equal? '(("xxxxxxxx")) (vector-ref r 2))))
-      (mysql-close! conn))
+      (myconnpool-close! conn))
 
     ;; ---- reassembly across fragment boundaries ---------------------------
     ;; 8 MiB arriving in 256 separate reads. This is the case the buffer
@@ -260,7 +260,7 @@
     (set-box! fragment-gap-ms 1)
     (let ((conn (mysql-connect "127.0.0.1" port "user" "pw" "db")))
       (let* ((t0 (now-ms))
-             (r (mysql-query conn "SELECT v"))
+             (r (myconnpool-call conn "SELECT v"))
              (ms (- (now-ms) t0)))
         (check "a fragmented multi-megabyte reply parses"
           (and (vector? r) (eq? (vector-ref r 0) 'rows)
@@ -268,7 +268,7 @@
                   (string-length (car (car (vector-ref r 2)))))))
         (display "  [info] 8 MiB in 256 fragments: ") (display ms)
         (display " ms (quadratic reassembly measured 411 ms; see above)\n"))
-      (mysql-close! conn))
+      (myconnpool-close! conn))
 
     ;; ---- a packet the length field cannot describe ------------------------
     ;; 16 MiB and above needs the protocol's continuation split, which this
@@ -282,9 +282,9 @@
     (let ((conn (mysql-connect "127.0.0.1" port "user" "pw" "db")))
       (check "an oversized query is refused, not truncated"
         (guard (e (#t #t))
-          (mysql-query conn (make-string (* 17 1024 1024) #\a))
+          (myconnpool-call conn (make-string (* 17 1024 1024) #\a))
           #f))
-      (mysql-close! conn))
+      (myconnpool-close! conn))
 
     ;; ---- a greeting that never finishes -----------------------------------
     ;; The handshake deadline was stamped after the greeting had been READ,

@@ -435,7 +435,7 @@
   ;; keeps a later call from mis-reading it, but nothing removed it, so a
   ;; long-lived process that suffers timeouts accumulated immortal replies
   ;; -- possibly large bulk values or arrays -- that every later selective
-  ;; receive walks past. sqlpool and gen-server both drain at entry for the
+  ;; receive walks past. connpool and gen-server both drain at entry for the
   ;; same reason; this did not.
   ;;
   ;; A call is synchronous within one green process, so anything present at

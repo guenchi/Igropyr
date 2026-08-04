@@ -24,7 +24,7 @@
 ;;;
 ;;; So the engine moves to the far side of a socket. That makes a render
 ;;; structurally identical to a query: an exclusive resource, borrowed for
-;;; one request, whose work happens somewhere else. (igropyr sqlpool)
+;;; one request, whose work happens somewhere else. (igropyr connpool)
 ;;; already models exactly that -- checkout, leases, per-call and
 ;;; per-checkout deadlines, monitor reclaim when a borrower is killed,
 ;;; rebuild on death, statistics -- so this library supplies a wire protocol
@@ -79,7 +79,7 @@
           qjspool qjspool-connect qjspool?
           qjspool-render qjspool-render/bytes
           qjspool-timeout-ms qjspool-stats qjspool-close!)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sqlpool)
+  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr connpool)
           (igropyr buffer)
           (only (igropyr quickjs) qjs-boot! qjs-call/bytes))
 
@@ -272,7 +272,7 @@
                     (read-response c buf deadline-ms ref))
                   (`#(tcp-eof) (raise (qjs-err "worker closed the connection")))
                   (`#(tcp-error ,e) (raise (qjs-err (uv-strerror e))))
-                  ;; A TEARDOWN HAS TO REACH US HERE. The pool sends db-quit
+                  ;; A TEARDOWN HAS TO REACH US HERE. The pool sends pool-quit
                   ;; to reclaim a connection whose borrower died -- @kill
                   ;; discards winders, so the monitor is the only path back
                   ;; -- and a receive that matched only the socket left that
@@ -284,7 +284,7 @@
                   ;;
                   ;; Raising hands this to the same path a transport failure
                   ;; takes: reply, tell the pool, close, exit, be rebuilt.
-                  (`#(db-quit) (raise (qjs-err "connection shut down mid-render")))
+                  (`#(pool-quit) (raise (qjs-err "connection shut down mid-render")))
                   ;; THE CALLER GAVE UP. Its deadline and this one are
                   ;; ordered only by a margin -- the caller's starts when it
                   ;; posts the request, ours when the request is written --
@@ -310,7 +310,7 @@
                   ;; blocking FFI call, a large collection) inverts them.
                   ;; Reaching it from a test would mean exposing the
                   ;; connection pid, which is worth less than the clause.
-                  (`#(db-query-cancel ,@ref ,from)
+                  (`#(pool-request-cancel ,@ref ,from)
                     (raise (qjs-err "caller gave up on this render")))
                   ;; the pool itself died: nobody can adopt or reach us again
                   (`#(DOWN ,pid ,reason)
@@ -347,7 +347,7 @@
         (if (and notify (eq? pid notify))
             (tcp-close! c)
             (serve-loop c buf notify render-ms)))
-      (`#(db-query ,req ,ref ,from)
+      (`#(pool-request ,req ,ref ,from)
         (let ((r (render-on! c buf req render-ms ref)))
           (if (qjs-error? r)
               (begin
@@ -363,23 +363,23 @@
           ;; The cost of this order is a two-send window in which a kill
           ;; would leave the caller with no reply at all rather than a
           ;; duplicate one. That is a narrower window and a milder failure.
-                (when notify (send notify (vector 'db-conn-dead self)))
-                (send from (vector 'db-reply ref r))
+                (when notify (send notify (vector 'pool-conn-dead self)))
+                (send from (vector 'pool-reply ref r))
                 (tcp-close! c))                    ; exit -> DOWN -> rebuild
               (begin
-                (send from (vector 'db-reply ref r))
-                (when notify (send notify (vector 'db-idle self)))
+                (send from (vector 'pool-reply ref r))
+                (when notify (send notify (vector 'pool-idle self)))
                 (serve-loop c buf notify render-ms)))))
-      ;; sql-query sends this to whatever handle it was given when a call
+      ;; connpool-call sends this to whatever handle it was given when a call
       ;; times out; only a pool acts on it. Consumed here so it does not sit
       ;; in the mailbox slowing every later selective receive.
-      (`#(db-query-cancel ,ref ,from) (serve-loop c buf notify render-ms))
+      (`#(pool-request-cancel ,ref ,from) (serve-loop c buf notify render-ms))
       ;; a lone connection keeps no pool bookkeeping; answering is what
       ;; stops the request sitting here forever
-      (`#(db-stats ,ref ,from)
-        (send from (vector 'db-stats-reply ref #f))
+      (`#(pool-stats ,ref ,from)
+        (send from (vector 'pool-stats-reply ref #f))
         (serve-loop c buf notify render-ms))
-      (`#(db-quit) (tcp-close! c))
+      (`#(pool-quit) (tcp-close! c))
       ;; Bytes arriving BETWEEN renders have no meaning in this protocol: a
       ;; worker speaks only when asked, and nothing is outstanding here.
       ;; They are evidence the stream is already out of step -- buffering
@@ -395,16 +395,16 @@
   ;; exit rather than hold a socket nobody can reach.
   (define (await-adoption c buf notify render-ms)
     (receive (after connect-timeout-ms (tcp-close! c))
-      (`#(db-adopt)
+      (`#(pool-adopt)
         (when notify (monitor notify))
         (serve-loop c buf notify render-ms))
-      (`#(db-quit) (tcp-close! c))
+      (`#(pool-quit) (tcp-close! c))
       ;; likewise before adoption: nothing has been asked yet
       (`#(tcp-data ,bv) (tcp-close! c))
       (`#(tcp-eof) (tcp-close! c))
       (`#(tcp-error ,e) (tcp-close! c))))
 
-  ;; Spawn a connection worker; it reports #(db-up ,ref ,self ,status) to
+  ;; Spawn a connection worker; it reports #(pool-up ,ref ,self ,status) to
   ;; report-to -- the ref lets the receiver ignore a stale report from an
   ;; earlier, timed-out attempt -- then waits to be adopted. Every failure
   ;; path closes the socket: the uv handle is freed only by tcp-close!, so
@@ -412,7 +412,7 @@
   (define (start-connection host port render-ms notify report-to ref)
     (spawn
       (lambda ()
-        (define (report! status) (send report-to (vector 'db-up ref self status)))
+        (define (report! status) (send report-to (vector 'pool-up ref self status)))
         (let ((started (guard (e (#t (as-qjs-error e "connect failed")))
                          (tcp-connect! host port self)
                          'ok)))
@@ -439,13 +439,13 @@
   ;; The handle carries its config because the deadlines are per-pool: two
   ;; pools of different things in one process do not share a timeout, and
   ;; the render path wants seconds where a database wants a minute.
-  ;; pooled?: a POOL answers db-checkout, a lone connection does not -- and
+  ;; pooled?: a POOL answers pool-checkout, a lone connection does not -- and
   ;; asking one for a lease is a wait that ends only in a timeout.
   (define-record-type (qjs-pool make-qjs-pool qjspool?)
     (fields handle cfg render-ms checkout-ms pooled?))
 
   (define (make-cfg render-ms checkout-ms)
-    (make-sql-cfg
+    (make-connpool-cfg
       qjs-error?
       (qjs-err "render worker connection lost")
       (qjs-err "render pool closed")
@@ -496,7 +496,7 @@
       (make-qjs-pool
         (spawn
           (lambda ()
-            (sql-pool-loop n
+            (connpool-loop n
               (lambda (notify report-to ref)
                 (let* ((i (unbox next))
                        (e (list-ref eps (modulo i n))))
@@ -515,14 +515,14 @@
            (checkout-ms (opt-ms opts 'checkout-timeout-ms default-checkout-ms
                                 'qjspool-connect))
            (cfg (make-cfg render-ms checkout-ms)))
-      (sql-drain-stale!)
+      (connpool-drain-stale!)
       (let ((ref (gensym)))
         (start-connection host port render-ms #f self ref)
         (receive (after (+ connect-timeout-ms 2000)
                     (raise (qjs-err "connect timeout")))
-          (`#(db-up ,@ref ,pid ,status)
+          (`#(pool-up ,@ref ,pid ,status)
             (if (eq? status 'ok)
-                (begin (send pid (vector 'db-adopt))
+                (begin (send pid (vector 'pool-adopt))
                        (make-qjs-pool pid cfg render-ms checkout-ms #f))
                 (raise status)))))))
 
@@ -564,8 +564,8 @@
   (define (render-through p req)
     (let ((h (qjs-pool-handle p)) (cfg (qjs-pool-cfg p)))
       (if (qjs-pool-pooled? p)
-          (sql-call-with-connection h (lambda (conn) (sql-query conn req cfg)) cfg)
-          (sql-query h req cfg))))
+          (connpool-lease h (lambda (conn) (connpool-call conn req cfg)) cfg)
+          (connpool-call h req cfg))))
 
   ;; the same, decoded to a string on success
   (define (qjspool-render p fn props)
@@ -592,9 +592,9 @@
   ;; site; nothing in the pool is in a position to know it.
   (define (qjspool-stats p)
     (check-pool 'qjspool-stats p)
-    (sql-pool-stats (qjs-pool-handle p)))
+    (connpool-stats (qjs-pool-handle p)))
 
   (define (qjspool-close! p)
     (check-pool 'qjspool-close! p)
-    (sql-close! (qjs-pool-handle p)))
+    (connpool-close! (qjs-pool-handle p)))
 )

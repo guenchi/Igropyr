@@ -530,7 +530,7 @@
       ;; Normal return and an uncaught raise DO run them. So dynamic-wind
       ;; is not a reliable release mechanism for a process that can be
       ;; killed -- have the resource's owner monitor the holder and
-      ;; reclaim on DOWN (see (igropyr sqlpool)'s leases), which is the
+      ;; reclaim on DOWN (see (igropyr connpool)'s leases), which is the
       ;; only teardown that survives a kill.
       (pcb-winders-set! p '())
       (pcb-exception-state-set! p #f)

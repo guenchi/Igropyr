@@ -63,42 +63,42 @@
                  (write e) (display ")\n")
                  (exit 0)))
         ;; a lone connect proves reachability + SCRAM auth before the pool
-        (postgresql-close! (postgresql-connect host port user pass db))
+        (postgreconnpool-close! (postgresql-connect host port user pass db))
         (postgresql-pool 4 host port user pass db)))
 
     ;; ---- basic query shapes -------------------------------------------------
-    (check "select-scalar" (= 1 (scalar-num (postgresql-query pool "SELECT 1"))))
-    (let ((r (postgresql-query pool "SELECT 1 AS a, 'x' AS b")))
+    (check "select-scalar" (= 1 (scalar-num (postgreconnpool-call pool "SELECT 1"))))
+    (let ((r (postgreconnpool-call pool "SELECT 1 AS a, 'x' AS b")))
       (check "rows-shape"
         (and (vector? r) (eq? (vector-ref r 0) 'rows)
              (equal? (vector-ref r 1) '("a" "b"))
              (equal? (vector-ref r 2) '(("1" "x"))))))
     (check "null-is-#f"
-      (let ((r (postgresql-query pool "SELECT NULL")))
+      (let ((r (postgreconnpool-call pool "SELECT NULL")))
         (and (eq? (vector-ref r 0) 'rows)
              (equal? (vector-ref r 2) '((#f))))))
     ;; a server SQL error carries its SQLSTATE and leaves the pool usable
     (check "sql-error-sqlstate"
       (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'postgresql-error))
                  (string? (vector-ref e 1))))       ; 5-char SQLSTATE, not 'transport
-        (postgresql-query pool "SELECT * FROM no_such_table_xyz") #f))
+        (postgreconnpool-call pool "SELECT * FROM no_such_table_xyz") #f))
     (check "pool-alive-after-sql-error"
-      (= 1 (scalar-num (postgresql-query pool "SELECT 1"))))
+      (= 1 (scalar-num (postgreconnpool-call pool "SELECT 1"))))
 
     ;; ---- fresh table + affected-row counts ----------------------------------
-    (postgresql-query pool (string-append "DROP TABLE IF EXISTS " table))
-    (postgresql-query pool
+    (postgreconnpool-call pool (string-append "DROP TABLE IF EXISTS " table))
+    (postgreconnpool-call pool
       (string-append "CREATE TABLE " table " (id INT PRIMARY KEY, val INT NOT NULL)"))
-    (let ((r (postgresql-query pool
+    (let ((r (postgreconnpool-call pool
                (string-append "INSERT INTO " table " (id,val) VALUES (1,0)"))))
       (check "insert-affected" (equal? r (vector 'ok 1))))
 
     ;; ---- 1. commit persists -------------------------------------------------
     (postgresql-transaction pool
       (lambda (c)
-        (postgresql-query c (string-append "UPDATE " table " SET val=7 WHERE id=1"))))
+        (postgreconnpool-call c (string-append "UPDATE " table " SET val=7 WHERE id=1"))))
     (check "commit-persists"
-      (= 7 (scalar-num (postgresql-query pool
+      (= 7 (scalar-num (postgreconnpool-call pool
              (string-append "SELECT val FROM " table " WHERE id=1")))))
 
     ;; ---- 2. escape rolls back, connection returns to the pool ---------------
@@ -106,27 +106,27 @@
       (guard (e (#t #t))
         (postgresql-transaction pool
           (lambda (c)
-            (postgresql-query c (string-append "UPDATE " table " SET val=999 WHERE id=1"))
+            (postgreconnpool-call c (string-append "UPDATE " table " SET val=999 WHERE id=1"))
             (raise 'boom)))
         #f))
     (check "rollback-reverted"
-      (= 7 (scalar-num (postgresql-query pool
+      (= 7 (scalar-num (postgreconnpool-call pool
              (string-append "SELECT val FROM " table " WHERE id=1")))))
     (check "pool-alive-after-rollback"
-      (= 1 (scalar-num (postgresql-query pool "SELECT 1"))))
+      (= 1 (scalar-num (postgreconnpool-call pool "SELECT 1"))))
 
     ;; ---- 3. FOR UPDATE serialises concurrent writers (no lost updates) ------
-    (postgresql-query pool (string-append "UPDATE " table " SET val=0 WHERE id=1"))
+    (postgreconnpool-call pool (string-append "UPDATE " table " SET val=0 WHERE id=1"))
     (let ((n 20) (p3 (postgresql-pool 3 host port user pass db)))
       (do ((i 0 (+ i 1))) ((= i n))
         (spawn (lambda ()
           (postgresql-transaction p3
             (lambda (c)
               (let ((v (scalar-num
-                         (postgresql-query c
+                         (postgreconnpool-call c
                            (string-append "SELECT val FROM " table
                                           " WHERE id=1 FOR UPDATE")))))
-                (postgresql-query c
+                (postgreconnpool-call c
                   (string-append "UPDATE " table " SET val="
                     (number->string (+ v 1)) " WHERE id=1")))))
           (send main (vector 'done)))))
@@ -134,19 +134,19 @@
         (when (< k n)
           (receive (after 20000 (fail "concurrency: workers did not finish"))
             (`#(done) (loop (+ k 1))))))
-      (postgresql-close! p3)
+      (postgreconnpool-close! p3)
       (check "for-update-no-lost-updates"
-        (= n (scalar-num (postgresql-query pool
+        (= n (scalar-num (postgreconnpool-call pool
                (string-append "SELECT val FROM " table " WHERE id=1"))))))
 
     ;; ---- 4. no connection leak: far more transactions than pool size --------
     (let ((m 40))
       (let loop ((i 0))
         (when (< i m)
-          (postgresql-transaction pool (lambda (c) (postgresql-query c "SELECT 1")))
+          (postgresql-transaction pool (lambda (c) (postgreconnpool-call c "SELECT 1")))
           (loop (+ i 1))))
       (check "no-leak-sequential"
-        (= 1 (scalar-num (postgresql-query pool "SELECT 1")))))
+        (= 1 (scalar-num (postgreconnpool-call pool "SELECT 1")))))
 
     ;; ---- 5. a borrower killed mid-transaction is reclaimed + rebuilt --------
     (let ((p1 (postgresql-pool 1 host port user pass db)))
@@ -154,7 +154,7 @@
              (spawn (lambda ()
                (postgresql-transaction p1
                  (lambda (c)
-                   (postgresql-query c "SELECT 1")
+                   (postgreconnpool-call c "SELECT 1")
                    (send main (vector 'holding))
                    (receive (`#(never) 'unreached))))))))
         (receive (after 5000 (fail "reclaim: victim never acquired the connection"))
@@ -164,15 +164,15 @@
           (equal? 42
             (guard (e (#t #f))
               (postgresql-transaction p1
-                (lambda (c) (scalar-num (postgresql-query c "SELECT 42"))))))))
-      (postgresql-close! p1))
+                (lambda (c) (scalar-num (postgreconnpool-call c "SELECT 42"))))))))
+      (postgreconnpool-close! p1))
 
     ;; ---- 6. extended query protocol: postgresql-execute ---------------------
     (let ((evil "Robert'); DROP TABLE students;--"))
       ;; values travel out-of-band: quoting characters are data, not SQL
-      (postgresql-query pool
+      (postgreconnpool-call pool
         (string-append "DROP TABLE IF EXISTS " table "_ex"))
-      (postgresql-query pool
+      (postgreconnpool-call pool
         (string-append "CREATE TABLE " table
                        "_ex (id INT PRIMARY KEY, name TEXT, score REAL)"))
       (check "execute-insert-params"
@@ -214,7 +214,7 @@
                  (vector->list (make-vector 65536 1)))
           #f))
       (check "pool-alive-after-param-overflow"
-        (= 1 (scalar-num (postgresql-query pool "SELECT 1"))))
+        (= 1 (scalar-num (postgreconnpool-call pool "SELECT 1"))))
       ;; a server error over the extended flow keeps the connection framed
       (check "execute-error-sqlstate"
         (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'postgresql-error))
@@ -222,8 +222,8 @@
           (postgresql-execute pool "SELECT * FROM no_such_table_xyz WHERE a = $1" 1)
           #f))
       (check "pool-alive-after-execute-error"
-        (= 1 (scalar-num (postgresql-query pool "SELECT 1"))))
-      (postgresql-query pool (string-append "DROP TABLE IF EXISTS " table "_ex")))
+        (= 1 (scalar-num (postgreconnpool-call pool "SELECT 1"))))
+      (postgreconnpool-call pool (string-append "DROP TABLE IF EXISTS " table "_ex")))
 
     ;; ---- 7. TLS (extra opt-in: server needs ssl=on and SSL_CERT_FILE must
     ;;         point at its certificate, self-signed being its own CA) -------
@@ -231,25 +231,25 @@
       (let ((topts (list (cons 'tls tls-establish!))))
         (let ((conn (postgresql-connect host port user pass db topts)))
           (check "tls-scram-connect"
-            (= 1 (scalar-num (postgresql-query conn "SELECT 1"))))
+            (= 1 (scalar-num (postgreconnpool-call conn "SELECT 1"))))
           ;; the backend itself must see this session as SSL
           (check "tls-backend-sees-ssl"
             (equal? "true"
-                    (scalar (postgresql-query conn
+                    (scalar (postgreconnpool-call conn
                       "SELECT ssl::text FROM pg_stat_ssl WHERE pid = pg_backend_pid()"))))
           (check "tls-execute-params"
             (let ((r (postgresql-execute conn "SELECT $1 || $2" "en" "crypted")))
               (equal? (vector-ref r 2) '(("encrypted")))))
-          (postgresql-close! conn))
+          (postgreconnpool-close! conn))
         ;; pool over TLS: rebuild machinery composes with the codec
         (let ((p2 (postgresql-pool 2 host port user pass db topts)))
           (check "tls-pool-query"
-            (= 7 (scalar-num (postgresql-query p2 "SELECT 7"))))
-          (postgresql-close! p2))))
+            (= 7 (scalar-num (postgreconnpool-call p2 "SELECT 7"))))
+          (postgreconnpool-close! p2))))
 
     ;; ---- done ---------------------------------------------------------------
-    (postgresql-query pool (string-append "DROP TABLE IF EXISTS " table))
-    (postgresql-close! pool)
+    (postgreconnpool-call pool (string-append "DROP TABLE IF EXISTS " table))
+    (postgreconnpool-close! pool)
     (sleep-ms 50)
     (if (zero? failures)
         (begin (display "postgresql-e2e: all tests passed\n") (exit 0))

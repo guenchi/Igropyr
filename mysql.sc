@@ -7,11 +7,11 @@
 ;;; are queued in the connection's mailbox and run one at a time.
 ;;;
 ;;;   (define db (mysql-connect "127.0.0.1" 3306 "user" "password" "dbname"))
-;;;   (mysql-query db "SELECT id, name FROM users")
+;;;   (myconnpool-call db "SELECT id, name FROM users")
 ;;;     ;; -> #(rows ("id" "name") (("1" "Alice") ("2" "Bob")))
-;;;   (mysql-query db "INSERT INTO users (name) VALUES ('Eve')")
+;;;   (myconnpool-call db "INSERT INTO users (name) VALUES ('Eve')")
 ;;;     ;; -> #(ok 1 3)                     ; affected rows, last insert id
-;;;   (mysql-close! db)
+;;;   (myconnpool-close! db)
 ;;;
 ;;; Values arrive as strings (MySQL text protocol); NULL is #f.
 ;;; Errors raise #(mysql-error ,code ,message) in the caller.
@@ -23,9 +23,9 @@
 ;;; servers via auth-switch.
 
 (library (igropyr mysql)
-  (export mysql-connect mysql-pool mysql-query mysql-close! mysql-pool-stats
+  (export mysql-connect mysql-pool myconnpool-call myconnpool-close! myconnpool-stats
           mysql-transaction call-with-mysql-connection)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr sqlpool)
+  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr connpool)
           (igropyr buffer)
           (only (igropyr crypto) sha1 sha256 base64-decode))
 
@@ -37,7 +37,7 @@
   ;; every nine seconds -- which a hostile or confused peer can keep up
   ;; indefinitely -- held a connection worker forever. The single-connection
   ;; caller gave up at twelve seconds and the worker kept running; a POOL
-  ;; worker never reported db-up at all, so it held its slot for the life of
+  ;; worker never reported pool-up at all, so it held its slot for the life of
   ;; the process while the pool waited for a connection never coming.
   (define connect-deadline-ms 30000)
 
@@ -279,14 +279,14 @@
       (`#(DOWN ,pid ,reason) (mysql-fail -1 "owner gone"))
       ;; A TEARDOWN has to reach us HERE as well. The pool reclaims a
       ;; connection whose borrower died by marking it dying and sending
-      ;; db-quit -- @kill discards dynamic-wind winders, so the pool's
+      ;; pool-quit -- @kill discards dynamic-wind winders, so the pool's
       ;; monitor is the only path back -- and a receive matching only the
       ;; socket left that message in the mailbox until the statement
       ;; finished. Against a server that has stopped answering, that is the
       ;; whole query timeout, and for all of it the connection is marked
       ;; dying: neither lent out nor rebuilt. Failing here takes the same
       ;; route a transport error already takes.
-      (`#(db-quit) (mysql-fail -1 "connection closed while a query was in flight"))))
+      (`#(pool-quit) (mysql-fail -1 "connection closed while a query was in flight"))))
 
   ;; ---- length-encoded values -------------------------------------------------------
 
@@ -575,7 +575,7 @@
     (and (vector? r) (eq? (vector-ref r 0) 'mysql-error)
          (< (vector-ref r 1) 0)))
 
-  ;; notify (a pid or #f): told #(db-idle ,self) after each finished
+  ;; notify (a pid or #f): told #(pool-idle ,self) after each finished
   ;; query, so a pool can hand this connection its next task. Replies
   ;; carry the caller's ref so a late reply (after the caller timed out)
   ;; cannot be mis-read by that caller's next query. On a transport
@@ -590,7 +590,7 @@
   ;; monitor is one-directional: when the pool was killed or died of an
   ;; internal error, actor cleanup dropped the monitoring relationships and
   ;; left every connection actor running, each holding an fd and, over TLS,
-  ;; a live session. Only an orderly db-quit ever closed them. Recreating
+  ;; a live session. Only an orderly pool-quit ever closed them. Recreating
   ;; the pool then stacked a second full set on top of the first.
   ;;
   ;; A connection whose owner is gone has nobody to serve and no way to be
@@ -602,7 +602,7 @@
             (begin (send-packet! c (bytevector 1) 0)   ; COM_QUIT
                    (tcp-close! c))
             (serve-loop c buf notify)))
-      (`#(db-query ,sql ,ref ,from)
+      (`#(pool-request ,sql ,ref ,from)
         (let ((r (guard (e (#t (as-mysql-error e "query failed")))
                    (run-query! c buf sql))))
           (if (transport-dead? r)
@@ -619,25 +619,25 @@
           ;; The cost of this order is a two-send window in which a kill
           ;; would leave the caller with no reply at all rather than a
           ;; duplicate one. That is a narrower window and a milder failure.
-                (when notify (send notify (vector 'db-conn-dead self)))
-                (send from (vector 'db-reply ref r))
+                (when notify (send notify (vector 'pool-conn-dead self)))
+                (send from (vector 'pool-reply ref r))
                 (tcp-close! c))                   ; exit -> DOWN -> rebuild
               (begin
-                (send from (vector 'db-reply ref r))
-                (when notify (send notify (vector 'db-idle self)))
+                (send from (vector 'pool-reply ref r))
+                (when notify (send notify (vector 'pool-idle self)))
                 (serve-loop c buf notify)))))
-      ;; sql-query sends this to whatever handle it was given when a call
+      ;; connpool-call sends this to whatever handle it was given when a call
       ;; times out; only a pool acts on it. Consume it here so it does not
       ;; sit in the mailbox forever, slowing every later selective receive
       ;; (the same accumulation drain-stale! exists to prevent).
-      (`#(db-query-cancel ,ref ,from) (serve-loop c buf notify))
+      (`#(pool-request-cancel ,ref ,from) (serve-loop c buf notify))
       ;; A single connection is not a pool and keeps none of its
       ;; bookkeeping. Answering #f is what keeps the request from sitting
-      ;; here forever; mysql-pool-stats turns it into a clear error.
-      (`#(db-stats ,ref ,from)
-        (send from (vector 'db-stats-reply ref #f))
+      ;; here forever; myconnpool-stats turns it into a clear error.
+      (`#(pool-stats ,ref ,from)
+        (send from (vector 'pool-stats-reply ref #f))
         (serve-loop c buf notify))
-      (`#(db-quit)
+      (`#(pool-quit)
         (send-packet! c (bytevector 1) 0)          ; COM_QUIT
         (tcp-close! c))
       (`#(tcp-data ,bv)                            ; stray data between queries
@@ -647,23 +647,23 @@
       (`#(tcp-error ,e) (tcp-close! c))))
 
   ;; After reporting up, wait to be adopted (the pool or the connecting
-  ;; caller answers with db-adopt). If nobody adopts -- the caller
+  ;; caller answers with pool-adopt). If nobody adopts -- the caller
   ;; timed out and moved on, or the pool was closed while we were still
   ;; authenticating -- close the socket and exit instead of holding an
   ;; authenticated connection forever.
   (define (await-adoption c buf notify)
     (receive (after connect-timeout-ms (tcp-close! c))
-      (`#(db-adopt)
+      (`#(pool-adopt)
         (when notify (monitor notify))
         (serve-loop c buf notify))
-      (`#(db-quit) (send-packet! c (bytevector 1) 0) (tcp-close! c))
+      (`#(pool-quit) (send-packet! c (bytevector 1) 0) (tcp-close! c))
       (`#(tcp-data ,bv)
         (inbuf-append! buf bv)
         (await-adoption c buf notify))
       (`#(tcp-eof) (tcp-close! c))
       (`#(tcp-error ,e) (tcp-close! c))))
 
-  ;; spawn a connection worker; reports #(db-up ,ref ,self status) to
+  ;; spawn a connection worker; reports #(pool-up ,ref ,self status) to
   ;; report-to -- ref lets the receiver ignore a stale report from an
   ;; earlier, timed-out attempt -- then waits for adoption and serves
   ;; queries (notifying `notify` when idle). Every failure path closes
@@ -674,7 +674,7 @@
     (spawn
       (lambda ()
         (define (report! status)
-          (send report-to (vector 'db-up ref self status)))
+          (send report-to (vector 'pool-up ref self status)))
         (let ((started (guard (e (#t (as-mysql-error e "connect failed")))
                          (tcp-connect! host port self)
                          'ok)))
@@ -700,12 +700,12 @@
                         (begin (tcp-close! c) (report! r)))))))))))
 
   ;; ---- pool + public API ---------------------------------------------------
-  ;; The pool, lease and transaction machinery is (igropyr sqlpool), shared
+  ;; The pool, lease and transaction machinery is (igropyr connpool), shared
   ;; with (igropyr postgresql); this driver contributes the wire protocol
   ;; above and its error shapes below.
 
   (define cfg
-    (make-sql-cfg
+    (make-connpool-cfg
       (lambda (r) (and (vector? r) (eq? (vector-ref r 0) 'mysql-error)))
       (vector 'mysql-error -1 "connection lost")
       (vector 'mysql-error -1 "pool closed")
@@ -740,7 +740,7 @@
       ;; it is immortal and every selective receive below scans past it. A
       ;; process that reconnects in a loop and never runs a query had
       ;; nothing else that would ever clear them.
-      (sql-drain-stale!)
+      (connpool-drain-stale!)
       (let ((ref (gensym)))
         (start-connection host port user password db opts #f self ref)
         (receive (after (+ connect-timeout-ms 2000)
@@ -748,13 +748,13 @@
                     ;; its socket by itself; the ref keeps its late up-report
                     ;; from ever being mistaken for another connect's.
                     (raise (vector 'mysql-error -1 "connect timeout")))
-          (`#(db-up ,@ref ,pid ,status)
+          (`#(pool-up ,@ref ,pid ,status)
             (if (eq? status 'ok)
-                (begin (send pid (vector 'db-adopt)) pid)
+                (begin (send pid (vector 'pool-adopt)) pid)
                 (raise status)))))))
 
-  ;; Pool of n connections; returns the dispatcher, which mysql-query
-  ;; and mysql-close! accept exactly like a single connection. Usable
+  ;; Pool of n connections; returns the dispatcher, which myconnpool-call
+  ;; and myconnpool-close! accept exactly like a single connection. Usable
   ;; immediately: queries queue until connections come up. Same optional
   ;; db + options as mysql-connect.
   (define (mysql-pool n host port user password . rest)
@@ -764,10 +764,10 @@
       ;; before the spawn: a bad size checked inside the pool process
       ;; raises where the caller cannot see it, and this returns a pid
       ;; that dies a moment later
-      (sql-check-pool-size! 'mysql-pool n)
+      (connpool-check-size! 'mysql-pool n)
       (spawn
         (lambda ()
-          (sql-pool-loop n
+          (connpool-loop n
             (lambda (notify report-to ref)
               (start-connection host port user password db opts
                                 notify report-to ref))
@@ -776,17 +776,17 @@
   ;; Run one SQL statement; blocks only the calling green process. A
   ;; timed-out statement's outcome is UNKNOWN -- it may still execute on
   ;; the server.
-  (define (mysql-query mc sql) (sql-query mc sql cfg))
+  (define (myconnpool-call mc sql) (connpool-call mc sql cfg))
 
   ;; Borrow one whole connection from a POOL for the extent of proc, then
   ;; return it -- even if proc raises or exits non-locally. proc receives
-  ;; the connection process; run mysql-query on THAT connection and no
+  ;; the connection process; run myconnpool-call on THAT connection and no
   ;; other caller's query can interleave, which is what makes a
   ;; multi-statement transaction correct. Requires a mysql-pool. Don't
   ;; send queries (or a second checkout) to the pool itself while holding
   ;; a connection.
   (define (call-with-mysql-connection pool proc)
-    (sql-call-with-connection pool proc cfg))
+    (connpool-lease pool proc cfg))
 
   ;; Run proc inside a transaction on a borrowed pool connection: START
   ;; TRANSACTION, then COMMIT if proc returns normally, or ROLLBACK if it
@@ -797,9 +797,9 @@
   (define (mysql-transaction pool proc)
     (sql-transaction pool proc cfg))
 
-  (define (mysql-close! mc) (sql-close! mc))
+  (define (myconnpool-close! mc) (connpool-close! mc))
 
   ;; A snapshot of a pool: in-use, pending, checkout wait, query duration,
-  ;; timeout counts and more. See (igropyr sqlpool) for the full key list.
-  (define (mysql-pool-stats pool) (sql-pool-stats pool))
+  ;; timeout counts and more. See (igropyr connpool) for the full key list.
+  (define (myconnpool-stats pool) (connpool-stats pool))
 )
