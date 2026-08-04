@@ -48,6 +48,26 @@
             (loop))
           (`#(db-quit) 'done))))))
 
+;; A stand-in that can be told to report itself dead to the pool WITHOUT
+;; exiting -- which is the state a driver connection is in for the moment
+;; between telling the pool its transport failed and actually closing.
+(define (reporting-spawn-conn! notify report-to ref)
+  (spawn
+    (lambda ()
+      (send report-to (vector 'db-up ref self 'ok))
+      (receive (`#(db-adopt) 'ok))
+      (let loop ()
+        (receive
+          (`#(db-query ,sql ,r ,from)
+            (send from (vector 'db-reply r (vector 'fake-rows sql)))
+            (send notify (vector 'db-idle self))
+            (loop))
+          (`#(report-dead) (send notify (vector 'db-conn-dead self)) (loop))
+          (`#(db-stats ,r ,from)
+            (send from (vector 'db-stats-reply r #f))
+            (loop))
+          (`#(db-quit) 'done))))))
+
 ;; A stand-in that reports up, is adopted, and dies at once -- what a peer
 ;; that accepts and then drops the connection looks like from in here.
 (define stillborn-spawns 0)
@@ -323,6 +343,47 @@
             (newline)
             (check "one connection is never leased to two borrowers at once"
               (not (and (unbox a) (unbox b) (eq? (unbox a) (unbox b))))))))
+      (send pool (vector 'db-quit)))
+
+    ;; ---- a check-in must not put a DYING connection back in rotation ------
+    ;;
+    ;; A connection that hits a transport error tells its caller and tells
+    ;; the pool, and the caller's check-in can arrive in between. The pool
+    ;; then made a connection it already knew was going available again and
+    ;; leased it to the next borrower, who got a pid that was about to
+    ;; exit: its statement went nowhere and it waited out its whole query
+    ;; timeout for a reply nobody would send. The connection's own DOWN
+    ;; tidied up afterwards, far too late to matter.
+    (let* ((pool (spawn (lambda () (sql-pool-loop 1 reporting-spawn-conn! cfg))))
+           (me self))
+      (sleep-ms 200)
+      (let ((borrower
+             (spawn (lambda ()
+                      (let ((r (gensym)))
+                        (send pool (vector 'db-checkout r self))
+                        (receive (after 2000 (send me (vector 'no-lease)))
+                          (`#(db-checkout-reply ,@r ,c)
+                            (send me (vector 'leased c))
+                            (receive (`#(release) (void)))
+                            (send pool (vector 'db-checkin self c))
+                            (send me (vector 'checked-in)))))))))
+        (let ((conn (receive (after 3000 #f) (`#(leased ,c) c))))
+          (check "the borrower has the only connection" (and conn #t))
+          ;; the transport failed: the connection says so and stays alive,
+          ;; exactly as a driver does between its two sends
+          (send conn (vector 'report-dead))
+          (sleep-ms 100)
+          (send borrower (vector 'release))
+          (receive (after 3000 (void)) (`#(checked-in) 'ok))
+          ;; a fresh borrower must NOT be handed that connection
+          (let ((r (gensym)))
+            (send pool (vector 'db-checkout r self))
+            (let ((got (receive (after 700 'none)
+                         (`#(db-checkout-reply ,@r ,c2) c2))))
+              (check "a checked-in connection the pool knows is dying is not re-lent"
+                     (not (eq? got conn)))
+              (when (eq? got conn)
+                (display "  [info] the pool handed back the dying connection\n"))))))
       (send pool (vector 'db-quit)))
 
     ;; ---- a connection that dies at once is a FAILED CONNECT ---------------

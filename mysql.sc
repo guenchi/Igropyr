@@ -605,12 +605,25 @@
       (`#(db-query ,sql ,ref ,from)
         (let ((r (guard (e (#t (as-mysql-error e "query failed")))
                    (run-query! c buf sql))))
-          (send from (vector 'db-reply ref r))
           (if (transport-dead? r)
               (begin
+          ;; THE POOL FIRST, then the caller. Telling the caller first
+          ;; releases it, and its check-in can reach the pool before this
+          ;; message does -- so the pool put a connection it was about to
+          ;; be told was dead back into rotation and lent it to the next
+          ;; borrower, whose statement went to a pid that then exited.
+          ;; (The pool also refuses to re-lend a connection already marked
+          ;; dying; both halves are needed, because that mark is what this
+          ;; ordering makes arrive in time.)
+          ;;
+          ;; The cost of this order is a two-send window in which a kill
+          ;; would leave the caller with no reply at all rather than a
+          ;; duplicate one. That is a narrower window and a milder failure.
                 (when notify (send notify (vector 'db-conn-dead self)))
+                (send from (vector 'db-reply ref r))
                 (tcp-close! c))                   ; exit -> DOWN -> rebuild
               (begin
+                (send from (vector 'db-reply ref r))
                 (when notify (send notify (vector 'db-idle self)))
                 (serve-loop c buf notify)))))
       ;; sql-query sends this to whatever handle it was given when a call
