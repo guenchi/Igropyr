@@ -352,7 +352,12 @@
     (define stat-checkout-timeouts 0)    ; callers that gave up waiting
     (define stat-connects 0)             ; workers that came up
     (define stat-connect-failures 0)
-    (define stat-connections-lost 0)     ; live connections that died
+    (define stat-connections-lost 0)     ; live connections that DIED
+    ;; ...as against stood down on schedule. Rolling a retirement into the
+    ;; loss count makes a pool recycling exactly as told look like one
+    ;; whose peer keeps dropping it, and that number is what an operator
+    ;; reads to tell those apart.
+    (define stat-connections-retired 0)
     (define stat-queue-wait-total 0)     ; ms a statement spent queued
     (define stat-queue-wait-max 0)
     (define stat-checkout-wait-total 0)  ; ms a borrower spent waiting
@@ -649,6 +654,7 @@
                 (cons 'connects stat-connects)
                 (cons 'connect-failures stat-connect-failures)
                 (cons 'connections-lost stat-connections-lost)
+                (cons 'connections-retired stat-connections-retired)
                 ;; latency: total + max, with the count above them, so the
                 ;; mean is total/count and the tail is not averaged away
                 (cons 'queue-wait-ms-total stat-queue-wait-total)
@@ -725,15 +731,20 @@
              ;; that cannot hold one up, and making it wait out the
              ;; stillborn backoff would charge every planned recycle for a
              ;; failure that did not happen.
-             (let* ((deliberate (memq (hashtable-ref dying pid #f)
-                                      '(teardown retired)))
+             ;; READ BEFORE THE DELETES BELOW: the dying mark is cleared a
+             ;; few lines down, so anything that wants to know why has to
+             ;; ask here.
+             (let* ((why (hashtable-ref dying pid #f))
+                    (deliberate (memq why '(teardown retired)))
                     (born (hashtable-ref up-at pid #f))
                     (stillborn (and (not deliberate) born
                                     (< (- (now-ms) born) min-lifetime-ms))))
                (hashtable-delete! up-at pid)
                (set! idle (remq pid idle))
                (hashtable-delete! dying pid)
-               (set! stat-connections-lost (+ stat-connections-lost 1))
+               (if (eq? why 'retired)
+                   (set! stat-connections-retired (+ stat-connections-retired 1))
+                   (set! stat-connections-lost (+ stat-connections-lost 1)))
                (let ((entry (hashtable-ref busy pid #f)))
                  (hashtable-delete! busy pid)
                  (when entry

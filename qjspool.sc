@@ -266,7 +266,16 @@
       ;; deadline, and is closed by the check BELOW on the very same read.
       ;; What the check up here changed was only the case where the frame
       ;; IS whole -- a real request, refused.
-      (let ((before (inbuf-length buf)))
+      ;; WHETHER WE WERE THE ONE RUNNING LATE, decided before the parse
+      ;; because the parse moves the clock. Reaching here with a deadline
+      ;; already past can only mean the worker was blocked: an idle one
+      ;; sits in a receive whose timer closes the connection at the
+      ;; deadline, and a buffer whose window has already run out is closed
+      ;; at the top of the loop without receiving at all. So these bytes
+      ;; were delivered while nobody could look at them, whenever they
+      ;; actually arrived.
+      (let ((late? (and since (>= (now-ms) since)))
+            (before (inbuf-length buf)))
         (if (guard (e (#t #f)) (answer-all! c buf) #t)
             (let* ((rest (inbuf-length buf))
                    ;; A FRAME WAS CONSUMED, so whatever is left over is a
@@ -278,8 +287,19 @@
                    ;; delivered in between. Our own client never pipelines,
                    ;; but answer-all! exists for clients that do.
                    (consumed (< rest before))
+                   ;; A LATE READ BUYS A FRESH WINDOW EVEN IF IT COMPLETED
+                   ;; NOTHING. TCP splits where it likes and the read
+                   ;; buffer is 64KiB, so a large request delivered whole
+                   ;; and in time still arrives as several messages; the
+                   ;; first of them completes no frame, and keeping the
+                   ;; old deadline closed the connection on it and threw
+                   ;; away the rest of a request that was never late.
+                   ;; Forgiving the read, not the frame, is what makes the
+                   ;; two indistinguishable cases -- split delivery and a
+                   ;; deadline spent inside someone else's render -- come
+                   ;; out the same way.
                    (deadline (cond ((= rest 0) #f)
-                                   ((or consumed (not since))
+                                   ((or consumed late? (not since))
                                     (+ (now-ms) partial-ms))
                                    (else since))))
               (cond
@@ -315,9 +335,10 @@
   ;; the thing that guard was for, whose whole cost is renders the peer
   ;; asked for and paid for.
   ;;
-  ;; What bounds a tail is the check BEFORE this runs: a tail carried in
-  ;; from an earlier read whose deadline has already passed ends the
-  ;; connection without anything being processed at all.
+  ;; What bounds a tail is the check AFTER this runs: a read that completes
+  ;; nothing keeps the deadline it came in with and is closed on that same
+  ;; read. There was a check before this one instead, and it refused whole
+  ;; frames that had arrived in time -- see the note at the caller.
   (define (answer-all! c buf)
     (let loop ()
       (let ((f (take-frame! buf)))
@@ -500,7 +521,13 @@
               ;; here, which is how a rule kept as prose next to one of its
               ;; sites fails: deciding it before the reply is what makes it
               ;; hold at both.
-              (let ((retiring (>= next-id max-id)))
+              ;; ONE-BASED CAP, ZERO-BASED IDS. next-id is the id carried
+              ;; by the answer being sent, and the first is 0, so the Nth
+              ;; render is the one numbered N-1. Comparing the id to the
+              ;; cap directly served N+1 -- invisible while the cap was
+              ;; #xffffffff and a broken promise the moment it was a
+              ;; number a caller chose.
+              (let ((retiring (>= next-id (- max-id 1))))
                 (when (and retiring notify)
                   ;; ON SCHEDULE, and it says so: a pool told only that a
                   ;; connection died treats a planned stand-down as a peer
@@ -629,11 +656,14 @@
 
   ;; How many renders one connection answers before it is retired. The
   ;; ceiling is not a policy choice: the id field is u32, so a counter that
-  ;; kept going could not be encoded at all. A caller may set it lower to
+  ;; kept going could not be encoded at all. There are 2^32 distinct ids
+  ;; and the first is 0, so 2^32 requests fit exactly -- the ceiling is a
+  ;; count, not the largest id, and reading it as the latter cost one
+  ;; request per connection at every setting. A caller may set it lower to
   ;; recycle connections on a schedule of its own -- and a lower value is
   ;; the only way to reach the retirement path in a test, which is
   ;; otherwise four billion renders away.
-  (define default-max-requests #xffffffff)
+  (define default-max-requests #x100000000)
 
   (define (opt-max-requests opts who)
     (let ((v (cond ((assq 'max-requests-per-connection opts) => cdr)
@@ -651,7 +681,9 @@
 
   ;; A pool with one connection per endpoint. Options: (render-timeout-ms .
   ;; n) how long a render may take, (checkout-timeout-ms . n) how long a
-  ;; caller waits for a free worker before being told there is none.
+  ;; caller waits for a free worker before being told there is none, and
+  ;; (max-requests-per-connection . n) how many renders a connection
+  ;; answers before it stands down and is rebuilt.
   ;;
   ;; Usable immediately: renders queue until the connections come up.
   (define (qjspool endpoints . rest)
@@ -688,7 +720,17 @@
            (render-ms (opt-ms opts 'render-timeout-ms default-render-ms 'qjspool-connect))
            (checkout-ms (opt-ms opts 'checkout-timeout-ms default-checkout-ms
                                 'qjspool-connect))
-           (max-id (opt-max-requests opts 'qjspool-connect))
+           ;; REFUSED HERE. A lone connection has no pool behind it, so
+           ;; retiring one is not recycling, it is a handle that stops
+           ;; working: nothing rebuilds it and every later render fails
+           ;; for good. Accepting the option by symmetry with qjspool
+           ;; would have been silent about that.
+           (max-id (begin
+                     (when (assq 'max-requests-per-connection opts)
+                       (assertion-violation 'qjspool-connect
+                         "max-requests-per-connection needs a pool to rebuild the connection; a lone connection cannot be recycled"
+                         (cdr (assq 'max-requests-per-connection opts))))
+                     default-max-requests))
            (cfg (make-cfg render-ms checkout-ms)))
       (connpool-drain-stale!)
       (let ((ref (gensym)))

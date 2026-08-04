@@ -48,6 +48,21 @@
             (loop))
           (`#(pool-quit) 'done))))))
 
+;; A stand-in that answers its caller itself and then reports the death,
+;; which is the order a driver uses when its transport fails under a query.
+(define (dying-mid-query-conn! notify report-to ref)
+  (spawn
+    (lambda ()
+      (send report-to (vector 'pool-up ref self 'ok))
+      (receive (`#(pool-adopt) 'ok))
+      (let loop ()
+        (receive
+          (`#(pool-request ,sql ,r ,from)
+            (send notify (vector 'pool-conn-dead self))
+            (send from (vector 'pool-reply r (vector 'fake-error "transport")))
+            'gone)                      ; ...and exits, so a DOWN follows
+          (`#(pool-quit) 'done))))))
+
 ;; A stand-in that can be told to report itself dead to the pool WITHOUT
 ;; exiting -- which is the state a driver connection is in for the moment
 ;; between telling the pool its transport failed and actually closing.
@@ -494,6 +509,77 @@
                      (not (eq? got conn)))
               (when (eq? got conn)
                 (display "  [info] the pool handed back the dying connection\n"))))))
+      (send pool (vector 'pool-quit)))
+
+    ;; ---- ...and neither must one that was ALREADY back in rotation -------
+    ;;
+    ;; The mirror of the case above, and the one the gate in
+    ;; make-available! cannot cover: here the check-in lands FIRST, so the
+    ;; connection is sitting in the idle set when its death is reported and
+    ;; never has to pass that gate again. Clearing only its busy entry left
+    ;; it idle and marked dying at the same time, and the next checkout was
+    ;; handed it.
+    (let* ((pool (spawn (lambda () (connpool-loop 1 reporting-spawn-conn! cfg))))
+           (me self))
+      (sleep-ms 200)
+      (let ((borrower
+             (spawn (lambda ()
+                      (let ((r (gensym)))
+                        (send pool (vector 'pool-checkout r self))
+                        (receive (after 2000 (send me (vector 'no-lease)))
+                          (`#(pool-checkout-reply ,@r ,c)
+                            (send me (vector 'leased c))
+                            (send pool (vector 'pool-checkin self c))
+                            (send me (vector 'checked-in)))))))))
+        (let ((conn (receive (after 3000 #f) (`#(leased ,c) c))))
+          (check "the borrower has the only connection (idle-then-dead)"
+                 (and conn #t))
+          (receive (after 3000 (void)) (`#(checked-in) 'ok))
+          (sleep-ms 100)                       ; the pool has filed it as idle
+          (send conn (vector 'report-dead))    ; ...and only now does it die
+          (sleep-ms 150)
+          (let ((st (connpool-stats pool)))
+            (check "a connection reported dead while idle leaves the idle set"
+                   (= (cond ((assq 'idle st) => cdr) (else -1)) 0))
+            (when (> (cond ((assq 'idle st) => cdr) (else -1)) 0)
+              (display "  [info] idle/dying at once: ")
+              (write (list (assq 'idle st) (assq 'dying st))) (newline)))
+          (let ((r (gensym)))
+            (send pool (vector 'pool-checkout r self))
+            (let ((got (receive (after 700 'none)
+                         (`#(pool-checkout-reply ,@r ,c2) c2))))
+              (check "an idle connection reported dead is not lent out"
+                     (not (eq? got conn)))))))
+      (send pool (vector 'pool-quit)))
+
+    ;; ---- a caller is answered ONCE when its connection fails mid-query ---
+    ;;
+    ;; A driver that hits a transport error answers its caller itself and
+    ;; then tells the pool. If the pool keeps the busy entry, the DOWN that
+    ;; follows answers the same caller a second time with the pool's own
+    ;; lost-error -- a caller that has already moved on gets a stray reply
+    ;; in its mailbox, and whatever it selectively receives next may match
+    ;; it. Clearing the entry when the death is reported is what makes the
+    ;; reply one shot.
+    (let* ((pool (spawn (lambda () (connpool-loop 1 dying-mid-query-conn! cfg))))
+           (me self))
+      (sleep-ms 200)
+      (let ((caller
+             (spawn (lambda ()
+                      (let ((n (box 0)))
+                        (send me (vector 'asked
+                                         (guard (e (#t 'raised))
+                                           (connpool-call pool "SELECT 1" cfg))))
+                        ;; anything else that arrives is a SECOND answer
+                        (receive (after 1200 (send me (vector 'extra 0)))
+                          (`#(pool-reply ,r ,v) (send me (vector 'extra (list 1 v))))))))))
+        (receive (after 3000 (void))
+(`#(asked ,v) 'ok))
+        (let ((extra (receive (after 3000 'lost) (`#(extra ,k) k))))
+          (check "a caller answered by its failing connection is not answered again"
+                 (eqv? extra 0))
+          (when (not (eqv? extra 0))
+            (display "  [info] duplicate replies: ") (write extra) (newline))))
       (send pool (vector 'pool-quit)))
 
     ;; ---- a connection that dies at once is a FAILED CONNECT ---------------

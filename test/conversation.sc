@@ -20,6 +20,8 @@
     (bytevector-copy! b 0 out na nb)
     out))
 
+(define kill-latency (box 999999))
+
 (define (fail label detail)
   (display "FAIL: ") (display label) (display " ") (write detail) (newline)
   (exit 1))
@@ -631,13 +633,91 @@
         (`#(latency ,took ,v)
           (when (and (vector? v) (eq? (vector-ref v 0) 'should-not-get-here))
             (fail "a runaway step ran to completion" v))
-          ;; told: ~ttl. Noticed on the poll: ttl + 50 at best, and the
-          ;; whole poll floor when the notification is lost.
-          (unless (< took 45)
-            (fail "the kill waited for a poll instead of being told" took))
-          (display (string-append "a runaway step is stopped in "
-                                  (number->string took)
-                                  "ms on a 20ms TTL ok\n")))))))
+          (set-box! kill-latency took))))))
+
+;; THE BEST OF SEVERAL, not one measurement. now-ms is a wall clock, so a
+;; collection or a host pause lands inside `took` and would fail a run
+;; whose behaviour was right. Losing the notification costs every trial
+;; the poll floor, so a single trial under it is enough to show the
+;; notification arrived -- while no single slow trial can condemn it.
+(let ((best (unbox kill-latency)))
+  (do ((i 0 (+ i 1))) ((= i 2))
+    (let ((ttl 20))
+      (let-values (((kid ktok kfirst)
+                    (conversation-start!
+                      (lambda (req suspend!)
+                        (let ((a (suspend! (vector 'parked req))))
+                          (sleep-ms 2000)
+                          (vector 'should-not-get-here a)))
+                      'go
+                      ttl)))
+        (let ((me self))
+          (spawn (lambda ()
+                   (let* ((t0 (now-ms)))
+                     (let-values (((r st) (conversation-resume! kid ktok 'X)))
+                       (send me (vector 'latency (- (now-ms) t0) r))))))
+          (receive (after 6000 (void))
+            (`#(latency ,took ,v)
+              (when (< took best) (set! best took))))))))
+  ;; told: ~ttl. Noticed on the poll: the floor is 50ms, and a lost
+  ;; notification costs it on every trial.
+  (unless (< best 45)
+    (fail "the kill waited for a poll instead of being told" best))
+  (display (string-append "a runaway step is stopped in "
+                          (number->string best)
+                          "ms on a 20ms TTL (best of 3) ok\n")))
+
+;; ---- a step that lands inside the grace tick is NOT killed --------------
+;;
+;; The grace tick exists so that a flow which has already returned is not
+;; killed on its way back and reported rolled back. The sweep below pins
+;; that declining to kill leaves the watchdog watching -- but it is
+;; satisfied just as well by a watchdog that never declines at all, so
+;; deleting the re-check inside the grace window left it green. This is
+;; the other side: a step finishing one or two milliseconds past its
+;; allowance must COMPLETE, which it can only do if the grace period is
+;; there and the decision is taken again at the end of it.
+;; WHAT TO COUNT IS NOT HOW MANY SURVIVED. Whether a step overrunning by
+;; four milliseconds is killed or not is a coin toss on the sampling
+;; phase, and asserting a rate would be asserting the coin. What must
+;; never happen is BOTH: a flow whose value came back and whose
+;; compensation ran anyway -- a committed transaction told it was rolled
+;; back. Deleting the re-check produced exactly that, 13 times in 20.
+(let* ((ttl 20)
+       (d (+ ttl 4))
+       (n 20)
+       (both 0)
+       (killed 0))
+  (do ((i 0 (+ i 1))) ((= i n))
+    (let ((released (box #f)))
+      (let ((r (guard (e (#t 'raised))
+                 (let-values (((gid gtok gfirst)
+                               (conversation-start!
+                                 (lambda (req suspend!)
+                                   (sleep-ms d)
+                                   (vector 'landed d))
+                                 'go
+                                 ttl
+                                 (lambda (x) x)
+                                 (lambda () (set-box! released #t)))))
+                   gfirst))))
+        (sleep-ms 60)                       ; let a late kill land
+        (when (unbox released) (set! killed (+ killed 1)))
+        (when (and (vector? r) (eq? (vector-ref r 0) 'landed) (unbox released))
+          (set! both (+ both 1))))))
+  (unless (= both 0)
+    (fail "a flow that returned its value also had its compensation run"
+          (list both n)))
+  ;; ...and the grace period is what makes that possible. Without it the
+  ;; decision is retaken in the same instant it was made, so every step
+  ;; that was running at the sample dies -- 20 of 20, against 3 to 9 with
+  ;; the millisecond in place.
+  (unless (< killed n)
+    (fail "every overrunning step was killed: the grace tick bought nothing"
+          killed))
+  (display (string-append "a committed flow is never also released ("
+                          (number->string killed) "/"
+                          (number->string n) " killed) ok\n")))
 
 ;; ---- the watchdog outlives a step it decided NOT to kill ----------------
 ;;
@@ -648,7 +728,8 @@
 ;; first step's duration across the deadline and settles for hitting it
 ;; some of the time: a single run to completion is the failure.
 (let* ((ttl 20)
-       (hits 0))
+       (hits 0)
+       (survived 0))
   (do ((d ttl (+ d 1))) ((> d (+ ttl 5)))
     (do ((trial 0 (+ trial 1))) ((= trial 5))
       ;; the first step may or may not have been killed -- when it was,
@@ -665,6 +746,7 @@
                           (vector 'ran-to-completion a)))
                       'go
                       ttl)))
+        (set! survived (+ survived 1))
         (let ((me self))
           (spawn (lambda ()
                    ;; a first step that WAS killed makes the resume raise;
@@ -679,6 +761,13 @@
   (unless (= hits 0)
     (fail "a later step ran unbounded after the watchdog declined to kill"
           hits))
+  ;; ...AND THE SWEEP HAS TO HAVE SWEPT SOMETHING. Every trial whose first
+  ;; step was killed proves nothing about a second step, because there was
+  ;; none. If they were all killed, `hits = 0` is vacuous and this run says
+  ;; nothing at all -- which is a failure of the test, not a pass.
+  (when (= survived 0)
+    (fail "no trial got past its first step: the sweep proved nothing"
+          survived))
   (display "the watchdog keeps watching after declining to kill ok\n"))
 
 ;; ---- a resume long after the park deadline does not advance -------------
