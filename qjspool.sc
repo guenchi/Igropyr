@@ -65,9 +65,15 @@
 ;;;
 ;;; WIRE FORMAT -- one length-prefixed frame each way:
 ;;;
-;;;   request    u32be n | u16be fnlen | fn utf8 | props json utf8
-;;;   response   u32be n | u8 status   | body
+;;;   request    u32be n | u32be id | u16be fnlen | fn utf8 | props utf8
+;;;   response   u32be n | u32be id | u8 status  | body
 ;;;              status 0 = the render's HTML, 1 = the JS error text.
+;;;
+;;; The ID is echoed by the worker and checked on the way back. Without it
+;;; a response carries nothing that ties it to a request, and "the buffer
+;;; is empty after I took my frame" does not cover a stray frame still in
+;;; flight: it arrives later, on a connection that has since been returned
+;;; to the pool and lent to somebody else, and answers THEIR render.
 ;;;
 ;;; A JS error is a NORMAL response and the connection stays usable; only a
 ;;; malformed or oversized frame is a transport failure, and that discards
@@ -119,10 +125,10 @@
       (bytevector-copy! bv from out 0 n)
       out))
 
-  (define (encode-request fn json)
+  (define (encode-request id fn json)
     (let* ((f (string->utf8 fn)) (j (string->utf8 json))
            (fl (bytevector-length f)) (jl (bytevector-length j))
-           (n (+ 2 fl jl)))
+           (n (+ 4 2 fl jl)))
       ;; refused HERE rather than sent: the length field cannot carry it, and
       ;; a truncated name would ask the worker to render a different function
       (when (> fl 65535)
@@ -131,22 +137,25 @@
         (raise (qjs-err "render request larger than the frame limit")))
       (let ((bv (make-bytevector (+ 4 n))))
         (bytevector-u32-set! bv 0 n (endianness big))
-        (bytevector-u16-set! bv 4 fl (endianness big))
-        (bytevector-copy! f 0 bv 6 fl)
-        (bytevector-copy! j 0 bv (+ 6 fl) jl)
+        (bytevector-u32-set! bv 4 id (endianness big))
+        (bytevector-u16-set! bv 8 fl (endianness big))
+        (bytevector-copy! f 0 bv 10 fl)
+        (bytevector-copy! j 0 bv (+ 10 fl) jl)
         bv)))
 
-  (define (encode-response status body)
-    (let ((n (+ 1 (bytevector-length body))))
+  (define (encode-response id status body)
+    (let ((n (+ 4 1 (bytevector-length body))))
       (if (> n max-frame)
           ;; Our own output must stay inside what the peer will accept, or a
           ;; successful render becomes a transport error that discards a
           ;; healthy connection. Reported as a JS-level failure instead.
-          (encode-response 1 (string->utf8 "render output exceeds the frame limit"))
+          (encode-response id 1
+            (string->utf8 "render output exceeds the frame limit"))
           (let ((bv (make-bytevector (+ 4 n))))
             (bytevector-u32-set! bv 0 n (endianness big))
-            (bytevector-u8-set! bv 4 status)
-            (bytevector-copy! body 0 bv 5 (bytevector-length body))
+            (bytevector-u32-set! bv 4 id (endianness big))
+            (bytevector-u8-set! bv 8 status)
+            (bytevector-copy! body 0 bv 9 (bytevector-length body))
             bv))))
 
   ;; -> the frame body with its length prefix dropped, or #f while the
@@ -197,18 +206,39 @@
   ;; park most of a frame's worth of buffer per connection and simply stop,
   ;; without ever sending a FIN that would end it.
   (define (worker-conn-loop c buf partial-ms)
+    (worker-conn-loop* c buf partial-ms #f))
+
+  ;; `since` is the ABSOLUTE deadline of the frame currently half delivered,
+  ;; or #f when nothing is. Re-arming a fresh timeout on every arrival made
+  ;; this an inactivity timer, and an inactivity timer bounds nothing here:
+  ;; a peer sending one byte just under the interval keeps the same half
+  ;; frame -- and its process, its descriptor and most of a frame's worth of
+  ;; buffer -- alive indefinitely. The deadline is taken once, when the
+  ;; buffer stops being empty, and further bytes shorten the wait rather
+  ;; than renew it. It is also re-checked after answering, because the
+  ;; renders in between are synchronous and nothing was counting during
+  ;; them.
+  (define (worker-conn-loop* c buf partial-ms since)
     (define (on-data bv)
       (inbuf-append! buf bv)
       ;; a framing error is not recoverable on this connection: we no
       ;; longer know where the next request starts
       (if (guard (e (#t #f)) (answer-all! c buf) #t)
-          (worker-conn-loop c buf partial-ms)
+          (let ((left-over (> (inbuf-length buf) 0)))
+            (cond
+              ((not left-over) (worker-conn-loop* c buf partial-ms #f))
+              ((and since (>= (now-ms) since)) (tcp-close! c))
+              (else (worker-conn-loop* c buf partial-ms
+                      (or since (+ (now-ms) partial-ms))))))
           (tcp-close! c)))
     (if (> (inbuf-length buf) 0)
-        (receive (after partial-ms (tcp-close! c))
-          (`#(tcp-data ,bv) (on-data bv))
-          (`#(tcp-eof) (tcp-close! c))
-          (`#(tcp-error ,e) (tcp-close! c)))
+        (let ((left (- (or since (+ (now-ms) partial-ms)) (now-ms))))
+          (if (<= left 0)
+              (tcp-close! c)
+              (receive (after left (tcp-close! c))
+                (`#(tcp-data ,bv) (on-data bv))
+                (`#(tcp-eof) (tcp-close! c))
+                (`#(tcp-error ,e) (tcp-close! c)))))
         (receive
           (`#(tcp-data ,bv) (on-data bv))
           (`#(tcp-eof) (tcp-close! c))
@@ -227,17 +257,18 @@
 
   (define (answer body)
     (let ((n (bytevector-length body)))
-      (when (< n 2) (raise (qjs-err "short request frame")))
-      (let ((fl (bytevector-u16-ref body 0 (endianness big))))
-        (when (> (+ 2 fl) n) (raise (qjs-err "function-name length past the frame")))
-        (let ((fn (utf8->string (bv-slice body 2 fl)))
-              (json (utf8->string (bv-slice body (+ 2 fl) (- n 2 fl)))))
+      (when (< n 6) (raise (qjs-err "short request frame")))
+      (let ((id (bytevector-u32-ref body 0 (endianness big)))
+            (fl (bytevector-u16-ref body 4 (endianness big))))
+        (when (> (+ 6 fl) n) (raise (qjs-err "function-name length past the frame")))
+        (let ((fn (utf8->string (bv-slice body 6 fl)))
+              (json (utf8->string (bv-slice body (+ 6 fl) (- n 6 fl)))))
           ;; qjs-call/bytes never raises: it answers (values ok? bytes-or-text),
           ;; and a failed call has already rebuilt the engine
           (let-values (((ok s) (qjs-call/bytes fn json)))
             (if ok
-                (encode-response 0 s)
-                (encode-response 1 (string->utf8 s))))))))
+                (encode-response id 0 s)
+                (encode-response id 1 (string->utf8 s))))))))
 
   ;; ---- caller side: one connection ----------------------------------------
 
@@ -250,7 +281,7 @@
   ;; wedged in a runaway render never replies and never closes the socket,
   ;; so without it this process would wait forever and the pool would count
   ;; the connection busy for the life of the node.
-  (define (read-response c buf deadline-ms ref)
+  (define (read-response c buf deadline-ms ref id)
     (let ((f (take-frame! buf)))
       (if f
           ;; ONE request is outstanding, so one response is all there can
@@ -263,13 +294,13 @@
           (begin
             (when (> (inbuf-length buf) 0)
               (raise (qjs-err "worker sent more than one response")))
-            (decode-response f))
+            (decode-response f id))
           (let ((left (- deadline-ms (now-ms))))
             (if (<= left 0)
                 (raise (qjs-err "render timed out"))
                 (receive (after left (raise (qjs-err "render timed out")))
                   (`#(tcp-data ,bv) (inbuf-append! buf bv)
-                    (read-response c buf deadline-ms ref))
+                    (read-response c buf deadline-ms ref id))
                   (`#(tcp-eof) (raise (qjs-err "worker closed the connection")))
                   (`#(tcp-error ,e) (raise (qjs-err (uv-strerror e))))
                   ;; A TEARDOWN HAS TO REACH US HERE. The pool sends pool-quit
@@ -316,11 +347,18 @@
                   (`#(DOWN ,pid ,reason)
                     (raise (qjs-err "render pool went away mid-render")))))))))
 
-  (define (decode-response body)
+  (define (decode-response body want-id)
     (let ((n (bytevector-length body)))
-      (when (< n 1) (raise (qjs-err "short response frame")))
-      (let ((status (bytevector-u8-ref body 0))
-            (rest (bv-slice body 1 (- n 1))))
+      (when (< n 5) (raise (qjs-err "short response frame")))
+      (let ((id (bytevector-u32-ref body 0 (endianness big)))
+            (status (bytevector-u8-ref body 4))
+            (rest (bv-slice body 5 (- n 5))))
+        ;; A frame for a request this connection is no longer waiting on is
+        ;; not a reply, it is a desync -- and the one that survives being
+        ;; read late, after the connection has gone back to the pool and
+        ;; been lent to somebody else.
+        (unless (= id want-id)
+          (raise (qjs-err "worker answered a request we are not waiting on")))
         (case status
           ((0) (cons #t rest))
           ((1) (cons #f (utf8->string rest)))
@@ -331,24 +369,37 @@
   ;; Encoding is proportional to the props, so charging it to the margin
   ;; between this deadline and the caller's is charging it to the one
   ;; thing that keeps their order predictable.
-  (define (render-on! c buf req render-ms ref)
-    (let ((deadline (+ (now-ms) render-ms)))
+  ;; The id is per connection and only has to distinguish THIS request from
+  ;; the one before it on the same stream, so a counter is enough.
+  (define (render-on! c buf req render-ms ref id)
+    (let ((deadline (+ (now-ms) render-ms))
+          (frame (guard (e (#t #f)) (encode-request id (car req) (cdr req)))))
       (guard (e (#t (as-qjs-error e "render failed")))
-        (tcp-write! c (encode-request (car req) (cdr req)) #f)
-        (read-response c buf deadline ref))))
+        (unless frame (raise (qjs-err "render request could not be encoded")))
+        ;; CHECKED AGAIN before the write. Encoding is proportional to the
+        ;; props and the runtime can stall for longer than the whole
+        ;; deadline, and sending a request we have already given up on
+        ;; starts a render nobody will read -- on a worker that cannot be
+        ;; told to stop.
+        (when (>= (now-ms) deadline)
+          (raise (qjs-err "render timed out before it was sent")))
+        (tcp-write! c frame #f)
+        (read-response c buf deadline ref id))))
 
   ;; An adopted connection watches its owner: the pool monitors its
   ;; connections and not the other way round, so a pool that died would
   ;; otherwise leave every connection running and holding an fd, with
   ;; nothing able to reach them. See the same note in (igropyr mysql).
-  (define (serve-loop c buf notify render-ms)
+  (define (serve-loop c buf notify render-ms) (serve-loop* c buf notify render-ms 0))
+
+  (define (serve-loop* c buf notify render-ms next-id)
     (receive
       (`#(DOWN ,pid ,reason)
         (if (and notify (eq? pid notify))
             (tcp-close! c)
-            (serve-loop c buf notify render-ms)))
+            (serve-loop* c buf notify render-ms next-id)))
       (`#(pool-request ,req ,ref ,from)
-        (let ((r (render-on! c buf req render-ms ref)))
+        (let ((r (render-on! c buf req render-ms ref next-id)))
           (if (qjs-error? r)
               (begin
           ;; THE POOL FIRST, then the caller. Telling the caller first
@@ -369,16 +420,19 @@
               (begin
                 (send from (vector 'pool-reply ref r))
                 (when notify (send notify (vector 'pool-idle self)))
-                (serve-loop c buf notify render-ms)))))
+                ;; the id ADVANCES: the next request must not be answerable
+                ;; by a frame belonging to this one
+                (serve-loop* c buf notify render-ms (+ next-id 1))))))
       ;; connpool-call sends this to whatever handle it was given when a call
       ;; times out; only a pool acts on it. Consumed here so it does not sit
       ;; in the mailbox slowing every later selective receive.
-      (`#(pool-request-cancel ,ref ,from) (serve-loop c buf notify render-ms))
+      (`#(pool-request-cancel ,ref ,from)
+        (serve-loop* c buf notify render-ms next-id))
       ;; a lone connection keeps no pool bookkeeping; answering is what
       ;; stops the request sitting here forever
       (`#(pool-stats ,ref ,from)
         (send from (vector 'pool-stats-reply ref #f))
-        (serve-loop c buf notify render-ms))
+        (serve-loop* c buf notify render-ms next-id))
       (`#(pool-quit) (tcp-close! c))
       ;; Bytes arriving BETWEEN renders have no meaning in this protocol: a
       ;; worker speaks only when asked, and nothing is outstanding here.
@@ -564,7 +618,11 @@
   (define (render-through p req)
     (let ((h (qjs-pool-handle p)) (cfg (qjs-pool-cfg p)))
       (if (qjs-pool-pooled? p)
-          (connpool-lease h (lambda (conn) (connpool-call conn req cfg)) cfg)
+          ;; #t: an escape here means the render may still be running on the
+          ;; worker, so the connection goes back broken. Handing it back
+          ;; clean lets the pool lend a worker that is still busy with the
+          ;; request its caller has already abandoned.
+          (connpool-lease h (lambda (conn) (connpool-call conn req cfg)) cfg #t)
           (connpool-call h req cfg))))
 
   ;; the same, decoded to a string on success

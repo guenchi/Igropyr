@@ -31,12 +31,16 @@
 (define (get-u32 bv i) (bytevector-u32-ref bv i (endianness big)))
 (define (get-u16 bv i) (bytevector-u16-ref bv i (endianness big)))
 
-(define (frame status body-bv)
-  (let* ((n (+ 1 (bytevector-length body-bv)))
+;; id defaults to 0 -- the first request on a connection -- so the cases
+;; that only care about framing stay short
+(define (frame status body-bv . rest)
+  (let* ((id (if (pair? rest) (car rest) 0))
+         (n (+ 4 1 (bytevector-length body-bv)))
          (bv (make-bytevector (+ 4 n))))
     (put-u32! bv 0 n)
-    (bytevector-u8-set! bv 4 status)
-    (bytevector-copy! body-bv 0 bv 5 (bytevector-length body-bv))
+    (put-u32! bv 4 id)
+    (bytevector-u8-set! bv 8 status)
+    (bytevector-copy! body-bv 0 bv 9 (bytevector-length body-bv))
     bv))
 
 ;; the request the library sends -> (fn . json), or #f if incomplete
@@ -46,9 +50,16 @@
          (and (>= (inbuf-length buf) (+ 4 n))
               (let ((body (inbuf-sub buf 4 (+ 4 n))))
                 (inbuf-consume! buf (+ 4 n))
-                (let ((fl (get-u16 body 0)))
-                  (cons (utf8->string (sub body 2 fl))
-                        (utf8->string (sub body (+ 2 fl) (- n 2 fl))))))))))
+                (let ((id (get-u32 body 0))
+                      (fl (get-u16 body 4)))
+                  (list id
+                        (utf8->string (sub body 6 fl))
+                        (utf8->string (sub body (+ 6 fl) (- n 6 fl))))))))))
+
+;; a request is (id fn json)
+(define (req-id r) (car r))
+(define (req-fn r) (cadr r))
+(define (req-json r) (caddr r))
 
 (define (sub bv from n)
   (let ((out (make-bytevector n))) (bytevector-copy! bv from out 0 n) out))
@@ -80,13 +91,16 @@
 ;; echoes what it was asked, so the REQUEST encoding is checked too: a
 ;; wrong length or offset would come back as the wrong function name
 (define (echo-reply! c req)
-  (tcp-write! c (frame 0 (string->utf8 (string-append (car req) "|" (cdr req)))) #f)
+  (tcp-write! c (frame 0 (string->utf8 (string-append (req-fn req) "|" (req-json req)))
+                  (req-id req))
+              #f)
   'ok)
 
 ;; the same answer, delivered in two writes with a gap, so the client has
 ;; to reassemble across packets rather than assume one read = one frame
 (define (dribble-reply! c req)
-  (let* ((full (frame 0 (string->utf8 (string-append (car req) "|" (cdr req)))))
+  (let* ((full (frame 0 (string->utf8 (string-append (req-fn req) "|" (req-json req)))
+                  (req-id req)))
          (n (bytevector-length full))
          (cut 3))                       ; splits the LENGTH PREFIX itself
     (tcp-write! c (sub full 0 cut) #f)
@@ -100,13 +114,42 @@
 ;; check only sees messages, so bytes already read past cannot be caught
 ;; there.
 (define (tailgate-reply! c req)
-  (let* ((mine (frame 0 (string->utf8 (string-append (car req) "|" (cdr req)))))
-         (extra (frame 0 (string->utf8 "TAILGATE")))
+  (let* ((mine (frame 0 (string->utf8 (string-append (req-fn req) "|" (req-json req)))
+                  (req-id req)))
+         (extra (frame 0 (string->utf8 "TAILGATE") (req-id req)))
          (n1 (bytevector-length mine)) (n2 (bytevector-length extra))
          (both (make-bytevector (+ n1 n2))))
     (bytevector-copy! mine 0 both 0 n1)
     (bytevector-copy! extra 0 both n1 n2)
     (tcp-write! c both #f))
+  'ok)
+
+;; Answers correctly, and then -- after a delay -- writes a SECOND frame
+;; carrying the id of the request it already answered. By the time it
+;; arrives the connection has been handed back and lent to somebody else,
+;; so the "buffer must be empty" check cannot see it: it was not read past,
+;; it had not been sent yet. Only the id ties a response to a request.
+;; The first request is answered at once and an extra frame carrying ITS id
+;; is scheduled for 250ms later. The second is answered only after 600ms --
+;; so the extra lands while the connection is WAITING for the second answer,
+;; which is the only arrangement in which a buffer check cannot help: the
+;; frame was not read past, it had not been sent yet.
+(define late-seen (box 0))
+(define (late-extra-reply! c req)
+  (set-box! late-seen (+ 1 (unbox late-seen)))
+  (if (= 1 (unbox late-seen))
+      (begin
+        (tcp-write! c (frame 0 (string->utf8 (string-append (req-fn req) "|" (req-json req)))
+                        (req-id req))
+                    #f)
+        (spawn (lambda ()
+                 (sleep-ms 250)
+                 (guard (e (#t 'gone))
+                   (tcp-write! c (frame 0 (string->utf8 "LATE") (req-id req)) #f)))))
+      (spawn (lambda ()
+               (sleep-ms 600)
+               (guard (e (#t 'gone))
+                 (tcp-write! c (frame 0 (string->utf8 "REAL-SECOND") (req-id req)) #f)))))
   'ok)
 
 ;; announces a body it will never send, and one past the client's cap
@@ -137,6 +180,7 @@
     (fake-listen! (p 3) (request-server mute-reply!))
     (fake-listen! (p 4) (request-server truncate-reply!))
     (fake-listen! (p 7) (request-server tailgate-reply!))
+    (fake-listen! (p 8) (request-server late-extra-reply!))
     ;; Talks before anything is asked -- and what it says is a PERFECTLY
     ;; WELL-FORMED response. That is the case worth testing: junk that fails
     ;; to parse is refused by the frame limit whatever the client does with
@@ -264,6 +308,23 @@
                           (and k2 (string=? v2 "TAILGATE")))))
           (check "and the desync is reported rather than carried forward"
                  (or (not k1) (not k2))))))
+
+    ;; ---- an extra response that arrives LATE --------------------------
+    ;;
+    ;; The other half of the tailgating case, and the half a buffer check
+    ;; cannot reach: the extra frame is written after the first answer has
+    ;; been delivered, so it lands while the connection is serving the NEXT
+    ;; request. Nothing about its shape says it is stale -- only the id it
+    ;; carries, which belongs to a request this connection has finished.
+    (let ((c (qjspool-connect "127.0.0.1" (p 8) '((render-timeout-ms . 2000)))))
+      (let-values (((k1 v1) (qjspool-render c "first" "{}")))
+        (check "the first answer is the one that was asked for"
+               (and k1 (string=? v1 "first|{}"))))
+      ;; no pause: the second request goes out while the extra is still on
+      ;; its way, so the connection is inside read-response when it lands
+      (let-values (((k2 v2) (qjspool-render c "second" "{}")))
+        (check "a stale response is never returned as the next render"
+               (not (and k2 (string=? v2 "LATE"))))))
 
     ;; ---- a borrower KILLED mid-render -------------------------------------
     ;;
