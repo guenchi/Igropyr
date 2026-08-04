@@ -94,6 +94,21 @@
     (tcp-write! c (sub full cut (- n cut)) #f)
     'ok))
 
+;; answers correctly, and then appends a SECOND complete response in the
+;; same write. The extra frame lands in the client's buffer rather than in
+;; its mailbox, which is a different route to the same desync: the idle
+;; check only sees messages, so bytes already read past cannot be caught
+;; there.
+(define (tailgate-reply! c req)
+  (let* ((mine (frame 0 (string->utf8 (string-append (car req) "|" (cdr req)))))
+         (extra (frame 0 (string->utf8 "TAILGATE")))
+         (n1 (bytevector-length mine)) (n2 (bytevector-length extra))
+         (both (make-bytevector (+ n1 n2))))
+    (bytevector-copy! mine 0 both 0 n1)
+    (bytevector-copy! extra 0 both n1 n2)
+    (tcp-write! c both #f))
+  'ok)
+
 ;; announces a body it will never send, and one past the client's cap
 (define (huge-reply! c req)
   (let ((bv (make-bytevector 4)))
@@ -121,6 +136,7 @@
     (fake-listen! (p 2) (request-server huge-reply!))
     (fake-listen! (p 3) (request-server mute-reply!))
     (fake-listen! (p 4) (request-server truncate-reply!))
+    (fake-listen! (p 7) (request-server tailgate-reply!))
     ;; Talks before anything is asked -- and what it says is a PERFECTLY
     ;; WELL-FORMED response. That is the case worth testing: junk that fails
     ;; to parse is refused by the frame limit whatever the client does with
@@ -225,6 +241,29 @@
                 ((< i 5) (sleep-ms 300) (retry (+ i 1)))
                 (else (fail "the pool never recovered after the drop" v)))))
       (qjspool-close! pool))
+
+    ;; ---- a second response riding along with the first ---------------------
+    ;;
+    ;; Same desync as the unsolicited frame above, by the other route: the
+    ;; extra bytes were already read into the buffer while the first
+    ;; response was being taken, so they never arrive as a message and the
+    ;; idle check cannot see them. Left there, the NEXT render finds a
+    ;; complete frame waiting before its own answer can arrive and returns
+    ;; it -- a render that succeeds with the previous exchange's leftovers.
+    ;; Stated as an invariant over BOTH calls, because which one catches it
+    ;; depends on how the peer's single write is delivered: coalesced, the
+    ;; leftover is seen while the first response is taken and that render
+    ;; fails; split, the first succeeds and the second finds the stale
+    ;; frame. Either is correct. What must never happen is that a render
+    ;; RETURNS the tailgating bytes.
+    (let ((c (qjspool-connect "127.0.0.1" (p 7) '((render-timeout-ms . 1500)))))
+      (let-values (((k1 v1) (qjspool-render c "first" "{}")))
+        (let-values (((k2 v2) (qjspool-render c "second" "{}")))
+          (check "a tailgating frame is never returned as a render"
+                 (not (or (and k1 (string=? v1 "TAILGATE"))
+                          (and k2 (string=? v2 "TAILGATE")))))
+          (check "and the desync is reported rather than carried forward"
+                 (or (not k1) (not k2))))))
 
     ;; ---- a borrower KILLED mid-render -------------------------------------
     ;;

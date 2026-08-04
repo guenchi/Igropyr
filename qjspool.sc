@@ -228,7 +228,17 @@
   (define (read-response c buf deadline-ms)
     (let ((f (take-frame! buf)))
       (if f
-          (decode-response f)
+          ;; ONE request is outstanding, so one response is all there can
+          ;; be. Bytes left over are the same desync the idle check refuses,
+          ;; arriving by the other route: read past while this response was
+          ;; being taken, they never appear as a message, and left in the
+          ;; buffer the NEXT render finds a complete frame waiting before
+          ;; its own answer can arrive and returns it -- a render that
+          ;; succeeds with the previous exchange's leftovers.
+          (begin
+            (when (> (inbuf-length buf) 0)
+              (raise (qjs-err "worker sent more than one response")))
+            (decode-response f))
           (let ((left (- deadline-ms (now-ms))))
             (if (<= left 0)
                 (raise (qjs-err "render timed out"))
@@ -282,12 +292,25 @@
             (serve-loop c buf notify render-ms)))
       (`#(db-query ,req ,ref ,from)
         (let ((r (render-on! c buf req render-ms)))
-          (send from (vector 'db-reply ref r))
           (if (qjs-error? r)
               (begin
+          ;; THE POOL FIRST, then the caller. Telling the caller first
+          ;; releases it, and its check-in can reach the pool before this
+          ;; message does -- so the pool put a connection it was about to
+          ;; be told was dead back into rotation and lent it to the next
+          ;; borrower, whose statement went to a pid that then exited.
+          ;; (The pool also refuses to re-lend a connection already marked
+          ;; dying; both halves are needed, because that mark is what this
+          ;; ordering makes arrive in time.)
+          ;;
+          ;; The cost of this order is a two-send window in which a kill
+          ;; would leave the caller with no reply at all rather than a
+          ;; duplicate one. That is a narrower window and a milder failure.
                 (when notify (send notify (vector 'db-conn-dead self)))
+                (send from (vector 'db-reply ref r))
                 (tcp-close! c))                    ; exit -> DOWN -> rebuild
               (begin
+                (send from (vector 'db-reply ref r))
                 (when notify (send notify (vector 'db-idle self)))
                 (serve-loop c buf notify render-ms)))))
       ;; sql-query sends this to whatever handle it was given when a call
