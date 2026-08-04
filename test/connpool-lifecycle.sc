@@ -68,6 +68,29 @@
             (loop))
           (`#(pool-quit) 'done))))))
 
+;; Reports up, is adopted, and on pool-quit answers the way every real
+;; driver does -- as a TRANSPORT failure -- before exiting. That is what
+;; makes the pool's own teardown come back to it labelled 'transport.
+(define teardown-spawns 0)
+(define (quit-as-transport-spawn-conn! notify report-to ref)
+  (set! teardown-spawns (+ teardown-spawns 1))
+  (spawn
+    (lambda ()
+      (send report-to (vector 'pool-up ref self 'ok))
+      (receive (`#(pool-adopt) 'ok))
+      (let loop ()
+        (receive
+          (`#(pool-quit)
+            (send notify (vector 'pool-conn-dead self))   ; as a driver does
+            'gone)
+          (`#(pool-request ,sql ,r ,from)
+            (send from (vector 'pool-reply r (vector 'fake-rows sql)))
+            (send notify (vector 'pool-idle self))
+            (loop))
+          (`#(pool-stats ,r ,from)
+            (send from (vector 'pool-stats-reply r #f))
+            (loop)))))))
+
 ;; Reports up, is adopted, and then reports a TRANSPORT failure before
 ;; exiting -- which is what a driver does when its socket dies on the
 ;; first request. The pool marks it dying on that message, and reading any
@@ -468,6 +491,39 @@
                                       (number->string (length ts)) " attempts\n"))
               (check "and the backoff escalates rather than repeating its first step"
                      (> last-gap (* 3/2 first-gap))))))
+      (send pool (vector 'pool-quit)))
+
+    ;; ---- the pool's own teardown stays the pool's own decision ------------
+    ;;
+    ;; The pool tears a connection down by sending pool-quit. Every driver
+    ;; answers pool-quit while mid-request as a TRANSPORT failure, so the
+    ;; connection then reports pool-conn-dead -- and an unconditional write
+    ;; let that overwrite the pool's own mark. A healthy connection the pool
+    ;; asked to go then looked stillborn, and the backoff that follows is
+    ;; POOL-WIDE and doubles: a supervisor reaping stuck borrowers walks an
+    ;; entirely healthy pool up toward the ceiling.
+    (set! teardown-spawns 0)
+    (let ((pool (spawn (lambda () (connpool-loop 1 quit-as-transport-spawn-conn! cfg))))
+          (me self))
+      (sleep-ms 300)
+      ;; a borrower takes the lease and is killed, which is what makes the
+      ;; pool send pool-quit
+      (let ((victim (spawn (lambda ()
+                             (let ((r (gensym)))
+                               (send pool (vector 'pool-checkout r self))
+                               (receive (after 2000 'none)
+                                 (`#(pool-checkout-reply ,@r ,c)
+                                   (send me (vector 'leased))
+                                   (receive (`#(never) 'no)))))))))
+        (receive (after 3000 (void)) (`#(leased) 'ok))
+        (kill victim 'reaped)
+        ;; the replacement must be built AT ONCE -- this was the pool's own
+        ;; decision, not a peer problem
+        (sleep-ms 700)
+        (check "a connection the pool tore down is rebuilt without backoff"
+               (>= teardown-spawns 2))
+        (display (string-append "  [info] rebuilds 700ms after a reaped borrower: "
+                                (number->string teardown-spawns) "\n")))
       (send pool (vector 'pool-quit)))
 
     ;; ---- a leased connection that dies answers its borrower ---------------
