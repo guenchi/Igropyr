@@ -141,6 +141,14 @@
                                       (`#(tcp-data ,bv) (loop)))))
               ((request-server echo-reply!) c buf)))))
 
+    ;; mute on its first connection, an ordinary worker afterwards
+    (let ((first? (box #t)))
+      (fake-listen! (p 6)
+        (lambda (c buf)
+          (if (unbox first?)
+              (begin (set-box! first? #f) ((request-server mute-reply!) c buf))
+              ((request-server echo-reply!) c buf)))))
+
     ;; ---- the round trip, both directions ---------------------------------
     (let ((c (qjspool-connect "127.0.0.1" (p 0) '((render-timeout-ms . 2000)))))
       (let-values (((k v) (qjspool-render c "renderPost" "{\"a\":1}")))
@@ -216,6 +224,42 @@
                  (ok "the rebuilt connection serves normally"))
                 ((< i 5) (sleep-ms 300) (retry (+ i 1)))
                 (else (fail "the pool never recovered after the drop" v)))))
+      (qjspool-close! pool))
+
+    ;; ---- a borrower KILLED mid-render -------------------------------------
+    ;;
+    ;; A render holds its worker as a lease, and @kill discards
+    ;; dynamic-wind winders -- so the check-in never runs and the pool's
+    ;; monitor is the only path back. This is the first non-SQL driver to
+    ;; take that path, and if it were missed the pool would count the
+    ;; worker in use forever: one endpoint, one lease, nothing left to
+    ;; lend, and every later render failing on the checkout deadline.
+    ;; The render deadline is set FAR beyond this check's own patience on
+    ;; purpose. A connection whose render times out discards itself and is
+    ;; rebuilt, which heals the pool too -- so a short one would let that
+    ;; path pass the test and the monitor could be broken without anyone
+    ;; noticing. At a minute, nothing but the reclaim can finish in time.
+    (let ((pool (qjspool (list (cons "127.0.0.1" (p 6)))
+                         '((render-timeout-ms . 60000)
+                           (checkout-timeout-ms . 700))))
+          (me self))
+      (sleep-ms 400)
+      (let ((victim (spawn (lambda ()
+                             (let-values (((k v) (qjspool-render pool "hangs" "{}")))
+                               (send me (vector 'came-back k)))))))
+        (sleep-ms 400)
+        (kill victim 'reaped-mid-render)
+        ;; the reclaim is not instant: the monitor fires, the connection is
+        ;; discarded and rebuilt, and only then is there a worker to lend
+        (let retry ((i 0))
+          (let-values (((k v) (qjspool-render pool "after-kill" "{}")))
+            (cond ((and k (string=? v "after-kill|{}"))
+                   (ok "a killed borrower's worker comes back to the pool"))
+                  ((< i 4) (sleep-ms 300) (retry (+ i 1)))
+                  (else (fail "the lease was never reclaimed" v)))))
+        (let ((st (guard (e (#t '())) (qjspool-stats pool))))
+          (check "and nothing is left leased"
+                 (equal? (cond ((assq 'in-use st) => cdr) (else #f)) 0))))
       (qjspool-close! pool))
 
     (sleep-ms 100)

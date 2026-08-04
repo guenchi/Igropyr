@@ -236,7 +236,23 @@
                   (`#(tcp-data ,bv) (inbuf-append! buf bv)
                     (read-response c buf deadline-ms))
                   (`#(tcp-eof) (raise (qjs-err "worker closed the connection")))
-                  (`#(tcp-error ,e) (raise (qjs-err (uv-strerror e))))))))))
+                  (`#(tcp-error ,e) (raise (qjs-err (uv-strerror e))))
+                  ;; A TEARDOWN HAS TO REACH US HERE. The pool sends db-quit
+                  ;; to reclaim a connection whose borrower died -- @kill
+                  ;; discards winders, so the monitor is the only path back
+                  ;; -- and a receive that matched only the socket left that
+                  ;; message in the mailbox until the render deadline. The
+                  ;; pool had marked the connection dying and had nothing to
+                  ;; lend, so with a deadline set long enough to be worth
+                  ;; setting (a minute), one killed caller took the pool out
+                  ;; of service for a minute.
+                  ;;
+                  ;; Raising hands this to the same path a transport failure
+                  ;; takes: reply, tell the pool, close, exit, be rebuilt.
+                  (`#(db-quit) (raise (qjs-err "connection shut down mid-render")))
+                  ;; the pool itself died: nobody can adopt or reach us again
+                  (`#(DOWN ,pid ,reason)
+                    (raise (qjs-err "render pool went away mid-render")))))))))
 
   (define (decode-response body)
     (let ((n (bytevector-length body)))
