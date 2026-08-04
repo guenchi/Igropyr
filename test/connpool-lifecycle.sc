@@ -44,7 +44,7 @@
         (receive
           (`#(pool-request ,sql ,r ,from)
             (send from (vector 'pool-reply r (vector 'fake-rows sql)))
-            (send notify (vector 'pool-idle self))
+            (send notify (vector 'pool-idle self r))
             (loop))
           (`#(pool-quit) 'done))))))
 
@@ -60,7 +60,7 @@
         (receive
           (`#(pool-request ,sql ,r ,from)
             (send from (vector 'pool-reply r (vector 'fake-rows sql)))
-            (send notify (vector 'pool-idle self))
+            (send notify (vector 'pool-idle self r))
             (loop))
           (`#(report-dead) (send notify (vector 'pool-conn-dead self)) (loop))
           (`#(pool-stats ,r ,from)
@@ -85,7 +85,7 @@
             'gone)
           (`#(pool-request ,sql ,r ,from)
             (send from (vector 'pool-reply r (vector 'fake-rows sql)))
-            (send notify (vector 'pool-idle self))
+            (send notify (vector 'pool-idle self r))
             (loop))
           (`#(pool-stats ,r ,from)
             (send from (vector 'pool-stats-reply r #f))
@@ -106,6 +106,27 @@
       (receive (`#(pool-adopt) 'ok))
       (send notify (vector 'pool-conn-dead self))
       'gone)))
+
+;; Answers slowly, so a dispatched request stays on the pool's books long
+;; enough to send something at it.
+(define slow-conn (box #f))
+(define (slow-spawn-conn! notify report-to ref)
+  (spawn
+    (lambda ()
+      (set-box! slow-conn self)
+      (send report-to (vector 'pool-up ref self 'ok))
+      (receive (`#(pool-adopt) 'ok))
+      (let loop ()
+        (receive
+          (`#(pool-request ,sql ,r ,from)
+            (sleep-ms 800)
+            (send from (vector 'pool-reply r (vector 'fake-rows sql)))
+            (send notify (vector 'pool-idle self r))
+            (loop))
+          (`#(pool-quit) 'done)
+          (`#(pool-stats ,r ,from)
+            (send from (vector 'pool-stats-reply r #f))
+            (loop)))))))
 
 ;; Reports a TRANSPORT failure to the pool and then keeps running, so the
 ;; borrower's own broken check-in can arrive AFTER that report. This is the
@@ -255,7 +276,7 @@
                        (`#(pool-request ,sql ,r ,from)
                          (set-box! executed (cons sql (unbox executed)))
                          (send from (vector 'pool-reply r (vector 'fake-rows sql)))
-                         (send notify (vector 'pool-idle self))
+                         (send notify (vector 'pool-idle self r))
                          (loop))
                        (`#(pool-quit) 'done)))))))
            (pool (spawn (lambda () (connpool-loop 1 spawn-recording cfg))))
@@ -315,7 +336,7 @@
                                          (set-box! executed
                                                    (cons sql (unbox executed)))
                                          (send from (vector 'pool-reply r 'ok))
-                                         (send notify (vector 'pool-idle self))
+                                         (send notify (vector 'pool-idle self r))
                                          (loop))
                                        (`#(pool-stats ,r ,from)
                                          (send from (vector 'pool-stats-reply r #f))
@@ -398,8 +419,12 @@
           (receive (after 2000 (void)) (`#(held) 'ok))
           (send holder (vector 'release))
           (sleep-ms 200)
-          ;; the late pool-idle, arriving after the checkin already freed it
-          (send pool (vector 'pool-idle (unbox conn)))
+          ;; The late pool-idle, arriving after the check-in already freed
+          ;; it. It names a request this connection is not running -- which
+          ;; is the whole point: a stale idle is now ignored outright, a
+          ;; stronger guarantee than the idempotent re-add this case
+          ;; originally pinned. Either way it must not end up in idle twice.
+          (send pool (vector 'pool-idle (unbox conn) (gensym)))
           (sleep-ms 200)
           ;; If it is in idle twice, two checkouts get the SAME connection.
           (let ((a (box #f)) (b (box #f)))
@@ -614,6 +639,36 @@
           (display (string-append "  [info] leased connection death reported after "
                                   (number->string took) "ms (the query deadline is 5000)\n")))
         (send pool (vector 'pool-quit))))
+
+    ;; ---- a late idle must not free somebody else's request -----------------
+    ;;
+    ;; A connection sends its reply and then pool-idle, and can be preempted
+    ;; between the two. If the pool dispatches the next queued request in
+    ;; that gap, the LATE idle arrives against a busy entry belonging to a
+    ;; DIFFERENT request -- clearing it, crediting the wrong request with
+    ;; the duration, and putting the connection back in rotation while the
+    ;; request it was just given is still in its mailbox. Two callers, one
+    ;; connection.
+    ;;
+    ;; Constructed directly: a request slow enough to still be dispatched,
+    ;; and an idle naming something this connection never ran. The books
+    ;; must still show it busy.
+    (let ((pool (spawn (lambda () (connpool-loop 1 slow-spawn-conn! cfg))))
+          (me self))
+      (sleep-ms 300)
+      (spawn (lambda ()
+               (guard (e (#t 'ok)) (connpool-call pool 'slow cfg))
+               (send me (vector 'slow-done))))
+      (sleep-ms 200)                       ; dispatched, still running
+      ;; an idle for this very connection, naming a request it never ran
+      (send pool (vector 'pool-idle (unbox slow-conn) (gensym)))
+      (sleep-ms 50)
+      (let ((st (connpool-stats pool)))
+        (define (g k) (cond ((assq k st) => cdr) (else -1)))
+        (check "a request in flight is still on the books"
+               (and (= 1 (g 'busy)) (= 0 (g 'idle)))))
+      (receive (after 3000 (void)) (`#(slow-done) 'ok))
+      (send pool (vector 'pool-quit)))
 
     ;; ---- a dead pool is not a busy one -------------------------------------
     ;;

@@ -437,7 +437,7 @@
                 (tcp-close! c))                    ; exit -> DOWN -> rebuild
               (begin
                 (send from (vector 'pool-reply ref r))
-                (when notify (send notify (vector 'pool-idle self)))
+                (when notify (send notify (vector 'pool-idle self ref)))
                 ;; the id ADVANCES: the next request must not be answerable
                 ;; by a frame belonging to this one
                 ;; wrapped to the width of the field it travels in. An
