@@ -251,14 +251,21 @@
       ;; tail's life by sending slow work ahead of it -- costs that peer
       ;; real render time it asked for, and the buffer is bounded by the
       ;; frame cap either way. The liveness bug is the concrete one.
-      ;; An already-expired tail is refused BEFORE anything else runs. A
-      ;; receive answers a message that is already in its mailbox before it
-      ;; consults its timer, so bytes that complete the frame after the
-      ;; deadline beat the timer that should have closed the connection --
-      ;; and if they empty the buffer the deadline is cleared and the
-      ;; expiry is never observed at all.
-      (if (and since (>= (now-ms) since))
-          (tcp-close! c)
+      ;; NO EXPIRY CHECK BEFORE THE PARSE. There was one, on the reasoning
+      ;; that a receive answers a message already in its mailbox before it
+      ;; consults its timer, so bytes completing a frame after the deadline
+      ;; beat the timer that should have closed the connection. True, but
+      ;; the reason they beat it is usually that WE were the ones running
+      ;; late: a render is a synchronous call that stops the whole runtime,
+      ;; so another connection's 700ms render swallows this one's 500ms
+      ;; window whole, and the bytes sitting in the mailbox arrived well
+      ;; inside it. Refusing them punishes a peer for our own scheduling.
+      ;;
+      ;; Nothing is lost by parsing first, because a peer that dribbles
+      ;; never completes a frame: it consumes nothing, keeps its original
+      ;; deadline, and is closed by the check BELOW on the very same read.
+      ;; What the check up here changed was only the case where the frame
+      ;; IS whole -- a real request, refused.
       (let ((before (inbuf-length buf)))
         (if (guard (e (#t #f)) (answer-all! c buf) #t)
             (let* ((rest (inbuf-length buf))
@@ -279,7 +286,7 @@
                 ((= rest 0) (worker-conn-loop* c buf partial-ms #f))
                 ((>= (now-ms) deadline) (tcp-close! c))
                 (else (worker-conn-loop* c buf partial-ms deadline))))
-            (tcp-close! c)))))
+            (tcp-close! c))))
     (if (> (inbuf-length buf) 0)
         (let ((left (- (or since (+ (now-ms) partial-ms)) (now-ms))))
           (if (<= left 0)
@@ -453,14 +460,15 @@
   ;; connections and not the other way round, so a pool that died would
   ;; otherwise leave every connection running and holding an fd, with
   ;; nothing able to reach them. See the same note in (igropyr mysql).
-  (define (serve-loop c buf notify render-ms) (serve-loop* c buf notify render-ms 0))
+  (define (serve-loop c buf notify render-ms max-id)
+    (serve-loop* c buf notify render-ms max-id 0))
 
-  (define (serve-loop* c buf notify render-ms next-id)
+  (define (serve-loop* c buf notify render-ms max-id next-id)
     (receive
       (`#(DOWN ,pid ,reason)
         (if (and notify (eq? pid notify))
             (tcp-close! c)
-            (serve-loop* c buf notify render-ms next-id)))
+            (serve-loop* c buf notify render-ms max-id next-id)))
       (`#(pool-request ,req ,ref ,from)
         (let ((r (render-on! c buf req render-ms ref next-id)))
           (if (qjs-error? r)
@@ -480,9 +488,25 @@
                 (when notify (send notify (vector 'pool-conn-dead self)))
                 (send from (vector 'pool-reply ref r))
                 (tcp-close! c))                    ; exit -> DOWN -> rebuild
-              (begin
+              ;; SAME ORDER AS THE ERROR BRANCH ABOVE, and for the same
+              ;; reason: when this answer is the connection's last, the
+              ;; pool has to hear that before the caller is released, or
+              ;; the caller's check-in gets there first and the pool lends
+              ;; out a connection that is already exiting. Retiring also
+              ;; means NOT reporting idle -- that is the message that puts
+              ;; it back in rotation.
+              ;;
+              ;; The rule was stated twenty lines up and then not applied
+              ;; here, which is how a rule kept as prose next to one of its
+              ;; sites fails: deciding it before the reply is what makes it
+              ;; hold at both.
+              (let ((retiring (>= next-id max-id)))
+                (when (and retiring notify)
+                  ;; ON SCHEDULE, and it says so: a pool told only that a
+                  ;; connection died treats a planned stand-down as a peer
+                  ;; failure and backs off before rebuilding it.
+                  (send notify (vector 'pool-conn-dead self 'retired)))
                 (send from (vector 'pool-reply ref r))
-                (when notify (send notify (vector 'pool-idle self ref)))
                 ;; the id ADVANCES: the next request must not be answerable
                 ;; by a frame belonging to this one
                 ;; RETIRED rather than wrapped. The field is u32, so an
@@ -497,21 +521,21 @@
                 ;; unique for the life of a stream, which is the property
                 ;; the check is written on. It costs one reconnect per four
                 ;; billion renders.
-                (if (>= next-id #xffffffff)
+                (if retiring
+                    (tcp-close! c)
                     (begin
-                      (when notify (send notify (vector 'pool-conn-dead self)))
-                      (tcp-close! c))
-                    (serve-loop* c buf notify render-ms (+ next-id 1)))))))
+                      (when notify (send notify (vector 'pool-idle self ref)))
+                      (serve-loop* c buf notify render-ms max-id (+ next-id 1))))))))
       ;; connpool-call sends this to whatever handle it was given when a call
       ;; times out; only a pool acts on it. Consumed here so it does not sit
       ;; in the mailbox slowing every later selective receive.
       (`#(pool-request-cancel ,ref ,from)
-        (serve-loop* c buf notify render-ms next-id))
+        (serve-loop* c buf notify render-ms max-id next-id))
       ;; a lone connection keeps no pool bookkeeping; answering is what
       ;; stops the request sitting here forever
       (`#(pool-stats ,ref ,from)
         (send from (vector 'pool-stats-reply ref #f))
-        (serve-loop* c buf notify render-ms next-id))
+        (serve-loop* c buf notify render-ms max-id next-id))
       (`#(pool-quit) (tcp-close! c))
       ;; Bytes arriving BETWEEN renders have no meaning in this protocol: a
       ;; worker speaks only when asked, and nothing is outstanding here.
@@ -526,11 +550,11 @@
   ;; After reporting up, wait to be adopted. If nobody adopts -- the caller
   ;; timed out, or the pool was closed while we were connecting -- close and
   ;; exit rather than hold a socket nobody can reach.
-  (define (await-adoption c buf notify render-ms)
+  (define (await-adoption c buf notify render-ms max-id)
     (receive (after connect-timeout-ms (tcp-close! c))
       (`#(pool-adopt)
         (when notify (monitor notify))
-        (serve-loop c buf notify render-ms))
+        (serve-loop c buf notify render-ms max-id))
       (`#(pool-quit) (tcp-close! c))
       ;; likewise before adoption: nothing has been asked yet
       (`#(tcp-data ,bv) (tcp-close! c))
@@ -542,7 +566,7 @@
   ;; earlier, timed-out attempt -- then waits to be adopted. Every failure
   ;; path closes the socket: the uv handle is freed only by tcp-close!, so
   ;; skipping it would leak one fd per retry.
-  (define (start-connection host port render-ms notify report-to ref)
+  (define (start-connection host port render-ms max-id notify report-to ref)
     (spawn
       (lambda ()
         (define (report! status) (send report-to (vector 'pool-up ref self status)))
@@ -565,7 +589,7 @@
                   ;; no handshake: the connection is usable as soon as it is
                   ;; open, so there is nothing to authenticate before reporting
                   (report! 'ok)
-                  (await-adoption c (make-inbuf) notify render-ms))))))))
+                  (await-adoption c (make-inbuf) notify render-ms max-id))))))))
 
   ;; ---- caller side: the pool ----------------------------------------------
 
@@ -603,6 +627,22 @@
       eps)
     eps)
 
+  ;; How many renders one connection answers before it is retired. The
+  ;; ceiling is not a policy choice: the id field is u32, so a counter that
+  ;; kept going could not be encoded at all. A caller may set it lower to
+  ;; recycle connections on a schedule of its own -- and a lower value is
+  ;; the only way to reach the retirement path in a test, which is
+  ;; otherwise four billion renders away.
+  (define default-max-requests #xffffffff)
+
+  (define (opt-max-requests opts who)
+    (let ((v (cond ((assq 'max-requests-per-connection opts) => cdr)
+                   (else default-max-requests))))
+      (unless (and (integer? v) (exact? v) (> v 0) (<= v default-max-requests))
+        (assertion-violation who
+          "max-requests-per-connection must be a positive exact integer no greater than #xffffffff" v))
+      v))
+
   (define (opt-ms opts key default who)
     (let ((v (cond ((assq key opts) => cdr) (else default))))
       (unless (and (integer? v) (exact? v) (> v 0))
@@ -619,6 +659,7 @@
            (eps (endpoint-list 'qjspool endpoints))
            (render-ms (opt-ms opts 'render-timeout-ms default-render-ms 'qjspool))
            (checkout-ms (opt-ms opts 'checkout-timeout-ms default-checkout-ms 'qjspool))
+           (max-id (opt-max-requests opts 'qjspool))
            (cfg (make-cfg render-ms checkout-ms))
            (n (length eps))
            ;; Rebuilt connections rotate through the endpoints. The pool
@@ -634,7 +675,7 @@
                 (let* ((i (unbox next))
                        (e (list-ref eps (modulo i n))))
                   (set-box! next (+ i 1))
-                  (start-connection (car e) (cdr e) render-ms
+                  (start-connection (car e) (cdr e) render-ms max-id
                                     notify report-to ref)))
               cfg)))
         cfg render-ms checkout-ms #t)))
@@ -647,10 +688,11 @@
            (render-ms (opt-ms opts 'render-timeout-ms default-render-ms 'qjspool-connect))
            (checkout-ms (opt-ms opts 'checkout-timeout-ms default-checkout-ms
                                 'qjspool-connect))
+           (max-id (opt-max-requests opts 'qjspool-connect))
            (cfg (make-cfg render-ms checkout-ms)))
       (connpool-drain-stale!)
       (let ((ref (gensym)))
-        (start-connection host port render-ms #f self ref)
+        (start-connection host port render-ms max-id #f self ref)
         (receive (after (+ connect-timeout-ms 2000)
                     (raise (qjs-err "connect timeout")))
           (`#(pool-up ,@ref ,pid ,status)

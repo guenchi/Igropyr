@@ -217,9 +217,6 @@
   (define (set-phase! st phase)
     (let ((entering (and (eq? phase 'running)
                          (not (eq? (step-state-phase st) 'running)))))
-      (when entering
-        (let ((w (unbox (step-state-watch-box st))))
-          (when w (send w (vector 'conv-step-started)))))
       (step-state-phase-set! st phase)
       (when entering
         ;; TIMESTAMP BEFORE THE FLAG. The watchdog reads the flag and then
@@ -227,7 +224,17 @@
         ;; window in which it sees a step running against the PREVIOUS
         ;; step's start.
         (set-box! (step-state-run-start-box st) (now-ms)))
-      (set-box! (step-state-running-box st) (eq? phase 'running))))
+      (set-box! (step-state-running-box st) (eq? phase 'running))
+      ;; ...AND THE FLAGS BEFORE THE WAKE-UP, for the same reason one line
+      ;; up. Waking the watchdog first meant it could read the flag before
+      ;; this process had set it, find nothing running, and go back to
+      ;; waiting -- and no second notification is ever sent for that step,
+      ;; so it silently fell back to the poll floor. Measured on a 20ms
+      ;; TTL: 24ms to the kill when the flags are published first, 53ms
+      ;; when the notification is.
+      (when entering
+        (let ((w (unbox (step-state-watch-box st))))
+          (when w (send w (vector 'conv-step-started)))))))
 
   (define (token=? a b)
     (and a b (string? a) (string? b) (string=? a b)))
@@ -931,10 +938,26 @@
                                             (begin
                                               (kill watched 'conversation-expired)
                                               #t)))))
-                                (when (and killed on-killed)
-                                  ;; the flow's winders did not run; this is
-                                  ;; the only chance to release what it held
-                                  (guard (e (#t (void))) (on-killed)))))))))))))
+                                ;; DECLINING TO KILL IS NOT BEING DONE.
+                                ;; Before the grace period this branch
+                                ;; always killed, so falling out of it was
+                                ;; the end of the watchdog's job. Now the
+                                ;; re-check can find the step finished in
+                                ;; that millisecond -- and returning there
+                                ;; left the conversation alive, healthy,
+                                ;; and with NOTHING BOUNDING ANY LATER
+                                ;; STEP: its wake-up goes to a dead pid,
+                                ;; and a step that never returns holds
+                                ;; whatever it holds for the life of the
+                                ;; VM while its caller waits in a receive
+                                ;; that has no deadline.
+                                (if killed
+                                    (when on-killed
+                                      ;; the flow's winders did not run;
+                                      ;; this is the only chance to release
+                                      ;; what it held
+                                      (guard (e (#t (void))) (on-killed)))
+                                    (loop))))))))))))
                  (let ((who starter) (tag ref)
                        (st (make-step-state 'running #f #f #f #f 0
                                             running-box run-start-box

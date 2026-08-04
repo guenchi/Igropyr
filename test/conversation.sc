@@ -604,6 +604,83 @@
         (fail "a settled caller received further replies" extra))
       (display "a caller that was already answered is not answered again ok\n"))))
 
+;; ---- the kill happens ON TIME, not eventually ---------------------------
+;;
+;; Every other watchdog case here asserts only that the sentinel value did
+;; not come back -- which cannot tell "killed at the TTL" from "killed at
+;; twice the TTL". Reverting the whole event-driven wake-up left all of
+;; them green. What pins it is the LATENCY: a step that runs far past its
+;; allowance must be stopped within a small multiple of it, and the
+;; parked poll floor is 50ms, so a TTL well under that separates "told"
+;; from "noticed on the next poll".
+(let ((ttl 20))
+  (let-values (((kid ktok kfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (sleep-ms 2000)              ; a hundred times the TTL
+                      (vector 'should-not-get-here a)))
+                  'go
+                  ttl)))
+    (let ((me self))
+      (spawn (lambda ()
+               (let* ((t0 (now-ms)))
+                 (let-values (((r st) (conversation-resume! kid ktok 'X)))
+                   (send me (vector 'latency (- (now-ms) t0) r))))))
+      (receive (after 6000 (fail "on-time-kill" 'no-answer))
+        (`#(latency ,took ,v)
+          (when (and (vector? v) (eq? (vector-ref v 0) 'should-not-get-here))
+            (fail "a runaway step ran to completion" v))
+          ;; told: ~ttl. Noticed on the poll: ttl + 50 at best, and the
+          ;; whole poll floor when the notification is lost.
+          (unless (< took 45)
+            (fail "the kill waited for a poll instead of being told" took))
+          (display (string-append "a runaway step is stopped in "
+                                  (number->string took)
+                                  "ms on a 20ms TTL ok\n")))))))
+
+;; ---- the watchdog outlives a step it decided NOT to kill ----------------
+;;
+;; The grace tick re-checks before killing, so it can find the step
+;; already finished -- and a watchdog that treats "nothing to kill" as
+;; "nothing left to do" leaves every LATER step of that conversation
+;; unbounded. The window is one millisecond wide, so this sweeps the
+;; first step's duration across the deadline and settles for hitting it
+;; some of the time: a single run to completion is the failure.
+(let* ((ttl 20)
+       (hits 0))
+  (do ((d ttl (+ d 1))) ((> d (+ ttl 5)))
+    (do ((trial 0 (+ trial 1))) ((= trial 5))
+      ;; the first step may or may not have been killed -- when it was,
+      ;; the start itself raises, and that trial simply did not land in
+      ;; the window. What must hold is that when it PARKED, the second
+      ;; step is still bounded.
+      (guard (e (#t (void)))
+       (let-values (((gid gtok gfirst)
+                    (conversation-start!
+                      (lambda (req suspend!)
+                        (sleep-ms d)          ; ends right around the deadline
+                        (let ((a (suspend! (vector 'parked req))))
+                          (sleep-ms (* 20 ttl))
+                          (vector 'ran-to-completion a)))
+                      'go
+                      ttl)))
+        (let ((me self))
+          (spawn (lambda ()
+                   ;; a first step that WAS killed makes the resume raise;
+                   ;; that is the healthy outcome, not the one under test
+                   (guard (e (#t (send me (vector 'g 'raised))))
+                     (let-values (((r st) (conversation-resume! gid gtok 'X)))
+                       (send me (vector 'g r))))))
+          (receive (after (* 30 ttl) (void))
+            (`#(g ,v)
+              (when (and (vector? v) (eq? (vector-ref v 0) 'ran-to-completion))
+                (set! hits (+ hits 1))))))))))
+  (unless (= hits 0)
+    (fail "a later step ran unbounded after the watchdog declined to kill"
+          hits))
+  (display "the watchdog keeps watching after declining to kill ok\n"))
+
 ;; ---- a resume long after the park deadline does not advance -------------
 ;;
 ;; What this pins is the ordinary case: the window closed, the flow was

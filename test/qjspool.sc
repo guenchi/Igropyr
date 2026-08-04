@@ -59,9 +59,17 @@ function counted(j){ N++; var p = JSON.parse(j); return '<p>' + p.t + '</p>'; }
 function count(j){ return String(N); }
 function boom(j){ throw new Error('render blew up'); }
 function spin(j){ for(;;){} }
+// slower than a short partial-frame window on purpose: a render is a
+// synchronous call that stops the whole worker, so this is what a tail's
+// deadline gets spent on.
+function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'; }
 ")
 
 (define good-port 19731)
+;; its own worker: a window far shorter than one render, which is what
+;; makes a carried-in tail's deadline pass DURING a render rather than
+;; between reads
+(define carry-port 19734)
 (define spin-port 19732)
 (define half-port 19733)
 
@@ -71,19 +79,52 @@ function spin(j){ for(;;){} }
 
 (define (pid-file name) (string-append "/tmp/igropyr-qjsw-" name ".pid"))
 
+;; a request frame, built here rather than through the pool: what these
+;; probes need is control over where the byte boundaries fall, which the
+;; pool by construction never gives (it writes one whole frame per read).
+(define (qframe id fn json)
+  (let* ((f (string->utf8 fn)) (j (string->utf8 json))
+         (fl (bytevector-length f)) (jl (bytevector-length j))
+         (n (+ 4 2 fl jl))
+         (bv (make-bytevector (+ 4 n))))
+    (bytevector-u32-set! bv 0 n (endianness big))
+    (bytevector-u32-set! bv 4 id (endianness big))
+    (bytevector-u16-set! bv 8 fl (endianness big))
+    (bytevector-copy! f 0 bv 10 fl)
+    (bytevector-copy! j 0 bv (+ 10 fl) jl)
+    bv))
+
+(define (bv-append a b)
+  (let ((r (make-bytevector (+ (bytevector-length a) (bytevector-length b)))))
+    (bytevector-copy! a 0 r 0 (bytevector-length a))
+    (bytevector-copy! b 0 r (bytevector-length a) (bytevector-length b))
+    r))
+
+;; REPLIES ARE COUNTED AS FRAMES, never as tcp-data messages: two replies
+;; written back to back usually arrive in one read, so a message count
+;; says one and is wrong about it.
+(define (count-frames acc)
+  (let ((n (bytevector-length acc)))
+    (let scan ((i 0) (k 0))
+      (if (> (+ i 4) n)
+          k
+          (let ((len (bytevector-u32-ref acc i (endianness big))))
+            (if (> (+ i 4 len) n) k (scan (+ i 4 len) (+ k 1))))))))
+
 ;; Backgrounded, because `system` blocks the ONE OS thread until the child
 ;; exits -- a foreground worker would deadlock the test against itself.
 ;; The pid is recorded rather than matched by name later: pkill -f does not
 ;; match reliably in every sandbox, and a leaked worker holds its port for
 ;; the next run.
-(define (spawn-worker! name port timeout-ms)
+(define (spawn-worker! name port timeout-ms . partial)
   (system (string-append "scheme --script igropyr/qjs-worker.sc 127.0.0.1 "
                          (number->string port) " " bundle-path
                          " timeout-ms=" (number->string timeout-ms)
                          ;; short enough to be observable: the default is
                          ;; half a minute, which is right in production and
                          ;; useless in a test
-                         " partial-frame-ms=1200"
+                         " partial-frame-ms="
+                         (number->string (if (pair? partial) (car partial) 1200))
                          " >/dev/null 2>&1 & echo $! > " (pid-file name))))
 
 (define (kill-worker! name)
@@ -108,7 +149,12 @@ function spin(j){ for(;;){} }
   (lambda ()
     (write-bundle!)
     (kill-worker! "good") (kill-worker! "spin") (kill-worker! "half")
+    (kill-worker! "carry")
     (spawn-worker! "good" good-port 800)
+    ;; renders may run to 3s; a tail may not live past 400ms. That gap is
+    ;; the point -- it puts a deadline INSIDE a render rather than between
+    ;; two reads, which is where both of the bugs below lived.
+    (spawn-worker! "carry" carry-port 3000 400)
     (spawn-worker! "half" half-port 800)
     (spawn-worker! "spin" spin-port 60000)   ; long engine deadline: the
                                              ; CALLER's timeout is what must
@@ -352,6 +398,175 @@ function spin(j){ for(;;){} }
                                                 (number->string r)))
                                           "\n")))))
 
+            ;; ---- a whole frame behind a carried-in tail ------------------
+            ;;
+            ;; The pipelined pair above lands in an EMPTY buffer, so the
+            ;; connection has no deadline while it is parsed -- which is
+            ;; why it stayed green against the version that dropped
+            ;; requests. This one arrives the other way: a tail carried in
+            ;; from an earlier read, its deadline passing during the very
+            ;; render that is meant to be answering it, and a second whole
+            ;; frame sitting behind it in the same read. That reader used
+            ;; to stop on the old deadline with the third frame complete
+            ;; in the buffer, then wait for bytes that were never coming.
+            (let ((me self))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" carry-port self)
+                  (receive (after 3000 (send me (vector 'carry 'no-connect)))
+                    (`#(tcp-connect-failed ,e) (send me (vector 'carry 'no-connect)))
+                    (`#(tcp-connected ,c)
+                      (tcp-read-start! c)
+                      (let* ((f1 (qframe 1 "slow" "{}"))
+                             (f2 (qframe 2 "slow" "{}"))
+                             (f3 (qframe 3 "hello" "{\"name\":\"C\"}"))
+                             (head (let ((h (make-bytevector 2)))
+                                     (bytevector-u8-set! h 0 (bytevector-u8-ref f2 0))
+                                     (bytevector-u8-set! h 1 (bytevector-u8-ref f2 1))
+                                     h))
+                             (tail (let* ((n (bytevector-length f2))
+                                          (t (make-bytevector (- n 2))))
+                                     (bytevector-copy! f2 2 t 0 (- n 2))
+                                     t)))
+                        ;; read 1: a whole slow render, then two bytes that
+                        ;; become the tail with a 400ms window of its own
+                        (tcp-write! c (bv-append f1 head) #f)
+                        (let wait1 ((acc (make-bytevector 0)))
+                          (if (>= (count-frames acc) 1)
+                              (begin
+                                ;; read 2: the tail completes into another
+                                ;; slow render -- which outlives the window
+                                ;; the tail was given -- with a third whole
+                                ;; frame behind it
+                                (tcp-write! c (bv-append tail f3) #f)
+                                (let wait2 ((acc2 acc))
+                                  (if (>= (count-frames acc2) 3)
+                                      (send me (vector 'carry 'all))
+                                      (receive (after 5000
+                                                 (send me (vector 'carry
+                                                                  (count-frames acc2))))
+                                        (`#(tcp-data ,bv) (wait2 (bv-append acc2 bv)))
+                                        (`#(tcp-eof)
+                                          (send me (vector 'carry (count-frames acc2))))
+                                        (`#(tcp-error ,e)
+                                          (send me (vector 'carry (count-frames acc2))))))))
+                              (receive (after 5000 (send me (vector 'carry 'no-first)))
+                                (`#(tcp-data ,bv) (wait1 (bv-append acc bv)))
+                                (`#(tcp-eof) (send me (vector 'carry 'eof-first)))
+                                (`#(tcp-error ,e)
+                                  (send me (vector 'carry 'err-first))))))))))) 
+              (receive (after 12000 (fail "carried-tail probe never answered"))
+                (`#(carry ,r)
+                  (check "a whole frame behind a carried-in tail is answered"
+                         (eq? r 'all))
+                  (unless (eq? r 'all)
+                    (display "  [info] carried tail: ") (write r) (newline)))))
+
+            ;; ---- an in-time frame is not charged for someone else's render
+            ;;
+            ;; A render stops the whole worker, so one connection's window
+            ;; can pass entirely inside another connection's render. The
+            ;; bytes are then already in the mailbox when the reader next
+            ;; runs -- they arrived in time -- and a reader that consults
+            ;; the clock before parsing closes a peer for being punctual.
+            (let ((me self))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" carry-port self)
+                  (receive (after 3000 (send me (vector 'punct 'no-connect)))
+                    (`#(tcp-connect-failed ,e) (send me (vector 'punct 'no-connect)))
+                    (`#(tcp-connected 'a)
+                      (send me (vector 'punct 'bad-tag)))
+                    (`#(tcp-connected ,ca)
+                      (tcp-read-start! ca)
+                      (let* ((fa (qframe 7 "hello" "{\"name\":\"P\"}"))
+                             (n (bytevector-length fa))
+                             (h (make-bytevector 6))
+                             (rest (make-bytevector (- n 6))))
+                        (bytevector-copy! fa 0 h 0 6)
+                        (bytevector-copy! fa 6 rest 0 (- n 6))
+                        (tcp-write! ca h #f)        ; a partial frame: window opens
+                        ;; a SECOND connection asks for a 700ms render; the
+                        ;; worker is off the air for its duration
+                        (let ((mine self))
+                          (spawn (lambda ()
+                                   (tcp-connect! "127.0.0.1" carry-port self)
+                                   (receive (after 3000 (void))
+                                     (`#(tcp-connect-failed ,e) (void))
+                                     (`#(tcp-connected ,cb)
+                                       (tcp-read-start! cb)
+                                       (tcp-write! cb (qframe 8 "slow" "{}") #f)
+                                       (receive (after 5000 (void))
+                                         (`#(tcp-data ,bv) (void))
+                                         (`#(tcp-eof) (void))
+                                         (`#(tcp-error ,e) (void))))))))
+                        (sleep-ms 150)              ; well inside the 400ms window
+                        (tcp-write! ca rest #f)
+                        (let wait ((acc (make-bytevector 0)))
+                          (if (>= (count-frames acc) 1)
+                              (send me (vector 'punct 'answered))
+                              (receive (after 6000 (send me (vector 'punct 'timeout)))
+                                (`#(tcp-data ,bv) (wait (bv-append acc bv)))
+                                (`#(tcp-eof) (send me (vector 'punct 'closed)))
+                                (`#(tcp-error ,e)
+                                  (send me (vector 'punct 'closed))))))))))) 
+              (receive (after 12000 (fail "punctual-peer probe never answered"))
+                (`#(punct ,r)
+                  (check "a frame that arrived in time is answered even when a render outlasted its window"
+                         (eq? r 'answered))
+                  (unless (eq? r 'answered)
+                    (display "  [info] punctual peer: ") (write r) (newline)))))
+
+            ;; ---- a connection that retires under load --------------------
+            ;;
+            ;; The id field is u32, so a connection eventually has to be
+            ;; retired rather than have its counter wrap. Four billion
+            ;; renders away, that branch is unreachable in a test and was
+            ;; therefore never run: retiring after two renders, or never
+            ;; telling the pool at all, left every suite green. Setting the
+            ;; cap to one puts a retirement between every pair of renders.
+            ;;
+            ;; What must hold is that no caller pays for it. A connection
+            ;; on its way out that reports itself idle first -- or replies
+            ;; first, and lets its borrower's check-in reach the pool
+            ;; before the news of its death -- gets lent to the next
+            ;; caller in the queue, whose request then goes to a pid that
+            ;; is already exiting.
+            ;;
+            ;; HALF OF THAT IS STRUCTURAL and half is not. Reporting idle
+            ;; while retiring is now unreachable -- the send sits in the
+            ;; other arm -- and this probe would red if it came back. The
+            ;; remaining route is the borrower own check-in racing the
+            ;; news of the death, which needs the scheduler to preempt
+            ;; between two sends; that ordering is not pinned by any test
+            ;; here, because nothing outside the connection can make that
+            ;; preemption happen.
+            (let ((rp (qjspool (list (cons "127.0.0.1" good-port))
+                               '((render-timeout-ms . 2000)
+                                 (checkout-timeout-ms . 4000)
+                                 (max-requests-per-connection . 1)))))
+              (let ((me self) (n 12))
+                (do ((i 0 (+ i 1))) ((= i n))
+                  (spawn (lambda ()
+                           (let-values (((k v) (qjspool-render
+                                                 rp "hello"
+                                                 "{\"name\":\"R\"}")))
+                             (send me (vector 'retire k v))))))
+                (let loop ((got 0) (bad 0) (why #f))
+                  (if (= got n)
+                      (begin
+                        (check "every caller is answered across repeated retirements"
+                               (= bad 0))
+                        (when (> bad 0)
+                          (display "  [info] retirement losses: ")
+                          (write (cons bad why)) (newline)))
+                      (receive (after 20000
+                                 (fail "retirement probe never finished" got bad))
+                        (`#(retire ,k ,v)
+                          (if k (loop (+ got 1) bad why)
+                              (loop (+ got 1) (+ bad 1) v)))))))
+              (qjspool-close! rp))
+
             ;; ---- a worker that is not there ------------------------------
             ;; The pool must answer, not hang: an endpoint nobody is
             ;; listening on is the ordinary state during a deploy.
@@ -409,6 +624,7 @@ function spin(j){ for(;;){} }
       (kill-worker! "good")
       (kill-worker! "spin")
       (kill-worker! "half")
+      (kill-worker! "carry")
       (when (file-exists? bundle-path) (delete-file bundle-path))
       (if (= failures 0)
           (display "qjspool: all tests passed\n")
