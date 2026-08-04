@@ -46,6 +46,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # the test below it runs on every host, and it is where the wire's failure
 # modes live (dribbled, oversized, silent, truncated, unsolicited)
 "$scheme_bin" --script igropyr/test/qjspool-wire.sc
+# single-flight sequences that only became constructible once renders left
+# the process: a leader caught mid-render, invalidated under, or killed
+"$scheme_bin" --script igropyr/test/ssr-flight.sc
 # spawns real worker PROCESSES: the point of the library is that a render
 # which never returns cannot stop this scheduler, and that is only provable
 # with the engine on the other side of a socket

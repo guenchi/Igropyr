@@ -224,29 +224,43 @@
   ;; so a publish can be checked against the round that is actually live.
   (define flight-generation 0)
 
+  ;; An entry is #(generation leader waiters). waiters are (who . ref): the
+  ;; ref keeps a late publish from being matched by the caller's NEXT wait.
+  ;; The generation does the other half -- it keeps a late publish from an
+  ;; ABANDONED round from waking the waiters of the round that replaced it,
+  ;; which would hand them an arbitrarily stale render and delete the live
+  ;; round's entry underneath it. A ref cannot cover that: the waiters it
+  ;; would wake are new, and their refs are exactly the ones the stale
+  ;; publish carries no knowledge of.
+  ;;
+  ;; The LEADER is recorded because a round whose leader is gone is not a
+  ;; round. Without it, a request joining such a key waited out the whole
+  ;; timeout before rendering, every time, for as long as the key stayed
+  ;; cold -- and a waiter that was killed rather than timing out never
+  ;; unclaimed, so the entry never emptied and never dropped: the key was
+  ;; wedged in follower-forever mode permanently.
+  (define (entry-gen e) (vector-ref e 0))
+  (define (entry-leader e) (vector-ref e 1))
+  (define (entry-waiters e) (vector-ref e 2))
+  (define (live-waiters ws) (filter (lambda (w) (process-alive? (car w))) ws))
+
   (define (flight-call msg from tbl)      ; claim -> 'leader | 'follower
     (case (vector-ref msg 0)
       ((claim)
-       ;; An entry is #(generation waiters). waiters are (who . ref): the
-       ;; ref keeps a late publish from being matched by the caller's NEXT
-       ;; wait. The generation does the other half -- it keeps a late
-       ;; publish from an ABANDONED round from waking the waiters of the
-       ;; round that replaced it, which would hand them an arbitrarily
-       ;; stale render and delete the live round's entry underneath it.
-       ;; A ref cannot cover that: the waiters it would wake are new, and
-       ;; their refs are exactly the ones the stale publish carries no
-       ;; knowledge of.
        (let ((key (vector-ref msg 1)) (who (vector-ref msg 2))
              (ref (vector-ref msg 3)))
-         (let ((e (hashtable-ref tbl key #f)))
+         (let* ((e (hashtable-ref tbl key #f))
+                ;; a dead leader's round is not one to join
+                (e (and e (process-alive? (entry-leader e)) e)))
            (if e
                (begin (hashtable-set! tbl key
-                        (vector (vector-ref e 0)
-                                (cons (cons who ref) (vector-ref e 1))))
-                      (values (cons 'follower (vector-ref e 0)) tbl))
+                        (vector (entry-gen e) (entry-leader e)
+                                (cons (cons who ref)
+                                      (live-waiters (entry-waiters e)))))
+                      (values (cons 'follower (entry-gen e)) tbl))
                (let ((g (begin (set! flight-generation (+ flight-generation 1))
                                flight-generation)))
-                 (hashtable-set! tbl key (vector g '()))
+                 (hashtable-set! tbl key (vector g who '()))
                  (values (cons 'leader g) tbl))))))
       (else (values 'bad-request tbl))))
 
@@ -262,21 +276,46 @@
          ;; that is the point, because waking the new round's waiters with
          ;; the old round's render is how a caller receives content from
          ;; before whatever invalidated the key.
-         (when (and e (= (vector-ref e 0) g))
+         (when (and e (= (entry-gen e) g))
            (for-each (lambda (w) (send (car w) (vector 'ssr-flight (cdr w) res)))
-                     (vector-ref e 1))
+                     (entry-waiters e))
            (hashtable-delete! tbl key))))
+      ((retire)
+       ;; EVERY round in progress is producing content that has just been
+       ;; invalidated. The epoch already stops those renders reaching the
+       ;; cache, but it does not stop them reaching a caller: a request
+       ;; arriving AFTER the invalidation joined the round that was already
+       ;; running and was handed its pre-invalidation HTML. Invalidating has
+       ;; to draw a line for readers, not only for the cache.
+       ;;
+       ;; Waiters are woken with #f rather than left to time out -- they
+       ;; have a fresh render to do and no reason to wait for one that no
+       ;; longer counts.
+       (let ((ks (hashtable-keys tbl)))
+         (vector-for-each
+           (lambda (k)
+             (let ((e (hashtable-ref tbl k #f)))
+               (when e
+                 (for-each
+                   (lambda (w) (send (car w) (vector 'ssr-flight (cdr w) #f)))
+                   (entry-waiters e)))))
+           ks)
+         (hashtable-clear! tbl)))
       ((unclaim)                          ; a follower timed out (dead leader)
        (let ((key (vector-ref msg 1)) (ref (vector-ref msg 2))
              (g (vector-ref msg 3)))
          (let ((e (hashtable-ref tbl key #f)))
-           (when (and e (= (vector-ref e 0) g))
-             (let ((ws (remp (lambda (w) (eq? (cdr w) ref))
-                             (vector-ref e 1))))
+           (when (and e (= (entry-gen e) g))
+             ;; dead waiters go too: one that was KILLED never unclaims, and
+             ;; while it is counted the entry can never empty
+             (let ((ws (live-waiters
+                         (remp (lambda (w) (eq? (cdr w) ref))
+                               (entry-waiters e)))))
                ;; last waiter gone with no publish -> the leader is stuck; drop
                ;; the entry so the key isn't wedged in follower-forever mode
                (if (null? ws) (hashtable-delete! tbl key)
-                   (hashtable-set! tbl key (vector g ws)))))))))
+                   (hashtable-set! tbl key
+                     (vector g (entry-leader e) ws)))))))))
     tbl)
 
   ;; render (non-raising) + cache on success -> (ok . text). Each call is one
@@ -319,7 +358,20 @@
                  ;; the memory-cache hit straight through with no re-encode
                  (let-values (((ok s) (render-with engine fn json))) (cons ok s)))))
       (when (and (car res) (= epoch cache-epoch))
-        (b-put backend key (cdr res) ttl))
+        (b-put backend key (cdr res) ttl)
+        ;; ...and again AFTER. The check above is not atomic with the write:
+        ;; the memory backend's put is a cast the invalidation's drop can be
+        ;; queued ahead of, and the redis backend's is a network call that
+        ;; parks for as long as the round trip takes. An invalidation
+        ;; landing in that window left the render it existed to remove
+        ;; sitting in the cache with a fresh TTL -- exactly the outcome the
+        ;; epoch was added to prevent, just through a narrower door.
+        ;;
+        ;; Undoing it can at worst drop a NEWER entry somebody else wrote in
+        ;; the same window, which costs one re-render and can never serve
+        ;; anything stale. The other way round is not a trade worth making.
+        (unless (= epoch cache-epoch)
+          (b-drop backend key)))
       res))
 
   (define (flight-error-text e)
@@ -345,6 +397,20 @@
                  (claimed (gen-server-call flight (vector 'claim key self ref)))
                  (role (car claimed))
                  (gen (cdr claimed)))
+            ;; What a follower does when it stops waiting -- because it
+            ;; gave up, or because an invalidation retired the round.
+            ;; It LOOKS IN THE CACHE FIRST. The leader may have finished
+            ;; and written and then died before publishing, or simply have
+            ;; taken longer than the wait allowed for -- the wait covers a
+            ;; render, not the leader's own cache round trips, which with a
+            ;; remote cache are network calls of their own. Rendering
+            ;; without looking turns both into a herd on a key that is
+            ;; already warm.
+            (define (fallback!)
+              (let ((again (b-get backend key)))
+                (if again
+                    (cons #t again)
+                    (call+cache rnd backend key fn json ttl eng))))
             (if (eq? role 'leader)
                 (let* ((again (b-get backend key))       ; double-check
                        (res (if again (cons #t again)
@@ -354,8 +420,12 @@
                 (receive (after (ssr-flight-wait r)
                             ;; leader vanished -> render ourselves
                             (gen-server-cast flight (vector 'unclaim key ref gen))
-                            (call+cache rnd backend key fn json ttl eng))
-                  (`#(ssr-flight ,@ref ,res) res))))))))
+                            (fallback!))
+                  ;; #f is a RETIREMENT: an invalidation ended this round,
+                  ;; so there is nothing to wait for and the answer it would
+                  ;; have given is one this caller must not receive
+                  (`#(ssr-flight ,@ref ,res)
+                    (if res res (fallback!))))))))))
 
   ;; ---- public ssr: #(backend ttl flight wait renders engine) ------------
   ;;
@@ -439,8 +509,18 @@
 
   ;; The epoch bump goes FIRST. Dropping the entry and then bumping leaves
   ;; a window in which a render that finished in between still writes.
-  (define (ssr-invalidate! r key) (bump-epoch!) (b-drop (ssr-backend r) key))
-  (define (ssr-clear! r)          (bump-epoch!) (b-clear (ssr-backend r)))
+  ;;
+  ;; Retiring the in-flight rounds goes with it. The epoch keeps a render
+  ;; that began before the invalidation out of the CACHE; it does not keep
+  ;; it away from a caller that arrived after and joined that round. Both
+  ;; halves are the same statement -- content from before this call must
+  ;; not be served after it -- so they happen together.
+  (define (retire-rounds! r)
+    (bump-epoch!)
+    (let ((f (ssr-flight r)))
+      (when f (gen-server-cast f (vector 'retire)))))
+  (define (ssr-invalidate! r key) (retire-rounds! r) (b-drop (ssr-backend r) key))
+  (define (ssr-clear! r)          (retire-rounds! r) (b-clear (ssr-backend r)))
   (define (ssr-stats r)
     (cons (cons 'renders (unbox (ssr-renders r))) (b-stats (ssr-backend r))))
 )
