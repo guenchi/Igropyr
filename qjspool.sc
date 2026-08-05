@@ -202,9 +202,16 @@
   ;; closing connections is otherwise a black box.
   (define trace-port (make-parameter #f))
 
+  ;; WHOSE READ IT WAS. One worker serves many connections at once, and a
+  ;; probe that asserts "a late read happened" against a global count can
+  ;; be satisfied by a DIFFERENT connection's read -- which is the exact
+  ;; kind of silent pass these assertions exist to remove. Every line
+  ;; carries the connection's own process, so a count can be taken per
+  ;; connection.
   (define (trace! . parts)
     (let ((p (trace-port)))
       (when p
+        (display "c" p) (display (process-id self) p) (display " " p)
         (for-each (lambda (x) (display x p)) parts)
         (newline p)
         (flush-output-port p))))
