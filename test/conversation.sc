@@ -689,9 +689,20 @@
 ;; trial 40ms with the notification also removed: green at "0ms after it
 ;; started". The gate was applied to the new trials and left off the one
 ;; feeding them.
-(let ((best 999999)
-      (samples 0))
-  (do ((i 0 (+ i 1))) ((= i 3))
+;; A MAJORITY, NOT THE LUCKIEST. Taking the fastest of several resists a
+;; collection landing in one measurement, but it also lets one lucky
+;; trial carry the assertion -- and there is a way to be lucky without
+;; the notification: the watchdog may still be asleep on a PREVIOUS
+;; step's deadline, which expires first, and it re-reads the clock on
+;; waking and kills the new step on time having been told nothing.
+;; Requiring two of three to clear the bar survives one slow trial and
+;; one lucky one, and both together are what it would take to hide a
+;; lost notification.
+(let ((under 0)
+      (best 999999)
+      (samples 0)
+      (trials 3))
+  (do ((i 0 (+ i 1))) ((= i trials))
     (let ((ttl 20)
           (started (box #f)))
       (let-values (((kid ktok kfirst)
@@ -716,17 +727,22 @@
               (when (unbox started)
                 (set! samples (+ samples 1))
                 (let ((took (- at (unbox started))))
-                  (when (< took best) (set! best took))))))))))
+                  (when (< took best) (set! best took))
+                  (when (< took 30) (set! under (+ under 1)))))))))))
   (when (= samples 0)
     (fail "no trial started a step: nothing was timed" samples))
   ;; told: ttl plus the grace. Noticed on the poll: the floor is 50 and
   ;; the step had to begin inside a 20ms park window, so 30 is the least
   ;; it can cost measured from the step.
-  (unless (< best 30)
-    (fail "the kill waited for a poll instead of being told" best))
+  (unless (>= under 2)
+    (fail "the kill waited for a poll instead of being told"
+          (list 'under under 'of samples 'best best)))
   (display (string-append "a runaway step is stopped "
                           (number->string best)
-                          "ms after it started, on a 20ms TTL ok\n")))
+                          "ms after it started ("
+                          (number->string under) "/"
+                          (number->string samples)
+                          " under the bar) ok\n")))
 
 ;; ---- a step that lands inside the grace tick is NOT killed --------------
 ;;
