@@ -208,13 +208,25 @@
   ;; kind of silent pass these assertions exist to remove. Every line
   ;; carries the connection's own process, so a count can be taken per
   ;; connection.
+  ;; A DIAGNOSTIC MUST NOT KILL WHAT IT IS DIAGNOSING. This runs at the
+  ;; top of the read path, outside the guard that turns a framing error
+  ;; into a closed connection, so a full disk or an unlinked file would
+  ;; otherwise raise here and take down the connection's process -- while
+  ;; the listener stayed up, leaving a worker that holds its port and
+  ;; fails every render. The first failure turns tracing off for the life
+  ;; of the process and says so once; nothing after that can raise.
   (define (trace! . parts)
     (let ((p (trace-port)))
       (when p
-        (display "c" p) (display (process-id self) p) (display " " p)
-        (for-each (lambda (x) (display x p)) parts)
-        (newline p)
-        (flush-output-port p))))
+        (guard (e (#t (trace-port #f)
+                      (guard (e2 (#t (void)))
+                        (display "qjs-worker: tracing disabled after a write error\n"
+                                 (console-error-port))
+                        (flush-output-port (console-error-port)))))
+          (display "c" p) (display (process-id self) p) (display " " p)
+          (for-each (lambda (x) (display x p)) parts)
+          (newline p)
+          (flush-output-port p)))))
 
   (define (qjs-worker-serve! host port bundle . rest)
     (let* ((qopts (if (pair? rest) (car rest) '()))
@@ -224,11 +236,17 @@
       (unless (and (integer? partial-ms) (exact? partial-ms) (> partial-ms 0))
         (assertion-violation 'qjs-worker-serve!
           "partial-frame-ms must be a positive exact integer" partial-ms))
+      (when (assq 'trace-file qopts)
+        (unless (string? trace)
+          (assertion-violation 'qjs-worker-serve!
+            "trace-file must be a path" trace)))
       (when (string? trace)
-        (trace-port (open-file-output-port trace
+        (trace-port (guard (e (#t (assertion-violation 'qjs-worker-serve!
+                                    "trace-file could not be opened" trace)))
+                     (open-file-output-port trace
                                            (file-options no-fail no-truncate append)
                                            (buffer-mode line)
-                                           (native-transcoder))))
+                                           (native-transcoder)))))
       (qjs-boot! bundle qopts)
       (tcp-listen! host port 128
         (lambda (c)
@@ -324,10 +342,14 @@
       (let retry ()
        (let ((late? (and since (>= (now-ms) since)))
             (before (inbuf-length buf)))
+        ;; EVENT TYPES DO NOT SHARE FIELD NAMES. A close line also
+        ;; reported "late=1", so an assertion looking for a late READ
+        ;; counted closes as well -- a probe could pass on the strength of
+        ;; the very event it was meant to rule out.
         (trace! "read buffered=" before
                 " since=" (or since "-")
                 " now=" (now-ms)
-                " late=" (if late? "1" "0"))
+                " read-late=" (if late? "1" "0"))
         (if (guard (e (#t #f)) (answer-all! c buf) #t)
             (let* ((rest (inbuf-length buf))
                    ;; A FRAME WAS CONSUMED, so whatever is left over is a
@@ -367,8 +389,8 @@
                  (trace! "drained rest=" rest) (retry))
                 ((>= (now-ms) deadline)
                  (trace! "close deadline rest=" rest
-                         " consumed=" (if consumed "1" "0")
-                         " late=" (if late? "1" "0"))
+                         " close-consumed=" (if consumed "1" "0")
+                         " close-late=" (if late? "1" "0"))
                  (tcp-close! c))
                 (else (worker-conn-loop* c buf partial-ms deadline))))
             (tcp-close! c)))))

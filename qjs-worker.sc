@@ -39,6 +39,14 @@
 ;; key=value -> (key . value); numeric values are parsed as numbers, so
 ;; timeout-ms=1500 reaches qjs-boot! as a fixnum and not as a string it
 ;; would reject.
+;; WHICH OPTIONS ARE NUMBERS IS DECIDED BY THE KEY, not by whether the
+;; value happens to parse as one. Converting anything numeric-looking
+;; meant trace-file=123 -- a perfectly legal relative filename -- arrived
+;; as the integer 123, failed the string? test at the far end, and left a
+;; worker that listened normally and produced no trace at all, with
+;; nothing said about it.
+(define numeric-opts '(timeout-ms partial-frame-ms mem-mb stack-kb))
+
 (define (parse-opt s)
   (let ((i (let loop ((i 0))
              (cond ((= i (string-length s)) #f)
@@ -46,9 +54,14 @@
                    (else (loop (+ i 1)))))))
     (unless i (die! (string-append "options are key=value, got: " s)))
     (let* ((k (string->symbol (substring s 0 i)))
-           (v (substring s (+ i 1) (string-length s)))
-           (n (string->number v)))
-      (cons k (if (and n (exact? n) (integer? n)) n v)))))
+           (v (substring s (+ i 1) (string-length s))))
+      (if (memq k numeric-opts)
+          (let ((n (string->number v)))
+            (unless (and n (exact? n) (integer? n))
+              (die! (string-append (symbol->string k)
+                                   " takes an integer, got: " v)))
+            (cons k n))
+          (cons k v)))))
 
 (define args (command-line-arguments))
 
@@ -66,10 +79,13 @@
   (let ((bundle (read-file bundle-path)))
     (start-scheduler
       (lambda ()
-        ;; a bundle that does not parse must fail HERE, loudly, at startup
-        ;; -- not once per render on a worker the pool believes is healthy
+        ;; anything wrong must fail HERE, loudly, at startup -- not once
+        ;; per render on a worker the pool believes is healthy. The label
+        ;; says "starting", not "the bundle", because this covers the
+        ;; bundle, the options, the trace file and the listen: naming one
+        ;; of them sent every other cause out under the wrong heading.
         (guard (e (#t (die! (string-append
-                              "bundle failed to load: "
+                              "failed to start: "
                               (if (and (condition? e) (message-condition? e))
                                   (condition-message e)
                                   "unknown error")))))
