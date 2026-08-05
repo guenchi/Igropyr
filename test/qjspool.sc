@@ -721,6 +721,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                       (tcp-read-start! ca)
                       (let ((fa (qframe 11 "hello" "{\"name\":\"L\"}"))
                             (t0 (now-ms))
+                            (watcher self)
                             (rounds 4))
                         ;; a prefix and nothing else, ever
                         (tcp-write! ca (let ((h (make-bytevector 4)))
@@ -736,18 +737,31 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                             (let round ((k 0))
                               (when (< k rounds)
                                 (sleep-ms 250)
-                                (let ((mine self))
-                                  (spawn (lambda ()
-                                           (tcp-connect! "127.0.0.1" carry-port self)
-                                           (receive (after 2000 (void))
-                                             (`#(tcp-connect-failed ,e) (void))
-                                             (`#(tcp-connected ,cb)
-                                               (tcp-read-start! cb)
-                                               (tcp-write! cb (qframe (+ 20 k) "slow" "{}") #f)
-                                               (receive (after 3000 (void))
-                                                 (`#(tcp-data ,bv) (void))
-                                                 (`#(tcp-eof) (void))
-                                                 (`#(tcp-error ,e) (void))))))))
+                                ;; EACH RENDER IS ASSERTED. Every failure
+                                ;; path here was (void), so a port
+                                ;; collision or a worker that had not come
+                                ;; up left no render straddling anything
+                                ;; and the probe passed having tested
+                                ;; nothing. A round of this review claimed
+                                ;; in its commit message to have fixed
+                                ;; that here; it fixed it in the probe
+                                ;; above and not in this one.
+                                (spawn (lambda ()
+                                         (tcp-connect! "127.0.0.1" carry-port self)
+                                         (receive (after 2000
+                                                    (send watcher (vector 'rnd 'no-connect)))
+                                           (`#(tcp-connect-failed ,e)
+                                             (send watcher (vector 'rnd 'no-connect)))
+                                           (`#(tcp-connected ,cb)
+                                             (tcp-read-start! cb)
+                                             (tcp-write! cb (qframe (+ 20 k) "slow" "{}") #f)
+                                             (receive (after 3000
+                                                        (send watcher (vector 'rnd 'no-answer)))
+                                               (`#(tcp-data ,bv)
+                                                 (send watcher (vector 'rnd 'rendered)))
+                                               (`#(tcp-eof) (send watcher (vector 'rnd 'eof)))
+                                               (`#(tcp-error ,e)
+                                                 (send watcher (vector 'rnd 'err))))))))
                                 (sleep-ms 50)
                                 (guard (e (#t (void)))
                                   (tcp-write! ca (let ((b (make-bytevector 1)))
@@ -756,12 +770,25 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                                               #f))
                                 (sleep-ms 700)
                                 (round (+ k 1))))))
-                        (let wait ()
+                        ;; the close is reported with how many renders
+                        ;; actually straddled a window by then: a close
+                        ;; that happened because nothing was rendering
+                        ;; proves nothing about forgiveness
+                        (let wait ((rendered 0) (bad #f))
                           (receive (after 12000 (send me (vector 'renew 'never-closed)))
-                            (`#(tcp-data ,bv) (wait))
-                            (`#(tcp-eof) (send me (vector 'renew (- (now-ms) t0))))
+                            (`#(rnd rendered) (wait (+ rendered 1) bad))
+                            (`#(rnd ,other) (wait rendered (or bad other)))
+                            (`#(tcp-data ,bv) (wait rendered bad))
+                            (`#(tcp-eof)
+                              (send me (vector 'renew
+                                               (if (> rendered 0)
+                                                   (- (now-ms) t0)
+                                                   (cons 'no-render bad)))))
                             (`#(tcp-error ,e)
-                              (send me (vector 'renew (- (now-ms) t0)))))))))))
+                              (send me (vector 'renew
+                                               (if (> rendered 0)
+                                                   (- (now-ms) t0)
+                                                   (cons 'no-render bad))))))))))))
               (receive (after 20000 (fail "late-byte probe never answered"))
                 (`#(renew ,r)
                   ;; one straddling render is ~950ms; four rounds of
