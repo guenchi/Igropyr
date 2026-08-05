@@ -474,11 +474,26 @@
   ;; it out is what lets a conversation publish its completion -- phase,
   ;; running flag and tombstone -- as one indivisible act; the prune loop
   ;; stays outside, where it belongs.
-  (define (tomb-insert! id)
+  ;; WHAT THE RECORD SAYS, not merely that there is one. #t is "this
+  ;; conversation settled"; 'killed is "the watchdog stopped it in flight
+  ;; and what it had already done is not knowable from here". The
+  ;; difference matters because the ABSENCE of a record is read as 'gone,
+  ;; and 'gone is documented as "the transaction rolled back" -- an answer
+  ;; a caller may act on by doing the whole thing again. A step killed
+  ;; mid-flow may have committed already: the commit is inside the flow,
+  ;; while the record is written after it returns, and everything between
+  ;; those two points is preemptible.
+  ;;
+  ;; First write wins, and that is the right order both ways: a flow that
+  ;; published before the kill keeps its 'settled, and a flow killed
+  ;; before it could publish can never publish afterwards.
+  (define (tomb-insert-as! id what)
     (unless (hashtable-contains? tombstones id)
-      (hashtable-set! tombstones id #t)
+      (hashtable-set! tombstones id what)
       (set! tomb-back (cons (cons id (now-ms)) tomb-back))
       (set! tomb-n (+ tomb-n 1))))
+
+  (define (tomb-insert! id) (tomb-insert-as! id #t))
 
   (define (tomb-record! id)
     (with-interrupts-disabled (tomb-insert! id))
@@ -487,7 +502,13 @@
   (define (tomb-settled? id)
     (tomb-prune!)
     (with-interrupts-disabled
-      (hashtable-contains? tombstones id)))
+      (eq? #t (hashtable-ref tombstones id #f))))
+
+  ;; stopped in flight: neither settled nor provably rolled back
+  (define (tomb-killed? id)
+    (tomb-prune!)
+    (with-interrupts-disabled
+      (eq? 'killed (hashtable-ref tombstones id #f))))
 
   ;; Size the record of completed conversations. #f leaves one alone.
   (define (conversation-set-limits! max-entries ttl-ms)
@@ -956,6 +977,18 @@
                                             (overrun?)
                                             (begin
                                               (kill watched 'conversation-expired)
+                                              ;; SAY THAT WE DID IT, in the
+                                              ;; same atom. Without a record
+                                              ;; the absence of one is read
+                                              ;; as 'gone -- "the transaction
+                                              ;; rolled back" -- and a step
+                                              ;; killed after its COMMIT
+                                              ;; returned but before it could
+                                              ;; publish has not rolled back
+                                              ;; at all. First write wins, so
+                                              ;; a flow that published first
+                                              ;; keeps its 'settled.
+                                              (tomb-insert-as! id 'killed)
                                               #t)))))
                                 ;; DECLINING TO KILL IS NOT BEING DONE.
                                 ;; Before the grace period this branch
@@ -1203,6 +1236,10 @@
   ;; transaction twice.
   (define (settled-or-lost id)
     (cond ((tomb-settled? id) 'settled)
+          ;; killed while a step was running: it may have committed and it
+          ;; may not have, and saying 'gone here is what performs a
+          ;; committed transfer twice
+          ((tomb-killed? id) 'unknown)
           ((tomb-remembers? id) 'gone)
           (else 'unknown)))
 
