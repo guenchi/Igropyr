@@ -612,7 +612,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                   ;; straddling the window every read lands inside it and
                   ;; this proves nothing; the worker says which it was.
                   (check "that frame's completing read was in fact overdue"
-                         (> (trace-count-new "carry" mark "late=1") 0))
+                         (> (trace-count-new "carry" mark "read-late=1") 0))
                   (unless (eq? r 'answered)
                     (display "  [info] punctual peer: ") (write r) (newline)))))
 

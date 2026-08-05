@@ -665,7 +665,8 @@
 ;; and its tombstone written, so the caller falls back to the record and
 ;; is told 'settled. What must NOT happen is the compensation running --
 ;; the flow committed.
-(let ((released (box 0)))
+(let ((released (box 0))
+      (entered-key (box #f)))
   (let-values (((hid htok hfirst)
                 (conversation-start!
                   (lambda (req suspend!)
@@ -674,6 +675,7 @@
                   'go
                   120
                   (lambda (r)                     ; hangs, only on replay
+                    (when (eq? r 'HANG) (set-box! entered-key #t))
                     (if (eq? r 'HANG) (sleep-ms 60000) (void))
                     r)
                   (lambda () (set-box! released (+ 1 (unbox released)))))))
@@ -704,9 +706,18 @@
       (let wait ((hung #f) (behind #f))
         (if (and hung behind)
             (begin
+              ;; the key really did run and really did hang -- an
+              ;; implementation that only compares tokens and never calls
+              ;; the key at all would otherwise pass this whole case
+              (unless (unbox entered-key)
+                (fail "the request key was never called" (unbox entered-key)))
               (when (> (car hung) 4000)
                 (fail "a hung key was bounded only by its own sleep" (car hung)))
-              (unless (memq (cdr hung) '(settled done raised))
+              ;; exactly 'settled: the flow committed and its tombstone
+              ;; says so. 'raised would mean the guard swallowed something
+              ;; and 'done would mean it was never killed at all -- the
+              ;; disjunction that used to be here accepted both.
+              (unless (eq? (cdr hung) 'settled)
                 (fail "a replay past a hung key got the wrong answer" (cdr hung)))
               (when (> (car behind) 4000)
                 (fail "a request behind a hung key waited out the hang"
@@ -789,7 +800,11 @@
           (spawn (lambda ()
                    (let-values (((r st) (conversation-resume! kid ktok 'X)))
                      (send me (vector 'latency (now-ms) r)))))
-          (receive (after 6000 (void))
+          ;; A TRIAL THAT NEVER ANSWERS IS NOT A TRIAL THAT DID NOT COUNT.
+          ;; Swallowing the timeout here meant two ordinary trials and one
+          ;; caller left with neither a reply nor a DOWN still passed the
+          ;; whole case -- the one outcome that would matter most.
+          (receive (after 6000 (fail "a latency trial was never answered" i))
             (`#(latency ,at ,v)
               (when (and (vector? v) (eq? (vector-ref v 0) 'should-not-get-here))
                 (fail "a runaway step ran to completion" v))
