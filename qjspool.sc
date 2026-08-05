@@ -266,32 +266,48 @@
       ;; deadline, and is closed by the check BELOW on the very same read.
       ;; What the check up here changed was only the case where the frame
       ;; IS whole -- a real request, refused.
-      ;; WHAT IS NOT HERE, and why. Two rounds of review reported that a
-      ;; deadline can pass inside another connection's render, so that a
-      ;; peer which delivered its bytes in time meets a reader that has
-      ;; already given up on it -- and machinery went in to forgive such a
-      ;; read, then to forgive only the rest of a delivery already in hand
-      ;; so a peer could not renew indefinitely by dribbling.
+      ;; WHETHER WE WERE THE ONE RUNNING LATE, decided before the parse
+      ;; because the parse moves the clock.
       ;;
-      ;; Instrumenting the branch says that state never occurs: across the
-      ;; whole suite -- straddling renders, 192KiB split deliveries, junk
-      ;; bytes sent after a window closed -- this reader was reached with
-      ;; an expired deadline exactly ZERO times. A connection whose window
-      ;; runs out while the runtime is blocked is closed by its own timer
-      ;; or at the top of the loop; its already-arrived bytes are never
-      ;; delivered to it. The forgiving machinery was answering a question
-      ;; this runtime does not ask, and it is gone rather than carried
-      ;; untested in the read path.
+      ;; This state is REACHABLE, and the scheduler is why. The event loop
+      ;; polls libuv before it expires timers (actor.sc:740-746), and a
+      ;; send to a process sitting in a timed receive cancels that
+      ;; process's timeout outright rather than comparing it against the
+      ;; clock (actor.sc:597-601). So when a synchronous render ends, the
+      ;; bytes that arrived during it are delivered first and the
+      ;; connection's own deadline never fires: it wakes holding data,
+      ;; overdue. Measured across the suite: three such reads, overdue by
+      ;; 300, 342 and 551ms.
       ;;
-      ;; If the scheduler ever delivers libuv reads ahead of expired
-      ;; timers, this becomes live again and the argument above is the one
-      ;; to reach for -- along with the fact that forgiving a read is not
-      ;; the same as forgiving a frame.
-      (let ((before (inbuf-length buf)))
+      ;; A round of this review once concluded the opposite from an
+      ;; instrumented count of zero. That count was of the logging, not
+      ;; the branch -- workers are reaped with kill -9 and Chez block
+      ;; buffers to a file, so unflushed output dies with them.
+      ;;
+      ;; IT DOES NOT MEAN THE BYTES WERE PUNCTUAL. A peer with an
+      ;; accomplice keeping the worker busy could send one byte after each
+      ;; deadline and be forgiven for it forever. What a late read does
+      ;; say is that everything libuv has ALREADY handed up was delivered
+      ;; with nobody able to look at it -- so the rest of that delivery is
+      ;; taken below before any decision, and a peer that has sent nothing
+      ;; further has nothing to take.
+      (let retry ()
+       (let ((late? (and since (>= (now-ms) since)))
+            (before (inbuf-length buf)))
         (if (guard (e (#t #f)) (answer-all! c buf) #t)
             (let* ((rest (inbuf-length buf))
                    ;; A FRAME WAS CONSUMED, so whatever is left over is a
                    ;; DIFFERENT half frame and gets a window of its own.
+                   ;;
+                   ;; WHICH BOUNDS THE FRAME, NOT THE CONNECTION. A peer
+                   ;; that appends one cheap whole frame ahead of its tail
+                   ;; each window renews forever, and it costs it a cheap
+                   ;; render rather than the slow one an earlier note here
+                   ;; assumed. Its resources stay bounded -- one process,
+                   ;; one descriptor, at most the frame cap of buffer --
+                   ;; but its lifetime does not, and nothing on this side
+                   ;; caps it: max-requests-per-connection is enforced by
+                   ;; the caller's connection, never by this reader.
                    ;; Keying the reset on "the buffer emptied" instead meant
                    ;; a peer that always keeps a partial tail -- which is
                    ;; what pipelining looks like -- was closed at the first
@@ -305,9 +321,18 @@
                                    (else since))))
               (cond
                 ((= rest 0) (worker-conn-loop* c buf partial-ms #f))
+                ;; THE REST OF THE SAME DELIVERY, before deciding against
+                ;; it. libuv hands up at most 64KiB per callback, so a
+                ;; request sent whole and in time still arrives in
+                ;; pieces; the first completes no frame, and closing on it
+                ;; threw away a request that was never late. Taking what
+                ;; is already queued tells that apart from a peer still
+                ;; owing us bytes, which has nothing queued and is closed
+                ;; on the deadline it had.
+                ((and late? (not consumed) (drain-queued! buf)) (retry))
                 ((>= (now-ms) deadline) (tcp-close! c))
                 (else (worker-conn-loop* c buf partial-ms deadline))))
-            (tcp-close! c))))
+            (tcp-close! c)))))
     (if (> (inbuf-length buf) 0)
         (let ((left (- (or since (+ (now-ms) partial-ms)) (now-ms))))
           (if (<= left 0)
@@ -320,6 +345,14 @@
           (`#(tcp-data ,bv) (on-data bv))
           (`#(tcp-eof) (tcp-close! c))
           (`#(tcp-error ,e) (tcp-close! c)))))
+
+  ;; Whatever libuv has already handed up, taken without waiting. #t if
+  ;; anything was there. This is not a read: it cannot wait, so it can
+  ;; only collect what was delivered while the worker was busy elsewhere.
+  (define (drain-queued! buf)
+    (let loop ((got #f))
+      (receive (after 0 got)
+        (`#(tcp-data ,bv) (inbuf-append! buf bv) (loop #t)))))
 
   ;; Every whole request the buffer holds, answered in order. A client that
   ;; pipelines gets its replies in the order it asked; the pool never does,

@@ -20,8 +20,6 @@
     (bytevector-copy! b 0 out na nb)
     out))
 
-(define kill-latency (box 999999))
-
 (define (fail label detail)
   (display "FAIL: ") (display label) (display " ") (write detail) (newline)
   (exit 1))
@@ -664,26 +662,7 @@
 ;; allowance must be stopped within a small multiple of it, and the
 ;; parked poll floor is 50ms, so a TTL well under that separates "told"
 ;; from "noticed on the next poll".
-(let ((ttl 20))
-  (let-values (((kid ktok kfirst)
-                (conversation-start!
-                  (lambda (req suspend!)
-                    (let ((a (suspend! (vector 'parked req))))
-                      (sleep-ms 2000)              ; a hundred times the TTL
-                      (vector 'should-not-get-here a)))
-                  'go
-                  ttl)))
-    (let ((me self))
-      (spawn (lambda ()
-               (let* ((t0 (now-ms)))
-                 (let-values (((r st) (conversation-resume! kid ktok 'X)))
-                   (send me (vector 'latency (- (now-ms) t0) r))))))
-      (receive (after 6000 (fail "on-time-kill" 'no-answer))
-        (`#(latency ,took ,v)
-          (when (and (vector? v) (eq? (vector-ref v 0) 'should-not-get-here))
-            (fail "a runaway step ran to completion" v))
-          (set-box! kill-latency took))))))
-
+;;
 ;; MEASURED FROM THE STEP, and only when there was one.
 ;;
 ;; Timing from the caller's side measures two things it should not. A
@@ -701,7 +680,16 @@
 ;; lands in the measurement; a lost notification costs EVERY trial, so
 ;; one good sample is enough to show it arrived and no slow one can
 ;; condemn it.
-(let ((best (unbox kill-latency))
+;; SEEDED WITH NOTHING. There was a fourth trial ahead of these that
+;; timed from the caller and seeded this, and it carried the very defect
+;; the paragraph above says was removed: when its resume arrived after
+;; the park deadline it was refused, returned in under a millisecond,
+;; and seeded a value already under the bar -- so the assertion passed
+;; whatever the three real samples said. Reproduced by delaying that
+;; trial 40ms with the notification also removed: green at "0ms after it
+;; started". The gate was applied to the new trials and left off the one
+;; feeding them.
+(let ((best 999999)
       (samples 0))
   (do ((i 0 (+ i 1))) ((= i 3))
     (let ((ttl 20)

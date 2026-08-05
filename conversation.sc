@@ -887,28 +887,6 @@
                        ;; every ttl for a small ttl -- a thousand wake-ups a
                        ;; second for a 1ms allowance, on the one thread that
                        ;; runs everything.
-                       ;; ARMED, not merely running -- the same reads
-                       ;; overrun? makes, minus the clock, and the reason
-                       ;; they have to be the same: sleeping to the
-                       ;; deadline is only worth doing when a kill can
-                       ;; come of it. Waking on "running" alone meant that
-                       ;; a settled conversation computing a key during
-                       ;; its linger held running-box true with its
-                       ;; deadline already past, so the sleep collapsed to
-                       ;; its 1ms floor and overrun? refused every time:
-                       ;; a thousand wake-ups a second, on the one thread
-                       ;; that runs everything, for as long as the linger
-                       ;; lasted. Measured at 436 of them in one existing
-                       ;; case.
-                       ;;
-                       ;; NOT PINNED BY A TEST, and here is why: a 1ms
-                       ;; timer is cheap enough that nine hundred extra
-                       ;; wake-ups do not move anything a test can read.
-                       ;; A compute-bound process alongside the linger
-                       ;; measured the same throughput either way over
-                       ;; three runs each. The cost is real and the fix
-                       ;; is a condition already written one screen down;
-                       ;; what is missing is an observable, not a reason.
                        ;; ARMED MEANS RUNNING, full stop. A running phase
                        ;; always has a deadline, and settling does not
                        ;; change that: safe-key marks the phase running so
