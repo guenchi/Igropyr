@@ -355,15 +355,15 @@
                                    (else since))))
               (cond
                 ((= rest 0) (worker-conn-loop* c buf partial-ms #f))
-                ;; THE REST OF THE SAME DELIVERY, before deciding against
-                ;; it. libuv hands up at most 64KiB per callback, so a
-                ;; request sent whole and in time still arrives in
-                ;; pieces; the first completes no frame, and closing on it
-                ;; threw away a request that was never late. Taking what
-                ;; is already queued tells that apart from a peer still
-                ;; owing us bytes, which has nothing queued and is closed
-                ;; on the deadline it had.
-                ((and late? (not consumed) (drain-queued! buf))
+                ;; MORE OF THE SAME DELIVERY, before deciding against it.
+                ;; libuv hands up at most 64KiB per callback, so a request
+                ;; sent whole and in time still arrives in pieces; the
+                ;; first completes no frame, and closing on it threw away
+                ;; a request that was never late. Something already queued
+                ;; tells that apart from a peer still owing us bytes,
+                ;; which has nothing queued and is closed on the deadline
+                ;; it had.
+                ((and late? (not consumed) (take-queued! buf))
                  (trace! "drained rest=" rest) (retry))
                 ((>= (now-ms) deadline)
                  (trace! "close deadline rest=" rest
@@ -385,13 +385,21 @@
           (`#(tcp-eof) (tcp-close! c))
           (`#(tcp-error ,e) (tcp-close! c)))))
 
-  ;; Whatever libuv has already handed up, taken without waiting. #t if
-  ;; anything was there. This is not a read: it cannot wait, so it can
-  ;; only collect what was delivered while the worker was busy elsewhere.
-  (define (drain-queued! buf)
-    (let loop ((got #f))
-      (receive (after 0 got)
-        (`#(tcp-data ,bv) (inbuf-append! buf bv) (loop #t)))))
+  ;; ONE message that libuv has already handed up, taken without waiting.
+  ;; #t if there was one.
+  ;;
+  ;; ONE, not all of them. A loop here looked like a snapshot of the
+  ;; mailbox and was not: receive re-enables interrupts before running a
+  ;; matched clause (actor.sc:632), so the append and the recursion are
+  ;; both preemptible, the event loop gets to poll in between, and a peer
+  ;; that keeps sending keeps the loop fed -- the connection never returns
+  ;; to the parser and the buffer grows the whole time. Taking one and
+  ;; going back through the parser also restores what the ordinary path
+  ;; has: the announced length is checked against the frame cap between
+  ;; every appended message, not after an unbounded run of them.
+  (define (take-queued! buf)
+    (receive (after 0 #f)
+      (`#(tcp-data ,bv) (inbuf-append! buf bv) #t)))
 
   ;; Every whole request the buffer holds, answered in order. A client that
   ;; pipelines gets its replies in the order it asked; the pool never does,
