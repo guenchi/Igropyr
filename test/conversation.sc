@@ -631,7 +631,14 @@
                   (lambda () (set-box! released (+ 1 (unbox released)))))))
     (let-values (((r st) (conversation-resume! hid htok 'confirm)))
       (unless (conversation-done? st) (fail "hung-key setup" st)))
-    ;; ...and now a replay whose key never comes back
+    ;; ...and now a replay whose key never comes back, WITH A SECOND
+    ;; REQUEST QUEUED BEHIND IT. The conversation serves one at a time, so
+    ;; a key that never returns holds not just its own caller but every
+    ;; later arrival at that id; bounding only the first would leave the
+    ;; queue exactly as stuck as before. The second is sent while the key
+    ;; is still hanging -- sending it afterwards would only prove that a
+    ;; dead conversation answers from its tombstone, which is a different
+    ;; and much weaker statement.
     (let ((me self))
       (spawn (lambda ()
                (let* ((t0 (now-ms)))
@@ -639,19 +646,35 @@
                                (guard (e (#t (values 'raised 'raised)))
                                  (conversation-resume! hid htok 'HANG))))
                    (send me (vector 'hung (- (now-ms) t0) st2))))))
-      (receive (after 8000
-                 (fail "a hung key during the linger was never bounded" 'no-answer))
-        (`#(hung ,took ,status)
-          (when (> took 4000)
-            (fail "a hung key was bounded only by its own sleep" took))
-          (unless (memq status '(settled done raised))
-            (fail "a replay past a hung key got the wrong answer" status))
-          (sleep-ms 200)
-          (unless (= 0 (unbox released))
-            (fail "a committed flow was compensated for a hung key"
-                  (unbox released)))
-          (display (string-append "a key that hangs after settling is bounded ("
-                                  (number->string took) "ms) ok\n")))))))
+      (sleep-ms 30)                          ; well inside the 120ms TTL
+      (spawn (lambda ()
+               (let* ((t0 (now-ms)))
+                 (let-values (((r3 st3)
+                               (guard (e (#t (values 'raised 'raised)))
+                                 (conversation-resume! hid htok 'BEHIND))))
+                   (send me (vector 'behind (- (now-ms) t0) st3))))))
+      (let wait ((hung #f) (behind #f))
+        (if (and hung behind)
+            (begin
+              (when (> (car hung) 4000)
+                (fail "a hung key was bounded only by its own sleep" (car hung)))
+              (unless (memq (cdr hung) '(settled done raised))
+                (fail "a replay past a hung key got the wrong answer" (cdr hung)))
+              (when (> (car behind) 4000)
+                (fail "a request behind a hung key waited out the hang"
+                      (car behind)))
+              (sleep-ms 200)
+              (unless (= 0 (unbox released))
+                (fail "a committed flow was compensated for a hung key"
+                      (unbox released)))
+              (display (string-append "a key that hangs after settling is bounded ("
+                                      (number->string (car hung)) "ms, the one behind it "
+                                      (number->string (car behind)) "ms) ok\n")))
+            (receive (after 8000
+                       (fail "a hung key during the linger was never bounded"
+                             (list 'hung hung 'behind behind)))
+              (`#(hung ,t ,st) (wait (cons t st) behind))
+              (`#(behind ,t ,st) (wait hung (cons t st)))))))))
 
 ;; ---- the kill happens ON TIME, not eventually ---------------------------
 ;;

@@ -148,6 +148,38 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
           ((line-has? (car ls) sub) (loop (cdr ls) (+ k 1)))
           (else (loop (cdr ls) k)))))
 
+;; ATTRIBUTED, not just counted. One worker serves several connections at
+;; once -- the probe's own, its rival's, and whatever the previous probe
+;; has not closed yet -- so "a late read happened somewhere" can be true
+;; while the probe's own connection saw nothing of the sort. Each trace
+;; line names its connection, so a probe counts only lines belonging to a
+;; connection that had not spoken before the probe started. That picks out
+;; its own connection without the worker having to say which one it is.
+(define (line-conn l)
+  (let scan ((i 0))
+    (cond ((= i (string-length l)) #f)
+          ((char=? (string-ref l i) #\space) (substring l 0 i))
+          (else (scan (+ i 1))))))
+
+(define (trace-len name) (length (trace-lines name)))
+
+(define (trace-count-new name before sub)
+  (let* ((ls (trace-lines name))
+         (old (let loop ((k 0) (rest ls) (acc '()))
+                (if (or (= k before) (null? rest))
+                    acc
+                    (let ((c (line-conn (car rest))))
+                      (loop (+ k 1) (cdr rest)
+                            (if (and c (not (member c acc))) (cons c acc) acc)))))))
+    (let loop ((k 0) (rest ls) (n 0))
+      (cond ((null? rest) n)
+            ((< k before) (loop (+ k 1) (cdr rest) n))
+            (else
+             (let ((c (line-conn (car rest))))
+               (loop (+ k 1) (cdr rest)
+                     (if (and c (not (member c old)) (line-has? (car rest) sub))
+                         (+ n 1) n))))))))
+
 (define (spawn-worker! name port timeout-ms . partial)
   (system (string-append "rm -f " (trace-file name) "; "
                          "scheme --script igropyr/qjs-worker.sc 127.0.0.1 "
@@ -517,7 +549,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
             ;; runs -- they arrived in time -- and a reader that consults
             ;; the clock before parsing closes a peer for being punctual.
             (let ((me self)
-                  (late-before (trace-count "carry" "late=1")))
+                  (mark (trace-len "carry")))
               (spawn
                 (lambda ()
                   (tcp-connect! "127.0.0.1" carry-port self)
@@ -580,7 +612,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                   ;; straddling the window every read lands inside it and
                   ;; this proves nothing; the worker says which it was.
                   (check "that frame's completing read was in fact overdue"
-                         (> (trace-count "carry" "late=1") late-before))
+                         (> (trace-count-new "carry" mark "late=1") 0))
                   (unless (eq? r 'answered)
                     (display "  [info] punctual peer: ") (write r) (newline)))))
 
@@ -666,7 +698,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
             ;; NOT pin anything about deadlines: measured, every one of
             ;; those reads lands inside the window.
             (let ((me self)
-                  (drained-before (trace-count "carry" "drained")))
+                  (mark (trace-len "carry")))
               (spawn
                 (lambda ()
                   (tcp-connect! "127.0.0.1" carry-port self)
@@ -744,7 +776,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                   ;; went through a late, nothing-consumed read is the
                   ;; ordinary path and would pass with the rule removed.
                   (check "that reassembly went through a drained late read"
-                         (> (trace-count "carry" "drained") drained-before))
+                         (> (trace-count-new "carry" mark "drained") 0))
                   (unless (eq? r 'answered)
                     (display "  [info] split request: ") (write r) (newline)))))
 
@@ -761,7 +793,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
             ;; This is the case a forgiving reader would have gotten
             ;; wrong, so it stays as the guard on ever adding one.
             (let ((me self)
-                  (closed-before (trace-count "carry" "close deadline")))
+                  (mark (trace-len "carry")))
               (spawn
                 (lambda ()
                   (tcp-connect! "127.0.0.1" carry-port self)
@@ -856,7 +888,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                   ;; completed nothing and had nothing more behind it,
                   ;; rather than closed by an unrelated framing error.
                   (check "it was refused on a late read with nothing left to take"
-                         (> (trace-count "carry" "close deadline") closed-before))
+                         (> (trace-count-new "carry" mark "close deadline") 0))
                   (display "  [info] half frame closed after ") (write r)
                   (display "ms\n"))))
 
