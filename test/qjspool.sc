@@ -777,6 +777,15 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                   ;; ordinary path and would pass with the rule removed.
                   (check "that reassembly went through a drained late read"
                          (> (trace-count-new "carry" mark "drained") 0))
+                  ;; ...ONE MESSAGE AT A TIME. Taking everything queued in
+                  ;; a loop looked like a snapshot and was not -- a matched
+                  ;; receive clause runs preemptibly, so a peer that keeps
+                  ;; writing keeps the loop fed and the parser never runs,
+                  ;; which is also where the frame cap is enforced. A
+                  ;; delivery split over three messages must therefore
+                  ;; return to the parser twice, not once.
+                  (check "it returned to the parser between deliveries"
+                         (>= (trace-count-new "carry" mark "drained") 2))
                   (unless (eq? r 'answered)
                     (display "  [info] split request: ") (write r) (newline)))))
 

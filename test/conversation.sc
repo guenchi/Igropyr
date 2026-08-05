@@ -452,6 +452,46 @@
               (fail "a killed step was reported as something other than unknown"
                     st)))))))
 
+;; ---- an effect that landed is never reported rolled back ----------------
+;;
+;; The window this is about: the flow's COMMIT has returned -- the money
+;; has moved -- and the flow is on its way back to publish. Nothing in the
+;; system records "on its way back", so the watchdog can stop it there.
+;; The compensation runs against work that already succeeded (unavoidable,
+;; and why compensation must be idempotent), but what must NOT happen is
+;; telling the caller the transaction rolled back: it would do the whole
+;; thing again. 'gone says exactly that, and before the tombstone learned
+;; to distinguish a kill from a settle, that is what this caller got.
+(let* ((ttl 100)
+       (committed (box 0)))
+  (let-values (((eid etok efirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (set-box! committed (+ 1 (unbox committed)))  ; the COMMIT
+                      (sleep-ms (* 6 ttl))          ; ...and then it is late
+                      (vector 'committed a)))
+                  'go
+                  ttl)))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! eid etok 'go))))
+                 (send me (vector 'eff r st)))))
+      (receive (after 6000 (fail "the committed-then-late flow never answered"
+                                 'no-answer))
+        (`#(eff ,r ,st)
+          ;; the effect really did land -- without this the case could pass
+          ;; on a flow that was killed before doing anything
+          (unless (= 1 (unbox committed))
+            (fail "the flow never reached its commit" (unbox committed)))
+          (when (eq? st 'gone)
+            (fail "an effect that landed was reported rolled back" st))
+          (unless (eq? st 'unknown)
+            (fail "a flow killed after its commit got the wrong status" st))
+          (display "an effect that landed is never reported rolled back ok\n"))))))
+
 ;; ---- a spent token against a flow that re-parks is stale ----------------
 ;;
 ;; What this actually pins: a flow whose guard swallows 'conversation-expired
