@@ -192,13 +192,36 @@
   ;; from the boot options, so a caller (and the test) can shorten it.
   (define default-partial-frame-ms 30000)
 
+  ;; A READ TRACE, off unless asked for. One line per read, flushed, so
+  ;; that a test can assert what the reader actually saw rather than infer
+  ;; it from how long a sleep was. That distinction is not academic: two
+  ;; rounds of this library's review turned on an ad-hoc instrumentation
+  ;; that measured zero because a worker reaped with kill -9 takes its
+  ;; block-buffered output with it, and a wrong conclusion shipped. It is
+  ;; a diagnostic for the same reason a production worker that starts
+  ;; closing connections is otherwise a black box.
+  (define trace-port (make-parameter #f))
+
+  (define (trace! . parts)
+    (let ((p (trace-port)))
+      (when p
+        (for-each (lambda (x) (display x p)) parts)
+        (newline p)
+        (flush-output-port p))))
+
   (define (qjs-worker-serve! host port bundle . rest)
     (let* ((qopts (if (pair? rest) (car rest) '()))
            (partial-ms (cond ((assq 'partial-frame-ms qopts) => cdr)
-                             (else default-partial-frame-ms))))
+                             (else default-partial-frame-ms)))
+           (trace (cond ((assq 'trace-file qopts) => cdr) (else #f))))
       (unless (and (integer? partial-ms) (exact? partial-ms) (> partial-ms 0))
         (assertion-violation 'qjs-worker-serve!
           "partial-frame-ms must be a positive exact integer" partial-ms))
+      (when (string? trace)
+        (trace-port (open-file-output-port trace
+                                           (file-options no-fail no-truncate append)
+                                           (buffer-mode line)
+                                           (native-transcoder))))
       (qjs-boot! bundle qopts)
       (tcp-listen! host port 128
         (lambda (c)
@@ -294,6 +317,10 @@
       (let retry ()
        (let ((late? (and since (>= (now-ms) since)))
             (before (inbuf-length buf)))
+        (trace! "read buffered=" before
+                " since=" (or since "-")
+                " now=" (now-ms)
+                " late=" (if late? "1" "0"))
         (if (guard (e (#t #f)) (answer-all! c buf) #t)
             (let* ((rest (inbuf-length buf))
                    ;; A FRAME WAS CONSUMED, so whatever is left over is a
@@ -329,8 +356,13 @@
                 ;; is already queued tells that apart from a peer still
                 ;; owing us bytes, which has nothing queued and is closed
                 ;; on the deadline it had.
-                ((and late? (not consumed) (drain-queued! buf)) (retry))
-                ((>= (now-ms) deadline) (tcp-close! c))
+                ((and late? (not consumed) (drain-queued! buf))
+                 (trace! "drained rest=" rest) (retry))
+                ((>= (now-ms) deadline)
+                 (trace! "close deadline rest=" rest
+                         " consumed=" (if consumed "1" "0")
+                         " late=" (if late? "1" "0"))
+                 (tcp-close! c))
                 (else (worker-conn-loop* c buf partial-ms deadline))))
             (tcp-close! c)))))
     (if (> (inbuf-length buf) 0)
@@ -381,6 +413,7 @@
           (loop)))))
 
   (define (answer body)
+    (trace! "answer")
     (let ((n (bytevector-length body)))
       (when (< n 6) (raise (qjs-err "short request frame")))
       (let ((id (bytevector-u32-ref body 0 (endianness big)))

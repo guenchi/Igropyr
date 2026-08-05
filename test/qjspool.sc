@@ -116,8 +116,41 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
 ;; The pid is recorded rather than matched by name later: pkill -f does not
 ;; match reliably in every sandbox, and a leaked worker holds its port for
 ;; the next run.
+;; WHAT THE READER SAW, not what a sleep suggests it saw. The worker
+;; appends one flushed line per read to this file when asked; probes below
+;; assert against it rather than inferring the worker's state from their
+;; own timing. Every one of these probes had its precondition -- "a render
+;; was straddling this connection's window" -- established by a sleep and
+;; asserted nowhere, and a review round found each of them able to pass
+;; with that precondition absent.
+(define (trace-file name) (string-append "/tmp/igropyr-qjsw-" name ".trace"))
+
+(define (trace-lines name)
+  (let ((p (trace-file name)))
+    (if (not (file-exists? p))
+        '()
+        (call-with-input-file p
+          (lambda (in)
+            (let loop ((acc '()))
+              (let ((l (get-line in)))
+                (if (eof-object? l) (reverse acc) (loop (cons l acc))))))))))
+
+(define (line-has? line sub)
+  (let ((n (string-length line)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i m) n) #f)
+            ((string=? (substring line i (+ i m)) sub) #t)
+            (else (loop (+ i 1)))))))
+
+(define (trace-count name sub)
+  (let loop ((ls (trace-lines name)) (k 0))
+    (cond ((null? ls) k)
+          ((line-has? (car ls) sub) (loop (cdr ls) (+ k 1)))
+          (else (loop (cdr ls) k)))))
+
 (define (spawn-worker! name port timeout-ms . partial)
-  (system (string-append "scheme --script igropyr/qjs-worker.sc 127.0.0.1 "
+  (system (string-append "rm -f " (trace-file name) "; "
+                         "scheme --script igropyr/qjs-worker.sc 127.0.0.1 "
                          (number->string port) " " bundle-path
                          " timeout-ms=" (number->string timeout-ms)
                          ;; short enough to be observable: the default is
@@ -125,11 +158,15 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                          ;; useless in a test
                          " partial-frame-ms="
                          (number->string (if (pair? partial) (car partial) 1200))
+                         " trace-file=" (trace-file name)
                          " >/dev/null 2>&1 & echo $! > " (pid-file name))))
 
 (define (kill-worker! name)
   (system (string-append
             "kill -9 $(cat " (pid-file name) " 2>/dev/null) 2>/dev/null;"
+            ;; the trace outlives the worker on purpose: it is what a
+            ;; failing probe is read against afterwards, and spawn-worker!
+            ;; truncates it at the start of the next run
             " rm -f " (pid-file name))))
 
 ;; Poll until the worker answers a render, rather than sleeping a guessed
@@ -479,7 +516,8 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
             ;; bytes are then already in the mailbox when the reader next
             ;; runs -- they arrived in time -- and a reader that consults
             ;; the clock before parsing closes a peer for being punctual.
-            (let ((me self))
+            (let ((me self)
+                  (late-before (trace-count "carry" "late=1")))
               (spawn
                 (lambda ()
                   (tcp-connect! "127.0.0.1" carry-port self)
@@ -538,6 +576,11 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                 (`#(punct ,r)
                   (check "a frame completed while another connection was rendering is answered"
                          (eq? r 'answered))
+                  ;; ...AND IT WAS ACTUALLY LATE. Without a render
+                  ;; straddling the window every read lands inside it and
+                  ;; this proves nothing; the worker says which it was.
+                  (check "that frame's completing read was in fact overdue"
+                         (> (trace-count "carry" "late=1") late-before))
                   (unless (eq? r 'answered)
                     (display "  [info] punctual peer: ") (write r) (newline)))))
 
@@ -622,7 +665,8 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
             ;; three. What this pins is reassembly across them. It does
             ;; NOT pin anything about deadlines: measured, every one of
             ;; those reads lands inside the window.
-            (let ((me self))
+            (let ((me self)
+                  (drained-before (trace-count "carry" "drained")))
               (spawn
                 (lambda ()
                   (tcp-connect! "127.0.0.1" carry-port self)
@@ -696,6 +740,11 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                 (`#(split ,r)
                   (check "a request larger than one read is reassembled and answered"
                          (eq? r 'answered))
+                  ;; ...BY THE RULE UNDER TEST. A reassembly that never
+                  ;; went through a late, nothing-consumed read is the
+                  ;; ordinary path and would pass with the rule removed.
+                  (check "that reassembly went through a drained late read"
+                         (> (trace-count "carry" "drained") drained-before))
                   (unless (eq? r 'answered)
                     (display "  [info] split request: ") (write r) (newline)))))
 
@@ -711,7 +760,8 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
             ;;
             ;; This is the case a forgiving reader would have gotten
             ;; wrong, so it stays as the guard on ever adding one.
-            (let ((me self))
+            (let ((me self)
+                  (closed-before (trace-count "carry" "close deadline")))
               (spawn
                 (lambda ()
                   (tcp-connect! "127.0.0.1" carry-port self)
@@ -774,27 +824,39 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                         ;; actually straddled a window by then: a close
                         ;; that happened because nothing was rendering
                         ;; proves nothing about forgiveness
-                        (let wait ((rendered 0) (bad #f))
-                          (receive (after 12000 (send me (vector 'renew 'never-closed)))
-                            (`#(rnd rendered) (wait (+ rendered 1) bad))
-                            (`#(rnd ,other) (wait rendered (or bad other)))
-                            (`#(tcp-data ,bv) (wait rendered bad))
-                            (`#(tcp-eof)
-                              (send me (vector 'renew
-                                               (if (> rendered 0)
-                                                   (- (now-ms) t0)
-                                                   (cons 'no-render bad)))))
-                            (`#(tcp-error ,e)
-                              (send me (vector 'renew
-                                               (if (> rendered 0)
-                                                   (- (now-ms) t0)
-                                                   (cons 'no-render bad))))))))))))
+                        ;; THE CLOSE DOES NOT END THE WAIT. A render that
+                        ;; straddled the window finishes at about the same
+                        ;; instant the connection is closed for it, so
+                        ;; deciding on the eof alone reported "no render"
+                        ;; once in three runs -- a race in the probe, not
+                        ;; in the worker. The close time is recorded and
+                        ;; the rivals are given a moment to report.
+                        (let wait ((nrend 0) (bad #f) (closed #f))
+                          (if (and closed (> nrend 0))
+                              (send me (vector 'renew closed))
+                              (receive (after (if closed 2000 12000)
+                                         (send me (vector 'renew
+                                                          (if closed
+                                                              (cons 'no-render bad)
+                                                              'never-closed))))
+                                (`#(rnd rendered) (wait (+ nrend 1) bad closed))
+                                (`#(rnd ,other) (wait nrend (or bad other) closed))
+                                (`#(tcp-data ,bv) (wait nrend bad closed))
+                                (`#(tcp-eof)
+                                  (wait nrend bad (or closed (- (now-ms) t0))))
+                                (`#(tcp-error ,e)
+                                  (wait nrend bad (or closed (- (now-ms) t0))))))))))))
               (receive (after 20000 (fail "late-byte probe never answered"))
                 (`#(renew ,r)
                   ;; one straddling render is ~950ms; four rounds of
                   ;; renewal ran past 3s in the version that forgave them
                   (check "a half frame is closed on its deadline whatever else the worker is doing"
                          (and (number? r) (< r 2000)))
+                  ;; ...for the RIGHT reason: refused on a late read that
+                  ;; completed nothing and had nothing more behind it,
+                  ;; rather than closed by an unrelated framing error.
+                  (check "it was refused on a late read with nothing left to take"
+                         (> (trace-count "carry" "close deadline") closed-before))
                   (display "  [info] half frame closed after ") (write r)
                   (display "ms\n"))))
 
