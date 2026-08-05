@@ -437,12 +437,20 @@
       (spawn (lambda ()
                (let-values (((r st) (conversation-resume! bid btok 'anything)))
                  (send me (vector 'answered st)))))
+      ;; ...AND IS TOLD 'unknown, EXACTLY. This used to accept any of
+      ;; gone/settled/stale, and what it actually got was 'gone -- which
+      ;; this library documents as "the transaction rolled back". The
+      ;; watchdog cannot know that: it sees a step that overran, and
+      ;; cannot tell a cleanup from a first step that had already
+      ;; committed. 'gone is now reserved for a flow that RAISED, whose
+      ;; winders ran; a step stopped in flight says so, and the caller
+      ;; reconciles instead of redoing the work.
       (receive (after 4000 (fail "a caller waited forever on a wedged cleanup" bid))
         (`#(answered ,st)
-          (if (or (conversation-gone? st) (conversation-settled? st)
-                  (conversation-stale? st))
-              (display "a wedged cleanup is killed and the caller is answered ok\n")
-              (fail "a wedged cleanup left the caller with a live conversation" st)))))))
+          (if (eq? st 'unknown)
+              (display "a wedged cleanup is killed and the caller is told 'unknown ok\n")
+              (fail "a killed step was reported as something other than unknown"
+                    st)))))))
 
 ;; ---- a spent token against a flow that re-parks is stale ----------------
 ;;
