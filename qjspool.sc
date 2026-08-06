@@ -368,11 +368,29 @@
                    ;; that appends one cheap whole frame ahead of its tail
                    ;; each window renews forever, and it costs it a cheap
                    ;; render rather than the slow one an earlier note here
-                   ;; assumed. Its resources stay bounded -- one process,
-                   ;; one descriptor, at most the frame cap of buffer --
-                   ;; but its lifetime does not, and nothing on this side
-                   ;; caps it: max-requests-per-connection is enforced by
-                   ;; the caller's connection, never by this reader.
+                   ;; assumed. Its lifetime is unbounded, and nothing on
+                   ;; this side caps it: max-requests-per-connection is
+                   ;; enforced by the caller's connection, never here.
+                   ;;
+                   ;; NOR IS ITS MEMORY BOUNDED BY THE FRAME CAP, which an
+                   ;; earlier version of this note claimed. take-frame!
+                   ;; bounds one frame's announced body; it says nothing
+                   ;; about what has been delivered and not yet parsed.
+                   ;; Reading stays on for the life of the connection --
+                   ;; there is no tcp-read-stop! anywhere here -- so a peer
+                   ;; that writes faster than renders retire copies every
+                   ;; segment into an unbounded mailbox, which inbuf-length
+                   ;; cannot see. Even one legal maximum frame overshoots:
+                   ;; a message that completes it can carry up to 64KiB of
+                   ;; the next one past the cap, and the buffer's doubling
+                   ;; can hold twice the cap in backing store while
+                   ;; take-frame! copies the body out again.
+                   ;;
+                   ;; The bound that would make this true is backpressure
+                   ;; -- a per-connection high-water mark over mailbox plus
+                   ;; buffer, tcp-read-stop! above it and tcp-read-start!
+                   ;; below -- and it is not here. Stated rather than
+                   ;; claimed away.
                    ;; Keying the reset on "the buffer emptied" instead meant
                    ;; a peer that always keeps a partial tail -- which is
                    ;; what pipelining looks like -- was closed at the first

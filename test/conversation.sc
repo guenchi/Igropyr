@@ -452,6 +452,92 @@
               (fail "a killed step was reported as something other than unknown"
                     st)))))))
 
+;; ---- a settled record that was pruned is still not 'killed --------------
+;;
+;; First-write-wins is decided by what is in the table, and the table
+;; forgets. A conversation that settled, whose record was then evicted by
+;; the count limit while it was still lingering, and which is then killed
+;; for a hung key, would have its certain answer overwritten with an
+;; uncertain one -- although the flag saying it settled is still right
+;; there to be read.
+(let ((limit-restored #f))
+  (conversation-set-limits! 1 #f)          ; one tombstone at a time
+  (let ((released (box 0)))
+    (let-values (((pid ptok pfirst)
+                  (conversation-start!
+                    (lambda (req suspend!)
+                      (let ((a (suspend! (vector 'parked req))))
+                        (vector 'committed a)))
+                    'go
+                    150
+                    (lambda (r)                  ; hangs, only on replay
+                      (if (eq? r 'HANG) (sleep-ms 60000) (void))
+                      r)
+                    (lambda () (set-box! released (+ 1 (unbox released)))))))
+      (let-values (((r st) (conversation-resume! pid ptok 'confirm)))
+        (unless (conversation-done? st) (fail "pruned-settled setup" st)))
+      ;; a second conversation completes and evicts the first one's record
+      (let-values (((qid qtok qfirst)
+                    (conversation-start!
+                      (lambda (req suspend!) (vector 'done req))
+                      'go
+                      150)))
+        (void))
+      ;; ...and now the first one is killed while it still knows it settled
+      (let ((me self))
+        (spawn (lambda ()
+                 (let-values (((r2 st2)
+                               (guard (e (#t (values 'raised 'raised)))
+                                 (conversation-resume! pid ptok 'HANG))))
+                   (send me (vector 'pruned st2)))))
+        (receive (after 8000 (fail "the pruned-settled replay never answered"
+                                   'no-answer))
+          (`#(pruned ,st)
+            (conversation-set-limits! 4096 #f)
+            (set! limit-restored #t)
+            (unless (eq? st 'settled)
+              (fail "a settled conversation whose record was pruned was answered"
+                    st))
+            (display "a pruned settled record is not overwritten by a kill ok\n"))))))
+  (unless limit-restored (conversation-set-limits! 4096 #f)))
+
+;; ---- an initial step that committed is not a retryable failure ----------
+;;
+;; The same hazard one step earlier. A flow that reaches its COMMIT before
+;; its first suspend! and is then stopped never gives conversation-start!
+;; a reply, so the starter sees only a DOWN -- and the worker pool re-runs
+;; an unanswered task by design. Raising the ordinary retryable failure
+;; there is how that commit happens a second time.
+(let* ((ttl 100)
+       (committed (box 0)))
+  (let ((outcome
+         (guard (e (#t e))
+           (conversation-start!
+             (lambda (req suspend!)
+               (set-box! committed (+ 1 (unbox committed)))   ; the COMMIT
+               (sleep-ms (* 6 ttl))                           ; ...then late
+               (suspend! (vector 'never-reached req)))
+             'go
+             ttl))))
+    (unless (= 1 (unbox committed))
+      (fail "the initial flow never reached its commit" (unbox committed)))
+    (unless (vector? outcome)
+      (fail "a killed initial step did not raise" outcome))
+    (when (eq? (vector-ref outcome 0) 'conversation-failed)
+      (fail "a committed initial step was raised as a retryable failure"
+            outcome))
+    (unless (eq? (vector-ref outcome 0) 'conversation-uncertain)
+      (fail "a killed initial step raised the wrong thing" outcome))
+    ;; the id has to come with it, or the caller cannot reconcile what it
+    ;; started -- and reconciling is the only thing left to do
+    (unless (and (> (vector-length outcome) 2)
+                 (eq? (vector-ref outcome 2) 'unknown))
+      (fail "the uncertain raise did not carry an outcome" outcome))
+    (let-values (((st tok reply) (conversation-peek (vector-ref outcome 1))))
+      (unless (eq? st 'unknown)
+        (fail "the id from an uncertain raise does not reconcile" st)))
+    (display "a committed initial step is not raised as retryable ok\n")))
+
 ;; ---- an effect that landed is never reported rolled back ----------------
 ;;
 ;; The window this is about: the flow's COMMIT has returned -- the money
