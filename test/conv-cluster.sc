@@ -7,7 +7,10 @@
 ;;; there, and the reply carried back. Verifies:
 ;;;   - forwarded resume round-trips (ack sums accumulate correctly)
 ;;;   - the final reply crosses back
-;;;   - resuming a completed conversation returns 'gone
+;;;   - a completed conversation still answers across the link: its final
+;;;     reply replays, an invented token is 'stale. (Nothing here expects
+;;;     'gone, and nothing here can produce it: 'gone is a record saying
+;;;     the flow rolled back, and every flow in this file completes.)
 ;;;   - resuming an id whose owner node is unknown returns 'unreachable
 
 (import (chezscheme) (igropyr actor) (igropyr node) (igropyr conversation))
