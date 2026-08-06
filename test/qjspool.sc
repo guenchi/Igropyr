@@ -163,6 +163,44 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
 
 (define (trace-len name) (length (trace-lines name)))
 
+;; WHICH CONNECTION IS MINE, asked rather than inferred. "The one that
+;; had not spoken before I started" cannot tell a probe's connection from
+;; the rival it starts alongside it, and every one of these probes starts
+;; both at once -- so a rival's late read, drained delivery or refused
+;; frame could satisfy an assertion about the probe's own. A warm-up
+;; request carries an id nothing else uses; the trace ties that id to a
+;; connection, and everything after is counted for that connection only.
+;; A COMPLETE CHEAP REQUEST, answered before the probe's real work, whose
+;; id nothing else uses. That answer is what puts this connection into the
+;; trace under a name the assertions can look up.
+(define (warm-up! c id)
+  (tcp-write! c (qframe id "hello" "{\"name\":\"w\"}") #f)
+  (let wait ((acc (make-bytevector 0)))
+    (if (>= (count-frames acc) 1)
+        #t
+        (receive (after 4000 #f)
+          (`#(tcp-data ,bv) (wait (bv-append acc bv)))
+          (`#(tcp-eof) #f)
+          (`#(tcp-error ,e) #f)))))
+
+(define (trace-conn-of-id name id)
+  (let ((want (string-append "answer id=" (number->string id))))
+    (let loop ((ls (trace-lines name)))
+      (cond ((null? ls) #f)
+            ((line-has? (car ls) want) (line-conn (car ls)))
+            (else (loop (cdr ls)))))))
+
+(define (trace-count-of name conn before sub)
+  (let loop ((k 0) (rest (trace-lines name)) (n 0))
+    (cond ((null? rest) n)
+          ((< k before) (loop (+ k 1) (cdr rest) n))
+          (else
+           (loop (+ k 1) (cdr rest)
+                 (if (and conn
+                          (equal? conn (line-conn (car rest)))
+                          (line-has? (car rest) sub))
+                     (+ n 1) n))))))
+
 (define (trace-count-new name before sub)
   (let* ((ls (trace-lines name))
          (old (let loop ((k 0) (rest ls) (acc '()))
@@ -559,6 +597,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                       (send me (vector 'punct 'bad-tag)))
                     (`#(tcp-connected ,ca)
                       (tcp-read-start! ca)
+                      (warm-up! ca 907)
                       (let* ((fa (qframe 7 "hello" "{\"name\":\"P\"}"))
                              (n (bytevector-length fa))
                              (h (make-bytevector 6))
@@ -611,8 +650,10 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                   ;; ...AND IT WAS ACTUALLY LATE. Without a render
                   ;; straddling the window every read lands inside it and
                   ;; this proves nothing; the worker says which it was.
-                  (check "that frame's completing read was in fact overdue"
-                         (> (trace-count-new "carry" mark "read-late=1") 0))
+                  (let ((mine (trace-conn-of-id "carry" 907)))
+                    (check "the probe's own connection is identified" (and mine #t))
+                    (check "that frame's completing read was in fact overdue"
+                           (> (trace-count-of "carry" mine mark "read-late=1") 0)))
                   (unless (eq? r 'answered)
                     (display "  [info] punctual peer: ") (write r) (newline)))))
 
@@ -706,6 +747,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                     (`#(tcp-connect-failed ,e) (send me (vector 'split 'no-connect)))
                     (`#(tcp-connected ,ca)
                       (tcp-read-start! ca)
+                      (warm-up! ca 909)
                       ;; BIGGER THAN ONE READ, so the split is structural
                       ;; rather than a race: libuv hands up at most 64KiB
                       ;; per callback, so a 192KiB request cannot arrive
@@ -775,8 +817,11 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                   ;; ...BY THE RULE UNDER TEST. A reassembly that never
                   ;; went through a late, nothing-consumed read is the
                   ;; ordinary path and would pass with the rule removed.
-                  (check "that reassembly went through a drained late read"
-                         (> (trace-count-new "carry" mark "drained") 0))
+                  (let ((mine (trace-conn-of-id "carry" 909)))
+                    (check "the split probe's own connection is identified"
+                           (and mine #t))
+                    (check "that reassembly went through a drained late read"
+                           (> (trace-count-of "carry" mine mark "drained") 0))
                   ;; ...ONE MESSAGE AT A TIME. Taking everything queued in
                   ;; a loop looked like a snapshot and was not -- a matched
                   ;; receive clause runs preemptibly, so a peer that keeps
@@ -784,8 +829,8 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                   ;; which is also where the frame cap is enforced. A
                   ;; delivery split over three messages must therefore
                   ;; return to the parser twice, not once.
-                  (check "it returned to the parser between deliveries"
-                         (>= (trace-count-new "carry" mark "drained") 2))
+                    (check "it returned to the parser between deliveries"
+                           (>= (trace-count-of "carry" mine mark "drained") 2)))
                   (unless (eq? r 'answered)
                     (display "  [info] split request: ") (write r) (newline)))))
 
@@ -810,6 +855,7 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                     (`#(tcp-connect-failed ,e) (send me (vector 'renew 'no-connect)))
                     (`#(tcp-connected ,ca)
                       (tcp-read-start! ca)
+                      (warm-up! ca 911)
                       (let ((fa (qframe 11 "hello" "{\"name\":\"L\"}"))
                             (t0 (now-ms))
                             (watcher self)
@@ -896,8 +942,14 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                   ;; ...for the RIGHT reason: refused on a late read that
                   ;; completed nothing and had nothing more behind it,
                   ;; rather than closed by an unrelated framing error.
-                  (check "it was refused on a late read with nothing left to take"
-                         (> (trace-count-new "carry" mark "close deadline") 0))
+                  (let ((mine (trace-conn-of-id "carry" 911)))
+                    (check "the late-byte probe's own connection is identified"
+                           (and mine #t))
+                    ;; and the close was decided on a read that WAS overdue:
+                    ;; the ordinary timed-receive timeout closes too, and
+                    ;; without this field a close for that reason counted
+                    (check "it was refused on a late read with nothing left to take"
+                           (> (trace-count-of "carry" mine mark "close-late=1") 0)))
                   (display "  [info] half frame closed after ") (write r)
                   (display "ms\n"))))
 
