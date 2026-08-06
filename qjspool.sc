@@ -215,18 +215,27 @@
   ;; the listener stayed up, leaving a worker that holds its port and
   ;; fails every render. The first failure turns tracing off for the life
   ;; of the process and says so once; nothing after that can raise.
+  ;; ONE RECORD, ONE WRITE, UNDER ONE LOCK. Built as a string first and
+  ;; emitted inside a region where nothing else can run. A record made of
+  ;; several displays is not atomic just because there is one OS thread:
+  ;; a green process can be preempted between any two of them, so two
+  ;; connections' records interleave and the reader attributes the second
+  ;; one's fields to the first. The enabled check and the switch to
+  ;; disabled live in the same region, so a port read before a failure
+  ;; cannot be used after it.
   (define (trace! . parts)
-    (let ((p (trace-port)))
-      (when p
-        (guard (e (#t (trace-port #f)
-                      (guard (e2 (#t (void)))
-                        (display "qjs-worker: tracing disabled after a write error\n"
-                                 (console-error-port))
-                        (flush-output-port (console-error-port)))))
-          (display "c" p) (display (process-id self) p) (display " " p)
-          (for-each (lambda (x) (display x p)) parts)
-          (newline p)
-          (flush-output-port p)))))
+    (with-interrupts-disabled
+      (let ((p (trace-port)))
+        (when p
+          (guard (e (#t (trace-port #f)))
+            (display (apply string-append
+                            "c" (number->string (process-id self)) " "
+                            (append (map (lambda (x)
+                                           (if (string? x) x (format "~a" x)))
+                                         parts)
+                                    (list "\n")))
+                     p)
+            (flush-output-port p))))))
 
   (define (qjs-worker-serve! host port bundle . rest)
     (let* ((qopts (if (pair? rest) (car rest) '()))
@@ -450,12 +459,16 @@
           (loop)))))
 
   (define (answer body)
-    (trace! "answer")
     (let ((n (bytevector-length body)))
       (when (< n 6) (raise (qjs-err "short request frame")))
       (let ((id (bytevector-u32-ref body 0 (endianness big)))
             (fl (bytevector-u16-ref body 4 (endianness big))))
         (when (> (+ 6 fl) n) (raise (qjs-err "function-name length past the frame")))
+        ;; THE REQUEST ID, so a reader can tie a connection to a request it
+        ;; sent. Inferring which connection is which from "the one that
+        ;; had not spoken yet" cannot tell a probe's connection from the
+        ;; rival it starts alongside it.
+        (trace! "answer id=" id)
         (let ((fn (utf8->string (bv-slice body 6 fl)))
               (json (utf8->string (bv-slice body (+ 6 fl) (- n 6 fl)))))
           ;; qjs-call/bytes never raises: it answers (values ok? bytes-or-text),
