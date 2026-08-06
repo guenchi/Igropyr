@@ -42,7 +42,6 @@
     ("igropyr/dpool.sc" . 2)
     ("igropyr/express.sc" . 2)
     ("igropyr/session.sc" . 2)
-    ("igropyr/ssr.sc" . 2)
     ("igropyr/auth.sc" . 2)
     ("igropyr/middleware.sc" . 2)
     ("igropyr/jwt.sc" . 2)
@@ -62,7 +61,13 @@
     ("igropyr/jwks.sc" . 2)
     ("igropyr/kdf.sc" . 2)
     ("igropyr/redis.sc" . 2)
-    ("igropyr/sqlpool.sc" . 2)
+    ;; connpool is the shared checkout/lease engine: it imports only actor
+    ;; and libuv, and every pooled driver below imports it.
+    ("igropyr/connpool.sc" . 2)
+    ("igropyr/qjspool.sc" . 2)
+    ;; ssr comes after both of its pools' dependencies -- qjspool (the
+    ;; render engine) and redis (a cache backend).
+    ("igropyr/ssr.sc" . 2)
     ("igropyr/mysql.sc" . 2)
     ("igropyr/postgresql.sc" . 2)
     ("igropyr/cluster.sc" . 2)))
