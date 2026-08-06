@@ -1138,28 +1138,166 @@
       (fail "a crashed conversation was reported as settled" state)))
   (display "a conversation that died is still gone ok\n"))
 
-;; What this pins is the PRE-INCARNATION FORMAT: an id with no incarnation
-;; field at all reads as unknown. It does NOT reach the horizon comparison
-;; -- conv-created-at returns #f before ever looking at a timestamp -- and
-;; an earlier version of this comment claimed it did. The horizon itself is
-;; pinned separately, below.
+;; ---- 'gone comes only from evidence: the death-mode matrix --------------
+;;
+;; 'gone is the rollback guarantee -- the one answer a caller is told it
+;; may retry on -- so it has to be read off a record that SAYS the flow
+;; rolled back, never off the absence of one. The absence reading is
+;; wrong for every way of dying that writes nothing: a kill from outside,
+;; a link cascade, an after-thunk raising while the flow was already
+;; returning from its COMMIT. Those cannot be enumerated, so what is
+;; pinned here is the rule and not the list -- a death that left through
+;; the flow's winders answers 'gone, and a death nothing witnessed
+;; answers 'unknown.
+;;
+;; EXACT ANSWERS, in both directions. Accepting either of gone/unknown
+;; anywhere below would pass with the entire distinction deleted, which
+;; is the shape of the defect these cases exist for.
+
+;; 1. A RAISE MID-STEP, before anything committed. The flow's own guard
+;; ran on the way out, so something witnessed the rollback and 'gone can
+;; be stated rather than guessed.
+(let ((rolled (box #f)))
+  (let-values (((aid atok afirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (guard (e (#t (set-box! rolled #t) (raise e)))
+                      (let ((a (suspend! (vector 'parked req))))
+                        (raise 'flow-raised))))
+                  'go
+                  300)))
+    (let-values (((r st) (conversation-resume! aid atok 'confirm)))
+      (unless (eq? st 'gone)
+        (fail "a flow that raised was not reported rolled back" st)))
+    ;; without this the case would pass on a flow that never got there
+    (unless (unbox rolled)
+      (fail "the raise never reached the flow's rollback" (unbox rolled)))
+    ;; ...and the record outlives the process, so a caller reconciling
+    ;; later is told the same thing
+    (sleep-ms 200)
+    (let-values (((state tok reply) (conversation-peek aid)))
+      (unless (eq? state 'gone)
+        (fail "a rolled-back conversation stopped saying so" state)))
+    (display "a flow that raised mid-step -> gone, on its own record ok\n")))
+
+;; 2. A PARK DEADLINE THAT PASSED. This one is 'gone for the same reason
+;; and by the same path: the park expiry RAISES 'conversation-expired
+;; into the flow rather than killing it, so an application that does not
+;; swallow the raise leaves through its winders exactly as above. That is
+;; a fact about the code and not a choice made here -- were the park
+;; deadline ever changed to a kill, the winders would not run, nothing
+;; would witness a rollback, and this assertion would be wrong and would
+;; say so.
+(let ((rolled (box #f)))
+  (let-values (((bid btok bfirst)
+                (conversation-start!
+                  (lambda (req suspend!)
+                    (guard (e (#t (set-box! rolled #t) (raise e)))
+                      (let ((a (suspend! (vector 'parked req))))
+                        (vector 'never a))))
+                  'go
+                  200)))
+    (sleep-ms 500)                     ; nobody answers; the window closes
+    (unless (unbox rolled)
+      (fail "the park deadline did not raise into the flow" (unbox rolled)))
+    (let-values (((state tok reply) (conversation-peek bid)))
+      (unless (eq? state 'gone)
+        (fail "an expired park was not reported rolled back" state)))
+    (display "a park deadline that expired -> gone, its winders ran ok\n")))
+
+;; 3. A KILL FROM OUTSIDE, mid-step. Nothing in this library caused it,
+;; the flow's guard did NOT run -- @kill discards winders -- and the step
+;; may have committed a moment earlier. The old rule answered 'gone here
+;; purely because the id was young and the table was empty, which is a
+;; rollback guarantee derived from having no evidence at all.
+;;
+;; The conversation's process is reached the way the outside world
+;; reaches it, through the registry, so nothing about this shape depends
+;; on the library cooperating.
+(let-values (((cid ctok cfirst)
+              (conversation-start!
+                (lambda (req suspend!)
+                  (guard (e (#t (raise e)))     ; would witness a rollback...
+                    (let ((a (suspend! (vector 'parked req))))
+                      (sleep-ms 3000)           ; ...but is killed in here
+                      (vector 'never a))))
+                'go
+                400)))
+  (let ((me self))
+    (spawn (lambda ()
+             (let-values (((r st)
+                           (guard (e (#t (values 'raised 'raised)))
+                             (conversation-resume! cid ctok 'go))))
+               (send me (vector 'ext st)))))
+    (sleep-ms 100)                              ; the step is running now
+    (let ((p (whereis (string->symbol (string-append "igropyr-conv-" cid)))))
+      (unless p (fail "the conversation process could not be reached" cid))
+      (kill p 'killed-by-someone-else))
+    (receive (after 4000 (fail "an externally killed conversation never answered" cid))
+      (`#(ext ,st)
+        (when (eq? st 'gone)
+          (fail "a kill from outside was reported as a rollback" st))
+        (unless (eq? st 'unknown)
+          (fail "a kill from outside got the wrong status" st))))
+    ;; ...and it must still be 'unknown once the watchdog has had its say.
+    ;; The watchdog outlives the process it watches, so it is the only
+    ;; thing left that can record a death the conversation never got to
+    ;; describe -- and what it records is a kill, which reads as 'unknown,
+    ;; the same as the silence it replaces. What must not happen is the
+    ;; answer drifting to 'gone once the process is properly gone.
+    (sleep-ms 700)
+    (let-values (((state tok reply) (conversation-peek cid)))
+      (when (eq? state 'gone)
+        (fail "a kill from outside later became a rollback" state))
+      (unless (eq? state 'unknown)
+        (fail "a kill from outside did not reconcile as unknown" state)))
+    (display "a kill from outside -> unknown, never gone ok\n")))
+
+;; 4. ...and the same rule one step EARLIER. A flow that raises before its
+;; first suspend! never answers conversation-start!, which sees only a
+;; DOWN and has to decide whether the caller may retry. It may -- the
+;; raise left through the winders and the record says so -- and that is
+;; the documented retryable failure. Nothing else here pins it: the
+;; neighbouring case pins only that a KILLED initial step is NOT
+;; retryable, and both of them would pass with the retryable raise
+;; deleted altogether.
+(let ((outcome
+       (guard (e (#t e))
+         (conversation-start!
+           (lambda (req suspend!) (raise 'before-anything))
+           'go
+           4000))))
+  (unless (vector? outcome)
+    (fail "an initial raise did not reach the caller" outcome))
+  (unless (eq? (vector-ref outcome 0) 'conversation-failed)
+    (fail "an initial raise was not raised as the retryable failure" outcome))
+  (display "a flow that raised before its first suspend! is retryable ok\n"))
+
 ;; An id from BEFORE this incarnation is outside what this process can
 ;; speak for. A restart erases the completion records but not the ids the
 ;; clients are holding, and answering 'gone for those is the same lie the
 ;; expiry case makes: the transaction may well have committed just before
-;; the restart. The horizon starts at process start, so this is free --
-;; the id below is well-formed and simply older than this process.
+;; the restart.
+;;
+;; HOW MUCH THIS STILL PINS, stated plainly because it used to pin more.
+;; Since 'gone became a positive record and every absence became 'unknown,
+;; this and the two cases below hold for a reason that has nothing to do
+;; with the id's shape: there is no record, so there is no 'gone to be
+;; had. They no longer discriminate the incarnation check or the horizon
+;; comparison, and would stay green with both deleted. They are kept as
+;; statements about the ANSWER -- an old id, whatever its shape, is never
+;; a rollback guarantee -- and not as coverage of the machinery that used
+;; to produce it.
 (let ((ancient "1-00112233445566778899aabbccddeeff"))   ; no node prefix: this test runs single-node
   (let-values (((state token reply) (conversation-peek ancient)))
     (unless (conversation-unknown? state)
       (fail "an id older than this process was not reported unknown" state)))
   (display "an id in the pre-incarnation format -> unknown ok\n"))
 
-;; THE HORIZON ITSELF. Same incarnation as this run -- so the comparison is
-;; actually reached -- and a timestamp older than anything this process
-;; would still have a record of. Every other 'unknown case in this file is
-;; answered before the horizon is consulted, so without this one the
-;; comparison has no test at all.
+;; Same incarnation as this run, and a timestamp older than anything this
+;; process would still have a record of. This used to be the one case that
+;; reached the horizon comparison at all; see the note above for why it no
+;; longer reaches it, and what it does still say.
 (let* ((real (let-values (((hid htok hfirst)
                            (conversation-start!
                              (lambda (req suspend!) 'done) 'go 300)))
@@ -1239,8 +1377,9 @@
 ;; about. Across a host reboot it starts over near zero, so an id minted
 ;; before the reboot carries a LARGER number than the fresh horizon and
 ;; would read as "newer than anything I have forgotten" -- 'gone, for a
-;; conversation that may well have committed. Comparing timestamps only
-;; within the run that wrote them is what makes the horizon mean anything.
+;; conversation that may well have committed. Requiring a record to say
+;; rolled back removes that reading whatever the timestamp says; see the
+;; note two cases up for what this still discriminates, which is less.
 (let ((from-another-run "deadbeef.zzzzzzzzzz-00112233445566778899aabbccddeeff"))
   (let-values (((state token reply) (conversation-peek from-another-run)))
     (when (conversation-gone? state)
@@ -1256,6 +1395,13 @@
 ;; Built from a REAL id, so it carries this run's own incarnation and gets
 ;; past that check -- otherwise the incarnation mismatch refuses it first
 ;; and the length bound is never reached.
+;; MEASURES NOTHING WHILE NOTHING PARSES THE TIMESTAMP. The lookup path
+;; stopped consulting an id's mint time when 'gone became a record rather
+;; than an inference, so this is fast because it does no work at all, not
+;; because the length bound refused it. Kept as a bound on the PUBLIC
+;; call -- a caller-supplied id may not cost a worker whatever the lookup
+;; does with it -- and it will discriminate again the moment anything
+;; parses the field.
 (let* ((absurd-id-from
         (lambda (real)
           (let* ((len (string-length real))

@@ -78,17 +78,31 @@
 ;;; as "the transaction rolled back". For a flow that had just COMMITTED
 ;;; that is false, and a client acting on it performs the whole thing
 ;;; again. The cost is one parked process per completed conversation until
-;;; the window closes. Past it, 'gone can no longer tell a flow that died
-;;; from one that finished long ago, so size the TTL to cover the retry
-;;; window your clients actually use.
+;;; the window closes. Past it the record still says what happened
+;;; ('settled), but the ANSWER is no longer retained -- so size the TTL to
+;;; cover the retry window your clients actually use.
 ;;;
 ;;; Fault semantics (the transaction-ring contract):
-;;;   - flow crashes, TTL expires, or the process dies for any reason
-;;;     -> the process is unregistered automatically; every later resume
-;;;     returns 'gone. For a flow holding a database transaction, dead
-;;;     process = dropped connection = the database itself rolled back:
-;;;     'gone GUARANTEES the transaction did not commit.
-;;;   - 'unreachable is NOT that guarantee. A resume forwarded to another
+;;;   - 'gone IS EVIDENCE, NEVER AN ABSENCE. It is answered only where
+;;;     this node holds a record saying the conversation ROLLED BACK: the
+;;;     flow raised and its winders ran, or its park deadline passed and
+;;;     the raise that carries went uncaught out of the flow. For a flow
+;;;     holding a database transaction that is the rollback guarantee --
+;;;     dead process = dropped connection = the database rolled back on
+;;;     its own -- and it is the only answer that carries it. Retry only
+;;;     on 'gone.
+;;;   - EVERY OTHER WAY OF DYING IS 'unknown. A kill from outside, a link
+;;;     cascade, a step the watchdog stopped, an after-thunk that raised
+;;;     while the flow was returning from its COMMIT, a record that aged
+;;;     out, an id from an earlier incarnation: none of them say anything
+;;;     about the transaction, because the commit happens INSIDE the flow
+;;;     and the record is written after it returns. "No process and no
+;;;     record" used to be reported as 'gone, which derives a positive
+;;;     claim from missing evidence -- and the death paths that write no
+;;;     record are an open set nobody can enumerate, so the claim was
+;;;     wrong an unbounded number of ways. On 'unknown the outcome is not
+;;;     knowable from here: reconcile, do not resubmit.
+;;;   - 'unreachable is NOT that guarantee either. A resume forwarded to another
 ;;;     node answers it when the link went down or the forwarding wait
 ;;;     expired: both prove that WE could not reach the owner, neither
 ;;;     proves the owner died. Under a partition the conversation keeps
@@ -96,29 +110,35 @@
 ;;;     how a flow's effects get applied twice -- exactly what the ring
 ;;;     exists to prevent. Retry only on 'gone; on 'unreachable the
 ;;;     outcome is unknown, so reconcile rather than resubmit.
-;;;   - TTL EXPIRY HAS TWO PATHS, and only one of them raises.
+;;;   - TTL EXPIRY HAS TWO PATHS, and only one of them raises -- which is
+;;;     also why they answer differently.
 ;;;     A conversation that sat PARKED too long is raised at:
 ;;;     'conversation-expired reaches the flow, a guard runs, and it can
 ;;;     roll back explicitly (re-raise, or don't catch, so the process
-;;;     exits).
+;;;     exits). An expiry that leaves the flow that way ran its winders,
+;;;     so it is recorded as rolled back and answers 'gone.
 ;;;     A STEP that overruns is KILLED -- that is what the watchdog is
 ;;;     for, and a step stuck in a loop or a foreign call cannot be raised
 ;;;     at. @kill discards dynamic-wind winders, so the flow's guard does
-;;;     NOT run. A pooled database connection is still safe: the pool
+;;;     NOT run and nothing it held was given back by the flow itself;
+;;;     that is recorded as a kill and answers 'unknown, because a step
+;;;     stopped in flight may have committed already. A pooled database
+;;;     connection is still safe: the pool
 ;;;     monitors its borrower and rebuilds the connection when it dies,
 ;;;     which drops the transaction. Anything held IN PROCESS is not --
 ;;;     a reservation, a file handle, an in-memory hold. Pass an
 ;;;     on-killed thunk (conversation-start!'s fifth argument) to release
 ;;;     those; it runs after the kill, outside the dead process.
-;;;   - a crash before the first suspend! makes conversation-start!
-;;;     raise #(conversation-failed reason) in the caller -- the worker
-;;;     crashes, and the pool's normal retry handles it (nothing had
-;;;     been answered yet, and the dead process rolled back).
-;;;   - ...unless the record says otherwise. A first step stopped after
-;;;     its COMMIT returned has not rolled back, and re-running an
-;;;     unanswered task would repeat it. That raises
-;;;     #(conversation-uncertain id outcome reason) instead, which is
-;;;     NOT retryable: the id is there so the caller can reconcile.
+;;;   - a flow that RAISES before its first suspend! makes
+;;;     conversation-start! raise #(conversation-failed reason) in the
+;;;     caller -- the worker crashes, and the pool's normal retry handles
+;;;     it (nothing had been answered yet, and a raise that left the flow
+;;;     ran its winders, so the record says rolled back).
+;;;   - ...and only then. A first step STOPPED -- killed for overrunning,
+;;;     killed from outside, taken down by a link -- may have got past its
+;;;     COMMIT, and re-running an unanswered task would repeat it. That
+;;;     raises #(conversation-uncertain id outcome reason) instead, which
+;;;     is NOT retryable: the id is there so the caller can reconcile.
 ;;;
 ;;; Clustered: a conversation is PINNED to the node that created it --
 ;;; its continuation and open transaction cannot migrate. The id carries
@@ -380,25 +400,41 @@
                    (send from (vector 'conv-reply ref2 #f 'stale))
                    (loop))))))))))
 
-  ;; ---- completed-conversation tombstones ---------------------------------
+  ;; ---- how a conversation ended: the tombstone ---------------------------
   ;;
-  ;; 'gone means "no process here". For a conversation that DIED -- crashed,
-  ;; expired -- that is the rollback guarantee, because a dead process is a
-  ;; dropped connection and the database rolled back on its own. For one
-  ;; that COMPLETED it is false: the flow committed and then exited, and a
-  ;; caller told "rolled back" does the whole thing again.
+  ;; A tombstone is an id and an OUTCOME, and every answer about a
+  ;; conversation with no process behind it is read off one. There are
+  ;; three, and the whole design of this file rests on keeping them apart:
+  ;;
+  ;;   #t             the flow returned: it SETTLED. -> 'settled
+  ;;   'rolled-back   the flow raised (or its park deadline raised into it
+  ;;                  and nothing caught it) and left through its winders,
+  ;;                  so whatever it held was given back. -> 'gone
+  ;;   'killed        it was stopped in flight: the winders did not run and
+  ;;                  the flow may have committed first. -> 'unknown
+  ;;
+  ;; ...and NO RECORD is 'unknown too, which is the point. 'gone is the
+  ;; rollback guarantee a caller retries on, so it has to come from a
+  ;; record that SAYS rolled back -- never from the absence of one. The
+  ;; absence reading was the defect this structure exists to remove: a
+  ;; process killed from outside, a link cascade, an after-thunk raising
+  ;; on the way back from a COMMIT all leave no record, and every one of
+  ;; them was answered 'gone. Those paths are an open set; the rule that
+  ;; only positive evidence answers 'gone covers all of them at once,
+  ;; including the ones nobody has thought of.
   ;;
   ;; The linger covers the window just after completion, but it holds a
-  ;; whole process and the retained reply, so it cannot be long. A
-  ;; tombstone is an id and an outcome, so it can be: the answer is no
-  ;; longer available, but "this committed" is what a reconciling caller
-  ;; actually needs, and it is the opposite of what 'gone would have said.
+  ;; whole process and the retained reply, so it cannot be long. A record
+  ;; is two words, so it can be: the answer is no longer available, but
+  ;; "this committed" is what a reconciling caller actually needs, and it
+  ;; is the opposite of what 'gone would have said.
   ;;
   ;; BOUNDED, by age and by count, because an unbounded record of every
   ;; conversation that ever finished is a leak with a long fuse. Past
-  ;; either bound an entry is dropped and 'gone becomes ambiguous again --
-  ;; that is the honest limit of this mechanism, and the reason both bounds
-  ;; are settable.
+  ;; either bound an entry is dropped and the conversation becomes
+  ;; 'unknown -- that is the honest limit of this mechanism, and the
+  ;; reason both bounds are settable. What it can no longer do is become
+  ;; 'gone by being forgotten.
   (define tombstone-max 10000)
   (define tombstone-ttl-ms 3600000)    ; one hour
 
@@ -409,13 +445,25 @@
 
   ;; HOW FAR BACK THIS NODE REMEMBERS.
   ;;
-  ;; "No process and no record" was read as "it never completed", and that
-  ;; reading needs a premise nobody was checking: WOULD I STILL HAVE THE
-  ;; RECORD? Past the age limit, past the count limit, or on the other side
-  ;; of a restart, the answer is no -- and the same absence then meant
-  ;; nothing at all while still being reported as 'gone, which this library
-  ;; documents as "the transaction rolled back". A committed transfer told
-  ;; that is performed again.
+  ;; "No process and no record" was once read as "it never completed", and
+  ;; that reading needs a premise nobody was checking: WOULD I STILL HAVE
+  ;; THE RECORD? Past the age limit, past the count limit, or on the other
+  ;; side of a restart, the answer is no -- and the same absence then meant
+  ;; nothing at all while still being reported as 'gone.
+  ;;
+  ;; NOTHING IS DECIDED FROM THIS ANY MORE, and that is deliberate. The
+  ;; horizon made the absence reading correct where it applied, but it
+  ;; could only ever cover the absences it knew the reason for: a record
+  ;; that aged out, one pushed out by newer ones, one from before a
+  ;; restart. It cannot cover a conversation killed from outside or taken
+  ;; down by a link, which leave a young id, an empty table, and no reason
+  ;; at all. 'gone now comes from a 'rolled-back record and from nothing
+  ;; else, which subsumes every case this bounded the damage of.
+  ;;
+  ;; It is kept because the table still moves it and it costs one
+  ;; comparison per eviction: how far back this node can speak is a true
+  ;; and cheap thing to know, and an answer derived from an absence would
+  ;; need it again.
   ;;
   ;; Initialised to THIS PROCESS'S START, so every conversation older than
   ;; this incarnation is outside what it can speak for. That is the restart
@@ -424,7 +472,16 @@
   (define (raise-horizon! t)
     (when (> t tomb-horizon) (set! tomb-horizon t)))
 
-  ;; -> #t when an absent record really does mean "never completed"
+  ;; -> #t when this node would still hold a record of the conversation.
+  ;;
+  ;; STRICT, and it has to stay strict on the eviction side: the horizon is
+  ;; raised to the moment a dropped record was WRITTEN, and now-ms is whole
+  ;; milliseconds, so an id born in that same millisecond may be exactly
+  ;; the one just forgotten. Relaxing to >= would call it remembered. The
+  ;; cost is at the other end -- an id minted in the very millisecond the
+  ;; initial horizon was taken reads as older than this process -- and
+  ;; that direction is the safe one, so the two are not worth separating
+  ;; while nothing reads this.
   (define (tomb-remembers? id)
     (let ((born (conv-created-at id)))
       (and born (> born tomb-horizon))))
@@ -479,19 +536,16 @@
   ;; it out is what lets a conversation publish its completion -- phase,
   ;; running flag and tombstone -- as one indivisible act; the prune loop
   ;; stays outside, where it belongs.
-  ;; WHAT THE RECORD SAYS, not merely that there is one. #t is "this
-  ;; conversation settled"; 'killed is "the watchdog stopped it in flight
-  ;; and what it had already done is not knowable from here". The
-  ;; difference matters because the ABSENCE of a record is read as 'gone,
-  ;; and 'gone is documented as "the transaction rolled back" -- an answer
-  ;; a caller may act on by doing the whole thing again. A step killed
-  ;; mid-flow may have committed already: the commit is inside the flow,
-  ;; while the record is written after it returns, and everything between
-  ;; those two points is preemptible.
+  ;; WHAT THE RECORD SAYS, not merely that there is one. #t settled,
+  ;; 'rolled-back left through its winders, 'killed was stopped in flight
+  ;; -- see the head of this section for why those three and not two.
   ;;
-  ;; First write wins, and that is the right order both ways: a flow that
-  ;; published before the kill keeps its 'settled, and a flow killed
-  ;; before it could publish can never publish afterwards.
+  ;; First write wins, and that is the right order in every direction: a
+  ;; flow that published before the kill keeps its 'settled, a flow killed
+  ;; before it could publish can never publish afterwards, and the
+  ;; watchdog's backstop -- which writes 'killed for a death it did not
+  ;; cause and cannot classify -- never overwrites a flow that had already
+  ;; said what happened to it.
   (define (tomb-insert-as! id what)
     (unless (hashtable-contains? tombstones id)
       (hashtable-set! tombstones id what)
@@ -500,20 +554,24 @@
 
   (define (tomb-insert! id) (tomb-insert-as! id #t))
 
-  (define (tomb-record! id)
-    (with-interrupts-disabled (tomb-insert! id))
+  ;; THE ONE WRITER for a caller that is not already holding interrupts:
+  ;; write, then prune outside the region. Every exit shape reaches the
+  ;; table through this, so there is one place where a record is committed
+  ;; and one place where the table is trimmed after it. (The completion
+  ;; path and the watchdog's kill both publish the record inside a larger
+  ;; atom of their own and call tomb-prune! themselves; see each.)
+  (define (tomb-record-as! id what)
+    (with-interrupts-disabled (tomb-insert-as! id what))
     (tomb-prune!))
 
-  (define (tomb-settled? id)
+  ;; WHAT THE RECORD SAYS, or #f for no record. Reading it in one place is
+  ;; what keeps the mapping from records to answers in one place too: see
+  ;; settled-or-lost, which is the only caller and the only thing that
+  ;; decides what a record MEANS.
+  (define (tomb-outcome id)
     (tomb-prune!)
     (with-interrupts-disabled
-      (eq? #t (hashtable-ref tombstones id #f))))
-
-  ;; stopped in flight: neither settled nor provably rolled back
-  (define (tomb-killed? id)
-    (tomb-prune!)
-    (with-interrupts-disabled
-      (eq? 'killed (hashtable-ref tombstones id #f))))
+      (hashtable-ref tombstones id #f)))
 
   ;; Size the record of completed conversations. #f leaves one alone.
   (define (conversation-set-limits! max-entries ttl-ms)
@@ -867,6 +925,18 @@
            ;; set when the flow returns: from then on nothing the watchdog
            ;; sees is a step that overran, whatever marks the phase running
            (settled-box (box #f))
+           ;; SET WHEN SOMETHING THAT KNEW WHAT HAPPENED SAID SO -- the
+           ;; flow returning, an exception leaving the flow, or the
+           ;; watchdog's own kill. It is what the backstop below asks
+           ;; before filling in a silence, and it is a BOX rather than a
+           ;; lookup in the table for the same reason settled-box is: the
+           ;; table forgets. A conversation whose record is evicted while
+           ;; its watchdog is still winding down would otherwise be
+           ;; described a second time, by the one process that does not
+           ;; know what happened to it -- which costs a slot, evicts a
+           ;; live record to get it, and puts the wrong outcome in the
+           ;; entry it leaves behind.
+           (recorded-box (box #f))
            ;; the watchdog, so entering running can WAKE it instead of
            ;; being noticed by a poll. Polling fast enough to catch the
            ;; start of a step meant polling every ttl for a small ttl --
@@ -963,7 +1033,36 @@
                                          (> (- (now-ms) (unbox run-start-box))
                                             ttl)))))
                            (cond
-                             ((not (process-alive? watched)) 'done)
+                             ((not (process-alive? watched))
+                              ;; THE BACKSTOP. This process outlives the one
+                              ;; it watches, so it is the last thing that
+                              ;; can say anything about a conversation that
+                              ;; died some way the conversation itself never
+                              ;; got to describe: killed from outside, taken
+                              ;; down by a link, an after-thunk raising
+                              ;; while the flow was already returning from
+                              ;; its COMMIT. Those paths are an open set --
+                              ;; they cannot be enumerated and so cannot be
+                              ;; instrumented one by one -- and what they
+                              ;; have in common is that they leave the table
+                              ;; empty. 'killed is the honest reading of
+                              ;; that: it was stopped, and what it had done
+                              ;; by then is not knowable from here.
+                              ;;
+                              ;; First write wins, so a conversation that
+                              ;; already published -- settled, or rolled
+                              ;; back through its winders -- keeps the
+                              ;; answer it gave itself; this only ever fills
+                              ;; in a silence.
+                              ;;
+                              ;; OUTSIDE the kill atom below, deliberately:
+                              ;; that region exists to make deciding and
+                              ;; killing indivisible, and this is
+                              ;; bookkeeping about something that already
+                              ;; happened.
+                              (unless (unbox recorded-box)
+                                (tomb-record-as! id 'killed))
+                              'done)
                              ((not (overrun?)) (loop))
                              (else
                               ;; ONE GRACE TICK. The atom below cannot cover
@@ -983,16 +1082,24 @@
                                             (begin
                                               (kill watched 'conversation-expired)
                                               ;; SAY THAT WE DID IT, in the
-                                              ;; same atom. Without a record
-                                              ;; the absence of one is read
-                                              ;; as 'gone -- "the transaction
-                                              ;; rolled back" -- and a step
-                                              ;; killed after its COMMIT
-                                              ;; returned but before it could
-                                              ;; publish has not rolled back
-                                              ;; at all. First write wins, so
-                                              ;; a flow that published first
-                                              ;; keeps its 'settled.
+                                              ;; same atom. A step killed
+                                              ;; after its COMMIT returned
+                                              ;; but before it could publish
+                                              ;; has not rolled back, and
+                                              ;; the kill discarded its
+                                              ;; winders, so nothing gave
+                                              ;; anything back either:
+                                              ;; 'killed, which reads as
+                                              ;; 'unknown, is the whole of
+                                              ;; what is knowable. First
+                                              ;; write wins, so a flow that
+                                              ;; published first keeps its
+                                              ;; 'settled -- or its
+                                              ;; 'rolled-back, written the
+                                              ;; instant its exception left
+                                              ;; the flow, while the process
+                                              ;; is still on its way to
+                                              ;; dying of it.
                                               ;;
                                               ;; ...AND SO DOES ONE WHOSE
                                               ;; RECORD WAS PRUNED. First
@@ -1011,6 +1118,7 @@
                                                 (if (unbox settled-box)
                                                     #t
                                                     'killed))
+                                              (set-box! recorded-box #t)
                                               #t)))))
                                 ;; DECLINING TO KILL IS NOT BEING DONE.
                                 ;; Before the grace period this branch
@@ -1127,7 +1235,37 @@
                          (set-phase! st 'running)
                          (raise 'conversation-expired))))
 
-                   (let ((final (flow req suspend!)))
+                   ;; THE ONLY PLACE A ROLLBACK IS WITNESSED.
+                   ;;
+                   ;; An exception that leaves the flow has already run the
+                   ;; flow's winders -- its guards, its dynamic-wind
+                   ;; after-thunks -- so whatever it held has been given
+                   ;; back, and THAT is what 'gone claims. Nothing else in
+                   ;; the system was recording it: the process simply died,
+                   ;; and the answer was read off an empty table, which is
+                   ;; also what a kill from outside leaves.
+                   ;;
+                   ;; This is one wrapper for every raise the flow can
+                   ;; produce, because there is one flow lambda: the first
+                   ;; call and every resumed step run inside it, and the
+                   ;; park deadline raises 'conversation-expired THROUGH it
+                   ;; (see suspend!'s on-expire above), so an expiry the
+                   ;; application does not catch arrives here too and is the
+                   ;; same fact. A flow that catches it and returns settled
+                   ;; instead, and says so below.
+                   ;;
+                   ;; A GUARD, not an exception handler: the handler would
+                   ;; run at the point of the raise, BEFORE the flow's own
+                   ;; winders, and would witness a rollback that had not
+                   ;; happened yet. A cleanup that then wedges is killed by
+                   ;; the watchdog, which is 'killed and 'unknown -- the
+                   ;; honest answer, and the one this ordering preserves.
+                   ;; Re-raised unchanged, so the process still dies of what
+                   ;; the application raised and every monitor sees it.
+                   (let ((final (guard (e (#t (set-box! recorded-box #t)
+                                              (tomb-record-as! id 'rolled-back)
+                                              (raise e)))
+                                  (flow req suspend!))))
                      ;; ONE INDIVISIBLE ACT. The watchdog reads the running
                      ;; flag and the clock; between a flow returning and its
                      ;; completion being published there were four separate
@@ -1144,6 +1282,7 @@
                        (step-state-awaiting-set! st #f)
                        (set-phase! st 'completed)
                        (set-box! settled-box #t)
+                       (set-box! recorded-box #t)
                        (tomb-insert! id))
                      (tomb-prune!)
                      (when who
@@ -1184,11 +1323,17 @@
           ;; ASK THE RECORD BEFORE CALLING IT A FAILURE. The retry that
           ;; makes a crash here harmless rests on "nothing had been
           ;; answered yet, and the dead process rolled back" -- and the
-          ;; second half is not always true. A first step that reached its
-          ;; COMMIT and was then stopped has not rolled back, and a worker
-          ;; pool re-runs an unanswered task by design, so raising the
-          ;; same retryable failure for both is how that commit happens
-          ;; twice. The id goes with it: without it the caller cannot even
+          ;; second half is only true where something WITNESSED it. A flow
+          ;; that raised left through its winders and says so, and this
+          ;; raises the ordinary retryable failure for it. A first step
+          ;; that reached its COMMIT and was then stopped has not rolled
+          ;; back, and a worker pool re-runs an unanswered task by design,
+          ;; so raising the same failure for both is how that commit
+          ;; happens twice. The classification comes from settled-or-lost
+          ;; and from nowhere else, so it moved with the rest of the rule
+          ;; when 'gone stopped being derivable from an absence: a death
+          ;; nothing recorded is now 'unknown, and 'unknown is uncertain.
+          ;; The id goes with it: without it the caller cannot even
           ;; reconcile what it started.
           (`#(DOWN ,@conv ,reason)
             (let ((outcome (settled-or-lost id)))
@@ -1197,9 +1342,10 @@
                   (raise (vector 'conversation-uncertain id outcome reason)))))))))
 
   ;; Resume the conversation with the next request; parks until the flow
-  ;; yields its reply. Returns 'gone when the conversation is over,
-  ;; expired, or crashed -- for a transactional flow that means the
-  ;; database already rolled back.
+  ;; yields its reply. Returns 'gone when the record says the flow rolled
+  ;; back -- for a transactional flow that is the rollback guarantee --
+  ;; and 'unknown when the conversation is not here and no record says
+  ;; what became of it.
   ;; TURNING 'unknown BACK INTO AN ANSWER.
   ;;
   ;; 'unknown is honest and useless: the caller is told not to resubmit and
@@ -1269,24 +1415,35 @@
   ;;   a token string -- the step ran; present it to continue
   ;;   'done          -- the flow finished; reply is its final answer
   ;;   'stale         -- not applied, and will not be; reply is #f
-  ;;   'gone          -- unreachable here; reply is #f
+  ;;   'settled       -- it finished earlier; the answer is not retained
+  ;;   'gone          -- it rolled back, on the record; reply is #f
+  ;;   'unknown       -- not here and not knowable from here; reply is #f
   ;;   'unreachable   -- the owner node could not be reached; reply is #f
-  ;; WHAT AN ABSENCE MEANS. One place, because it is one rule: a record
-  ;; says 'settled; no record says 'gone only while this node would still
-  ;; have had the record, and 'unknown otherwise.
+  ;; WHAT THE RECORD MEANS. The only place in this library that turns a
+  ;; tombstone into an answer, and the only place that decides what may be
+  ;; called 'gone -- everything else either writes a record or asks this.
   ;;
-  ;; 'unknown appears exactly where 'gone used to be a guess. It is not a
-  ;; degradation: the answer was already unreliable there, and a caller
-  ;; that acts on "rolled back" when the truth is "committed" performs the
-  ;; transaction twice.
+  ;; EVERY ANSWER HERE IS POSITIVE EVIDENCE. 'gone is the rollback
+  ;; guarantee, the one answer a caller is told it may retry on, so it
+  ;; comes from a record that says the flow rolled back and from nothing
+  ;; else. It used to come from an ABSENCE as well -- no process, no
+  ;; record, and an id young enough that a record should still have been
+  ;; there -- which reads a positive claim off missing evidence, and every
+  ;; way of dying that writes no record made that claim false: a kill from
+  ;; outside, a link cascade, an after-thunk raising while the flow was
+  ;; returning from its COMMIT. There is no enumerating those. Requiring
+  ;; the evidence closes all of them at once, at the cost of answering
+  ;; 'unknown where the old code guessed right.
   (define (settled-or-lost id)
-    (cond ((tomb-settled? id) 'settled)
-          ;; killed while a step was running: it may have committed and it
-          ;; may not have, and saying 'gone here is what performs a
-          ;; committed transfer twice
-          ((tomb-killed? id) 'unknown)
-          ((tomb-remembers? id) 'gone)
-          (else 'unknown)))
+    (let ((rec (tomb-outcome id)))
+      (cond ((eq? rec #t) 'settled)
+            ;; left through its winders: it gave back what it held
+            ((eq? rec 'rolled-back) 'gone)
+            ;; 'killed, and no record at all, are the same statement --
+            ;; stopped, or stopped in a way nothing recorded. A step
+            ;; stopped in flight may have committed and may not have;
+            ;; saying 'gone is what performs a committed transfer twice.
+            (else 'unknown))))
 
   (define (local-resume id token req)
     (let ((p (whereis (conversation-name id))))
@@ -1316,8 +1473,9 @@
   ;;                    reply it is waiting to have answered
   ;;      'completed -- the flow returned; last-reply is its final answer
   ;;                    and no token continues it
-  ;;      'gone      -- not reachable here (died, expired, or its linger
-  ;;                    window closed)
+  ;;      'settled   -- it finished earlier; only the record is left
+  ;;      'gone      -- the record says it rolled back
+  ;;      'unknown   -- not here, and no record says what became of it
   ;;      'unreachable -- the owner node could not be reached; nothing is
   ;;                    known, exactly as for a resume
   ;;
@@ -1355,20 +1513,28 @@
               (`#(DOWN ,@p ,reason)
                 (values (settled-or-lost id) #f #f)))))))
 
+  ;; THE ROLLBACK GUARANTEE, and the only answer that is one. A record
+  ;; says the flow rolled back: it raised, or its park deadline raised
+  ;; into it and nothing caught that, and either way it left through its
+  ;; winders. This is what a caller may retry on.
+  ;;
   ;; Applied to the STATUS, never to the reply. A flow may return the
   ;; symbol 'gone as a perfectly ordinary answer; only the status carries
   ;; control meaning.
   (define (conversation-gone? x) (eq? x 'gone))
 
-  ;; Neither confirmed. The conversation is not here and this node cannot
-  ;; say whether it ever completed -- its record has aged out, been pushed
-  ;; out by newer ones, or belonged to an earlier incarnation of this
-  ;; process. DO NOT RESUBMIT: that is the one action this answer cannot
-  ;; license. Reconcile against your own state instead, which is the only
-  ;; place the truth still is.
+  ;; Neither confirmed. The conversation is not here and no record says
+  ;; what became of it -- it was stopped in flight, killed from outside,
+  ;; taken down by a link, or its record aged out, was pushed out by newer
+  ;; ones, or belonged to an earlier incarnation of this process. DO NOT
+  ;; RESUBMIT: that is the one action this answer cannot license.
+  ;; Reconcile against your own state instead, which is the only place the
+  ;; truth still is.
   ;;
-  ;; Everywhere this now appears, 'gone was previously returned as though
-  ;; it were a rollback guarantee it could not support.
+  ;; THIS IS THE DEFAULT, and that is the change worth knowing about.
+  ;; Everywhere this appears, 'gone was previously returned as though a
+  ;; missing record were a rollback guarantee -- a positive claim read off
+  ;; an absence, and wrong for every death path that writes no record.
   (define (conversation-unknown? x) (eq? x 'unknown))
 
   ;; The flow returned: reply is its final answer, and no token continues
