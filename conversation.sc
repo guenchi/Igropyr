@@ -114,6 +114,11 @@
 ;;;     raise #(conversation-failed reason) in the caller -- the worker
 ;;;     crashes, and the pool's normal retry handles it (nothing had
 ;;;     been answered yet, and the dead process rolled back).
+;;;   - ...unless the record says otherwise. A first step stopped after
+;;;     its COMMIT returned has not rolled back, and re-running an
+;;;     unanswered task would repeat it. That raises
+;;;     #(conversation-uncertain id outcome reason) instead, which is
+;;;     NOT retryable: the id is there so the caller can reconcile.
 ;;;
 ;;; Clustered: a conversation is PINNED to the node that created it --
 ;;; its continuation and open transaction cannot migrate. The id carries
@@ -988,7 +993,24 @@
                                               ;; at all. First write wins, so
                                               ;; a flow that published first
                                               ;; keeps its 'settled.
-                                              (tomb-insert-as! id 'killed)
+                                              ;;
+                                              ;; ...AND SO DOES ONE WHOSE
+                                              ;; RECORD WAS PRUNED. First
+                                              ;; write wins is decided by
+                                              ;; what is in the table, and
+                                              ;; a settled record can be
+                                              ;; evicted while its
+                                              ;; conversation is still
+                                              ;; lingering -- after which
+                                              ;; this would overwrite a
+                                              ;; certain answer with an
+                                              ;; uncertain one. The flag is
+                                              ;; still here to be read.
+                                              (tomb-insert-as!
+                                                id
+                                                (if (unbox settled-box)
+                                                    #t
+                                                    'killed))
                                               #t)))))
                                 ;; DECLINING TO KILL IS NOT BEING DONE.
                                 ;; Before the grace period this branch
@@ -1003,6 +1025,17 @@
                                 ;; whatever it holds for the life of the
                                 ;; VM while its caller waits in a receive
                                 ;; that has no deadline.
+                                ;; THE KILL PATH PRUNES TOO. Every other
+                                ;; way a tombstone is written prunes after
+                                ;; it; this one did not, so a workload of
+                                ;; nothing but killed conversations grew
+                                ;; the table past both its limits -- and
+                                ;; those ids are never handed to a caller,
+                                ;; so no later query would prune either.
+                                ;; Outside the atom: pruning is bookkeeping
+                                ;; and does not belong in a region that
+                                ;; exists to make the kill indivisible.
+                                (when killed (tomb-prune!))
                                 (if killed
                                     ;; ...BUT ONLY IF NOTHING SETTLED. A
                                     ;; killed flow's winders did not run,
@@ -1148,8 +1181,20 @@
             (when m (demonitor m))
             (flush-down! conv)
             (values id status reply))
+          ;; ASK THE RECORD BEFORE CALLING IT A FAILURE. The retry that
+          ;; makes a crash here harmless rests on "nothing had been
+          ;; answered yet, and the dead process rolled back" -- and the
+          ;; second half is not always true. A first step that reached its
+          ;; COMMIT and was then stopped has not rolled back, and a worker
+          ;; pool re-runs an unanswered task by design, so raising the
+          ;; same retryable failure for both is how that commit happens
+          ;; twice. The id goes with it: without it the caller cannot even
+          ;; reconcile what it started.
           (`#(DOWN ,@conv ,reason)
-            (raise (vector 'conversation-failed reason)))))))
+            (let ((outcome (settled-or-lost id)))
+              (if (eq? outcome 'gone)
+                  (raise (vector 'conversation-failed reason))
+                  (raise (vector 'conversation-uncertain id outcome reason)))))))))
 
   ;; Resume the conversation with the next request; parks until the flow
   ;; yields its reply. Returns 'gone when the conversation is over,
