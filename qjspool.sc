@@ -289,6 +289,36 @@
   ;; them.
   (define (worker-conn-loop* c buf partial-ms since)
     (define (on-data bv)
+      ;; READING STOPS FOR THE LENGTH OF THIS PASS. The loop turns it back
+      ;; on only where it goes back to waiting, so bytes are pulled out of
+      ;; the kernel only while somebody is there to look at them. While it
+      ;; is off they stay in the socket's receive buffer, the window
+      ;; closes, and the PEER's writes are what stall -- which is where
+      ;; flow control belongs. An actor mailbox is not a substitute for
+      ;; it: it is unbounded, and nothing in this protocol counts what has
+      ;; been delivered and not yet parsed.
+      ;;
+      ;; AHEAD OF THE PARSE, therefore ahead of any render answer-all!
+      ;; starts: the rule is about the whole pass, and putting it after
+      ;; the parse would leave the renders -- the slowest thing this loop
+      ;; does -- outside it.
+      ;;
+      ;; HOW MUCH THIS BUYS TODAY IS SMALL, and honesty about that is
+      ;; worth more than the rule sounding stronger than it is. Reads
+      ;; happen only during an event loop poll, and a poll can only
+      ;; happen where this loop yields. A render yields nothing (a
+      ;; synchronous call made with interrupts disabled), and everything
+      ;; else in a pass is a primitive that burns no preemption ticks --
+      ;; measured, utf8->string of 8MiB lets a competing process run zero
+      ;; times. So a pass is currently never interrupted and reads were
+      ;; already confined to the waits. What this makes is the invariant
+      ;; STRUCTURAL rather than incidental: it does not depend on nothing
+      ;; in the pass ever parking or ever being preempted, which is a
+      ;; property of the primitives used here rather than anything the
+      ;; protocol promises, and the first version of this loop that
+      ;; awaits anything mid-pass would otherwise reintroduce the leak
+      ;; silently.
+      (tcp-read-stop! c)
       (inbuf-append! buf bv)
       ;; a framing error is not recoverable on this connection: we no
       ;; longer know where the next request starts
@@ -372,25 +402,41 @@
                    ;; this side caps it: max-requests-per-connection is
                    ;; enforced by the caller's connection, never here.
                    ;;
-                   ;; NOR IS ITS MEMORY BOUNDED BY THE FRAME CAP, which an
-                   ;; earlier version of this note claimed. take-frame!
-                   ;; bounds one frame's announced body; it says nothing
-                   ;; about what has been delivered and not yet parsed.
-                   ;; Reading stays on for the life of the connection --
-                   ;; there is no tcp-read-stop! anywhere here -- so a peer
-                   ;; that writes faster than renders retire copies every
-                   ;; segment into an unbounded mailbox, which inbuf-length
-                   ;; cannot see. Even one legal maximum frame overshoots:
-                   ;; a message that completes it can carry up to 64KiB of
-                   ;; the next one past the cap, and the buffer's doubling
-                   ;; can hold twice the cap in backing store while
-                   ;; take-frame! copies the body out again.
+                   ;; ITS MEMORY IS BOUNDED BY TWO DIFFERENT THINGS, and
+                   ;; an earlier version of this note ran them together
+                   ;; and then, correctly, said only what it could prove.
                    ;;
-                   ;; The bound that would make this true is backpressure
-                   ;; -- a per-connection high-water mark over mailbox plus
-                   ;; buffer, tcp-read-stop! above it and tcp-read-start!
-                   ;; below -- and it is not here. Stated rather than
-                   ;; claimed away.
+                   ;; While a frame is being ASSEMBLED, the bound is the
+                   ;; cap: the length was checked before the body was
+                   ;; accepted, so the buffer cannot outgrow the frame
+                   ;; that was announced. It can overshoot it -- a message
+                   ;; completing a maximum frame can carry up to 64KiB of
+                   ;; the next one past it, and the buffer's doubling can
+                   ;; hold twice the cap in backing store while
+                   ;; take-frame! copies the body out again -- but that is
+                   ;; a constant factor, which is what a cap is for.
+                   ;;
+                   ;; While this loop is BUSY, the cap bounds nothing: it
+                   ;; is enforced on bytes that have already been queued,
+                   ;; and inbuf-length cannot see the mailbox at all. What
+                   ;; bounds that is the tcp-read-stop! at the top of
+                   ;; on-data. Reading is on only while this loop waits,
+                   ;; so a peer that writes faster than renders retire
+                   ;; fills the kernel's receive buffer, has its window
+                   ;; closed, and stalls on its own writes rather than
+                   ;; having every segment copied into a mailbox nothing
+                   ;; counts. The high-water mark is the socket buffer,
+                   ;; which the kernel already sizes: no counter here to
+                   ;; keep in step with one, and no option to get wrong.
+                   ;;
+                   ;; WHAT IS STILL IN FLIGHT WHEN THE STOP LANDS is one
+                   ;; poll turn's delivery: libuv hands up everything
+                   ;; readable in a turn, so several segments can already
+                   ;; be in the mailbox before the first of them is
+                   ;; looked at. take-queued! below is what consumes
+                   ;; exactly those, which is why a delivery split across
+                   ;; messages is still seen whole rather than as its
+                   ;; first segment.
                    ;; Keying the reset on "the buffer emptied" instead meant
                    ;; a peer that always keeps a partial tail -- which is
                    ;; what pipelining looks like -- was closed at the first
@@ -421,6 +467,24 @@
                  (tcp-close! c))
                 (else (worker-conn-loop* c buf partial-ms deadline))))
             (tcp-close! c)))))
+    ;; BACK TO WAITING, so reading goes back on. This is the only place
+    ;; this loop turns it on, as the tcp-read-stop! at the top of on-data
+    ;; is the only place it turns it off, and that is what makes the
+    ;; invariant readable in one sitting: reads are enabled exactly while
+    ;; this loop is parked in one of the two receives below. Deciding it
+    ;; here rather than in each of them also means a third wait could not
+    ;; be added without inheriting it.
+    ;;
+    ;; NO FLAG IS NEEDED, because both transitions are idempotent: libuv
+    ;; answers a start on a stream that is already reading with
+    ;; UV_EALREADY and a stop on one that is not reading with success, and
+    ;; (igropyr libuv) discards both codes. So the first entry -- which
+    ;; follows the tcp-read-start! the accept callback does when it hands
+    ;; the connection to this process -- needs nothing to tell it apart
+    ;; from a re-entry, and the one path that starts and then closes
+    ;; rather than waiting (an already-expired deadline, just below) costs
+    ;; a start that closing the handle undoes.
+    (tcp-read-start! c)
     (if (> (inbuf-length buf) 0)
         (let ((left (- (or since (+ (now-ms) partial-ms)) (now-ms))))
           (if (<= left 0)

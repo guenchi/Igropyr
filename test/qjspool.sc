@@ -63,6 +63,11 @@ function spin(j){ for(;;){} }
 // synchronous call that stops the whole worker, so this is what a tail's
 // deadline gets spent on.
 function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'; }
+// takes a LARGE argument and returns a tiny answer, so that a request
+// costs the worker real decoding work (the props are converted to a
+// string and back for the engine) without the reply size telling the
+// peer anything about the worker's buffer. Used by the flood probe.
+function eat(j){ return String(j.length); }
 ")
 
 (define good-port 19731)
@@ -200,6 +205,51 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                           (equal? conn (line-conn (car rest)))
                           (line-has? (car rest) sub))
                      (+ n 1) n))))))
+
+;; The number written immediately after `sub` on a trace line, or #f when
+;; that field is not on it. Fields are read by name rather than by
+;; position because the line's shape differs per event type -- the same
+;; mistake the "late=" fields already cost this file once.
+(define (line-number-after l sub)
+  (let ((n (string-length l)) (m (string-length sub)))
+    (let scan ((i 0))
+      (cond ((> (+ i m) n) #f)
+            ((string=? (substring l i (+ i m)) sub)
+             (let digits ((j (+ i m)) (acc 0) (any #f))
+               (if (and (< j n) (char<=? #\0 (string-ref l j) #\9))
+                   (digits (+ j 1)
+                           (+ (* acc 10) (- (char->integer (string-ref l j)) 48))
+                           #t)
+                   (and any acc))))
+            (else (scan (+ i 1)))))))
+
+;; The LARGEST value this connection reported for `sub`, over the lines
+;; from `before` up to (not including) the first of its lines containing
+;; `until`. How much a read loop is holding cannot be seen from outside
+;; the worker -- a peer knows only what it handed to the kernel, and the
+;; kernel's own buffers are counted nowhere -- so the trace is the only
+;; witness there is.
+;;
+;; THE `until` BOUND IS NOT A CONVENIENCE. It is what makes the window
+;; measured the one under test: reads being ON while this loop WAITS is
+;; the correct state, and a peer with a half frame outstanding is
+;; entitled to be read then, up to the frame cap. What has to be bounded
+;; is what accumulates while the loop is not waiting, so the measurement
+;; ends where the work it was measuring does.
+(define (trace-max-until name conn before sub until)
+  (let loop ((k 0) (rest (trace-lines name)) (mx 0))
+    (cond ((null? rest) mx)
+          ((< k before) (loop (+ k 1) (cdr rest) mx))
+          (else
+           (let ((l (car rest)))
+             (cond
+               ((not (and conn (equal? conn (line-conn l))))
+                (loop (+ k 1) (cdr rest) mx))
+               ((line-has? l until) mx)
+               (else
+                (loop (+ k 1) (cdr rest)
+                      (let ((v (line-number-after l sub)))
+                        (if (and v (> v mx)) v mx))))))))))
 
 (define (trace-count-new name before sub)
   (let* ((ls (trace-lines name))
@@ -833,6 +883,191 @@ function slow(j){ var t = Date.now(); while (Date.now() - t < 700) {} return 'S'
                            (>= (trace-count-of "carry" mine mark "drained") 2)))
                   (unless (eq? r 'answered)
                     (display "  [info] split request: ") (write r) (newline)))))
+
+            ;; ---- a peer that floods behind its own requests ---------------
+            ;;
+            ;; A peer that pipelines megabyte-sized requests and pushes the
+            ;; body of a frame it never finishes behind them, as fast as
+            ;; the wire will take it. Every request must still be answered,
+            ;; and the connection must still die on its half-frame deadline
+            ;; rather than live on the flood.
+            ;;
+            ;; THIS PROBE DOES NOT DISCRIMINATE THE READ STOP, and says so
+            ;; rather than implying otherwise. worker-conn-loop* stops
+            ;; reading for the length of a processing pass so that a peer
+            ;; writing faster than the reader retires has its window closed
+            ;; instead of its segments copied into an unbounded mailbox.
+            ;; That is the right rule, and it is what (igropyr http-client)
+            ;; does around its on-chunk handler -- but on THIS runtime it
+            ;; is not observable. Three runs each way: with the stop, the
+            ;; connection peaked at 6016 / 8704 / 9152 KiB; with it deleted,
+            ;; 8960 / 8960 / 8768 KiB. Overlapping ranges, no signal.
+            ;;
+            ;; The reason is that reads only ever happen during an event
+            ;; loop poll, and this loop has no point at which it is running
+            ;; while a poll can occur. A render is a synchronous call made
+            ;; with interrupts disabled, so nothing is read while one runs
+            ;; either way. Everything else in a pass -- inbuf-append!,
+            ;; take-frame!'s slices, utf8->string and string->utf8 on the
+            ;; props, encode-response, the write -- is a primitive, and
+            ;; primitives burn no preemption ticks at all: measured here,
+            ;; utf8->string of 8 MiB takes 9ms and lets a competing process
+            ;; run exactly zero times, where a plain Scheme loop yields on
+            ;; every slice. So the pass is never interrupted, reads already
+            ;; happen only while this loop is parked in a receive, and
+            ;; turning them off in between changes nothing that can be
+            ;; measured from either end.
+            ;;
+            ;; What this DOES pin is the restart half, which is not
+            ;; cosmetic: dropping the tcp-read-start! takes the whole suite
+            ;; from 47 passing checks to 8, because a connection that stops
+            ;; reading and never resumes goes deaf after its first read.
+            ;; The figure is reported as [info] because it is the only
+            ;; witness there is to how much reached the process -- a peer
+            ;; knows only what it handed to the kernel -- and because a
+            ;; regression that broke the bound would show up in it.
+            (let ((me self)
+                  (mark (trace-len "carry"))
+                  (heavy 6)
+                  ;; large enough that a request is delivered in pieces and
+                  ;; its decode is real work, without being a frame the cap
+                  ;; would refuse
+                  (props-bytes (* 1024 1024))
+                  ;; ANNOUNCED, NEVER COMPLETED. 64 MiB is exactly the
+                  ;; frame cap, so it is accepted, and every byte behind
+                  ;; it is buffered rather than parsed. The flood ceiling
+                  ;; below stays far under it, so no render is ever
+                  ;; started on this garbage.
+                  (announce (* 64 1024 1024))
+                  (chunk-bytes 65536)
+                  ;; IN FLIGHT AT ONCE, and bounded on purpose. Handing
+                  ;; libuv the whole flood in one go measures nothing --
+                  ;; its write queue is unbounded, so the bytes would sit
+                  ;; on THIS side either way and the peer would never feel
+                  ;; the closed window. A small window makes the stall
+                  ;; real and also caps what can still drain after the
+                  ;; peer is told to stop.
+                  (window 64)
+                  (max-chunks 768))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" carry-port self)
+                  (receive (after 3000 (send me (vector 'flood 'no-connect)))
+                    (`#(tcp-connect-failed ,e) (send me (vector 'flood 'no-connect)))
+                    (`#(tcp-connected ,ca)
+                      (tcp-read-start! ca)
+                      (warm-up! ca 913)
+                      (let ((stop (box #f))
+                            (accepted (box 0))
+                            (props (make-string props-bytes #\x)))
+                        ;; the requests and the announcement in one write,
+                        ;; so the flood is strictly BEHIND them in the
+                        ;; stream and cannot be reached until they are
+                        ;; done
+                        (let build ((k 0) (acc (make-bytevector 0)))
+                          (if (= k heavy)
+                              (tcp-write! ca
+                                          (bv-append
+                                            acc
+                                            (let ((h (make-bytevector 4)))
+                                              (bytevector-u32-set!
+                                                h 0 announce (endianness big))
+                                              h))
+                                          #f)
+                              (build (+ k 1)
+                                     (bv-append acc (qframe (+ 50 k) "eat" props)))))
+                        (spawn
+                          (lambda ()
+                            (let ((chunk (make-bytevector chunk-bytes 120))
+                                  (w self))
+                              (let pump ((issued 0) (done 0))
+                                (cond
+                                  ((or (unbox stop) (>= issued max-chunks)) 'done)
+                                  ((< (- issued done) window)
+                                   (if (guard (e (#t #f))
+                                         (tcp-write! ca chunk
+                                                     (lambda (st)
+                                                       (send w (vector 'wrote st))))
+                                         #t)
+                                       (pump (+ issued 1) done)
+                                       'done))
+                                  (else
+                                   (receive (after 8000 'done)
+                                     (`#(wrote ,st)
+                                       (set-box! accepted
+                                                 (+ (unbox accepted) chunk-bytes))
+                                       (pump issued (+ done 1))))))))))
+                        ;; THE FLOOD STOPS WHEN THE REQUESTS ARE ANSWERED.
+                        ;; The connection still has a 400ms window after
+                        ;; that and reads are on for all of it, so a peer
+                        ;; left running would push megabytes through the
+                        ;; one state this is not measuring.
+                        (let wait ((acc (make-bytevector 0)) (closed #f))
+                          (if closed
+                              (send me (vector 'flood
+                                               (list (count-frames acc)
+                                                     (unbox accepted))))
+                              (begin
+                                (when (>= (count-frames acc) heavy)
+                                  (set-box! stop #t))
+                                (receive (after 30000
+                                           (set-box! stop #t)
+                                           (send me (vector 'flood 'timeout)))
+                                  (`#(tcp-data ,bv) (wait (bv-append acc bv) closed))
+                                  (`#(tcp-eof) (set-box! stop #t) (wait acc #t))
+                                  (`#(tcp-error ,e)
+                                    (set-box! stop #t) (wait acc #t)))))))))))
+              (receive (after 45000 (fail "flood probe never answered"))
+                (`#(flood ,r)
+                  ;; ...AND THE PRESSURE WAS REAL. A run in which the
+                  ;; requests were never answered, or in which the peer
+                  ;; never got a megabyte onto the wire, proves nothing
+                  ;; about where the bytes ended up.
+                  (check "the pipelined requests are all answered under a flood"
+                         (and (pair? r) (= (car r) heavy)))
+                  (check "the peer did get a flood onto the wire"
+                         (and (pair? r) (>= (cadr r) (* 1024 1024))))
+                  ;; ...AND THE FLOOD DID NOT KEEP IT ALIVE. A connection
+                  ;; whose deadline is renewed by unparseable bytes is the
+                  ;; failure the half-frame deadline exists to stop, and a
+                  ;; flood is the cheapest way to try it: the wait above
+                  ;; only ends on the close, so a run that reaches here at
+                  ;; all saw one.
+                  (check "the flooded connection is still closed on its deadline"
+                         (pair? r))
+                  (unless (pair? r)
+                    (display "  [info] flood probe: ") (write r) (newline))
+                  (let* ((mine (trace-conn-of-id "carry" 913))
+                         ;; UP TO THE LAST REQUEST BEING ANSWERED, and
+                         ;; over the whole connection, reported separately.
+                         ;; Reads being on while this loop WAITS is the
+                         ;; correct state and a half frame is entitled to
+                         ;; be read then, up to the frame cap -- so the two
+                         ;; numbers are different questions, and neither is
+                         ;; asserted on (see the note above).
+                         (during (and mine
+                                      (trace-max-until
+                                        "carry" mine mark "buffered="
+                                        (string-append
+                                          "answer id="
+                                          (number->string (+ 50 heavy -1))))))
+                         (total (and mine
+                                     (trace-max-until "carry" mine mark
+                                                      "buffered=" "close deadline"))))
+                    (check "the flood probe's own connection is identified" (and mine #t))
+                    (display (string-append
+                               "  [info] flooded connection held at most "
+                               (if during (number->string (div during 1024)) "?")
+                               " KiB while answering and "
+                               (if total (number->string (div total 1024)) "?")
+                               " KiB over its life; the peer got "
+                               (if (pair? r) (number->string (div (cadr r) 1024)) "?")
+                               " KiB accepted onto the wire\n"))
+                    ;; The one thing the frame cap really does promise: a
+                    ;; connection cannot hold more than the frame it
+                    ;; announced, whatever the peer does behind it.
+                    (check "the flood never takes the connection past the frame cap"
+                           (and total (< total (* 64 1024 1024))))))))
 
             ;; ---- a half frame dies on its deadline, busy worker or not ---
             ;;
