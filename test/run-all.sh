@@ -142,6 +142,15 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # is missing) on a libcrypto older than OpenSSL 3.2, which is what Debian 12
 # and Ubuntu 22.04 ship. The argon2id guard tests still run there.
 "$scheme_bin" --script igropyr/test/kdf.sc
+# RSA-SHA256 against the RFC 7515 A.2 published signature (always runs) and
+# against the openssl CLI in both directions, byte for byte -- the CLI part
+# mints throwaway keys in /tmp and self-skips, naming what is missing, where
+# openssl is absent
+"$scheme_bin" --script igropyr/test/rsa.sc
+# AES-256-GCM against the published AES-256 GCM test vectors (always runs)
+# and against a second implementation in another process (python3's
+# cryptography, or node), which self-skips naming both
+"$scheme_bin" --script igropyr/test/aead.sc
 # a gen-server must not run a call whose caller was killed while it
 # waited: the effects would be applied for nobody, and the retry
 # applies them again

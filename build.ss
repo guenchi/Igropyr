@@ -60,6 +60,11 @@
     ("igropyr/apple-jws.sc" . 2)
     ("igropyr/jwks.sc" . 2)
     ("igropyr/kdf.sc" . 2)
+    ;; rsa and aead import only (igropyr platform) -- the libcrypto loader --
+    ;; so they can sit anywhere after it; they are kept with the other
+    ;; libcrypto-backed libraries above rather than scattered.
+    ("igropyr/rsa.sc" . 2)
+    ("igropyr/aead.sc" . 2)
     ("igropyr/redis.sc" . 2)
     ;; connpool is the shared checkout/lease engine: it imports only actor
     ;; and libuv, and every pooled driver below imports it.
