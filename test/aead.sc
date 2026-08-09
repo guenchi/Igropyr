@@ -469,7 +469,167 @@
   (check "iv-reuse-not-rejected"
     (bytevector? (aes-256-gcm-seal key iv m2 #f))))
 
-;; ---- 8. FFI discipline: the error paths must free their contexts -------
+;; ---- 8. the caller's mistakes are reported whatever an attacker sends ---
+;;
+;; A wrong TYPE is the caller's own bug and raises; a ciphertext that will
+;; not authenticate is an attacker's input and answers #f. Which of the two
+;; a call is must not depend on the attacker: a sealed message too short to
+;; hold a tag used to short-circuit before the aad was ever looked at, so
+;; the same wrong aad raised or did not depending on how many bytes arrived.
+
+(let ((key (aead-random-bytes 32))
+      (iv (aead-random-bytes 12)))
+  (define (raises? thunk) (guard (e (#t #t)) (thunk) #f))
+  (check "open-checks-aad-type-on-a-short-input"
+    (raises? (lambda () (aes-256-gcm-open key iv (make-bytevector 4) "not bytes"))))
+  (check "open-checks-aad-type-on-an-empty-input"
+    (raises? (lambda () (aes-256-gcm-open key iv (make-bytevector 0) 'nope))))
+  ;; the long input already did, and must keep doing so
+  (check "open-checks-aad-type-on-a-long-input"
+    (raises? (lambda () (aes-256-gcm-open key iv (make-bytevector 64) "not bytes"))))
+  ;; and a short input with a LEGAL aad is still an answer, not an error
+  (check "short-input-with-legal-aad-answers-false"
+    (not (aes-256-gcm-open key iv (make-bytevector 4) (u "ctx"))))
+  (check "short-input-with-no-aad-answers-false"
+    (not (aes-256-gcm-open key iv (make-bytevector 4) #f))))
+
+;; ---- 9. what a rejected message costs -----------------------------------
+;;
+;; Rejecting a forgery should be cheap. It used to allocate about three
+;; copies of the payload before answering #f -- the ciphertext lifted out of
+;; the sealed message, the decryption scratch, and on the success path the
+;; plaintext again -- so an attacker could buy three megabytes of heap
+;; churn with one forged megabyte. Measured, not asserted by eye: with the
+;; collector switched off for the duration, bytes-allocated is monotonic and
+;; the difference across a call IS what the call allocated.
+
+(let* ((key (aead-random-bytes 32))
+       (iv (aead-random-bytes 12))
+       (n (* 4 1024 1024))
+       (pt (make-bytevector n 7))
+       (sealed (aes-256-gcm-seal key iv pt #f))
+       (forged (flip sealed 0)))
+  (define (allocated-by thunk)
+    (collect (collect-maximum-generation))
+    (let ((h (collect-request-handler)))
+      (collect-request-handler void)
+      (let* ((b0 (bytes-allocated))
+             (_ (thunk))
+             (d (- (bytes-allocated) b0)))
+        (collect-request-handler h)
+        (collect (collect-maximum-generation))
+        d)))
+  (let ((rejected (allocated-by (lambda () (aes-256-gcm-open key iv forged #f))))
+        (accepted (allocated-by (lambda () (aes-256-gcm-open key iv sealed #f)))))
+    (display "  [alloc] 4 MiB payload: reject ") (display rejected)
+    (display " B, accept ") (display accepted) (display " B\n")
+    ;; one payload-sized buffer plus slack, not two or three. The bound is
+    ;; 1.5x so it cannot be met by accident and cannot fail on rounding.
+    (check "rejecting-a-forgery-allocates-one-buffer"
+      (< rejected (* 3/2 n)))
+    (check "opening-a-real-message-allocates-one-buffer"
+      (< accepted (* 3/2 n)))))
+
+;; ---- 10. the OpenSSL error queue belongs to the OS thread ---------------
+;;
+;; One OS thread runs every green process, so all of them share one error
+;; queue. A library that calls ERR_clear_error on its failure path is
+;; deleting whatever else was on it -- an in-flight TLS session preempted
+;; between SSL_read and SSL_get_error, for instance -- and a library that
+;; clears nothing leaves its own failures to be reported as somebody else's
+;; reason. Neither is acceptable, and the answer is a scope: mark on entry,
+;; pop to the mark on exit, so exactly the entries this operation pushed go
+;; away. Checked from outside the library, against the same libcrypto.
+
+(define ERR_clear_error #f)
+(define ERR_peek_error #f)
+(define push-openssl-error! #f)
+
+(let ()
+  (import (igropyr platform))
+  (load-first-shared-object! 'aead-test (shared-object-candidates "libcrypto"))
+  (set! ERR_clear_error (foreign-procedure "ERR_clear_error" () void))
+  (set! ERR_peek_error (foreign-procedure "ERR_peek_error" () unsigned-long))
+  (let ((BIO_new_mem_buf (foreign-procedure "BIO_new_mem_buf" (void* int) void*))
+        (BIO_free (foreign-procedure "BIO_free" (void*) int))
+        (PEM_read_bio_PUBKEY
+          (foreign-procedure "PEM_read_bio_PUBKEY" (void* void* void* void*) void*))
+        (memcpy-to-c (foreign-procedure "memcpy" (void* u8* size_t) void*))
+        ;; no Proc-Type/DEK-Info here, so a NULL callback cannot reach a
+        ;; passphrase prompt; it just fails and leaves entries on the queue
+        (garbage (u "-----BEGIN PUBLIC KEY-----\nAAAAAAAAAAAAAAAA\n-----END PUBLIC KEY-----\n")))
+    (set! push-openssl-error!
+      (lambda ()
+        (let* ((len (bytevector-length garbage))
+               (buf (foreign-alloc len)))
+          (memcpy-to-c buf garbage len)
+          (let ((bio (BIO_new_mem_buf buf len)))
+            (PEM_read_bio_PUBKEY bio 0 0 0)
+            (BIO_free bio))
+          (foreign-free buf))))))
+
+(let* ((key (aead-random-bytes 32))
+       (iv (aead-random-bytes 12))
+       (sealed (aes-256-gcm-seal key iv (u "queue probe") (u "aad")))
+       (forged (flip sealed 3)))
+  ;; each check plants its own entry, so one of them failing cannot make the
+  ;; next one fail for a reason that is not its own
+  (define (with-planted-error thunk)
+    (ERR_clear_error)
+    (push-openssl-error!)
+    (let ((planted (ERR_peek_error)))
+      (thunk)
+      (and (not (zero? planted)) (= planted (ERR_peek_error)))))
+  (define (leaves-nothing thunk)
+    (ERR_clear_error)
+    (thunk)
+    (zero? (ERR_peek_error)))
+  (ERR_clear_error)
+  (push-openssl-error!)
+  (if (zero? (ERR_peek_error))
+      (begin
+        (ERR_clear_error)
+        (display "  SKIP error-queue scoping checks: a deliberately malformed\n")
+        (display "       PEM left nothing on this build's error queue, so\n")
+        (display "       there is no planted entry to see preserved and the\n")
+        (display "       checks would pass vacuously.\n"))
+      (begin
+        (ERR_clear_error)
+        ;; a rejected tag must not delete an unrelated pending error
+        (check "aead-failure-preserves-an-unrelated-error"
+          (with-planted-error
+            (lambda () (aes-256-gcm-open key iv forged (u "aad")))))
+        ;; nor a successful call
+        (check "aead-success-preserves-an-unrelated-error"
+          (with-planted-error
+            (lambda () (aes-256-gcm-open key iv sealed (u "aad")))))
+        ;; nor a raise out of one
+        (check "aead-raise-preserves-an-unrelated-error"
+          (with-planted-error
+            (lambda ()
+              (guard (e (#t #t))
+                (aes-256-gcm-encrypt (make-bytevector 31 0) iv (u "x") #f)))))
+        (check "aead-random-bytes-preserves-an-unrelated-error"
+          (with-planted-error (lambda () (aead-random-bytes 16))))
+        ;; and in the other direction: nothing of its own is left behind
+        (check "aead-failure-leaves-nothing-behind"
+          (leaves-nothing (lambda () (aes-256-gcm-open key iv forged (u "aad")))))
+        (check "aead-success-leaves-nothing-behind"
+          (leaves-nothing (lambda () (aes-256-gcm-open key iv sealed (u "aad")))))
+        (check "aead-random-bytes-leaves-nothing-behind"
+          (leaves-nothing (lambda () (aead-random-bytes 16))))
+        (ERR_clear_error))))
+
+;; NOT TESTED, and worth saying so rather than shipping an assertion that
+;; cannot fail: that the decryption buffer is zeroed when the tag is
+;; rejected. The buffer is internal, and once aes-256-gcm-decrypt has
+;; returned #f nothing in Scheme holds a reference to it -- there is no
+;; supported way to look at freed heap from inside the process, and a check
+;; that scanned for the plaintext would be asserting something about the
+;; collector, not about this library. The wipe is verifiable only by reading
+;; the failure branch of decrypt-core.
+
+;; ---- 11. FFI discipline: the error paths must free their contexts ------
 ;;
 ;; Each call allocates an EVP_CIPHER_CTX, and a GCM context carries its
 ;; multiplication tables -- kilobytes apiece. A path that raises or answers

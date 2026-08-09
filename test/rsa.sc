@@ -26,7 +26,8 @@
 ;;; signature from another key, and every malformed PEM shape must be
 ;;; refused, cleanly and without prompting the operator for a passphrase.
 
-(import (chezscheme) (igropyr rsa) (only (igropyr crypto) bytevector->hex))
+(import (chezscheme) (igropyr rsa)
+        (only (igropyr crypto) bytevector->hex sha256))
 
 (define failures 0)
 (define (fail label)
@@ -80,8 +81,13 @@
   (when (file-exists? path) (delete-file path))
   (call-with-port (open-file-output-port path) (lambda (o) (put-bytevector o bv))))
 
+;; "" for an empty file, not the eof object: several callers hand the result
+;; straight to string-length, and a child that was killed before it could
+;; print anything must be reported as "said nothing", not as a crash in the
+;; harness.
 (define (read-text path)
-  (call-with-port (open-input-file path) get-string-all))
+  (let ((s (call-with-port (open-input-file path) get-string-all)))
+    (if (eof-object? s) "" s)))
 
 (define capture-file (p "capture.txt"))
 (define (cap cmd)
@@ -94,6 +100,42 @@
       (cond ((> (+ i nn) hn) #f)
             ((string=? needle (substring hay i (+ i nn))) #t)
             (else (loop (+ i 1)))))))
+
+(define (bv-find hay needle)
+  (let ((hn (bytevector-length hay)) (nn (bytevector-length needle)))
+    (let loop ((i 0))
+      (cond ((> (+ i nn) hn) #f)
+            ((let inner ((j 0))
+               (cond ((= j nn) #t)
+                     ((= (bytevector-u8-ref hay (+ i j))
+                         (bytevector-u8-ref needle j))
+                      (inner (+ j 1)))
+                     (else #f)))
+             i)
+            (else (loop (+ i 1)))))))
+
+;; The PKCS#1 v1.5 signature block for a SHA-256 digest, built from the
+;; encoding in RFC 8017 section 9.2 rather than from anything this library
+;; does: 0x00 0x01, 0xff padding, 0x00, then the DER DigestInfo. It is the
+;; value an RSA public operation is supposed to RECOVER from a signature --
+;; which is why, with e = 1, presenting it AS the signature is a forgery.
+(define sha256-digestinfo-prefix
+  (hex->bv "3031300d060960864801650304020105000420"))
+
+(define (emsa-pkcs1-v15-sha256 msg k)
+  (let* ((t (let* ((h (sha256 msg))
+                   (b (make-bytevector (+ (bytevector-length sha256-digestinfo-prefix) 32))))
+              (bytevector-copy! sha256-digestinfo-prefix 0 b 0
+                                (bytevector-length sha256-digestinfo-prefix))
+              (bytevector-copy! h 0 b (bytevector-length sha256-digestinfo-prefix) 32)
+              b))
+         (tl (bytevector-length t))
+         (out (make-bytevector k #xff)))
+    (bytevector-u8-set! out 0 #x00)
+    (bytevector-u8-set! out 1 #x01)
+    (bytevector-u8-set! out (- k tl 1) #x00)
+    (bytevector-copy! t 0 out (- k tl) tl)
+    out))
 
 ;; ---- 1. RFC 7515 A.2: a published RS256 signature ----------------------
 ;;
@@ -232,6 +274,79 @@
     (let ((bv (u "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n")))
       (bytevector-u8-set! bv 5 0)
       (rsa-public-key-from-pem bv)))))
+
+;; ---- what a key is allowed to be ---------------------------------------
+;;
+;; These need no private key and no CLI: every one of them is a public key
+;; an attacker publishes, and the question is whether the loader takes it.
+
+;; e = 1. The public operation becomes the identity, so the PKCS#1 v1.5
+;; block a verifier expects to RECOVER can simply be handed in as the
+;; signature. The first check is that the key is refused; the second is the
+;; forgery itself, spelled out, so that a loader which ever starts accepting
+;; e = 1 again fails on the consequence and not only on the policy.
+(define e1-message (u "a message nobody holding a private key ever signed"))
+(check "exponent-1-key-refused"
+  (rsa-error? (lambda () (rsa-public-key-from-modulus rfc7515-n (bytevector 1)))))
+(check "exponent-1-forgery-does-not-verify"
+  (let ((k (guard (e (#t #f))
+             (rsa-public-key-from-modulus rfc7515-n (bytevector 1)))))
+    (or (not k)
+        (not (rsa-verify-sha256 k e1-message
+               (emsa-pkcs1-v15-sha256 e1-message 256))))))
+;; and the forged block really is the block a verifier looks for: with the
+;; RFC's own key it is exactly what the RFC's own signature recovers, so the
+;; check above would have passed for the wrong reason if this were wrong
+(check "forged-block-is-256-bytes-and-well-formed"
+  (let ((b (emsa-pkcs1-v15-sha256 e1-message 256)))
+    (and (= 256 (bytevector-length b))
+         (= 0 (bytevector-u8-ref b 0))
+         (= 1 (bytevector-u8-ref b 1))
+         (= 255 (bytevector-u8-ref b 2))
+         (= 0 (bytevector-u8-ref b (- 256 51 1))))))
+
+;; even exponents and even moduli are not RSA at all
+(check "even-exponent-refused"
+  (rsa-error? (lambda () (rsa-public-key-from-modulus rfc7515-n (bytevector 2)))))
+(check "even-modulus-refused"
+  (let ((n (bytevector-copy rfc7515-n)))
+    (bytevector-u8-set! n 255 (fxand #xfe (bytevector-u8-ref n 255)))
+    (rsa-error? (lambda () (rsa-public-key-from-modulus n rfc7515-e)))))
+
+;; a 1024-bit modulus is factorable today; the floor is 2048
+(check "1024-bit-modulus-refused"
+  (let ((n (make-bytevector 128 #xff)))
+    (rsa-error? (lambda () (rsa-public-key-from-modulus n rfc7515-e)))))
+(check "2048-bit-modulus-accepted"
+  (rsa-key? (rsa-public-key-from-modulus rfc7515-n rfc7515-e)))
+
+;; and the ceilings, which exist so that one verification cannot become a
+;; multi-second modular exponentiation with the whole runtime stopped behind
+;; it: 16384 bits of modulus, 64 bits of exponent
+(check "oversized-modulus-refused"
+  (let ((n (make-bytevector 2049 #xff)))
+    (rsa-error? (lambda () (rsa-public-key-from-modulus n rfc7515-e)))))
+(check "16384-bit-modulus-accepted"
+  (let ((n (make-bytevector 2048 #xff)))
+    (rsa-key? (rsa-public-key-from-modulus n rfc7515-e))))
+(check "oversized-exponent-refused"
+  (let ((e (make-bytevector 9 #xff)))
+    (rsa-error? (lambda () (rsa-public-key-from-modulus rfc7515-n e)))))
+(check "64-bit-exponent-accepted"
+  (let ((e (make-bytevector 8 #xff)))
+    (rsa-key? (rsa-public-key-from-modulus rfc7515-n e))))
+;; leading zeros are not part of the number, so they must not count against
+;; either ceiling
+(check "leading-zeros-do-not-count-against-the-exponent-ceiling"
+  (let ((e (make-bytevector 16 0)))
+    (bytevector-u8-set! e 13 1)
+    (bytevector-u8-set! e 15 1)
+    (rsa-key? (rsa-public-key-from-modulus rfc7515-n e))))
+;; a magnitude too big to be any key is refused before libcrypto is asked
+;; to allocate for it
+(check "absurd-magnitude-refused"
+  (rsa-error? (lambda () (rsa-public-key-from-modulus
+                           (make-bytevector 5000 #xff) rfc7515-e))))
 
 ;; ---- 2. everything that needs a key: the openssl CLI --------------------
 
@@ -509,7 +624,24 @@
 ;; can capture, and a regression here would HANG rather than fail, which is
 ;; the one outcome a test must not inflict on the suite that runs it.
 
-(define (child-loads label loader-form path expected)
+;; Run one loader in a child and report what it said. The child is killed
+;; by a shell watchdog after `kill-after` seconds, because every regression
+;; guarded here HANGS rather than fails -- a terminal prompt waiting on
+;; stdin, a key derivation the attacker sized, a FIFO with no writer -- and
+;; a suite must not be hangable by the thing it is testing. `timeout(1)` is
+;; not used: it is not in the base system everywhere this runs.
+(define (child-run script kill-after)
+  (cap (string-append
+         "bin=\"${SCHEME_BIN:-}\"; "
+         "[ -n \"$bin\" ] || { if command -v chez >/dev/null 2>&1; "
+         "then bin=chez; else bin=scheme; fi; }; "
+         "\"$bin\" --script " script " < /dev/null & cpid=$!; "
+         "( sleep " (number->string kill-after)
+         "; kill -9 $cpid >/dev/null 2>&1 ) & wpid=$!; "
+         "wait $cpid >/dev/null 2>&1; "
+         "kill $wpid >/dev/null 2>&1; wait $wpid >/dev/null 2>&1; true")))
+
+(define (write-child-script loader-form path)
   (let ((script (p "child.sc")))
     (write-bytes script
       (u (string-append
@@ -519,23 +651,39 @@
            "                          'rsa-error 'other-raise)))\n"
            "  (" loader-form " \"" path "\") 'loaded))\n"
            "(newline)\n")))
-    ;; the same interpreter-discovery run-all.sh uses, so this works whether
-    ;; the suite was started with scheme, chez or $SCHEME_BIN
-    (let ((out (cap (string-append
-                      "bin=\"${SCHEME_BIN:-}\"; "
-                      "[ -n \"$bin\" ] || { if command -v chez >/dev/null 2>&1; "
-                      "then bin=chez; else bin=scheme; fi; }; "
-                      "\"$bin\" --script " script " < /dev/null"))))
-      (cond
-        ((not (contains? out "CHILD "))
-         (fail (string-append label "-child-ran"))
-         (display "    child output: ") (write out) (newline))
-        (else
-          (check (string-append label "-raises-cleanly")
-                 (contains? out (string-append "CHILD " expected)))
-          ;; the actual regression: OpenSSL asking for a passphrase
-          (check (string-append label "-does-not-prompt")
-                 (not (contains? out "pass phrase"))))))))
+    script))
+
+(define (child-loads label loader-form path expected)
+  (let ((out (child-run (write-child-script loader-form path) 60)))
+    (cond
+      ((not (contains? out "CHILD "))
+       (fail (string-append label "-child-ran"))
+       (display "    child output: ") (write out) (newline))
+      (else
+        (check (string-append label "-raises-cleanly")
+               (contains? out (string-append "CHILD " expected)))
+        ;; the actual regression: OpenSSL asking for a passphrase
+        (check (string-append label "-does-not-prompt")
+               (not (contains? out "pass phrase")))))))
+
+;; Same, but the assertion is about the CLOCK: the loader must come back
+;; with an answer inside `limit-ms`, so that "it refused" is distinguished
+;; from "it is still working on it". The watchdog is set well beyond the
+;; limit, so a regression is reported as a slow child rather than as a
+;; missing one.
+(define (child-loads-promptly label loader-form path expected limit-ms)
+  (let* ((script (write-child-script loader-form path))
+         (t0 (real-time))
+         (out (child-run script (div (* 3 limit-ms) 1000)))
+         (elapsed (- (real-time) t0)))
+    (check (string-append label "-answers")
+           (contains? out (string-append "CHILD " expected)))
+    (unless (contains? out (string-append "CHILD " expected))
+      (display "    child output: ") (write out) (newline))
+    (check (string-append label "-within-" (number->string limit-ms) "ms")
+           (< elapsed limit-ms))
+    (display "    [clock] ") (display label) (display ": ")
+    (display elapsed) (display " ms\n")))
 
 (when have-keys?
   (child-loads "encrypted-private-pem" "rsa-load-private-key" (p "a.enc.pem") "rsa-error")
@@ -558,6 +706,178 @@
          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
          "-----END RSA PRIVATE KEY-----\n")))
   (child-loads "hostile-private-pem" "rsa-load-private-key" (p "hostile.pem") "rsa-error"))
+
+;; An ENCRYPTED PKCS#8 key whose password is the EMPTY STRING. This is the
+;; one that says whether the passphrase handling refuses or guesses: with a
+;; NULL callback and a non-NULL userdata OpenSSL treats the userdata AS the
+;; passphrase, so an empty C string is not "do not ask", it is "try the
+;; empty password" -- and this key is encrypted under exactly that password,
+;; so it decrypts and loads. The library's contract says unencrypted PEM
+;; only, whatever the password happens to be.
+(when have-keys?
+  (system (string-append "cd " dir " && openssl pkcs8 -topk8 -in a.pem "
+                         "-out empty.enc.pem -passout pass: -v2 aes-256-cbc "
+                         "2>/dev/null"))
+  (if (not (file-exists? (p "empty.enc.pem")))
+      (begin
+        (fail "openssl-generated-the-empty-passphrase-key")
+        (display "    `openssl pkcs8 -passout pass:` did not produce a key\n")
+        (display "    encrypted under the empty password, so the check that\n")
+        (display "    an empty passphrase is REFUSED rather than TRIED could\n")
+        (display "    not run.\n"))
+      (check "pem-encrypted-under-the-empty-passphrase-refused"
+        (rsa-error? (lambda () (rsa-load-private-key (p "empty.enc.pem")))))))
+
+;; And the reason refusing matters beyond the contract: an encrypted PEM
+;; names its own key-derivation parameters, so an attacker who can hand one
+;; in picks the iteration count. The derivation runs inside a single
+;; unpreemptible FFI call, so on a one-thread runtime it stops every green
+;; process, every timer and all supervision for as long as it was asked to.
+;; The PEM below carries a PBKDF2 iteration count of 2147483647 -- minutes
+;; of work -- reached by generating one at 8388608 (under a second) and
+;; patching the count in place, since both encode in four DER bytes and
+;; nothing else in the structure moves. A loader that refuses the passphrase
+;; request never starts the derivation, so it must answer in well under a
+;; second; the assertion is on the clock, in a child, because the regression
+;; is a hang.
+(define kdf-bomb?
+  (and have-keys?
+       (begin
+         (system (string-append "cd " dir " && openssl pkcs8 -topk8 -in a.pem "
+                                "-outform DER -out kdf.der -passout pass: "
+                                "-v2 aes-256-cbc -iter 8388608 2>/dev/null"))
+         (and (file-exists? (p "kdf.der"))
+              (let* ((der (read-bytes (p "kdf.der")))
+                     ;; DER INTEGER 8388608, four content bytes
+                     (at (bv-find der (bytevector #x02 #x04 #x00 #x80 #x00 #x00))))
+                (and at
+                     (begin
+                       (bytevector-copy! (bytevector #x02 #x04 #x7f #xff #xff #xff)
+                                         0 der at 6)
+                       (write-bytes (p "kdf.patched.der") der)
+                       (system (string-append
+                                 "cd " dir " && { echo '-----BEGIN ENCRYPTED PRIVATE KEY-----'; "
+                                 "openssl base64 -in kdf.patched.der; "
+                                 "echo '-----END ENCRYPTED PRIVATE KEY-----'; } > kdfbomb.pem"))
+                       (file-exists? (p "kdfbomb.pem")))))))))
+
+(when (and have-keys? (not kdf-bomb?))
+  (display "  SKIP key-derivation-bomb check: this openssl build would not\n")
+  (display "       produce a PBES2/PBKDF2 key at -iter 8388608, or encoded\n")
+  (display "       the iteration count differently, so the count could not be\n")
+  (display "       patched up to 2147483647. The empty-passphrase refusal\n")
+  (display "       above covers the same code path without the clock.\n"))
+
+(when kdf-bomb?
+  (child-loads-promptly "kdf-bomb-pem" "rsa-load-private-key"
+                        (p "kdfbomb.pem") "rsa-error" 5000))
+
+;; ---- RSA-PSS is a different algorithm wearing the same parameters ------
+;;
+;; EVP_PKEY_get1_RSA unwraps an id-RSASSA-PSS key perfectly happily, and the
+;; EVP_PKEY that reaches EVP_DigestSign still carries the PSS type -- so a
+;; key loaded this way would make rsa-sign-sha256 emit randomised PSS
+;; signatures under a procedure whose name, and whose whole file, promise
+;; PKCS#1 v1.5. It has to be refused at load.
+
+(define pss?
+  (and have-keys?
+       (begin
+         (system (string-append "cd " dir " && openssl genpkey -algorithm RSA-PSS "
+                                "-pkeyopt rsa_keygen_bits:2048 -out pss.pem 2>/dev/null "
+                                "&& openssl pkey -in pss.pem -pubout -out pss.pub 2>/dev/null"))
+         (and (file-exists? (p "pss.pem")) (file-exists? (p "pss.pub"))))))
+
+(when (and have-keys? (not pss?))
+  (display "  SKIP RSA-PSS refusal checks: this openssl build would not\n")
+  (display "       generate an RSA-PSS key (`openssl genpkey -algorithm\n")
+  (display "       RSA-PSS`). Every other key check ran.\n"))
+
+(when pss?
+  (check "rsa-pss-private-pem-refused"
+    (rsa-error? (lambda () (rsa-load-private-key (p "pss.pem")))))
+  (check "rsa-pss-public-pem-refused"
+    (rsa-error? (lambda () (rsa-load-public-key (p "pss.pub")))))
+  ;; and the same key handed over as text, not as a path
+  (check "rsa-pss-public-pem-as-string-refused"
+    (rsa-error? (lambda () (rsa-public-key-from-pem (read-text (p "pss.pub")))))))
+
+;; ---- a key too small to be worth verifying with -------------------------
+
+(define k1024?
+  (and have-keys?
+       (begin
+         (system (string-append "cd " dir " && openssl genpkey -algorithm RSA "
+                                "-pkeyopt rsa_keygen_bits:1024 -out k1024.pem 2>/dev/null "
+                                "&& openssl rsa -in k1024.pem -pubout -out k1024.pub 2>/dev/null"))
+         (and (file-exists? (p "k1024.pem")) (file-exists? (p "k1024.pub"))))))
+
+(when (and have-keys? (not k1024?))
+  (display "  SKIP 1024-bit refusal checks on a real key: this openssl build\n")
+  (display "       would not generate a 1024-bit RSA key (several now refuse\n")
+  (display "       below 2048 by policy). The synthetic 1024-bit modulus\n")
+  (display "       check above covers the same rule.\n"))
+
+(when k1024?
+  (check "real-1024-bit-private-key-refused"
+    (rsa-error? (lambda () (rsa-load-private-key (p "k1024.pem")))))
+  (check "real-1024-bit-public-key-refused"
+    (rsa-error? (lambda () (rsa-load-public-key (p "k1024.pub"))))))
+
+;; ---- how big a PEM is allowed to be -------------------------------------
+;;
+;; PEM readers skip whatever precedes the BEGIN line, so "a valid key with a
+;; lot of text in front of it" is a PEM as far as OpenSSL is concerned. The
+;; bound has to be applied to the input, not inferred from its shape.
+
+(when have-keys?
+  (let ((padded (string-append (make-string 70000 #\newline)
+                               (read-text (p "a.pub")))))
+    (check "valid-key-behind-70KB-of-padding-refused"
+      (rsa-error? (lambda () (rsa-public-key-from-pem padded))))
+    ;; the same key without the padding still loads, so the refusal above is
+    ;; about the size and not about the leading blank lines
+    (check "same-key-with-a-little-padding-still-loads"
+      (rsa-key? (rsa-public-key-from-pem
+                  (string-append (make-string 100 #\newline)
+                                 (read-text (p "a.pub"))))))))
+
+;; ---- a path is not just a name for bytes --------------------------------
+;;
+;; open() on a FIFO with no writer blocks forever and /dev/zero never
+;; reaches EOF; on one OS thread either one stops every green process, and
+;; no actor timeout can interrupt it, because the thread that would run the
+;; timeout is the thread that is blocked. Both must be refused on the stat,
+;; before the open. Child processes with a clock, again, because the
+;; regression is a hang and (for /dev/zero) an unbounded allocation.
+
+(when have-keys?
+  (system (string-append "rm -f " (p "fifo.pem") " && mkfifo " (p "fifo.pem")
+                         " 2>/dev/null"))
+  (if (not (file-exists? (p "fifo.pem")))
+      (begin
+        (display "  SKIP FIFO refusal check: `mkfifo` is not available here,\n")
+        (display "       so there is no way to present a path that blocks on\n")
+        (display "       open. The character-device check below covers the\n")
+        (display "       same rule.\n"))
+      (child-loads-promptly "fifo-key-path" "rsa-load-private-key"
+                            (p "fifo.pem") "rsa-error" 5000))
+  (if (not (file-exists? "/dev/zero"))
+      (begin
+        (display "  SKIP character-device refusal check: this host has no\n")
+        (display "       /dev/zero, so there is nothing that reads forever\n")
+        (display "       without reaching EOF.\n"))
+      (child-loads-promptly "char-device-key-path" "rsa-load-public-key"
+                            "/dev/zero" "rsa-error" 5000)))
+
+;; An empty file is a malformed key, and must be reported as one -- not as
+;; "PEM must be a string or a bytevector", which is what a port EOF object
+;; handed straight to the parser produces.
+(when have-keys?
+  (check "empty-file-raises-rsa-error"
+    (rsa-error? (lambda () (rsa-load-public-key (p "empty.pem")))))
+  (check "empty-file-raises-rsa-error-private"
+    (rsa-error? (lambda () (rsa-load-private-key (p "empty.pem"))))))
 
 ;; ---- rsa-key-free! ------------------------------------------------------
 
@@ -582,6 +902,124 @@
       ;; and a freed key does not poison the ones still loaded
       (check "other-keys-unaffected-by-free"
         (rsa-verify-sha256 (rsa-load-public-key (p "a.pub")) msg sig)))))
+
+;; ---- the OpenSSL error queue belongs to the OS thread ------------------
+;;
+;; One OS thread runs every green process, so all of them share one error
+;; queue. A library that calls ERR_clear_error on its failure path deletes
+;; whatever else was on it -- a TLS session preempted between SSL_read and
+;; SSL_get_error, say -- and one that clears nothing leaves its own failures
+;; to be reported as somebody else's reason. The answer is a scope: mark on
+;; entry, pop to the mark on exit, so exactly what this operation pushed
+;; goes away and nothing else does. Checked from outside the library,
+;; against the same libcrypto it loaded.
+
+(define ERR_clear_error #f)
+(define ERR_peek_error #f)
+(define push-openssl-error! #f)
+
+(let ()
+  (import (igropyr platform))
+  (load-first-shared-object! 'rsa-test (shared-object-candidates "libcrypto"))
+  (set! ERR_clear_error (foreign-procedure "ERR_clear_error" () void))
+  (set! ERR_peek_error (foreign-procedure "ERR_peek_error" () unsigned-long))
+  (let ((BIO_new_mem_buf (foreign-procedure "BIO_new_mem_buf" (void* int) void*))
+        (BIO_free (foreign-procedure "BIO_free" (void*) int))
+        (PEM_read_bio_PUBKEY
+          (foreign-procedure "PEM_read_bio_PUBKEY" (void* void* void* void*) void*))
+        (memcpy-to-c (foreign-procedure "memcpy" (void* u8* size_t) void*))
+        ;; no Proc-Type/DEK-Info, so a NULL callback cannot reach a
+        ;; passphrase prompt; it just fails and leaves entries on the queue
+        (garbage (u "-----BEGIN PUBLIC KEY-----\nAAAAAAAAAAAAAAAA\n-----END PUBLIC KEY-----\n")))
+    (set! push-openssl-error!
+      (lambda ()
+        (let* ((len (bytevector-length garbage))
+               (buf (foreign-alloc len)))
+          (memcpy-to-c buf garbage len)
+          (let ((bio (BIO_new_mem_buf buf len)))
+            (PEM_read_bio_PUBKEY bio 0 0 0)
+            (BIO_free bio))
+          (foreign-free buf))))))
+
+(let ((bad-sig (flip rfc7515-sig 100)))
+  ;; each check plants its own entry, so one failing cannot make the next
+  ;; fail for a reason that is not its own
+  (define (with-planted-error thunk)
+    (ERR_clear_error)
+    (push-openssl-error!)
+    (let ((planted (ERR_peek_error)))
+      (guard (e (#t #t)) (thunk))
+      (and (not (zero? planted)) (= planted (ERR_peek_error)))))
+  (define (leaves-nothing thunk)
+    (ERR_clear_error)
+    (guard (e (#t #t)) (thunk))
+    (zero? (ERR_peek_error)))
+  (ERR_clear_error)
+  (push-openssl-error!)
+  (if (zero? (ERR_peek_error))
+      (begin
+        (ERR_clear_error)
+        (display "  SKIP error-queue scoping checks: a deliberately malformed\n")
+        (display "       PEM left nothing on this build's error queue, so there\n")
+        (display "       is no planted entry to see preserved and the checks\n")
+        (display "       would pass vacuously.\n"))
+      (begin
+        (ERR_clear_error)
+        (check "rejected-signature-preserves-an-unrelated-error"
+          (with-planted-error
+            (lambda () (rsa-verify-sha256 rfc-key rfc7515-input bad-sig))))
+        (check "accepted-signature-preserves-an-unrelated-error"
+          (with-planted-error
+            (lambda () (rsa-verify-sha256 rfc-key rfc7515-input rfc7515-sig))))
+        (check "failed-pem-parse-preserves-an-unrelated-error"
+          (with-planted-error
+            (lambda () (rsa-public-key-from-pem "not a PEM at all"))))
+        (check "key-from-modulus-preserves-an-unrelated-error"
+          (with-planted-error
+            (lambda () (rsa-public-key-from-modulus rfc7515-n rfc7515-e))))
+        ;; and in the other direction: nothing of its own is left behind.
+        ;; The public-key loader is the sharpest case -- it tries three
+        ;; parsers, so two of them always fail even on a key it accepts.
+        (check "rejected-signature-leaves-nothing-behind"
+          (leaves-nothing
+            (lambda () (rsa-verify-sha256 rfc-key rfc7515-input bad-sig))))
+        (check "failed-pem-parse-leaves-nothing-behind"
+          (leaves-nothing
+            (lambda () (rsa-public-key-from-pem "not a PEM at all"))))
+        (when have-keys?
+          (check "successful-pem-parse-leaves-nothing-behind"
+            (leaves-nothing (lambda () (rsa-load-public-key (p "a.pub")))))
+          (check "successful-private-pem-parse-leaves-nothing-behind"
+            (leaves-nothing (lambda () (rsa-load-private-key (p "a.pem"))))))
+        (ERR_clear_error))))
+
+;; NOT TESTED, and said out loud rather than covered by an assertion that
+;; could not fail:
+;;
+;;  - That the PEM is copied into memory C owns before BIO_new_mem_buf sees
+;;    it. The bug it prevents needs a collection to land between the BIO
+;;    construction and the PEM reader, and Scheme cannot ask for a
+;;    collection at a point inside a procedure it is calling. Verifiable
+;;    only by reading with-bio.
+;;
+;;  - That sign and verify hold their own EVP_PKEY reference, so a rotation
+;;    that frees the key while an operation is in flight cannot hand
+;;    OpenSSL a dangling pointer. Reaching the window needs two processes
+;;    interleaved inside one operation, and the operation now runs with
+;;    preemption off precisely so that cannot happen -- the property and
+;;    the means of provoking it exclude each other. Verifiable only by
+;;    reading with-pkey-ref.
+;;
+;;  - That a verification which could not be PERFORMED raises instead of
+;;    answering #f. The reachable trigger the review named was an RSA-PSS
+;;    key restricted to another digest, and refusing PSS keys at load (see
+;;    above) removes it; what is left -- a provider or policy refusal, an
+;;    allocation failure inside EVP_DigestVerifyInit -- cannot be
+;;    provoked from Scheme. What IS pinned, by the signature checks
+;;    throughout this file, is the other half of that boundary: a
+;;    malformed, truncated, over-long, all-zero or all-ones signature must
+;;    still answer #f and must NOT raise, which is what would break first
+;;    if the classification were widened too far.
 
 ;; ---- FFI discipline: contexts and BIOs freed on the failing paths ------
 ;;

@@ -37,8 +37,43 @@
 ;;; SIZE is the caller's own configuration and raises immediately. A tag or
 ;;; a ciphertext that fails to authenticate -- including a tag of the wrong
 ;;; length, which can never authenticate -- is attacker-supplied input, and
-;;; the answer is #f. Decryption never returns partial or unauthenticated
-;;; plaintext: the buffer is handed back only after the tag check passes.
+;;; the answer is #f. The split is decided on the CALLER's arguments before
+;;; any attacker-controlled length is looked at, so a short sealed message
+;;; cannot decide whether a malformed aad is reported at all. Decryption
+;;; never returns partial or unauthenticated plaintext: the buffer is handed
+;;; back only after the tag check passes, and when the tag is rejected the
+;;; buffer GCM already decrypted into is overwritten with zeros before it is
+;;; dropped -- unauthenticated plaintext that nothing will read is still
+;;; plaintext sitting in the heap for a core file to pick up. (Best effort,
+;;; and worth saying why: the collector may have copied that buffer before
+;;; the wipe, and a kill lands with the whole scope non-preemptible, so the
+;;; wipe is skipped only when the process dies anyway.)
+;;;
+;;; Type errors report the TYPE, never the value: the value here is a key,
+;;; a plaintext or associated data, and irritants get printed by every
+;;; logger that renders a condition.
+;;;
+;;; SCHEDULING AND OWNERSHIP. One OS thread runs every green process, so an
+;;; FFI call is not preemptible and a kill discards dynamic-wind winders --
+;;; which is what would otherwise free the EVP_CIPHER_CTX. So each operation
+;;; runs inside with-openssl-scope: preemption off for the whole
+;;; acquire/use/release interval, which is precisely the property that makes
+;;; the winder reliable (a process that cannot be preempted cannot be
+;;; killed). The scope also brackets OpenSSL's error queue with
+;;; ERR_set_mark / ERR_pop_to_mark. That queue is per OS THREAD and every
+;;; green process shares one, so a bare ERR_clear_error would delete entries
+;;; belonging to whoever was preempted last -- an in-flight TLS session, say
+;;; -- while leaving none behind would let a rejected tag be reported as
+;;; some unrelated call's reason. Popping to a mark removes exactly what
+;;; this operation added.
+;;;
+;;; These are ONE-SHOT procedures: the whole plaintext, ciphertext and aad
+;;; go through libcrypto in a single Update, so the stall they impose on
+;;; every other green process is proportional to their input. There is no
+;;; maximum here -- the argument is a bytevector the caller already holds
+;;; entire, so a cap would only move the failure -- but a caller feeding
+;;; these hundreds of megabytes is asking for a stall of that size, and
+;;; should be streaming instead.
 ;;;
 ;;; libcrypto FFI, the same OpenSSL (igropyr tls) and (igropyr kdf) load.
 ;;; Only AES-256 is offered; a 128-bit variant would be a second name to
@@ -92,7 +127,24 @@
   (define EVP_CIPHER_CTX_ctrl/null
     (foreign-procedure "EVP_CIPHER_CTX_ctrl" (void* int int void*) int))
   (define RAND_bytes (foreign-procedure "RAND_bytes" (u8* int) int))
-  (define ERR_clear_error (foreign-procedure "ERR_clear_error" () void))
+
+  ;; Error-queue scoping. ERR_set_mark records the current top of the
+  ;; per-thread queue; ERR_pop_to_mark drops everything pushed above it.
+  (define ERR_set_mark    (foreign-procedure "ERR_set_mark" () int))
+  (define ERR_pop_to_mark (foreign-procedure "ERR_pop_to_mark" () int))
+
+  ;; One region per public operation: preemption off for its whole extent
+  ;; (so the EVP_CIPHER_CTX winder cannot be discarded by a kill), and the
+  ;; error queue bracketed so this operation's failures are removed and
+  ;; nobody else's are. See SCHEDULING AND OWNERSHIP above.
+  (define-syntax with-openssl-scope
+    (syntax-rules ()
+      ((_ body ...)
+       (with-interrupts-disabled
+         (dynamic-wind
+           (lambda () (ERR_set_mark))
+           (lambda () body ...)
+           (lambda () (ERR_pop_to_mark)))))))
 
   ;; EVP_CTRL_AEAD_* -- stable across OpenSSL 1.1 and 3.x
   (define EVP_CTRL_GCM_SET_IVLEN #x9)
@@ -108,15 +160,48 @@
     (unless (and (fixnum? n) (fx> n 0))
       (assertion-violation 'aead-random-bytes "n must be a positive fixnum" n))
     (let ((bv (make-bytevector n)))
-      (if (fx= 1 (RAND_bytes bv n))
+      (if (with-openssl-scope (fx= 1 (RAND_bytes bv n)))
           bv
           (aead-fail "RAND_bytes failed"))))
 
   ;; ---- argument shapes ---------------------------------------------------
 
+  ;; Type errors name the type, never the value: what is being passed here
+  ;; is a key, a plaintext or associated data.
+  (define (type-name x)
+    (cond ((bytevector? x) 'bytevector)
+          ((string? x) 'string)
+          ((symbol? x) 'symbol)
+          ((number? x) 'number)
+          ((char? x) 'char)
+          ((boolean? x) 'boolean)
+          ((null? x) 'null)
+          ((pair? x) 'pair)
+          ((vector? x) 'vector)
+          ((procedure? x) 'procedure)
+          ((port? x) 'port)
+          (else 'other)))
+
+  ;; EVP_*Update and the IVLEN control take a C `int`, and Chez converts an
+  ;; out-of-range argument by TRUNCATING it -- 2^31 arrives as -2147483648
+  ;; and 2^32 as 0 -- so a bytevector this long would silently become a
+  ;; different length on the other side of the FFI. The length-agreement
+  ;; checks below would catch what came back, but "the answer disagreed with
+  ;; itself" is not the report to give for an input that was never
+  ;; representable. NOT covered by a test: reaching it needs a two-gigabyte
+  ;; bytevector plus the buffers the call would build on top of it, which is
+  ;; not an allocation a suite should make on every run.
+  (define aead-max-bytes (- (expt 2 31) 1))
+
   (define (need-bv who what x)
     (unless (bytevector? x)
-      (assertion-violation who (string-append what " must be a bytevector") x))
+      (assertion-violation who (string-append what " must be a bytevector")
+                           (type-name x)))
+    (when (fx> (bytevector-length x) aead-max-bytes)
+      (assertion-violation who
+        (string-append what " is longer than this cipher API can address"
+                       " (2 GiB - 1)")
+        (bytevector-length x)))
     x)
 
   (define (check-key who key)
@@ -133,16 +218,16 @@
   (define (check-iv who iv)
     (need-bv who "iv" iv)
     (when (fx= 0 (bytevector-length iv))
-      (assertion-violation who "iv must not be empty" iv))
+      (assertion-violation who "iv must not be empty" 0))
     iv)
 
   (define empty-bytes (make-bytevector 0))
 
   (define (check-aad who aad)
     (cond ((not aad) empty-bytes)
-          ((bytevector? aad) aad)
+          ((bytevector? aad) (need-bv who "aad" aad))
           (else (assertion-violation who
-                  "aad must be a bytevector or #f" aad))))
+                  "aad must be a bytevector or #f" (type-name aad)))))
 
   (define (with-cipher-ctx proc)
     (let ((ctx (EVP_CIPHER_CTX_new)))
@@ -176,44 +261,99 @@
       (need-bv who "plaintext" plaintext)
       (let ((ad (check-aad who aad))
             (ptlen (bytevector-length plaintext)))
-        (with-cipher-ctx
-          (lambda (ctx)
-            (let ((outl (make-outl))
-                  ;; +16: a block's slack, so a mode that is not
-                  ;; length-preserving cannot write past the end. GCM never
-                  ;; uses it, and the length check below says so out loud.
-                  (buf (make-bytevector (fx+ ptlen 16) 0))
-                  (tag (make-bytevector aes-256-gcm-tag-bytes 0)))
-              (unless (fx= 1 (EVP_EncryptInit_ex/cipher ctx (EVP_aes_256_gcm) 0 0 0))
-                (aead-fail "EVP_EncryptInit_ex(cipher) failed"))
-              (unless (fx= 1 (EVP_CIPHER_CTX_ctrl/null ctx EVP_CTRL_GCM_SET_IVLEN
-                                                       (bytevector-length iv) 0))
-                (aead-fail "EVP_CIPHER_CTX_ctrl(SET_IVLEN) failed"))
-              (unless (fx= 1 (EVP_EncryptInit_ex/key ctx 0 0 key iv))
-                (aead-fail "EVP_EncryptInit_ex(key) failed"))
-              (feed-aad! who ctx EVP_EncryptUpdate/aad outl ad)
-              (let ((n (if (fx= 0 ptlen)
-                           0
-                           (begin
-                             (unless (fx= 1 (EVP_EncryptUpdate ctx buf outl
-                                                               plaintext ptlen))
-                               (aead-fail "EVP_EncryptUpdate failed"))
-                             (outl-ref outl)))))
-                (let ((fin (make-bytevector 16 0)))
-                  (unless (fx= 1 (EVP_EncryptFinal_ex ctx fin outl))
-                    (aead-fail "EVP_EncryptFinal_ex failed"))
-                  (let* ((m (outl-ref outl)) (total (fx+ n m)))
-                    (when (fx> m 0) (bytevector-copy! fin 0 buf n m))
-                    (unless (fx= total ptlen)
-                      (aead-fail "ciphertext length does not match plaintext"))
-                    (unless (fx= 1 (EVP_CIPHER_CTX_ctrl ctx EVP_CTRL_GCM_GET_TAG
-                                                        aes-256-gcm-tag-bytes tag))
-                      (aead-fail "EVP_CIPHER_CTX_ctrl(GET_TAG) failed"))
-                    (let ((ct (make-bytevector total)))
-                      (bytevector-copy! buf 0 ct 0 total)
-                      (vector ct tag)))))))))))
+        (with-openssl-scope
+          (with-cipher-ctx
+            (lambda (ctx)
+              (let ((outl (make-outl))
+                    ;; +16: a block's slack, so a mode that is not
+                    ;; length-preserving cannot write past the end. GCM never
+                    ;; uses it, and the length check below says so out loud;
+                    ;; the slack is then cut off in place rather than copied
+                    ;; away, so one payload-sized buffer exists, not two.
+                    (buf (make-bytevector (fx+ ptlen 16) 0))
+                    (tag (make-bytevector aes-256-gcm-tag-bytes 0)))
+                (unless (fx= 1 (EVP_EncryptInit_ex/cipher ctx (EVP_aes_256_gcm) 0 0 0))
+                  (aead-fail "EVP_EncryptInit_ex(cipher) failed"))
+                (unless (fx= 1 (EVP_CIPHER_CTX_ctrl/null ctx EVP_CTRL_GCM_SET_IVLEN
+                                                         (bytevector-length iv) 0))
+                  (aead-fail "EVP_CIPHER_CTX_ctrl(SET_IVLEN) failed"))
+                (unless (fx= 1 (EVP_EncryptInit_ex/key ctx 0 0 key iv))
+                  (aead-fail "EVP_EncryptInit_ex(key) failed"))
+                (feed-aad! who ctx EVP_EncryptUpdate/aad outl ad)
+                (let ((n (if (fx= 0 ptlen)
+                             0
+                             (begin
+                               (unless (fx= 1 (EVP_EncryptUpdate ctx buf outl
+                                                                 plaintext ptlen))
+                                 (aead-fail "EVP_EncryptUpdate failed"))
+                               (outl-ref outl)))))
+                  (let ((fin (make-bytevector 16 0)))
+                    (unless (fx= 1 (EVP_EncryptFinal_ex ctx fin outl))
+                      (aead-fail "EVP_EncryptFinal_ex failed"))
+                    (let* ((m (outl-ref outl)) (total (fx+ n m)))
+                      (when (fx> m 0) (bytevector-copy! fin 0 buf n m))
+                      (unless (fx= total ptlen)
+                        (aead-fail "ciphertext length does not match plaintext"))
+                      (unless (fx= 1 (EVP_CIPHER_CTX_ctrl ctx EVP_CTRL_GCM_GET_TAG
+                                                          aes-256-gcm-tag-bytes tag))
+                        (aead-fail "EVP_CIPHER_CTX_ctrl(GET_TAG) failed"))
+                      ;; the RETURN value: truncating to zero cannot be done
+                      ;; in place, so it hands back the empty bytevector
+                      (vector (bytevector-truncate! buf total) tag)))))))))))
 
   ;; ---- decryption --------------------------------------------------------
+
+  ;; The engine. Arguments are already validated, and `ctlen` says how much
+  ;; of `ciphertext` to consume from the front -- which is what lets
+  ;; aes-256-gcm-open hand the sealed message straight through instead of
+  ;; copying the payload out of it just to throw the copy away when the tag
+  ;; is wrong.
+  (define (decrypt-core who key iv ciphertext ctlen ad tag)
+    (with-openssl-scope
+      (with-cipher-ctx
+        (lambda (ctx)
+          (let ((outl (make-outl))
+                (buf (make-bytevector (fx+ ctlen 16) 0)))
+            (unless (fx= 1 (EVP_DecryptInit_ex/cipher ctx (EVP_aes_256_gcm) 0 0 0))
+              (aead-fail "EVP_DecryptInit_ex(cipher) failed"))
+            (unless (fx= 1 (EVP_CIPHER_CTX_ctrl/null ctx EVP_CTRL_GCM_SET_IVLEN
+                                                     (bytevector-length iv) 0))
+              (aead-fail "EVP_CIPHER_CTX_ctrl(SET_IVLEN) failed"))
+            (unless (fx= 1 (EVP_DecryptInit_ex/key ctx 0 0 key iv))
+              (aead-fail "EVP_DecryptInit_ex(key) failed"))
+            (feed-aad! who ctx EVP_DecryptUpdate/aad outl ad)
+            (let ((n (if (fx= 0 ctlen)
+                         0
+                         (begin
+                           (unless (fx= 1 (EVP_DecryptUpdate ctx buf outl
+                                                             ciphertext ctlen))
+                             (bytevector-fill! buf 0)
+                             (aead-fail "EVP_DecryptUpdate failed"))
+                           (outl-ref outl)))))
+              (unless (fx= 1 (EVP_CIPHER_CTX_ctrl ctx EVP_CTRL_GCM_SET_TAG
+                                                  aes-256-gcm-tag-bytes tag))
+                (bytevector-fill! buf 0)
+                (aead-fail "EVP_CIPHER_CTX_ctrl(SET_TAG) failed"))
+              (let ((fin (make-bytevector 16 0)))
+                (if (fx= 1 (EVP_DecryptFinal_ex ctx fin outl))
+                    (let* ((m (outl-ref outl)) (total (fx+ n m)))
+                      (when (fx> m 0) (bytevector-copy! fin 0 buf n m))
+                      (bytevector-fill! fin 0)
+                      (unless (fx= total ctlen)
+                        (bytevector-fill! buf 0)
+                        (aead-fail "plaintext length does not match ciphertext"))
+                      ;; the slack is cut off in place: the authenticated
+                      ;; plaintext exists once, not as a buffer plus a copy.
+                      ;; The RETURN value, because truncating to zero cannot
+                      ;; be done in place and hands back a fresh empty one.
+                      (bytevector-truncate! buf total))
+                    ;; authentication failed. GCM decrypted before the tag was
+                    ;; checked, so buf holds real plaintext that no caller may
+                    ;; see; wipe it rather than leave it for a core file.
+                    (begin
+                      (bytevector-fill! buf 0)
+                      (bytevector-fill! fin 0)
+                      #f)))))))))
 
   ;; -> plaintext bytevector, or #f if anything fails to authenticate.
   ;; Nothing is returned before EVP_DecryptFinal_ex has checked the tag.
@@ -223,43 +363,12 @@
       (check-iv who iv)
       (need-bv who "ciphertext" ciphertext)
       (need-bv who "tag" tag)
-      (let ((ad (check-aad who aad))
-            (ctlen (bytevector-length ciphertext)))
+      (let ((ad (check-aad who aad)))
         ;; a truncated tag can never authenticate -- refusing it here is the
         ;; same answer, reached without touching the cipher
         (and (fx= aes-256-gcm-tag-bytes (bytevector-length tag))
-             (with-cipher-ctx
-               (lambda (ctx)
-                 (let ((outl (make-outl))
-                       (buf (make-bytevector (fx+ ctlen 16) 0)))
-                   (unless (fx= 1 (EVP_DecryptInit_ex/cipher ctx (EVP_aes_256_gcm) 0 0 0))
-                     (aead-fail "EVP_DecryptInit_ex(cipher) failed"))
-                   (unless (fx= 1 (EVP_CIPHER_CTX_ctrl/null ctx EVP_CTRL_GCM_SET_IVLEN
-                                                            (bytevector-length iv) 0))
-                     (aead-fail "EVP_CIPHER_CTX_ctrl(SET_IVLEN) failed"))
-                   (unless (fx= 1 (EVP_DecryptInit_ex/key ctx 0 0 key iv))
-                     (aead-fail "EVP_DecryptInit_ex(key) failed"))
-                   (feed-aad! who ctx EVP_DecryptUpdate/aad outl ad)
-                   (let ((n (if (fx= 0 ctlen)
-                                0
-                                (begin
-                                  (unless (fx= 1 (EVP_DecryptUpdate ctx buf outl
-                                                                    ciphertext ctlen))
-                                    (aead-fail "EVP_DecryptUpdate failed"))
-                                  (outl-ref outl)))))
-                     (unless (fx= 1 (EVP_CIPHER_CTX_ctrl ctx EVP_CTRL_GCM_SET_TAG
-                                                         aes-256-gcm-tag-bytes tag))
-                       (aead-fail "EVP_CIPHER_CTX_ctrl(SET_TAG) failed"))
-                     (let ((fin (make-bytevector 16 0)))
-                       (if (fx= 1 (EVP_DecryptFinal_ex ctx fin outl))
-                           (let* ((m (outl-ref outl)) (total (fx+ n m)))
-                             (when (fx> m 0) (bytevector-copy! fin 0 buf n m))
-                             (let ((pt (make-bytevector total)))
-                               (bytevector-copy! buf 0 pt 0 total)
-                               pt))
-                           ;; authentication failed: no plaintext leaves here,
-                           ;; and the failure does not stay on the error queue
-                           (begin (ERR_clear_error) #f)))))))))))
+             (decrypt-core who key iv ciphertext
+                           (bytevector-length ciphertext) ad tag)))))
 
   ;; ---- ciphertext with the tag attached ----------------------------------
 
@@ -278,13 +387,18 @@
       (check-key who key)
       (check-iv who iv)
       (need-bv who "sealed" sealed)
-      ;; too short to hold a tag: attacker-supplied, so #f, not a raise
-      (let ((len (bytevector-length sealed)))
+      ;; EVERY caller-supplied argument is checked before the first
+      ;; attacker-supplied length is looked at. Deciding the short-input
+      ;; case first would have made "is this aad even a bytevector?" depend
+      ;; on how many bytes an attacker sent.
+      (let ((ad (check-aad who aad))
+            (len (bytevector-length sealed)))
+        ;; too short to hold a tag: attacker-supplied, so #f, not a raise
         (and (fx>= len aes-256-gcm-tag-bytes)
-             (let* ((n (fx- len aes-256-gcm-tag-bytes))
-                    (ct (make-bytevector n))
-                    (tag (make-bytevector aes-256-gcm-tag-bytes)))
-               (bytevector-copy! sealed 0 ct 0 n)
+             (let ((n (fx- len aes-256-gcm-tag-bytes))
+                   (tag (make-bytevector aes-256-gcm-tag-bytes)))
                (bytevector-copy! sealed n tag 0 aes-256-gcm-tag-bytes)
-               (aes-256-gcm-decrypt key iv ct aad tag))))))
+               ;; sealed itself is the cipher input, bounded to its first n
+               ;; bytes: a forged megabyte costs one buffer, not three
+               (decrypt-core who key iv sealed n ad tag))))))
 )
