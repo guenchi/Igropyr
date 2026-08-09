@@ -19,6 +19,86 @@
         (only (igropyr ssr) make-ssr ssr-render ssr-try-render ssr-invalidate! ssr-stats)
         (only (igropyr quickjs) qjs-boot! qjs-call/bytes))
 
+(define failures 0)
+(define (fail label . info)
+  (set! failures (+ failures 1))
+  (display "FAIL  ") (display label)
+  (for-each (lambda (x) (display " ") (write x)) info)
+  (newline))
+(define (ok label) (display "  ok  ") (display label) (newline))
+(define (check label c) (if c (ok label) (fail label)))
+
+;; ---- a STRUCTURAL sentinel for the read stop ---------------------------
+;;
+;; worker-conn-loop*'s tcp-read-stop! has no behavioural test, and cannot
+;; have one on this runtime: deleting the call leaves the entire suite
+;; green. Reads happen only inside an event-loop poll, a poll happens only
+;; where the loop yields, and a processing pass never yields -- a render
+;; runs with interrupts disabled, and the bulk primitives around it burn
+;; no preemption ticks at all (measured: utf8->string of 8MiB lets a
+;; competing process run exactly zero times). No arrival order tells the
+;; two versions apart, so no probe can either. See the flood probe below,
+;; which reports the same figure with and without the call.
+;;
+;; What CAN be pinned is that the rule is still WRITTEN DOWN. This asserts
+;; tcp-read-stop! is the first thing on-data does. Deleting it turns this
+;; red; so does moving it below answer-all!, which is the subtler
+;; regression -- a render would then run with reads still on, which is
+;; precisely the window the rule exists to close.
+;;
+;; NOT A PROOF OF BEHAVIOUR, and it does not pretend to be one: it is a
+;; guard against silent removal of a rule whose effect this runtime cannot
+;; observe. Stated rather than dressed up as a functional test.
+;;
+;; IT RUNS BEFORE THE libquickjs GATE, deliberately. It reads source and
+;; needs no engine, so gating it would retire this rule's only protection
+;; on every host without QuickJS -- the exact silent-skip failure the
+;; suite's own conventions forbid.
+(let ()
+  (define path "igropyr/qjspool.sc")
+  (define (has? line sub)
+    (let ((n (string-length line)) (m (string-length sub)))
+      (let loop ((i 0))
+        (cond ((> (+ i m) n) #f)
+              ((string=? (substring line i (+ i m)) sub) #t)
+              (else (loop (+ i 1)))))))
+  (define (blank-or-comment? s)
+    (let loop ((i 0))
+      (cond ((= i (string-length s)) #t)
+            ((or (char=? (string-ref s i) #\space)
+                 (char=? (string-ref s i) #\tab))
+             (loop (+ i 1)))
+            ((char=? (string-ref s i) #\;) #t)
+            (else #f))))
+  ;; MISSING SOURCE IS A FAILURE, never a skip: this check costs nothing
+  ;; and has no environmental precondition, so "could not read it" can
+  ;; only mean the path assumption broke -- which would retire the check
+  ;; silently, exactly what it is here to prevent.
+  (if (not (file-exists? path))
+      (fail "the worker source can be read for the structural check" path)
+      (let ((lines (call-with-input-file path
+                     (lambda (in)
+                       (let loop ((acc '()))
+                         (let ((l (get-line in)))
+                           (if (eof-object? l) (reverse acc) (loop (cons l acc)))))))))
+        ;; the first line of real code after on-data's header
+        (let scan ((ls lines) (inside #f))
+          (cond
+            ((null? ls)
+             (if inside
+                 (fail "on-data has a first expression")
+                 (fail "on-data was found in the worker source")))
+            ((and (not inside) (has? (car ls) "(define (on-data bv)"))
+             (scan (cdr ls) #t))
+            ((not inside) (scan (cdr ls) #f))
+            ((blank-or-comment? (car ls)) (scan (cdr ls) #t))
+            (else
+             (check "reading is stopped as the FIRST act of a read pass, ahead of any render"
+                    (has? (car ls) "(tcp-read-stop! c)"))
+             (unless (has? (car ls) "(tcp-read-stop! c)")
+               (display "  [info] on-data's first expression is instead: ")
+               (display (car ls)) (newline))))))))
+
 ;; (igropyr quickjs) is the pure-Scheme binding: it needs a stock shared
 ;; libquickjs. Gate on that so run-all stays green on hosts without QuickJS.
 (define (quickjs-present?)
@@ -36,17 +116,16 @@
       (file-exists? "/usr/lib/libquickjs.so")
       (file-exists? "/usr/lib/quickjs/libquickjs.so")))
 
+;; WHAT IS SKIPPED IS THE WORKER TESTS, not the whole file: the
+;; structural check above reads source only, so it has already run and
+;; its verdict still decides the exit status. Saying "test skipped" while
+;; a check had in fact failed would be the report this suite's
+;; conventions exist to prevent.
 (unless (quickjs-present?)
-  (display "qjspool: no stock libquickjs found, test skipped\n") (exit 0))
-
-(define failures 0)
-(define (fail label . info)
-  (set! failures (+ failures 1))
-  (display "FAIL  ") (display label)
-  (for-each (lambda (x) (display " ") (write x)) info)
-  (newline))
-(define (ok label) (display "  ok  ") (display label) (newline))
-(define (check label c) (if c (ok label) (fail label)))
+  (display "qjspool: no stock libquickjs found, WORKER tests skipped\n")
+  (display "  (install a stock libquickjs, or set IGROPYR_LIBQUICKJS_SO, to run them;\n")
+  (display "   the structural check above needs no engine and did run)\n")
+  (exit (if (= failures 0) 0 1)))
 
 (define bundle-path "/tmp/igropyr-qjspool-bundle.js")
 ;; N counts renders IN THE WORKER, so a cache hit is provable from here:
