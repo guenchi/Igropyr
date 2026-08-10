@@ -40,6 +40,35 @@
 ;;; Connection: close and hard-closes the socket right after, and both
 ;;; framings it accepts (content-length, chunked) detect truncation by
 ;;; construction.
+;;;
+;;; One hazard is specific to running OpenSSL under green processes, and
+;;; shapes the code below: the error queue is per OS THREAD, this runtime
+;;; has one thread, so EVERY green process shares a single queue.
+;;;
+;;;   - SSL_get_error is not a function of (ssl, ret) alone. It peeks the
+;;;     queue FIRST and answers SSL_ERROR_SSL / SSL_ERROR_SYSCALL for
+;;;     whatever it finds there, before it ever consults the SSL object's
+;;;     own rwstate. So an entry pushed by an unrelated process between an
+;;;     SSL_* call and its SSL_get_error turns that call's verdict into a
+;;;     fatal one. Measured on 3.6.3: a handshake step and a read that are
+;;;     both genuinely SSL_ERROR_WANT_READ (2) report SSL_ERROR_SSL (1)
+;;;     when one foreign entry is planted in the gap. Both call sites here
+;;;     treat anything but WANT_READ as fatal, so this closes a live
+;;;     connection -- it is not merely a wrong message. Each SSL_* call,
+;;;     the test of its result, its SSL_get_error and the reading of its
+;;;     reason therefore run as one non-preemptible step (ssl-step).
+;;;     ONLY that: this library parks in receive and writes to a socket,
+;;;     and neither may ever happen with interrupts disabled.
+;;;
+;;;   - Conversely, a bare ERR_clear_error -- or a drain to the bottom of
+;;;     the queue -- deletes entries belonging to another process. Nothing
+;;;     here clears; every region is bracketed by ERR_set_mark /
+;;;     ERR_pop_to_mark and the message extraction never reads past its
+;;;     own mark. (SSL_read / SSL_write / SSL_do_handshake clear the whole
+;;;     queue themselves on entry in OpenSSL 3 -- also measured -- which
+;;;     is outside this library's control; nothing here relies on that
+;;;     happening, since the documented contract puts the requirement on
+;;;     the caller and older versions do not do it.)
 
 (library (igropyr tls)
   (export tls-enable! tls-establish!)
@@ -87,8 +116,16 @@
   (define BIO_ctrl_pending  (foreign-procedure "BIO_ctrl_pending" (void*) size_t))
 
   (define ERR_get_error     (foreign-procedure "ERR_get_error" () unsigned-long))
+  (define ERR_peek_error    (foreign-procedure "ERR_peek_error" () unsigned-long))
   (define ERR_error_string_n
     (foreign-procedure "ERR_error_string_n" (unsigned-long u8* size_t) void))
+  ;; Error-queue scoping. ERR_set_mark records the current top of the
+  ;; per-thread queue; ERR_pop_to_mark drops everything pushed above it
+  ;; (and, if the mark itself was destroyed by an ERR_clear_error inside
+  ;; OpenSSL, everything -- which is then exactly this region's own
+  ;; entries, since that clear removed the older ones first).
+  (define ERR_set_mark      (foreign-procedure "ERR_set_mark" () int))
+  (define ERR_pop_to_mark   (foreign-procedure "ERR_pop_to_mark" () int))
   (define SSL_CTX_free      (foreign-procedure "SSL_CTX_free" (void*) void))
   (define BIO_free          (foreign-procedure "BIO_free" (void*) int))
 
@@ -119,10 +156,36 @@
   (define SSL_CTRL_SET_MIN_PROTO_VERSION 123)
   (define TLS1_2_VERSION #x0303)
   (define SSL_CTRL_SET_TLSEXT_HOSTNAME 55)     ; SSL_set_tlsext_host_name
+  (define SSL_ERROR_NONE 0)
   (define SSL_ERROR_WANT_READ 2)
   (define SSL_ERROR_ZERO_RETURN 6)
 
   ;; ---- error reporting ---------------------------------------------------
+
+  ;; Does the queue hold an entry pushed since the enclosing scope's mark?
+  ;; ERR_count_to_mark answers exactly and is OpenSSL 3; without it the
+  ;; question degrades to "is the queue non-empty", which can attribute a
+  ;; foreign entry to us but still never DELETES one below the mark.
+  (define err-own-entry?
+    (if (foreign-entry? "ERR_count_to_mark")
+        (let ((f (foreign-procedure "ERR_count_to_mark" () int)))
+          (lambda () (fx> (f) 0)))
+        (lambda () (not (zero? (ERR_peek_error))))))
+
+  ;; One region per operation: preemption off for its whole extent, and
+  ;; the error queue bracketed so the region's own failures are removed
+  ;; and nobody else's are. NOTHING inside a scope may park, write to a
+  ;; socket, or otherwise block -- it would stop the entire runtime, and
+  ;; a process that cannot be preempted cannot be killed. Keep the bodies
+  ;; to the OpenSSL calls themselves and act on the result outside.
+  (define-syntax with-openssl-scope
+    (syntax-rules ()
+      ((_ body ...)
+       (with-interrupts-disabled
+         (dynamic-wind
+           (lambda () (ERR_set_mark))
+           (lambda () body ...)
+           (lambda () (ERR_pop_to_mark)))))))
 
   (define (bv-prefix->string bv)
     (let ((n (bytevector-length bv)))
@@ -134,15 +197,41 @@
                 r))
             (loop (+ i 1))))))
 
-  ;; First queued OpenSSL error as text (draining the rest), or default.
+  ;; This region's first queued OpenSSL error as text, or default. Only
+  ;; valid inside with-openssl-scope: entries below the mark belong to
+  ;; another green process, and neither reporting one as ours nor
+  ;; consuming it would be right. There is deliberately no drain loop --
+  ;; the rest of the region's own entries go with the scope's
+  ;; ERR_pop_to_mark, which stops at the mark; a drain would not.
   (define (tls-reason default)
-    (let ((e (ERR_get_error)))
-      (if (zero? e)
-          default
-          (let ((buf (make-bytevector 256 0)))
-            (ERR_error_string_n e buf 256)
-            (let drain () (unless (zero? (ERR_get_error)) (drain)))
-            (string-append "tls: " (bv-prefix->string buf))))))
+    (if (not (err-own-entry?))
+        default
+        (let ((e (ERR_get_error)))
+          (if (zero? e)
+              default
+              (let ((buf (make-bytevector 256 0)))
+                (ERR_error_string_n e buf 256)
+                (string-append "tls: " (bv-prefix->string buf)))))))
+
+  ;; One SSL_* call and its whole classification as a single step with no
+  ;; preemption point inside: SSL_get_error must see the error queue
+  ;; exactly as the call left it, and a fatal reason must be read from the
+  ;; same region. Yields the return value, the SSL_ERROR_* code, and the
+  ;; reason string (#f whenever the call did not fail: a positive return,
+  ;; or a want-read that the caller retries). The body raises nothing,
+  ;; parks nowhere and touches no socket -- the caller acts on the three
+  ;; values after the scope has ended.
+  (define-syntax ssl-step
+    (syntax-rules ()
+      ((_ ssl-expr default call)
+       (let ((s ssl-expr))
+         (with-openssl-scope
+           (let* ((rc call)
+                  (code (if (fx> rc 0) SSL_ERROR_NONE (SSL_get_error s rc))))
+             (values rc code
+                     (if (or (fx> rc 0) (fx= code SSL_ERROR_WANT_READ))
+                         #f
+                         (tls-reason default)))))))))
 
   (define (die msg) (raise (vector 'tls-error msg)))
 
@@ -151,7 +240,7 @@
   (define ctx 0)
 
   (define (ensure-ctx!)
-    (with-interrupts-disabled
+    (with-openssl-scope
       (when (zero? ctx)
         (let ((c (SSL_CTX_new (TLS_client_method))))
           (when (zero? c) (die (tls-reason "tls: SSL_CTX_new failed")))
@@ -187,8 +276,9 @@
              (BIO_read wbio bv n)
              bv))))
 
+  ;; The OpenSSL half is scoped; the socket write is not, and must not be.
   (define (flush-out! c wbio)
-    (let ((out (drain-wbio wbio)))
+    (let ((out (with-openssl-scope (drain-wbio wbio))))
       (when out (tcp-write! c out #f))))
 
   (define empty-bv (make-bytevector 0))
@@ -201,7 +291,11 @@
   ;; certificate, or a signature scheme with no retrievable digest).
   (define NID-md5 4)
   (define NID-sha1 64)
+  ;; Scoped: several of these push on failure (no peer certificate, an
+  ;; unknown signature OID), and this runs once at the end of a handshake
+  ;; whose entries nobody is going to read.
   (define (peer-cb-hash ssl)
+   (with-openssl-scope
     (let ((x (SSL_get-peer-cert ssl)))
       (if (zero? x)
           #f
@@ -225,7 +319,7 @@
                                (let* ((n (bytevector-u32-native-ref lenbv 0))
                                       (out (make-bytevector n)))
                                  (bytevector-copy! buf 0 out 0 n)
-                                 out)))))))))))
+                                 out))))))))))))
 
   ;; ---- the connector --------------------------------------------------------
   ;;
@@ -244,8 +338,15 @@
         (unless (zero? rbio) (BIO_free rbio))
         (unless (zero? wbio) (BIO_free wbio))
         (die "tls: BIO_new failed"))
-      (let ((ssl (SSL_new ctx))
-            (closed #f))
+      ;; SSL_new and the reading of its failure reason are one scope: the
+      ;; reason has to come from this call, not from whatever another
+      ;; process happened to leave queued, and must not be eaten from it.
+      (let* ((born (with-openssl-scope
+                     (let ((s (SSL_new ctx)))
+                       (cons s (and (zero? s)
+                                    (tls-reason "tls: SSL_new failed"))))))
+             (ssl (car born))
+             (closed #f))
         (define (close!)                 ; frees both BIOs too (SSL owns them)
           (unless closed
             (set! closed #t)
@@ -253,7 +354,7 @@
         (define (fail! msg) (close!) (die msg))
         (when (zero? ssl)
           (BIO_free rbio) (BIO_free wbio)
-          (die (tls-reason "tls: SSL_new failed")))
+          (die (cdr born)))
         (SSL_set_bio ssl rbio wbio)
         ;; From here the SSL exists and this process can be killed while
         ;; parked in the handshake receive below -- winders and guards do
@@ -262,13 +363,22 @@
         ;; the conn, and the close completion runs close! (idempotent, so
         ;; the normal-path free through the codec stays correct).
         (conn-on-close! c close!)
-        (if (ip-literal? host)
-            (when (zero? (X509_VERIFY_PARAM_set1_ip_asc (SSL_get0_param ssl) host))
-              (fail! "tls: bad ip literal"))
-            (begin
-              (SSL_ctrl/string ssl SSL_CTRL_SET_TLSEXT_HOSTNAME 0 host)  ; SNI
-              (when (zero? (SSL_set1_host ssl host))
-                (fail! "tls: SSL_set1_host failed"))))
+        ;; Verification parameters: scoped, so the entries a rejected host
+        ;; or IP literal leaves behind cannot outlive this call. The
+        ;; messages are fixed strings, so nothing is read from the queue;
+        ;; raising happens after the scope, never inside one.
+        (let ((setup-err
+                (with-openssl-scope
+                  (cond
+                    ((ip-literal? host)
+                     (and (zero? (X509_VERIFY_PARAM_set1_ip_asc
+                                   (SSL_get0_param ssl) host))
+                          "tls: bad ip literal"))
+                    (else
+                      (SSL_ctrl/string ssl SSL_CTRL_SET_TLSEXT_HOSTNAME 0 host) ; SNI
+                      (and (zero? (SSL_set1_host ssl host))
+                           "tls: SSL_set1_host failed"))))))
+          (when setup-err (fail! setup-err)))
         (SSL_set_connect_state ssl)
 
         ;; drive the handshake: flush whatever each step produced, wait
@@ -279,18 +389,37 @@
         ;; open indefinitely at no cost to itself.
         (let ((deadline (+ (now-ms) timeout)))
         (let handshake ()
-          (let ((r (SSL_do_handshake ssl)))
+          ;; Classify BEFORE flushing. The flush used to sit between the
+          ;; step and its SSL_get_error, which is the widest form of the
+          ;; gap described at the top of this file: draining the wbio is
+          ;; itself OpenSSL work, and tcp-write! is a preemption point, so
+          ;; any process scheduled there decided whether this handshake
+          ;; lived. Nothing needs the flush first: SSL_get_error reads the
+          ;; SSL object's rwstate and the error queue, never the wbio's
+          ;; contents. It does read the BIOs' retry FLAGS, and reading a
+          ;; memory BIO down to empty is what sets those -- so if it has
+          ;; to be on one side, this is the correct side.
+          (let-values (((r code reason)
+                        (ssl-step ssl "tls handshake failed"
+                                  (SSL_do_handshake ssl))))
+            ;; Still before anything that blocks, and on the failing path
+            ;; too: whatever OpenSSL just produced -- the ClientHello, or
+            ;; the alert that explains the failure below -- goes out.
             (flush-out! c wbio)
-            (unless (= r 1)
-              (if (= (SSL_get_error ssl r) SSL_ERROR_WANT_READ)
-                  (receive (after (max 1 (- deadline (now-ms)))
-                              (fail! "tls handshake timeout"))
-                    (`#(tcp-data ,bv)
-                      (BIO_write rbio bv (bytevector-length bv))
-                      (handshake))
-                    (`#(tcp-eof) (fail! "connection closed during tls handshake"))
-                    (`#(tcp-error ,e) (fail! "connection error during tls handshake")))
-                  (fail! (tls-reason "tls handshake failed")))))))
+            (cond
+              ((= r 1) 'established)
+              ((= code SSL_ERROR_WANT_READ)
+               (receive (after (max 1 (- deadline (now-ms)))
+                           (fail! "tls handshake timeout"))
+                 (`#(tcp-data ,bv)
+                   (with-openssl-scope
+                     (BIO_write rbio bv (bytevector-length bv)))
+                   (handshake))
+                 (`#(tcp-eof) (fail! "connection closed during tls handshake"))
+                 (`#(tcp-error ,e) (fail! "connection error during tls handshake"))))
+              ;; the or is belt-and-braces: ssl-step withholds a reason
+              ;; only for the two cases above
+              (else (fail! (or reason "tls handshake failed")))))))
 
         ;; ---- established: hand back the codec --------------------------
         (let ((scratch (make-bytevector 16384)))
@@ -298,29 +427,37 @@
             (let ((n (bytevector-length bv)))
               (if (zero? n)
                   empty-bv
-                  (begin
-                    (unless (= n (SSL_write ssl bv n))
-                      (die (tls-reason "tls write failed")))
-                    (or (drain-wbio wbio) empty-bv)))))
+                  ;; the write and the reading of its reason in one step,
+                  ;; for the same reason the handshake needs one; the
+                  ;; raise happens after the scope
+                  (let ((err (with-openssl-scope
+                               (and (not (= n (SSL_write ssl bv n)))
+                                    (tls-reason "tls write failed")))))
+                    (when err (die err))
+                    (or (with-openssl-scope (drain-wbio wbio)) empty-bv)))))
           (define (decrypt raw)
-            (BIO_write rbio raw (bytevector-length raw))
+            (with-openssl-scope (BIO_write rbio raw (bytevector-length raw)))
             (let-values (((p get) (open-bytevector-output-port)))
               (let loop ()
-                (let ((n (SSL_read ssl scratch 16384)))
-                  (if (> n 0)
-                      (begin (put-bytevector p scratch 0 n) (loop))
-                      (let ((e (SSL_get_error ssl n)))
-                        (cond
-                          ((= e SSL_ERROR_WANT_READ) 'drained)
-                          ((= e SSL_ERROR_ZERO_RETURN)
-                           ;; close_notify: the TLS stream is over NOW.
-                           ;; A close-wait peer (e.g. openssl s_server)
-                           ;; may hold the TCP socket open waiting for
-                           ;; our close_notify, so a close-delimited
-                           ;; response must not depend on a TCP FIN --
-                           ;; synthesize the eof for the client loop.
-                           (send self (vector 'tcp-eof)))
-                          (else (die (tls-reason "tls read failed"))))))))
+                ;; SSL_read and its SSL_get_error are one step: with a gap
+                ;; between them a plain "no more whole records buffered"
+                ;; (WANT_READ) reads as SSL_ERROR_SSL and kills a healthy
+                ;; connection. Growing the output port is done outside.
+                (let-values (((n code reason)
+                              (ssl-step ssl "tls read failed"
+                                        (SSL_read ssl scratch 16384))))
+                  (cond
+                    ((> n 0) (put-bytevector p scratch 0 n) (loop))
+                    ((= code SSL_ERROR_WANT_READ) 'drained)
+                    ((= code SSL_ERROR_ZERO_RETURN)
+                     ;; close_notify: the TLS stream is over NOW.
+                     ;; A close-wait peer (e.g. openssl s_server)
+                     ;; may hold the TCP socket open waiting for
+                     ;; our close_notify, so a close-delimited
+                     ;; response must not depend on a TCP FIN --
+                     ;; synthesize the eof for the client loop.
+                     (send self (vector 'tcp-eof)))
+                    (else (die (or reason "tls read failed"))))))
               ;; post-handshake protocol output (ticket acks, key updates)
               (flush-out! c wbio)
               (get)))
