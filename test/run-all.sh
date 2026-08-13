@@ -36,6 +36,12 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # (an out-of-range exponent became +inf.0, which passes any real? guard --
 # including the one on a JWT expiry)
 "$scheme_bin" --script igropyr/test/json-numbers.sc
+# every byte in must come back out, checked against the system gzip(1)
+# tool in a separate process. Also the regression for zlib coexistence:
+# with the runtime's embedded zlib and a dlopened libz sharing one
+# process, deflate() faults or emits unbounded output with no error
+# code, so this script surviving is part of the check
+"$scheme_bin" --script igropyr/test/gzip.sc
 "$scheme_bin" --script igropyr/test/sigv4.sc
 "$scheme_bin" --script igropyr/test/blas.sc
 "$scheme_bin" --script igropyr/test/quickjs.sc

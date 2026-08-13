@@ -10,14 +10,9 @@
   (export gzip-compress gzip-acceptable?)
   (import (chezscheme) (igropyr platform))
 
-  (define zlib-loaded
+  (define libc-loaded
     (begin
       (ensure-supported-platform!)
-      (load-first-shared-object! 'zlib
-        (case platform-os
-          ((macos) '("libz.1.dylib" "libz.dylib"))
-          ((freebsd) '("libz.so.6" "libz.so.5" "libz.so"))
-          (else '("libz.so.1" "libz.so"))))
       (load-first-shared-object! 'libc
         (case platform-os
           ((macos) '("libSystem.B.dylib" "libSystem.dylib"))
@@ -26,14 +21,186 @@
           ((freebsd) '("libc.so.7" "libc.so.6" "libc.so"))
           (else '("libc.so.6" "libc.so"))))))
 
-  (define zlib-version   (foreign-procedure "zlibVersion" () string))
-  (define deflate-init2  (foreign-procedure "deflateInit2_"
-                           (void* int int int int int string int) int))
-  (define deflate*       (foreign-procedure "deflate" (void* int) int))
-  (define deflate-end    (foreign-procedure "deflateEnd" (void*) int))
   (define memset*        (foreign-procedure "memset" (void* int size_t) void*))
   (define memcpy-to-c    (foreign-procedure "memcpy" (void* u8* size_t) void*))
   (define memcpy-from-c  (foreign-procedure "memcpy" (u8* void* size_t) void*))
+
+  ;; ------------------------------------------------------------------
+  ;; Which zlib?
+  ;;
+  ;; The Chez Scheme runtime embeds a complete zlib (it compresses fasl
+  ;; files with it), and on FreeBSD the chez-scheme executable exports
+  ;; every zlib symbol. Loading the system libz there puts a SECOND
+  ;; zlib with identically named globals into the process, and deflate
+  ;; breaks in that combination: deflateInit2_ reports success but
+  ;; leaves a deflate_state whose sym_buf holds only the low 32 bits of
+  ;; pending_buf -- deflate() then faults as soon as the C heap sits
+  ;; above 4 GB, and incompressible input drives it into emitting
+  ;; unbounded output. The same call sequence against the embedded copy
+  ;; alone behaves, and so does the system libz from a plain C program;
+  ;; the defect belongs to the coexistence, not to either zlib.
+  ;;
+  ;; So on FreeBSD this library binds the embedded zlib and never loads
+  ;; a second one. chez-scheme there is a non-PIE executable, so the
+  ;; addresses in its own dynamic symbol table ARE its runtime
+  ;; addresses, and foreign-procedure accepts an address as an entry.
+  ;; If any assumption fails (a PIE build, missing symbols), gzip stays
+  ;; disabled -- gzip-compress returns #f, which callers already treat
+  ;; as "send this uncompressed" -- rather than bind the combination
+  ;; known to corrupt memory.
+  ;; ------------------------------------------------------------------
+
+  ;; The absolute path of the running executable, via
+  ;; sysctl kern.proc.pathname; #f if the kernel will not say.
+  (define (freebsd-executable-path)
+    (let ((sysctl* (foreign-procedure "sysctl"
+                     (void* unsigned-int void* void* void* size_t) int))
+          (mib (foreign-alloc 16))
+          (cap 1024))
+      (let ((buf (foreign-alloc cap))
+            (len (foreign-alloc 8)))
+        (foreign-set! 'int mib 0 1)          ; CTL_KERN
+        (foreign-set! 'int mib 4 14)         ; KERN_PROC
+        (foreign-set! 'int mib 8 12)         ; KERN_PROC_PATHNAME
+        (foreign-set! 'int mib 12 -1)        ; the calling process
+        (foreign-set! 'unsigned-long len 0 cap)
+        (let* ((rc (sysctl* mib 4 buf len 0 0))
+               (path (and (= rc 0)
+                          (let scan ((i 0) (acc '()))
+                            (and (< i cap)
+                                 (let ((b (foreign-ref 'unsigned-8 buf i)))
+                                   (if (fx= b 0)
+                                       (utf8->string
+                                         (u8-list->bytevector (reverse acc)))
+                                       (scan (fx+ i 1) (cons b acc)))))))))
+          (foreign-free mib) (foreign-free buf) (foreign-free len)
+          path))))
+
+  ;; Addresses of the `wanted` dynamic symbols in a little-endian
+  ;; non-PIE ELF64 executable, where link address = runtime address.
+  ;; -> alist of (name . address), or #f when the image does not
+  ;; satisfy those assumptions (wrong magic, PIE, no .dynsym).
+  (define (elf-dynamic-symbol-addresses path wanted)
+    (guard (e (#t #f))
+      (let ((p (open-file-input-port path)))
+        (dynamic-wind
+          (lambda () (void))
+          (lambda ()
+            (define (bytes at n)
+              (set-port-position! p at)
+              (let ((bv (get-bytevector-n p n)))
+                (and (bytevector? bv) (= (bytevector-length bv) n) bv)))
+            (define (u16 bv i) (bytevector-u16-ref bv i 'little))
+            (define (u32 bv i) (bytevector-u32-ref bv i 'little))
+            (define (u64 bv i) (bytevector-u64-ref bv i 'little))
+            (define (name-at bv i)             ; NUL-terminated, ASCII
+              (let scan ((e i) (acc '()))
+                (let ((b (bytevector-u8-ref bv e)))
+                  (if (fx= b 0)
+                      (list->string (reverse acc))
+                      (scan (fx+ e 1) (cons (integer->char b) acc))))))
+            (let ((eh (bytes 0 64)))
+              (and eh
+                   (= (u32 eh 0) #x464C457F)        ; "\x7fELF"
+                   (fx= (bytevector-u8-ref eh 4) 2) ; ELFCLASS64
+                   (fx= (bytevector-u8-ref eh 5) 1) ; little-endian
+                   (fx= (u16 eh 16) 2)              ; ET_EXEC: non-PIE only
+                   (let* ((shoff (u64 eh 40))
+                          (shentsize (u16 eh 58))
+                          (shnum (u16 eh 60))
+                          (shs (bytes shoff (* shnum shentsize))))
+                     (and shs
+                          (let find-dynsym ((i 0))
+                            (and (fx< i shnum)
+                                 (let ((sh (fx* i shentsize)))
+                                   (if (not (= 11 (u32 shs (fx+ sh 4)))) ; SHT_DYNSYM
+                                       (find-dynsym (fx+ i 1))
+                                       ;; sh_link names the paired string
+                                       ;; table's section index
+                                       (let* ((strsh (fx* (u32 shs (fx+ sh 40))
+                                                          shentsize))
+                                              (syms (bytes (u64 shs (fx+ sh 24))
+                                                           (u64 shs (fx+ sh 32))))
+                                              (entsz (u64 shs (fx+ sh 56)))
+                                              (strs (bytes (u64 shs (fx+ strsh 24))
+                                                           (u64 shs (fx+ strsh 32)))))
+                                         (and syms strs (>= entsz 24)
+                                              (let collect ((o 0) (acc '()))
+                                                (if (> (+ o entsz)
+                                                       (bytevector-length syms))
+                                                    acc
+                                                    (let ((nameoff (u32 syms o))
+                                                          (shndx (u16 syms (fx+ o 6)))
+                                                          (value (u64 syms (fx+ o 8))))
+                                                      (collect
+                                                        (+ o entsz)
+                                                        (if (and (not (fx= shndx 0)) ; defined here
+                                                                 (not (fx= nameoff 0))
+                                                                 (not (= value 0)))
+                                                            (let ((nm (name-at strs nameoff)))
+                                                              (if (member nm wanted)
+                                                                  (cons (cons nm value) acc)
+                                                                  acc))
+                                                            acc))))))))))))))))
+          (lambda () (close-port p))))))
+
+  (define zlib-symbol-names
+    '("zlibVersion" "deflateInit2_" "deflate" "deflateEnd"
+      "inflateInit2_" "inflate" "inflateEnd"))
+
+  (define zlib-addresses
+    (and (eq? platform-os 'freebsd)
+         (let ((path (freebsd-executable-path)))
+           (and path
+                (let ((syms (elf-dynamic-symbol-addresses path zlib-symbol-names)))
+                  (and syms
+                       (for-all (lambda (n) (assoc n syms)) zlib-symbol-names)
+                       syms))))))
+
+  ;; 'embedded -> entries are addresses inside the running executable
+  ;; 'system   -> the platform zlib, referenced by name
+  ;; 'disabled -> no safe zlib here; gzip-compress yields #f
+  (define zlib-source
+    (cond
+      (zlib-addresses 'embedded)
+      ((eq? platform-os 'freebsd) 'disabled)
+      (else (load-first-shared-object! 'zlib
+              (case platform-os
+                ((macos) '("libz.1.dylib" "libz.dylib"))
+                (else '("libz.so.1" "libz.so"))))
+            'system)))
+
+  (define (zlib-entry name)
+    (case zlib-source
+      ((embedded) (cdr (assoc name zlib-addresses)))
+      ((system) name)
+      (else #f)))
+
+  ;; When disabled, bind a stub whose return value no caller reads as
+  ;; success (Z_OK = 0, Z_STREAM_END = 1).
+  (define-syntax define-zlib-procedure
+    (syntax-rules ()
+      ((_ id name (arg ...) res)
+       (define id
+         (let ((entry (zlib-entry name)))
+           (if entry
+               (foreign-procedure entry (arg ...) res)
+               (lambda ignored -1)))))))
+
+  (define zlib-version
+    (let ((entry (zlib-entry "zlibVersion")))
+      (if entry
+          (foreign-procedure entry () string)
+          (lambda () "unavailable"))))
+  (define-zlib-procedure deflate-init2 "deflateInit2_"
+    (void* int int int int int string int) int)
+  (define-zlib-procedure deflate* "deflate" (void* int) int)
+  (define-zlib-procedure deflate-end "deflateEnd" (void*) int)
+  ;; inflate side: used only by the load-time self-check below
+  (define-zlib-procedure inflate-init2 "inflateInit2_"
+    (void* int string int) int)
+  (define-zlib-procedure inflate* "inflate" (void* int) int)
+  (define-zlib-procedure inflate-end "inflateEnd" (void*) int)
 
   ;; z_stream field offsets on LP64 (see zlib.h):
   ;;   next_in @0 (ptr), avail_in @8 (u32), next_out @24 (ptr),
@@ -47,8 +214,8 @@
   (define Z-OK 0)
   (define Z-STREAM-END 1)
 
-  ;; Compress bv to gzip format. Returns #f on any zlib error.
-  (define (gzip-compress bv level)
+  ;; The worker. Returns #f on any zlib error.
+  (define (gzip-compress* bv level)
     (let* ((n (bytevector-length bv))
            (strm (foreign-alloc 128))                 ; >= z-stream-size, zeroed
            (src (foreign-alloc (max 1 n)))
@@ -75,6 +242,57 @@
                       (cleanup)
                       res)
                     (begin (cleanup) #f))))))))
+
+  ;; Inflate `gz` expecting exactly n bytes back; self-check only.
+  (define (gunzip-for-self-check gz n)
+    (let* ((glen (bytevector-length gz))
+           (strm (foreign-alloc 128))
+           (src (foreign-alloc (max 1 glen)))
+           (dst (foreign-alloc (max 1 n))))
+      (define (cleanup) (foreign-free strm) (foreign-free src) (foreign-free dst))
+      (memset* strm 0 128)
+      (memcpy-to-c src gz glen)
+      (if (not (= Z-OK (inflate-init2 strm Z-GZIP-WINDOW (zlib-version)
+                                      z-stream-size)))
+          (begin (cleanup) #f)
+          (begin
+            (foreign-set! 'void* strm 0 src)
+            (foreign-set! 'unsigned-32 strm 8 glen)
+            (foreign-set! 'void* strm 24 dst)
+            (foreign-set! 'unsigned-32 strm 32 n)
+            (let* ((rc (inflate* strm Z-FINISH))
+                   (out-len (foreign-ref 'unsigned-long strm 40)))
+              (inflate-end strm)
+              (if (and (= rc Z-STREAM-END) (= out-len n))
+                  (let ((res (make-bytevector n)))
+                    (memcpy-from-c res dst n)
+                    (cleanup)
+                    res)
+                  (begin (cleanup) #f)))))))
+
+  ;; A load-time round trip through whatever was bound: compress a
+  ;; sample and inflate it back, and refuse the binding unless the
+  ;; bytes return intact. This guards every process that loads the
+  ;; library, not only the ones a test suite runs next to.
+  (define zlib-usable?
+    (and (not (eq? zlib-source 'disabled))
+         (guard (e (#t #f))
+           (let* ((sample (string->utf8
+                            "gzip self-check: 0123456789 0123456789"))
+                  (gz (gzip-compress* sample 6)))
+             (and gz
+                  (>= (bytevector-length gz) 18)     ; gzip header + trailer
+                  (fx= #x1f (bytevector-u8-ref gz 0))
+                  (fx= #x8b (bytevector-u8-ref gz 1))
+                  (let ((back (gunzip-for-self-check
+                                gz (bytevector-length sample))))
+                    (and back (bytevector=? back sample))))))))
+
+  ;; Compress bv to gzip format. Returns #f on any zlib error, and on a
+  ;; host with no safe zlib binding -- callers already treat #f as
+  ;; "send this body uncompressed".
+  (define (gzip-compress bv level)
+    (and zlib-usable? (gzip-compress* bv level)))
 
   ;; does an Accept-Encoding header value allow gzip? Case-insensitive
   ;; search in place: no downcased copy, no per-position substring.
