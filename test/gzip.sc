@@ -148,12 +148,19 @@
       (check "input past the 32-bit bound returns #f"
         (not (gzip-compress (make-bytevector 4290676492 0) 1)))
       ;; ...and the bound is not off by one: the largest in-range
-      ;; length still compresses (peak memory ~13 GB)
+      ;; length still compresses (peak memory ~13 GB). The trailer's
+      ;; ISIZE (last 4 bytes, LE) is the input length mod 2^32, and
+      ;; 4290676491 < 2^32 -- an equal ISIZE pins that every byte
+      ;; entered the stream, where the magic alone would also pass on
+      ;; a truncated prefix
       (let ((gz (gzip-compress (make-bytevector 4290676491 0) 1)))
-        (check "largest in-range input still compresses"
+        (check "largest in-range input compresses in full"
           (and gz
                (= #x1f (bytevector-u8-ref gz 0))
-               (= #x8b (bytevector-u8-ref gz 1))))))
+               (= #x8b (bytevector-u8-ref gz 1))
+               (= 4290676491
+                  (bytevector-u32-ref gz (- (bytevector-length gz) 4)
+                                      'little))))))
     (begin
       (display "  skip  32-bit-bound cases (set IGROPYR_GZIP_HUGE_TEST to run; allocates up to ~13 GB)")
       (newline)))

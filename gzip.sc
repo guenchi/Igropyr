@@ -198,25 +198,34 @@
   ;; mappings alike -- mincore cannot (it reports existence, not
   ;; readability), and a /dev/null fd cannot either (its driver never
   ;; reads the buffer and reports success for any address; verified).
-  (define pipe*  (foreign-procedure "pipe" (u8*) int))
+  ;; pipe2 exists on FreeBSD only, and this probe only runs there; the
+  ;; guard keeps the symbol from being resolved on hosts without it.
+  ;; O_CLOEXEC stops the fds leaking into a child should another thread
+  ;; fork+exec mid-probe; the dynamic-wind closes them on any exit,
+  ;; non-local ones included.
+  (define pipe2* (and (eq? platform-os 'freebsd)
+                      (foreign-procedure "pipe2" (u8* int) int)))
   (define write* (foreign-procedure "write" (int void* size_t) integer-64))
   (define close* (foreign-procedure "close" (int) int))
+  (define O-CLOEXEC #x100000)                    ; FreeBSD fcntl.h
   (define (readable-and-matching? addr expected)
     (let ((count (bytevector-length expected))
           (fds (make-bytevector 8)))
       (and (fx> count 0)
-           (fx= 0 (pipe* fds))
-           (let* ((rfd (bytevector-s32-native-ref fds 0))
-                  (wfd (bytevector-s32-native-ref fds 4))
-                  (n (write* wfd addr count)))    ; count <= 64 << PIPE_BUF
-             (close* rfd) (close* wfd)
-             (and (= n count)
-                  (let loop ((i 0))
-                    (cond ((fx= i count) #t)
-                          ((fx= (foreign-ref 'unsigned-8 addr i)
-                                (bytevector-u8-ref expected i))
-                           (loop (fx+ i 1)))
-                          (else #f))))))))
+           (fx= 0 (pipe2* fds O-CLOEXEC))
+           (let ((rfd (bytevector-s32-native-ref fds 0))
+                 (wfd (bytevector-s32-native-ref fds 4)))
+             (dynamic-wind
+               (lambda () (void))
+               (lambda ()
+                 (and (= count (write* wfd addr count)) ; count <= 64 << PIPE_BUF
+                      (let loop ((i 0))
+                        (cond ((fx= i count) #t)
+                              ((fx= (foreign-ref 'unsigned-8 addr i)
+                                    (bytevector-u8-ref expected i))
+                               (loop (fx+ i 1)))
+                              (else #f)))))
+               (lambda () (close* rfd) (close* wfd)))))))
 
   (define zlib-addresses
     (and (eq? platform-os 'freebsd)
