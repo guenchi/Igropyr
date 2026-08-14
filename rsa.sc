@@ -132,6 +132,29 @@
   ;; for any real key file and a bound on how long the parse can hold the
   ;; scheduler. The same number caps a key FILE, so the read is bounded too.
   (define rsa-max-pem-bytes 65536)
+
+  ;; Opening a key file safely on the one OS thread this runtime has.
+  ;; O_NONBLOCK so even a FIFO with no writer returns instead of parking
+  ;; the whole scheduler; then fstat the FD (not the path) and read only
+  ;; a regular file -- the check and the read now share one inode, so a
+  ;; path swapped after the open cannot matter. O_NONBLOCK is 0x0004 on
+  ;; both macOS and FreeBSD; st_mode is a uint16 whose offset in struct
+  ;; stat differs (macOS 4, FreeBSD 24).
+  (define _libc
+    (load-first-shared-object! 'libc
+      (case platform-os
+        ((macos) '("libSystem.B.dylib" "libSystem.dylib"))
+        ((freebsd) '("libc.so.7" "libc.so.6" "libc.so"))
+        (else '("libc.so.6" "libc.so")))))
+  (define O-RDONLY 0)
+  (define O-NONBLOCK 4)
+  (define S-IFMT #xF000)
+  (define S-IFREG #x8000)
+  (define st-mode-offset
+    (case platform-os ((macos) 4) ((freebsd) 24) (else 24)))
+  (define c-open  (foreign-procedure "open" (string int) int))
+  (define c-fstat (foreign-procedure "fstat" (int u8*) int))
+  (define c-close (foreign-procedure "close" (int) int))
   ;; raw big-endian magnitudes handed to rsa-public-key-from-modulus: the
   ;; bit limits above are enforced after BN_bin2bn, but the byte arrays are
   ;; refused first so a gigabyte of leading zeros never reaches libcrypto
@@ -203,6 +226,13 @@
     (foreign-procedure
       (if (foreign-entry? "EVP_PKEY_get_id") "EVP_PKEY_get_id" "EVP_PKEY_id")
       (void*) int))
+  (define EVP_PKEY_CTX_new  (foreign-procedure "EVP_PKEY_CTX_new" (void* void*) void*))
+  (define EVP_PKEY_CTX_free (foreign-procedure "EVP_PKEY_CTX_free" (void*) void))
+  ;; consistency of a private key's own parameters (d*e = 1 mod lcm, p*q = n):
+  ;; PEM decoding does not perform it, so a structurally valid but
+  ;; mathematically inconsistent private key would otherwise be accepted
+  ;; and only fail later at signing time
+  (define EVP_PKEY_check    (foreign-procedure "EVP_PKEY_check" (void*) int))
   (define EVP_PKEY_get1_RSA (foreign-procedure "EVP_PKEY_get1_RSA" (void*) void*))
   (define EVP_PKEY_set1_RSA (foreign-procedure "EVP_PKEY_set1_RSA" (void* void*) int))
   (define RSA_new         (foreign-procedure "RSA_new" () void*))
@@ -427,26 +457,42 @@
   ;; Every parse attempt gets its own copy, its own BIO, and both are freed
   ;; on every path including a raise out of proc. The copy is what makes the
   ;; BIO safe: see BIO_new_mem_buf above.
+  ;; Each native resource is allocated inside the before-thunk of the wind
+  ;; that frees it, so the free is registered before the resource exists to
+  ;; be leaked -- no out-of-memory window between allocation and winder.
   (define (with-bio pem proc)
-    (let* ((n (bytevector-length pem))
-           (buf (foreign-alloc (fx+ n 1))))     ; +1: never a zero-size alloc
+    (let ((n (bytevector-length pem))
+          (buf #f))
       (dynamic-wind
-        (lambda () (void))
+        (lambda () (set! buf (foreign-alloc (fx+ n 1))))  ; +1: never a zero-size alloc
         (lambda ()
           (when (fx> n 0) (memcpy-to-c buf pem n))
-          (let ((bio (BIO_new_mem_buf buf n)))
-            (when (zero? bio) (rsa-fail "BIO_new_mem_buf failed"))
+          (let ((bio #f))
             (dynamic-wind
-              (lambda () (void))
+              (lambda ()
+                (set! bio (BIO_new_mem_buf buf n))
+                (when (zero? bio) (rsa-fail "BIO_new_mem_buf failed")))
               (lambda () (proc bio))
-              (lambda () (BIO_free bio)))))
-        (lambda () (foreign-free buf)))))
+              (lambda () (when (and bio (not (zero? bio))) (BIO_free bio))))))
+        (lambda () (when buf (foreign-free buf))))))
 
   ;; EVP_PKEY -> rsa-key. Owns pk from here: every exit either hands it to
   ;; the record or frees it, the record construction included -- an
   ;; allocation failure at the very last step must not strand a private key.
   (define EVP_PKEY_RSA 6)          ; NID_rsaEncryption
   (define EVP_PKEY_RSA_PSS 912)    ; NID_rsassaPss
+
+  ;; A private key must be self-consistent, not merely well-encoded: a
+  ;; PEM whose d/p/q do not match n/e decodes fine but cannot sign
+  ;; verifiably. Reject it at load time rather than at first signature.
+  (define (check-private-consistency! pk)
+    (let ((ctx (EVP_PKEY_CTX_new pk 0)))
+      (when (zero? ctx) (rsa-fail "EVP_PKEY_CTX_new failed"))
+      (let ((ok (guard (e (#t (EVP_PKEY_CTX_free ctx) (raise e)))
+                  (fx= 1 (EVP_PKEY_check ctx)))))
+        (EVP_PKEY_CTX_free ctx)
+        (unless ok
+          (rsa-fail "inconsistent RSA private key (parameters do not agree)")))))
 
   (define (pkey->rsa-key pk private?)
     (guard (e (#t (EVP_PKEY_free pk) (raise e)))
@@ -471,6 +517,7 @@
                       (list (bn->bytes n) (bn->bytes e) (BN_num_bits n)))))))
           (RSA_free rsa)
           (check-rsa-parts! (car parts) (cadr parts) (caddr parts))
+          (when private? (check-private-consistency! pk))
           (mk-rsa-key pk private? (car parts) (cadr parts) (caddr parts))))))
 
   (define (rsa-private-key-from-pem pem)
@@ -574,35 +621,45 @@
   ;; blocks forever, /dev/zero never reaches EOF, and either one -- executed
   ;; on the one OS thread this runtime has -- stops every green process,
   ;; every timer and all supervision, with no actor timeout able to
-  ;; interrupt it. So: stat first, regular files only, and read at most one
-  ;; PEM's worth. What remains is a stat-then-open race (a regular file
-  ;; swapped for a FIFO in between) and a filesystem that hangs in stat
-  ;; itself; neither is reachable without write access to the key
-  ;; directory. A caller who must not block AT ALL should read the bytes
-  ;; itself, asynchronously, and use rsa-*-key-from-pem -- which is the
-  ;; interface these two wrappers are built from.
+  ;; interrupt it. So open with O_NONBLOCK (a FIFO returns a fd instead of
+  ;; parking), fstat THAT fd, accept only a regular file, and read at most
+  ;; one PEM's worth. Because the fstat and the read act on the opened
+  ;; inode, not on the path, the classic stat-then-open swap (regular file
+  ;; replaced by a FIFO in between) cannot reach the read. A caller who
+  ;; must not block AT ALL should read the bytes itself, asynchronously,
+  ;; and use rsa-*-key-from-pem -- the interface these wrappers build on.
   (define (read-file-bytes who path)
     (unless (string? path)
       (assertion-violation who "path must be a string" (type-name path)))
-    (unless (file-exists? path)
-      (rsa-fail (string-append (symbol->string who) ": no such file: " path)))
-    (unless (file-regular? path)
-      (rsa-fail (string-append (symbol->string who)
-                               ": not a regular file: " path)))
-    (call-with-port (open-file-input-port path)
-      (lambda (p)
-        (let ((bv (get-bytevector-n p (fx+ rsa-max-pem-bytes 1))))
-          (cond
-            ;; an empty file reads as EOF; hand the parser bytes, not an eof
-            ;; object, so the answer is "malformed PEM" and not "PEM must be
-            ;; a string or a bytevector"
-            ((eof-object? bv) (make-bytevector 0))
-            ((fx> (bytevector-length bv) rsa-max-pem-bytes)
-             (rsa-fail (string-append (symbol->string who) ": " path
-                                      " is larger than "
-                                      (number->string rsa-max-pem-bytes)
-                                      " bytes")))
-            (else bv))))))
+    (let ((fd (c-open path (fxior O-RDONLY O-NONBLOCK))))
+      (when (fx< fd 0)
+        (rsa-fail (string-append (symbol->string who) ": cannot open: " path)))
+      ;; fstat the fd, so the regular-file verdict is about the very inode
+      ;; that will be read, not about whatever the path named a moment ago
+      (let ((st (make-bytevector 256 0)))
+        (when (fx< (c-fstat fd st) 0)
+          (c-close fd)
+          (rsa-fail (string-append (symbol->string who) ": fstat failed: " path)))
+        (let ((mode (bytevector-u16-native-ref st st-mode-offset)))
+          (unless (fx= S-IFREG (fxand mode S-IFMT))
+            (c-close fd)
+            (rsa-fail (string-append (symbol->string who)
+                                     ": not a regular file: " path)))))
+      ;; the port takes ownership of the fd and closes it with the port
+      (call-with-port (open-fd-input-port fd (buffer-mode block))
+        (lambda (p)
+          (let ((bv (get-bytevector-n p (fx+ rsa-max-pem-bytes 1))))
+            (cond
+              ;; an empty file reads as EOF; hand the parser bytes, not an eof
+              ;; object, so the answer is "malformed PEM" and not "PEM must be
+              ;; a string or a bytevector"
+              ((eof-object? bv) (make-bytevector 0))
+              ((fx> (bytevector-length bv) rsa-max-pem-bytes)
+               (rsa-fail (string-append (symbol->string who) ": " path
+                                        " is larger than "
+                                        (number->string rsa-max-pem-bytes)
+                                        " bytes")))
+              (else bv)))))))
 
   (define (rsa-load-private-key path)
     (rsa-private-key-from-pem (read-file-bytes 'rsa-load-private-key path)))

@@ -247,6 +247,44 @@
 (rejects "from-modulus-non-bv-e" (lambda () (rsa-public-key-from-modulus rfc7515-n 65537)))
 (rejects "from-pem-non-text"     (lambda () (rsa-public-key-from-pem 42)))
 (rejects "private-from-pem-non-text" (lambda () (rsa-private-key-from-pem 42)))
+
+;; A structurally valid PKCS#1 private key whose d was tampered (d+2) so it
+;; no longer agrees with n/e. PEM decoding accepts it -- `openssl rsa -check`
+;; reports "d e not congruent to 1" on this exact blob -- so loading it must
+;; be refused here, not deferred to a mysterious failure at signing time.
+;; Frozen vector (generated once via pyca unsafe_skip_rsa_key_validation),
+;; so the test needs no key-generation tool at run time.
+(define inconsistent-private-pem
+  (string-append
+    "-----BEGIN RSA PRIVATE KEY-----\n"
+    "MIIEowIBAAKCAQEAtBvqND3Ux3kCcRwPdY1MU11U/60OiRHsRMb3w8MnbEdvF0ZY\n"
+    "lq9L8fQIBuD8dzqjlJdt/4yxT/iLD9eNHcZis/wpbRUnjJ+QkQwb/qlBS46ZFOTa\n"
+    "CWm2i9sAm9Kr4JpyWU7c2DUMXH0UeZ+hAlZbGBSLt1ex0KU1/caeNA9+yy/P0F0B\n"
+    "9C+D1xUcbKOyBfDkKrpaZVu3hCD9dVkkGQ/MQ/MhbzQSTx0/A1lbzkUSdPG3pMcl\n"
+    "eYrYAdq7HeZIyfyPtIhdAmE3sJHz6muo5xMB6AsEVMcGzIkIlyzReE+GDI6GMSDg\n"
+    "ZzKYmkKVvLzESFf+xrfHIir5ZXx+zN8DMiJxyQIDAQABAoIBADzIMujAeR98OhO7\n"
+    "+YedUMXNeJL0bzRY5Rhs4U6ifJpxHQ+IwPrRW9rilRblNK50DqJl3ExiybAIW73T\n"
+    "657BxauiDMTwX7F4ZAxfPs9ZhVyfWhAQD3kfwOg/11u+5BxfYvm6wJMCjBJmb9N/\n"
+    "yJGGXSWqQWB1at/T8X2cWuWM2ShugE1/Pvl3G+1oucNVI/zM61dUe3IcBT4h1fax\n"
+    "PwVOsbDZXnMZuqcBI9CMhOV37j338DpFt6m0q84yfYkBt4s/0fIeELGcNKKEkEks\n"
+    "TKjQxL/L9uJi1RXSGuyOU/nSFetWTKn6UNdGON0dlF2laExkqwpHBrJGwaUpOUVv\n"
+    "9k5bRxcCgYEA2TFyufGNK9QtTIzLbt5c+eJAAi9EbOqRb6EKx2TeBtrQa/1hOVws\n"
+    "Tx1/9BhmOFZ+0mjWRRWOCnkLKQxeKHLpaTt96nkNpwQ0e3JrnlgSgpCj9ztYAdTS\n"
+    "p5vIwXy1B82YpO+EwpB11DIXohtKyzqquZWJKWLmNtJDKFoY9oLBN1MCgYEA1Eo3\n"
+    "SHQW5cYJobCzosxD5ZqgWOYgd1WvaCK5Fc1B1kTWF3datC3NLEx9ooijX1icMSyM\n"
+    "DJQK0GUZX+i6Rgon77aPj1OkxWlMY3C8aV3TxA3zvyOTlCngG+VZehZdHW3qu703\n"
+    "qTFSMkVkVYEtYZZ62GyeMph83TK2+iqUMDFhmvMCgYEAy6D0syio9qKjJdYLFRMd\n"
+    "kJpy8JloScVSPZp7BJ6pGzwjlFumv6SPVk2OHUiS7dcKaDMqUPL4jREXSZDy5nF2\n"
+    "LNc+IosEJcZnfiW0iGyCTi9VywG0bWMfbU09V0qYX4x+xIRbsB7Imf2s8qsr4IZM\n"
+    "clqkkkzLEjLoC/kM1nGYvUkCgYAcmJKx09Fxyidp/F92QoWy3A1VbEpbSNOD94lv\n"
+    "AmMn9cXRC2bQdor4uKUDy9wV7926UgHbf+WlBLlSTgspfBy9EZ5s9Btx7Ck6C+mV\n"
+    "V+o6spZu3N/4SVvC5jYTWAfa+v9voqFozRgBZY+KZQgz6Q1LMfZtYlUPhtFXCX1E\n"
+    "sKIxOQKBgBFnGl20BiDvX0ZZbbZjecUs+3SldW6rUixUrdZwClPE43I1AM0FGYNb\n"
+    "nnUnY+NmR2sJ78HQZaDU8MoVW3TQmtsSoPqGkohfLUSfHZpkaCIocDVUUQoE/kTt\n"
+    "BHhsWo14945YjMbprrzEekuk52fqpKh8x0VkVKCz+MKSZIwDYzeS\n"
+    "-----END RSA PRIVATE KEY-----\n"))
+(check "inconsistent-private-key-refused"
+  (rsa-error? (lambda () (rsa-private-key-from-pem inconsistent-private-pem))))
 (rejects "load-path-not-a-string" (lambda () (rsa-load-public-key 42)))
 (rejects "load-missing-file"     (lambda () (rsa-load-public-key (p "does-not-exist.pem"))))
 
@@ -847,9 +885,12 @@
 ;; open() on a FIFO with no writer blocks forever and /dev/zero never
 ;; reaches EOF; on one OS thread either one stops every green process, and
 ;; no actor timeout can interrupt it, because the thread that would run the
-;; timeout is the thread that is blocked. Both must be refused on the stat,
-;; before the open. Child processes with a clock, again, because the
-;; regression is a hang and (for /dev/zero) an unbounded allocation.
+;; timeout is the thread that is blocked. The loader opens O_NONBLOCK and
+;; classifies the fd with fstat, so a FIFO returns a fd (refused as
+;; non-regular) instead of parking, and the fstat verdict is about the
+;; opened inode -- no stat-then-open swap window. Child processes with a
+;; clock, because the regression is a hang and (for /dev/zero) an
+;; unbounded allocation.
 
 (when have-keys?
   (system (string-append "rm -f " (p "fifo.pem") " && mkfifo " (p "fifo.pem")

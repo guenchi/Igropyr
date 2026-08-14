@@ -687,6 +687,28 @@
             ;; tight enough to catch a missing free
             (check "no-rss-growth-on-failure-paths" (< grew 65536)))))))
 
+;; ---- 32-bit addressing edges (opt-in: each allocates ~2 GiB) ----------
+;; aead-max-bytes = 2^31-1 is the ceiling for the C int lengths OpenSSL's
+;; RAND_bytes and the cipher take. These pin the two places a length past
+;; it must be refused cleanly rather than truncated or over-produced.
+(if (getenv "IGROPYR_AEAD_HUGE_TEST")
+    (let ((max-bytes (- (expt 2 31) 1)))
+      ;; A4: a random request past the int ceiling must raise, not fill a
+      ;; prefix and return the rest unrandomized
+      (check "random past 32-bit ceiling raises"
+        (guard (e (#t #t)) (aead-random-bytes (+ max-bytes 1)) #f))
+      ;; A3: seal must refuse a plaintext whose sealed form (plaintext ||
+      ;; 16-byte tag) would exceed what open can address -- otherwise seal
+      ;; produces a message its own opener rejects
+      (let ((k (make-bytevector 32 7)) (iv (make-bytevector 12 3)))
+        (check "seal refuses plaintext whose sealed form open cannot address"
+          (guard (e (#t #t))
+            (aes-256-gcm-seal k iv (make-bytevector (- max-bytes 15) 0) #f)
+            #f))))
+    (begin
+      (display "  skip  32-bit addressing edges (set IGROPYR_AEAD_HUGE_TEST")
+      (display " to run; each allocates ~2 GiB)\n")))
+
 (system (string-append "rm -rf " dir))
 
 (if (zero? failures)
