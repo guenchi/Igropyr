@@ -78,8 +78,13 @@
 
   ;; Addresses of the `wanted` dynamic symbols in a little-endian
   ;; non-PIE ELF64 executable, where link address = runtime address.
-  ;; -> alist of (name . address), or #f when the image does not
-  ;; satisfy those assumptions (wrong magic, PIE, no .dynsym).
+  ;; -> list of (name address . entry-bytes), or #f when the image does
+  ;; not satisfy those assumptions (wrong magic, PIE, no .dynsym).
+  ;; entry-bytes are the file's first bytes at the symbol (up to 64,
+  ;; located through the PT_LOAD segments) -- the caller compares them
+  ;; with live memory before trusting an address, because the file at
+  ;; this path is not necessarily the image this process is running
+  ;; (a package upgrade can replace the file after exec).
   (define (elf-dynamic-symbol-addresses path wanted)
     (guard (e (#t #f))
       (let ((p (open-file-input-port path)))
@@ -108,8 +113,29 @@
                    (let* ((shoff (u64 eh 40))
                           (shentsize (u16 eh 58))
                           (shnum (u16 eh 60))
-                          (shs (bytes shoff (* shnum shentsize))))
-                     (and shs
+                          (shs (bytes shoff (* shnum shentsize)))
+                          (phoff (u64 eh 32))
+                          (phentsize (u16 eh 54))
+                          (phnum (u16 eh 56))
+                          (phs (bytes phoff (* phnum phentsize))))
+                     (define (file-bytes-at vaddr want)
+                       ;; the file's bytes for a virtual address, found
+                       ;; through the PT_LOAD segment that carries it
+                       (let seek ((i 0))
+                         (and (fx< i phnum)
+                              (let ((ph (fx* i phentsize)))
+                                (if (not (= 1 (u32 phs ph)))    ; PT_LOAD
+                                    (seek (fx+ i 1))
+                                    (let ((p-off (u64 phs (fx+ ph 8)))
+                                          (p-vaddr (u64 phs (fx+ ph 16)))
+                                          (p-filesz (u64 phs (fx+ ph 32))))
+                                      (if (and (>= vaddr p-vaddr)
+                                               (< vaddr (+ p-vaddr p-filesz)))
+                                          (bytes (+ p-off (- vaddr p-vaddr))
+                                                 (min want (- (+ p-vaddr p-filesz)
+                                                              vaddr)))
+                                          (seek (fx+ i 1)))))))))
+                     (and shs phs
                           (let find-dynsym ((i 0))
                             (and (fx< i shnum)
                                  (let ((sh (fx* i shentsize)))
@@ -139,7 +165,12 @@
                                                                  (not (= value 0)))
                                                             (let ((nm (name-at strs nameoff)))
                                                               (if (member nm wanted)
-                                                                  (cons (cons nm value) acc)
+                                                                  (let* ((size (u64 syms (fx+ o 16)))
+                                                                         (want (max 8 (min 64 (if (= size 0) 16 size))))
+                                                                         (slice (file-bytes-at value want)))
+                                                                    (if slice
+                                                                        (cons (cons nm (cons value slice)) acc)
+                                                                        acc))
                                                                   acc))
                                                             acc))))))))))))))))
           (lambda () (close-port p))))))
@@ -148,14 +179,42 @@
     '("zlibVersion" "deflateInit2_" "deflate" "deflateEnd"
       "inflateInit2_" "inflate" "inflateEnd"))
 
+  ;; Is memory at addr mapped in this process AND byte-for-byte equal
+  ;; to `expected`? mincore first, so an address that is not mapped
+  ;; here fails cleanly instead of faulting on the read. This is what
+  ;; stands between "the file at the executable's path" and "the image
+  ;; this process is actually running": when an upgrade has replaced
+  ;; the file after exec, its symbol addresses describe the wrong
+  ;; image, and no symbol may be called on that evidence.
+  (define getpagesize* (foreign-procedure "getpagesize" () int))
+  (define mincore*     (foreign-procedure "mincore" (void* size_t u8*) int))
+  (define (mapped-and-matching? addr expected)
+    (let* ((count (bytevector-length expected))
+           (ps (getpagesize*))
+           (base (* ps (div addr ps)))
+           (span (- (* ps (div (+ addr count ps -1) ps)) base))
+           (vec (make-bytevector (div span ps) 0)))
+      (and (fx> count 0)
+           (fx= 0 (mincore* base span vec))
+           (let loop ((i 0))
+             (cond ((fx= i count) #t)
+                   ((fx= (foreign-ref 'unsigned-8 addr i)
+                         (bytevector-u8-ref expected i))
+                    (loop (fx+ i 1)))
+                   (else #f))))))
+
   (define zlib-addresses
     (and (eq? platform-os 'freebsd)
          (let ((path (freebsd-executable-path)))
            (and path
                 (let ((syms (elf-dynamic-symbol-addresses path zlib-symbol-names)))
                   (and syms
-                       (for-all (lambda (n) (assoc n syms)) zlib-symbol-names)
-                       syms))))))
+                       (for-all
+                         (lambda (n)
+                           (let ((e (assoc n syms)))
+                             (and e (mapped-and-matching? (cadr e) (cddr e)))))
+                         zlib-symbol-names)
+                       (map (lambda (e) (cons (car e) (cadr e))) syms)))))))
 
   ;; 'embedded -> entries are addresses inside the running executable
   ;; 'system   -> the platform zlib, referenced by name
@@ -214,8 +273,21 @@
   (define Z-OK 0)
   (define Z-STREAM-END 1)
 
+  ;; z_stream's avail_in/avail_out are 32-bit. The largest n whose
+  ;; output bound (n + n/1000 + 128) still fits in one is 4290676491;
+  ;; past that the stream cannot be described to deflate in one call,
+  ;; so refuse with #f up front instead of overflowing the counters
+  ;; (which would raise mid-call, or silently truncate at optimize
+  ;; levels that elide the foreign-set! range check).
+  (define max-input-size 4290676491)
+
   ;; The worker. Returns #f on any zlib error.
   (define (gzip-compress* bv level)
+    (if (> (bytevector-length bv) max-input-size)
+        #f
+        (gzip-compress-in-range bv level)))
+
+  (define (gzip-compress-in-range bv level)
     (let* ((n (bytevector-length bv))
            (strm (foreign-alloc 128))                 ; >= z-stream-size, zeroed
            (src (foreign-alloc (max 1 n)))
@@ -261,9 +333,13 @@
             (foreign-set! 'void* strm 24 dst)
             (foreign-set! 'unsigned-32 strm 32 n)
             (let* ((rc (inflate* strm Z-FINISH))
-                   (out-len (foreign-ref 'unsigned-long strm 40)))
+                   (out-len (foreign-ref 'unsigned-long strm 40))
+                   (in-len (foreign-ref 'unsigned-long strm 16))) ; total_in
               (inflate-end strm)
-              (if (and (= rc Z-STREAM-END) (= out-len n))
+              ;; in-len = glen rejects a stream whose first member
+              ;; reproduces the sample but which carries trailing bytes
+              ;; -- Z_STREAM_END alone stops at the first member's end
+              (if (and (= rc Z-STREAM-END) (= out-len n) (= in-len glen))
                   (let ((res (make-bytevector n)))
                     (memcpy-from-c res dst n)
                     (cleanup)

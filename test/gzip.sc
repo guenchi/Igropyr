@@ -28,8 +28,10 @@
   (if ok (begin (display "  ok  ") (display label) (newline)) (fail label)))
 
 ;; ---- the independent decompressor ------------------------------------
+;; pid keeps two concurrently running test processes off each other's
+;; files; real-time alone can collide across processes
 (define scratch
-  (format "/tmp/igropyr-gzip-test-~a" (real-time)))
+  (format "/tmp/igropyr-gzip-test-~a-~a" (get-process-id) (real-time)))
 
 (define (gunzip bv)
   ;; -> the decompressed bytes, or #f if gzip(1) refuses the stream
@@ -125,6 +127,28 @@
     (check "and the last one still round-trips"
       (let ((back (gunzip (gzip-compress input 6))))
         (and back (bytevector=? back input))))))
+
+;; ---- level edges -----------------------------------------------------
+;; 10 is refused by deflateInit2 and must surface as #f, not an error;
+;; 0 (store-only) is allowed by zlib and must still round-trip
+(check "level 10 refused" (not (gzip-compress (proseish 64) 10)))
+(let* ((input (proseish 4096))
+       (gz (gzip-compress input 0)))
+  (check "level 0 still round-trips"
+    (and gz (let ((back (gunzip gz)))
+              (and back (bytevector=? back input))))))
+
+;; ---- the 32-bit stream-counter bound ---------------------------------
+;; zlib's avail_in/avail_out are 32-bit: past n = 4290676491 the output
+;; bound no longer fits and the call must refuse with #f -- not raise,
+;; not compress a truncated prefix. Needs a ~4.3 GB allocation, so
+;; opt-in.
+(if (getenv "IGROPYR_GZIP_HUGE_TEST")
+    (check "input past the 32-bit bound returns #f"
+      (not (gzip-compress (make-bytevector 4290676492 0) 1)))
+    (begin
+      (display "  skip  huge-input bound (set IGROPYR_GZIP_HUGE_TEST to run; allocates ~4.3 GB)")
+      (newline)))
 
 ;; ---- Accept-Encoding negotiation -------------------------------------
 (check "plain gzip" (gzip-acceptable? "gzip"))
