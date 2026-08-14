@@ -134,12 +134,17 @@
   (define rsa-max-pem-bytes 65536)
 
   ;; Opening a key file safely on the one OS thread this runtime has.
-  ;; O_NONBLOCK so even a FIFO with no writer returns instead of parking
-  ;; the whole scheduler; then fstat the FD (not the path) and read only
-  ;; a regular file -- the check and the read now share one inode, so a
-  ;; path swapped after the open cannot matter. O_NONBLOCK is 0x0004 on
-  ;; both macOS and FreeBSD; st_mode is a uint16 whose offset in struct
-  ;; stat differs (macOS 4, FreeBSD 24).
+  ;; open() on a FIFO with no writer would block the whole scheduler, so
+  ;; open O_NONBLOCK -- then reject anything that is not seekable: a
+  ;; regular file (and a block/char device) answers lseek(SEEK_CUR),
+  ;; while a FIFO, pipe or socket returns ESPIPE. lseek, fcntl and their
+  ;; constants are identical across the Unix targets, so this needs no
+  ;; per-arch struct layout; only O_NONBLOCK's value differs (0x0004 on
+  ;; macOS/FreeBSD, 0x0800 on Linux). The fd is made close-on-exec so a
+  ;; concurrent fork+exec cannot inherit an open key file, and it is
+  ;; closed on every path until the port takes ownership. A device that
+  ;; is seekable but not a real key is bounded by the read limit below
+  ;; and then fails to parse -- it cannot hang or read without end.
   (define _libc
     (load-first-shared-object! 'libc
       (case platform-os
@@ -147,13 +152,13 @@
         ((freebsd) '("libc.so.7" "libc.so.6" "libc.so"))
         (else '("libc.so.6" "libc.so")))))
   (define O-RDONLY 0)
-  (define O-NONBLOCK 4)
-  (define S-IFMT #xF000)
-  (define S-IFREG #x8000)
-  (define st-mode-offset
-    (case platform-os ((macos) 4) ((freebsd) 24) (else 24)))
+  (define O-NONBLOCK (case platform-os ((linux) #x800) (else 4)))
+  (define F-SETFD 2)                 ; POSIX, same everywhere
+  (define FD-CLOEXEC 1)
+  (define SEEK-CUR 1)
   (define c-open  (foreign-procedure "open" (string int) int))
-  (define c-fstat (foreign-procedure "fstat" (int u8*) int))
+  (define c-lseek (foreign-procedure "lseek" (int integer-64 int) integer-64))
+  (define c-fcntl (foreign-procedure "fcntl" (int int int) int))
   (define c-close (foreign-procedure "close" (int) int))
   ;; raw big-endian magnitudes handed to rsa-public-key-from-modulus: the
   ;; bit limits above are enforced after BN_bin2bn, but the byte arrays are
@@ -231,8 +236,12 @@
   ;; consistency of a private key's own parameters (d*e = 1 mod lcm, p*q = n):
   ;; PEM decoding does not perform it, so a structurally valid but
   ;; mathematically inconsistent private key would otherwise be accepted
-  ;; and only fail later at signing time
-  (define EVP_PKEY_check    (foreign-procedure "EVP_PKEY_check" (void*) int))
+  ;; and only fail later at signing time. New in OpenSSL 1.1.1, so bind it
+  ;; optionally: on an older libcrypto the check is skipped rather than
+  ;; failing to load the library.
+  (define EVP_PKEY_check
+    (and (foreign-entry? "EVP_PKEY_check")
+         (foreign-procedure "EVP_PKEY_check" (void*) int)))
   (define EVP_PKEY_get1_RSA (foreign-procedure "EVP_PKEY_get1_RSA" (void*) void*))
   (define EVP_PKEY_set1_RSA (foreign-procedure "EVP_PKEY_set1_RSA" (void* void*) int))
   (define RSA_new         (foreign-procedure "RSA_new" () void*))
@@ -486,13 +495,23 @@
   ;; PEM whose d/p/q do not match n/e decodes fine but cannot sign
   ;; verifiably. Reject it at load time rather than at first signature.
   (define (check-private-consistency! pk)
-    (let ((ctx (EVP_PKEY_CTX_new pk 0)))
-      (when (zero? ctx) (rsa-fail "EVP_PKEY_CTX_new failed"))
-      (let ((ok (guard (e (#t (EVP_PKEY_CTX_free ctx) (raise e)))
-                  (fx= 1 (EVP_PKEY_check ctx)))))
-        (EVP_PKEY_CTX_free ctx)
-        (unless ok
-          (rsa-fail "inconsistent RSA private key (parameters do not agree)")))))
+    (when EVP_PKEY_check                    ; skipped on OpenSSL < 1.1.1
+      (let ((ctx #f))
+        ;; allocate inside the before-thunk so the free is registered
+        ;; before the ctx exists to be leaked
+        (dynamic-wind
+          (lambda ()
+            (set! ctx (EVP_PKEY_CTX_new pk 0))
+            (when (zero? ctx) (rsa-fail "EVP_PKEY_CTX_new failed")))
+          (lambda ()
+            ;; only an explicit 0 means "parameters disagree". -2 is "this
+            ;; provider does not implement the check" and other negatives
+            ;; are check-time errors -- treat both as "cannot check", never
+            ;; as inconsistent, so a provider policy (FIPS, a stricter e)
+            ;; cannot turn a mathematically sound key away
+            (when (fx= 0 (EVP_PKEY_check ctx))
+              (rsa-fail "inconsistent RSA private key (parameters do not agree)")))
+          (lambda () (when (and ctx (not (zero? ctx))) (EVP_PKEY_CTX_free ctx)))))))
 
   (define (pkey->rsa-key pk private?)
     (guard (e (#t (EVP_PKEY_free pk) (raise e)))
@@ -634,32 +653,37 @@
     (let ((fd (c-open path (fxior O-RDONLY O-NONBLOCK))))
       (when (fx< fd 0)
         (rsa-fail (string-append (symbol->string who) ": cannot open: " path)))
-      ;; fstat the fd, so the regular-file verdict is about the very inode
-      ;; that will be read, not about whatever the path named a moment ago
-      (let ((st (make-bytevector 256 0)))
-        (when (fx< (c-fstat fd st) 0)
-          (c-close fd)
-          (rsa-fail (string-append (symbol->string who) ": fstat failed: " path)))
-        (let ((mode (bytevector-u16-native-ref st st-mode-offset)))
-          (unless (fx= S-IFREG (fxand mode S-IFMT))
-            (c-close fd)
-            (rsa-fail (string-append (symbol->string who)
-                                     ": not a regular file: " path)))))
-      ;; the port takes ownership of the fd and closes it with the port
-      (call-with-port (open-fd-input-port fd (buffer-mode block))
-        (lambda (p)
-          (let ((bv (get-bytevector-n p (fx+ rsa-max-pem-bytes 1))))
-            (cond
-              ;; an empty file reads as EOF; hand the parser bytes, not an eof
-              ;; object, so the answer is "malformed PEM" and not "PEM must be
-              ;; a string or a bytevector"
-              ((eof-object? bv) (make-bytevector 0))
-              ((fx> (bytevector-length bv) rsa-max-pem-bytes)
-               (rsa-fail (string-append (symbol->string who) ": " path
-                                        " is larger than "
-                                        (number->string rsa-max-pem-bytes)
-                                        " bytes")))
-              (else bv)))))))
+      ;; own the raw fd until it is either rejected (closed here) or handed
+      ;; to a port (closed with the port). A failure anywhere in this
+      ;; stretch -- an allocation that throws, a non-seekable verdict --
+      ;; must not strand it, and it must not survive a fork+exec.
+      (let ((port #f))
+        (dynamic-wind
+          (lambda () (void))
+          (lambda ()
+            (c-fcntl fd F-SETFD FD-CLOEXEC)     ; close-on-exec
+            ;; a FIFO/pipe/socket cannot seek (ESPIPE) -- reject it before
+            ;; a read could block; the verdict is on this fd, so no
+            ;; path-swap window
+            (when (< (c-lseek fd 0 SEEK-CUR) 0)
+              (rsa-fail (string-append (symbol->string who)
+                                       ": not a seekable file: " path)))
+            (set! port (open-fd-input-port fd (buffer-mode block)))
+            (let ((bv (get-bytevector-n port (fx+ rsa-max-pem-bytes 1))))
+              (cond
+                ;; an empty file reads as EOF; hand the parser bytes, not an
+                ;; eof object, so the answer is "malformed PEM" and not "PEM
+                ;; must be a string or a bytevector"
+                ((eof-object? bv) (make-bytevector 0))
+                ((fx> (bytevector-length bv) rsa-max-pem-bytes)
+                 (rsa-fail (string-append (symbol->string who) ": " path
+                                          " is larger than "
+                                          (number->string rsa-max-pem-bytes)
+                                          " bytes")))
+                (else bv))))
+          (lambda ()
+            ;; the port, once created, owns the fd; before that we do
+            (if port (close-port port) (c-close fd)))))))
 
   (define (rsa-load-private-key path)
     (rsa-private-key-from-pem (read-file-bytes 'rsa-load-private-key path)))

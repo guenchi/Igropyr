@@ -886,11 +886,11 @@
 ;; reaches EOF; on one OS thread either one stops every green process, and
 ;; no actor timeout can interrupt it, because the thread that would run the
 ;; timeout is the thread that is blocked. The loader opens O_NONBLOCK and
-;; classifies the fd with fstat, so a FIFO returns a fd (refused as
-;; non-regular) instead of parking, and the fstat verdict is about the
-;; opened inode -- no stat-then-open swap window. Child processes with a
-;; clock, because the regression is a hang and (for /dev/zero) an
-;; unbounded allocation.
+;; rejects a fd that cannot seek (a FIFO/pipe/socket answers lseek with
+;; ESPIPE), so a FIFO returns instead of parking; the verdict is on the
+;; opened fd, so there is no stat-then-open swap window, and /dev/zero is
+;; bounded by the read limit rather than read without end. Child processes
+;; with a clock, because the regression is a hang.
 
 (when have-keys?
   (system (string-append "rm -f " (p "fifo.pem") " && mkfifo " (p "fifo.pem")
