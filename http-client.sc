@@ -621,6 +621,14 @@
     ;; raise propagates to the process guards, which free the codec,
     ;; close the socket, and answer the caller with the message
     ;;
+    ;; CONTRACT (behavioral guarantee, not an implementation detail):
+    ;; the on-chunk callback is invoked synchronously from the read loop,
+    ;; and socket reads are suspended for the duration of the callback.
+    ;; Downstream code may rely on this ordering -- chunks never interleave
+    ;; with callback execution, and no chunk is buffered behind a running
+    ;; callback. Changing this (e.g. queueing callbacks) is a breaking
+    ;; change to the streaming interface, not a refactor.
+    ;;
     ;; Reads are STOPPED around the handler. The handler is called
     ;; synchronously from this loop, and a handler that does real work --
     ;; a database write, a disk write, anything that parks -- lets the
