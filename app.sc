@@ -176,9 +176,11 @@
 ;; Conversation demo: a two-step transfer as one process. POST /transfer
 ;; with an amount provisionally holds it and answers a conversation id;
 ;; POST /transfer/:id with "confirm" commits, anything else cancels.
-;; Abandoning the dialogue (TTL) or a crash rolls the hold back -- the
-;; guard around the suspend! IS the transaction boundary. A resume after
-;; the conversation ended gets 410 Gone: guaranteed rolled back.
+;; Abandoning the dialogue (TTL) or a crash before the commit rolls the
+;; hold back -- the guard around the suspend! IS the transaction boundary,
+;; and a resume then gets 410 Gone: guaranteed rolled back. Past the
+;; commit! the guard no longer undoes anything, so the same failure is
+;; 409 unknown instead; only the first of those may be retried.
 (define account (box 1000))
 (app-post app "/transfer"
   (lambda (req res)
@@ -202,7 +204,7 @@
                        (set-box! account (+ (unbox account) amt))))))
           (let-values (((id token reply)
                         (conversation-start!
-                          (lambda (req suspend!)
+                          (lambda (req suspend! commit!)
                             (set-box! account (- (unbox account) amt))  ; hold
                             (guard (e (#t (release!) (raise e)))
                               (let ((req2 (suspend! (list (cons 'step "confirm")
@@ -210,14 +212,20 @@
                                 (if (equal? (utf8->string (req-body req2)) "confirm")
                                     (begin
                                       ;; committed: the hold becomes the
-                                      ;; transfer, so nothing is released
-                                      (set-box! released #t)
+                                      ;; transfer, so nothing is released.
+                                      ;; THROUGH commit!, because that is
+                                      ;; what tells the library the money
+                                      ;; moved -- a raise on the way out
+                                      ;; after this point must be answered
+                                      ;; 'unknown, not 'gone, or the client
+                                      ;; retries a transfer that happened.
+                                      (commit! (lambda () (set-box! released #t)))
                                       (list (cons 'done #t)
                                             (cons 'balance (unbox account))))
                                     (begin
                                       (release!)
                                       (list (cons 'done #f)
-                                            (cons 'cancelled #t))))))
+                                            (cons 'cancelled #t)))))))
                           req
                           15000                                         ; demo TTL 15s
                           ;; two retries of the same call are two different
@@ -231,7 +239,7 @@
             ;; the flow past a reply nobody read -- here, confirming a
             ;; transfer the user never saw the amount for.
             (send-json! res (cons (cons 'conv id)
-                                  (cons (cons 'token token) reply))))))))))
+                                  (cons (cons 'token token) reply)))))))))
 
 ;; The token comes back as ?token=N. A request without it, or with an old
 ;; one, is refused: it was written against a reply that is no longer the

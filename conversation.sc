@@ -20,13 +20,24 @@
 ;;;
 ;;;   (define-values (id token reply)
 ;;;     (conversation-start!
-;;;       (lambda (req suspend!)
+;;;       (lambda (req suspend! commit!)
 ;;;         (let ((tx (begin-tx!)))          ; live state, held across rounds
 ;;;           (guard (e (#t (rollback! tx) (raise e)))
 ;;;             (let ((req2 (suspend! first-reply)))   ; answer, park, resume
-;;;               (commit! tx)
+;;;               (commit! (lambda () (commit-tx! tx)))  ; commit THROUGH here
 ;;;               final-reply))))
 ;;;       req))
+;;;
+;;; A FLOW COMMITS THROUGH commit!, and the library learns the transaction
+;;; became permanent at the moment it did. Everything else it could observe
+;;; -- the flow returned, something was raised -- fails to separate a flow
+;;; that rolled back from one that committed and then tripped on the way
+;;; out, and those two get opposite answers ('gone, which invites a retry,
+;;; versus 'unknown, which does not). ONE CONVERSATION IS ONE LOGICAL
+;;; TRANSACTION: commit! runs the conversation's last state change, and no
+;;; new transaction is opened after it. The fact is STICKY -- once a
+;;; conversation has committed, nothing that happens to it afterwards, in
+;;; that round or any later one, is ever reported as a rollback.
 ;;;
 ;;;   (conversation-resume! id token req)
 ;;;     ; -> (values reply next-token), or 'stale / 'gone / 'unreachable
@@ -86,17 +97,32 @@
 ;;;   - 'gone IS EVIDENCE, NEVER AN ABSENCE. It is answered only where
 ;;;     this node holds a record saying the conversation ROLLED BACK: the
 ;;;     flow raised and its winders ran, or its park deadline passed and
-;;;     the raise that carries went uncaught out of the flow. For a flow
+;;;     the raise that carries went uncaught out of the flow -- and in
+;;;     either case commit! had NOT returned. For a flow
 ;;;     holding a database transaction that is the rollback guarantee --
 ;;;     dead process = dropped connection = the database rolled back on
 ;;;     its own -- and it is the only answer that carries it. Retry only
 ;;;     on 'gone.
+;;;   - COMMITTED, THEN FAILED, IS 'unknown. An exception can leave the
+;;;     flow after its commit! has returned: an after-thunk that raises
+;;;     while the flow is unwinding, a guard that re-raises, anything on
+;;;     the way out. The winders ran, so nothing is still held -- but the
+;;;     transaction is permanent, so this is not a rollback and must never
+;;;     be answered 'gone. Without commit! the library could not tell this
+;;;     apart from a flow that failed before committing: both arrive as one
+;;;     raise through one set of winders, and calling both 'gone is how a
+;;;     committed transfer gets retried into a double spend.
+;;;     THE SAME ANSWER HOLDS HOWEVER LATE THE FAILURE COMES. A flow that
+;;;     commits, parks, is resumed and only then raises has still
+;;;     committed; the conversation was one transaction and it is
+;;;     permanent, so that raise is 'unknown too. The mark commit! sets is
+;;;     never cleared, which is what makes the answer independent of how
+;;;     many rounds sit between the commit and the failure.
 ;;;   - EVERY OTHER WAY OF DYING IS 'unknown. A kill from outside, a link
-;;;     cascade, a step the watchdog stopped, an after-thunk that raised
-;;;     while the flow was returning from its COMMIT, a record that aged
+;;;     cascade, a step the watchdog stopped, a record that aged
 ;;;     out, an id from an earlier incarnation: none of them say anything
 ;;;     about the transaction, because the commit happens INSIDE the flow
-;;;     and the record is written after it returns. "No process and no
+;;;     and a stopped step leaves no record of where it got to. "No process and no
 ;;;     record" used to be reported as 'gone, which derives a positive
 ;;;     claim from missing evidence -- and the death paths that write no
 ;;;     record are an open set nobody can enumerate, so the claim was
@@ -116,7 +142,12 @@
 ;;;     'conversation-expired reaches the flow, a guard runs, and it can
 ;;;     roll back explicitly (re-raise, or don't catch, so the process
 ;;;     exits). An expiry that leaves the flow that way ran its winders,
-;;;     so it is recorded as rolled back and answers 'gone.
+;;;     so it is recorded as rolled back and answers 'gone -- UNLESS the
+;;;     conversation had already committed through commit!, in which case
+;;;     the winders running does not undo it and it answers 'unknown. A
+;;;     flow that commits and then parks until its deadline is the case
+;;;     that separates the two, and it holds however many rounds later the
+;;;     expiry comes: the commit mark is never cleared.
 ;;;     A STEP that overruns is KILLED -- that is what the watchdog is
 ;;;     for, and a step stuck in a loop or a foreign call cannot be raised
 ;;;     at. @kill discards dynamic-wind winders, so the flow's guard does
@@ -129,14 +160,16 @@
 ;;;     a reservation, a file handle, an in-memory hold. Pass an
 ;;;     on-killed thunk (conversation-start!'s fifth argument) to release
 ;;;     those; it runs after the kill, outside the dead process.
-;;;   - a flow that RAISES before its first suspend! makes
+;;;   - a flow that RAISES before its first suspend! AND BEFORE ITS
+;;;     commit! makes
 ;;;     conversation-start! raise #(conversation-failed reason) in the
 ;;;     caller -- the worker crashes, and the pool's normal retry handles
 ;;;     it (nothing had been answered yet, and a raise that left the flow
 ;;;     ran its winders, so the record says rolled back).
-;;;   - ...and only then. A first step STOPPED -- killed for overrunning,
-;;;     killed from outside, taken down by a link -- may have got past its
-;;;     COMMIT, and re-running an unanswered task would repeat it. That
+;;;   - ...and only then. A first step that may have got past its COMMIT --
+;;;     killed for overrunning, killed from outside, taken down by a link,
+;;;     or raising after its commit! had returned -- would be repeated by
+;;;     re-running an unanswered task. That
 ;;;     raises #(conversation-uncertain id outcome reason) instead, which
 ;;;     is NOT retryable: the id is there so the caller can reconcile.
 ;;;
@@ -404,24 +437,34 @@
   ;;
   ;; A tombstone is an id and an OUTCOME, and every answer about a
   ;; conversation with no process behind it is read off one. There are
-  ;; three, and the whole design of this file rests on keeping them apart:
+  ;; four, and the whole design of this file rests on keeping them apart:
   ;;
   ;;   #t             the flow returned: it SETTLED. -> 'settled
   ;;   'rolled-back   the flow raised (or its park deadline raised into it
-  ;;                  and nothing caught it) and left through its winders,
-  ;;                  so whatever it held was given back. -> 'gone
+  ;;                  and nothing caught it) and left through its winders
+  ;;                  WITHOUT its commit! having returned, so whatever it
+  ;;                  held was given back and nothing was made permanent.
+  ;;                  -> 'gone
+  ;;   'committed-then-failed
+  ;;                  the same exit, but ANY TIME AFTER commit! returned --
+  ;;                  in that round or a later one: the winders ran, and
+  ;;                  the transaction stands anyway. -> 'unknown
   ;;   'killed        it was stopped in flight: the winders did not run and
   ;;                  the flow may have committed first. -> 'unknown
   ;;
   ;; ...and NO RECORD is 'unknown too, which is the point. 'gone is the
   ;; rollback guarantee a caller retries on, so it has to come from a
-  ;; record that SAYS rolled back -- never from the absence of one. The
-  ;; absence reading was the defect this structure exists to remove: a
-  ;; process killed from outside, a link cascade, an after-thunk raising
-  ;; on the way back from a COMMIT all leave no record, and every one of
-  ;; them was answered 'gone. Those paths are an open set; the rule that
+  ;; record that SAYS rolled back -- never from the absence of one, and
+  ;; never from a record that merely says the flow left through its
+  ;; winders. The absence reading was the first half of that defect: a
+  ;; process killed from outside, a link cascade, a VM going down all
+  ;; leave no record, and every one of them was answered 'gone. Those
+  ;; paths are an open set; the rule that
   ;; only positive evidence answers 'gone covers all of them at once,
-  ;; including the ones nobody has thought of.
+  ;; including the ones nobody has thought of. The second half was reading
+  ;; every exception out of the flow as a rollback, which made 'gone a
+  ;; retry invitation for a flow that had committed; commit! is what
+  ;; splits that record in two.
   ;;
   ;; The linger covers the window just after completion, but it holds a
   ;; whole process and the retained reply, so it cannot be long. A record
@@ -457,7 +500,8 @@
   ;; that aged out, one pushed out by newer ones, one from before a
   ;; restart. It cannot cover a conversation killed from outside or taken
   ;; down by a link, which leave a young id, an empty table, and no reason
-  ;; at all. 'gone now comes from a 'rolled-back record and from nothing
+  ;; at all. 'gone now comes from a 'rolled-back record -- and only the
+  ;; ones written where commit! had not returned -- and from nothing
   ;; else, which subsumes every case this bounded the damage of.
   ;;
   ;; It is kept because the table still moves it and it costs one
@@ -537,8 +581,9 @@
   ;; running flag and tombstone -- as one indivisible act; the prune loop
   ;; stays outside, where it belongs.
   ;; WHAT THE RECORD SAYS, not merely that there is one. #t settled,
-  ;; 'rolled-back left through its winders, 'killed was stopped in flight
-  ;; -- see the head of this section for why those three and not two.
+  ;; 'rolled-back left through its winders before committing,
+  ;; 'committed-then-failed left through them after, 'killed was stopped in
+  ;; flight -- see the head of this section for why those four and not one.
   ;;
   ;; First write wins, and that is the right order in every direction: a
   ;; flow that published before the kill keeps its 'settled, a flow killed
@@ -829,13 +874,23 @@
           (receive (after 0 'ok) (`#(conv-forward-reply ,@ref ,a ,b) 'ok))
           (unregister reply-name)))))
 
-  ;; Start a conversation. flow: (lambda (req suspend!) ... final-reply).
+  ;; Start a conversation. flow: (lambda (req suspend! commit!) ... final-reply).
   ;; suspend! answers the current round and parks until the next resume,
   ;; returning the next request; on TTL expiry it raises
-  ;; 'conversation-expired inside the flow. The flow's return value is
-  ;; the final round's reply; the process then unregisters and exits.
-  ;; Returns (values id first-reply); the caller parks meanwhile.
-  ;; Optional trailing argument: ttl-ms (default 300000).
+  ;; 'conversation-expired inside the flow. commit! takes a thunk, runs it,
+  ;; and marks the conversation committed the moment it returns -- run the
+  ;; transaction's commit through it, or an exception on the way out of the
+  ;; flow will be recorded as a rollback and answered 'gone. One
+  ;; conversation is one logical transaction: commit! is the CONVERSATION's
+  ;; last state change, and the mark it sets is sticky -- never cleared, so
+  ;; nothing that happens afterwards can call this a rollback. The flow's
+  ;; return value is
+  ;; the final round's reply; the process then lingers one more TTL, so a
+  ;; lost final reply can still be replayed, and unregisters after it.
+  ;; Returns (values id token first-reply); the caller parks meanwhile.
+  ;; Optional trailing arguments: ttl-ms (default 300000), request-key
+  ;; (default values), on-killed (default #f) -- each documented at its
+  ;; binding below.
   (define (conversation-start! flow req . opts)
     (ensure-router!)
     ;; A ttl that is not a positive exact integer reaches receive's `after`
@@ -937,6 +992,27 @@
            ;; live record to get it, and puts the wrong outcome in the
            ;; entry it leaves behind.
            (recorded-box (box #f))
+           ;; DID THIS CONVERSATION GET PAST ITS COMMIT? Set by commit! the
+           ;; instant the thunk it was given returns, and NEVER CLEARED --
+           ;; there is no clearing point anywhere in this file. One
+           ;; conversation is one logical transaction, so once that
+           ;; transaction is permanent, no later death of this conversation
+           ;; may be described as a rollback: the effects are out in the
+           ;; world and 'gone would invite a caller to produce them again.
+           ;; A mark that reset each round said the opposite -- commit,
+           ;; park, resume, raise, and the answer was 'gone for a
+           ;; transaction that had already happened, which is the defect
+           ;; this box exists to close, one round later.
+           ;;
+           ;; Nothing else in the library can know this: under
+           ;; standard dynamic-wind an exception arriving from the flow
+           ;; looks the same whether the body raised (a real rollback) or
+           ;; the after-thunk raised while the body was RETURNING from a
+           ;; commit that succeeded. The first is 'gone, the second must be
+           ;; 'unknown, and reading them off one raise is not possible from
+           ;; outside; the flow has to say. So it does, by committing
+           ;; THROUGH the library.
+           (committed-box (box #f))
            ;; the watchdog, so entering running can WAKE it instead of
            ;; being noticed by a poll. Polling fast enough to catch the
            ;; start of a step meant polling every ttl for a small ttl --
@@ -1039,9 +1115,12 @@
                               ;; can say anything about a conversation that
                               ;; died some way the conversation itself never
                               ;; got to describe: killed from outside, taken
-                              ;; down by a link, an after-thunk raising
-                              ;; while the flow was already returning from
-                              ;; its COMMIT. Those paths are an open set --
+                              ;; down by a link, a death between deciding
+                              ;; and publishing. (An after-thunk raising on
+                              ;; the way out of a COMMIT is no longer one of
+                              ;; them: the flow's own guard writes
+                              ;; 'committed-then-failed for it.)
+                              ;; Those paths are an open set --
                               ;; they cannot be enumerated and so cannot be
                               ;; instrumented one by one -- and what they
                               ;; have in common is that they leave the table
@@ -1050,10 +1129,10 @@
                               ;; by then is not knowable from here.
                               ;;
                               ;; First write wins, so a conversation that
-                              ;; already published -- settled, or rolled
-                              ;; back through its winders -- keeps the
-                              ;; answer it gave itself; this only ever fills
-                              ;; in a silence.
+                              ;; already published -- settled, or left
+                              ;; through its winders either side of its
+                              ;; commit -- keeps the answer it gave itself;
+                              ;; this only ever fills in a silence.
                               ;;
                               ;; OUTSIDE the kill atom below, deliberately:
                               ;; that region exists to make deciding and
@@ -1235,6 +1314,79 @@
                          (set-phase! st 'running)
                          (raise 'conversation-expired))))
 
+                   ;; COMMIT THROUGH HERE, or the library cannot tell a
+                   ;; rollback from a commit that was followed by a failure.
+                   ;;
+                   ;; The commit happens INSIDE the flow, and everything the
+                   ;; library learns about the flow arrives as "it returned"
+                   ;; or "something was raised". Those two do not separate
+                   ;; the case that matters: an after-thunk that raises while
+                   ;; the flow is unwinding from a SUCCESSFUL commit produces
+                   ;; the same raise, through the same winders, as a body
+                   ;; that failed before committing anything. Recorded as a
+                   ;; rollback, the first tells a caller to retry a
+                   ;; transaction that already happened -- and 'gone is the
+                   ;; one answer this library says may be retried on.
+                   ;;
+                   ;; So the fact travels the only way it can: the flow runs
+                   ;; its commit as (commit! (lambda () ...)), and the mark
+                   ;; is set the instant that thunk RETURNS. Not before -- a
+                   ;; thunk that raises never returns, and the mark stays
+                   ;; off. The window between the real commit and the
+                   ;; mark is the return itself, which is the closest two
+                   ;; separate facts can be brought without being one.
+                   ;;
+                   ;; WHAT THE MARK ACTUALLY SAYS is "the thunk returned",
+                   ;; and that is as close to "the transaction is permanent"
+                   ;; as anything outside the thunk can get. A commit
+                   ;; primitive that raises AFTER the server made the
+                   ;; transaction durable -- an acknowledgement lost on the
+                   ;; way back -- is indistinguishable here from one that
+                   ;; never got there, and this records the second. That
+                   ;; residue belongs to the commit primitive, not to this:
+                   ;; a thunk that cannot tell the two apart should raise
+                   ;; something the flow turns into its own uncertainty
+                   ;; rather than let the conversation be called a rollback.
+                   ;;
+                   ;; A NON-LOCAL EXIT OUT OF THE THUNK skips the mark too
+                   ;; -- an escaping continuation, or suspend! called from
+                   ;; inside it. Both are outside the contract (commit! runs
+                   ;; the commit and nothing else), and neither can be
+                   ;; detected from here; a thunk that does either after a
+                   ;; real commit gets the conversation called a rollback.
+                   ;;
+                   ;; The contract this rests on: ONE CONVERSATION IS ONE
+                   ;; LOGICAL TRANSACTION, and commit! is the last state
+                   ;; change of THE CONVERSATION -- not of a round, and no
+                   ;; new transaction is opened after it. Which is why the
+                   ;; mark is STICKY: it is never cleared, so every later
+                   ;; way this conversation can die is described against a
+                   ;; transaction that already happened. A flow that
+                   ;; commits, parks, resumes and only then fails is the
+                   ;; case that makes the difference -- per-round the answer
+                   ;; would have been 'gone, and the caller would have been
+                   ;; invited to produce the same effects a second time.
+                   ;; A flow that commits, then opens a second transaction
+                   ;; and fails in it, is likewise described as "committed,
+                   ;; then failed": that is all one mark can say, and it is
+                   ;; the safe half to say.
+                   ;;
+                   ;; The thunk's values are passed back unchanged, HOWEVER
+                   ;; MANY there are, so wrapping a commit changes nothing
+                   ;; the flow can observe. Binding one value would have
+                   ;; been enough for every commit anyone writes -- and a
+                   ;; thunk returning none, or two, would then have raised
+                   ;; BEFORE the mark was set, so a commit that had already
+                   ;; happened would be recorded as a rollback and answered
+                   ;; 'gone. That is the very failure this exists to remove,
+                   ;; and refusing an arity nobody needs is not worth
+                   ;; reintroducing it.
+                   (define (commit! thunk)
+                     (call-with-values thunk   ; the commit itself
+                       (lambda vals
+                         (set-box! committed-box #t)
+                         (apply values vals))))
+
                    ;; THE ONLY PLACE A ROLLBACK IS WITNESSED.
                    ;;
                    ;; An exception that leaves the flow has already run the
@@ -1262,10 +1414,24 @@
                    ;; honest answer, and the one this ordering preserves.
                    ;; Re-raised unchanged, so the process still dies of what
                    ;; the application raised and every monitor sees it.
+                   ;;
+                   ;; AND WHAT IT WITNESSES IS NOT ALWAYS A ROLLBACK. Leaving
+                   ;; the flow through its winders says everything the flow
+                   ;; held was given back; it does NOT say the transaction is
+                   ;; undone, because an after-thunk can raise while the flow
+                   ;; is returning from a commit that already succeeded. This
+                   ;; branch used to record every such exit as 'rolled-back,
+                   ;; which answers 'gone -- the retry guarantee -- for a
+                   ;; conversation that had committed, and the retry performs
+                   ;; the transfer a second time. commit! is what separates
+                   ;; the two, and this is the only reader of its mark.
                    (let ((final (guard (e (#t (set-box! recorded-box #t)
-                                              (tomb-record-as! id 'rolled-back)
+                                              (tomb-record-as! id
+                                                (if (unbox committed-box)
+                                                    'committed-then-failed
+                                                    'rolled-back))
                                               (raise e)))
-                                  (flow req suspend!))))
+                                  (flow req suspend! commit!))))
                      ;; ONE INDIVISIBLE ACT. The watchdog reads the running
                      ;; flag and the clock; between a flow returning and its
                      ;; completion being published there were four separate
@@ -1364,6 +1530,32 @@
   ;; 'unknown. A predicate that fails must not turn an honest "I cannot
   ;; say" into a confident wrong answer, and it must not take the caller
   ;; down either.
+  ;;
+  ;; ...EXCEPT AGAINST A LOCAL WITNESS, which beats the predicate. This
+  ;; node watched commit!'s thunk return and wrote that down, so a #f --
+  ;; "durably not committed" -- is not new information filling a gap, it
+  ;; is evidence CONTRADICTING evidence already in hand. A store that
+  ;; lags, a read that landed on a replica, an id written under a
+  ;; different key: any of them produce that #f, and honouring it answers
+  ;; 'gone for a transaction that this node saw commit -- which is a retry
+  ;; invitation, and the one outcome the whole file is built to refuse. On
+  ;; contradiction the honest answer is 'unknown: two sources disagree,
+  ;; and neither of them is "it rolled back".
+  ;;
+  ;; The predicate keeps every case it was added for. It is asked in the
+  ;; first place because 'unknown usually means this node knows NOTHING --
+  ;; a kill, a record that aged out, no record at all -- and there a #f is
+  ;; the only evidence there is, so it still resolves to 'gone. What
+  ;; changed is only the one record that already says the commit happened.
+  ;;
+  ;; ASYMMETRIC ACROSS A FORWARD, deliberately. The predicate is applied
+  ;; on the ASKING node, and for a forwarded resume the owner's tombstone
+  ;; is on the OWNER -- so there is no local witness to contradict and
+  ;; this check cannot fire. That is a defence for the local case only,
+  ;; and it is not a weakening of the forwarded one: the predicate's own
+  ;; contract (#f means the authoritative store holds no commit) is what
+  ;; carries both, and this adds a degenerate cross-check where a second,
+  ;; independent record happens to be within reach.
   (define (resolve-unknown id status settled?)
     (if (and settled? (eq? status 'unknown))
         ;; call-with-values and a variadic consumer, both INSIDE the guard.
@@ -1377,7 +1569,14 @@
             (lambda () (settled? id))
             (lambda v
               (cond ((and (pair? v) (null? (cdr v)) (eq? (car v) #t)) 'settled)
-                    ((and (pair? v) (null? (cdr v)) (eq? (car v) #f)) 'gone)
+                    ((and (pair? v) (null? (cdr v)) (eq? (car v) #f))
+                     ;; 'killed and no-record carry no commit witness, so
+                     ;; the predicate is the only evidence and #f still
+                     ;; means rolled back. 'committed-then-failed is the
+                     ;; one record that contradicts it.
+                     (if (eq? (tomb-outcome id) 'committed-then-failed)
+                         'unknown
+                         'gone))
                     (else 'unknown)))))
         status))
 
@@ -1430,15 +1629,34 @@
   ;; record, and an id young enough that a record should still have been
   ;; there -- which reads a positive claim off missing evidence, and every
   ;; way of dying that writes no record made that claim false: a kill from
-  ;; outside, a link cascade, an after-thunk raising while the flow was
-  ;; returning from its COMMIT. There is no enumerating those. Requiring
+  ;; outside, a link cascade, a VM going down mid-step. There is no
+  ;; enumerating those. Requiring
   ;; the evidence closes all of them at once, at the cost of answering
   ;; 'unknown where the old code guessed right.
+  ;;
+  ;; A RECORD IS NOT AUTOMATICALLY A ROLLBACK EITHER, which is the other
+  ;; half of the same rule. An exception leaving the flow proves its
+  ;; winders ran; it does not prove the transaction was undone, because the
+  ;; flow may have been unwinding from a commit that had already succeeded.
+  ;; The flow says which by committing through commit!, and the two
+  ;; outcomes are recorded apart -- 'rolled-back and 'committed-then-failed
+  ;; -- so that only the first is ever answered 'gone.
   (define (settled-or-lost id)
     (let ((rec (tomb-outcome id)))
       (cond ((eq? rec #t) 'settled)
-            ;; left through its winders: it gave back what it held
+            ;; left through its winders WITHOUT having committed: it gave
+            ;; back what it held, and there is nothing to give back that it
+            ;; had already made permanent
             ((eq? rec 'rolled-back) 'gone)
+            ;; left through its winders AFTER its commit returned -- an
+            ;; after-thunk, or anything else on the way out, raised once the
+            ;; transaction was already permanent. The winders ran, so this
+            ;; is not a kill; the commit stands, so it is not a rollback.
+            ;; The `else` below would answer 'unknown anyway; it is spelled
+            ;; out because a reader asking "what does a flow that committed
+            ;; and then failed get told" should find the answer here rather
+            ;; than infer it from a fall-through.
+            ((eq? rec 'committed-then-failed) 'unknown)
             ;; 'killed, and no record at all, are the same statement --
             ;; stopped, or stopped in a way nothing recorded. A step
             ;; stopped in flight may have committed and may not have;

@@ -31,7 +31,7 @@
         (call-with-values
           (lambda ()
             (conversation-start!
-              (lambda (req suspend!)
+              (lambda (req suspend! commit!)
                 (let loop ((sum 0) (r req))
                   (if (eq? r 'done)
                       (vector 'final sum)

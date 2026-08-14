@@ -6,6 +6,8 @@
 ;;;   - gone: resume after the conversation ended / with a bad id -> 410
 ;;;   - expiry: abandoning the dialogue rolls the hold back (guard ran)
 ;;;   - crash inside a step -> resume answers gone, hold rolled back
+;;;   - commit!: a raise after a commit the library witnessed -> 'unknown,
+;;;     never 'gone; a commit! whose thunk raised is still 'gone
 
 (import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
         (igropyr json) (igropyr conversation) (igropyr libuv))
@@ -80,7 +82,7 @@
 (define account (box 1000))
 
 (define (transfer-flow amt crash-on-confirm?)
-  (lambda (req suspend!)
+  (lambda (req suspend! commit!)
     (set-box! account (- (unbox account) amt))       ; provisional hold
     (guard (e (#t (set-box! account (+ (unbox account) amt))
                   (raise e)))                        ; roll the hold back
@@ -267,7 +269,7 @@
 ;; skipped, or one stage's payload applied to the next.
 (let-values (((id token first)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   ;; Three stages, so the conversation is still ALIVE and
                   ;; parked when the second resume arrives -- otherwise it
                   ;; answers 'gone (the flow finished) and the test proves
@@ -313,7 +315,7 @@
 ;; exists.
 (let-values (((rid rtok rfirst)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'after-first req))))
                     (sleep-ms 150)
                     (let ((b (suspend! (vector 'after-second a))))
@@ -348,7 +350,7 @@
 ;; the safe reading of that is 'stale.
 (let-values (((uid utok ufirst)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'parked req))))
                     (vector 'confirmed a)))
                 'go
@@ -390,7 +392,7 @@
                      (set-box! held (- (unbox held) 100))))))
   (let-values (((kid ktok kfirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (set-box! held (+ (unbox held) 100))       ; the hold
                     (guard (e (#t (release!) (raise e)))       ; never runs
                       (let ((a (suspend! (vector 'held req))))
@@ -426,7 +428,7 @@
 (let ((released (box #f)))
   (let-values (((bid btok bfirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (guard (e (#t (receive (after 60000 'never))))   ; wedges
                       (suspend! (vector 'parked req))))
                   'go
@@ -465,7 +467,7 @@
   (let ((released (box 0)))
     (let-values (((pid ptok pfirst)
                   (conversation-start!
-                    (lambda (req suspend!)
+                    (lambda (req suspend! commit!)
                       (let ((a (suspend! (vector 'parked req))))
                         (vector 'committed a)))
                     'go
@@ -479,7 +481,7 @@
       ;; a second conversation completes and evicts the first one's record
       (let-values (((qid qtok qfirst)
                     (conversation-start!
-                      (lambda (req suspend!) (vector 'done req))
+                      (lambda (req suspend! commit!) (vector 'done req))
                       'go
                       150)))
         (void))
@@ -513,7 +515,7 @@
   (let ((outcome
          (guard (e (#t e))
            (conversation-start!
-             (lambda (req suspend!)
+             (lambda (req suspend! commit!)
                (set-box! committed (+ 1 (unbox committed)))   ; the COMMIT
                (sleep-ms (* 6 ttl))                           ; ...then late
                (suspend! (vector 'never-reached req)))
@@ -552,7 +554,7 @@
        (committed (box 0)))
   (let-values (((eid etok efirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (let ((a (suspend! (vector 'parked req))))
                       (set-box! committed (+ 1 (unbox committed)))  ; the COMMIT
                       (sleep-ms (* 6 ttl))          ; ...and then it is late
@@ -593,7 +595,7 @@
 (let ((rounds (box 0)))
   (let-values (((sid stok sfirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (let loop ((r req))
                       (set-box! rounds (+ 1 (unbox rounds)))
                       (loop (guard (e (#t 'swallowed))   ; eats the expiry
@@ -621,7 +623,7 @@
 (let ((releases (box 0)))
   (let-values (((cid ctok cfirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (let ((a (suspend! (vector 'parked req))))
                       (vector 'committed a)))
                   'go
@@ -662,7 +664,7 @@
 (let ((committed (box #f)))
   (let-values (((wid wtok wfirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (let ((a (suspend! (vector 'parked req))))
                       (sleep-ms 380)            ; inside a 400ms TTL, just
                       (set-box! committed #t)   ; "commit"
@@ -695,7 +697,7 @@
 ;; claimed as tested.
 (let-values (((tid ttok tfirst)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'parked req))))
                     (sleep-ms 300)              ; far past a 40ms TTL
                     (vector 'should-not-get-here a)))
@@ -721,7 +723,7 @@
 (let ((me self))
   (let-values (((oid otok ofirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (let loop ((r req))
                       (loop (guard (e (#t 'swallowed))
                               (suspend! (vector 'ask r))))))
@@ -755,7 +757,7 @@
       (entered-key (box #f)))
   (let-values (((hid htok hfirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (let ((a (suspend! (vector 'parked req))))
                       (vector 'committed a)))
                   'go
@@ -875,7 +877,7 @@
           (started (box #f)))
       (let-values (((kid ktok kfirst)
                     (conversation-start!
-                      (lambda (req suspend!)
+                      (lambda (req suspend! commit!)
                         (let ((a (suspend! (vector 'parked req))))
                           (set-box! started (now-ms))
                           (sleep-ms 2000)
@@ -942,7 +944,7 @@
       (let ((r (guard (e (#t 'raised))
                  (let-values (((gid gtok gfirst)
                                (conversation-start!
-                                 (lambda (req suspend!)
+                                 (lambda (req suspend! commit!)
                                    (sleep-ms d)
                                    (vector 'landed d))
                                  'go
@@ -984,7 +986,7 @@
       (guard (e (#t (void)))
         (let-values (((gid gtok gfirst)
                       (conversation-start!
-                        (lambda (req suspend!)
+                        (lambda (req suspend! commit!)
                           (sleep-ms d)
                           (let ((a (suspend! (vector 'parked 'x))))
                             (vector 'done a)))
@@ -1034,7 +1036,7 @@
       (guard (e (#t (void)))
        (let-values (((gid gtok gfirst)
                     (conversation-start!
-                      (lambda (req suspend!)
+                      (lambda (req suspend! commit!)
                         (sleep-ms d)          ; ends right around the deadline
                         (let ((a (suspend! (vector 'parked req))))
                           (sleep-ms (* 20 ttl))
@@ -1082,7 +1084,7 @@
 (let ((advanced (box #f)))
   (let-values (((lid ltok lfirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (let ((a (suspend! (vector 'parked req))))
                       (set-box! advanced #t)
                       (vector 'advanced a)))
@@ -1105,7 +1107,7 @@
 ;; outlast it cheaply.
 (let-values (((sid stok sfirst)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'parked req))))
                     (vector 'committed a)))
                 'go
@@ -1125,7 +1127,7 @@
 ;; ...and one that DIED is still 'gone -- the guarantee that matters
 (let-values (((did dtok dfirst)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'parked req))))
                     (raise 'flow-crashed)))
                 'go
@@ -1160,7 +1162,7 @@
 (let ((rolled (box #f)))
   (let-values (((aid atok afirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (guard (e (#t (set-box! rolled #t) (raise e)))
                       (let ((a (suspend! (vector 'parked req))))
                         (raise 'flow-raised))))
@@ -1191,7 +1193,7 @@
 (let ((rolled (box #f)))
   (let-values (((bid btok bfirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (guard (e (#t (set-box! rolled #t) (raise e)))
                       (let ((a (suspend! (vector 'parked req))))
                         (vector 'never a))))
@@ -1216,7 +1218,7 @@
 ;; on the library cooperating.
 (let-values (((cid ctok cfirst)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (guard (e (#t (raise e)))     ; would witness a rollback...
                     (let ((a (suspend! (vector 'parked req))))
                       (sleep-ms 3000)           ; ...but is killed in here
@@ -1264,7 +1266,7 @@
 (let ((outcome
        (guard (e (#t e))
          (conversation-start!
-           (lambda (req suspend!) (raise 'before-anything))
+           (lambda (req suspend! commit!) (raise 'before-anything))
            'go
            4000))))
   (unless (vector? outcome)
@@ -1300,7 +1302,7 @@
 ;; longer reaches it, and what it does still say.
 (let* ((real (let-values (((hid htok hfirst)
                            (conversation-start!
-                             (lambda (req suspend!) 'done) 'go 300)))
+                             (lambda (req suspend! commit!) 'done) 'go 300)))
                hid))
        (len (string-length real))
        (dot (let loop ((i 0))
@@ -1333,7 +1335,7 @@
 (let ((seen '()))
   (let-values (((tid ttok tfirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (let loop ((i 0) (r req))
                       (if (>= i 4)
                           'done
@@ -1419,7 +1421,7 @@
                                 (substring real dash len))))))
        (probe (let-values (((pid ptok pfirst)
                             (conversation-start!
-                              (lambda (req suspend!) 'done) 'go 300)))
+                              (lambda (req suspend! commit!) 'done) 'go 300)))
                 pid))
        (absurd (or (absurd-id-from probe)
                    (fail "could not build an absurd id from" probe))))
@@ -1461,7 +1463,7 @@
 ;; knowable from here.
 (let-values (((eid etok efirst)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'parked req))))
                     (vector 'committed a)))
                 'go
@@ -1488,7 +1490,7 @@
 ;; what it bounds.
 (let-values (((kid ktok kfirst)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'parked req))))
                     (vector 'final a)))
                 'go
@@ -1516,7 +1518,7 @@
 ;; what did it last say.
 (let-values (((pid ptok pfirst)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'parked req))))
                     (vector 'final a)))
                 'go
@@ -1578,7 +1580,7 @@
 (let ((asked (box 0)))
   (let-values (((gid gtok gfirst)
                 (conversation-start!
-                  (lambda (req suspend!)
+                  (lambda (req suspend! commit!)
                     (suspend! (vector 'parked req))
                     (raise 'boom))
                   'go
@@ -1600,7 +1602,7 @@
 ;; the change above must not have swallowed it.
 (let-values (((gid gtok gfirst)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (suspend! (vector 'parked req))
                   (raise 'boom))                   ; dies without completing
                 'go
@@ -1621,7 +1623,7 @@
 ;; the reply, while the conversation is its own process.
 (let-values (((id tok first)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'parked req))))
                     (sleep-ms 3000)          ; far past the TTL below
                     (vector 'should-not-get-here a)))
@@ -1648,7 +1650,7 @@
 ;; two together do, so only a step measured end to end is stopped.
 (let-values (((id tok first)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'parked req))))
                     (sleep-ms 300)              ; under the TTL by itself
                     (vector 'should-not-get-here a)))
@@ -1679,7 +1681,7 @@
 ;; and is then killed at the next, having run a fraction of its allowance.
 (let-values (((id2 tok2 first2)
               (conversation-start!
-                (lambda (req suspend!)
+                (lambda (req suspend! commit!)
                   (let ((a (suspend! (vector 'parked req))))
                     (sleep-ms 100)
                     (let ((b (suspend! (vector 'parked2 a))))
@@ -1701,6 +1703,323 @@
         (if (and (vector? v) (eq? (vector-ref v 0) 'finished))
             (display "a step gets its whole TTL whatever the sampling phase ok\n")
             (fail "a step well inside the TTL was cut short by sampling phase" v))))))
+
+;; ---- a commit the library WITNESSED is never reported rolled back -------
+;;
+;; The one shape dynamic-wind cannot let the library distinguish from
+;; outside: the body has run its COMMIT and is returning, and the
+;; after-thunk raises on the way out. That raise leaves the flow exactly
+;; like a rollback does, and the guard used to record it as 'rolled-back --
+;; so the caller was told 'gone, the one answer documented as "safe to
+;; retry", and retried a committed transaction. commit! exists so the
+;; library can witness the commit itself: the thunk returned, so the
+;; record says the transaction may have landed and the answer is 'unknown.
+(let ((committed (box 0)))
+  (let-values (((id tok first)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (dynamic-wind
+                        (lambda () (void))
+                        (lambda ()
+                          (commit! (lambda ()
+                                     (set-box! committed
+                                               (+ 1 (unbox committed)))))
+                          (vector 'committed a))
+                        (lambda () (raise 'cleanup-raised)))))
+                  'go
+                  3000)))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'cw r st)))))
+      (receive (after 6000 (fail "commit-then-raise never answered" 'no-answer))
+        (`#(cw ,r ,st)
+          (unless (= 1 (unbox committed))
+            (fail "the commit! thunk never ran" (unbox committed)))
+          (when (eq? st 'gone)
+            (fail "a commit the library witnessed was reported rolled back" st))
+          (unless (eq? st 'unknown)
+            (fail "commit-then-raise got the wrong status" st))
+          (display "a raise after commit! answers 'unknown, not 'gone ok\n"))))
+    ;; ...and the classification is DURABLE: a reconciler asking later --
+    ;; off the tombstone, not off a parked resume -- gets the same answer,
+    ;; not a rollback record that was merely overridden once.
+    (let-values (((st tok2 reply) (conversation-peek id)))
+      (unless (eq? st 'unknown)
+        (fail "the witnessed commit did not survive into the record" st))
+      (display "a witnessed commit survives into the tombstone ok\n"))))
+
+;; ...and the witness OUTRANKS the reconciliation predicate. A
+;; caller-supplied settled? may turn 'unknown into 'gone off durable
+;; absence -- built for records this node knows nothing about (killed,
+;; aged out, never written). A committed-then-failed record is not
+;; nothing: this node watched the commit! thunk return. A predicate
+;; answering #f against that -- a lagging replica, a mismatched key -- is
+;; contradicted evidence, and the answer stays 'unknown; #t still
+;; upgrades to 'settled, and junk still leaves 'unknown standing.
+(let-values (((id tok first)
+              (conversation-start!
+                (lambda (req suspend! commit!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (dynamic-wind
+                      (lambda () (void))
+                      (lambda ()
+                        (commit! (lambda () 'tx))
+                        (vector 'done a))
+                      (lambda () (raise 'cleanup-raised)))))
+                'go
+                3000)))
+  (let ((me self))
+    (spawn (lambda ()
+             (let-values (((r st)
+                           (guard (e (#t (values 'raised 'raised)))
+                             (conversation-resume! id tok 'go))))
+               (send me (vector 'pw st)))))
+    (receive (after 6000 (fail "the predicate-witness setup never answered"
+                               'no-answer))
+      (`#(pw ,st)
+        (unless (eq? st 'unknown)
+          (fail "the predicate-witness setup got the wrong status" st)))))
+  ;; the flow is dead behind a committed-then-failed record; ask again
+  ;; with a predicate of each shape
+  (let-values (((r st) (conversation-resume! id tok 'again (lambda (i) #f))))
+    (when (eq? st 'gone)
+      (fail "a #f predicate overrode the local commit witness" st))
+    (unless (eq? st 'unknown)
+      (fail "witness-vs-#f got the wrong status" st)))
+  (let-values (((r st) (conversation-resume! id tok 'again (lambda (i) #t))))
+    (unless (eq? st 'settled)
+      (fail "a #t predicate did not upgrade a witnessed commit" st)))
+  (let-values (((r st) (conversation-resume! id tok 'again (lambda (i) 'maybe))))
+    (unless (eq? st 'unknown)
+      (fail "a non-boolean predicate disturbed a witnessed commit" st)))
+  (display "the commit witness outranks a #f reconciliation predicate ok\n"))
+
+;; ...and a commit! whose thunk RAISES marked nothing. The transaction
+;; never happened -- the raise left the thunk before commit! could witness
+;; a return -- so the flow's death through its winders is an ordinary
+;; rollback, and 'gone (retry) is exactly right.
+(let ((entered (box 0)))
+  (let-values (((id tok first)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (commit! (lambda ()
+                                 (set-box! entered (+ 1 (unbox entered)))
+                                 (raise 'commit-refused)))
+                      (vector 'unreachable a)))
+                  'go
+                  3000)))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'cr st)))))
+      (receive (after 6000 (fail "refused-commit never answered" 'no-answer))
+        (`#(cr ,st)
+          (unless (= 1 (unbox entered))
+            (fail "the refused commit! thunk never ran" (unbox entered)))
+          (unless (eq? st 'gone)
+            (fail "a commit that never happened was not reported rolled back" st))
+          (display "a commit! whose thunk raises still answers 'gone ok\n"))))))
+
+;; ...and the witness is STICKY. A flow that committed in one round and
+;; parked again is a conversation whose one logical transaction is already
+;; permanent -- that is the contract: one conversation, one transaction,
+;; nothing new opened after commit!. A raise in ANY later round leaves a
+;; conversation that committed, and 'gone there would invite a retry that
+;; performs the committed transaction again. Once the mark is set, every
+;; later death answers 'unknown.
+(let-values (((id tok first)
+              (conversation-start!
+                (lambda (req suspend! commit!)
+                  (let ((a (suspend! (vector 'round1 req))))
+                    (commit! (lambda () 'first-tx))
+                    (let ((b (suspend! (vector 'round2 a))))
+                      (raise 'later-round-raise))))
+                'go
+                3000)))
+  (let-values (((r2 tok2) (conversation-resume! id tok 'go)))
+    (unless (and (vector? r2) (eq? (vector-ref r2 0) 'round2))
+      (fail "the committed round did not park again" r2))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok2 'go))))
+                 (send me (vector 'rr st)))))
+      (receive (after 6000 (fail "the later-round raise never answered" 'no-answer))
+        (`#(rr ,st)
+          (when (eq? st 'gone)
+            (fail "a committed conversation's later raise was reported rolled back"
+                  st))
+          (unless (eq? st 'unknown)
+            (fail "a raise after a committed round got the wrong status" st))
+          (display "a raise in any round after a commit answers 'unknown ok\n"))))))
+
+;; ...and commit! is transparent on the success path: it returns the
+;; thunk's value, the flow returns its reply, and the record says settled.
+(let-values (((id tok first)
+              (conversation-start!
+                (lambda (req suspend! commit!)
+                  (let ((a (suspend! (vector 'parked req))))
+                    (vector 'done (commit! (lambda () 'tx-value)))))
+                'go
+                3000)))
+  (let-values (((r st) (conversation-resume! id tok 'go)))
+    (unless (and (vector? r) (eq? (vector-ref r 0) 'done)
+                 (eq? (vector-ref r 1) 'tx-value))
+      (fail "commit! did not return its thunk's value" r))
+    (unless (conversation-done? st)
+      (fail "a committed clean return did not settle" st))
+    (display "commit! returns the thunk's value and the flow settles ok\n")))
+
+;; ...and a flow that committed and then sat PARKED past its TTL is not
+;; 'gone either. The expiry raise runs the flow's winders like any
+;; rollback, but the transaction this conversation carried already
+;; committed and the mark never clears, so the answer is 'unknown:
+;; reconcile, do not redo.
+(let ((committed (box 0)))
+  (let-values (((id tok first)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'round1 req))))
+                      (commit! (lambda ()
+                                 (set-box! committed (+ 1 (unbox committed)))))
+                      (let ((b (suspend! (vector 'round2 a))))
+                        (vector 'unreachable b))))
+                  'go
+                  300)))
+    (let-values (((r2 tok2) (conversation-resume! id tok 'go)))
+      (unless (= 1 (unbox committed))
+        (fail "the expiring flow never reached its commit" (unbox committed)))
+      (unless (and (vector? r2) (eq? (vector-ref r2 0) 'round2))
+        (fail "the committed flow did not park again" r2))
+      (sleep-ms 700)                     ; the round-2 park expires; flow dies
+      (let-values (((r st) (conversation-resume! id tok2 'go)))
+        (when (eq? st 'gone)
+          (fail "a committed conversation that expired was reported rolled back"
+                st))
+        (unless (eq? st 'unknown)
+          (fail "commit-then-expiry got the wrong status" st))
+        (display "a committed flow abandoned at a park answers 'unknown ok\n")))))
+
+;; ---- the witness works on the INITIAL round too --------------------------
+;;
+;; Before the first suspend! nothing has been answered, so the starter's
+;; classification is what decides between "retry" and "reconcile". A flow
+;; whose commit! returned and whose after-thunk then raised must surface
+;; as conversation-uncertain -- the retryable conversation-failed there is
+;; how a worker pool re-runs a committed transaction.
+(let ((committed (box 0)))
+  (let ((outcome
+         (guard (e (#t e))
+           (conversation-start!
+             (lambda (req suspend! commit!)
+               (dynamic-wind
+                 (lambda () (void))
+                 (lambda ()
+                   (commit! (lambda ()
+                              (set-box! committed (+ 1 (unbox committed)))))
+                   (vector 'never-published req))
+                 (lambda () (raise 'initial-cleanup-raised))))
+             'go
+             3000))))
+    (unless (= 1 (unbox committed))
+      (fail "the initial commit! thunk never ran" (unbox committed)))
+    (unless (and (vector? outcome)
+                 (eq? (vector-ref outcome 0) 'conversation-uncertain))
+      (fail "an initial commit-then-raise was raised as retryable" outcome))
+    (unless (and (> (vector-length outcome) 2)
+                 (eq? (vector-ref outcome 2) 'unknown))
+      (fail "the initial uncertain raise carried the wrong outcome" outcome))
+    (display "an initial commit-then-raise is uncertain, not retryable ok\n")))
+
+;; ...and an initial round that commits and returns cleanly needs no
+;; suspension for commit! to work.
+(let-values (((id st reply)
+              (conversation-start!
+                (lambda (req suspend! commit!)
+                  (vector 'done (commit! (lambda () 'initial-tx))))
+                'go
+                3000)))
+  (unless (conversation-done? st)
+    (fail "an initial clean commit did not settle" st))
+  (unless (and (vector? reply) (eq? (vector-ref reply 1) 'initial-tx))
+    (fail "the initial commit! lost its thunk's value" reply))
+  (display "an initial-round commit! settles without a suspension ok\n"))
+
+;; ---- one conversation's witness is not another's -------------------------
+;;
+;; Two conversations in flight: A commits and parks again; B never
+;; commits and is abandoned. B's expiry must read B's mark, not A's --
+;; a witness kept anywhere but per-conversation state answers 'unknown
+;; for B, and 'unknown where 'gone was earned surrenders the retry.
+(let ((a-committed (box 0)))
+  (let-values (((aid atok afirst)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'a-round1 req))))
+                      (commit! (lambda ()
+                                 (set-box! a-committed
+                                           (+ 1 (unbox a-committed)))))
+                      (let ((b (suspend! (vector 'a-round2 a))))
+                        (vector 'unreachable b))))
+                  'go
+                  600)))
+    (let-values (((bid btok bfirst)
+                  (conversation-start!
+                    (lambda (req suspend! commit!)
+                      (let ((a (suspend! (vector 'b-round1 req))))
+                        (vector 'unreachable a)))
+                    'go
+                    400)))
+      ;; A commits while B is parked, then both are abandoned
+      (let-values (((ar atok2) (conversation-resume! aid atok 'go)))
+        (unless (= 1 (unbox a-committed))
+          (fail "conversation A never reached its commit" (unbox a-committed)))
+        (sleep-ms 1300)                  ; both parks expire; both flows die
+        (let-values (((br bst) (conversation-resume! bid btok 'go)))
+          (unless (eq? bst 'gone)
+            (fail "an uncommitted conversation borrowed another's witness" bst)))
+        (let-values (((ar2 ast) (conversation-resume! aid atok2 'go)))
+          (unless (eq? ast 'unknown)
+            (fail "a committed conversation lost its witness to another" ast)))
+        (display "the commit witness is per conversation ok\n")))))
+
+;; ...and a message that does not ADVANCE the flow does not touch the
+;; witness either. Nothing clears the mark, and a stale token in
+;; particular must not: it answers 'stale without waking the flow, and a
+;; replayed request must never talk a committed conversation back into
+;; 'gone.
+(let ((committed (box 0)))
+  (let-values (((id tok first)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'round1 req))))
+                      (commit! (lambda ()
+                                 (set-box! committed (+ 1 (unbox committed)))))
+                      (let ((b (suspend! (vector 'round2 a))))
+                        (vector 'unreachable b))))
+                  'go
+                  400)))
+    (let-values (((r2 tok2) (conversation-resume! id tok 'go)))
+      (unless (= 1 (unbox committed))
+        (fail "the stale-probe flow never reached its commit" (unbox committed)))
+      ;; a token this conversation never issued: answered 'stale, no round
+      ;; starts, the witness must survive it
+      (let-values (((sr sst) (conversation-resume! id (gensym "bogus") 'poke)))
+        (unless (conversation-stale? sst)
+          (fail "a bogus token was not answered stale" sst)))
+      (sleep-ms 900)                     ; the round-2 park expires; flow dies
+      (let-values (((r st) (conversation-resume! id tok2 'go)))
+        (unless (eq? st 'unknown)
+          (fail "a stale probe erased the commit witness" st))
+        (display "a stale token does not touch the commit witness ok\n")))))
 
 (display "ALL CONVERSATION TESTS PASSED\n")
     (exit 0)))
