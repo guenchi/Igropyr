@@ -152,13 +152,17 @@
         ((freebsd) '("libc.so.7" "libc.so.6" "libc.so"))
         (else '("libc.so.6" "libc.so")))))
   (define O-RDONLY 0)
+  ;; O_NONBLOCK and O_CLOEXEC are the two flags whose value differs per OS.
+  ;; Setting O_CLOEXEC in the open() flags is atomic -- there is no
+  ;; open-then-fcntl window in which a concurrent fork+exec could inherit
+  ;; the key fd, and no fcntl return value to check.
   (define O-NONBLOCK (case platform-os ((linux) #x800) (else 4)))
-  (define F-SETFD 2)                 ; POSIX, same everywhere
-  (define FD-CLOEXEC 1)
-  (define SEEK-CUR 1)
+  (define O-CLOEXEC
+    (case platform-os
+      ((linux) #x80000) ((freebsd) #x100000) ((macos) #x1000000) (else 0)))
+  (define SEEK-CUR 1)                 ; POSIX, same everywhere
   (define c-open  (foreign-procedure "open" (string int) int))
   (define c-lseek (foreign-procedure "lseek" (int integer-64 int) integer-64))
-  (define c-fcntl (foreign-procedure "fcntl" (int int int) int))
   (define c-close (foreign-procedure "close" (int) int))
   ;; raw big-endian magnitudes handed to rsa-public-key-from-modulus: the
   ;; bit limits above are enforced after BN_bin2bn, but the byte arrays are
@@ -504,13 +508,17 @@
             (set! ctx (EVP_PKEY_CTX_new pk 0))
             (when (zero? ctx) (rsa-fail "EVP_PKEY_CTX_new failed")))
           (lambda ()
-            ;; only an explicit 0 means "parameters disagree". -2 is "this
-            ;; provider does not implement the check" and other negatives
-            ;; are check-time errors -- treat both as "cannot check", never
-            ;; as inconsistent, so a provider policy (FIPS, a stricter e)
-            ;; cannot turn a mathematically sound key away
-            (when (fx= 0 (EVP_PKEY_check ctx))
-              (rsa-fail "inconsistent RSA private key (parameters do not agree)")))
+            ;; 1 = valid (accept); -2 = provider does not implement the
+            ;; check (cannot judge -> accept, so a provider lacking it does
+            ;; not reject every key); 0 and any other negative = invalid or
+            ;; check failed -> reject, so an internal error is fail-closed,
+            ;; never fail-open. A FIPS provider failing a mathematically
+            ;; sound key on policy also returns 0 and is refused here -- the
+            ;; return value cannot tell the two apart; such a key must be
+            ;; loaded through the raw-modulus API instead.
+            (let ((r (EVP_PKEY_check ctx)))
+              (unless (or (fx= r 1) (fx= r -2))
+                (rsa-fail "inconsistent RSA private key (parameters do not agree)"))))
           (lambda () (when (and ctx (not (zero? ctx))) (EVP_PKEY_CTX_free ctx)))))))
 
   (define (pkey->rsa-key pk private?)
@@ -650,18 +658,18 @@
   (define (read-file-bytes who path)
     (unless (string? path)
       (assertion-violation who "path must be a string" (type-name path)))
-    (let ((fd (c-open path (fxior O-RDONLY O-NONBLOCK))))
+    (let ((fd (c-open path (fxior O-RDONLY O-NONBLOCK O-CLOEXEC))))
       (when (fx< fd 0)
         (rsa-fail (string-append (symbol->string who) ": cannot open: " path)))
       ;; own the raw fd until it is either rejected (closed here) or handed
       ;; to a port (closed with the port). A failure anywhere in this
       ;; stretch -- an allocation that throws, a non-seekable verdict --
-      ;; must not strand it, and it must not survive a fork+exec.
+      ;; must not strand it. close-on-exec was set atomically in the open
+      ;; flags, so no fork+exec can inherit it.
       (let ((port #f))
         (dynamic-wind
           (lambda () (void))
           (lambda ()
-            (c-fcntl fd F-SETFD FD-CLOEXEC)     ; close-on-exec
             ;; a FIFO/pipe/socket cannot seek (ESPIPE) -- reject it before
             ;; a read could block; the verdict is on this fd, so no
             ;; path-swap window

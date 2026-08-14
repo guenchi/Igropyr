@@ -37,6 +37,27 @@
   (if ok
       (begin (display "  ok  ") (display label) (newline))
       (fail label)))
+
+(define (str-contains? m needle)
+  (let ((nl (string-length needle)) (ml (string-length m)))
+    (let loop ((i 0))
+      (cond ((fx> (fx+ i nl) ml) #f)
+            ((string=? (substring m i (fx+ i nl)) needle) #t)
+            (else (loop (fx+ i 1)))))))
+
+;; Did the thunk raise a condition whose own message contains `needle`?
+;; This distinguishes OUR bound check (which refuses before allocating or
+;; calling into the FFI) from an incidental low-level error a too-large
+;; value would raise anyway -- so a "raises" assertion actually pins the
+;; fix, not just any exception.
+(define (raises-message-containing? needle thunk)
+  (guard (e ((and (message-condition? e)
+                  (string? (condition-message e))
+                  (str-contains? (condition-message e) needle))
+             #t)
+            (#t #f))
+    (thunk)
+    #f))
 (define (check= label got want)
   (if (equal? got want)
       (begin (display "  ok  ") (display label) (newline))
@@ -693,18 +714,21 @@
 ;; it must be refused cleanly rather than truncated or over-produced.
 (if (getenv "IGROPYR_AEAD_HUGE_TEST")
     (let ((max-bytes (- (expt 2 31) 1)))
-      ;; A4: a random request past the int ceiling must raise, not fill a
-      ;; prefix and return the rest unrandomized
-      (check "random past 32-bit ceiling raises"
-        (guard (e (#t #t)) (aead-random-bytes (+ max-bytes 1)) #f))
-      ;; A3: seal must refuse a plaintext whose sealed form (plaintext ||
-      ;; 16-byte tag) would exceed what open can address -- otherwise seal
-      ;; produces a message its own opener rejects
+      ;; A4: a request past the int ceiling must be refused BY OUR CHECK
+      ;; (message names the ceiling), before allocation or the FFI -- not
+      ;; merely raise some low-level error a too-large value would raise
+      ;; anyway
+      (check "random past 32-bit ceiling raises our own bound error"
+        (raises-message-containing? "exceeds"
+          (lambda () (aead-random-bytes (+ max-bytes 1)))))
+      ;; A3: seal must refuse (again by our own check) a plaintext whose
+      ;; sealed form (plaintext || 16-byte tag) would exceed what open can
+      ;; address -- otherwise seal produces a message its own opener rejects
       (let ((k (make-bytevector 32 7)) (iv (make-bytevector 12 3)))
         (check "seal refuses plaintext whose sealed form open cannot address"
-          (guard (e (#t #t))
-            (aes-256-gcm-seal k iv (make-bytevector (- max-bytes 15) 0) #f)
-            #f))))
+          (raises-message-containing? "too long"
+            (lambda ()
+              (aes-256-gcm-seal k iv (make-bytevector (- max-bytes 15) 0) #f))))))
     (begin
       (display "  skip  32-bit addressing edges (set IGROPYR_AEAD_HUGE_TEST")
       (display " to run; each allocates ~2 GiB)\n")))
