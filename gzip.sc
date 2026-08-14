@@ -131,9 +131,15 @@
                                           (p-filesz (u64 phs (fx+ ph 32))))
                                       (if (and (>= vaddr p-vaddr)
                                                (< vaddr (+ p-vaddr p-filesz)))
-                                          (bytes (+ p-off (- vaddr p-vaddr))
-                                                 (min want (- (+ p-vaddr p-filesz)
-                                                              vaddr)))
+                                          ;; the whole want or nothing: a
+                                          ;; slice shortened by the segment
+                                          ;; end would weaken the identity
+                                          ;; comparison below, possibly to a
+                                          ;; single byte
+                                          (and (>= (- (+ p-vaddr p-filesz) vaddr)
+                                                   want)
+                                               (bytes (+ p-off (- vaddr p-vaddr))
+                                                      want))
                                           (seek (fx+ i 1)))))))))
                      (and shs phs
                           (let find-dynsym ((i 0))
@@ -179,29 +185,38 @@
     '("zlibVersion" "deflateInit2_" "deflate" "deflateEnd"
       "inflateInit2_" "inflate" "inflateEnd"))
 
-  ;; Is memory at addr mapped in this process AND byte-for-byte equal
-  ;; to `expected`? mincore first, so an address that is not mapped
-  ;; here fails cleanly instead of faulting on the read. This is what
-  ;; stands between "the file at the executable's path" and "the image
-  ;; this process is actually running": when an upgrade has replaced
-  ;; the file after exec, its symbol addresses describe the wrong
-  ;; image, and no symbol may be called on that evidence.
-  (define getpagesize* (foreign-procedure "getpagesize" () int))
-  (define mincore*     (foreign-procedure "mincore" (void* size_t u8*) int))
-  (define (mapped-and-matching? addr expected)
-    (let* ((count (bytevector-length expected))
-           (ps (getpagesize*))
-           (base (* ps (div addr ps)))
-           (span (- (* ps (div (+ addr count ps -1) ps)) base))
-           (vec (make-bytevector (div span ps) 0)))
+  ;; Is memory at addr readable in this process AND byte-for-byte equal
+  ;; to `expected`? This is what stands between "the file at the
+  ;; executable's path" and "the image this process is actually
+  ;; running": when an upgrade has replaced the file after exec, its
+  ;; symbol addresses describe the wrong image, and no symbol may be
+  ;; called on that evidence.
+  ;;
+  ;; Readability is probed by handing the range to write(2) on a pipe:
+  ;; the kernel copies from the address and reports EFAULT instead of
+  ;; faulting the process, which covers unmapped pages and PROT_NONE
+  ;; mappings alike -- mincore cannot (it reports existence, not
+  ;; readability), and a /dev/null fd cannot either (its driver never
+  ;; reads the buffer and reports success for any address; verified).
+  (define pipe*  (foreign-procedure "pipe" (u8*) int))
+  (define write* (foreign-procedure "write" (int void* size_t) integer-64))
+  (define close* (foreign-procedure "close" (int) int))
+  (define (readable-and-matching? addr expected)
+    (let ((count (bytevector-length expected))
+          (fds (make-bytevector 8)))
       (and (fx> count 0)
-           (fx= 0 (mincore* base span vec))
-           (let loop ((i 0))
-             (cond ((fx= i count) #t)
-                   ((fx= (foreign-ref 'unsigned-8 addr i)
-                         (bytevector-u8-ref expected i))
-                    (loop (fx+ i 1)))
-                   (else #f))))))
+           (fx= 0 (pipe* fds))
+           (let* ((rfd (bytevector-s32-native-ref fds 0))
+                  (wfd (bytevector-s32-native-ref fds 4))
+                  (n (write* wfd addr count)))    ; count <= 64 << PIPE_BUF
+             (close* rfd) (close* wfd)
+             (and (= n count)
+                  (let loop ((i 0))
+                    (cond ((fx= i count) #t)
+                          ((fx= (foreign-ref 'unsigned-8 addr i)
+                                (bytevector-u8-ref expected i))
+                           (loop (fx+ i 1)))
+                          (else #f))))))))
 
   (define zlib-addresses
     (and (eq? platform-os 'freebsd)
@@ -212,7 +227,7 @@
                        (for-all
                          (lambda (n)
                            (let ((e (assoc n syms)))
-                             (and e (mapped-and-matching? (cadr e) (cddr e)))))
+                             (and e (readable-and-matching? (cadr e) (cddr e)))))
                          zlib-symbol-names)
                        (map (lambda (e) (cons (car e) (cadr e))) syms)))))))
 

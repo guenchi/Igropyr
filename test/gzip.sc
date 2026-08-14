@@ -144,10 +144,18 @@
 ;; not compress a truncated prefix. Needs a ~4.3 GB allocation, so
 ;; opt-in.
 (if (getenv "IGROPYR_GZIP_HUGE_TEST")
-    (check "input past the 32-bit bound returns #f"
-      (not (gzip-compress (make-bytevector 4290676492 0) 1)))
     (begin
-      (display "  skip  huge-input bound (set IGROPYR_GZIP_HUGE_TEST to run; allocates ~4.3 GB)")
+      (check "input past the 32-bit bound returns #f"
+        (not (gzip-compress (make-bytevector 4290676492 0) 1)))
+      ;; ...and the bound is not off by one: the largest in-range
+      ;; length still compresses (peak memory ~13 GB)
+      (let ((gz (gzip-compress (make-bytevector 4290676491 0) 1)))
+        (check "largest in-range input still compresses"
+          (and gz
+               (= #x1f (bytevector-u8-ref gz 0))
+               (= #x8b (bytevector-u8-ref gz 1))))))
+    (begin
+      (display "  skip  32-bit-bound cases (set IGROPYR_GZIP_HUGE_TEST to run; allocates up to ~13 GB)")
       (newline)))
 
 ;; ---- Accept-Encoding negotiation -------------------------------------
