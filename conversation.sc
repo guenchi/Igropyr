@@ -165,6 +165,12 @@
 ;;;     unconditionally; undo the transaction only under (not
 ;;;     committed?), because undoing one that succeeded is the same
 ;;;     damage 'gone would have done, arriving by another route.
+;;;     EVERY ACTION IN THE HOOK MUST BE IDEMPOTENT -- the release as
+;;;     much as the undo. "The winders did not run" is true of the kill
+;;;     itself and not of every conversation that reaches this hook: one
+;;;     whose exception had already finished unwinding, but whose outcome
+;;;     was not yet published when the kill landed, arrives here having
+;;;     released once already. The hook then releases a second time.
 ;;;     THAT ARGUMENT CAN BE A FALSE NEGATIVE, in one instant: a kill
 ;;;     landing between the commit thunk's return and the mark being set
 ;;;     passes #f for a transaction that did happen. The window cannot be
@@ -603,6 +609,13 @@
   ;; watchdog's backstop -- which writes 'killed for a death it did not
   ;; cause and cannot classify -- never overwrites a flow that had already
   ;; said what happened to it.
+  ;;
+  ;; ...WHILE THE RECORD IS STILL HERE, which is all this rule can
+  ;; promise. An entry that has been pruned is not a first write any more,
+  ;; so a later insert wins by default; what actually preserves a
+  ;; classification across an eviction is the conversation's own
+  ;; outcome-box, which the kill path re-inserts from. This function is
+  ;; the tie-breaker between two live writers, not the memory.
   (define (tomb-insert-as! id what)
     (unless (hashtable-contains? tombstones id)
       (hashtable-set! tombstones id what)
@@ -789,17 +802,26 @@
   (define (conv-router-loop)
     (let loop ()
       (receive
+        ;; The record each local call read stays HERE. Carrying it back
+        ;; would widen these reply frames, and they are matched by vector
+        ;; shape: a node that has not been upgraded does not fail to
+        ;; understand a wider frame, it fails to MATCH it, waits out
+        ;; conv-forward-ttl-ms and answers 'unreachable -- for every
+        ;; forwarded resume, not just the ones a witness would have helped.
+        ;; Sending the witness across the mesh is a separate, additive
+        ;; change: teach every node to accept both shapes first, then start
+        ;; sending the wider one.
         (`#(conv-peek-fwd ,from-node ,reply-name ,ref ,id)
           (spawn
             (lambda ()
-              (let-values (((state token reply) (local-peek id)))
+              (let-values (((state token reply rec) (local-peek id)))
                 (rsend from-node reply-name
                        (vector 'conv-peek-reply ref state token reply)))))
           (loop))
         (`#(conv-resume ,from-node ,reply-name ,ref ,id ,token ,req)
           (spawn
             (lambda ()
-              (let-values (((reply status) (local-resume id token req)))
+              (let-values (((reply status rec) (local-resume id token req)))
                 (rsend from-node reply-name
                        (vector 'conv-forward-reply ref reply status)))))
           (loop))
@@ -1020,8 +1042,18 @@
            ;; watchdog's call site). So #f means "no witness", not "proof
            ;; it did not commit". An undo that is destructive when wrong
            ;; must be idempotent, or consult the authoritative store,
-           ;; rather than rest on this flag alone; releasing a handle,
-           ;; which is unconditional anyway, never has the problem.
+           ;; rather than rest on this flag alone.
+           ;;
+           ;; EVERY ACTION IN THE HOOK MUST BE IDEMPOTENT, not only the
+           ;; compensation. This used to say that releasing a handle,
+           ;; being unconditional anyway, never had the problem -- which
+           ;; is wrong in the two windows the kill gate cannot close: a
+           ;; flow whose winders have ALREADY run (they released once) but
+           ;; whose outcome had not yet been published when the kill
+           ;; landed reaches this hook as well, and releases a second
+           ;; time. The gate below narrows those windows; nothing closes
+           ;; them, because "the winders have finished running" is not a
+           ;; fact any other process can observe.
            (on-killed
              (if (and (pair? opts) (pair? (cdr opts)) (pair? (cddr opts)))
                  (caddr opts)
@@ -1046,18 +1078,31 @@
            ;; set when the flow returns: from then on nothing the watchdog
            ;; sees is a step that overran, whatever marks the phase running
            (settled-box (box #f))
-           ;; SET WHEN SOMETHING THAT KNEW WHAT HAPPENED SAID SO -- the
-           ;; flow returning, an exception leaving the flow, or the
-           ;; watchdog's own kill. It is what the backstop below asks
-           ;; before filling in a silence, and it is a BOX rather than a
-           ;; lookup in the table for the same reason settled-box is: the
-           ;; table forgets. A conversation whose record is evicted while
-           ;; its watchdog is still winding down would otherwise be
-           ;; described a second time, by the one process that does not
-           ;; know what happened to it -- which costs a slot, evicts a
-           ;; live record to get it, and puts the wrong outcome in the
-           ;; entry it leaves behind.
-           (recorded-box (box #f))
+           ;; WHAT SOMETHING THAT KNEW WHAT HAPPENED SAID -- not merely
+           ;; THAT it said something. #f until published; then #t for a
+           ;; flow that returned, or the outcome symbol an exception left
+           ;; ('rolled-back / 'committed-then-failed), or 'killed.
+           ;;
+           ;; It is a BOX rather than a lookup in the table for the same
+           ;; reason settled-box is: THE TABLE FORGETS. A conversation
+           ;; whose record is evicted while its watchdog is still winding
+           ;; down would otherwise be described a second time, by the one
+           ;; process that does not know what happened to it -- which
+           ;; costs a slot, evicts a live record to get it, and puts the
+           ;; wrong outcome in the entry it leaves behind.
+           ;;
+           ;; It holds the OUTCOME and not just a flag because "first
+           ;; write wins" only protects a record that is still in the
+           ;; table. A flow can publish 'rolled-back, have that record
+           ;; pruned -- by age, or by another conversation's insert under
+           ;; the count limit -- and still be alive on its way out of the
+           ;; guard when the watchdog kills it; the kill then finds no
+           ;; record, and a KNOWN rollback becomes 'killed, which answers
+           ;; 'unknown. A caller that could have retried is told to
+           ;; reconcile instead. Carrying the outcome lets the kill path
+           ;; re-establish the classification it found rather than
+           ;; overwrite it with the weakest one.
+           (outcome-box (box #f))
            ;; DID THIS CONVERSATION GET PAST ITS COMMIT? Set by commit! the
            ;; instant the thunk it was given returns, and NEVER CLEARED --
            ;; there is no clearing point anywhere in this file. One
@@ -1159,13 +1204,28 @@
                            ;; gone, and every later retry gets 'settled with
                            ;; no answer instead of the answer.
                            ;;
-                           ;; A flow that already returned is never a step
-                           ;; that overran, so settled-box gates the KILL and
-                           ;; not merely the hook: computing a request key
-                           ;; marks the phase running during the linger too,
-                           ;; and a slow key on a replay would otherwise
-                           ;; still bring the watchdog down on a finished
-                           ;; conversation. It holds nothing by then.
+                           ;; WHAT IS GATED IS THE HOOK, NOT THE KILL. The
+                           ;; kill asks two things only: is the process
+                           ;; alive, and has the running phase outlived its
+                           ;; allowance. A settled conversation can still
+                           ;; meet both -- computing a request key marks the
+                           ;; phase running during the linger too, so a slow
+                           ;; key on a replay is killed like any other
+                           ;; overrun. That is deliberate: the alternative
+                           ;; is a key function that wedges and holds a
+                           ;; process, registered and unreachable, for the
+                           ;; life of the VM. The linger and the reply it
+                           ;; was retaining are lost, which costs a late
+                           ;; retry its answer; the OUTCOME survives, because
+                           ;; the kill below re-establishes the record it
+                           ;; found rather than overwriting it, so that
+                           ;; retry is told 'settled and never something
+                           ;; wrong.
+                           ;; (This comment used to claim settled-box gated
+                           ;; the kill. It never did -- the condition below
+                           ;; has always been alive-and-overrun -- so it
+                           ;; described an intention the code did not carry
+                           ;; out.)
                            ;;
                            ;; on-killed is application code and runs OUTSIDE
                            ;; the region.
@@ -1200,12 +1260,26 @@
                               ;; commit -- keeps the answer it gave itself;
                               ;; this only ever fills in a silence.
                               ;;
+                              ;; THE OUTCOME-BOX GUARD IS THE REAL ONE
+                              ;; here, because first-write-wins only holds
+                              ;; while the record exists: a published
+                              ;; outcome whose record was pruned would
+                              ;; otherwise be overwritten with 'killed by
+                              ;; this very line. Unlike the kill branch
+                              ;; below, this backstop does not re-insert
+                              ;; the outcome it remembers -- it declines to
+                              ;; write instead, so such a conversation
+                              ;; answers 'unknown rather than a wrong
+                              ;; 'gone. It runs for a process that is
+                              ;; already dead and cannot be given a second
+                              ;; record's worth of table pressure.
+                              ;;
                               ;; OUTSIDE the kill atom below, deliberately:
                               ;; that region exists to make deciding and
                               ;; killing indivisible, and this is
                               ;; bookkeeping about something that already
                               ;; happened.
-                              (unless (unbox recorded-box)
+                              (unless (unbox outcome-box)
                                 (tomb-record-as! id 'killed))
                               'done)
                              ((not (overrun?)) (loop))
@@ -1220,12 +1294,29 @@
                               ;; leaving a committed transaction to be
                               ;; killed and reported rolled back.
                               (sleep-ms 1)
-                              (let ((killed
-                                     (with-interrupts-disabled
-                                       (and (process-alive? watched)
-                                            (overrun?)
-                                            (begin
-                                              (kill watched 'conversation-expired)
+                              (let-values
+                                  (((killed run-hook?)
+                                    (with-interrupts-disabled
+                                      (if (not (and (process-alive? watched)
+                                                    (overrun?)))
+                                          (values #f #f)
+                                          ;; READ BEFORE KILLING, INSIDE THE
+                                          ;; ATOM. What decides whether the
+                                          ;; hook runs is whether anything
+                                          ;; had already described this
+                                          ;; conversation when the kill
+                                          ;; landed -- and this region is
+                                          ;; about to describe it itself, so
+                                          ;; the snapshot has to be taken
+                                          ;; before that write and before
+                                          ;; the kill. Asking afterwards
+                                          ;; reads what this very region
+                                          ;; just wrote, which would silence
+                                          ;; the hook on every kill; asking
+                                          ;; outside the atom re-opens the
+                                          ;; race the atom exists to close.
+                                          (let ((had (unbox outcome-box)))
+                                            (kill watched 'conversation-expired)
                                               ;; SAY THAT WE DID IT, in the
                                               ;; same atom. A step killed
                                               ;; after its COMMIT returned
@@ -1250,21 +1341,33 @@
                                               ;; RECORD WAS PRUNED. First
                                               ;; write wins is decided by
                                               ;; what is in the table, and
-                                              ;; a settled record can be
-                                              ;; evicted while its
-                                              ;; conversation is still
-                                              ;; lingering -- after which
-                                              ;; this would overwrite a
-                                              ;; certain answer with an
-                                              ;; uncertain one. The flag is
-                                              ;; still here to be read.
-                                              (tomb-insert-as!
-                                                id
-                                                (if (unbox settled-box)
-                                                    #t
-                                                    'killed))
-                                              (set-box! recorded-box #t)
-                                              #t)))))
+                                              ;; a record can be evicted
+                                              ;; while its conversation is
+                                              ;; still alive -- lingering
+                                              ;; after settling, or on its
+                                              ;; way out of the guard that
+                                              ;; just published a rollback.
+                                              ;; Re-inserting the outcome
+                                              ;; this region SAW is what
+                                              ;; keeps that classification;
+                                              ;; the old code re-inserted
+                                              ;; 'killed and turned a known
+                                              ;; rollback into 'unknown.
+                                              ;; (Where the record is still
+                                              ;; there, tomb-insert-as! is
+                                              ;; first-write-wins and this
+                                              ;; changes nothing.)
+                                              (let ((o (cond
+                                                         (had had)
+                                                         ((unbox settled-box) #t)
+                                                         (else 'killed))))
+                                                (tomb-insert-as! id o)
+                                                (unless had
+                                                  (set-box! outcome-box o)))
+                                              ;; the hook is for a
+                                              ;; conversation nothing had
+                                              ;; described yet
+                                              (values #t (not had)))))))
                                 ;; DECLINING TO KILL IS NOT BEING DONE.
                                 ;; Before the grace period this branch
                                 ;; always killed, so falling out of it was
@@ -1299,6 +1402,7 @@
                                     ;; and there is nothing left to give
                                     ;; back.
                                     (when (and on-killed
+                                               run-hook?
                                                (not (unbox settled-box)))
                                       ;; AND IT IS TOLD WHETHER THE
                                       ;; TRANSACTION COMMITTED. A killed
@@ -1526,11 +1630,21 @@
                    ;; conversation that had committed, and the retry performs
                    ;; the transfer a second time. commit! is what separates
                    ;; the two, and this is the only reader of its mark.
-                   (let ((final (guard (e (#t (set-box! recorded-box #t)
-                                              (tomb-record-as! id
-                                                (if (unbox committed-box)
-                                                    'committed-then-failed
-                                                    'rolled-back))
+                   ;; PUBLISHED AS ONE ACT, for the reason the completion
+                   ;; path below is: the box and the record are one fact
+                   ;; about this conversation, and the watchdog reads them.
+                   ;; Written separately, a kill could land between them and
+                   ;; find a conversation that had already decided it rolled
+                   ;; back but had not said so where the kill could see.
+                   ;; The prune stays outside -- it walks the table, and a
+                   ;; region that cannot be preempted should not.
+                   (let ((final (guard (e (#t (let ((o (if (unbox committed-box)
+                                                           'committed-then-failed
+                                                           'rolled-back)))
+                                                (with-interrupts-disabled
+                                                  (set-box! outcome-box o)
+                                                  (tomb-insert-as! id o))
+                                                (tomb-prune!))
                                               (raise e)))
                                   (flow req suspend! commit!))))
                      ;; ONE INDIVISIBLE ACT. The watchdog reads the running
@@ -1549,7 +1663,7 @@
                        (step-state-awaiting-set! st #f)
                        (set-phase! st 'completed)
                        (set-box! settled-box #t)
-                       (set-box! recorded-box #t)
+                       (set-box! outcome-box #t)
                        (tomb-insert! id))
                      (tomb-prune!)
                      (when who
@@ -1657,7 +1771,7 @@
   ;; contract (#f means the authoritative store holds no commit) is what
   ;; carries both, and this adds a degenerate cross-check where a second,
   ;; independent record happens to be within reach.
-  (define (resolve-unknown id status settled?)
+  (define (resolve-unknown id status settled? rec)
     (if (and settled? (eq? status 'unknown))
         ;; call-with-values and a variadic consumer, both INSIDE the guard.
         ;; A predicate that returns no value or several is not a raise, so
@@ -1675,7 +1789,18 @@
                      ;; the predicate is the only evidence and #f still
                      ;; means rolled back. 'committed-then-failed is the
                      ;; one record that contradicts it.
-                     (if (eq? (tomb-outcome id) 'committed-then-failed)
+                     ;;
+                     ;; THE RECORD IS THE ONE ALREADY READ, not a second
+                     ;; lookup. Asking the table again would be asking a
+                     ;; different table: tomb-outcome prunes on the way in,
+                     ;; so an entry seen a moment ago can be gone by now --
+                     ;; by age, or pushed out by another conversation's
+                     ;; insert -- and the witness would vanish exactly when
+                     ;; a busy node needs it. record-not-read arrives from
+                     ;; the forwarded path, where this node consulted no
+                     ;; table at all; it is not a witness and does not
+                     ;; pretend to be one.
+                     (if (eq? rec 'committed-then-failed)
                          'unknown
                          'gone))
                     (else 'unknown)))))
@@ -1693,11 +1818,12 @@
   (define (conversation-resume! id token req . rest)
     (let ((owner (conv-owner id))
           (settled? (opt-settled? rest 'conversation-resume!)))
-      (let-values (((r status)
-                    (if (or (not owner) (eq? owner (node-self)))
-                        (local-resume id token req)
-                        (forward-resume owner id token req))))
-        (values r (resolve-unknown id status settled?)))))
+      ;; the forwarded path reads no table on this node, and says so
+      (if (or (not owner) (eq? owner (node-self)))
+          (let-values (((r status rec) (local-resume id token req)))
+            (values r (resolve-unknown id status settled? rec)))
+          (let-values (((r status) (forward-resume owner id token req)))
+            (values r (resolve-unknown id status settled? record-not-read))))))
 
   ;; Resume a conversation that lives on THIS node.
   ;; -> (values reply next-token), where next-token is #f when the
@@ -1742,9 +1868,28 @@
   ;; The flow says which by committing through commit!, and the two
   ;; outcomes are recorded apart -- 'rolled-back and 'committed-then-failed
   ;; -- so that only the first is ever answered 'gone.
-  (define (settled-or-lost id)
+  ;; NO RECORD WAS CONSULTED on this path -- which is not the same fact as
+  ;; #f, "the table was consulted and held nothing". A forwarded resume
+  ;; never reads this node's table, and saying so explicitly is what keeps
+  ;; the witness check below from treating a missing lookup as evidence.
+  (define record-not-read 'record-not-read)
+
+  ;; -> (values answer record). The record travels with the answer because
+  ;; a second reader would not be asking the same table: tomb-outcome
+  ;; prunes on the way in, so between two calls an entry can age out or be
+  ;; pushed out by another conversation's insert -- and the second question
+  ;; (does this node hold a commit witness?) would then be answered off a
+  ;; table that no longer says what the first one saw. One read, two uses.
+  (define (settled-or-lost/record id)
     (let ((rec (tomb-outcome id)))
-      (cond ((eq? rec #t) 'settled)
+      (values (settled-or-lost-answer rec) rec)))
+
+  (define (settled-or-lost id)
+    (let-values (((answer rec) (settled-or-lost/record id)))
+      answer))
+
+  (define (settled-or-lost-answer rec)
+    (cond ((eq? rec #t) 'settled)
             ;; left through its winders WITHOUT having committed: it gave
             ;; back what it held, and there is nothing to give back that it
             ;; had already made permanent
@@ -1762,8 +1907,11 @@
             ;; stopped, or stopped in a way nothing recorded. A step
             ;; stopped in flight may have committed and may not have;
             ;; saying 'gone is what performs a committed transfer twice.
-            (else 'unknown))))
+            (else 'unknown)))
 
+  ;; -> (values reply status record); the record is what settled-or-lost
+  ;; read, or record-not-read where the answer came from the live process
+  ;; and no table was consulted.
   (define (local-resume id token req)
     (let ((p (whereis (conversation-name id))))
       (if (not p)
@@ -1771,7 +1919,8 @@
           ;; difference between "your transaction committed" and "it rolled
           ;; back", and answering 'gone for both is how a committed
           ;; transfer gets performed twice.
-          (values #f (settled-or-lost id))
+          (let-values (((status rec) (settled-or-lost/record id)))
+            (values #f status rec))
           (let ((ref (gensym))
                 (m (monitor p)))
             (send p (vector 'conv-step self ref token req))
@@ -1779,11 +1928,12 @@
               (`#(conv-reply ,@ref ,reply ,status)
                 (when m (demonitor m))
                 (flush-down! p)
-                (values reply status))
+                (values reply status record-not-read))
               ;; the process died while we waited: it may have finished
               ;; and lingered out in between, so ask the record
               (`#(DOWN ,@p ,reason)
-                (values #f (settled-or-lost id))))))))
+                (let-values (((status rec) (settled-or-lost/record id)))
+                  (values #f status rec))))))))
 
   ;; What is this conversation waiting for, and what did it last say?
   ;;
@@ -1811,16 +1961,19 @@
   (define (conversation-peek id . rest)
     (let ((owner (conv-owner id))
           (settled? (opt-settled? rest 'conversation-peek)))
-      (let-values (((state token reply)
-                    (if (or (not owner) (eq? owner (node-self)))
-                        (local-peek id)
-                        (forward-peek owner id))))
-        (values (resolve-unknown id state settled?) token reply))))
+      (if (or (not owner) (eq? owner (node-self)))
+          (let-values (((state token reply rec) (local-peek id)))
+            (values (resolve-unknown id state settled? rec) token reply))
+          (let-values (((state token reply) (forward-peek owner id)))
+            (values (resolve-unknown id state settled? record-not-read)
+                    token reply)))))
 
+  ;; -> (values state token last-reply record), the record as in local-resume
   (define (local-peek id)
     (let ((p (whereis (conversation-name id))))
       (if (not p)
-          (values (settled-or-lost id) #f #f)
+          (let-values (((state rec) (settled-or-lost/record id)))
+            (values state #f #f rec))
           (let ((ref (gensym))
                 (m (monitor p)))
             (send p (vector 'conv-peek self ref))
@@ -1828,9 +1981,10 @@
               (`#(conv-peeked ,@ref ,state ,token ,reply)
                 (when m (demonitor m))
                 (flush-down! p)
-                (values state token reply))
+                (values state token reply record-not-read))
               (`#(DOWN ,@p ,reason)
-                (values (settled-or-lost id) #f #f)))))))
+                (let-values (((state rec) (settled-or-lost/record id)))
+                  (values state #f #f rec))))))))
 
   ;; THE ROLLBACK GUARANTEE, and the only answer that is one. A record
   ;; says the flow rolled back: it raised, or its park deadline raised
