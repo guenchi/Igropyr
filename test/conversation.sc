@@ -386,6 +386,7 @@
 ;; worse bug than never giving it back.
 (let* ((held (box 0))
        (released (box #f))
+       (hook-arg (box 'unset))
        (release! (lambda ()
                    (unless (unbox released)
                      (set-box! released #t)
@@ -403,8 +404,11 @@
                   values                                       ; request-key
                   ;; runs AFTER the kill, in the watchdog's process, on
                   ;; what the flow was holding -- reached through the box
-                  ;; it closed over, not through the dead stack
-                  release!)))
+                  ;; it closed over, not through the dead stack. This flow
+                  ;; never committed, and the hook is told so.
+                  (lambda (committed?)
+                    (set-box! hook-arg committed?)
+                    (release!)))))
     (let ((me self))
       (spawn (lambda ()
                (let-values (((r st) (conversation-resume! kid ktok 'go)))
@@ -413,6 +417,8 @@
   (sleep-ms 400)
   (unless (= 0 (unbox held))
     (fail "a killed step leaked its in-process hold" (unbox held)))
+  (unless (eq? #f (unbox hook-arg))
+    (fail "an uncommitted kill did not tell its hook so" (unbox hook-arg)))
   (display "an on-killed hook releases what a killed step held ok\n"))
 
 
@@ -475,7 +481,8 @@
                     (lambda (r)                  ; hangs, only on replay
                       (if (eq? r 'HANG) (sleep-ms 60000) (void))
                       r)
-                    (lambda () (set-box! released (+ 1 (unbox released)))))))
+                    (lambda (committed?)
+                      (set-box! released (+ 1 (unbox released)))))))
       (let-values (((r st) (conversation-resume! pid ptok 'confirm)))
         (unless (conversation-done? st) (fail "pruned-settled setup" st)))
       ;; a second conversation completes and evicts the first one's record
@@ -631,7 +638,8 @@
                   (lambda (r)                       ; slow key, only on replay
                     (if (eq? r 'REPLAY) (sleep-ms 900) (void))
                     r)
-                  (lambda () (set-box! releases (+ 1 (unbox releases)))))))
+                  (lambda (committed?)
+                    (set-box! releases (+ 1 (unbox releases)))))))
     (let-values (((r st) (conversation-resume! cid ctok 'confirm)))
       (unless (conversation-done? st) (fail "completed-setup" st)))
     ;; a replay whose key is slow enough to look like an overrunning step
@@ -766,7 +774,8 @@
                     (when (eq? r 'HANG) (set-box! entered-key #t))
                     (if (eq? r 'HANG) (sleep-ms 60000) (void))
                     r)
-                  (lambda () (set-box! released (+ 1 (unbox released)))))))
+                  (lambda (committed?)
+                    (set-box! released (+ 1 (unbox released)))))))
     (let-values (((r st) (conversation-resume! hid htok 'confirm)))
       (unless (conversation-done? st) (fail "hung-key setup" st)))
     ;; ...and now a replay whose key never comes back, WITH A SECOND
@@ -950,7 +959,7 @@
                                  'go
                                  ttl
                                  (lambda (x) x)
-                                 (lambda () (set-box! released #t)))))
+                                 (lambda (committed?) (set-box! released #t)))))
                    gfirst))))
         (sleep-ms 60)                       ; let a late kill land
         (when (unbox released) (set! killed (+ killed 1)))
@@ -993,7 +1002,7 @@
                         'go
                         ttl
                         (lambda (x) x)
-                        (lambda () (set-box! released #t)))))
+                        (lambda (committed?) (set-box! released #t)))))
           ;; finish it at once, so the park deadline is not what ends it
           (guard (e (#t (void)))
             (let-values (((r st) (conversation-resume! gid gtok 'go)))
@@ -2020,6 +2029,85 @@
         (unless (eq? st 'unknown)
           (fail "a stale probe erased the commit witness" st))
         (display "a stale token does not touch the commit witness ok\n")))))
+
+;; ---- the on-killed hook is told whether the flow had committed -----------
+;;
+;; on-killed does two jobs: it releases what the dead flow held in
+;; process (a handle, a reservation), and it compensates the flow's
+;; effect. After commit! has returned those jobs part ways -- the handle
+;; must still be given back, but compensating would undo a transaction
+;; that is permanent. The library cannot run half a hook, so it passes
+;; the witness in and the application branches: release unconditionally,
+;; compensate only when nothing committed.
+(let ((held (box 100))
+      (seen (box 'unset))
+      (compensated (box #f)))
+  (let-values (((id tok first)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (dynamic-wind
+                        (lambda () (void))
+                        (lambda ()
+                          (commit! (lambda () 'tx))
+                          (vector 'done a))
+                        ;; wedges AFTER the commit: the watchdog is what
+                        ;; ends this flow, with the mark already set
+                        (lambda () (receive (after 60000 'never))))))
+                  'go
+                  300
+                  values
+                  (lambda (committed?)
+                    (set-box! seen committed?)
+                    (set-box! held 0)                 ; the handle: always
+                    (unless committed?
+                      (set-box! compensated #t))))))  ; the effect: only if not
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'ck st)))))
+      (receive (after 6000 (fail "the committed-kill flow never answered"
+                                 'no-answer))
+        (`#(ck ,st)
+          (unless (eq? st 'unknown)
+            (fail "a flow killed after its commit got the wrong status" st)))))
+    (sleep-ms 400)
+    (unless (eq? #t (unbox seen))
+      (fail "the hook was not told the flow had committed" (unbox seen)))
+    (unless (= 0 (unbox held))
+      (fail "a committed kill still leaked its in-process hold" (unbox held)))
+    (when (unbox compensated)
+      (fail "a committed effect was compensated away" (unbox compensated)))
+    (display "on-killed is told about a witnessed commit ok\n")))
+
+;; ...and a hook that cannot receive the witness is refused where it is
+;; written. The watchdog swallows whatever on-killed raises -- it has to
+;; survive a bad hook -- so a zero-argument hook would not blow up there:
+;; it would silently never run. No release, no compensation, and no
+;; message saying why. The arity is checked at conversation-start!
+;; instead, in the caller that wrote the hook, like the ttl is.
+(let ((outcome (guard (e (#t
+                          ;; the RIGHT refusal, not just any raise: an
+                          ;; assertion-violation attributed to
+                          ;; conversation-start!, where the hook was written
+                          (if (and (assertion-violation? e)
+                                   (who-condition? e)
+                                   (eq? (condition-who e)
+                                        'conversation-start!))
+                              'refused
+                              (list 'wrong-raise e))))
+                 (conversation-start!
+                   (lambda (req suspend! commit!) (vector 'done req))
+                   'go
+                   300
+                   values
+                   (lambda () 'legacy-zero-arg))
+                 'accepted)))
+  (unless (eq? outcome 'refused)
+    (fail "a zero-argument on-killed hook was not refused at start" outcome))
+  (display "a zero-argument on-killed hook is refused at start ok\n"))
 
 (display "ALL CONVERSATION TESTS PASSED\n")
     (exit 0)))

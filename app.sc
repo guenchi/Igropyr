@@ -196,6 +196,12 @@
           ;; reaches both, and returning the money twice is a worse bug
           ;; than never returning it. A hold in a database does not need
           ;; this; one in a box does.
+          ;;
+          ;; It stays a THUNK: the guard and the cancel branch call it with
+          ;; no argument, and the one caller that has something to say --
+          ;; on-killed, which is told whether the transfer committed --
+          ;; wraps it below rather than pushing that argument through every
+          ;; other call site.
           (let* ((released (box #f))
                  (release!
                    (lambda ()
@@ -232,7 +238,19 @@
                           ;; request records; what identifies the call is
                           ;; its body, and the body is all that is retained
                           req-body
-                          release!)))
+                          ;; on-killed takes committed?, because releasing
+                          ;; and undoing are not the same act. In this demo
+                          ;; they happen to be one thing -- the only thing
+                          ;; the flow holds IS the money, so giving the hold
+                          ;; back is also undoing the transfer -- which is
+                          ;; exactly why the branch has to be here: past the
+                          ;; commit! that hold has become a completed
+                          ;; transfer, and handing it back would reverse a
+                          ;; transfer the client was told stands. A flow
+                          ;; holding a file handle as well would release
+                          ;; that one either way, outside the `unless`.
+                          (lambda (committed?)
+                            (unless committed? (release!))))))
             ;; The token goes to the client and must come back with the
             ;; next request. It says WHICH reply is being answered, which is
             ;; what stops a double click or a retried request from advancing

@@ -158,8 +158,20 @@
 ;;;     monitors its borrower and rebuilds the connection when it dies,
 ;;;     which drops the transaction. Anything held IN PROCESS is not --
 ;;;     a reservation, a file handle, an in-memory hold. Pass an
-;;;     on-killed thunk (conversation-start!'s fifth argument) to release
-;;;     those; it runs after the kill, outside the dead process.
+;;;     on-killed procedure (conversation-start!'s fifth argument) to
+;;;     release those; it runs after the kill, outside the dead process,
+;;;     and is called with one argument: whether the conversation had
+;;;     COMMITTED when the kill landed. Release what is held in process
+;;;     unconditionally; undo the transaction only under (not
+;;;     committed?), because undoing one that succeeded is the same
+;;;     damage 'gone would have done, arriving by another route.
+;;;     THAT ARGUMENT CAN BE A FALSE NEGATIVE, in one instant: a kill
+;;;     landing between the commit thunk's return and the mark being set
+;;;     passes #f for a transaction that did happen. The window cannot be
+;;;     closed from outside the dead process, so an undo that would be
+;;;     destructive if wrong must be idempotent, or check the
+;;;     authoritative store itself, rather than trust this flag alone.
+;;;     #t is never wrong; only #f carries the doubt.
 ;;;   - a flow that RAISES before its first suspend! AND BEFORE ITS
 ;;;     commit! makes
 ;;;     conversation-start! raise #(conversation-failed reason) in the
@@ -890,7 +902,8 @@
   ;; Returns (values id token first-reply); the caller parks meanwhile.
   ;; Optional trailing arguments: ttl-ms (default 300000), request-key
   ;; (default values), on-killed (default #f) -- each documented at its
-  ;; binding below.
+  ;; binding below. on-killed takes one argument, committed?, and is
+  ;; rejected here if it cannot accept one.
   (define (conversation-start! flow req . opts)
     (ensure-router!)
     ;; A ttl that is not a positive exact integer reaches receive's `after`
@@ -903,6 +916,28 @@
         (unless (and (integer? t) (exact? t) (> t 0))
           (assertion-violation 'conversation-start!
             "ttl-ms must be a positive exact integer" t))))
+    ;; ...and on-killed is checked here for a sharper version of the same
+    ;; reason. It is CALLED in the watchdog's process, inside a guard that
+    ;; swallows everything so that a bad hook cannot take the watchdog down
+    ;; -- which means a hook of the wrong shape does not fail loudly, it
+    ;; fails SILENTLY: the arity error is caught, the compensation never
+    ;; runs, and whatever the flow was holding is held for the life of the
+    ;; VM with nothing anywhere saying why. That is the worst way for an
+    ;; interface change to be discovered, so the shape is settled at the
+    ;; point it was written, where the raise reaches the code that is
+    ;; wrong.
+    ;;
+    ;; Accepting one argument, not accepting EXACTLY one: a variadic hook
+    ;; and one with optionals are both fine, and the only thing worth
+    ;; refusing is a hook that cannot be told whether the transaction
+    ;; committed.
+    (when (and (pair? opts) (pair? (cdr opts)) (pair? (cddr opts))
+               (caddr opts))
+      (let ((h (caddr opts)))
+        (unless (and (procedure? h) (logbit? 1 (procedure-arity-mask h)))
+          (assertion-violation 'conversation-start!
+            "on-killed must be a procedure accepting one argument (committed?)"
+            h))))
     (let* ((ttl (if (pair? opts) (car opts) default-ttl-ms))
            ;; WHAT IDENTIFIES A REQUEST, for replay.
            ;;
@@ -951,11 +986,42 @@
            ;; deducted from a balance and restored in a guard -- stays held
            ;; for the life of the VM.
            ;;
-           ;; So: a thunk, run after the kill, in the watchdog's own
+           ;; So: a procedure of one argument, run after the kill, in the
+           ;; watchdog's own
            ;; process. It cannot touch the flow's stack (that is gone); it
            ;; releases what the flow was holding, which the application
            ;; reaches through whatever it closed over. Its own exceptions
            ;; are swallowed -- the watchdog must survive a bad hook.
+           ;;
+           ;; THE ARGUMENT IS committed? -- whether this conversation had
+           ;; got past its commit! when the kill landed. The hook has two
+           ;; jobs and they need different answers. RELEASING what is held
+           ;; in this process -- a handle, a reservation, a slot -- is
+           ;; unconditional: the flow is dead and nothing else will ever
+           ;; give it back. UNDOING the transaction is only right where
+           ;; the transaction did not happen; run against a flow that
+           ;; committed, it reverses work that succeeded, and the client
+           ;; has already been told 'unknown rather than 'gone precisely
+           ;; because that work stands. So: release unconditionally,
+           ;; compensate under (not committed?).
+           ;;
+           ;;   (lambda (committed?) (release-handle!)
+           ;;                        (unless committed? (undo-hold!)))
+           ;;
+           ;; The library does not make that split itself, because only
+           ;; the application knows which of its own effects are which.
+           ;;
+           ;; committed? IS ONE-SIDED. #t is never wrong -- the mark is
+           ;; only ever set by a commit thunk that returned, and it is
+           ;; never cleared. #f can be one instant stale: a kill landing
+           ;; between that return and the mark being set reads #f for a
+           ;; transaction that did happen, and the window is the return
+           ;; itself, which cannot be closed from another process (see the
+           ;; watchdog's call site). So #f means "no witness", not "proof
+           ;; it did not commit". An undo that is destructive when wrong
+           ;; must be idempotent, or consult the authoritative store,
+           ;; rather than rest on this flag alone; releasing a handle,
+           ;; which is unconditional anyway, never has the problem.
            (on-killed
              (if (and (pair? opts) (pair? (cdr opts)) (pair? (cddr opts)))
                  (caddr opts)
@@ -1224,25 +1290,60 @@
                                 ;; exists to make the kill indivisible.
                                 (when killed (tomb-prune!))
                                 (if killed
-                                    ;; ...BUT ONLY IF NOTHING SETTLED. A
-                                    ;; killed flow's winders did not run,
-                                    ;; so its compensation is this
-                                    ;; process's last act -- unless the
-                                    ;; flow already committed and it was
-                                    ;; something after it that overran, in
-                                    ;; which case releasing what it took
-                                    ;; would undo work that succeeded.
+                                    ;; ...BUT ONLY IF NOTHING SETTLED.
                                     ;; Killing a settled conversation
                                     ;; costs only its linger: its value is
                                     ;; published and its tombstone
                                     ;; written, so a replay falls back to
-                                    ;; the record and is told 'settled.
+                                    ;; the record and is told 'settled,
+                                    ;; and there is nothing left to give
+                                    ;; back.
                                     (when (and on-killed
                                                (not (unbox settled-box)))
-                                      ;; the flow's winders did not run;
-                                      ;; this is the only chance to release
-                                      ;; what it held
-                                      (guard (e (#t (void))) (on-killed)))
+                                      ;; AND IT IS TOLD WHETHER THE
+                                      ;; TRANSACTION COMMITTED. A killed
+                                      ;; flow's winders did not run, so
+                                      ;; this hook is the last act that can
+                                      ;; give anything back -- but "give it
+                                      ;; back" means two different things
+                                      ;; and only one of them is always
+                                      ;; right. A file handle, a
+                                      ;; reservation, an in-process hold is
+                                      ;; released whatever happened; an
+                                      ;; UNDO of the transaction is correct
+                                      ;; only where the transaction did not
+                                      ;; happen, and running it on a flow
+                                      ;; that committed reverses work that
+                                      ;; succeeded. The library cannot tell
+                                      ;; those two apart inside somebody
+                                      ;; else's hook, so it does not try:
+                                      ;; it passes the witness and the
+                                      ;; application branches. This comment
+                                      ;; used to describe that distinction
+                                      ;; as though the code made it, while
+                                      ;; the condition consulted only
+                                      ;; settled-box -- there was nothing
+                                      ;; to consult until commit! existed.
+                                      ;;
+                                      ;; THE WITNESS CAN BE ONE INSTANT
+                                      ;; STALE. A kill landing between the
+                                      ;; commit thunk's return and the mark
+                                      ;; being set reads #f, and the
+                                      ;; compensation runs after a commit
+                                      ;; that really happened. The window
+                                      ;; is the return itself and cannot be
+                                      ;; closed from out here -- the two
+                                      ;; facts live in different processes.
+                                      ;; So this is not a guarantee that
+                                      ;; compensation never follows a
+                                      ;; commit; it is a guarantee that it
+                                      ;; is not INVITED to. A compensation
+                                      ;; that would be destructive if wrong
+                                      ;; must be idempotent, or check the
+                                      ;; authoritative store itself, rather
+                                      ;; than trust this flag alone.
+                                      (guard (e (#t (void)))
+                                        (on-killed (unbox committed-box))))
                                     (loop))))))))))))
                  (let ((who starter) (tag ref)
                        (st (make-step-state 'running #f #f #f #f 0
