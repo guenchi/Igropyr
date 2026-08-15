@@ -53,6 +53,7 @@
 (define port-self 18442)
 (define port-wrong 18443)
 (define port-plain 18444)
+(define port-reneg 18445)
 
 (define (cleanup!)
   (system "pkill -f 's_server -accept 1844' 2>/dev/null"))
@@ -73,6 +74,44 @@
             " -key " dir "/" key " -cert " dir "/" cert
             " -www -quiet >/dev/null 2>&1 & pid=$!;"
             " sleep 30; kill $pid 2>/dev/null ) &")))
+
+;; The renegotiation case needs a server it can TALK to: s_server's
+;; interactive mode reads commands from its stdin, and "r" on a line of
+;; its own makes it renegotiate. -www is not usable for that (its HTTP
+;; modes never read stdin), and neither is -quiet: measured, a -quiet
+;; server sends the "r" to the client as data instead of acting on it,
+;; which produces a run that looks like a result and tested nothing.
+;; The log is kept because it is the only place the SECOND handshake is
+;; visible from outside the client.
+(define reneg-fifo "/tmp/igropyr-tls-test/reneg-fifo")
+(define reneg-log "/tmp/igropyr-tls-test/reneg-log")
+
+(define (s-server-interactive! port cert key)
+  (system (string-append "rm -f " reneg-fifo " " reneg-log
+                         "; mkfifo " reneg-fifo))
+  ;; a writer that outlives the server keeps the fifo from seeing eof
+  (system (string-append "( sleep 60 > " reneg-fifo " ) &"))
+  (system (string-append
+            "( openssl s_server -accept " (number->string port)
+            " -key " dir "/" key " -cert " dir "/" cert
+            " -tls1_2 < " reneg-fifo " > " reneg-log " 2>&1 & pid=$!;"
+            " sleep 30; kill $pid 2>/dev/null ) &")))
+
+(define (s-server-say! line)
+  (system (string-append "printf '" line "\\n' > " reneg-fifo)))
+
+;; How many RENEGOTIATIONS the server has completed. s_server logs
+;; "SSL_do_handshake -> 1" only when it drives a second handshake on an
+;; established connection -- the initial one goes through SSL_accept and
+;; prints the cipher block instead, so this line counts exactly the thing
+;; being tested and nothing else.
+(define (server-renegotiation-count)
+  (let ((out (string-append reneg-log ".count")))
+    (system (string-append "grep -c 'SSL_do_handshake -> 1' "
+                           reneg-log " > " out " 2>/dev/null || echo 0 > " out))
+    (guard (e (#t 0))
+      (let ((n (call-with-input-file out read)))
+        (if (number? n) n 0)))))
 
 ;; the client must only trust the test CA
 (putenv "SSL_CERT_FILE" (string-append dir "/ca.pem"))
@@ -355,6 +394,7 @@
             (fail! "an over-long SNI name failed for some other reason" r)))))
     (display "a hostname too long for the SNI extension is refused, not ignored ok\n")
 
+
     ;; The sweep: the library is immune to it. A green process is switched
     ;; in with a fresh tick budget, so the preemption cannot be aimed by
     ;; waiting for it; but the budget can be REPLACED with set-timer
@@ -417,6 +457,103 @@
         (set! poisoning #f)
         (unless (null? poisoned) (fail! "tls-tick-sweep-poisoned" poisoned))))
     (display "a handshake survives another process poisoning the error queue ok\n")
+
+    ;; ---- a server-initiated renegotiation is carried by the read path ---
+    ;;
+    ;; TLS 1.2 lets a server ask for a second handshake mid-connection.
+    ;; Nothing in tls.sc looks like it handles that, and yet it works:
+    ;; SSL_read processes the HelloRequest and queues a ClientHello in the
+    ;; wbio, decrypt's closing flush-out! puts it on the socket, and the
+    ;; answering records come back through decrypt as ordinary ciphertext.
+    ;; The capability is accidental, which is exactly why it is pinned
+    ;; here -- it would otherwise be removed by anyone tightening the
+    ;; context's options, and nothing would report it. (Turning on
+    ;; SSL_OP_NO_RENEGOTIATION was tried and reverted for this reason.)
+    ;;
+    ;; TWO OBSERVATIONS, because the obvious one alone proves nothing. The
+    ;; client receiving data after the renegotiation is NOT evidence on its
+    ;; own: if the server never treated "r" as a command it would send that
+    ;; line as data and the rest of the exchange would look identical.
+    ;; Measured once, that is exactly what a -quiet server does. So the
+    ;; server's own log has to show a SECOND completed handshake, and the
+    ;; literal "r" must not arrive as application data.
+    (let ()
+      (s-server-interactive! port-reneg "good.pem" "good.key")
+      (sleep-ms 700)
+      (tcp-connect! "127.0.0.1" port-reneg self)
+      (let ((c (receive (after 8000 #f)
+                 (`#(tcp-connected ,c) c)
+                 (`#(tcp-connect-failed ,e) #f))))
+        (unless c (fail! "reneg-connect-failed"))
+        (conn-set-owner! c self)
+        (tcp-read-start! c)
+        (let* ((codec (guard (e (#t (fail! "reneg-handshake" e)))
+                        (tls-establish! c "127.0.0.1" 8000)))
+               (encrypt (vector-ref codec 0))
+               (decrypt (vector-ref codec 1)))
+          ;; application data before the renegotiation, so the server has
+          ;; a live connection to renegotiate ON
+          (tcp-write! c (encrypt (string->utf8 "before\n")) #f)
+          (sleep-ms 300)
+          (let ((renegs-before (server-renegotiation-count)))
+            ;; DRIVEN BY OBSERVATION, NOT BY SLEEPING. s_server only looks
+            ;; at its stdin between reads, so a command sent while it is
+            ;; still busy is simply not seen -- measured: with a fixed
+            ;; pause this passed on an idle machine and silently tested
+            ;; nothing right after the 320-handshake sweep above. So the
+            ;; command is repeated until the server's own log shows the
+            ;; second handshake, and the client keeps decrypting
+            ;; throughout, because the renegotiation cannot complete
+            ;; without it.
+            (s-server-say! "r")
+            (let loop ((deadline (+ (now-ms) 12000))
+                       (seen "")
+                       (renegotiated #f)
+                       (asked 1)
+                       (payload-sent #f))
+              (cond
+                ((and payload-sent (contains? seen "after-reneg"))
+                 (system (string-append "pkill -f 's_server -accept "
+                                        (number->string port-reneg) "' 2>/dev/null"))
+                 ;; the command must not have been delivered as data --
+                 ;; the other way this case can look like it worked
+                 (when (contains? seen "r\n")
+                   (fail! "the renegotiate command arrived as application data" seen))
+                 (display "  [info] server renegotiations: ")
+                 (display renegs-before) (display " -> ")
+                 (display (server-renegotiation-count)) (newline))
+                ((>= (now-ms) deadline)
+                 (system (string-append "pkill -f 's_server -accept "
+                                        (number->string port-reneg) "' 2>/dev/null"))
+                 (if (not renegotiated)
+                     (fail! "the server never renegotiated -- the case tested nothing"
+                            (list 'before renegs-before
+                                  'after (server-renegotiation-count) 'asked asked))
+                     (fail! "no application data survived the renegotiation" seen)))
+                ((and (not renegotiated)
+                      (> (server-renegotiation-count) renegs-before))
+                 ;; the second handshake is done: now ask for data across it
+                 (s-server-say! "after-reneg")
+                 (loop deadline seen #t asked #t))
+                (else
+                 (receive (after 300
+                            ;; still no second handshake: the server was
+                            ;; busy when it was asked, so ask again
+                            (if (or renegotiated (>= asked 8))
+                                (loop deadline seen renegotiated asked payload-sent)
+                                (begin (s-server-say! "r")
+                                       (loop deadline seen renegotiated
+                                             (+ asked 1) payload-sent))))
+                   (`#(tcp-data ,bv)
+                     (let ((plain (guard (e (#t (fail! "a renegotiation killed the connection" e)))
+                                    (decrypt bv))))
+                       (loop deadline (string-append seen (utf8->string plain))
+                             renegotiated asked payload-sent)))
+                   (`#(tcp-eof)
+                     (loop 0 seen renegotiated asked payload-sent))
+                   (`#(tcp-error ,e)
+                     (loop 0 seen renegotiated asked payload-sent))))))))))
+    (display "a server-initiated renegotiation is carried by the read path ok\n")
 
     ;; plain http still works with the connector registered
     (http-listen port-plain

@@ -656,6 +656,47 @@
               (else (fail! (or reason "tls handshake failed")))))))
 
         ;; ---- established: hand back the codec --------------------------
+        ;;
+        ;; RENEGOTIATION, which this codec half supports -- and the half it
+        ;; supports is the one that matters. TLS 1.3 has no renegotiation;
+        ;; TLS 1.2 does, and a server can ask for one mid-connection.
+        ;;
+        ;; THE READ PATH HANDLES IT, and this is measured rather than
+        ;; intended: against `openssl s_server -tls1_2` driven to
+        ;; renegotiate on command, a client built from this file completes
+        ;; the second handshake and goes on to receive the application data
+        ;; sent after it. The mechanism is entirely accidental and worth
+        ;; writing down because nothing here looks like it does this:
+        ;; SSL_read processes the HelloRequest and queues a ClientHello in
+        ;; the wbio, decrypt's closing flush-out! puts it on the socket,
+        ;; the answering handshake records arrive as ordinary ciphertext
+        ;; and go through decrypt again. SSL_write is never involved.
+        ;;
+        ;; THE WRITE PATH IS THE BOUNDARY. A renegotiation that a SSL_write
+        ;; runs into makes it answer WANT_READ, and encrypt treats anything
+        ;; short of a full write as fatal, so that connection closes.
+        ;;
+        ;; Neither half is fixed here, for different reasons.
+        ;;
+        ;; The write path is not fixed because handling WANT_READ correctly
+        ;; means re-issuing the SAME write once the handshake finishes --
+        ;; OpenSSL wants the identical pointer, contents and length -- and
+        ;; holding the caller's plaintext for later is a state a codec
+        ;; whose contract is "bytes in, bytes out" cannot express: a
+        ;; successful return from encrypt would have to mean "your data is
+        ;; still with me". A HALF FIX IS WORSE THAN NONE: classifying the
+        ;; WANT_READ without retrying makes encrypt return empty ciphertext
+        ;; for plaintext that was never sent and never will be, which is
+        ;; silent data loss. A closed connection is at least visible.
+        ;;
+        ;; And renegotiation is NOT disabled at the context
+        ;; (SSL_OP_NO_RENEGOTIATION), which was tried and reverted: it does
+        ;; not narrow the write case, it removes the read case as well. The
+        ;; shape of these clients decides which one that costs -- a short
+        ;; request and then a long read is what both HTTP and the
+        ;; PostgreSQL protocol do, so a server's HelloRequest lands while
+        ;; the client is READING, most of the time. Turning the option on
+        ;; trades the path that works for the path that does not.
         (let ((scratch (make-bytevector 16384)))
           (define (encrypt bv)
             (let ((n (bytevector-length bv)))
