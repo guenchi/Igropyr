@@ -458,6 +458,44 @@
         (unless (null? poisoned) (fail! "tls-tick-sweep-poisoned" poisoned))))
     (display "a handshake survives another process poisoning the error queue ok\n")
 
+    ;; ---- a handshake on a connection that is already gone -------------
+    ;;
+    ;; conn-on-close! runs its thunk IMMEDIATELY when the connection is
+    ;; already closed by the time the hook is registered -- the resource is
+    ;; gone, so the cleanup is due now. tls-establish! registers close!
+    ;; there, and close! frees the SSL. Everything the handshake does after
+    ;; that line -- the verification parameters, the SNI name, setting
+    ;; connect state -- then ran on a freed pointer. Not a race: one
+    ;; process, straight-line, needing only that the peer closed before the
+    ;; handshake started.
+    ;;
+    ;; This is the reachable half of that hazard, and it is asserted the
+    ;; only way it safely can be: that the attempt is REFUSED with the
+    ;; codec's own message. The failing side cannot be pinned here --
+    ;; touching freed memory is undefined, and a case whose red form is a
+    ;; segfault taking the runner with it is not a discriminating test.
+    (let ()
+      (tcp-connect! "127.0.0.1" port-good self)
+      (let ((c (receive (after 8000 #f)
+                 (`#(tcp-connected ,c) c)
+                 (`#(tcp-connect-failed ,e) #f))))
+        (unless c (fail! "closed-conn-connect-failed"))
+        (conn-set-owner! c self)
+        (tcp-close! c)
+        (sleep-ms 400)                       ; let the close completion run
+        (let ((r (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'tls-error))
+                            (vector-ref e 1)))
+                   (tls-establish! c "127.0.0.1" 8000)
+                   #f)))
+          (unless r
+            (fail! "a handshake on a closed connection was accepted"))
+          (display "  [info] closed-connection handshake: ") (display r) (newline)
+          ;; and refused for THAT reason -- a generic handshake failure
+          ;; would mean it went into OpenSSL anyway and failed there
+          (unless (contains? r "closed")
+            (fail! "a closed connection was refused for the wrong reason" r)))))
+    (display "a handshake on an already-closed connection is refused, not attempted ok\n")
+
     ;; ---- a server-initiated renegotiation is carried by the read path ---
     ;;
     ;; TLS 1.2 lets a server ask for a second handshake mid-connection.

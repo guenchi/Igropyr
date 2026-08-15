@@ -36,6 +36,48 @@
 ;;; tls-enable! itself (e.g. a missing system trust store at startup)
 ;;; raises tls-error directly.
 ;;;
+;;; A CODEC IS ONE-SHOT ONCE IT BREAKS. After close!, or after any failure
+;;; that had already touched TLS state, the codec is permanently unusable:
+;;; every later encrypt/decrypt fails with a stable message naming the
+;;; failure that retired it, without reaching the SSL or BIO objects (the
+;;; error-queue bookkeeping around them still runs; what never happens is a
+;;; call on a session that has been freed). So an operator
+;;; reads one incident and a misuse, not two independent TLS faults. A
+;;; failure decided BEFORE OpenSSL is entered -- a segment longer than a C
+;;; int -- is the caller's, not the session's, and leaves the codec usable;
+;;; split the buffer and carry on.
+;;;
+;;; One flag, not one per direction. A record-layer failure ends both: the
+;;; session may have failed at the protocol level, the inbound stream may
+;;; have a hole, and a write-side WANT_READ is deliberately fatal here (see
+;;; the renegotiation note below). Keeping the read side "open" would
+;;; invite an application to go on writing to a connection both consumers
+;;; must discard.
+;;;
+;;; WHERE THAT FLAG IS TESTED matters as much as that it exists. Safety
+;;; comes from reading it INSIDE each non-preemptible region, immediately
+;;; before the pointers are used -- never from the check at the entry to
+;;; encrypt/decrypt, which exists only so that a retired codec gives the
+;;; same answer to every bytevector it is handed, empty ones included. An entry check
+;;; answers about a moment that has passed: another process (the
+;;; connection's close hook) can free the session between the check and the
+;;; SSL_write, or between a completed SSL_write and the drain of the wbio
+;;; that follows it. Since freeing also happens in a region, and regions on
+;;; one thread cannot interleave, a test inside the region holds for the
+;;; whole region -- and only there.
+;;;
+;;; RETIRING HAPPENS IN THAT SAME REGION wherever a LIVE CODEC could be
+;;; used concurrently -- the three record-layer failures -- for the
+;;; mirror-image reason: a failure detected inside and recorded after
+;;; leaves a gap where the state is already broken and the flag still says
+;;; otherwise, and it makes the stored message depend on who got there
+;;; first rather than on whose failure came first. Two paths retire
+;;; outside their region instead, and may: a setup call that fails, and a
+;;; fatal SSL_do_handshake -- no codec exists yet, so this code is the
+;;; session's only user, and the handshake needs its alert flushed before
+;;; the free. (Buffering ciphertext during the handshake still retires
+;;; in-region; it shares that code with the established codec.)
+;;;
 ;;; Sessions are closed by freeing (no close_notify): the client speaks
 ;;; Connection: close and hard-closes the socket right after, and both
 ;;; framings it accepts (content-length, chunked) detect truncation by
@@ -52,9 +94,10 @@
 ;;;     SSL_* call and its SSL_get_error turns that call's verdict into a
 ;;;     fatal one. Measured on 3.6.3: a handshake step and a read that are
 ;;;     both genuinely SSL_ERROR_WANT_READ (2) report SSL_ERROR_SSL (1)
-;;;     when one foreign entry is planted in the gap. Both call sites here
-;;;     treat anything but WANT_READ as fatal, so this closes a live
-;;;     connection -- it is not merely a wrong message. Each SSL_* call,
+;;;     when one foreign entry is planted in the gap. Neither call site
+;;;     has a way back from a fatal verdict -- the handshake fails and the
+;;;     read retires the codec -- so this closes a live connection rather
+;;;     than merely mislabelling one. Each SSL_* call,
 ;;;     the test of its result, its SSL_get_error and the reading of its
 ;;;     reason therefore run as one non-preemptible step (ssl-step).
 ;;;     ONLY that: this library parks in receive and writes to a socket,
@@ -352,22 +395,55 @@
   ;; One SSL_* call and its whole classification as a single step with no
   ;; preemption point inside: SSL_get_error must see the error queue
   ;; exactly as the call left it, and a fatal reason must be read from the
-  ;; same region. Yields the return value, the SSL_ERROR_* code, and the
-  ;; reason string (#f whenever the call did not fail: a positive return,
-  ;; or a want-read that the caller retries). The body raises nothing,
-  ;; parks nowhere and touches no socket -- the caller acts on the three
-  ;; values after the scope has ended.
+  ;; same region. The body raises nothing, parks nowhere and touches no
+  ;; socket -- the caller acts on the values after the scope has ended.
+  ;; The reason is #f whenever nothing was retired: a positive return, a
+  ;; want-read the caller retries, or a clean close_notify.
+  ;;
+  ;; That set of "not a failure" codes is a property of THIS configuration
+  ;; -- a memory BIO, no async engine, no client-certificate callback.
+  ;; WANT_WRITE needs a BIO that can push back, and the others need modes
+  ;; or callbacks nothing here installs. Adding any of those means
+  ;; revisiting this classification.
+  ;; -> (values gone rc code reason). `gone` is #f, or the stored message
+  ;; of a codec that is already unusable -- in which case the call was NOT
+  ;; made and the other three values mean nothing.
+  ;;
+  ;; THE LIVENESS TEST IS INSIDE THE REGION, and that placement is the
+  ;; whole point. Asking before entering would answer about a moment that
+  ;; has passed: another process can free the session between the answer
+  ;; and the dereference, and this one would then hand a dangling pointer
+  ;; to OpenSSL. Inside, the test and the call cannot be separated -- and
+  ;; whatever frees does so from a region of its own, so the two can never
+  ;; interleave.
+  ;; A verdict that BREAKS THE SESSION retires it here, before the region
+  ;; ends: a TLS session does not resynchronise past one, and leaving the
+  ;; flag for the caller to set after it returns is a window in which the
+  ;; state is already finished and the codec still says it is fine.
+  ;;
+  ;; ZERO_RETURN IS NOT ONE OF THOSE. A close_notify is the peer ending the
+  ;; stream cleanly -- an ending, not a fault -- and the caller turns it
+  ;; into an ordinary EOF. Retiring on it would file a normal shutdown as
+  ;; "a previous failure" and hand that sentence to whoever asked next.
   (define-syntax ssl-step
     (syntax-rules ()
-      ((_ ssl-expr default call)
-       (let ((s ssl-expr))
+      ((_ dead-expr poison-expr ssl-expr default call)
+       (let ((d dead-expr) (p poison-expr) (s ssl-expr))
          (with-ssl-call
-           (let* ((rc call)
-                  (code (if (fx> rc 0) SSL_ERROR_NONE (SSL_get_error s rc))))
-             (values rc code
-                     (if (or (fx> rc 0) (fx= code SSL_ERROR_WANT_READ))
-                         #f
-                         (ssl-drain-reason default)))))))))
+           (let ((gone (unbox d)))
+             (if gone
+                 (values gone 0 SSL_ERROR_NONE #f)
+                 (let* ((rc call)
+                        (code (if (fx> rc 0) SSL_ERROR_NONE (SSL_get_error s rc))))
+                   (cond
+                     ((or (fx> rc 0)
+                          (fx= code SSL_ERROR_WANT_READ)
+                          (fx= code SSL_ERROR_ZERO_RETURN))
+                      (values #f rc code #f))
+                     (else
+                       (let ((reason (ssl-drain-reason default)))
+                         (p reason)
+                         (values #f rc code reason))))))))))))
 
   (define (die msg) (raise (vector 'tls-error msg)))
 
@@ -486,21 +562,41 @@
   ;; not fit are gone from a stream that cannot tolerate a hole. The
   ;; return value used to be discarded at both call sites, so such a
   ;; connection carried on and failed later as a decryption error with no
-  ;; trace of where the gap came from. -> reason string, or #f on success.
-  (define (bio-write! bio bv)
+  ;; trace of where the gap came from.
+  ;; -> #f on success, or (kind . message). The caller raises the message;
+  ;;   the retiring, where it is due, has already happened in here.
+  ;;      'dead  the codec was already unusable; message is the stored one
+  ;;      'arg   the CALLER's input was impossible, before OpenSSL was
+  ;;             touched -- nothing is broken and a smaller segment works
+  ;;      'state the BIO took part of it; the record stream now has a hole,
+  ;;             and the codec has been retired inside the region that saw it
+  (define (bio-write! dead poison! bio bv)
     (let ((n (bytevector-length bv)))
       (cond
+        ((unbox dead) => (lambda (d) (cons 'dead d)))
         ((fx= n 0) #f)
-        ((> n max-c-int) "tls: ciphertext segment too large for this platform")
+        ((> n max-c-int)
+         (cons 'arg "tls: ciphertext segment too large for this platform"))
         (else
           (with-openssl-scope
-            (let ((rc (BIO_write bio bv n)))
-              (and (not (fx= rc n))
-                   (tls-reason "tls: could not buffer ciphertext"))))))))
+            (let ((d (unbox dead)))
+              (if d
+                  (cons 'dead d)
+                  (let ((rc (BIO_write bio bv n)))
+                    (and (not (fx= rc n))
+                         (let ((m (tls-reason
+                                    "tls: could not buffer ciphertext")))
+                           ;; retired HERE, still inside the region that
+                           ;; saw the hole appear
+                           (poison! m)
+                           (cons 'state m)))))))))))
 
   ;; The OpenSSL half is scoped; the socket write is not, and must not be.
-  (define (flush-out! c wbio)
-    (let ((out (with-openssl-scope (drain-wbio wbio))))
+  ;; Best-effort by design: a dead codec has nothing to flush, and no
+  ;; caller of this needs a flush to have happened to be correct.
+  (define (flush-out! dead c wbio)
+    (let ((out (with-openssl-scope
+                 (and (not (unbox dead)) (drain-wbio wbio)))))
       (when out (tcp-write! c out #f))))
 
   (define empty-bv (make-bytevector 0))
@@ -516,9 +612,9 @@
   ;; Scoped: several of these push on failure (no peer certificate, an
   ;; unknown signature OID), and this runs once at the end of a handshake
   ;; whose entries nobody is going to read.
-  (define (peer-cb-hash ssl)
+  (define (peer-cb-hash dead ssl)
    (with-openssl-scope
-    (let ((x (SSL_get-peer-cert ssl)))
+    (let ((x (if (unbox dead) 0 (SSL_get-peer-cert ssl))))
       (if (zero? x)
           #f
           (let ((dignid-bv (make-bytevector 4 0))
@@ -547,8 +643,11 @@
   ;;
   ;; Runs inside the request's green process; the socket is read-started,
   ;; so ciphertext arrives here as #(tcp-data ...) messages. Returns the
-  ;; codec #(encrypt decrypt close) for (igropyr http-client); raises
-  ;; #(http-client-error ...) after freeing the session on any failure.
+  ;; codec #(encrypt decrypt close! cb-hash); raises the neutral
+  ;; #(tls-error ...) after retiring the session on any failure. (The https
+  ;; connector registered by tls-enable! is what re-tags those as
+  ;; #(http-client-error ...) and drops the fourth slot; this is the shared
+  ;; entry point, and tls-establish! hands the four back unchanged.)
 
   (define (establish! c host timeout)
     (ensure-ctx!)
@@ -568,11 +667,39 @@
                        (cons s (and (zero? s)
                                     (tls-reason "tls: SSL_new failed"))))))
              (ssl (car born))
-             (closed #f))
-        (define (close!)                 ; frees both BIOs too (SSL owns them)
-          (unless closed
-            (set! closed #t)
-            (SSL_free ssl)))
+             ;; ONE CELL FOR TWO FACTS: #f while the session is usable,
+             ;; otherwise the message every later call raises. It is the
+             ;; liveness flag the regions above test, and the reason they
+             ;; report, deliberately in one place -- a codec that is dead
+             ;; and a codec that has something to say about why are the
+             ;; same codec.
+             (dead (box #f)))
+        ;; THE TRANSITION IS INDIVISIBLE, and it frees exactly once.
+        ;; Setting a flag and then freeing was two acts: a process killed
+        ;; between them left a session that the close hook would skip
+        ;; (the flag said "done") and that nothing else would ever free.
+        ;; Whoever gets here first inside the region does both or neither.
+        (define (retire! msg)
+          (with-interrupts-disabled
+            (unless (unbox dead)
+              (set-box! dead msg)
+              (SSL_free ssl))))         ; frees both BIOs too (SSL owns them)
+        (define (close!) (retire! "tls: codec is closed"))
+        ;; A failure that touched TLS state: the session is finished, and
+        ;; the FIRST caller still gets its own message. What is stored is
+        ;; the sentence later callers get, and it says plainly that this is
+        ;; a second use of a broken codec rather than a second TLS fault --
+        ;; the difference between one incident and two in an operator's log.
+        ;;
+        ;; CALLED WHERE THE FAILURE IS SEEN, inside the same region. Doing
+        ;; it after leaving the region left a gap with the state already
+        ;; broken and the flag not yet set: another process could enter and
+        ;; be told the codec was fine. It also decided the stored message
+        ;; by who reached this first rather than by whose failure happened
+        ;; first, which are not the same ordering once anyone is preempted.
+        (define (poison! msg)
+          (retire! (string-append
+                     "tls: codec is unusable after previous failure: " msg)))
         (define (fail! msg) (close!) (die msg))
         (when (zero? ssl)
           (BIO_free rbio) (BIO_free wbio)
@@ -585,6 +712,14 @@
         ;; the conn, and the close completion runs close! (idempotent, so
         ;; the normal-path free through the codec stays correct).
         (conn-on-close! c close!)
+        ;; ...AND IT CAN HAVE RUN ALREADY. conn-on-close! runs the thunk
+        ;; immediately when the connection is closed by the time it is
+        ;; registered, so close! -- and the SSL_free inside it -- can
+        ;; happen on the line above, before anything below has configured
+        ;; the session. That is not a race to lose; it is a straight line.
+        ;; Everything from here on therefore asks whether the session is
+        ;; still there, in the same region where it uses it.
+        ;;
         ;; Verification parameters: scoped, so the entries a rejected host
         ;; or IP literal leaves behind cannot outlive this call. The
         ;; messages are fixed strings, so nothing is read from the queue;
@@ -592,6 +727,7 @@
         (let ((setup-err
                 (with-openssl-scope
                   (cond
+                    ((unbox dead))      ; the stored message, as-is
                     ((ip-literal? host)
                      (and (zero? (X509_VERIFY_PARAM_set1_ip_asc
                                    (SSL_get0_param ssl) host))
@@ -613,7 +749,13 @@
                          "tls: SSL_set1_host failed")
                         (else #f)))))))
           (when setup-err (fail! setup-err)))
-        (SSL_set_connect_state ssl)
+        ;; the last configuration call, and the only one that used to sit
+        ;; outside a region entirely
+        (let ((gone (with-interrupts-disabled
+                      (let ((d (unbox dead)))
+                        (unless d (SSL_set_connect_state ssl))
+                        d))))
+          (when gone (die gone)))
 
         ;; drive the handshake: flush whatever each step produced, wait
         ;; for more ciphertext when OpenSSL wants it
@@ -633,26 +775,45 @@
           ;; contents. It does read the BIOs' retry FLAGS, and reading a
           ;; memory BIO down to empty is what sets those -- so if it has
           ;; to be on one side, this is the correct side.
-          (let-values (((r code reason)
-                        (ssl-step ssl "tls handshake failed"
+          ;; THE HANDSHAKE DOES NOT RETIRE IN-REGION, and passes a hook
+          ;; that does nothing. Retiring frees the SSL, and the SSL owns
+          ;; the wbio -- so poisoning here would throw away the alert that
+          ;; the flush below exists to send, and the peer would be left to
+          ;; infer the failure from a dropped connection. Nothing is racing
+          ;; for this session either: no codec has been handed out, so the
+          ;; only user is this code, and fail! retires it a few lines down
+          ;; once the alert is gone.
+          (let-values (((gone r code reason)
+                        (ssl-step dead (lambda (m) (void)) ssl
+                                  "tls handshake failed"
                                   (SSL_do_handshake ssl))))
+            ;; the connection's close hook can retire this session while
+            ;; the handshake is parked below; then there is nothing left
+            ;; to hand back and the stored message is the whole answer
+            (when gone (die gone))
             ;; Still before anything that blocks, and on the failing path
             ;; too: whatever OpenSSL just produced -- the ClientHello, or
             ;; the alert that explains the failure below -- goes out.
-            (flush-out! c wbio)
+            (flush-out! dead c wbio)
             (cond
               ((= r 1) 'established)
               ((= code SSL_ERROR_WANT_READ)
                (receive (after (max 1 (- deadline (now-ms)))
                            (fail! "tls handshake timeout"))
                  (`#(tcp-data ,bv)
-                   (let ((werr (bio-write! rbio bv)))
-                     (when werr (fail! werr)))
+                   ;; every kind is fatal to a HANDSHAKE -- there is no
+                   ;; codec yet to keep usable -- so they share fail!
+                   (let ((werr (bio-write! dead poison! rbio bv)))
+                     (when werr (fail! (cdr werr))))
                    (handshake))
                  (`#(tcp-eof) (fail! "connection closed during tls handshake"))
                  (`#(tcp-error ,e) (fail! "connection error during tls handshake"))))
-              ;; the or is belt-and-braces: ssl-step withholds a reason
-              ;; only for the two cases above
+              ;; ssl-step withholds a reason for a positive return, a
+              ;; want-read, and a clean close_notify. The first two are
+              ;; handled above; a close_notify DURING a handshake reaches
+              ;; here, and the fallback string is what it gets -- an
+              ;; unfinished handshake is a failed connection whatever ended
+              ;; it, and a clean shutdown leaves no OpenSSL reason to quote
               (else (fail! (or reason "tls handshake failed")))))))
 
         ;; ---- established: hand back the codec --------------------------
@@ -701,33 +862,75 @@
           (define (encrypt bv)
             (let ((n (bytevector-length bv)))
               (cond
+                ;; A RETIRED CODEC ANSWERS THE SAME TO EVERY BYTEVECTOR,
+                ;; and that is what this first test is for -- not safety,
+                ;; which the regions below provide, but a consistent
+                ;; answer. Without it an empty buffer would still return
+                ;; successfully from a dead codec, and an over-long one
+                ;; would report a length complaint about a session that no
+                ;; longer exists. (A non-bytevector argument still fails as
+                ;; the type error it is, before any of this.)
+                ((unbox dead) => die)
                 ((zero? n) empty-bv)
                 ;; the length argument is a C int; a longer plaintext would
                 ;; be truncated by the conversion and the tail silently
-                ;; never encrypted
+                ;; never encrypted.
+                ;; THIS ONE DOES NOT RETIRE THE CODEC: it is decided before
+                ;; OpenSSL is entered, so no state was touched and the same
+                ;; caller can split the buffer and carry on.
                 ((> n max-c-int) (die "tls: plaintext segment too large"))
                 (else
                   ;; the write and the reading of its reason in one step,
                   ;; for the same reason the handshake needs one; the
                   ;; raise happens after the step
-                  (let ((err (with-ssl-call
-                               (and (not (= n (SSL_write ssl bv n)))
-                                    (ssl-drain-reason "tls write failed")))))
+                  (let-values (((gone err)
+                                (with-ssl-call
+                                  (let ((d (unbox dead)))
+                                    (if d
+                                        (values d #f)
+                                        (values #f
+                                                (let ((bad (not (= n (SSL_write ssl bv n)))))
+                                                  (and bad
+                                                       (let ((m (ssl-drain-reason
+                                                                  "tls write failed")))
+                                                         ;; retired here, not
+                                                         ;; after the region
+                                                         (poison! m)
+                                                         m)))))))))
+                    (when gone (die gone))
+                    ;; already retired inside the region that saw it
                     (when err (die err))
-                    (or (with-openssl-scope (drain-wbio wbio)) empty-bv))))))
+                    ;; the drain dereferences the wbio, so it needs the
+                    ;; same guard: the session can be retired between the
+                    ;; write above and this region
+                    (let-values (((gone2 out)
+                                  (with-openssl-scope
+                                    (let ((d (unbox dead)))
+                                      (if d
+                                          (values d #f)
+                                          (values #f (drain-wbio wbio)))))))
+                      (when gone2 (die gone2))
+                      (or out empty-bv)))))))
           (define (decrypt raw)
-            (let ((werr (bio-write! rbio raw)))
-              (when werr (die werr)))
+            (cond ((unbox dead) => die))
+            ;; only 'state retires the codec: 'arg was decided before
+            ;; OpenSSL was entered and leaves the session intact, 'dead
+            ;; is the stored message of a session already retired
+            (let ((werr (bio-write! dead poison! rbio raw)))
+              ;; every kind is raised the same way here; they differ in
+              ;; whether the codec was retired, which bio-write! decided
+              (when werr (die (cdr werr))))
             (let-values (((p get) (open-bytevector-output-port)))
               (let loop ()
                 ;; SSL_read and its SSL_get_error are one step: with a gap
                 ;; between them a plain "no more whole records buffered"
                 ;; (WANT_READ) reads as SSL_ERROR_SSL and kills a healthy
                 ;; connection. Growing the output port is done outside.
-                (let-values (((n code reason)
-                              (ssl-step ssl "tls read failed"
+                (let-values (((gone n code reason)
+                              (ssl-step dead poison! ssl "tls read failed"
                                         (SSL_read ssl scratch 16384))))
                   (cond
+                    (gone (die gone))
                     ((> n 0) (put-bytevector p scratch 0 n) (loop))
                     ((= code SSL_ERROR_WANT_READ) 'drained)
                     ((= code SSL_ERROR_ZERO_RETURN)
@@ -738,14 +941,31 @@
                      ;; response must not depend on a TCP FIN --
                      ;; synthesize the eof for the client loop.
                      (send self (vector 'tcp-eof)))
+                    ;; a fatal read means the inbound record stream is
+                    ;; finished -- there is no resynchronising a TLS
+                    ;; session past one -- so this retires the codec
                     (else (die (or reason "tls read failed"))))))
               ;; post-handshake protocol output (ticket acks, key updates)
-              (flush-out! c wbio)
+              (flush-out! dead c wbio)
               (get)))
           ;; 4th slot: the tls-server-end-point hash for SCRAM channel
           ;; binding (or #f); https ignores it, the postgresql client
           ;; feeds it into SCRAM-SHA-256-PLUS.
-          (vector encrypt decrypt close! (peer-cb-hash ssl))))))
+          ;; THE LAST LOOK, and it comes after everything that touches the
+          ;; session -- peer-cb-hash included, which silently answers #f
+          ;; on a retired one and would otherwise let a codec through on
+          ;; the strength of a check made before it.
+          ;;
+          ;; It is an OBSERVATION, not a promise. The connection can close
+          ;; between this line and the vector below, or one instruction
+          ;; after establish! returns, and no check anywhere covers that --
+          ;; what it does cover is the window that mattered: every point up
+          ;; to here that still touches the session. A codec retired
+          ;; afterwards is not a hazard, because every call on it raises the
+          ;; stored message instead of reaching a freed pointer.
+          (let ((cb (peer-cb-hash dead ssl)))
+            (cond ((unbox dead) => die))
+            (vector encrypt decrypt close! cb))))))
 
   ;; ---- public entry ---------------------------------------------------------
 
