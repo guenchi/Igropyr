@@ -1284,11 +1284,11 @@ express cannot happen.
   (lambda (req res)
     (let-values (((id token reply)
                   (conversation-start!
-                    (lambda (req suspend!)
+                    (lambda (req suspend! commit!)
                       (let ((tx (begin-tx!)))          ; live, held across rounds
                         (guard (e (#t (rollback! tx) (raise e)))
                           (let ((req2 (suspend! confirm-page-data)))
-                            (commit! tx)
+                            (commit! (lambda () (commit-tx! tx)))  ; through commit!
                             done-data))))
                     req
                     300000
@@ -1299,8 +1299,9 @@ express cannot happen.
 
 (app-post app "/transfer/:id"
   (lambda (req res)
-    (let ((token (string->number
-                   (cond ((assoc "token" (req-query req)) => cdr) (else "")))))
+    ;; the token stays a STRING — it is opaque hex, and one that has been
+    ;; through a decoder that changed its type compares 'stale
+    (let ((token (cond ((assoc "token" (req-query req)) => cdr) (else ""))))
       ;; the STATUS decides, never the reply
       (let-values (((r status) (conversation-resume! (req-param req "id") token req)))
         (cond
@@ -1317,12 +1318,33 @@ express cannot happen.
           (else (send-json! res (cons (cons 'token status) r))))))))
 ```
 
-API: `(conversation-start! flow req [ttl-ms [request-key]])` spawns the
-flow and returns `(values id token first-reply)`; inside the flow,
-`(suspend! reply)` answers the current round and parks until the next
-`(conversation-resume! id token req)`, which returns
-`(values reply status)`. Default TTL 300 000 ms; expiry raises
-`'conversation-expired` inside the flow so a `guard` can roll back.
+API: `(conversation-start! flow req [ttl-ms [request-key [on-killed]]])`
+spawns the flow and returns `(values id token first-reply)`. The flow is
+called as `(flow req suspend! commit!)`: `(suspend! reply)` answers the
+current round and parks until the next `(conversation-resume! id token
+req)`, which returns `(values reply status)`. Default TTL 300 000 ms;
+expiry raises `'conversation-expired` inside the flow so a `guard` can
+roll back.
+
+**Commit through `commit!`.** `(commit! thunk)` runs the thunk, marks the
+conversation committed the instant it *returns*, and passes its values
+back unchanged. This is not bookkeeping — it is the only way the library
+can tell two exits apart that otherwise look identical. An exception
+leaving the flow proves the winders ran; it does **not** prove the
+transaction was undone, because the flow may have been unwinding from a
+commit that had already succeeded — an after-thunk that raised, a `guard`
+that re-raised. Recorded as a rollback, that exit answers `'gone`, and a
+client that retries on `'gone` performs the whole thing twice. With
+`commit!` the two are recorded apart and only the genuine rollback is
+`'gone`.
+
+**One conversation is one logical transaction.** `commit!` is the
+conversation's last state change — no new transaction is opened after it
+— and the mark it sets is **sticky**: never cleared, so a flow that
+commits, parks, is resumed and only then fails is still `'unknown`, not
+`'gone`. Wrap only the commit itself; a non-local exit out of the thunk
+(an escaping continuation, or `suspend!` called inside it) skips the mark
+and is outside the contract.
 
 **The status is the answer; the reply is only data.** A flow may
 legitimately return the symbol `'gone` as its final value, so control
@@ -1334,7 +1356,7 @@ outcomes never share a position with it:
 | `'done` | the flow finished; `reply` is its final answer |
 | `'settled` | it finished, but the answer is no longer retained |
 | `'stale` | not applied, and will not be |
-| `'gone` | it died or expired — for a transactional flow, rolled back |
+| `'gone` | it left through its winders *before* `commit!` returned — for a transactional flow, rolled back |
 | `'unknown` | it is not here and this node cannot say whether it committed |
 | `'unreachable` | the owner node could not be reached; nothing is known |
 
@@ -1342,22 +1364,37 @@ outcomes never share a position with it:
 `conversation-gone?` and `conversation-unknown?` are applied to the
 *status*.
 
-**`'unknown` is not `'gone`.** `'gone` promises a rollback, and that
-promise needs a premise: *would this node still have the completion
-record?* Past the age limit, past the count limit, or on the other side
-of a restart the answer is no — and the same absence then means nothing
-at all. An id carries the time it was made
-(`<node>~<base36 ms>-<hex>`, or without the node prefix on a single
-node) and the record carries a **horizon**: how far back this node
-remembers, starting at process start and moving up whenever an entry is
-discarded. No record and an id newer than the horizon is `'gone`;
-otherwise `'unknown`.
+**`'unknown` is not `'gone`.** `'gone` promises a rollback, so it is
+answered only from **positive evidence**: a record on this node saying
+this conversation left through its winders without having committed.
+Never from an absence — "no process and no record" is `'unknown`,
+because the ways of dying that write no record (a kill from outside, a
+link cascade, a VM going down, a record that aged out, an id from an
+earlier incarnation) are an open set, and reading a rollback guarantee
+off any of them is a positive claim derived from missing evidence.
+Never from a record that merely says the flow raised, either: that is
+what `commit!` splits in two.
+
+The library keeps four outcomes apart, and every answer is read off one:
+
+| record | meaning | answer |
+|---|---|---|
+| settled | the flow returned | `'settled` |
+| rolled back | left through its winders, `commit!` had not returned | `'gone` |
+| committed then failed | left through its winders *after* `commit!` returned | `'unknown` |
+| killed / no record | stopped in flight, or stopped in a way nothing recorded | `'unknown` |
 
 `'unknown` licenses one thing less than `'gone`: **do not resubmit**.
 Reconcile against your own state, which is where the truth still is. It
-appears exactly where `'gone` used to be a guess — including for a
-fabricated id, which this node cannot tell from a real one it has
-forgotten.
+appears wherever this node cannot produce the evidence — including for a
+fabricated id, which it cannot tell from a real one it has forgotten.
+
+The record is **bounded**, by age and by count (`conversation-set-limits!`),
+because an unbounded log of every conversation that ever finished is a
+leak with a long fuse. Past either bound an entry is dropped and the
+conversation becomes `'unknown` — the honest limit of the mechanism, and
+the reason both bounds are settable. What a forgotten record can no
+longer do is become `'gone`.
 
 **Answering `'unknown` yourself.** `conversation-resume!` and
 `conversation-peek` take an optional predicate — `(conversation-resume!
@@ -1367,11 +1404,22 @@ including a raise, leaves `'unknown` standing. It is applied on the
 asking node, so it covers a forwarded resume too.
 
 This is where an application that wrote the conversation id **in the same
-transaction as the effect** hands the library the truth. That is also the
-only fix for the one case the horizon cannot cover: a flow that commits
-and then dies before returning leaves no record, and inside the horizon
-that reads as `'gone`. Nothing the library can observe distinguishes it;
-a marker in the transaction can.
+transaction as the effect** hands the library the truth: durable, atomic
+with the thing it describes, and outliving both the record and the
+process.
+
+**A local witness beats the predicate.** Where this node's own record
+says *committed then failed*, a `#f` — "durably not committed" — is not
+new information filling a gap; it contradicts evidence already in hand,
+and the honest answer to a contradiction is `'unknown`, not `'gone`. A
+store that lags, a read served by a replica, or an id written under a
+different key all produce that `#f`, and honouring it would invite a
+retry of a transaction this node watched commit. Everywhere else — a
+kill, an aged-out record, no record at all — there is no witness to
+contradict, `#f` is the only evidence there is, and it still resolves to
+`'gone`. The check is local by nature: for a forwarded resume the owner's
+record is on the owner, so the predicate's own contract carries that case
+alone.
 
 `(conversation-peek id [settled?])` asks what a conversation is waiting
 for without advancing it — `(values state token last-reply)`, with the same states.
@@ -1452,13 +1500,23 @@ The conversation never touches the connection: pool workers stay the
 protocol adapters, parking until the flow replies, so the pool's
 stuck-killer and failure hook keep protecting every round.
 
-**The `gone` guarantee.** Death for any reason — crash, TTL, normal
-completion — automatically unregisters the process, and every later
-resume returns `'gone`. For a flow holding a database transaction,
-dead process = dropped connection = the database itself rolled back:
-`gone` *guarantees* nothing committed. Combined with the failure
-hook's `crash`/`stuck` codes, a client always knows the definite
-server state — the full remote transaction ring.
+**The `gone` guarantee, and what it is *not*.** For a flow holding a
+database transaction, a death that ran the flow's winders before its
+commit is the rollback guarantee: dead process = dropped connection =
+the database itself rolled back, so `'gone` *proves* nothing committed,
+and it is the one status a client may retry on.
+
+It does not follow from death as such. "Death for any reason returns
+`'gone`" was the earlier reading, and each way of dying that it covered
+by accident made it false: normal completion (that is `'done`, then
+`'settled`), a kill from outside, a step the watchdog stopped, a link
+cascade, an after-thunk raising on the way out of a successful commit.
+Each of those answers `'unknown`, and each of them was a double charge
+while it answered `'gone`. Retry on `'gone`; on `'unknown` and
+`'unreachable`, reconcile. Combined with the failure hook's
+`crash`/`stuck` codes, that is the full remote transaction ring — the
+difference being that the ring now carries "I cannot say" as a
+first-class answer rather than guessing.
 
 **Where to use it** — critical transactional flows: payments against
 internal strong-transaction operations, booking (the seat hold is the

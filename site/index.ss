@@ -114,13 +114,16 @@
                (b "at that line") ". A step order the code cannot express cannot "
                "happen — no state machine to get wrong, no replay to defend "
                "against.")
-            (p (b "The " (code "gone") " guarantee:") " death for any reason — "
-               "crash, TTL, completion — unregisters the process, and a later "
-               "resume answers " (code "gone") ". Dead process = dropped "
-               "connection = the database itself rolled back: " (code "gone")
-               " " (b "proves") " nothing committed. Together with the fault "
-               "codes above, the client always knows the definite server state "
-               "— a complete remote transaction ring."))
+            (p (b "The " (code "gone") " guarantee:") " the transaction commits "
+               "through " (code "commit!") ", so the library knows which side of "
+               "it a death fell on. Before it: dead process = dropped connection "
+               "= the database itself rolled back, and " (code "gone") " "
+               (b "proves") " nothing committed — the one status you may retry "
+               "on. After it, or a kill, or no record at all: " (code "unknown")
+               " — reconcile, never resubmit. Together with the fault codes "
+               "above, the client always knows the definite server state, and "
+               "is told plainly when it cannot be known — a complete remote "
+               "transaction ring."))
           (pre ,(raw conv-code)))))
 
    ;; ---- 5. s-expression rpc ----
@@ -253,8 +256,11 @@
              '(code "suspend!") " answers and parks, " '(code "conversation-resume!")
              " continues — carrying a token that names the reply it answers, so a "
              "double click or a retried request replays that answer instead of "
-             "taking a step nobody asked for; death for any reason (crash, TTL) "
-             "means guaranteed rollback: a later resume gets " '(code "gone"))
+             "taking a step nobody asked for; the transaction commits through "
+             '(code "commit!") ", so a death that left the flow before it is "
+             "the rollback guarantee — a later resume gets " '(code "gone")
+             " and may be retried — while one after it is " '(code "unknown")
+             ", which may not")
           ,(fitem "Hot code swapping"
              "replace the handler (or individual routes) on a live server: the "
              "listener, open connections and worker pool stay up, in-flight "

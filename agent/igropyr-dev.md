@@ -75,7 +75,7 @@ Atomicity: `(with-interrupts-disabled ...)` from (igropyr actor).
 | tls | tls-enable! (once at startup; then https:// and wss:// work; certificates verified by default; needs system OpenSSL 3/1.1) |
 | gen-server | gen-server-start gen-server-start-named gen-server-call gen-server-cast |
 | pubsub | start-pubsub! subscribe unsubscribe publish |
-| conversation | conversation-start! conversation-resume! conversation-gone? (process = conversation; death = guaranteed rollback → 'gone; clustered ids carry the owner and auto-forward) |
+| conversation | conversation-start! conversation-resume! conversation-gone?/-unknown? (process = conversation; flow is `(lambda (req suspend! commit!) ...)` and the transaction MUST commit through `(commit! thunk)`; dying before that commit → 'gone, the one retryable status; dying after it, or killed, or no record → 'unknown, do not resubmit; clustered ids carry the owner and auto-forward) |
 | node | node-start! node-connect!/disconnect! node-self rsend rcall monitor-node/remote (+demonitor) node-peers node-set-limits! |
 | cluster | cluster-start cluster-stop (discover: static list / redis heartbeat / custom thunk — no port scanning) |
 | dpool | dpool-start dpool-submit dpool-await dpool-worker-start dpool-stats |

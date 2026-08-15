@@ -33,18 +33,20 @@
 <span class=\"c\">;;   {\"fault\":\"stuck\",\"elapsed-ms\":3012,...}</span>
 <span class=\"c\">;; unset? the plain 500 remains. zero breakage.</span>")
   (define conv-code "(<span class=\"f\">conversation-start!</span>
-  (<span class=\"k\">lambda</span> (req suspend!)
+  (<span class=\"k\">lambda</span> (req suspend! commit!)
     (<span class=\"k\">let</span> ((tx (begin-tx!)))       <span class=\"c\">; live, across requests</span>
       (<span class=\"k\">guard</span> (e (#t (rollback! tx) (<span class=\"k\">raise</span> e)))
         (<span class=\"k\">let</span> ((req2 (suspend! confirm-page)))
-          (commit! tx)
+          (commit! (<span class=\"k\">lambda</span> () (commit-tx! tx)))
           done))))
   req)
 
 (<span class=\"f\">conversation-resume!</span> id token req)
 <span class=\"c\">;; =&gt; (values reply next-token) | 'stale | 'gone</span>
 <span class=\"c\">;; the token names the reply you are answering;</span>
-<span class=\"c\">;; repeating one replays its answer, once.</span>")
+<span class=\"c\">;; repeating one replays its answer, once.</span>
+<span class=\"c\">;; commit through commit!: a failure after it is</span>
+<span class=\"c\">;; 'unknown, never the retryable 'gone.</span>")
   (define cluster-code "(<span class=\"f\">node-start!</span> <span class=\"n\">'web-1</span> secret <span class=\"n\">8888</span> <span class=\"s\">\"0.0.0.0\"</span>)
 
 <span class=\"c\">;; discover peers via redis; nodes heartbeat</span>
