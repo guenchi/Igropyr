@@ -159,7 +159,13 @@
 ;;;     which drops the transaction. Anything held IN PROCESS is not --
 ;;;     a reservation, a file handle, an in-memory hold. Pass an
 ;;;     on-killed procedure (conversation-start!'s fifth argument) to
-;;;     release those; it runs after the kill, outside the dead process,
+;;;     release those; it runs after the kill, in a supervised process of
+;;;     its own -- bounded by the conversation's ttl, and its outcome
+;;;     counted in conversation-hook-stats, so a hook that raises or hangs
+;;;     is visible instead of silent. That bound covers anything the
+;;;     scheduler can preempt; a hook that blocks the OS thread (a
+;;;     blocking foreign call) is beyond it. It runs outside the dead
+;;;     process,
 ;;;     and is called with one argument: whether the conversation had
 ;;;     COMMITTED when the kill landed. Release what is held in process
 ;;;     unconditionally; undo the transaction only under (not
@@ -238,7 +244,8 @@
 (library (igropyr conversation)
   (export conversation-start! conversation-resume! conversation-peek
           conversation-gone? conversation-stale? conversation-done?
-          conversation-settled? conversation-unknown? conversation-set-limits!)
+          conversation-settled? conversation-unknown? conversation-set-limits!
+          conversation-hook-stats)
   (import (chezscheme) (igropyr actor)
           (only (igropyr libuv) now-ms)
           (only (igropyr node) node-self rsend monitor-node demonitor-node))
@@ -938,6 +945,129 @@
           (receive (after 0 'ok) (`#(conv-forward-reply ,@ref ,a ,b) 'ok))
           (unregister reply-name)))))
 
+  ;; ---- on-killed health ---------------------------------------------------
+  ;;
+  ;; THE ONE PLACE THIS FILE COULD NOT SEE INTO. on-killed is application
+  ;; code run after a kill, and it had two ways to fail without leaving a
+  ;; trace anywhere: it could RAISE, and the guard around it -- which has
+  ;; to be there, or a bad hook takes the watchdog with it -- swallowed
+  ;; that silently, so a handle went unreleased and a compensation went
+  ;; unrun with nothing recorded; or it could HANG, which no guard covers
+  ;; at all, and the watchdog then sat inside it forever, never reaching
+  ;; its loop, leaking a green process per killed conversation.
+  ;;
+  ;; Counters, not an observer hook. A callback would run application code
+  ;; back inside the watchdog's timing, and would itself be able to fail
+  ;; the same two ways -- the thing being fixed. If "react to every hook
+  ;; failure" is ever a real requirement, adding it later is additive;
+  ;; reading a count is enough to know it is happening at all.
+  ;;
+  ;; None of this reaches the conversation's status or its tombstone.
+  ;; 'gone / 'settled / 'unknown describe the TRANSACTION, and hook health
+  ;; is orthogonal to it: a committed transaction can have a failing
+  ;; release hook, and a killed uncommitted one is 'unknown whether its
+  ;; compensation succeeded or not. Folding one into the other would hide
+  ;; the more important classification behind the less important one.
+  (define hook-attempted (box 0))
+  (define hook-succeeded (box 0))
+  (define hook-raised (box 0))
+  (define hook-timed-out (box 0))
+  (define hook-running (box 0))
+  ;; The last failure, WITH THE CONVERSATION ID -- counters alone tell an
+  ;; application that something failed but not what to reconcile, and
+  ;; between two reads the second failure would overwrite the first with
+  ;; no way back to the id. Only the newest is kept, which bounds this;
+  ;; note that the reason it carries is whatever the hook raised, so it
+  ;; can hold a large object graph, or one with data the application would
+  ;; not otherwise retain. Read it and let go of it.
+  (define hook-last-failure (box #f))
+
+  (define (hook-bump! b) (set-box! b (+ 1 (unbox b))))
+
+  ;; Cumulative since process start, like the rest of this framework's
+  ;; counters: never reset, so a caller that wants a delta takes its own
+  ;; baseline. `running` is the only gauge among them.
+  (define (conversation-hook-stats)
+    (with-interrupts-disabled
+      (list (cons 'attempted (unbox hook-attempted))
+            (cons 'succeeded (unbox hook-succeeded))
+            (cons 'raised (unbox hook-raised))
+            (cons 'timed-out (unbox hook-timed-out))
+            (cons 'running (unbox hook-running))
+            (cons 'last-failure (unbox hook-last-failure)))))
+
+  ;; Run on-killed in its own supervised process, and outlive it either way.
+  ;;
+  ;; LINKED AND MONITORED, BOTH. The monitor is how the outcome comes back;
+  ;; the link is what stops the hook from being orphaned when the watchdog
+  ;; itself dies -- spawn&link establishes that before the child can run,
+  ;; so there is no window where the child exists unattached. Trapping
+  ;; exits for the duration is what turns the child's death into a message
+  ;; instead of a cascade; it is turned back off afterwards so the
+  ;; watchdog's own behaviour is unchanged everywhere else.
+  ;;
+  ;; THE RAISE IS RE-TAGGED, and it has to be: a process's exit reason IS
+  ;; the object it raised, so a hook doing (raise 'normal) would produce
+  ;; exactly the reason a clean return produces, and a failure would be
+  ;; counted as a success. Wrapping it makes 'normal mean one thing.
+  ;;
+  ;; THE TIMEOUT IS THE CONVERSATION'S OWN ttl. It is already the caller's
+  ;; statement of how long this dialogue may take, and cleanup getting a
+  ;; fresh allowance of it is the same rule the expiry path follows. A
+  ;; fixed number would be unrelated to the application's operation, and a
+  ;; new parameter would ask every caller to describe something they have
+  ;; already described. (It is a deadline on the whole attempt, queueing
+  ;; included: under a burst of kills a hook can be timed out having had
+  ;; little CPU. That is the honest reading of "took too long" on a
+  ;; cooperatively scheduled runtime.)
+  ;;
+  ;; WHAT THIS DOES NOT COVER: a hook that blocks the OS THREAD. The child
+  ;; process bounds anything the scheduler can preempt -- sleeps, receives,
+  ;; async I/O, a CPU loop with interrupts on. A blocking foreign call, a
+  ;; synchronous OS call, or a loop with interrupts disabled stops the one
+  ;; thread everything runs on, and `after` never gets to fire. Bounding
+  ;; those needs a second OS thread, which this library does not have.
+  (define (run-on-killed! id on-killed committed? ttl)
+    (with-interrupts-disabled
+      (hook-bump! hook-attempted)
+      (hook-bump! hook-running))
+    (process-trap-exit #t)
+    (let* ((child (spawn&link
+                    (lambda ()
+                      (guard (e (#t (raise (vector 'conversation-hook-raised e))))
+                        (on-killed committed?)))))
+           (m (monitor child))
+           (outcome
+             (receive (after ttl
+                        ;; the kill discards the hook's own winders, just
+                        ;; as the kill that summoned it discarded the
+                        ;; flow's -- a hook must not put its releasing in
+                        ;; a winder for that reason
+                        (begin
+                          (kill child 'conversation-hook-timeout)
+                          (receive (after 0 'ok) (`#(DOWN ,@child ,r) 'ok))
+                          (cons 'timed-out 'conversation-hook-timeout)))
+               (`#(DOWN ,@child ,reason)
+                 (if (eq? reason 'normal)
+                     (cons 'succeeded #f)
+                     (cons 'raised reason))))))
+      (when m (demonitor m))
+      ;; the link's EXIT, however the child ended; left behind it would sit
+      ;; in the watchdog's mailbox and never match anything it receives
+      (receive (after 0 'ok) (`#(EXIT ,@child ,r) 'ok))
+      (process-trap-exit #f)
+      (with-interrupts-disabled
+        (set-box! hook-running (- (unbox hook-running) 1))
+        (case (car outcome)
+          ((succeeded) (hook-bump! hook-succeeded))
+          (else
+            (hook-bump! (if (eq? (car outcome) 'raised)
+                            hook-raised
+                            hook-timed-out))
+            (set-box! hook-last-failure
+              (vector 'conversation-hook-failure id (car outcome)
+                      (cdr outcome) committed? (now-ms))))))))
+
   ;; Start a conversation. flow: (lambda (req suspend! commit!) ... final-reply).
   ;; suspend! answers the current round and parks until the next resume,
   ;; returning the next request; on TTL expiry it raises
@@ -1038,12 +1168,41 @@
            ;; deducted from a balance and restored in a guard -- stays held
            ;; for the life of the VM.
            ;;
-           ;; So: a procedure of one argument, run after the kill, in the
-           ;; watchdog's own
-           ;; process. It cannot touch the flow's stack (that is gone); it
-           ;; releases what the flow was holding, which the application
-           ;; reaches through whatever it closed over. Its own exceptions
-           ;; are swallowed -- the watchdog must survive a bad hook.
+           ;; So: a procedure of one argument, run after the kill, in a
+           ;; dedicated supervised process of its own. It cannot touch the
+           ;; flow's stack (that is gone); it releases what the flow was
+           ;; holding, which the application reaches through whatever it
+           ;; closed over.
+           ;;
+           ;; WHAT "ITS OWN PROCESS" CHANGES, and what it does not. The
+           ;; heap is the same one: same OS thread, same boxes, same
+           ;; handles, so everything the hook closed over is exactly what
+           ;; the flow was holding. What differs is the process identity
+           ;; around it -- `self`, the mailbox, and who owns any link,
+           ;; monitor or registration the hook makes. A hook that spawns
+           ;; and links, or registers a name, is doing it from a process
+           ;; that ends when the hook does.
+           ;;
+           ;; It is bounded by the conversation's ttl and its outcome is
+           ;; counted (see run-on-killed! and conversation-hook-stats):
+           ;; raising no longer disappears, and hanging no longer strands
+           ;; the watchdog. Three things the hook still owes:
+           ;;   - BE IDEMPOTENT, in every action and not only the undo --
+           ;;     see below for the windows where it runs after the flow's
+           ;;     winders already released once.
+           ;;   - BE CANCELLABLE. A hook that overruns is killed, and that
+           ;;     kill discards its dynamic-wind winders exactly as the
+           ;;     kill that summoned it discarded the flow's. Releasing
+           ;;     from a winder is releasing from something that may not
+           ;;     run.
+           ;;   - RETURNING IS NOT EVIDENCE. A hook that swallows its own
+           ;;     errors, or does nothing, returns cleanly and is counted
+           ;;     as a success. The counters say the hook finished, never
+           ;;     that the resource came back.
+           ;; And the most reliable shape is not a long hook at all: let an
+           ;; owner process monitor whoever borrowed a resource and reclaim
+           ;; it on DOWN, and let this hook be one idempotent message to
+           ;; that owner.
            ;;
            ;; THE ARGUMENT IS committed? -- whether this conversation had
            ;; got past its commit! when the kill landed. The hook has two
@@ -1476,8 +1635,13 @@
                                       ;; must be idempotent, or check the
                                       ;; authoritative store itself, rather
                                       ;; than trust this flag alone.
-                                      (guard (e (#t (void)))
-                                        (on-killed (unbox committed-box))))
+                                      ;; ...in its own supervised process,
+                                      ;; so that a hook which raises or
+                                      ;; hangs is counted rather than
+                                      ;; swallowed -- see run-on-killed!
+                                      (run-on-killed!
+                                        id on-killed
+                                        (unbox committed-box) ttl))
                                     (loop))))))))))))
                  (let ((who starter) (tag ref)
                        (st (make-step-state 'running #f #f #f #f 0

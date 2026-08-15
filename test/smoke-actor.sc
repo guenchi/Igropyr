@@ -44,6 +44,33 @@
         (`#(DOWN ,pid ,reason) 'ok)))
     (display "preemption+kill ok\n")
 
+    ;; kill DELIVERS BEFORE IT RETURNS, and callers depend on that.
+    ;;
+    ;; A supervisor that kills a worker it both linked and monitored has to
+    ;; take the EXIT and the DOWN out of its own mailbox afterwards --
+    ;; anything left there matches nothing it receives later, and an EXIT
+    ;; left behind reaches a process that has since stopped trapping them,
+    ;; which kills it. That drain is written as a zero-timeout receive,
+    ;; which is only correct because kill appends both messages on the
+    ;; calling stack rather than queueing them for delivery. Nothing else
+    ;; states that, so it is pinned here: if kill ever becomes
+    ;; asynchronous, this fails and every zero-timeout drain built on it
+    ;; has to be revisited -- they would otherwise start silently missing.
+    (let ()
+      (process-trap-exit #t)
+      (let* ((victim (spawn&link (lambda () (receive (after 60000 'never)))))
+             (m (monitor victim)))
+        (kill victim 'pinning-the-contract)
+        (let ((down (receive (after 0 #f) (`#(DOWN ,@victim ,r) r)))
+              (exit (receive (after 0 #f) (`#(EXIT ,@victim ,r) r))))
+          (when m (demonitor m))
+          (process-trap-exit #f)
+          (unless down
+            (fail "kill returned before its DOWN was in the mailbox"))
+          (unless exit
+            (fail "kill returned before its EXIT was in the mailbox")))))
+    (display "kill has delivered EXIT and DOWN by the time it returns ok\n")
+
     ;; Established sockets are owned resources. Killing their actor must
     ;; remove the conn-table root and close the fd without actor cooperation.
     (let* ((caller self)

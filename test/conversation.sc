@@ -10,7 +10,11 @@
 ;;;     never 'gone; a commit! whose thunk raised is still 'gone
 
 (import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
-        (igropyr json) (igropyr conversation) (igropyr libuv))
+        (igropyr json) (igropyr conversation) (igropyr libuv)
+        ;; process-count: the hook cases below assert that a wedged hook
+        ;; leaves no process behind, which is the observation the counters
+        ;; cannot make
+        (only (igropyr actor) process-count))
 
 (define port 18084)
 (define empty-bv (make-bytevector 0))
@@ -71,6 +75,8 @@
             (else (scan (+ i 1)))))))
 
 (define (json-of response) (string->json (body-of response)))
+
+(define (stat name s) (cond ((assq name s) => cdr) (else #f)))
 
 (define (expect label got want)
   (if (equal? got want)
@@ -2108,6 +2114,97 @@
   (unless (eq? outcome 'refused)
     (fail "a zero-argument on-killed hook was not refused at start" outcome))
   (display "a zero-argument on-killed hook is refused at start ok\n"))
+
+;; ---- a hook that fails does not fail silently ---------------------------
+;;
+;; on-killed is the last chance to give back what a killed flow held, and
+;; it is application code called from the watchdog. Its two failures used
+;; to leave nothing behind: a raise was swallowed by the guard that keeps
+;; a bad hook from taking the watchdog with it, and a hook that blocked
+;; kept the watchdog inside it forever -- never reaching its loop, never
+;; finishing, one green process leaked per occurrence.
+;; A HOOK THAT RAISES THE SAME REASON A RETURN PRODUCES. The runtime uses
+;; whatever was raised as the exit reason, so a hook raising 'normal dies
+;; with exactly the reason a clean return gives -- and an implementation
+;; reading DOWN without tagging first records it as a success. This is the
+;; case that looks like it works.
+(let ((base (conversation-hook-stats)))
+  (let-values (((id tok first)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (sleep-ms 5000)                 ; overruns, gets killed
+                      (vector 'unreachable a)))
+                  'go
+                  200
+                  values
+                  (lambda (committed?) (raise 'normal)))))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'hk st)))))
+      (receive (after 6000 (fail "raising-hook-no-answer" 'timeout))
+        (`#(hk ,st) 'ok)))
+    (sleep-ms 500)
+    (let ((now (conversation-hook-stats)))
+      (unless (= (+ 1 (stat 'attempted base)) (stat 'attempted now))
+        (fail "the hook was not attempted" now))
+      (unless (= (+ 1 (stat 'raised base)) (stat 'raised now))
+        (fail "a hook that raised was not counted as raised" now))
+      (unless (= (stat 'succeeded base) (stat 'succeeded now))
+        (fail "a hook that raised was counted as a success" now))
+      (let ((f (stat 'last-failure now)))
+        (unless (and (vector? f) (eq? (vector-ref f 0) 'conversation-hook-failure))
+          (fail "no failure record was kept" f))
+        (unless (equal? (vector-ref f 1) id)
+          (fail "the failure record does not name the conversation" f))
+        (unless (eq? (vector-ref f 2) 'raised)
+          (fail "the failure was not classified as a raise" f)))
+      (display "a hook raising the reason a return produces is still a failure ok\n"))))
+
+;; ...AND A HOOK THAT BLOCKS DOES NOT KEEP THE WATCHDOG. The observation
+;; that matters is not the counter -- it is that the processes go away.
+;; Before this, the watchdog sat inside the hook forever; the count of
+;; live green processes never came back down.
+(let ((base (conversation-hook-stats))
+      (procs-before (process-count)))
+  (let-values (((id tok first)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (sleep-ms 5000)
+                      (vector 'unreachable a)))
+                  'go
+                  200
+                  values
+                  (lambda (committed?) (sleep-ms 600000)))))   ; never returns
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'hk st)))))
+      (receive (after 6000 (fail "blocking-hook-no-answer" 'timeout))
+        (`#(hk ,st) 'ok)))
+    ;; the hook's allowance is the conversation's own ttl, so this is well
+    ;; past it
+    (sleep-ms 1500)
+    (let ((now (conversation-hook-stats)))
+      (unless (= (+ 1 (stat 'timed-out base)) (stat 'timed-out now))
+        (fail "a hook that blocked was not counted as timed out" now))
+      (unless (= 0 (stat 'running now))
+        (fail "a timed-out hook is still counted as running" now)))
+    (let settle ((tries 0))
+      (cond ((<= (process-count) procs-before)
+             (display "  [info] processes: ") (display procs-before)
+             (display " -> ") (display (process-count)) (newline)
+             (display "a hook that blocks is bounded and leaks no process ok\n"))
+            ((> tries 20)
+             (fail "a blocked hook left processes behind"
+                   (list 'before procs-before 'after (process-count))))
+            (else (sleep-ms 200) (settle (+ tries 1)))))))
 
 (display "ALL CONVERSATION TESTS PASSED\n")
     (exit 0)))
