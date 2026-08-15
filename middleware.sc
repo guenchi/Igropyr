@@ -191,6 +191,17 @@
   ;; structured 500 (or your 'handler), with no supervisor retry. If the
   ;; handler already responded, the fallback is dropped (token guard).
   ;;
+  ;; THAT MOVES WHO DECIDES ABOUT RETRYING, rather than removing retries:
+  ;; what would have been a pool re-run of an unanswered task becomes an
+  ;; answer -- a 500 by default -- and whether anything runs again is then
+  ;; the client's decision, which may well be no. Worth knowing when
+  ;; reading any library whose contract mentions retrying -- "safe to
+  ;; retry" is a statement about the WORK, not a promise that anyone will
+  ;; do it. (igropyr
+  ;; conversation)'s #(conversation-failed ...) is documented that way for
+  ;; exactly this reason; a contract that names the pool specifically is
+  ;; one this middleware quietly invalidates.
+  ;;
   ;; A handler that raised AFTER res-begin! is a third case, and dropping
   ;; the fallback was wrong for it. The status line is already out, so the
   ;; 500 vanishes on the token guard -- but the response is not finished

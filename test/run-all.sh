@@ -22,6 +22,9 @@ export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm
 # rewrites a substring inside them moves every use with every definition,
 # so nothing else in the suite would notice
 "$scheme_bin" --script igropyr/test/public-names.sc
+# the status vocabulary must stay importable without the runtime: its own
+# process, so what it loads is observable at all
+"$scheme_bin" --script igropyr/test/conversation-status.sc
 IGROPYR_CONTRACTS=full "$scheme_bin" --script igropyr/test/checked-full.sc
 env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/smoke-actor.sc

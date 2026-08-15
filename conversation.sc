@@ -187,9 +187,10 @@
 ;;;   - a flow that RAISES before its first suspend! AND BEFORE ITS
 ;;;     commit! makes
 ;;;     conversation-start! raise #(conversation-failed reason) in the
-;;;     caller -- the worker crashes, and the pool's normal retry handles
-;;;     it (nothing had been answered yet, and a raise that left the flow
-;;;     ran its winders, so the record says rolled back).
+;;;     caller. What that raise ASSERTS is narrow and does not depend on
+;;;     who is listening: nothing had been answered yet, and a raise that
+;;;     left the flow ran its winders, so the record says rolled back --
+;;;     the work is undone and repeating it is safe.
 ;;;   - ...and only then. A first step that may have got past its COMMIT --
 ;;;     killed for overrunning, killed from outside, taken down by a link,
 ;;;     or raising after its commit! had returned -- would be repeated by
@@ -198,17 +199,26 @@
 ;;;     is NOT retryable: the id is there so the caller can reconcile.
 ;;;
 ;;;   - CATCH THE UNCERTAIN ONE. Both of these are raised in the CALLER,
-;;;     and the caller is typically a host that re-runs a task which never
-;;;     answered -- this framework's own worker pool is one, and it will
-;;;     re-run a handler up to its retry limit on any exception that
-;;;     escapes. For #(conversation-failed ...) that is the DESIGN: nothing
-;;;     was answered, the flow rolled back, running it again is what the
-;;;     retry is for. For #(conversation-uncertain ...) the same machinery
-;;;     is a double spend. "Not retryable" is a property of the fact, not
-;;;     a protection: an uncertain raise that is left to propagate is
-;;;     indistinguishable, to the host, from an ordinary crash -- so the
-;;;     one signal that exists to say "do not run this again" is what
-;;;     makes it run again.
+;;;     and WHO RETRIES DEPENDS ON HOW THE HOST IS ASSEMBLED, which is not
+;;;     this library's business and must not be assumed by it. Left to
+;;;     propagate under this framework's worker pool, the worker crashes
+;;;     and the pool re-runs the unanswered task. Under an outermost
+;;;     error-handler middleware -- the recommended assembly -- the raise
+;;;     is caught there instead, the client gets a 500, and the retry is
+;;;     the client's. Both are correct for #(conversation-failed ...),
+;;;     because the fact it asserts is "safe to repeat" rather than "the
+;;;     pool will repeat it". (This paragraph used to say the pool retry
+;;;     WAS the design; with an error-handler installed that retry never
+;;;     happens, so the two documents contradicted each other while both
+;;;     were being followed. See (igropyr middleware)'s error-handler.)
+;;;
+;;;     For #(conversation-uncertain ...) neither assembly is acceptable,
+;;;     and that is the point of this whole entry. "Not retryable" is a
+;;;     property of the fact, not a protection: an uncertain raise that is
+;;;     left to propagate is indistinguishable, to a pool or to a client,
+;;;     from an ordinary crash -- so the one signal that exists to say "do
+;;;     not run this again" is handed to whatever decides whether to run it
+;;;     again, saying nothing.
 ;;;
 ;;;     So an uncertain first step must be caught where it is raised and
 ;;;     turned into an ANSWER. Answering is what takes the task out of the
@@ -224,8 +234,10 @@
 ;;;                                    (resubmit . #f)))))
 ;;;         (conversation-start! flow req))
 ;;;
-;;;     #(conversation-failed ...) is deliberately NOT caught there: let it
-;;;     crash, and let the retry take it.
+;;;     #(conversation-failed ...) is deliberately NOT caught there. It is
+;;;     the one raise whose work is safe to repeat, so it is left to the
+;;;     host's ordinary failure handling -- whatever that is in this
+;;;     assembly -- rather than being converted into an answer here.
 ;;;
 ;;; Clustered: a conversation is PINNED to the node that created it --
 ;;; its continuation and open transaction cannot migrate. The id carries
@@ -243,10 +255,14 @@
 
 (library (igropyr conversation)
   (export conversation-start! conversation-resume! conversation-peek
+          conversation-set-limits! conversation-hook-stats
+          ;; re-exported from (igropyr conversation-status), so that
+          ;; importing this library still gives the whole vocabulary
           conversation-gone? conversation-stale? conversation-done?
-          conversation-settled? conversation-unknown? conversation-set-limits!
-          conversation-hook-stats)
+          conversation-settled? conversation-unknown?
+          conversation-unreachable?)
   (import (chezscheme) (igropyr actor)
+          (igropyr conversation-status)
           (only (igropyr libuv) now-ms)
           (only (igropyr node) node-self rsend monitor-node demonitor-node))
 
@@ -2244,48 +2260,10 @@
                 (let-values (((state rec) (settled-or-lost/record id)))
                   (values state #f #f rec))))))))
 
-  ;; THE ROLLBACK GUARANTEE, and the only answer that is one. A record
-  ;; says the flow rolled back: it raised, or its park deadline raised
-  ;; into it and nothing caught that, and either way it left through its
-  ;; winders. This is what a caller may retry on.
-  ;;
-  ;; Applied to the STATUS, never to the reply. A flow may return the
-  ;; symbol 'gone as a perfectly ordinary answer; only the status carries
-  ;; control meaning.
-  (define (conversation-gone? x) (eq? x 'gone))
-
-  ;; Neither confirmed. The conversation is not here and no record says
-  ;; what became of it -- it was stopped in flight, killed from outside,
-  ;; taken down by a link, or its record aged out, was pushed out by newer
-  ;; ones, or belonged to an earlier incarnation of this process. DO NOT
-  ;; RESUBMIT: that is the one action this answer cannot license.
-  ;; Reconcile against your own state instead, which is the only place the
-  ;; truth still is.
-  ;;
-  ;; THIS IS THE DEFAULT, and that is the change worth knowing about.
-  ;; Everywhere this appears, 'gone was previously returned as though a
-  ;; missing record were a rollback guarantee -- a positive claim read off
-  ;; an absence, and wrong for every death path that writes no record.
-  (define (conversation-unknown? x) (eq? x 'unknown))
-
-  ;; The flow returned: reply is its final answer, and no token continues
-  ;; it. Distinguishing this from 'gone is what tells a caller whether the
-  ;; transaction committed.
-  (define (conversation-done? x) (eq? x 'done))
-
-  ;; The flow finished, but its answer is no longer retained -- the linger
-  ;; window closed and only the record of completion is left. For a
-  ;; transactional flow this is the OPPOSITE of 'gone: it committed. Read
-  ;; your own state for the details; do not resubmit.
-  (define (conversation-settled? x) (eq? x 'settled))
-
-  ;; The request named a reply that is no longer the one being answered --
-  ;; a duplicate, a retry, a second front end. It was NOT applied and will
-  ;; not be, which is a fact about this conversation rather than a guess.
-  ;;
-  ;; It says nothing about whether the request it duplicates succeeded: the
-  ;; step it was trying to repeat may well have run for whoever got there
-  ;; first. A caller that reaches here should read the current state, not
-  ;; resubmit -- it has no valid token to resubmit with, which is the point.
-  (define (conversation-stale? x) (eq? x 'stale))
+  ;; The status predicates live in (igropyr conversation-status) and are
+  ;; re-exported above. They are one-line eq? tests with no dependencies,
+  ;; and keeping them here forced anyone who only wanted to CLASSIFY a
+  ;; status to load the scheduler, libuv, the node layer, and this file's
+  ;; load-time work -- a clock stamp and a read from /dev/urandom. See
+  ;; that file for why it imports nothing beyond (chezscheme).
 )

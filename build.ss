@@ -36,6 +36,7 @@
     ("igropyr/ws-client.sc" . 2)
     ("igropyr/gen-server.sc" . 2)
     ("igropyr/node.sc" . 2)
+    ("igropyr/conversation-status.sc" . 2)
     ("igropyr/conversation.sc" . 2)
     ("igropyr/http.sc" . 2)
     ("igropyr/pubsub.sc" . 2)
