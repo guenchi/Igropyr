@@ -972,27 +972,78 @@
   (define hook-succeeded (box 0))
   (define hook-raised (box 0))
   (define hook-timed-out (box 0))
+  (define hook-killed (box 0))
   (define hook-running (box 0))
+  ;; SUCCESS IS PROVED OFF-CHANNEL, not by the exit reason.
+  ;;
+  ;; A process's exit reason is whatever it raised, and a clean return
+  ;; produces 'normal -- which is also what killing it with reason 'normal
+  ;; produces, so "returned" and "stopped from outside" arrive identical.
+  ;; Tagging only the FAILURE closes half of that: a hook raising 'normal
+  ;; can no longer look like success, but an outside kill still can.
+  ;;
+  ;; The obvious repair -- exit with a private token instead of returning
+  ;; -- was tried and is wrong twice over. An exit reason is BROADCAST: it
+  ;; goes to every monitor and is kept on the dead process, where a later
+  ;; monitor of that pid hands it out again, so the token stops being
+  ;; private the first time a hook succeeds and can then be used to forge
+  ;; the next success. And a non-'normal exit CASCADES: anything the hook
+  ;; had linked, and that does not trap exits, is killed along with it --
+  ;; measured, a background process a hook spawn&links and leaves running
+  ;; survives a plain return and does not survive a token exit.
+  ;;
+  ;; So the proof does not travel through the actor's exit machinery at
+  ;; all: the child sets a box that only this wrapper holds, as the last
+  ;; thing it does. Nothing publishes it, nothing outside can write it,
+  ;; and being killed -- with any reason at all, 'normal included -- leaves
+  ;; it unset. The hook exits 'normal exactly as before.
   ;; The last failure, WITH THE CONVERSATION ID -- counters alone tell an
   ;; application that something failed but not what to reconcile, and
   ;; between two reads the second failure would overwrite the first with
   ;; no way back to the id. Only the newest is kept, which bounds this;
-  ;; note that the reason it carries is whatever the hook raised, so it
-  ;; can hold a large object graph, or one with data the application would
-  ;; not otherwise retain. Read it and let go of it.
+  ;; The reason field differs by kind: for `raised` it is the wrapper's
+  ;; tagged form of what the hook threw, for `timed-out` it is this
+  ;; library's own timeout symbol, and for `killed` it is whatever reason
+  ;; the outside used. The first of those can hold a large object graph, or
+  ;; one carrying data the application would not otherwise retain, since it
+  ;; is the application's own exception. Read it and let go of it.
   (define hook-last-failure (box #f))
 
   (define (hook-bump! b) (set-box! b (+ 1 (unbox b))))
 
   ;; Cumulative since process start, like the rest of this framework's
   ;; counters: never reset, so a caller that wants a delta takes its own
-  ;; baseline. `running` is the only gauge among them.
+  ;; baseline.
+  ;;
+  ;; WHAT EACH ONE MEANS, precisely, because the useful ones are the ones
+  ;; that are easy to over-read:
+  ;;   attempted   a hook was started
+  ;;   succeeded   the wrapper saw the hook RETURN. Not that anything was
+  ;;               released -- a hook that swallows its own errors, or does
+  ;;               nothing at all, returns.
+  ;;   raised      the hook raised, and the wrapper tagged it. An external
+  ;;               kill whose reason is deliberately shaped like that tag
+  ;;               also lands here rather than in `killed` -- both are
+  ;;               failures, so the miscount costs a distinction, not a
+  ;;               guarantee. Success is the one that cannot be forged.
+  ;;   timed-out   it outlived the conversation's ttl and was killed here
+  ;;   killed      it neither returned nor raised: something outside ended
+  ;;               it -- an external kill, or a link cascade from something
+  ;;               the hook itself linked to
+  ;;   running     an APPROXIMATE gauge, and it can be permanently high: it
+  ;;               is decremented by the same function that incremented it,
+  ;;               so a watchdog that dies DURING a hook never decrements.
+  ;;               Accepted rather than fixed -- exactness would mean
+  ;;               unwind-safe bookkeeping in a function that can be killed
+  ;;               outright -- but do not read a standing non-zero value as
+  ;;               proof that a hook is running now.
   (define (conversation-hook-stats)
     (with-interrupts-disabled
       (list (cons 'attempted (unbox hook-attempted))
             (cons 'succeeded (unbox hook-succeeded))
             (cons 'raised (unbox hook-raised))
             (cons 'timed-out (unbox hook-timed-out))
+            (cons 'killed (unbox hook-killed))
             (cons 'running (unbox hook-running))
             (cons 'last-failure (unbox hook-last-failure)))))
 
@@ -1032,10 +1083,13 @@
       (hook-bump! hook-attempted)
       (hook-bump! hook-running))
     (process-trap-exit #t)
-    (let* ((child (spawn&link
+    (let* ((returned (box #f))          ; the private proof; see above
+           (child (spawn&link
                     (lambda ()
                       (guard (e (#t (raise (vector 'conversation-hook-raised e))))
-                        (on-killed committed?)))))
+                        (on-killed committed?)
+                        ;; last act, and unreachable from anywhere else
+                        (set-box! returned #t)))))
            (m (monitor child))
            (outcome
              (receive (after ttl
@@ -1048,9 +1102,18 @@
                           (receive (after 0 'ok) (`#(DOWN ,@child ,r) 'ok))
                           (cons 'timed-out 'conversation-hook-timeout)))
                (`#(DOWN ,@child ,reason)
-                 (if (eq? reason 'normal)
-                     (cons 'succeeded #f)
-                     (cons 'raised reason))))))
+                 (cond
+                   ;; the box first: it is the only thing here that cannot
+                   ;; be produced from outside this wrapper
+                   ((unbox returned) (cons 'succeeded #f))
+                   ((and (vector? reason)
+                         (fx= 2 (vector-length reason))
+                         (eq? (vector-ref reason 0) 'conversation-hook-raised))
+                    (cons 'raised reason))
+                   ;; did not finish and did not raise: something outside
+                   ;; ended it -- an external kill (any reason, 'normal
+                   ;; included), or a cascade from something it linked
+                   (else (cons 'killed reason)))))))
       (when m (demonitor m))
       ;; the link's EXIT, however the child ended; left behind it would sit
       ;; in the watchdog's mailbox and never match anything it receives
@@ -1061,9 +1124,10 @@
         (case (car outcome)
           ((succeeded) (hook-bump! hook-succeeded))
           (else
-            (hook-bump! (if (eq? (car outcome) 'raised)
-                            hook-raised
-                            hook-timed-out))
+            (hook-bump! (case (car outcome)
+                          ((raised) hook-raised)
+                          ((timed-out) hook-timed-out)
+                          (else hook-killed)))
             (set-box! hook-last-failure
               (vector 'conversation-hook-failure id (car outcome)
                       (cdr outcome) committed? (now-ms))))))))
@@ -1099,15 +1163,15 @@
           (assertion-violation 'conversation-start!
             "ttl-ms must be a positive exact integer" t))))
     ;; ...and on-killed is checked here for a sharper version of the same
-    ;; reason. It is CALLED in the watchdog's process, inside a guard that
-    ;; swallows everything so that a bad hook cannot take the watchdog down
-    ;; -- which means a hook of the wrong shape does not fail loudly, it
-    ;; fails SILENTLY: the arity error is caught, the compensation never
-    ;; runs, and whatever the flow was holding is held for the life of the
-    ;; VM with nothing anywhere saying why. That is the worst way for an
-    ;; interface change to be discovered, so the shape is settled at the
-    ;; point it was written, where the raise reaches the code that is
-    ;; wrong.
+    ;; reason. It is CALLED much later, in a process of its own, where an
+    ;; arity error would be just another way for the hook to fail: counted
+    ;; as `raised`, but arriving long after the call that got the shape
+    ;; wrong, in a different process, with nothing pointing back at the
+    ;; conversation-start! that accepted it. The compensation would not
+    ;; run and whatever the flow was holding would stay held. That is the
+    ;; worst way for an interface change to be discovered, so the shape is
+    ;; settled at the point it was written, where the raise reaches the
+    ;; code that is wrong.
     ;;
     ;; Accepting one argument, not accepting EXACTLY one: a variadic hook
     ;; and one with optionals are both fine, and the only thing worth

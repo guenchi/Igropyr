@@ -46,16 +46,21 @@
 
     ;; kill DELIVERS BEFORE IT RETURNS, and callers depend on that.
     ;;
-    ;; A supervisor that kills a worker it both linked and monitored has to
-    ;; take the EXIT and the DOWN out of its own mailbox afterwards --
-    ;; anything left there matches nothing it receives later, and an EXIT
-    ;; left behind reaches a process that has since stopped trapping them,
-    ;; which kills it. That drain is written as a zero-timeout receive,
-    ;; which is only correct because kill appends both messages on the
-    ;; calling stack rather than queueing them for delivery. Nothing else
-    ;; states that, so it is pinned here: if kill ever becomes
-    ;; asynchronous, this fails and every zero-timeout drain built on it
-    ;; has to be revisited -- they would otherwise start silently missing.
+    ;; A supervisor that kills a worker it both linked and monitored takes
+    ;; the EXIT and the DOWN out of its own mailbox afterwards, with a
+    ;; zero-timeout receive. That drain is only correct because kill
+    ;; appends both messages on the calling stack rather than queueing them
+    ;; for delivery, and nothing else states it -- so it is pinned here. If
+    ;; kill ever becomes asynchronous, this case fails and every drain
+    ;; written that way has to be revisited: they would otherwise start
+    ;; silently leaving messages behind.
+    ;;
+    ;; What is pinned is that the drain SUCCEEDS, not that failing to drain
+    ;; would be fatal. A leftover EXIT is inert: trap-exit is consulted at
+    ;; the instant a linked process dies (see the send in @kill's link
+    ;; loop), so a message already in the mailbox is never re-interpreted
+    ;; if the receiver stops trapping later. It simply matches nothing and
+    ;; goes with the mailbox.
     (let ()
       (process-trap-exit #t)
       (let* ((victim (spawn&link (lambda () (receive (after 60000 'never)))))

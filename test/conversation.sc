@@ -14,7 +14,7 @@
         ;; process-count: the hook cases below assert that a wedged hook
         ;; leaves no process behind, which is the observation the counters
         ;; cannot make
-        (only (igropyr actor) process-count))
+        (only (igropyr actor) process-count spawn&link process-alive?))
 
 (define port 18084)
 (define empty-bv (make-bytevector 0))
@@ -2163,6 +2163,83 @@
         (unless (eq? (vector-ref f 2) 'raised)
           (fail "the failure was not classified as a raise" f)))
       (display "a hook raising the reason a return produces is still a failure ok\n"))))
+
+;; ...AND NEITHER DOES A HOOK THAT ENDS WITHOUT RETURNING. The mirror of
+;; the case above: there, a raise wore the reason a return produces; here
+;; a hook ends by killing itself with that same reason, having done
+;; nothing. If only failures are tagged, the runtime's default 'normal is
+;; what a clean return looks like, so anything else ending with 'normal is
+;; read as success -- a hook that released nothing, counted as one that
+;; did. Success needs a mark only the wrapper can produce, exactly as
+;; failure does.
+(let ((base (conversation-hook-stats)))
+  (let-values (((id tok first)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (sleep-ms 5000)
+                      (vector 'unreachable a)))
+                  'go
+                  200
+                  values
+                  (lambda (committed?) (kill self 'normal)))))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'hk st)))))
+      (receive (after 6000 (fail "self-killing-hook-no-answer" 'timeout))
+        (`#(hk ,st) 'ok)))
+    (sleep-ms 700)
+    (let ((now (conversation-hook-stats)))
+      (unless (= (+ 1 (stat 'attempted base)) (stat 'attempted now))
+        (fail "the self-killing hook was not attempted" now))
+      ;; the discriminating half: it must NOT have been counted as a success
+      (unless (= (stat 'succeeded base) (stat 'succeeded now))
+        (fail "a hook that never returned was counted as a success" now))
+      (unless (= (+ 1 (stat 'killed base)) (stat 'killed now))
+        (fail "a hook ended from outside was not counted as killed" now))
+      (display "a hook that ends without returning is not a success ok\n"))))
+
+;; ...AND A HOOK THAT RETURNS NORMALLY STILL EXITS NORMALLY. What the
+;; library uses to tell a return from an external kill must not be visible
+;; in the hook's EXIT REASON, because that reason is not private: it is
+;; broadcast to every monitor, it stays readable on the dead process, and
+;; -- the part that bites -- anything other than 'normal CASCADES, killing
+;; whatever the hook linked and did not trap. A hook that spawns a linked
+;; helper and returns cleanly would lose that helper. So the witness lives
+;; in a box only the wrapper holds, and the process still ends 'normal.
+(let ((helper-alive (box 'unset)))
+  (let-values (((id tok first)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (sleep-ms 5000)
+                      (vector 'unreachable a)))
+                  'go
+                  200
+                  values
+                  (lambda (committed?)
+                    ;; a helper the hook links and leaves running
+                    (let ((kid (spawn&link (lambda () (receive (after 30000 'done))))))
+                      (sleep-ms 100)
+                      (set-box! helper-alive kid))))))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'hk st)))))
+      (receive (after 6000 (fail "linking-hook-no-answer" 'timeout))
+        (`#(hk ,st) 'ok)))
+    (sleep-ms 700)
+    (let ((kid (unbox helper-alive)))
+      (when (eq? kid 'unset)
+        (fail "the linking hook never ran" kid))
+      (unless (process-alive? kid)
+        (fail "a hook that returned cleanly took its linked helper with it" kid))
+      (display "a hook that returns keeps what it linked ok\n"))))
 
 ;; ...AND A HOOK THAT BLOCKS DOES NOT KEEP THE WATCHDOG. The observation
 ;; that matters is not the counter -- it is that the processes go away.
