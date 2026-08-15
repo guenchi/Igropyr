@@ -1328,7 +1328,9 @@ conversation that sat *parked* past it is raised at —
 *step* that overruns is killed instead, and a kill runs no winders —
 that path is `on-killed`, below.
 
-**Commit through `commit!`.** `(commit! thunk)` runs the thunk, marks the
+### Commit through `commit!`
+
+`(commit! thunk)` runs the thunk, marks the
 conversation committed the instant it *returns*, and passes its values
 back unchanged. This is not bookkeeping — it is the only way the library
 can tell two exits apart that otherwise look identical. An exception
@@ -1340,7 +1342,9 @@ client that retries on `'gone` performs the whole thing twice. With
 `commit!` the two are recorded apart and only the genuine rollback is
 `'gone`.
 
-**One conversation is one logical transaction.** `commit!` is the
+#### One conversation is one logical transaction
+
+`commit!` is the
 conversation's last state change — no new transaction is opened after it
 — and the mark it sets is **sticky**: never cleared, so a flow that
 commits, parks, is resumed and only then fails is still `'unknown`, not
@@ -1348,8 +1352,10 @@ commits, parks, is resumed and only then fails is still `'unknown`, not
 (an escaping continuation, or `suspend!` called inside it) skips the mark
 and is outside the contract.
 
-**When the first step dies, `conversation-start!` raises — and one of the
-two raises must be caught.** Nothing has been answered yet at that point,
+### When the first step dies
+
+When the first step dies, `conversation-start!` raises — and one of the
+two raises must be caught. Nothing has been answered yet at that point,
 so the failure surfaces in the caller rather than as a status:
 
 | raise | meaning | what to do |
@@ -1385,7 +1391,9 @@ answer actionable:
 `#(conversation-failed ...)` is deliberately *not* caught there: let it
 crash, and let the retry take it.
 
-**The status is the answer; the reply is only data.** A flow may
+### The status is the answer; the reply is only data
+
+A flow may
 legitimately return the symbol `'gone` as its final value, so control
 outcomes never share a position with it:
 
@@ -1403,7 +1411,9 @@ outcomes never share a position with it:
 `conversation-gone?` and `conversation-unknown?` are applied to the
 *status*.
 
-**`'unknown` is not `'gone`.** `'gone` promises a rollback, so it is
+#### `'unknown` is not `'gone`
+
+`'gone` promises a rollback, so it is
 answered only from **positive evidence**: a record on this node saying
 this conversation left through its winders without having committed.
 Never from an absence — "no process and no record" is `'unknown`,
@@ -1435,7 +1445,9 @@ conversation becomes `'unknown` — the honest limit of the mechanism, and
 the reason both bounds are settable. What a forgotten record can no
 longer do is become `'gone`.
 
-**Answering `'unknown` yourself.** `conversation-resume!` and
+#### Answering `'unknown` yourself
+
+`conversation-resume!` and
 `conversation-peek` take an optional predicate — `(conversation-resume!
 id token req settled?)` — consulted *only* when the answer would be
 `'unknown`: `#t` gives `'settled`, `#f` gives `'gone`, and anything else,
@@ -1447,7 +1459,9 @@ transaction as the effect** hands the library the truth: durable, atomic
 with the thing it describes, and outliving both the record and the
 process.
 
-**A local witness beats the predicate.** Where this node's own record
+#### A local witness beats the predicate
+
+Where this node's own record
 says *committed then failed*, a `#f` — "durably not committed" — is not
 new information filling a gap; it contradicts evidence already in hand,
 and the honest answer to a contradiction is `'unknown`, not `'gone`. A
@@ -1478,7 +1492,9 @@ tell apart must not replay each other's replies — that is the case
 watchdog watching, so a key function that hangs does not park the
 conversation forever.
 
-**`on-killed` runs after the watchdog kills an overrunning step.** TTL
+### The `on-killed` hook
+
+`on-killed` runs after the watchdog kills an overrunning step. TTL
 expiry has two paths and only one of them raises. A conversation that sat
 *parked* too long is raised at, so the flow's `guard` runs and gives back
 what it held. A *step* that overruns is **killed** — a step stuck in a
@@ -1509,7 +1525,9 @@ committed, it reverses work that succeeded, which is the same damage
 make the split itself, because only the application knows which of its
 own effects are which.
 
-**`committed?` is one-sided.** `#t` is never wrong: the mark is set only
+#### `committed?` is one-sided
+
+`#t` is never wrong: the mark is set only
 by a commit thunk that returned, and it is never cleared. `#f` can be one
 instant stale — a kill landing between that return and the mark being set
 passes `#f` for a transaction that did happen, and the window is the
@@ -1527,7 +1545,9 @@ whatever the flow held stays held, and nothing anywhere says why.
 Accepting one argument, not exactly one: a variadic hook and one with
 optionals are both fine.
 
-**The token names the reply being answered.** A conversation hands one
+### The token names the reply being answered
+
+A conversation hands one
 out with every reply and consumes it the moment a request is accepted.
 Send it to the client alongside the reply and take it back with the next
 request — it is a short hex string, so it crosses JSON, a query string
@@ -1546,7 +1566,9 @@ answer: a confirmation skipped, or one stage's payload applied to the
 next. With the token the duplicate is refused however it is scheduled,
 and a genuine answer is accepted however late it arrives.
 
-**A repeat is answered, not refused.** Presenting the token that was
+#### A repeat is answered, not refused
+
+Presenting the token that was
 just spent hands back the reply it produced, together with the token
 that came with it — exactly what the original caller received. A double
 click, a client retry and a lost response therefore all end the same
@@ -1564,7 +1586,9 @@ this conversation, unlike `'unreachable`. It says nothing about whether
 the request it duplicates succeeded. Read the current state; do not
 resubmit, and note there is no valid token to resubmit with.
 
-**Completion lingers, and then leaves a record.** After the flow
+### Completion lingers, then leaves a record
+
+After the flow
 returns, the conversation stays reachable for one more TTL and can still
 replay that final reply. Exiting at once was a live double-charge path:
 the client's final confirm commits, the reply is lost, the retry meets a
@@ -1588,7 +1612,9 @@ The conversation never touches the connection: pool workers stay the
 protocol adapters, parking until the flow replies, so the pool's
 stuck-killer and failure hook keep protecting every round.
 
-**The `gone` guarantee, and what it is *not*.** For a flow holding a
+### The `gone` guarantee — and what it is *not*
+
+For a flow holding a
 database transaction, a death that ran the flow's winders before its
 commit is the rollback guarantee: dead process = dropped connection =
 the database itself rolled back, so `'gone` *proves* nothing committed,
@@ -1606,7 +1632,9 @@ while it answered `'gone`. Retry on `'gone`; on `'unknown` and
 difference being that the ring now carries "I cannot say" as a
 first-class answer rather than guessing.
 
-**Where to use it** — critical transactional flows: payments against
+### Where to use it
+
+Critical transactional flows: payments against
 internal strong-transaction operations, booking (the seat hold is the
 process's local state and `after` is its TTL), strictly ordered
 protocol dialogues. **Where not to** — ordinary stateless requests
