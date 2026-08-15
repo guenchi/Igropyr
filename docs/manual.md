@@ -1348,6 +1348,43 @@ commits, parks, is resumed and only then fails is still `'unknown`, not
 (an escaping continuation, or `suspend!` called inside it) skips the mark
 and is outside the contract.
 
+**When the first step dies, `conversation-start!` raises — and one of the
+two raises must be caught.** Nothing has been answered yet at that point,
+so the failure surfaces in the caller rather than as a status:
+
+| raise | meaning | what to do |
+|---|---|---|
+| `#(conversation-failed reason)` | the flow raised before its first `suspend!` **and** before its `commit!`; its winders ran, so it rolled back | let it crash — retrying is correct |
+| `#(conversation-uncertain id outcome reason)` | the first step may have got past its `COMMIT` — killed for overrunning, killed from outside, taken down by a link, or raising after `commit!` returned | **catch it**; do not run the work again |
+
+The distinction matters more than it looks, because of what a *host* does
+with an uncaught exception. A host that re-runs a task which never
+answered — this framework's own worker pool is one, and it will re-run a
+handler up to its retry limit — cannot tell an uncertain raise from an
+ordinary crash. So the one signal that exists to say *do not run this
+again* is exactly what makes it run again, up to the retry limit, on a
+first step that may already have committed. "Not retryable" is a property
+of the fact, not a protection.
+
+Catch it where it is raised and turn it into an **answer** — answering is
+what takes the task out of the re-run set, and the id is what makes the
+answer actionable:
+
+```scheme
+(guard (e ((and (vector? e)
+                (eq? (vector-ref e 0) 'conversation-uncertain))
+           ;; answered, so nothing re-runs it; the id goes to the client
+           ;; (or an operator) to reconcile against
+           (set-status! res 409)
+           (send-json! res `((fault . "uncertain")
+                             (conv . ,(vector-ref e 1))
+                             (resubmit . #f)))))
+  (conversation-start! flow req))
+```
+
+`#(conversation-failed ...)` is deliberately *not* caught there: let it
+crash, and let the retry take it.
+
 **The status is the answer; the reply is only data.** A flow may
 legitimately return the symbol `'gone` as its final value, so control
 outcomes never share a position with it:
