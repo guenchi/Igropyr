@@ -36,7 +36,9 @@
               conversation-gone? conversation-stale? conversation-done?
               conversation-settled? conversation-unknown?
               conversation-unreachable?
-              conversation-set-limits! conversation-hook-stats)
+              conversation-set-limits! conversation-hook-stats
+              conversation-prepare! conversation-run!
+              conversation-abandon! conversation-ref-id)
         ;; the same predicates again, from the library that has no
         ;; initialisation of its own: a pure consumer imports THIS one, and
         ;; that it exports the whole vocabulary is part of the public face

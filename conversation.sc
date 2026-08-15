@@ -28,6 +28,77 @@
 ;;;               final-reply))))
 ;;;       req))
 ;;;
+;;; TWO PHASES, WHEN THE ID HAS TO EXIST FIRST. conversation-start! mints
+;;; the id inside the call that spawns the flow and does not hand it back
+;;; until the first suspend! -- so between those two moments the flow has
+;;; begun acting on the world and nothing outside can name it. Split the
+;;; call and the id comes first:
+;;;
+;;;   (let ((h (conversation-prepare! flow req)))
+;;;     (record-intent! (conversation-ref-id h))     ; durable, before any effect
+;;;     (let-values (((token reply) (conversation-run! h)))
+;;;       ...))
+;;;
+;;; prepare! is INERT: no process, no registration, no timer. (Not "pure":
+;;; minting an id reads /dev/urandom, the node identity and the clock.)
+;;; No LIFETIME clock -- the step watchdog, the park deadline, the linger
+;;; -- starts before run! (the last two start later still, when the flow
+;;; first parks and when it finishes), so a handle may
+;;; sit for as long as the caller likes. A handle that is never run holds
+;;; no process, no registration and no timer -- but it does hold the flow,
+;;; the request and everything they close over, until it is abandoned or
+;;; collected. Dropping it is enough; conversation-abandon! is for saying
+;;; so on purpose, and both it and a completed run! release that payload
+;;; while keeping the id. conversation-start! is exactly
+;;; these two calls together.
+;;;
+;;; The handle may be handed to another PROCESS on this node -- the reply
+;;; goes to whoever calls run! -- but never to another NODE: it holds
+;;; closures, and the conversation is pinned to the node whose identity
+;;; minted the id. run! refuses if that identity has changed since.
+;;;
+;;; RECOVERING A CONVERSATION WHOSE STARTER DIED. This is what the id
+;;; bought, and it works for any death, including one that took the token
+;;; with it:
+;;;
+;;;   - persist the id BEFORE run!;
+;;;   - on recovery, (conversation-peek id):
+;;;     'parked with a token -> ADOPT IT. That token is live; resume! with
+;;;       it and this process becomes the one the conversation answers.
+;;;       (peek hands back the reply the conversation is waiting to have
+;;;       answered; resume! consumes the token and returns the NEXT round's
+;;;       reply.) A conversation whose starter died is otherwise perfectly
+;;;       healthy -- it is parked, holding its transaction, waiting.
+;;;     'completed -> the flow returned; the reply is its final answer and
+;;;       there is nothing to adopt. (peek never answers "running": a peek
+;;;       that arrives mid-step is answered when that step parks.)
+;;;     'gone -> it rolled back; nothing to adopt and safe to start afresh.
+;;;     'settled -> it finished earlier and only the record is left.
+;;;     'unknown or 'unreachable -> NOT AN ANSWER, and possibly transient:
+;;;       registration happens inside the conversation's own process, so a
+;;;       peek between spawn and registration answers 'unknown, and a
+;;;       remote peek before the owner's router exists answers
+;;;       'unreachable. Look again. Do NOT read either as licence to start
+;;;       a second attempt -- that licence comes only from reconciling
+;;;       downstream, or from the downstream operation being idempotent.
+;;;
+;;;   ONE ADOPTER. Two recoverers both peek and both see the same token;
+;;;   the first resume! wins and the other is 'stale (or replayed, if its
+;;;   request-key matches). The library will not pick between them, so the
+;;;   store the ids live in has to: a claim, a lease, something.
+;;;
+;;;   THE ID IS A BEARER CREDENTIAL, and this recipe deliberately puts it
+;;;   in a database. Whoever can read it can peek -- which discloses the
+;;;   last reply, whatever that contains -- and can present the live token
+;;;   with a request of their own choosing, which ADVANCES the flow. The
+;;;   entropy is not the exposure; distribution is. Treat a persisted id
+;;;   as a session control credential: not in logs, not in URLs, not in a
+;;;   table half the organisation can read.
+;;;
+;;;   AFTER A RESTART the process is gone and so is the conversation. A
+;;;   local peek on an old id answers 'unknown; a remote one answers
+;;;   'unreachable until the restarted owner has built its router.
+;;;
 ;;; A FLOW COMMITS THROUGH commit!, and the library learns the transaction
 ;;; became permanent at the moment it did. Everything else it could observe
 ;;; -- the flow returned, something was raised -- fails to separate a flow
@@ -186,8 +257,9 @@
 ;;;     #t is never wrong; only #f carries the doubt.
 ;;;   - a flow that RAISES before its first suspend! AND BEFORE ITS
 ;;;     commit! makes
-;;;     conversation-start! raise #(conversation-failed reason) in the
-;;;     caller. What that raise ASSERTS is narrow and does not depend on
+;;;     conversation-start! (or conversation-run!) raise
+;;;     #(conversation-failed id reason) in the caller -- with the id, so
+;;;     that even the retryable failure names what it was. What that raise ASSERTS is narrow and does not depend on
 ;;;     who is listening: nothing had been answered yet, and a raise that
 ;;;     left the flow ran its winders, so the record says rolled back --
 ;;;     the work is undone and repeating it is safe.
@@ -255,6 +327,8 @@
 
 (library (igropyr conversation)
   (export conversation-start! conversation-resume! conversation-peek
+          conversation-prepare! conversation-run! conversation-abandon!
+          conversation-ref-id
           conversation-set-limits! conversation-hook-stats
           ;; re-exported from (igropyr conversation-status), so that
           ;; importing this library still gives the whole vocabulary
@@ -764,12 +838,20 @@
   ;; after about nine thousand restarts, which a long-lived service reaches.
   (define incarnation (conv-hex/n! 16))
 
+  ;; -> (values id owner). The owner is the node identity THIS id was
+  ;; minted under, handed back with it rather than re-read later: an id
+  ;; carries its owner in its text, so the two are one fact and anything
+  ;; that reads them apart can see them disagree. (conversation-prepare!
+  ;; keeps the owner to compare at run! -- see there for what a
+  ;; disagreement would mean.)
   (define (conversation-id!)
     (let ((hex (conv-hex!)) (n (node-self))
           (stamp (ms->b36 (now-ms))))
-      (if n
-          (string-append (symbol->string n) "~" incarnation "." stamp "-" hex)
-          (string-append incarnation "." stamp "-" hex))))
+      (values
+        (if n
+            (string-append (symbol->string n) "~" incarnation "." stamp "-" hex)
+            (string-append incarnation "." stamp "-" hex))
+        n)))
 
   ;; When this id was made, or #f if THIS RUN cannot say. #f covers an id
   ;; from another incarnation, an id in the pre-incarnation format, and an
@@ -1166,8 +1248,90 @@
   ;; (default values), on-killed (default #f) -- each documented at its
   ;; binding below. on-killed takes one argument, committed?, and is
   ;; rejected here if it cannot accept one.
+  ;; ---- the handle -----------------------------------------------------
+  ;;
+  ;; WHAT PREPARE! HANDS BACK, and it is opaque on purpose: the id is
+  ;; reachable through conversation-ref-id and nothing else here is a
+  ;; caller's business.
+  ;;
+  ;; `state` is 'prepared, 'consumed or 'abandoned, and the last two are
+  ;; TERMINAL. A run! that raised does not go back to 'prepared: its flow
+  ;; may have run part-way and had effects, so what is used up is the
+  ;; handle's one chance to spawn, not "a live process" -- and a second
+  ;; run! of the same handle would be a second conversation wearing the
+  ;; first one's id.
+  ;;
+  ;; `launch` is the closure that spawns, and it holds the flow, the
+  ;; request and everything they close over. It is dropped on the way into
+  ;; either terminal state, because a handle that has been used or thrown
+  ;; away would otherwise pin all of that for as long as anyone keeps the
+  ;; handle -- and the handle is the thing a caller is told to persist.
+  (define-record-type (conv-handle make-conv-handle conv-handle?)
+    (fields id
+            owner                  ; node-self as it was when id was minted
+            (mutable state)
+            (mutable launch)))
+
+  (define (conversation-ref-id h)
+    (unless (conv-handle? h)
+      (assertion-violation 'conversation-ref-id "not a conversation handle" h))
+    (conv-handle-id h))
+
+  ;; Give up a prepared conversation without ever starting it. Nothing was
+  ;; spawned, so there is nothing to stop; this marks the handle so a later
+  ;; run! is refused rather than quietly starting a conversation the caller
+  ;; had already written off, and drops the payload.
+  ;;
+  ;; Dropping a handle on the floor instead is free and needs no call --
+  ;; the payload goes with it. Use this when the handle has been persisted
+  ;; or handed on, and "I decided not to" needs to be a fact rather than an
+  ;; absence.
+  (define (conversation-abandon! h)
+    (unless (conv-handle? h)
+      (assertion-violation 'conversation-abandon! "not a conversation handle" h))
+    (let ((bad (with-interrupts-disabled
+                 (let ((s (conv-handle-state h)))
+                   (cond ((eq? s 'prepared)
+                          (conv-handle-state-set! h 'abandoned)
+                          (conv-handle-launch-set! h #f)
+                          #f)
+                         (else s))))))
+      (when bad
+        (assertion-violation 'conversation-abandon!
+          "conversation handle is not prepared" bad))))
+
+  ;; prepare! + run! in one call, and the shape this library had before
+  ;; there were two. It still returns (values id token first-reply) -- but
+  ;; the id arrives only after the first suspend!, so a caller that needs
+  ;; the id BEFORE anything happens wants the two calls, not this one.
   (define (conversation-start! flow req . opts)
-    (ensure-router!)
+    (let ((h (apply prepare/who 'conversation-start! flow req opts)))
+      (let-values (((token reply) (conversation-run! h)))
+        (values (conv-handle-id h) token reply))))
+
+  ;; Mint the id and get everything ready, WITHOUT starting anything.
+  ;;
+  ;; The point is that the id exists before the first effect does. Under
+  ;; conversation-start! the id is minted inside the same call that spawns
+  ;; the flow and is not handed back until the flow's first suspend! --
+  ;; so between those two moments the conversation has begun to act on the
+  ;; world and nobody outside can name it. A starter killed in that window
+  ;; leaves a conversation that is still running, still talking to whatever
+  ;; the flow talks to, and whose id no longer exists anywhere. Preparing
+  ;; first lets a caller write "I am about to start <id>" somewhere durable
+  ;; and then start it.
+  ;;
+  ;; INERT: no process, no registration, no timer is started here. (Not
+  ;; "pure" -- minting an id reads /dev/urandom, the node identity and the
+  ;; clock.) No clock this conversation lives by starts before run!.
+  ;;
+  ;; The handle must not be sent to another node: it holds closures. It
+  ;; can be handed to another process on THIS node, and run! from there --
+  ;; that is a supported shape, and the reply goes to whoever calls run!.
+  (define (conversation-prepare! flow req . opts)
+    (apply prepare/who 'conversation-prepare! flow req opts))
+
+  (define (prepare/who who flow req . opts)
     ;; A ttl that is not a positive exact integer reaches receive's `after`
     ;; and raises THERE -- inside the conversation process, after it has
     ;; already handed back an id and a token. The caller sees a healthy
@@ -1176,7 +1340,7 @@
     (when (pair? opts)
       (let ((t (car opts)))
         (unless (and (integer? t) (exact? t) (> t 0))
-          (assertion-violation 'conversation-start!
+          (assertion-violation who
             "ttl-ms must be a positive exact integer" t))))
     ;; ...and on-killed is checked here for a sharper version of the same
     ;; reason. It is CALLED much later, in a process of its own, where an
@@ -1197,10 +1361,16 @@
                (caddr opts))
       (let ((h (caddr opts)))
         (unless (and (procedure? h) (logbit? 1 (procedure-arity-mask h)))
-          (assertion-violation 'conversation-start!
+          (assertion-violation who
             "on-killed must be a procedure accepting one argument (committed?)"
             h))))
-    (let* ((ttl (if (pair? opts) (car opts) default-ttl-ms))
+    (let-values (((id owner) (conversation-id!)))
+     (make-conv-handle
+      id owner 'prepared
+      ;; EVERYTHING BELOW HAPPENS AT run!, not here. The closure is built
+      ;; now and called then, with the runner's identity passed in.
+      (lambda (starter ref)
+       (let* ((ttl (if (pair? opts) (car opts) default-ttl-ms))
            ;; WHAT IDENTIFIES A REQUEST, for replay.
            ;;
            ;; A repeat is replayed; a DIFFERENT question bearing the same
@@ -1327,10 +1497,7 @@
              (if (and (pair? opts) (pair? (cdr opts)) (pair? (cddr opts)))
                  (caddr opts)
                  #f))
-           (id (conversation-id!))
            (name (conversation-name id))
-           (starter self)
-           (ref (gensym))
            ;; shared with the watchdog below: step-box counts completed
            ;; suspends (progress), running-box says whether the flow is
            ;; executing rather than parked waiting for the next request
@@ -1967,6 +2134,90 @@
                        (lambda (from ref2 token r) 'unreachable)
                        (lambda () 'done))
                      (unregister name)))))))
+         conv)))))
+
+  ;; Start the prepared conversation and park until its first suspend!.
+  ;; -> (values token first-reply). The id was already handed out by
+  ;; prepare!, which is the whole point; this returns what only running it
+  ;; can produce.
+  ;;
+  ;; THE RUNNER IS THE STARTER, deliberately. Everything about who is
+  ;; waiting is captured here rather than at prepare!: a handle can be
+  ;; prepared in one process and run in another, and the first reply must
+  ;; reach whoever is actually parked for it. Captured at prepare!, that
+  ;; reply would be sent to the preparer -- an unasked-for message if it is
+  ;; alive, and dropped on the floor if it is not, with the runner waiting
+  ;; for something that will never come.
+  ;;
+  ;; The step clock starts here for the same kind of reason. Stamped at
+  ;; prepare!, the wait between preparing and running would count as time
+  ;; the first step had already spent: prepare, sit for longer than the
+  ;; ttl, run, and the watchdog kills the first step the moment it begins.
+  (define (conversation-run! h)
+    (unless (conv-handle? h)
+      (assertion-violation 'conversation-run! "not a conversation handle" h))
+    (let ((id (conv-handle-id h)))
+      (let* ((ref (gensym))
+             (starter self)
+             ;; CLAIM, CHECK THE NODE, AND SPAWN AS ONE ACT.
+             ;;
+             ;; Between "it is still prepared" and "it is mine now" another
+             ;; process must not be able to claim it too, and there must be
+             ;; no instant where the state says consumed but nothing was
+             ;; spawned -- a handle that can never run again and never ran.
+             ;; spawn only queues the new process, so it belongs inside;
+             ;; the monitor below does not, because monitoring an
+             ;; already-dead process delivers its DOWN immediately rather
+             ;; than waiting.
+             ;;
+             ;; THE NODE CHECK IS IN HERE TOO, and that placement is the
+             ;; whole of its value. An id carries its owner, and a
+             ;; conversation is reachable from other nodes only through
+             ;; that; prepare with no node identity, call node-start!, then
+             ;; run, and the conversation lives on a clustered node while
+             ;; its id has no owner prefix -- so every node, this one
+             ;; included, treats it as local and no forwarded resume can
+             ;; ever find it. Checked outside the region, that is exactly
+             ;; the sequence that still gets through: compare, be
+             ;; preempted, have node-start! run, then spawn. There is no
+             ;; fixing it afterwards either -- the id is already the
+             ;; caller's and may already be persisted -- so the comparison
+             ;; and the spawn have to be one act.
+             (claim
+               (with-interrupts-disabled
+                 (let ((s (conv-handle-state h)))
+                   (cond
+                     ((not (eq? s 'prepared)) (cons 'bad s))
+                     ((not (eq? (conv-handle-owner h) (node-self)))
+                      (cons 'node (list 'prepared-under (conv-handle-owner h)
+                                        'now (node-self))))
+                     (else
+                       (let ((launch (conv-handle-launch h)))
+                         (conv-handle-state-set! h 'consumed)
+                         (conv-handle-launch-set! h #f)
+                         ;; THE ROUTER GOES UP WITH IT, in this same act.
+                         ;; It is what remote peeks and resumes reach, and
+                         ;; only a run! ever creates it. Called before the
+                         ;; region, an abandoned or mis-noded handle left a
+                         ;; router behind; called after it, a runner killed
+                         ;; in between leaves a conversation that runs,
+                         ;; registers and parks with no router on the node
+                         ;; -- so a holder of its id gets 'unreachable for
+                         ;; as long as no other conversation happens to
+                         ;; start. That is precisely the case this whole
+                         ;; two-phase API exists to make recoverable, so
+                         ;; the router cannot be left outside the atom.
+                         ;; It is idempotent and does nothing unclustered.
+                         (ensure-router!)
+                         (cons 'ok (launch starter ref)))))))))
+        ;; raised out here, as everywhere else in this file
+        (when (eq? (car claim) 'bad)
+          (assertion-violation 'conversation-run!
+            "conversation handle is not prepared" (cdr claim)))
+        (when (eq? (car claim) 'node)
+          (assertion-violation 'conversation-run!
+            "node identity changed between prepare! and run!" (cdr claim)))
+        (let ((conv (cdr claim)))
       (let ((m (monitor conv)))
         (receive
           ;; the first suspend! publishes a token, so `status` here is that
@@ -1974,7 +2225,7 @@
           (`#(conv-reply ,@ref ,reply ,status)
             (when m (demonitor m))
             (flush-down! conv)
-            (values id status reply))
+            (values status reply))
           ;; ASK THE RECORD BEFORE CALLING IT A FAILURE. The retry that
           ;; makes a crash here harmless rests on "nothing had been
           ;; answered yet, and the dead process rolled back" -- and the
@@ -1993,8 +2244,8 @@
           (`#(DOWN ,@conv ,reason)
             (let ((outcome (settled-or-lost id)))
               (if (eq? outcome 'gone)
-                  (raise (vector 'conversation-failed reason))
-                  (raise (vector 'conversation-uncertain id outcome reason)))))))))
+                  (raise (vector 'conversation-failed id reason))
+                  (raise (vector 'conversation-uncertain id outcome reason)))))))))))
 
   ;; Resume the conversation with the next request; parks until the flow
   ;; yields its reply. Returns 'gone when the record says the flow rolled

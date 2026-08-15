@@ -14,7 +14,7 @@
         ;; process-count: the hook cases below assert that a wedged hook
         ;; leaves no process behind, which is the observation the counters
         ;; cannot make
-        (only (igropyr actor) process-count spawn&link process-alive?))
+        (only (igropyr actor) process-count spawn&link process-alive? kill))
 
 (define port 18084)
 (define empty-bv (make-bytevector 0))
@@ -2282,6 +2282,170 @@
              (fail "a blocked hook left processes behind"
                    (list 'before procs-before 'after (process-count))))
             (else (sleep-ms 200) (settle (+ tries 1)))))))
+
+;; ---- the identity is available before the first effect ------------------
+;;
+;; conversation-prepare! mints the id and prepares everything; nothing
+;; runs, nothing is registered, no clock starts. The caller can persist
+;; the id -- the whole point -- and only then run!.
+(let* ((procs (process-count))
+       (h (conversation-prepare!
+            (lambda (req suspend! commit!)
+              (let ((a (suspend! (vector 'first req))))
+                (vector 'done a)))
+            'go
+            3000))
+       (id (conversation-ref-id h)))
+  (unless (string? id) (fail "prepare! did not yield an id" id))
+  (unless (= procs (process-count))
+    (fail "prepare! spawned something" (list procs (process-count))))
+  ;; nothing to peek yet: the conversation does not exist
+  (let-values (((st tok reply) (conversation-peek id)))
+    (unless (eq? st 'unknown)
+      (fail "a prepared-but-not-run id was not unknown" st)))
+  (let-values (((tok first) (conversation-run! h)))
+    (unless (and (vector? first) (eq? (vector-ref first 0) 'first))
+      (fail "run! did not deliver the first reply" first))
+    (let-values (((r st) (conversation-resume! id tok 'go)))
+      (unless (conversation-done? st) (fail "prepared flow did not finish" st))))
+  (display "the id is available before anything runs ok\n"))
+
+;; ...and the FIRST-STEP CLOCK STARTS AT run!, not at prepare!. A caller
+;; that prepares, persists, and only later runs must not have the wait
+;; counted against its first step -- stamped at prepare!, this flow is
+;; overrun the moment it starts and the watchdog kills it.
+(let ((h (conversation-prepare!
+           (lambda (req suspend! commit!)
+             (let ((a (suspend! (vector 'alive req))))
+               (vector 'done a)))
+           'go
+           150)))                          ; ttl well under the wait below
+  (sleep-ms 500)                           ; more than 3x the ttl
+  (let-values (((tok first) (conversation-run! h)))
+    (unless (and (vector? first) (eq? (vector-ref first 0) 'alive))
+      (fail "the wait between prepare! and run! was billed to the first step"
+            first)))
+  (display "the first-step clock starts at run!, not prepare! ok\n"))
+
+;; ...and the reply goes to whoever CALLED run!, not whoever prepared. A
+;; handle is ordinary heap data and crosses processes; the conversation's
+;; first reply must reach the runner -- captured at prepare! time, it goes
+;; to the preparer instead: silently dropped if dead, unsolicited if not.
+(let ((me self))
+  (let ((h (conversation-prepare!
+             (lambda (req suspend! commit!)
+               (let ((a (suspend! (vector 'handed req))))
+                 (vector 'done a)))
+             'go
+             3000)))
+    (spawn (lambda ()
+             (let-values (((tok first) (conversation-run! h)))
+               (send me (vector 'ran (vector-ref first 0) tok)))))
+    (receive (after 6000 (fail "the runner never got the first reply"
+                               'timeout))
+      (`#(ran ,tag ,tok)
+        (unless (eq? tag 'handed)
+          (fail "the runner got the wrong reply" tag))
+        (let-values (((r st) (conversation-resume! (conversation-ref-id h)
+                                                   tok 'go)))
+          (unless (conversation-done? st)
+            (fail "a handed-off conversation did not finish" st))))))
+  (display "the first reply reaches the runner, not the preparer ok\n"))
+
+;; ---- the persisted id recovers an orphaned first round -------------------
+;;
+;; The starter can die during run! -- stuck-killed, crashed -- and the
+;; conversation keeps going: it parks at its first suspend!, sends the
+;; reply to a dead process (dropped), and waits with a token nobody
+;; received. The id the caller persisted at prepare! is what makes that
+;; recoverable: peek returns the live token, and resuming with it ADOPTS
+;; the dialogue -- every later reply comes to the adopter.
+(let* ((h (conversation-prepare!
+            (lambda (req suspend! commit!)
+              (let ((a (suspend! (vector 'orphaned req))))
+                (vector 'adopted a)))
+            'go
+            5000))
+       (id (conversation-ref-id h))
+       (runner (spawn (lambda () (conversation-run! h)))))
+  (sleep-ms 200)                    ; the flow reaches its first suspend!
+  (kill runner 'starter-died)      ; ...and the starter is gone
+  (sleep-ms 100)
+  (let-values (((st tok reply) (conversation-peek id)))
+    (unless (eq? st 'parked)
+      (fail "the orphaned conversation is not parked" st))
+    (unless tok (fail "peek did not surface the live token" tok))
+    (unless (and (vector? reply) (eq? (vector-ref reply 0) 'orphaned))
+      (fail "peek did not surface the first reply" reply))
+    (let-values (((r st2) (conversation-resume! id tok 'go)))
+      (unless (and (vector? r) (eq? (vector-ref r 0) 'adopted))
+        (fail "the adopter did not receive the final reply" r))
+      (unless (conversation-done? st2)
+        (fail "the adopted conversation did not finish" st2))))
+  (display "a persisted id adopts an orphaned first round ok\n"))
+
+;; ---- the handle is one shot, in every direction --------------------------
+(let ((h (conversation-prepare!
+           (lambda (req suspend! commit!) (vector 'done req))
+           'go 3000)))
+  (conversation-run! h)
+  (let ((again (guard (e (#t (if (assertion-violation? e) 'refused e)))
+                 (conversation-run! h)
+                 'accepted)))
+    (unless (eq? again 'refused)
+      (fail "a consumed handle was run twice" again)))
+  (let ((ab (guard (e (#t (if (assertion-violation? e) 'refused e)))
+              (conversation-abandon! h)
+              'accepted)))
+    (unless (eq? ab 'refused)
+      (fail "a consumed handle was abandoned" ab))))
+(let ((h (conversation-prepare!
+           (lambda (req suspend! commit!) (vector 'done req))
+           'go 3000)))
+  (conversation-abandon! h)
+  (let ((r (guard (e (#t (if (assertion-violation? e) 'refused e)))
+             (conversation-run! h)
+             'accepted)))
+    (unless (eq? r 'refused)
+      (fail "an abandoned handle was run" r))))
+(display "a handle runs once, or is abandoned, never both ok\n")
+
+;; ---- both raises carry the id --------------------------------------------
+;;
+;; conversation-failed used to be two elements and carried no identity; a
+;; caller that persisted the id at prepare! can now match the raise to its
+;; intent record, and generic middleware that never saw the lexical id can
+;; too.
+(let* ((h (conversation-prepare!
+            (lambda (req suspend! commit!) (raise 'first-step-rollback))
+            'go 3000))
+       (id (conversation-ref-id h))
+       (outcome (guard (e (#t e)) (conversation-run! h) 'no-raise)))
+  (unless (and (vector? outcome)
+               (eq? (vector-ref outcome 0) 'conversation-failed)
+               (= 3 (vector-length outcome)))
+    (fail "conversation-failed is not three elements" outcome))
+  (unless (equal? (vector-ref outcome 1) id)
+    (fail "conversation-failed does not carry the prepared id" outcome)))
+(display "conversation-failed carries the id it was prepared with ok\n")
+
+;; ---- validation reports the entry point that was called ------------------
+(let ((who-of (lambda (thunk)
+                (guard (e ((assertion-violation? e)
+                           (and (who-condition? e) (condition-who e))))
+                  (thunk)
+                  'no-raise))))
+  (unless (eq? 'conversation-prepare!
+               (who-of (lambda ()
+                         (conversation-prepare!
+                           (lambda (req suspend! commit!) req) 'go -5))))
+    (fail "prepare! does not report itself on bad ttl"))
+  (unless (eq? 'conversation-start!
+               (who-of (lambda ()
+                         (conversation-start!
+                           (lambda (req suspend! commit!) req) 'go -5))))
+    (fail "start! does not report itself on bad ttl")))
+(display "validation names the entry point that was called ok\n")
 
 (display "ALL CONVERSATION TESTS PASSED\n")
     (exit 0)))
