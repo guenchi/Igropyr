@@ -191,6 +191,36 @@
 ;;;     raises #(conversation-uncertain id outcome reason) instead, which
 ;;;     is NOT retryable: the id is there so the caller can reconcile.
 ;;;
+;;;   - CATCH THE UNCERTAIN ONE. Both of these are raised in the CALLER,
+;;;     and the caller is typically a host that re-runs a task which never
+;;;     answered -- this framework's own worker pool is one, and it will
+;;;     re-run a handler up to its retry limit on any exception that
+;;;     escapes. For #(conversation-failed ...) that is the DESIGN: nothing
+;;;     was answered, the flow rolled back, running it again is what the
+;;;     retry is for. For #(conversation-uncertain ...) the same machinery
+;;;     is a double spend. "Not retryable" is a property of the fact, not
+;;;     a protection: an uncertain raise that is left to propagate is
+;;;     indistinguishable, to the host, from an ordinary crash -- so the
+;;;     one signal that exists to say "do not run this again" is what
+;;;     makes it run again.
+;;;
+;;;     So an uncertain first step must be caught where it is raised and
+;;;     turned into an ANSWER. Answering is what takes the task out of the
+;;;     re-run set; the id is what makes the answer actionable:
+;;;
+;;;       (guard (e ((and (vector? e)
+;;;                       (eq? (vector-ref e 0) 'conversation-uncertain))
+;;;                  ;; answered, so nothing re-runs it; the id goes to the
+;;;                  ;; client (or an operator) to reconcile against
+;;;                  (set-status! res 409)
+;;;                  (send-json! res `((fault . "uncertain")
+;;;                                    (conv . ,(vector-ref e 1))
+;;;                                    (resubmit . #f)))))
+;;;         (conversation-start! flow req))
+;;;
+;;;     #(conversation-failed ...) is deliberately NOT caught there: let it
+;;;     crash, and let the retry take it.
+;;;
 ;;; Clustered: a conversation is PINNED to the node that created it --
 ;;; its continuation and open transaction cannot migrate. The id carries
 ;;; that owner ("<node>~<hex>"), so conversation-resume! on ANY node
