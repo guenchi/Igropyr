@@ -36,6 +36,9 @@
 (define BIO_new           (foreign-procedure "BIO_new" (void*) void*))
 (define ERR_get_error     (foreign-procedure "ERR_get_error" () unsigned-long))
 (define ERR_peek_error    (foreign-procedure "ERR_peek_error" () unsigned-long))
+;; for the premise probe below: whether a mark survives an SSL_* call
+(define ERR_set_mark      (foreign-procedure "ERR_set_mark" () int))
+(define ERR_pop_to_mark   (foreign-procedure "ERR_pop_to_mark" () int))
 (define SSL_ERROR_SSL 1)
 (define SSL_ERROR_WANT_READ 2)
 
@@ -87,6 +90,13 @@
 (define (prefix? p s)
   (and (>= (string-length s) (string-length p))
        (string=? p (substring s 0 (string-length p)))))
+
+(define (contains? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i m) n) #f)
+            ((string=? (substring s i (+ i m)) sub) #t)
+            (else (loop (+ i 1)))))))
 
 ;; A rejection must carry OpenSSL's own reason for it, not the generic
 ;; fallback text. tls.sc reads that reason out of the shared error queue,
@@ -251,6 +261,99 @@
     ;; ERR_set_mark taken just before it is destroyed with it). That is
     ;; inside OpenSSL, so no scoping on this side can preserve the entry.
     ;; An assertion saying otherwise would only be pinning the version.
+
+    ;; ...AND THAT IS WHY THE LIBRARY CLEARS BEFORE EACH SSL_* CALL rather
+    ;; than bracketing one with a mark.
+    ;;
+    ;; THIS IS NOT REGRESSION COVERAGE. It calls OpenSSL directly and
+    ;; passes with the library before and after the change; nothing here
+    ;; can fail because clear-before-call was removed. What it pins is the
+    ;; PREMISE that decision rests on: where SSL_* clears the queue on
+    ;; entry, a mark taken just before it is destroyed by the call, and the
+    ;; ERR_pop_to_mark that follows finds no mark and empties the whole
+    ;; queue -- entries that were there first, belonging to whoever queued
+    ;; them, included. The bracket therefore protected nothing on this path
+    ;; while reading as though it did, so clearing deliberately gives up
+    ;; nothing that was not already being given up.
+    ;;
+    ;; If this fails, the premise moved rather than the library breaking. A
+    ;; surviving mark would restore the bracket's ability to preserve older
+    ;; entries -- it would NOT make a dirty queue safe for SSL_get_error,
+    ;; which reads the queue and not the mark, and which the control case
+    ;; above pins independently. What to revisit then is the cross-process
+    ;; ownership cost of clearing and the versions this has to hold for,
+    ;; not the classification step itself.
+    ;;
+    ;; The SSL object is built BEFORE the queue is prepared, so that
+    ;; SSL_do_handshake is the first OpenSSL call after the mark and the
+    ;; three observations can only be attributed to it.
+    (let* ((ctx (SSL_CTX_new (TLS_client_method)))
+           (ssl (SSL_new ctx)))
+      (SSL_set_bio ssl (BIO_new (BIO_s_mem)) (BIO_new (BIO_s_mem)))
+      (SSL_set_connect_state ssl)
+      (drain-openssl-errors!)
+      (plant-openssl-error!)                       ; somebody else's entry
+      (when (zero? (ERR_peek_error))
+        (fail! "premise-probe-could-not-plant-an-entry"))
+      (let ((marked (ERR_set_mark)))
+        (when (zero? marked)
+          (fail! "premise-probe-set-mark-refused-a-non-empty-queue" marked))
+        (SSL_do_handshake ssl)
+        ;; the planted entry is gone, taken by the call's own clear
+        (unless (zero? (ERR_peek_error))
+          (fail! "premise-probe-foreign-entry-survived-the-call" 'premise-moved))
+        ;; ...and with it the mark, so the pop cannot stop where it was told
+        (let ((popped (ERR_pop_to_mark)))
+          (unless (zero? popped)
+            (fail! "premise-probe-mark-survived-the-call" 'premise-moved popped))))
+      (drain-openssl-errors!)
+      (SSL_free ssl)
+      (SSL_CTX_free ctx))
+    (display "  [CHARACTERIZATION] an SSL_* call clears the queue and destroys the mark taken before it\n")
+
+    ;; ---- a setter that failed is not a setter that ran ------------------
+    ;;
+    ;; The SNI extension carries at most 255 bytes of name, and
+    ;; SSL_ctrl(SET_TLSEXT_HOSTNAME) refuses a longer one by returning 0 --
+    ;; measured here: 255 is accepted, 256 is refused, while SSL_set1_host
+    ;; accepts both, so verification is still armed either way. That return
+    ;; used to be discarded, and the handshake went out with NO SNI: a
+    ;; virtual host would answer with its default certificate, and the only
+    ;; thing standing between that and a wrong-certificate connection is a
+    ;; check that was never the one meant to carry it.
+    ;;
+    ;; The one branch among this round's new return checks that stock
+    ;; OpenSSL can actually be made to take: the others (the minimum
+    ;; protocol version, BIO transfers, the trust store) fail only on
+    ;; allocation failure or an OpenSSL built differently, and no honest
+    ;; black-box test provokes them.
+    (let ()
+      (tcp-connect! "127.0.0.1" port-good self)
+      (let ((c (receive (after 8000 #f)
+                 (`#(tcp-connected ,c) c)
+                 (`#(tcp-connect-failed ,e) #f))))
+        (unless c (fail! "sni-length-connect-failed"))
+        (conn-set-owner! c self)
+        (tcp-read-start! c)
+        (let ((r (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'tls-error))
+                            (vector-ref e 1)))
+                   (tls-establish! c (make-string 256 #\a) 8000)
+                   #f)))
+          (tcp-close! c)
+          (let flush () (receive (after 0 'done) (,_ (flush))))
+          (when (not r)
+            (fail! "a hostname too long for SNI was accepted silently"))
+          (display "  [info] over-long SNI name: ") (display r) (newline)
+          ;; ...AND IT MUST SAY SO. "It failed" is not the assertion: with
+          ;; the return discarded, this same call still fails -- the
+          ;; handshake goes out without SNI, SSL_set1_host has armed
+          ;; verification against the 256-byte name, and the certificate
+          ;; does not match it, so the answer is a verification failure.
+          ;; Same verdict, different reason, and asserting only the verdict
+          ;; would pass on both sides of the fix while pinning nothing.
+          (unless (contains? r "SNI")
+            (fail! "an over-long SNI name failed for some other reason" r)))))
+    (display "a hostname too long for the SNI extension is refused, not ignored ok\n")
 
     ;; The sweep: the library is immune to it. A green process is switched
     ;; in with a fresh tick budget, so the preemption cannot be aimed by

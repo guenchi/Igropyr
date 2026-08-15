@@ -60,15 +60,39 @@
 ;;;     ONLY that: this library parks in receive and writes to a socket,
 ;;;     and neither may ever happen with interrupts disabled.
 ;;;
-;;;   - Conversely, a bare ERR_clear_error -- or a drain to the bottom of
-;;;     the queue -- deletes entries belonging to another process. Nothing
-;;;     here clears; every region is bracketed by ERR_set_mark /
-;;;     ERR_pop_to_mark and the message extraction never reads past its
-;;;     own mark. (SSL_read / SSL_write / SSL_do_handshake clear the whole
-;;;     queue themselves on entry in OpenSSL 3 -- also measured -- which
-;;;     is outside this library's control; nothing here relies on that
-;;;     happening, since the documented contract puts the requirement on
-;;;     the caller and older versions do not do it.)
+;;;   - So the queue must be EMPTY when an SSL_* call is made, and this
+;;;     library empties it: ERR_clear_error immediately before the call,
+;;;     inside the same non-preemptible step. That is the obligation
+;;;     OpenSSL documents for anyone who calls SSL_get_error, and it is
+;;;     not one brackets can discharge. Measured on 3.6.3: ERR_set_mark
+;;;     succeeds, SSL_do_handshake then clears the queue itself -- which
+;;;     destroys the mark -- and the closing ERR_pop_to_mark reports "no
+;;;     mark" and takes the whole stack. This file used to be bracketed
+;;;     that way and say it never deleted another process's entries; on
+;;;     OpenSSL 3 it deleted them on every SSL_* call, by way of OpenSSL's
+;;;     own clear. Clearing on purpose therefore costs nothing new there,
+;;;     and on a libcrypto that does NOT self-clear (1.1, LibreSSL) it
+;;;     removes the misverdict described above instead of leaving it to
+;;;     chance. Every supported version now behaves identically.
+;;;
+;;;     A process that leaves errors queued across a yield and expects to
+;;;     read them later is already outside SSL_get_error's contract; this
+;;;     library does not, and reads its own reasons before releasing the
+;;;     step.
+;;;
+;;;     "SSL_*" above means the three TLS I/O calls and only those:
+;;;     SSL_do_handshake, SSL_read, SSL_write. They are what clears the
+;;;     queue, and what SSL_get_error is asked about.
+;;;
+;;;   - Everything else -- SSL_CTX_new, SSL_new, the verification
+;;;     parameters, buffering ciphertext into a memory BIO, the
+;;;     certificate hashing -- keeps the ERR_set_mark / ERR_pop_to_mark
+;;;     brackets, where a mark is real because nothing in those paths
+;;;     clears. Those regions do not call SSL_get_error, so a foreign
+;;;     entry cannot change their verdict, and their reason extraction
+;;;     only PEEKS (see tls-reason), so it can never consume one either.
+;;;     (BIO_new itself is called unbracketed; its failure is reported by
+;;;     a fixed string, not from the queue.)
 
 (library (igropyr tls)
   (export tls-enable! tls-establish!)
@@ -117,13 +141,22 @@
 
   (define ERR_get_error     (foreign-procedure "ERR_get_error" () unsigned-long))
   (define ERR_peek_error    (foreign-procedure "ERR_peek_error" () unsigned-long))
+  ;; the LATEST entry, and it does not modify the queue -- the only
+  ;; reader a mark/pop region may use; see tls-reason
+  (define ERR_peek_last_error
+    (foreign-procedure "ERR_peek_last_error" () unsigned-long))
+  (define ERR_clear_error   (foreign-procedure "ERR_clear_error" () void))
   (define ERR_error_string_n
     (foreign-procedure "ERR_error_string_n" (unsigned-long u8* size_t) void))
   ;; Error-queue scoping. ERR_set_mark records the current top of the
-  ;; per-thread queue; ERR_pop_to_mark drops everything pushed above it
-  ;; (and, if the mark itself was destroyed by an ERR_clear_error inside
-  ;; OpenSSL, everything -- which is then exactly this region's own
-  ;; entries, since that clear removed the older ones first).
+  ;; per-thread queue; ERR_pop_to_mark drops everything pushed above it,
+  ;; and returns 0 having dropped EVERYTHING if the mark is gone -- which
+  ;; is what a clear inside OpenSSL does to it. That case used to be
+  ;; excused here as "then the queue holds only this region's entries
+  ;; anyway"; it is true only if the clear and the region began together,
+  ;; and it was being relied on where they did not. The SSL_* path no
+  ;; longer uses these at all (see with-ssl-call); the paths that do keep
+  ;; them contain nothing that clears.
   (define ERR_set_mark      (foreign-procedure "ERR_set_mark" () int))
   (define ERR_pop_to_mark   (foreign-procedure "ERR_pop_to_mark" () int))
   (define SSL_CTX_free      (foreign-procedure "SSL_CTX_free" (void*) void))
@@ -160,12 +193,24 @@
   (define SSL_ERROR_WANT_READ 2)
   (define SSL_ERROR_ZERO_RETURN 6)
 
+  ;; The length arguments of BIO_write / SSL_write / BIO_read are C int.
+  ;; A bytevector longer than that would be truncated by the conversion --
+  ;; silently, and into ciphertext, where a lost tail is not a short write
+  ;; but a corrupt stream. Anything past this is refused before the FFI.
+  (define max-c-int (- (expt 2 31) 1))
+
   ;; ---- error reporting ---------------------------------------------------
 
   ;; Does the queue hold an entry pushed since the enclosing scope's mark?
-  ;; ERR_count_to_mark answers exactly and is OpenSSL 3; without it the
-  ;; question degrades to "is the queue non-empty", which can attribute a
-  ;; foreign entry to us but still never DELETES one below the mark.
+  ;; ERR_count_to_mark answers exactly; it is PROBED rather than assumed,
+  ;; because it is not in every libcrypto this library builds against, and
+  ;; without it the question degrades to "is the queue non-empty", which
+  ;; can attribute a foreign entry to us -- a wrong message, never a
+  ;; deletion, since the reader that follows only peeks. (ERR_count_to_mark
+  ;; arrived in OpenSSL 3.2, so 3.0 and 3.1 take the degraded path too;
+  ;; probing rather than version-testing is what makes that automatic.)
+  ;; Used only by the mark/pop regions: the TLS I/O path clears first and
+  ;; therefore owns everything it can see (see with-ssl-call).
   (define err-own-entry?
     (if (foreign-entry? "ERR_count_to_mark")
         (let ((f (foreign-procedure "ERR_count_to_mark" () int)))
@@ -178,6 +223,16 @@
   ;; socket, or otherwise block -- it would stop the entire runtime, and
   ;; a process that cannot be preempted cannot be killed. Keep the bodies
   ;; to the OpenSSL calls themselves and act on the result outside.
+  ;;
+  ;; NOT NESTABLE. On 1.1 and LibreSSL a mark is a flag on the top entry,
+  ;; not a counter of marks: two scopes entered around the same top entry
+  ;; set the same flag, and the inner ERR_pop_to_mark clears it -- so the
+  ;; outer pop finds no mark and takes the whole queue, including entries
+  ;; that were there before either scope began. Nothing here nests today;
+  ;; keep it that way rather than reasoning about which version forgives it.
+  ;;
+  ;; It also does NOT cover a call that then asks SSL_get_error what
+  ;; happened: see with-ssl-call, which is the form for those.
   (define-syntax with-openssl-scope
     (syntax-rules ()
       ((_ body ...)
@@ -186,6 +241,36 @@
            (lambda () (ERR_set_mark))
            (lambda () body ...)
            (lambda () (ERR_pop_to_mark)))))))
+
+  ;; THE SSL_* FORM: clear the queue, then call, and own what you find.
+  ;;
+  ;; SSL_get_error is only meaningful on a queue that held nothing before
+  ;; the call -- that is the documented obligation on the CALLER, and this
+  ;; library could not meet it with brackets. Measured on 3.6.3: entering
+  ;; a region with ERR_set_mark and then calling SSL_do_handshake finds
+  ;; the mark GONE afterwards, because SSL_* clears the whole queue on
+  ;; entry and a clear destroys marks; ERR_pop_to_mark then returns 0 and
+  ;; takes the entire stack. So the brackets that used to be here removed
+  ;; other processes' entries anyway, while reading as though they could
+  ;; not -- protection in name, a drain in fact.
+  ;;
+  ;; Clearing explicitly costs nothing that was not already being paid on
+  ;; that platform, and buys the two things brackets never delivered: on
+  ;; libcryptos that do NOT self-clear (1.1, LibreSSL) a stale entry can
+  ;; no longer turn a healthy WANT_READ into a fatal verdict, and every
+  ;; version now behaves the same way, which is the only version of this
+  ;; that can be described honestly at the top of the file.
+  ;;
+  ;; Deliberately no ERR_set_mark after the clear: the queue is empty, a
+  ;; mark on nothing is not a boundary, and interrupts are off for the
+  ;; whole extent -- so everything the queue holds when the body looks was
+  ;; put there by this call. Same rules as above about parking and sockets.
+  (define-syntax with-ssl-call
+    (syntax-rules ()
+      ((_ body ...)
+       (with-interrupts-disabled
+         (ERR_clear_error)
+         body ...))))
 
   (define (bv-prefix->string bv)
     (let ((n (bytevector-length bv)))
@@ -197,21 +282,72 @@
                 r))
             (loop (+ i 1))))))
 
-  ;; This region's first queued OpenSSL error as text, or default. Only
-  ;; valid inside with-openssl-scope: entries below the mark belong to
+  (define (err-entry->string e)
+    (let ((buf (make-bytevector 256 0)))
+      (ERR_error_string_n e buf 256)
+      (bv-prefix->string buf)))
+
+  ;; This region's most recent queued OpenSSL error as text, or default.
+  ;; Only valid inside with-openssl-scope: entries below the mark belong to
   ;; another green process, and neither reporting one as ours nor
-  ;; consuming it would be right. There is deliberately no drain loop --
-  ;; the rest of the region's own entries go with the scope's
-  ;; ERR_pop_to_mark, which stops at the mark; a drain would not.
+  ;; consuming it would be right.
+  ;;
+  ;; PEEK THE LATEST, NEVER GET THE EARLIEST. ERR_get_error is documented
+  ;; to return the EARLIEST entry in the thread's queue and to remove it,
+  ;; and a mark does not bound it -- so reading a reason with it did the
+  ;; two things this region exists to avoid: it reported another process's
+  ;; oldest error as this region's failure, and it deleted that error from
+  ;; under the process that was going to read it. (Worse where the deleted
+  ;; entry was the marked one: the mark went with it, and the closing
+  ;; ERR_pop_to_mark then found no mark and took the rest of the queue.)
+  ;; ERR_peek_last_error returns the LATEST and modifies nothing, and the
+  ;; latest is this region's whenever err-own-entry? is true -- because
+  ;; anything pushed after the mark is on top. Nothing is consumed here at
+  ;; all; the region's own entries go with the scope's ERR_pop_to_mark.
+  ;;
+  ;; Where ERR_count_to_mark is missing (before OpenSSL 3.2) the guard
+  ;; degrades to "the queue is non-empty", so a foreign entry can still be
+  ;; reported as ours -- a wrong message. It cannot be deleted, which is
+  ;; the property worth keeping.
   (define (tls-reason default)
     (if (not (err-own-entry?))
         default
-        (let ((e (ERR_get_error)))
+        (let ((e (ERR_peek_last_error)))
           (if (zero? e)
               default
-              (let ((buf (make-bytevector 256 0)))
-                (ERR_error_string_n e buf 256)
-                (string-append "tls: " (bv-prefix->string buf)))))))
+              (string-append "tls: " (err-entry->string e))))))
+
+  ;; The whole chain this call left, oldest first. Only valid inside
+  ;; with-ssl-call, where the queue was empty on entry: everything in it
+  ;; is this call's, so draining takes nothing from anyone.
+  ;;
+  ;; ONE FAILURE IS USUALLY SEVERAL ENTRIES, and the interesting one is
+  ;; not always at either end -- a rejected certificate chain pushes the
+  ;; verification failure first and the handshake-level alert on top of
+  ;; it, so reporting only the newest names the symptom and only the
+  ;; oldest can name something too low to act on. Oldest first, joined,
+  ;; is the order OpenSSL's own error printing uses.
+  ;;
+  ;; Bounded because an error message is a thing that gets logged, not
+  ;; because the queue could be huge (OpenSSL caps it at a small fixed
+  ;; number of entries): past the cap the rest is still DRAINED -- leaving
+  ;; it would hand this call's entries to whoever looks next -- but not
+  ;; rendered.
+  (define ssl-reason-max 4)
+
+  (define (ssl-drain-reason default)
+    (let loop ((n 0) (acc '()))
+      (let ((e (ERR_get_error)))
+        (cond ((zero? e)
+               (if (null? acc)
+                   default
+                   (let join ((rest (cdr acc)) (out (car acc)))
+                     (if (null? rest)
+                         (string-append "tls: " out)
+                         (join (cdr rest)
+                               (string-append (car rest) "; " out))))))
+              ((fx>= n ssl-reason-max) (loop n acc))
+              (else (loop (fx+ n 1) (cons (err-entry->string e) acc)))))))
 
   ;; One SSL_* call and its whole classification as a single step with no
   ;; preemption point inside: SSL_get_error must see the error queue
@@ -225,13 +361,13 @@
     (syntax-rules ()
       ((_ ssl-expr default call)
        (let ((s ssl-expr))
-         (with-openssl-scope
+         (with-ssl-call
            (let* ((rc call)
                   (code (if (fx> rc 0) SSL_ERROR_NONE (SSL_get_error s rc))))
              (values rc code
                      (if (or (fx> rc 0) (fx= code SSL_ERROR_WANT_READ))
                          #f
-                         (tls-reason default)))))))))
+                         (ssl-drain-reason default)))))))))
 
   (define (die msg) (raise (vector 'tls-error msg)))
 
@@ -239,20 +375,46 @@
 
   (define ctx 0)
 
+  ;; EVERY POSTURE CALL IS CHECKED, because each one of them is a claim
+  ;; this file makes at the top and a client cannot verify afterwards.
+  ;; SSL_CTX_ctrl returning 0 for the minimum version is the sharp one: it
+  ;; leaves a context that negotiates whatever the peer offers, including
+  ;; TLS 1.0, under a library that advertises "TLS >= 1.2, non-negotiable".
+  ;; A downgrade nobody is told about is worse than a connection refused.
+  ;;
+  ;; THE REASON IS READ BEFORE THE CLEANUP. SSL_CTX_free is OpenSSL work
+  ;; and can push entries of its own; reading the queue after it meant the
+  ;; message describing a missing trust store could be one the free left.
+  ;; Capture, then free, then raise -- and raise OUTSIDE the scope, which
+  ;; is this file's rule everywhere else.
   (define (ensure-ctx!)
-    (with-openssl-scope
-      (when (zero? ctx)
-        (let ((c (SSL_CTX_new (TLS_client_method))))
-          (when (zero? c) (die (tls-reason "tls: SSL_CTX_new failed")))
-          (SSL_CTX_ctrl c SSL_CTRL_SET_MIN_PROTO_VERSION TLS1_2_VERSION 0)
-          (SSL_CTX_set_verify c SSL_VERIFY_PEER 0)
-          (when (zero? (SSL_CTX_set_default_verify_paths c))
-            ;; free before raising: a caller in a reconnect loop (e.g. a
-            ;; database pool retrying every second) would otherwise leak
-            ;; one SSL_CTX per attempt for the life of the misconfiguration
-            (SSL_CTX_free c)
-            (die (tls-reason "tls: no system trust store")))
-          (set! ctx c)))))
+    (let ((err
+            (with-openssl-scope
+              (if (not (zero? ctx))
+                  #f
+                  (let ((c (SSL_CTX_new (TLS_client_method))))
+                    (if (zero? c)
+                        (tls-reason "tls: SSL_CTX_new failed")
+                        (let ((bad
+                                (cond
+                                  ((zero? (SSL_CTX_ctrl
+                                            c SSL_CTRL_SET_MIN_PROTO_VERSION
+                                            TLS1_2_VERSION 0))
+                                   (tls-reason "tls: could not require TLS >= 1.2"))
+                                  (else
+                                    (SSL_CTX_set_verify c SSL_VERIFY_PEER 0)
+                                    (and (zero? (SSL_CTX_set_default_verify_paths c))
+                                         (tls-reason "tls: no system trust store"))))))
+                          (cond
+                            (bad
+                              ;; free before raising: a caller in a reconnect
+                              ;; loop (e.g. a database pool retrying every
+                              ;; second) would otherwise leak one SSL_CTX per
+                              ;; attempt for the life of the misconfiguration
+                              (SSL_CTX_free c)
+                              bad)
+                            (else (set! ctx c) #f)))))))))
+      (when err (die err))))
 
   ;; ---- helpers -------------------------------------------------------------
 
@@ -269,12 +431,72 @@
                     (else (loop (+ i 1) #f))))))))
 
   ;; everything the wbio holds, as a fresh bytevector (or #f when empty)
+  ;;
+  ;; BIO_READ'S RETURN VALUE DECIDES THE LENGTH, not BIO_ctrl_pending.
+  ;; Sizing the buffer from pending and then keeping all of it assumed the
+  ;; read filled it exactly; when it does not, the tail of the bytevector
+  ;; is uninitialised memory that goes out on the socket as ciphertext, and
+  ;; the bytes actually still in the BIO are dropped. Reading in a loop
+  ;; keeps the property that matters: every byte reported is a byte the
+  ;; BIO actually handed over, and nothing is invented. The per-read size
+  ;; is capped at C int range, which the loop then walks.
+  ;;
+  ;; TWO CONDITIONS END IT EARLY, and neither loses data -- a memory BIO
+  ;; is FIFO, so later output queues behind whatever is left and the next
+  ;; drain still emits in order:
+  ;;   - a read that delivers nothing while bytes are still pending. This
+  ;;     should not happen for a memory BIO, but the loop has to terminate
+  ;;     on it rather than spin.
+  ;;   - more than C int range accumulated in one call, which bounds the
+  ;;     bytevector returned.
+  ;; So a caller must not assume one call empties the BIO. Every drain
+  ;; site here is reached again -- each handshake step, each decrypt, each
+  ;; encrypt -- and what is left goes out on the next one.
   (define (drain-wbio wbio)
-    (let ((n (BIO_ctrl_pending wbio)))
-      (and (> n 0)
-           (let ((bv (make-bytevector n)))
-             (BIO_read wbio bv n)
-             bv))))
+    (let loop ((chunks '()) (total 0))
+      (let ((n (BIO_ctrl_pending wbio)))
+        (if (or (= n 0) (> total max-c-int))
+            (and (pair? chunks) (join-chunks (reverse chunks) total))
+            (let* ((k (if (> n max-c-int) max-c-int n))
+                   (bv (make-bytevector k))
+                   (rc (BIO_read wbio bv k)))
+              (cond
+                ((fx= rc k) (loop (cons bv chunks) (+ total k)))
+                ((fx> rc 0)
+                 (let ((part (make-bytevector rc)))
+                   (bytevector-copy! bv 0 part 0 rc)
+                   (loop (cons part chunks) (+ total rc))))
+                (else (and (pair? chunks) (join-chunks (reverse chunks) total)))))))))
+
+  (define (join-chunks chunks total)
+    (if (null? (cdr chunks))
+        (car chunks)
+        (let ((out (make-bytevector total)))
+          (let loop ((cs chunks) (off 0))
+            (if (null? cs)
+                out
+                (let ((n (bytevector-length (car cs))))
+                  (bytevector-copy! (car cs) 0 out off n)
+                  (loop (cdr cs) (+ off n))))))))
+
+  ;; Ciphertext INTO a memory BIO: all of it or none of it.
+  ;;
+  ;; A memory BIO grows to take what it is given, so a short write is not
+  ;; backpressure -- it is an allocation failure, and the bytes that did
+  ;; not fit are gone from a stream that cannot tolerate a hole. The
+  ;; return value used to be discarded at both call sites, so such a
+  ;; connection carried on and failed later as a decryption error with no
+  ;; trace of where the gap came from. -> reason string, or #f on success.
+  (define (bio-write! bio bv)
+    (let ((n (bytevector-length bv)))
+      (cond
+        ((fx= n 0) #f)
+        ((> n max-c-int) "tls: ciphertext segment too large for this platform")
+        (else
+          (with-openssl-scope
+            (let ((rc (BIO_write bio bv n)))
+              (and (not (fx= rc n))
+                   (tls-reason "tls: could not buffer ciphertext"))))))))
 
   ;; The OpenSSL half is scoped; the socket write is not, and must not be.
   (define (flush-out! c wbio)
@@ -375,9 +597,21 @@
                                    (SSL_get0_param ssl) host))
                           "tls: bad ip literal"))
                     (else
-                      (SSL_ctrl/string ssl SSL_CTRL_SET_TLSEXT_HOSTNAME 0 host) ; SNI
-                      (and (zero? (SSL_set1_host ssl host))
-                           "tls: SSL_set1_host failed"))))))
+                      ;; SNI is checked too. It can fail (an allocation,
+                      ;; a host name the extension cannot carry), and the
+                      ;; result used to be dropped -- so the handshake went
+                      ;; ahead WITHOUT the extension, and a virtual host
+                      ;; answered with whatever certificate it serves by
+                      ;; default. That either fails verification later with
+                      ;; a message pointing at the wrong thing, or succeeds
+                      ;; against a name nobody asked for.
+                      (cond
+                        ((zero? (SSL_ctrl/string
+                                  ssl SSL_CTRL_SET_TLSEXT_HOSTNAME 0 host))
+                         "tls: could not set SNI host name")
+                        ((zero? (SSL_set1_host ssl host))
+                         "tls: SSL_set1_host failed")
+                        (else #f)))))))
           (when setup-err (fail! setup-err)))
         (SSL_set_connect_state ssl)
 
@@ -412,8 +646,8 @@
                (receive (after (max 1 (- deadline (now-ms)))
                            (fail! "tls handshake timeout"))
                  (`#(tcp-data ,bv)
-                   (with-openssl-scope
-                     (BIO_write rbio bv (bytevector-length bv)))
+                   (let ((werr (bio-write! rbio bv)))
+                     (when werr (fail! werr)))
                    (handshake))
                  (`#(tcp-eof) (fail! "connection closed during tls handshake"))
                  (`#(tcp-error ,e) (fail! "connection error during tls handshake"))))
@@ -425,18 +659,24 @@
         (let ((scratch (make-bytevector 16384)))
           (define (encrypt bv)
             (let ((n (bytevector-length bv)))
-              (if (zero? n)
-                  empty-bv
+              (cond
+                ((zero? n) empty-bv)
+                ;; the length argument is a C int; a longer plaintext would
+                ;; be truncated by the conversion and the tail silently
+                ;; never encrypted
+                ((> n max-c-int) (die "tls: plaintext segment too large"))
+                (else
                   ;; the write and the reading of its reason in one step,
                   ;; for the same reason the handshake needs one; the
-                  ;; raise happens after the scope
-                  (let ((err (with-openssl-scope
+                  ;; raise happens after the step
+                  (let ((err (with-ssl-call
                                (and (not (= n (SSL_write ssl bv n)))
-                                    (tls-reason "tls write failed")))))
+                                    (ssl-drain-reason "tls write failed")))))
                     (when err (die err))
-                    (or (with-openssl-scope (drain-wbio wbio)) empty-bv)))))
+                    (or (with-openssl-scope (drain-wbio wbio)) empty-bv))))))
           (define (decrypt raw)
-            (with-openssl-scope (BIO_write rbio raw (bytevector-length raw)))
+            (let ((werr (bio-write! rbio raw)))
+              (when werr (die werr)))
             (let-values (((p get) (open-bytevector-output-port)))
               (let loop ()
                 ;; SSL_read and its SSL_get_error are one step: with a gap
