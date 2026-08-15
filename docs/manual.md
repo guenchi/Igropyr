@@ -1319,7 +1319,9 @@ express cannot happen.
 ```
 
 API: `(conversation-start! flow req [ttl-ms [request-key [on-killed]]])`
-spawns the flow and returns `(values id token first-reply)`. The flow is
+spawns the flow and returns `(values id token first-reply)` — note that
+the id arrives only after the first `suspend!`, so a caller that needs it
+*before* anything happens wants the two-phase form below. The flow is
 called as `(flow req suspend! commit!)`: `(suspend! reply)` answers the
 current round and parks until the next `(conversation-resume! id token
 req)`, which returns `(values reply status)`. Default TTL 300 000 ms; a
@@ -1352,15 +1354,89 @@ commits, parks, is resumed and only then fails is still `'unknown`, not
 (an escaping continuation, or `suspend!` called inside it) skips the mark
 and is outside the contract.
 
+### Two phases, when the id has to exist first
+
+`conversation-start!` mints the conversation's id inside the same call
+that spawns the flow, and does not hand it back until the first
+`suspend!`. Between those two moments the flow has begun acting on the
+world and **nothing outside can name it** — so a caller cannot write "I am
+about to start X" anywhere durable, a `#(conversation-failed ...)` had no
+id to carry, and a starter killed during the first step left a
+conversation still running, still talking to whatever the flow talks to,
+whose id no longer existed anywhere.
+
+Splitting the call puts the identity first:
+
+```scheme
+(let ((h (conversation-prepare! flow req)))      ; inert
+  (record-intent! (conversation-ref-id h))       ; durable, before any effect
+  (let-values (((token reply) (conversation-run! h)))
+    ...))
+```
+
+| call | |
+|---|---|
+| `(conversation-prepare! flow req [ttl-ms [request-key [on-killed]]])` | validates the options, mints the id, returns an opaque **handle**. **Inert**: no process, no registration, no timer. (Not *pure* — minting an id reads the random source, the node identity and the clock.) |
+| `(conversation-ref-id h)` | the id, available immediately |
+| `(conversation-run! h)` | starts it and parks until the first `suspend!` → `(values token first-reply)` |
+| `(conversation-abandon! h)` | give up a prepared conversation that was never run |
+
+`conversation-start!` is exactly `prepare!` + `run!`, and still returns
+`(values id token first-reply)`.
+
+No lifetime clock starts before `run!`, so a handle may sit for as long as
+you like. A handle may be handed to another **process** on this node — the
+first reply goes to whoever calls `run!` — but never to another **node**:
+it holds closures, and `run!` refuses if the node identity has changed
+since the id was minted. Running, abandoning, or simply dropping a handle
+releases the flow and request it was holding; the handle is single-use in
+every direction, and a second `run!` (or an `abandon!` after one) is an
+`assertion-violation`.
+
+#### Recovering a conversation whose starter died
+
+This is what the id bought. Persist it **before** `run!`; on recovery, ask
+`(conversation-peek id)`:
+
+| answer | what it means |
+|---|---|
+| `'parked` with a token | **adopt it.** That token is live: `conversation-resume!` with it and this process becomes the one the conversation answers. A conversation whose starter died is otherwise perfectly healthy — parked, holding its transaction, waiting. (peek hands back the reply it is waiting to have answered; `resume!` consumes the token and returns the *next* round's reply.) |
+| `'completed` | the flow returned; the reply is its final answer and there is nothing to adopt. peek never answers "running" — a peek that arrives mid-step is answered when that step parks. |
+| `'gone` | it rolled back; nothing to adopt, and safe to start afresh |
+| `'settled` | it finished earlier; only the record is left |
+| `'unknown` / `'unreachable` | **not an answer, and possibly transient.** Registration happens inside the conversation's own process, so a peek between spawn and registration answers `'unknown`; a remote peek before the owner's router exists answers `'unreachable`. Look again. |
+
+Neither `'unknown` nor `'unreachable` licenses a second attempt. That
+licence comes only from reconciling downstream, or from the downstream
+operation being idempotent.
+
+**One adopter.** Two recoverers both peek and both see the same token; the
+first `resume!` wins and the other is `'stale` (or replayed, if its
+request-key matches). The library will not choose between them — the store
+the ids live in has to: a claim, a lease, something.
+
+**The id is a bearer credential**, and this recipe deliberately puts it in
+a database. Whoever can read it can peek — which discloses the last reply,
+whatever that contains — and can present the live token with a request of
+their own choosing, which *advances the flow*. The entropy is not the
+exposure; distribution is. Treat a persisted id as a session control
+credential: not in logs, not in URLs, not in a table half the organisation
+can read.
+
+After a restart the process is gone and so is the conversation: a local
+peek on an old id answers `'unknown`, a remote one `'unreachable` until the
+restarted owner has built its router.
+
 ### When the first step dies
 
-When the first step dies, `conversation-start!` raises — and one of the
+When the first step dies, `conversation-start!` (or `conversation-run!`)
+raises — and one of the
 two raises must be caught. Nothing has been answered yet at that point,
 so the failure surfaces in the caller rather than as a status:
 
 | raise | meaning | what to do |
 |---|---|---|
-| `#(conversation-failed reason)` | the flow raised before its first `suspend!` **and** before its `commit!`; its winders ran, so it rolled back | let it crash — retrying is correct |
+| `#(conversation-failed id reason)` | the flow raised before its first `suspend!` **and** before its `commit!`; its winders ran, so it rolled back | let it crash — retrying is correct |
 | `#(conversation-uncertain id outcome reason)` | the first step may have got past its `COMMIT` — killed for overrunning, killed from outside, taken down by a link, or raising after `commit!` returned | **catch it**; do not run the work again |
 
 The distinction matters more than it looks, because of what a *host* does
@@ -1388,8 +1464,9 @@ answer actionable:
   (conversation-start! flow req))
 ```
 
-`#(conversation-failed ...)` is deliberately *not* caught there: let it
-crash, and let the retry take it.
+`#(conversation-failed ...)` is deliberately *not* caught there. It is the
+one raise whose work is safe to repeat, so it is left to the host's
+ordinary failure handling — whatever that is in this assembly.
 
 ### The status is the answer; the reply is only data
 
