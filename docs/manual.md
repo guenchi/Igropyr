@@ -1322,9 +1322,11 @@ API: `(conversation-start! flow req [ttl-ms [request-key [on-killed]]])`
 spawns the flow and returns `(values id token first-reply)`. The flow is
 called as `(flow req suspend! commit!)`: `(suspend! reply)` answers the
 current round and parks until the next `(conversation-resume! id token
-req)`, which returns `(values reply status)`. Default TTL 300 000 ms;
-expiry raises `'conversation-expired` inside the flow so a `guard` can
-roll back.
+req)`, which returns `(values reply status)`. Default TTL 300 000 ms; a
+conversation that sat *parked* past it is raised at —
+`'conversation-expired` reaches the flow, so a `guard` can roll back. A
+*step* that overruns is killed instead, and a kill runs no winders —
+that path is `on-killed`, below.
 
 **Commit through `commit!`.** `(commit! thunk)` runs the thunk, marks the
 conversation committed the instant it *returns*, and passes its values
@@ -1438,6 +1440,55 @@ tell apart must not replay each other's replies — that is the case
 `'stale` exists for. It is bounded like a step: it runs with the
 watchdog watching, so a key function that hangs does not park the
 conversation forever.
+
+**`on-killed` runs after the watchdog kills an overrunning step.** TTL
+expiry has two paths and only one of them raises. A conversation that sat
+*parked* too long is raised at, so the flow's `guard` runs and gives back
+what it held. A *step* that overruns is **killed** — a step stuck in a
+loop or a foreign call cannot be raised at — and `@kill` discards
+`dynamic-wind` winders, so that `guard` does not run at all. A pooled
+database connection survives regardless: the pool monitors its borrower
+and rebuilds a connection whose borrower died, which drops the
+transaction. Anything held **in process** does not — a reservation, a
+file handle, an in-memory hold stays held for the life of the VM. That is
+what this hook is for; it runs after the kill, in the watchdog's process,
+and reaches what the flow held through whatever it closed over.
+
+It takes **one argument** — whether the conversation had committed when
+the kill landed — because the hook has two jobs that need different
+answers:
+
+```scheme
+(lambda (committed?)
+  (release-handle!)                  ; held in process: always
+  (unless committed? (undo-hold!)))  ; the transaction: only if it did not happen
+```
+
+Releasing what this process holds is unconditional — the flow is dead and
+nothing else will ever give it back. **Undoing the transaction is right
+only where the transaction did not happen**: run against a flow that
+committed, it reverses work that succeeded, which is the same damage
+`'gone` would have done arriving by another route. The library does not
+make the split itself, because only the application knows which of its
+own effects are which.
+
+**`committed?` is one-sided.** `#t` is never wrong: the mark is set only
+by a commit thunk that returned, and it is never cleared. `#f` can be one
+instant stale — a kill landing between that return and the mark being set
+passes `#f` for a transaction that did happen, and the window is the
+return itself, which cannot be closed from another process. So `#f` means
+*no witness*, not *proof it did not commit*. An undo that is destructive
+when wrong must be idempotent, or consult the authoritative store, rather
+than rest on this flag alone.
+
+A hook that cannot accept one argument is **rejected at
+`conversation-start!`**, with an `assertion-violation` in the caller. It
+is checked there because it is *called* inside a guard that swallows
+everything — the watchdog must survive a bad hook — so a hook of the
+wrong shape would otherwise fail silently: the compensation never runs,
+whatever the flow held stays held, and nothing anywhere says why.
+Accepting one argument, not exactly one: a variadic hook and one with
+optionals are both fine.
 
 **The token names the reply being answered.** A conversation hands one
 out with every reply and consumes it the moment a request is accepted.
