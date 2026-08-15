@@ -1464,6 +1464,17 @@ answer actionable:
   (conversation-start! flow req))
 ```
 
+**Match these by their tag, never by length or exact shape.** The guard
+above tests `(vector-ref e 0)` and nothing else, and that is the contract:
+the tag identifies the raise, the arity does not and is not promised. It
+has already changed once — `conversation-failed` carried two elements and
+now carries three, because a retryable failure that cannot name what
+failed is of little use — and a consumer that had written
+`(= (vector-length e) 2)` stopped matching the moment it did. That failure
+is silent, and it is the worst shape: the clause simply never fires, so
+the *error* path quietly stops being handled while every ordinary request
+still works.
+
 `#(conversation-failed ...)` is deliberately *not* caught there. It is the
 one raise whose work is safe to repeat, so it is left to the host's
 ordinary failure handling — whatever that is in this assembly.
