@@ -935,11 +935,49 @@
       (string->symbol
         (string-append "igropyr-conv-r-" (number->string reply-name-counter)))))
 
+  ;; Refs count up from 1, which is what leaves the negative range free to
+  ;; mean something (see the router). Nothing ever produces 0 or less here.
   (define ref-counter 0)
   (define (fresh-ref!)
     (with-interrupts-disabled
       (set! ref-counter (+ ref-counter 1))
       ref-counter))
+
+  ;; A ref this node minted to say "answer me with the wide frame".
+  ;; fail-closed: anything else at all is treated as an old asker.
+  (define (wide-ref? r) (and (fixnum? r) (fx< r 0)))
+
+  ;; WHAT CROSSES THE MESH IS A VERDICT, NOT THE RECORD. The tombstone
+  ;; values are this file's private vocabulary and would become wire format
+  ;; the moment they were sent; these three say only what the far side
+  ;; needs in order to decide, and can be extended without the reader
+  ;; having to know every tombstone this library will ever write.
+  (define (rec->evidence rec)
+    (cond ((eq? rec 'committed-then-failed) 'commit-witness)
+          ((eq? rec record-not-read) 'record-not-read)
+          (else 'no-commit-witness)))
+
+  ;; ...and coming back, ONLY an exact 'commit-witness is believed.
+  ;;
+  ;; The three verdicts collapse to two here because that is all today's
+  ;; resolver distinguishes: a commit witness stops a #f predicate from
+  ;; producing 'gone, and everything else leaves the predicate to decide as
+  ;; it does locally. The distinction is kept ON THE WIRE anyway, because
+  ;; "the owner looked and found no witness" and "the owner never looked"
+  ;; are different facts, and a later reader may want them apart.
+  ;;
+  ;; Anything unrecognised -- an old value, a new one, a corrupted field --
+  ;; is read as NO INFORMATION, which is the same thing an old owner's
+  ;; narrow reply carries. It is not a stronger guarantee than that: with
+  ;; no information the predicate decides, exactly as it has always done on
+  ;; this path, and a predicate answering #f still produces 'gone. What
+  ;; unrecognised evidence cannot do is MANUFACTURE A WITNESS -- it can
+  ;; never be the thing that blocks a legitimate 'gone, and it can never
+  ;; upgrade a caller's belief. Believing only one exact symbol is what
+  ;; buys that, and it is the invariant worth stating; "bad data can only
+  ;; end at 'unknown" would be a larger claim than this code makes.
+  (define (evidence->rec ev)
+    (if (eq? ev 'commit-witness) 'committed-then-failed record-not-read))
 
   ;; The owner's router: for each forwarded resume, spawn a worker that
   ;; runs the resume locally and sends the reply straight back to the
@@ -948,28 +986,58 @@
   (define (conv-router-loop)
     (let loop ()
       (receive
-        ;; The record each local call read stays HERE. Carrying it back
-        ;; would widen these reply frames, and they are matched by vector
-        ;; shape: a node that has not been upgraded does not fail to
-        ;; understand a wider frame, it fails to MATCH it, waits out
-        ;; conv-forward-ttl-ms and answers 'unreachable -- for every
-        ;; forwarded resume, not just the ones a witness would have helped.
-        ;; Sending the witness across the mesh is a separate, additive
-        ;; change: teach every node to accept both shapes first, then start
-        ;; sending the wider one.
+        ;; THE ASKER SAYS WHAT IT CAN READ, in the ref it sends.
+        ;;
+        ;; These reply frames carry the owner's VERDICT on what it read --
+        ;; not the tombstone itself, which is this file's private
+        ;; vocabulary -- because without it the asking node's settled?
+        ;; predicate can override a
+        ;; commit witness the owner is holding -- exactly the misreading
+        ;; the local path already refuses. But widening a frame is not a
+        ;; compatible change here: replies are matched by vector SHAPE, and
+        ;; a node that has not been upgraded does not fail to understand a
+        ;; wider frame, it fails to MATCH it -- then waits out
+        ;; conv-forward-ttl-ms and answers 'unreachable, for EVERY
+        ;; forwarded call rather than only the ones a witness would help.
+        ;;
+        ;; The obvious repair is a two-step release: teach every node to
+        ;; accept both shapes, wait for the fleet, then start sending the
+        ;; wide one. That was the plan and it is not workable -- it needs a
+        ;; barrier across machines that nothing enforces, and one node left
+        ;; behind turns every forwarded call into a five-minute timeout.
+        ;;
+        ;; So the asker declares its own capability in a field the old code
+        ;; already round-trips without interpreting: the ref. Refs are a
+        ;; counter from 1 (see fresh-ref!), so the negative range is free
+        ;; and unambiguous. A NEGATIVE ref means "I can read a wide reply".
+        ;; That makes one release safe in every direction:
+        ;;   old asker -> new owner: positive ref, narrow reply, unchanged
+        ;;   new asker -> old owner: the old router echoes the ref without
+        ;;     looking at it and answers narrow; the new asker matches
+        ;;     narrow too, and simply has no witness
+        ;;   new asker -> new owner: wide reply, witness delivered
+        ;; Anything not a negative fixnum answers narrow, so a malformed or
+        ;; unexpected ref degrades to today's behaviour rather than to a
+        ;; frame the peer cannot match.
         (`#(conv-peek-fwd ,from-node ,reply-name ,ref ,id)
           (spawn
             (lambda ()
               (let-values (((state token reply rec) (local-peek id)))
                 (rsend from-node reply-name
-                       (vector 'conv-peek-reply ref state token reply)))))
+                       (if (wide-ref? ref)
+                           (vector 'conv-peek-reply ref state token reply
+                                   (rec->evidence rec))
+                           (vector 'conv-peek-reply ref state token reply))))))
           (loop))
         (`#(conv-resume ,from-node ,reply-name ,ref ,id ,token ,req)
           (spawn
             (lambda ()
               (let-values (((reply status rec) (local-resume id token req)))
                 (rsend from-node reply-name
-                       (vector 'conv-forward-reply ref reply status)))))
+                       (if (wide-ref? ref)
+                           (vector 'conv-forward-reply ref reply status
+                                   (rec->evidence rec))
+                           (vector 'conv-forward-reply ref reply status))))))
           (loop))
         (,_ (loop)))))
 
@@ -983,9 +1051,17 @@
 
   ;; Forward a peek, with the same failure semantics as a forwarded resume:
   ;; anything that is not an answer is 'unreachable, never 'gone.
+  ;; -> (values state token last-reply record). That last value is this
+  ;; path's PROJECTION of the owner's verdict onto what resolve-unknown
+  ;; reads: 'committed-then-failed when the owner said it holds a commit
+  ;; witness, record-not-read for everything else -- an owner too old to
+  ;; send a verdict, a verdict saying there is no witness, an unreadable
+  ;; one, or any failure to get an answer at all. It is never a tombstone
+  ;; value the owner did not vouch for.
   (define (forward-peek owner id)
     (let ((reply-name (fresh-reply-name!))
-          (ref (fresh-ref!)))
+          ;; negative: this node can read the wide reply (see the router)
+          (ref (- (fresh-ref!))))
       (register reply-name self)
       (monitor-node owner)
       (dynamic-wind
@@ -993,11 +1069,17 @@
         (lambda ()
           (if (rsend owner conv-router-name
                      (vector 'conv-peek-fwd (node-self) reply-name ref id))
-              (receive (after conv-forward-ttl-ms (values 'unreachable #f #f))
+              (receive (after conv-forward-ttl-ms
+                          (values 'unreachable #f #f record-not-read))
+                ;; wide first: an owner that answers narrow is simply one
+                ;; that has not been upgraded, and both must be accepted
+                ;; for as long as a mesh can be mixed -- which is always
+                (`#(conv-peek-reply ,@ref ,state ,token ,reply ,ev)
+                  (values state token reply (evidence->rec ev)))
                 (`#(conv-peek-reply ,@ref ,state ,token ,reply)
-                  (values state token reply))
-                (`#(node-down ,@owner) (values 'unreachable #f #f)))
-              (values 'unreachable #f #f)))
+                  (values state token reply record-not-read))
+                (`#(node-down ,@owner) (values 'unreachable #f #f record-not-read)))
+              (values 'unreachable #f #f record-not-read)))
         (lambda ()
           (demonitor-node owner)
           (receive (after 0 'ok) (`#(node-down ,@owner) 'ok))
@@ -1005,7 +1087,16 @@
           ;; behind it sits in this process's mailbox -- a pool worker's,
           ;; reused for unrelated work -- where a later broad receive can
           ;; read it as its own.
-          (receive (after 0 'ok) (`#(conv-peek-reply ,@ref ,a ,b ,c) 'ok))
+          ;; both shapes, or a late wide reply would sit in this process's
+          ;; mailbox -- a pool worker's, reused for unrelated work -- where
+          ;; some later broad receive reads it as its own
+          ;; ONE scan with both shapes, not two scans with one each: a
+          ;; reply landing between two separate drains would be missed by
+          ;; the first (not there yet) and by the second (wrong arity), and
+          ;; stay in a mailbox this process does not own for long.
+          (receive (after 0 'ok)
+            (`#(conv-peek-reply ,@ref ,a ,b ,c ,d) 'ok)
+            (`#(conv-peek-reply ,@ref ,a ,b ,c) 'ok))
           (unregister reply-name)))))
 
   ;; Forward a resume to the owner node and wait for its reply.
@@ -1022,9 +1113,10 @@
   ;; really is gone, which for a flow holding a transaction means the
   ;; connection dropped and the database rolled back. That is a fact about
   ;; a process, not about a network.
+  ;; -> (values reply status record), the same projection as forward-peek.
   (define (forward-resume owner id token req)
     (let ((reply-name (fresh-reply-name!))
-          (ref (fresh-ref!)))
+          (ref (- (fresh-ref!))))
       (register reply-name self)
       (monitor-node owner)
       (dynamic-wind
@@ -1036,10 +1128,14 @@
           ;; now -- from here they are indistinguishable.
           (if (rsend owner conv-router-name
                      (vector 'conv-resume (node-self) reply-name ref id token req))
-              (receive (after conv-forward-ttl-ms (values #f 'unreachable))
-                (`#(conv-forward-reply ,@ref ,reply ,status) (values reply status))
-                (`#(node-down ,@owner) (values #f 'unreachable)))
-              (values #f 'unreachable)))
+              (receive (after conv-forward-ttl-ms
+                          (values #f 'unreachable record-not-read))
+                (`#(conv-forward-reply ,@ref ,reply ,status ,ev)
+                  (values reply status (evidence->rec ev)))
+                (`#(conv-forward-reply ,@ref ,reply ,status)
+                  (values reply status record-not-read))
+                (`#(node-down ,@owner) (values #f 'unreachable record-not-read)))
+              (values #f 'unreachable record-not-read)))
         (lambda ()
           (demonitor-node owner)
           ;; demonitor-node does not retract a #(node-down ...) already
@@ -1051,7 +1147,10 @@
           ;; told the transaction had certainly rolled back.)
           (receive (after 0 'ok) (`#(node-down ,@owner) 'ok))
           ;; same for a reply that arrived after we stopped waiting
-          (receive (after 0 'ok) (`#(conv-forward-reply ,@ref ,a ,b) 'ok))
+          ;; one scan, both shapes -- see forward-peek's drain
+          (receive (after 0 'ok)
+            (`#(conv-forward-reply ,@ref ,a ,b ,c) 'ok)
+            (`#(conv-forward-reply ,@ref ,a ,b) 'ok))
           (unregister reply-name)))))
 
   ;; ---- on-killed health ---------------------------------------------------
@@ -2282,13 +2381,15 @@
   ;; say" into a confident wrong answer, and it must not take the caller
   ;; down either.
   ;;
-  ;; ...EXCEPT AGAINST A LOCAL WITNESS, which beats the predicate. This
-  ;; node watched commit!'s thunk return and wrote that down, so a #f --
+  ;; ...EXCEPT AGAINST A COMMIT WITNESS, which beats the predicate. Some
+  ;; node watched commit!'s thunk return and wrote that down -- this one,
+  ;; or the owner, which now sends its verdict back with the reply -- so a
+  ;; #f --
   ;; "durably not committed" -- is not new information filling a gap, it
   ;; is evidence CONTRADICTING evidence already in hand. A store that
   ;; lags, a read that landed on a replica, an id written under a
   ;; different key: any of them produce that #f, and honouring it answers
-  ;; 'gone for a transaction that this node saw commit -- which is a retry
+  ;; 'gone for a transaction some node saw commit -- which is a retry
   ;; invitation, and the one outcome the whole file is built to refuse. On
   ;; contradiction the honest answer is 'unknown: two sources disagree,
   ;; and neither of them is "it rolled back".
@@ -2299,14 +2400,28 @@
   ;; the only evidence there is, so it still resolves to 'gone. What
   ;; changed is only the one record that already says the commit happened.
   ;;
-  ;; ASYMMETRIC ACROSS A FORWARD, deliberately. The predicate is applied
-  ;; on the ASKING node, and for a forwarded resume the owner's tombstone
-  ;; is on the OWNER -- so there is no local witness to contradict and
-  ;; this check cannot fire. That is a defence for the local case only,
-  ;; and it is not a weakening of the forwarded one: the predicate's own
-  ;; contract (#f means the authoritative store holds no commit) is what
-  ;; carries both, and this adds a degenerate cross-check where a second,
-  ;; independent record happens to be within reach.
+  ;; THE WITNESS TRAVELS NOW, so this is no longer a local-only defence.
+  ;; The predicate is applied on the ASKING node while the tombstone lives
+  ;; on the OWNER, and for a while that meant a forwarded call could not
+  ;; be defended: the asking node had nothing to contradict a wrong #f
+  ;; with. The owner's verdict is carried back in the reply frame (see the
+  ;; router), so on a forwarded call `rec` here is this path's projection
+  ;; of that verdict -- the owner's tombstone never crosses the mesh.
+  ;;
+  ;; It is still not universal, and the gap is worth naming: an owner too
+  ;; old to send the verdict answers the narrow frame, `rec` is
+  ;; record-not-read, and the forwarded call falls back to trusting the
+  ;; predicate exactly as it always did. That is the predicate's own
+  ;; contract (#f means the authoritative store holds no commit) doing the
+  ;; work alone -- correct where the predicate is, which is the same
+  ;; assumption the whole `settled?` mechanism rests on.
+  ;;
+  ;; A CARRIED WITNESS CAN BE STALE, and it does not matter. It reports
+  ;; what the owner's record said at the moment it looked, and that record
+  ;; may be pruned while the reply is in flight. What it attests -- that commit!
+  ;; once returned -- is monotone: no eviction makes that untrue later. A
+  ;; stale witness can therefore only hold an answer at 'unknown, never
+  ;; open a path to 'gone.
   (define (resolve-unknown id status settled? rec)
     (if (and settled? (eq? status 'unknown))
         ;; call-with-values and a variadic consumer, both INSIDE the guard.
@@ -2358,8 +2473,11 @@
       (if (or (not owner) (eq? owner (node-self)))
           (let-values (((r status rec) (local-resume id token req)))
             (values r (resolve-unknown id status settled? rec)))
-          (let-values (((r status) (forward-resume owner id token req)))
-            (values r (resolve-unknown id status settled? record-not-read))))))
+          ;; the verdict now comes FROM THE OWNER when the owner can send
+          ;; one -- the whole point of the wide frame -- and this is its
+          ;; projection; record-not-read otherwise, exactly as before
+          (let-values (((r status rec) (forward-resume owner id token req)))
+            (values r (resolve-unknown id status settled? rec))))))
 
   ;; Resume a conversation that lives on THIS node.
   ;; -> (values reply next-token), where next-token is #f when the
@@ -2500,8 +2618,8 @@
       (if (or (not owner) (eq? owner (node-self)))
           (let-values (((state token reply rec) (local-peek id)))
             (values (resolve-unknown id state settled? rec) token reply))
-          (let-values (((state token reply) (forward-peek owner id)))
-            (values (resolve-unknown id state settled? record-not-read)
+          (let-values (((state token reply rec) (forward-peek owner id)))
+            (values (resolve-unknown id state settled? rec)
                     token reply)))))
 
   ;; -> (values state token last-reply record), the record as in local-resume

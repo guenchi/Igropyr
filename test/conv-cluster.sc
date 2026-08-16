@@ -117,6 +117,38 @@
                 (fail! "final-replay-across-link" r5)))
             (display "the final reply replays across the link ok\n")))))
 
+    ;; ---- the commit witness crosses the link -----------------------------
+    ;;
+    ;; The owner (b) holds a record saying committed-then-failed: its flow
+    ;; committed through commit! and then raised. This node's settled?
+    ;; predicate answers #f -- a lagging replica, a mismatched key. Locally
+    ;; that #f cannot demote a witnessed commit to 'gone; before the
+    ;; witness crossed the link, the SAME call forwarded to b answered
+    ;; 'gone, and a retry of a committed transaction is what 'gone invites.
+    (let ((wid (receive (after 10000 (fail! "witness-id-timeout"))
+                 (`#(conv-witness ,id) id)
+                 (`#(conv-witness-setup-failed ,r)
+                   (fail! "witness-setup-on-owner" r)))))
+      (let-values (((r st) (conversation-resume! wid "bogus" 'x
+                                                 (lambda (i) #f))))
+        (unless (eq? st 'unknown)
+          (fail! "a #f predicate overrode the owner's commit witness" st)))
+      ;; peek rides the same frames and takes the same protection
+      (let-values (((st tok reply) (conversation-peek wid (lambda (i) #f))))
+        (unless (eq? st 'unknown)
+          (fail! "peek let the predicate override the owner's witness" st))))
+    (display "a #f predicate cannot override the owner's commit witness ok\n")
+
+    ;; ...and where the owner has NO record, the predicate's demotion is
+    ;; legitimate and must keep working: an id shaped for b that b never
+    ;; issued forwards, finds nothing, and the #f answer is the only
+    ;; evidence there is.
+    (let-values (((r st) (conversation-resume! "b~deadbeef" "bogus" 'x
+                                               (lambda (i) #f))))
+      (unless (eq? st 'gone)
+        (fail! "an absent record no longer demotes across the link" st)))
+    (display "no record on the owner still demotes to 'gone ok\n")
+
     (rsend 'b 'ctrl (vector 'quit))     ; let the owner exit promptly
     (sleep-ms 200)
     (display "ALL CONV-CLUSTER TESTS PASSED\n")

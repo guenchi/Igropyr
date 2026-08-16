@@ -43,6 +43,22 @@
           (lambda (id token first-reply)
             (rsend 'a 'main (vector 'conv-id id token first-reply))))))
 
+    ;; A conversation whose commit THIS node witnessed, and which then
+    ;; failed: the record here says committed-then-failed, and the whole
+    ;; point of carrying the witness across the link is that node a's
+    ;; lagging predicate cannot turn that into a retry.
+    (let ((r (guard (e (#t e))
+               (conversation-start!
+                 (lambda (req suspend! commit!)
+                   (commit! (lambda () 'tx))
+                   (raise 'post-commit-cleanup-failure))
+                 0))))
+      ;; #(conversation-uncertain id outcome reason)
+      (unless (and (vector? r) (eq? (vector-ref r 0) 'conversation-uncertain))
+        (rsend 'a 'main (vector 'conv-witness-setup-failed r))
+        (exit 3))
+      (rsend 'a 'main (vector 'conv-witness (vector-ref r 1))))
+
     (let loop ()
       (receive
         (`#(quit) (exit 0))
