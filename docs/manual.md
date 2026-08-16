@@ -1552,11 +1552,11 @@ outcomes never share a position with it:
 | `'stale` | not applied, and will not be |
 | `'gone` | it left through its winders *before* `commit!` returned — for a transactional flow, rolled back |
 | `'unknown` | it is not here and this node cannot say whether it committed |
-| `'unreachable` | the owner node could not be reached; nothing is known |
+| `'unreachable` | no definite reply came back from the owner node — equally consistent with the request having arrived and the owner still working on it |
 
 `conversation-done?`, `conversation-settled?`, `conversation-stale?`,
-`conversation-gone?` and `conversation-unknown?` are applied to the
-*status*.
+`conversation-gone?`, `conversation-unknown?` and
+`conversation-unreachable?` are applied to the *status*.
 
 #### `'unknown` is not `'gone`
 
