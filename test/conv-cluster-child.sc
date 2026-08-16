@@ -75,6 +75,39 @@
         (exit 4))
       (rsend 'a 'main (vector 'conv-uncertain (vector-ref r 1))))
 
+    ;; A conversation that will be BUSY when the other node peeks at it:
+    ;; its first step holds the floor for seconds, so a forwarded peek
+    ;; parks in the waiting process rather than answering. That is the
+    ;; state node a needs in order to kill an asker mid-wait.
+    (spawn
+      (lambda ()
+        (call-with-values
+          (lambda ()
+            (conversation-start!
+              (lambda (req suspend! commit!)
+                (let ((a (suspend! (vector 'ready req))))
+                  (sleep-ms 8000)               ; holds the floor
+                  (vector 'slow-done a)))
+              0
+              30000))
+          (lambda (id token first-reply)
+            (rsend 'a 'main (vector 'conv-slow id token))))))
+
+    ;; a second one, so node a still has a live id to ask about after the
+    ;; link is cut
+    (spawn
+      (lambda ()
+        (call-with-values
+          (lambda ()
+            (conversation-start!
+              (lambda (req suspend! commit!)
+                (let ((a (suspend! (vector 'ready2 req))))
+                  (vector 'done2 a)))
+              0
+              30000))
+          (lambda (id token first-reply)
+            (rsend 'a 'main (vector 'conv-slow2 id token))))))
+
     (let loop ()
       (receive
         (`#(quit) (exit 0))

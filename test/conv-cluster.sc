@@ -13,7 +13,8 @@
 ;;;     the flow rolled back, and every flow in this file completes.)
 ;;;   - resuming an id whose owner node is unknown returns 'unreachable
 
-(import (chezscheme) (igropyr actor) (igropyr node) (igropyr conversation))
+(import (chezscheme) (igropyr actor) (igropyr node) (igropyr conversation)
+        (only (igropyr libuv) now-ms))
 
 (define port 18093)
 (define secret "conv-mesh-secret")
@@ -169,7 +170,75 @@
           (fail! "an authoritative #f could not resolve an uncertain commit" st))))
     (display "an uncertain commit answers unknown, and yields to an authoritative no ok\n")
 
-    (rsend 'b 'ctrl (vector 'quit))     ; let the owner exit promptly
+    ;; ---- killing an asker mid-wait reclaims what it armed ---------------
+    ;;
+    ;; A forwarded peek registers a reply name and arms a remote monitor,
+    ;; and puts its teardown in a dynamic-wind after-thunk -- which a kill
+    ;; discards. The registered name survives that (kill reclaims a dead
+    ;; process's aliases itself), but the monitor is the library's own
+    ;; problem: watching a NODE left the dead process in a global list that
+    ;; is only ever swept when that node next changes state, which on a
+    ;; mesh that stays up is never. Watching the ROUTER instead gives the
+    ;; monitor an owner agent that reclaims on DOWN -- the one teardown
+    ;; that outlives a kill.
+    ;;
+    ;; This is the case that needs two real nodes: the asker parks in a
+    ;; forwarded peek at a conversation that is BUSY, and is killed there.
+    (let ((slow (receive (after 10000 (fail! "slow-conv-timeout"))
+                  (`#(conv-slow ,id ,tk) (cons id tk)))))
+      ;; drive it into its long step FROM ANOTHER PROCESS: this resume does
+      ;; not return until that step ends, and waiting for it here would
+      ;; mean peeking at a conversation that has already finished
+      (spawn (lambda () (conversation-resume! (car slow) (cdr slow) 1)))
+      (sleep-ms 500)
+      (let ((base (cond ((assq 'rmonitors (node-monitor-stats)) => cdr) (else 0))))
+        (let ((asker (spawn (lambda () (conversation-peek (car slow))))))
+          (sleep-ms 400)                ; it is now parked in the forward
+          (let ((armed (cond ((assq 'rmonitors (node-monitor-stats)) => cdr) (else 0))))
+            ;; it really did arm one -- without this the reclaim below
+            ;; would also "pass" if nothing had ever been armed
+            (unless (> armed base)
+              (fail! "the forwarded peek armed no monitor -- nothing was tested"
+                     (list 'base base 'armed armed)))
+            (kill asker 'asker-died)
+            (let settle ((n 0))
+              (let ((now (cond ((assq 'rmonitors (node-monitor-stats)) => cdr)
+                               (else 0))))
+                (cond ((<= now base)
+                       (display "  [info] rmonitors ") (display base)
+                       (display " -> ") (display armed) (display " -> ")
+                       (display now) (newline))
+                      ((> n 30)
+                       (fail! "a killed asker left its remote monitor behind"
+                              (list 'base base 'armed armed 'now now)))
+                      (else (sleep-ms 100) (settle (+ n 1))))))))))
+    (display "killing an asker parked in a forwarded peek reclaims its monitor ok\n")
+
+    ;; ---- a link that really drops still ends the wait at once -----------
+    ;;
+    ;; What ends a forwarded wait is whether the link is up -- not what a
+    ;; remote-down said, since a reason is somebody else's exit reason or a
+    ;; stale broadcast. The other half of that rule has to hold too: when
+    ;; the link is genuinely gone, the caller must not sit until the
+    ;; forwarding TTL (five minutes) expires.
+    (let ((slow-id (car (receive (after 10000 (fail! "slow2-timeout"))
+                          (`#(conv-slow2 ,id ,tk) (cons id tk))))))
+      (rsend 'b 'ctrl (vector 'quit))
+      (receive (after 10000 (fail! "owner-never-went-down")) (`#(node-down b) 'ok))
+      (let ((t0 (now-ms)))
+        (let-values (((st tk rp) (conversation-peek slow-id)))
+          (let ((elapsed (- (now-ms) t0)))
+            (unless (eq? st 'unreachable)
+              (fail! "a peek across a dropped link did not answer unreachable" st))
+            ;; the point is the SPEED: waiting out conv-forward-ttl-ms would
+            ;; also produce 'unreachable, and would be the bug
+            (when (> elapsed 5000)
+              (fail! "the caller waited out the forwarding TTL instead of
+                      noticing the link" elapsed))
+            (display "  [info] peek across a dropped link answered in ")
+            (display elapsed) (display "ms\n")))))
+    (display "a dropped link ends a forwarded wait at once ok\n")
+
     (sleep-ms 200)
     (display "ALL CONV-CLUSTER TESTS PASSED\n")
     (exit 0)))
