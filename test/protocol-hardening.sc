@@ -22,6 +22,24 @@
       (begin (set! failures (+ failures 1))
              (display "FAIL  ") (display label) (newline))))
 
+;; THE INTERPRETER IS LOOKED UP, NOT ASSUMED. FreeBSD -- a platform
+;; this library is deployed on -- installs python3.11 and no
+;; `python3`, and what that produced here was not a missing
+;; interpreter: system() reported nothing, the result file never
+;; appeared, the poll below timed out, and the case announced that
+;; the SERVER had sent zero bytes. It read as the exact defect
+;; these two cases exist to catch, on both of the versions it was
+;; compared across, for months. A dependency this test cannot run
+;; without is either found or named -- never silently absent.
+(define python
+  (let try ((cs '("python3" "python3.13" "python3.12" "python3.11"
+                  "python3.10" "python")))
+    (cond ((null? cs) #f)
+          ((zero? (system (string-append (car cs)
+                            " -c 'import socket' >/dev/null 2>&1")))
+           (car cs))
+          (else (try (cdr cs))))))
+
 (define port 18778)
 
 ;; Neither of the smuggling-shaped requests below may be ACCEPTED. A 400
@@ -158,6 +176,18 @@
         (check "a partial request is eventually reaped"
           (memq outcome '(answered closed))))
 
+      ;; Reported through this file's own counter, and the run stops
+      ;; here: the two cases below cannot be attempted without it, and
+      ;; attempting them anyway is what produced a server-shaped failure
+      ;; the last time. Nothing needs tearing down at this point -- the
+      ;; tail of this file only reports.
+      (unless python
+        (check "python3 is available to drive a half-closing client" #f)
+        (display "       looked for: python3 python3.13 python3.12 python3.11 python3.10 python\n")
+        (display "       these two cases need a client outside this library\n")
+        (display failures) (display " failures\n")
+        (exit 1))
+
       ;; ---- a client that half-closes after its request ------------------
       ;;
       ;; shutdown(SHUT_WR) after a complete request is permitted (RFC 7230
@@ -195,7 +225,10 @@
         ;; produce while it is blocked -- the first version of this case
         ;; deadlocked exactly that way and reported zero bytes, which looks
         ;; identical to the defect being tested.
-        (system (string-append "python3 " py " >/dev/null 2>&1 &"))
+        ;; stderr is kept, not discarded: a script that dies halfway
+        ;; leaves the same empty result file as a server that said
+        ;; nothing, and only this file tells them apart
+        (system (string-append python " " py " >/dev/null 2>" py ".err &"))
         (let poll ((i 0))
           (when (and (< i 150) (not (file-exists? out)))
             (sleep-ms 100)
@@ -237,7 +270,10 @@
             (display "except Exception: pass\n" p)
             (display "open('" p) (display out p) (display "','wb').write(d)\n" p))
           'replace)
-        (system (string-append "python3 " py " >/dev/null 2>&1 &"))
+        ;; stderr is kept, not discarded: a script that dies halfway
+        ;; leaves the same empty result file as a server that said
+        ;; nothing, and only this file tells them apart
+        (system (string-append python " " py " >/dev/null 2>" py ".err &"))
         (let poll ((i 0))
           (when (and (< i 150) (not (file-exists? out)))
             (sleep-ms 100)

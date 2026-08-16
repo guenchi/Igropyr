@@ -245,10 +245,25 @@
 
 ;; python3's `cryptography` first, node second; each is a build of the
 ;; primitive this process did not make and does not link
+
+;; The interpreter is looked up by every name it ships under, not just
+;; the one this developer happens to have: FreeBSD installs python3.11
+;; and no `python3`, so a hard-coded name silently loses the peer this
+;; check exists to compare against -- and losing it looks exactly like
+;; not having it.
+(define python
+  (let try ((cs '("python3" "python3.13" "python3.12" "python3.11"
+                  "python3.10" "python")))
+    (cond ((null? cs) #f)
+          ((zero? (system (string-append (car cs)
+                            " -c 'import cryptography' >/dev/null 2>&1")))
+           (car cs))
+          (else (try (cdr cs))))))
+
 (define peer
-  (cond ((zero? (system (string-append
-                          "python3 -c 'import cryptography' >/dev/null 2>&1")))
-         (cons "python3-cryptography" (string-append "python3 " py-peer)))
+  (cond (python
+         (cons (string-append python "-cryptography")
+               (string-append python " " py-peer)))
         ((zero? (system "node -e 'require(\"crypto\")' >/dev/null 2>&1"))
          (cons "node-crypto" (string-append "node " js-peer)))
         (else #f)))
