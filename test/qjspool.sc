@@ -379,7 +379,34 @@ function eat(j){ return String(j.length); }
           (if (not p)
               (begin (sleep-ms 200) (loop (+ i 1)))
               (let-values (((k v) (qjspool-render p "hello" "{\"name\":\"up\"}")))
-                (if k p (begin (sleep-ms 200) (loop (+ i 1))))))))))
+                ;; a live connection whose render failed: closing it is
+                ;; not tidiness. The path is reached whenever connect
+                ;; succeeded and the render did not -- a worker not
+                ;; serving yet is the expected reason, but a bad bundle
+                ;; or an engine error lands here too -- and it costs one
+                ;; connection per retry, on the machine least able to
+                ;; spare the descriptors.
+                (if k p (begin (qjspool-close! p)
+                               (sleep-ms 200)
+                               (loop (+ i 1))))))))))
+
+;; -> #t when the worker at `port` served a real request, #f (loudly)
+;; when it never did. It must return rather than abort: `fail` only
+;; counts, so anything after it still runs, and the caller has cleanup --
+;; four workers to kill and a bundle to remove -- that must happen even
+;; on this path.
+(define (require-worker! label port)
+  (let* ((t0 (now-ms))
+         (w (await-worker! port 40)))
+    (cond
+      (w (qjspool-close! w)     ; readiness only: ask it to close, keep no handle
+         (display (string-append "  [info] " label " worker answered after "
+                                 (number->string (- (now-ms) t0))
+                                 "ms of waiting here\n"))
+         #t)
+      (else
+        (fail (string-append "the " label " worker never came up") port)
+        #f))))
 
 (start-scheduler
   (lambda ()
@@ -395,10 +422,47 @@ function eat(j){ return String(j.length); }
     (spawn-worker! "spin" spin-port 60000)   ; long engine deadline: the
                                              ; CALLER's timeout is what must
                                              ; end a runaway render here
-    (let ((probe (await-worker! good-port 40)))
+    ;; WAIT FOR EVERY WORKER, not just the first. Each is a whole Chez
+    ;; process loading the library, and four of them start at once; on a
+    ;; busy machine the later ones are still coming up while the cases
+    ;; that use them run. (The good worker is probed last and only if the
+    ;; other three answered: with one of them missing the run is over
+    ;; anyway, and dialling a fourth adds nothing to the report.)
+    ;;
+    ;; CONNECT COMPLETING IS NOT THE WORKER BEING READY. The kernel can
+    ;; finish the handshake on a listening socket whose process is not
+    ;; serving, so a probe connects, writes, and then waits out its own
+    ;; timeout -- and reports that as a deadline that never fired, which
+    ;; reads like a fault in the thing under test rather than a worker that
+    ;; was not there yet. Probes against a worker that never answers at all
+    ;; report the opposite ("no-connect"). Both were seen in the same run on
+    ;; a loaded machine, from workers that had no barrier.
+    ;;
+    ;; So the wait is a real round trip -- connect AND a render -- and it
+    ;; ends when the worker can serve rather than when it can be dialled.
+    ;; A missing worker is reported here, once, by name, instead of as a
+    ;; string of deadline failures in whichever cases happen to use it.
+    ;;
+    ;; The printed time is how long THIS wait took, not how long the
+    ;; worker took to start: the workers were spawned together, so a later
+    ;; barrier may find its worker already up and report little or no
+    ;; waiting at all.
+    (let* ((carry-up (require-worker! "carry" carry-port))
+           (half-up (require-worker! "half" half-port))
+           (spin-up (require-worker! "spin" spin-port))
+           ;; every one is asked before the gate, so a run missing two
+           ;; workers says so twice rather than stopping at the first
+           (probe (and carry-up half-up spin-up
+                       (await-worker! good-port 40))))
       (if (not probe)
-          (fail "the worker process never came up" good-port)
+          ;; ...but do not also blame the good worker for somebody else
+          (when (and carry-up half-up spin-up)
+            (fail "the worker process never came up" good-port))
           (begin
+            ;; readiness only, like the other three: the cases below open
+            ;; their own pools, so holding this one just leaves a
+            ;; connection parked for the length of the suite
+            (qjspool-close! probe)
             ;; ---- a render round trip ------------------------------------
             (let ((pool (qjspool (list (cons "127.0.0.1" good-port))
                                  '((render-timeout-ms . 2000)))))

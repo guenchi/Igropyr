@@ -17,6 +17,21 @@ fi
 export CHEZSCHEMELIBDIRS=.
 export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
 
+# A RUN THAT STOPPED EARLY MUST NOT READ LIKE A RUN THAT PASSED. set -e
+# is deliberate -- the suites are serial and expensive, and the first red
+# decides the round -- but its cost is that everything after the failure
+# is never executed, and "never executed" leaves exactly the same trace as
+# "executed and silent": nothing. A run that died in the middle has been
+# quoted as a whole-suite result more than once, and the suites it never
+# reached were counted as fine. This banner is the only thing standing
+# between those two readings.
+trap 'st=$?; if [ "$st" -ne 0 ]; then
+  echo ""
+  echo "=== PARTIAL RUN: STOPPED AT THE SUITE ABOVE (exit $st) ==="
+  echo "=== The suites after it were NOT RUN. This is not a whole-suite"
+  echo "=== result and must not be reported as one."
+fi' EXIT
+
 "$scheme_bin" --script igropyr/test/import-all.sc
 # the names applications import, each named ONE BY ONE: a rename that
 # rewrites a substring inside them moves every use with every definition,
@@ -232,4 +247,7 @@ if [ "$boot_status" -ne 70 ] || [ "$boot_panic" -eq 0 ] || [ "$boot_msg" -eq 0 ]
   exit 1
 fi
 echo "BOOT FAILURE PROPAGATION PASSED"
+
+# reached only when every suite above ran and passed
+echo "=== WHOLE SUITE RUN: every suite was reached ==="
 
