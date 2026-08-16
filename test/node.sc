@@ -152,6 +152,58 @@
         '(rmonitors caller-agents owner-agents)))
     (display "missing self monitors clean up exactly once ok\n")
 
+    ;; The arming step itself: the rmonitors entry and the owner agent
+    ;; must appear in ONE atomic region, or a kill between them roots a
+    ;; dead process in a table nothing sweeps. Aiming a kill at a
+    ;; two-statement gap is hopeless -- but a kill can only land where
+    ;; the victim yields, and a yield inside the gap means another
+    ;; runnable process can OBSERVE it: rmonitors > owner-agents. So
+    ;; spin -- never sleep; sleeping parks this process and hands the
+    ;; whole machine back to the victim -- and watch for the imbalance,
+    ;; killing the victim the moment it shows. set-timer on the victim
+    ;; walks its preemption point across the call; when the tick budget
+    ;; dies inside an atomic region, delivery happens at region exit,
+    ;; which in a split arming is exactly the gap. Proven to discriminate:
+    ;; against a tree with the two regions split back apart, this loop
+    ;; catches the gap and the entry survives with no agent -- LEAKED.
+    ;; Note the benign look-alike: teardown stops the agent just before
+    ;; it deletes the entry, so a transient rmon > own is NOT the gap;
+    ;; only an entry that survives the kill is.
+    (let ((mstat (lambda (k) (cdr (assq k (node-monitor-stats))))))
+      (let sweep ((k 1) (armed-seen 0))
+        (if (> k 60)
+            (begin
+              ;; the probe must prove it reached the state it tests:
+              ;; a sweep that never saw an armed monitor tested nothing
+              (when (zero? armed-seen)
+                (fail! "arming-window-probe-blind" armed-seen))
+              (unless (and (zero? (mstat 'rmonitors))
+                           (zero? (mstat 'owner-agents)))
+                (fail! "arming-window-residue"
+                       (mstat 'rmonitors) (mstat 'owner-agents))))
+            (let ((v (spawn (lambda ()
+                              (set-timer k)
+                              (monitor-remote 'a 'main)))))
+              (let ((deadline (+ (now-ms) 60)) (seen armed-seen))
+                (let poll ()
+                  (let ((r (mstat 'rmonitors)) (o (mstat 'owner-agents)))
+                    (when (> r 0) (set! seen (+ seen 1)))
+                    (cond
+                      ((> r o)
+                       (kill v 'caught-in-gap)
+                       (sleep-ms 200)
+                       (when (> (mstat 'rmonitors) 0)
+                         (fail! "arming-window-leaked" k
+                                (mstat 'rmonitors) (mstat 'owner-agents))))
+                      ((not (process-alive? v)) 'round-over)
+                      ((< (now-ms) deadline) (poll)))))
+                (when (process-alive? v) (kill v 'round-over))
+                (let settle ((n 0))
+                  (when (and (> (mstat 'rmonitors) 0) (< n 20))
+                    (sleep-ms 20) (settle (+ n 1))))
+                (sweep (+ k 1) seen))))))
+    (display "arming window: entry and agent inseparable under kill ok\n")
+
     ;; wrong secret: must never come up
     (spawn-child! "evil" "wrong-secret")
     (monitor-node 'evil)
