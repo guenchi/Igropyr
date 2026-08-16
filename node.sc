@@ -555,6 +555,23 @@
             (when entry (remove-target-watch! mref entry))))
         (`#(owner-stop) (demonitor m)))))
 
+  ;; THE ENTRY AND ITS RELEASER MUST APPEAR TOGETHER. The rmonitors entry
+  ;; roots the caller's pcb; the owner agent is the only thing that clears
+  ;; that entry when the caller dies. Written as two separate atomic steps
+  ;; they can be split by a kill, leaving an entry rooted with nothing left
+  ;; to release it -- reclaimed only if the link to that node later drops,
+  ;; which on a mesh that stays up never happens. That is precisely the
+  ;; leak this mechanism exists to prevent, moved one table over.
+  ;;
+  ;; Interrupts stay off across both, so no kill can land between them.
+  ;; install-owner-agent! disables them again inside; the counter nests.
+  ;; Its own rule -- publish the agent's pid before the agent can run --
+  ;; still holds, because nothing runs until this region ends.
+  (define (arm-rmonitor! mref node name)
+    (atomically
+      (hashtable-set! rmonitors mref (vector self node name))
+      (install-owner-agent! self mref)))
+
   (define (install-owner-agent! caller mref)
     ;; Publish the pid before it can run and observe an already-dead caller;
     ;; otherwise that fast DOWN path could delete the not-yet-present entry
@@ -893,16 +910,16 @@
     (let ((mref (next-mref!)))
       (cond
         ((eq? node self-name)
-         (atomically (hashtable-set! rmonitors mref (vector self node name)))
          ;; The owner must exist before the target agent can report DOWN;
          ;; otherwise that fast path cannot stop it and leaves another dead
-         ;; agent rooted after the monitor has already completed.
-         (install-owner-agent! self mref)
+         ;; agent rooted after the monitor has already completed. It must
+         ;; also exist before this process can be killed -- see
+         ;; arm-rmonitor!, which is why the two are one step.
+         (arm-rmonitor! mref node name)
          (install-self-agent! self mref name))
         ((live-entry node)
          => (lambda (e)
-               (atomically (hashtable-set! rmonitors mref (vector self node name)))
-               (install-owner-agent! self mref)
+               (arm-rmonitor! mref node name)
               ;; no origin field: the target derives the watcher from the
               ;; authenticated far end of this very link (see dispatch!)
               (write-frame! (vector-ref e 0) (list 'mon name mref))))

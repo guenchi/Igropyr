@@ -2592,5 +2592,103 @@
       (fail "the hook was not told #t after an uncertainty signal" (unbox seen)))
     (display "on-killed is told #t for a possibly-effective commit ok\n")))
 
+;; ---- asking without waiting for the step to finish -----------------------
+;;
+;; conversation-peek answers a RUNNING conversation only when its step
+;; parks -- which is right for reconciliation and useless on a request
+;; path, where the asker is killed long before a step that may run for
+;; minutes gives up the floor. The bounded form answers 'no-answer-yet
+;; instead, which is not 'unknown: the prohibition is the same (neither
+;; licenses starting a replacement) but the next move is not. Ask again
+;; on 'no-answer-yet; reconcile on 'unknown.
+(let* ((h (conversation-prepare!
+            (lambda (req suspend! commit!)
+              (let ((a (suspend! (vector 'parked req))))
+                (sleep-ms 4000)                 ; a step that holds the floor
+                (vector 'done a)))
+            'go 20000))
+       (id (conversation-ref-id h)))
+  (let-values (((tok first) (conversation-run! h)))
+    ;; drive it into the long step, from a process that will not wait
+    (spawn (lambda () (conversation-resume! id tok 'go)))
+    (sleep-ms 200)
+    ;; ...the conversation is now RUNNING and will not park for seconds
+    (let ((before (process-count))
+          (peeking (box 'unset))
+          (during (box 0)))
+      ;; a sampler that observes the probe WHILE the bounded peek waits.
+      ;; Without it, "the count came back" would also hold if no probe was
+      ;; ever spawned -- the same shape as a broken probe agreeing with
+      ;; the answer it was meant to test.
+      (spawn (lambda () (sleep-ms 150) (set-box! during (process-count))))
+      (let ((t0 (now-ms)))
+        (let-values (((st tok2 reply) (conversation-peek/timeout id 600)))
+          (set-box! peeking st)
+          (let ((elapsed (- (now-ms) t0)))
+            (unless (conversation-no-answer-yet? st)
+              (fail "a bounded peek on a running step did not answer no-answer-yet" st))
+            (when (> elapsed 2000)
+              (fail "the bounded peek waited far past its budget" elapsed))
+            (display "  [info] bounded peek returned in ") (display elapsed)
+            (display "ms, processes ") (display before) (display " -> ")
+            (display (unbox during)) (display " -> "))))
+      ;; the probe existed (the sampler saw it) and is gone again
+      (unless (> (unbox during) before)
+        (fail "no probe was ever spawned -- the case tested nothing"
+              (list 'before before 'during (unbox during))))
+      (let settle ((n 0))
+        (cond ((<= (process-count) before)
+               (display (process-count)) (newline))
+              ((> n 20)
+               (fail "the bounded peek left a process behind"
+                     (list 'before before 'after (process-count))))
+              (else (sleep-ms 100) (settle (+ n 1)))))
+      ;; ...and it did NOT advance the flow: the step is still the one we
+      ;; started, and the conversation completes normally afterwards
+      (let-values (((st2 tok3 reply2) (conversation-peek id)))
+        (unless (memq st2 '(running parked completed))
+          (fail "the conversation was disturbed by a bounded peek" st2)))))
+  (display "a bounded peek answers without waiting for the step ok\n"))
+
+;; ...and a parked conversation answers immediately, with the real thing:
+;; the bounded form is not a degraded peek, it is the same answer under a
+;; deadline.
+(let* ((h (conversation-prepare!
+            (lambda (req suspend! commit!)
+              (let ((a (suspend! (vector 'parked req))))
+                (vector 'done a)))
+            'go 20000))
+       (id (conversation-ref-id h)))
+  (let-values (((tok first) (conversation-run! h)))
+    (let-values (((st tok2 reply) (conversation-peek/timeout id 2000)))
+      (unless (eq? st 'parked)
+        (fail "a parked conversation was not seen by the bounded peek" st))
+      (unless (equal? tok2 tok)
+        (fail "the bounded peek returned a different token" (list tok2 tok)))
+      (unless (and (vector? reply) (eq? (vector-ref reply 0) 'parked))
+        (fail "the bounded peek lost the reply" reply)))
+    ;; an id nobody ever ran is 'unknown, NOT 'no-answer-yet: we did get an
+    ;; answer, and the answer is that nothing here knows it
+    (let-values (((st tok2 reply) (conversation-peek/timeout "nope~deadbeef" 500)))
+      (when (conversation-no-answer-yet? st)
+        (fail "an absent id was reported as no-answer-yet" st)))
+    (let-values (((r st) (conversation-resume! id tok 'go)))
+      (unless (conversation-done? st) (fail "bounded-peek subject did not finish" st))))
+  (display "a bounded peek on a parked conversation is the ordinary answer ok\n"))
+
+;; ...and the deadline is the caller's to state: no default, and nothing
+;; that is not a positive exact count of milliseconds.
+(let ((refused
+       (lambda (t)
+         (guard (e (#t (if (assertion-violation? e) 'refused e)))
+           (conversation-peek/timeout "nope~deadbeef" t)
+           'accepted))))
+  (for-each
+    (lambda (bad)
+      (unless (eq? 'refused (refused bad))
+        (fail "a bad timeout was accepted" bad)))
+    (list 0 -1 1.5 'soon)))
+(display "a bounded peek refuses a timeout that is not a positive exact ms ok\n")
+
 (display "ALL CONVERSATION TESTS PASSED\n")
     (exit 0)))

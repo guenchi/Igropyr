@@ -38,13 +38,14 @@
               conversation-unreachable?
               conversation-set-limits! conversation-hook-stats
               conversation-prepare! conversation-run!
-              conversation-abandon! conversation-ref-id)
+              conversation-abandon! conversation-ref-id
+              conversation-peek/timeout conversation-no-answer-yet?)
         ;; the same predicates again, from the library that has no
         ;; initialisation of its own: a pure consumer imports THIS one, and
         ;; that it exports the whole vocabulary is part of the public face
         (only (igropyr conversation-status)
               conversation-gone? conversation-stale? conversation-done?
               conversation-settled? conversation-unknown?
-              conversation-unreachable?))
+              conversation-unreachable? conversation-no-answer-yet?))
 
 (display "public names: all present\n")

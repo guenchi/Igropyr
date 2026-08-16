@@ -139,6 +139,15 @@
 ;;;       'unreachable. Look again. Do NOT read either as licence to start
 ;;;       a second attempt -- that licence comes only from reconciling
 ;;;       downstream, or from the downstream operation being idempotent.
+;;;     'no-answer-yet -> only from conversation-peek/timeout, and under
+;;;       the same prohibition: it is not licence to start anything. What
+;;;       differs is the remedy. 'unknown and 'unreachable say this
+;;;       library cannot tell you what happened, so go and reconcile
+;;;       against your own records. 'no-answer-yet says only that nothing
+;;;       arrived within the limit -- typically a conversation still in a
+;;;       step, which does not answer until it parks -- so ask again.
+;;;       Reconciling on it risks reconciling against a conversation that
+;;;       is alive and was about to answer.
 ;;;
 ;;;   ONE ADOPTER. Two recoverers both peek and both see the same token;
 ;;;   the first resume! wins and the other is 'stale (or replayed, if its
@@ -156,6 +165,12 @@
 ;;;   AFTER A RESTART the process is gone and so is the conversation. A
 ;;;   local peek on an old id answers 'unknown; a remote one answers
 ;;;   'unreachable until the restarted owner has built its router.
+;;;   That wait is not shortened by the router being absent. The
+;;;   forwarding path does watch the owner's router, but only so the
+;;;   watch can be cleaned up after a kill -- what ENDS the wait is the
+;;;   reply, the link going down, or the forwarding TTL. An owner that is
+;;;   up but has no router yet is still reachable, and saying otherwise
+;;;   on its behalf would be a guess about a node that is plainly there.
 ;;;
 ;;; A FLOW COMMITS THROUGH commit!, and the library learns what the flow
 ;;; is able to say about the transaction, at the moment the flow can say
@@ -415,6 +430,7 @@
 
 (library (igropyr conversation)
   (export conversation-start! conversation-resume! conversation-peek
+          conversation-peek/timeout
           conversation-prepare! conversation-run! conversation-abandon!
           conversation-ref-id
           conversation-set-limits! conversation-hook-stats
@@ -422,11 +438,12 @@
           ;; importing this library still gives the whole vocabulary
           conversation-gone? conversation-stale? conversation-done?
           conversation-settled? conversation-unknown?
-          conversation-unreachable?)
+          conversation-unreachable? conversation-no-answer-yet?)
   (import (chezscheme) (igropyr actor)
           (igropyr conversation-status)
           (only (igropyr libuv) now-ms)
-          (only (igropyr node) node-self rsend monitor-node demonitor-node))
+          (only (igropyr node)
+                node-self rsend node-peers monitor-remote demonitor-remote))
 
   (define default-ttl-ms 300000)      ; 5 minutes
 
@@ -1156,46 +1173,204 @@
   ;; send a verdict, a verdict saying there is no witness, an unreadable
   ;; one, or any failure to get an answer at all. It is never a tombstone
   ;; value the owner did not vouch for.
+  ;; WATCHING THE ROUTER, NOT THE NODE, because this process can be
+  ;; KILLED and a kill discards its winders. The after-thunk below is
+  ;; therefore not a teardown anything may depend on: whatever it releases
+  ;; must ALSO be reclaimable by something that outlives the kill.
+  ;;
+  ;; The registered reply name is: the scheduler drops every alias of a
+  ;; process it kills. A node-level watcher is not. It sits in a table
+  ;; swept only when that node's up/down actually fires, so on a mesh that
+  ;; never flaps, a killed process's entry -- and the dead pcb it points
+  ;; at -- stays there for the life of the VM. The sweep exists; it is
+  ;; just driven by an event that a healthy cluster never produces, which
+  ;; is the worst shape for a leak: correct on the path anyone tests, and
+  ;; unbounded on the path that actually runs.
+  ;;
+  ;; monitor-remote instead installs an agent that monitors THIS process
+  ;; and dismantles the monitor when it goes down -- reclamation by an
+  ;; owner that survives the kill, the same discipline a lease pool uses.
+  ;; Earlier detection is not why it is here -- see the rule below, where
+  ;; every remote-down defers to the link's own state. It does still
+  ;; produce some: when the link really has dropped, this message is what
+  ;; brings the wait to an end before the TTL would.
+  ;;
+  ;; The mref is #f when this node was never named. monitor-remote
+  ;; requires node-start! where the node-level watcher did not, and an id
+  ;; minted on a cluster can be handed to a node that never joined one --
+  ;; ids travel as bearer tokens. That has to keep answering 'unreachable
+  ;; rather than start raising.
+  ;;
+  ;; THE LINK'S STATE ENDS THE WAIT, NOT THE remote-down. The watch is
+  ;; here for cleanup that survives a kill, NOT to detect failures
+  ;; earlier, and those are different jobs. So a remote-down is treated as
+  ;; a prompt to go and look, and what is looked at is whether the owner
+  ;; is still a live peer. If it is, the message said nothing about this
+  ;; request and the wait continues unwatched -- which is exactly the
+  ;; world this path lived in before there was a watch at all, ended by
+  ;; the reply or the TTL. A false 'unreachable is far worse than a slow
+  ;; true one: on a resume it sends a caller to reconcile a step that ran.
+  ;;
+  ;; THE REASON FIELD CANNOT CARRY THIS DECISION, which is worth spelling
+  ;; out because trusting it is the obvious thing to do and it is wrong
+  ;; three separate ways. 'noconnection is not evidence that the link for
+  ;; THIS call is down:
+  ;;   - a target's exit reason is relayed verbatim, so a router killed
+  ;;     with the reason 'noconnection produces one that has nothing to do
+  ;;     with connectivity;
+  ;;   - monitor-remote queues one immediately when there is no link at
+  ;;     the moment of asking, and the link can be back before the request
+  ;;     is sent;
+  ;;   - remote-down carries no ref, so one left over from an earlier call
+  ;;     is matched by a later call -- over a link that may since have
+  ;;     been rebuilt and be working.
+  ;; Each of those turns a healthy owner into 'unreachable. The peer list
+  ;; has none of the problem: it is the state of the link now rather than
+  ;; a claim about it earlier, and it belongs to no particular call. (Not
+  ;; an atomic snapshot either -- the peer keys are taken under one lock
+  ;; and then tested one by one, so a busy moment can be read across
+  ;; several. It does not need to be exact: what it must not do is speak
+  ;; for a different call, and it cannot.) A stale message can still send
+  ;; us to look; it cannot decide what we find.
+  ;;
+  ;; Two other reasons deserve naming, because they show why the reason
+  ;; field would be the wrong input even if it were trustworthy:
+  ;;   'overload -- the owner's monitor quota is full. That is all it
+  ;;     says: it is not a statement about the router, which may be
+  ;;     serving this very call. It fires under LOAD rather than under
+  ;;     partition, so trusting it would manufacture 'unreachable
+  ;;     systematically, exactly when a cluster is busiest.
+  ;;   the router dying -- the router only spawns a worker per request,
+  ;;     and a worker it has ALREADY spawned outlives it and still
+  ;;     replies. Giving up would discard an answer on its way. (Dying
+  ;;     before it dispatches leaves no worker, and that call does wait
+  ;;     out the TTL -- the wait is still right, just unrewarded.)
+  ;;
+  ;; WHAT THIS COSTS THE OWNER, because it is not free and the next person
+  ;; to tune it should see the bill. monitor-node was purely local: it
+  ;; touched a table here and sent nothing. A remote monitor occupies a
+  ;; hosting slot on the OWNER plus an agent process there, for as long as
+  ;; the call lasts -- and a forwarded resume can last a long time. The
+  ;; ceiling (node-set-limits!) is shared with every other monitor-remote
+  ;; user on that node. Reaching it DEGRADES rather than fails: refused
+  ;; watches fall back to the unwatched wait above. The trade is a bounded
+  ;; remote cost with a graceful ceiling in place of an unbounded local
+  ;; leak that never self-heals -- but it is a trade, not a free win.
   (define (forward-peek owner id)
     (let ((reply-name (fresh-reply-name!))
           ;; negative: this node can read the wide reply (see the router)
-          (ref (- (fresh-ref!))))
+          (ref (- (fresh-ref!)))
+          (router conv-router-name))
       (register reply-name self)
-      (monitor-node owner)
-      (dynamic-wind
-        (lambda () (void))
-        (lambda ()
-          (if (rsend owner conv-router-name
-                     (vector 'conv-peek-fwd (node-self) reply-name ref id))
-              (receive (after conv-forward-ttl-ms
-                          (values 'unreachable #f #f record-not-read))
-                ;; wide first: an owner that answers narrow is simply one
-                ;; that has not been upgraded, and both must be accepted
-                ;; for as long as a mesh can be mixed -- which is always
-                (`#(conv-peek-reply ,@ref ,state ,token ,reply ,ev)
-                  (values state token reply (evidence->rec ev)))
-                (`#(conv-peek-reply ,@ref ,state ,token ,reply)
-                  (values state token reply record-not-read))
-                (`#(node-down ,@owner) (values 'unreachable #f #f record-not-read)))
-              (values 'unreachable #f #f record-not-read)))
-        (lambda ()
-          (demonitor-node owner)
-          (receive (after 0 'ok) (`#(node-down ,@owner) 'ok))
-          ;; and the answer itself, if it landed after we gave up. Left
-          ;; behind it sits in this process's mailbox -- a pool worker's,
-          ;; reused for unrelated work -- where a later broad receive can
-          ;; read it as its own.
-          ;; both shapes, or a late wide reply would sit in this process's
-          ;; mailbox -- a pool worker's, reused for unrelated work -- where
-          ;; some later broad receive reads it as its own
-          ;; ONE scan with both shapes, not two scans with one each: a
-          ;; reply landing between two separate drains would be missed by
-          ;; the first (not there yet) and by the second (wrong arity), and
-          ;; stay in a mailbox this process does not own for long.
-          (receive (after 0 'ok)
-            (`#(conv-peek-reply ,@ref ,a ,b ,c ,d) 'ok)
-            (`#(conv-peek-reply ,@ref ,a ,b ,c) 'ok))
-          (unregister reply-name)))))
+      (let ((mref (and (node-self) (monitor-remote owner router))))
+        (dynamic-wind
+          (lambda () (void))
+          (lambda ()
+            (if (rsend owner router
+                       (vector 'conv-peek-fwd (node-self) reply-name ref id))
+                (let loop ((deadline (+ (now-ms) conv-forward-ttl-ms)))
+                  (let ((left (- deadline (now-ms))))
+                    (if (<= left 0)
+                        ;; ONE LAST LOOK BEFORE GIVING UP, and it is not
+                        ;; optional. A plain receive drains its mailbox
+                        ;; before it ever runs a timeout handler, so a
+                        ;; reply already queued always beats the clock.
+                        ;; Looping re-checks the deadline OUTSIDE any
+                        ;; receive, which throws that away: consume a
+                        ;; stale remote-down, come back to find the
+                        ;; deadline has just passed, and an answer sitting
+                        ;; behind it in the same mailbox would never be
+                        ;; looked at. The unrelated message would decide
+                        ;; the call. This scan restores that precedence
+                        ;; for THIS CALL'S REPLY, which is the part that
+                        ;; was lost -- not the whole FIFO order of the
+                        ;; original single receive, since it deliberately
+                        ;; does not match remote-down (see below).
+                        (receive (after 0
+                                    (values 'unreachable
+                                            #f #f record-not-read))
+                          (`#(conv-peek-reply ,@ref ,state ,token ,reply ,ev)
+                            (values state token reply (evidence->rec ev)))
+                          (`#(conv-peek-reply ,@ref ,state ,token ,reply)
+                            (values state token reply record-not-read)))
+                        (receive (after left
+                                    (values 'unreachable
+                                            #f #f record-not-read))
+                          ;; wide first: an owner that answers narrow is
+                          ;; simply one that has not been upgraded, and both
+                          ;; must be accepted for as long as a mesh can be
+                          ;; mixed -- which is always.
+                          ;;
+                          ;; That tolerance is for the CONVERSATION
+                          ;; protocol only. Watching the router needs the
+                          ;; node layer's monitor frame, so a peer old
+                          ;; enough to predate that frame is not a mixed
+                          ;; version this path degrades against -- it would
+                          ;; treat the frame as unknown and drop the link.
+                          ;; The mesh floor is the node protocol, not this
+                          ;; file's.
+                          (`#(conv-peek-reply ,@ref ,state ,token ,reply ,ev)
+                            (values state token reply (evidence->rec ev)))
+                          (`#(conv-peek-reply ,@ref ,state ,token ,reply)
+                            (values state token reply record-not-read))
+                          (`#(remote-down ,@owner ,@router ,why)
+                            (if (memq owner (node-peers))
+                                (loop deadline)
+                                (values 'unreachable
+                                        #f #f record-not-read)))))))
+                (values 'unreachable #f #f record-not-read)))
+          (lambda ()
+            ;; Unregister and demonitor BEFORE draining. This closes more
+            ;; than the other order did -- a reply arriving between a drain
+            ;; and a later unregister would be neither consumed nor
+            ;; prevented -- but it does NOT make the drain exhaustive, and
+            ;; the difference matters enough to name.
+            ;;
+            ;; Two interleavings still get past it, both because delivery
+            ;; is decided a step before it happens:
+            ;;   - a forwarded reply is dispatched as `whereis` and THEN
+            ;;     `send`. Preempted between the two, this process can
+            ;;     unregister and drain, and the send still lands on the
+            ;;     pid already in hand.
+            ;;   - a remote-down is fired by deleting the monitor entry and
+            ;;     THEN sending. Preempted between the two, demonitor-remote
+            ;;     finds nothing to cancel and the drain sees nothing, and
+            ;;     the message arrives afterwards.
+            ;; Neither can be closed from this side; both would have to be
+            ;; made atomic where they are produced.
+            ;;
+            ;; A leftover reply is claimed by no later call of this kind
+            ;; -- its ref is unique to this one. That is not the same as
+            ;; harmless: this process is typically a pooled worker, and a
+            ;; broad receive in whatever it does next can still take the
+            ;; message, which is the whole reason it is drained here at
+            ;; all. A leftover remote-down is worse:
+            ;; it carries no ref, so the next forward from this process to
+            ;; the same owner and router matches it immediately. What makes
+            ;; that survivable is that matching it decides nothing: the
+            ;; rule above then reads the live peer list, and a stale
+            ;; message about a link that is now up costs a loop and a scan
+            ;; of the peers rather than producing a false 'unreachable. It
+            ;; is not free -- a backlog of them is a scan apiece -- and the
+            ;; deadline is what bounds it. An earlier version of this
+            ;; comment claimed the reason value made the leftover safe --
+            ;; it does not, and that is precisely why the decision was
+            ;; moved off the reason and onto the link.
+            (unregister reply-name)
+            (when mref (demonitor-remote mref))
+            ;; Neither call retracts what is already queued: demonitor-remote
+            ;; does not cancel a remote-down in flight, and a reply sent
+            ;; before the unregister has already been placed. So both still
+            ;; have to be drained.
+            (receive (after 0 'ok)
+              (`#(remote-down ,@owner ,@router ,why) 'ok))
+            ;; ONE scan with both shapes, not two scans with one each: a
+            ;; reply landing between two separate drains would be missed by
+            ;; the first (not there yet) and by the second (wrong arity), and
+            ;; stay in a mailbox this process does not own for long.
+            (receive (after 0 'ok)
+              (`#(conv-peek-reply ,@ref ,a ,b ,c ,d) 'ok)
+              (`#(conv-peek-reply ,@ref ,a ,b ,c) 'ok)))))))
 
   ;; Forward a resume to the owner node and wait for its reply.
   ;;
@@ -1216,44 +1391,79 @@
   ;; this library does not hold -- see resolve-unknown, which is where that
   ;; authority is bounded.)
   ;; -> (values reply status record), the same projection as forward-peek.
+  ;; Watches the owner's router rather than the node, and for the same
+  ;; kill-safety reason -- see forward-peek, where it is written out.
   (define (forward-resume owner id token req)
     (let ((reply-name (fresh-reply-name!))
-          (ref (- (fresh-ref!))))
+          (ref (- (fresh-ref!)))
+          (router conv-router-name))
       (register reply-name self)
-      (monitor-node owner)
-      (dynamic-wind
-        (lambda () (void))
-        (lambda ()
-          ;; rsend is #f when the link is already down. That, a node-down
-          ;; mid-flight, and the forwarding TTL are all the same statement:
-          ;; unreachable. The owner may be dead, or may be committing right
-          ;; now -- from here they are indistinguishable.
-          (if (rsend owner conv-router-name
-                     (vector 'conv-resume (node-self) reply-name ref id token req))
-              (receive (after conv-forward-ttl-ms
-                          (values #f 'unreachable record-not-read))
-                (`#(conv-forward-reply ,@ref ,reply ,status ,ev)
-                  (values reply status (evidence->rec ev)))
-                (`#(conv-forward-reply ,@ref ,reply ,status)
-                  (values reply status record-not-read))
-                (`#(node-down ,@owner) (values #f 'unreachable record-not-read)))
-              (values #f 'unreachable record-not-read)))
-        (lambda ()
-          (demonitor-node owner)
-          ;; demonitor-node does not retract a #(node-down ...) already
-          ;; delivered. Left behind, a LATER forward to the same owner --
-          ;; after it rebooted -- would match that stale message at once
-          ;; and answer 'unreachable at once for an owner that is in fact
-          ;; up -- turning a healthy forward into a false failure. Drain it.
-          ;; (This used to answer 'gone, which was worse: the caller was
-          ;; told the transaction had certainly rolled back.)
-          (receive (after 0 'ok) (`#(node-down ,@owner) 'ok))
-          ;; same for a reply that arrived after we stopped waiting
-          ;; one scan, both shapes -- see forward-peek's drain
-          (receive (after 0 'ok)
-            (`#(conv-forward-reply ,@ref ,a ,b ,c) 'ok)
-            (`#(conv-forward-reply ,@ref ,a ,b) 'ok))
-          (unregister reply-name)))))
+      (let ((mref (and (node-self) (monitor-remote owner router))))
+        (dynamic-wind
+          (lambda () (void))
+          (lambda ()
+            ;; rsend is #f when the link is already down. That, the link
+            ;; dropping mid-flight, and the forwarding TTL are all the
+            ;; same statement: unreachable. The owner may be dead, or may
+            ;; be committing right now -- from here they are
+            ;; indistinguishable. The ROUTER going down is not on that
+            ;; list: a worker it has already spawned outlives it and
+            ;; answers, so that case waits like any other -- see the rule
+            ;; at the receive below. (A router that dies before dispatching
+            ;; leaves no worker and nothing to wait for, and that call does
+            ;; run out the TTL.)
+            (if (rsend owner router
+                       (vector 'conv-resume (node-self) reply-name ref
+                               id token req))
+                (let loop ((deadline (+ (now-ms) conv-forward-ttl-ms)))
+                  (let ((left (- deadline (now-ms))))
+                    (if (<= left 0)
+                        ;; last look before giving up -- see forward-peek:
+                        ;; without it a stale remote-down consumed at the
+                        ;; deadline would hide an answer queued behind it
+                        (receive (after 0
+                                    (values #f 'unreachable record-not-read))
+                          (`#(conv-forward-reply ,@ref ,reply ,status ,ev)
+                            (values reply status (evidence->rec ev)))
+                          (`#(conv-forward-reply ,@ref ,reply ,status)
+                            (values reply status record-not-read)))
+                        (receive (after left
+                                    (values #f 'unreachable record-not-read))
+                          (`#(conv-forward-reply ,@ref ,reply ,status ,ev)
+                            (values reply status (evidence->rec ev)))
+                          (`#(conv-forward-reply ,@ref ,reply ,status)
+                            (values reply status record-not-read))
+                          (`#(remote-down ,@owner ,@router ,why)
+                            ;; see forward-peek: the LINK's current state
+                            ;; decides, not the reason. Here a premature
+                            ;; give-up is worse than there -- this call may
+                            ;; have ALREADY advanced the flow on the owner,
+                            ;; and the caller would be sent to reconcile a
+                            ;; step that in fact ran.
+                            (if (memq owner (node-peers))
+                                (loop deadline)
+                                (values #f 'unreachable record-not-read)))))))
+                (values #f 'unreachable record-not-read)))
+          (lambda ()
+            ;; stop new deliveries, then drain -- see forward-peek
+            (unregister reply-name)
+            (when mref (demonitor-remote mref))
+            ;; demonitor-remote does not retract a #(remote-down ...)
+            ;; already delivered. Left behind, a LATER forward to the same
+            ;; owner matches that stale message at once -- it carries no
+            ;; ref to tell the calls apart. It no longer decides anything
+            ;; on its own (the rule at the receive reads the live peer
+            ;; list, so a recovered owner just costs a loop), but draining
+            ;; it here is what keeps that cost from accumulating.
+            ;; (This used to answer 'gone, which was worse: the caller was
+            ;; told the transaction had certainly rolled back.)
+            (receive (after 0 'ok)
+              (`#(remote-down ,@owner ,@router ,why) 'ok))
+            ;; same for a reply that arrived after we stopped waiting
+            ;; one scan, both shapes -- see forward-peek's drain
+            (receive (after 0 'ok)
+              (`#(conv-forward-reply ,@ref ,a ,b ,c) 'ok)
+              (`#(conv-forward-reply ,@ref ,a ,b) 'ok)))))))
 
   ;; ---- on-killed health ---------------------------------------------------
   ;;
@@ -2865,6 +3075,9 @@
   ;;      'unreachable -- the owner node could not be reached; nothing is
   ;;                    known, exactly as for a resume
   ;;
+  ;; conversation-peek/timeout answers from this same set plus one more,
+  ;; 'no-answer-yet, which THIS entry point never returns: it waits.
+  ;;
   ;; This exists because 'unreachable is not a rollback guarantee and never
   ;; can be: a broken link says nothing about the process behind it. A
   ;; caller left holding that answer had no way to ever settle the
@@ -2875,6 +3088,11 @@
   ;; RUNNING is answered when that step parks, so it can take as long as
   ;; the step does (bounded by the TTL). Reconciliation is not on a
   ;; latency path; taking the answer early would mean guessing.
+  ;;
+  ;; A caller that DOES have a deadline wants conversation-peek/timeout,
+  ;; which gives up at a stated bound and says so, rather than guessing.
+  ;; This unbounded form stays the default: the answer it waits for is the
+  ;; conversation's own, and for reconciliation that is worth waiting for.
   (define (conversation-peek id . rest)
     (let ((owner (conv-owner id))
           (settled? (opt-settled? rest 'conversation-peek)))
@@ -2885,8 +3103,162 @@
             (values (resolve-unknown id state settled? rec)
                     token reply)))))
 
+  ;; ---- bounded peek ------------------------------------------------------
+  ;;
+  ;; conversation-peek waits for a RUNNING conversation to reach its next
+  ;; park, which is unbounded by design: the question is answered by the
+  ;; conversation itself, between steps. That is the right default and the
+  ;; wrong thing to have on a latency path, where the asker is usually a
+  ;; request handler with a deadline far shorter than a conversation TTL.
+  ;;
+  ;; Told not to use peek there, a caller's only remaining move is to run
+  ;; it in a process of their own and kill that process on a timer -- and
+  ;; that is precisely the shape the forwarding paths above had to be made
+  ;; safe for. A library whose documented workaround lands on its own
+  ;; unsafe path should provide the bounded form instead.
+  ;;
+  ;; WHY A THROWAWAY PROCESS IS UNAVOIDABLE. The obvious cheaper design --
+  ;; keep one process, put `after timeout-ms` on the caller's own receive
+  ;; -- does not work, and its failure is not visible from the timeout
+  ;; path itself. The answer is not late-and-queued; it does not exist
+  ;; yet. The conversation reaches its park AFTER the caller gave up, and
+  ;; only then sends. A drain of the mailbox cannot collect a send that
+  ;; has not happened, so the message lands later, in whatever this
+  ;; process has become -- typically a pooled worker already serving an
+  ;; unrelated request, where some broader receive can take it.
+  ;;
+  ;; Killing a process closes that off, and nothing else does: after the
+  ;; kill the inbox is gone and @send drops every later message on the
+  ;; floor. On one OS thread there is no third interleaving -- the send
+  ;; either happened before the kill (so it is in the mailbox, and the
+  ;; drain below finds it) or it happens after (and is discarded).
+  ;;
+  ;; THE RACE RESOLVES TOWARD THE ANSWER. receive scans the mailbox before
+  ;; it takes the timeout branch, so a reply already queued when the timer
+  ;; expires wins, and the drain after the kill gives it a second chance.
+  ;; 'no-answer-yet is returned only when nothing had arrived by then.
+  ;;
+  ;; NO settled? PREDICATE HERE, deliberately. Everywhere else it is an
+  ;; optional argument; here the mechanism kills the process the call runs
+  ;; in, and a predicate is caller code that may hold a database handle or
+  ;; a pool lease. Accepting one would mean defining what a kill-safe
+  ;; predicate is and making every caller honour it -- a whole contract in
+  ;; exchange for an option.
+  ;;
+  ;; THAT IS A REAL DIFFERENCE IN WHAT THE TWO CALLS CAN ANSWER, and it
+  ;; cannot be closed by the caller afterwards. resolve-unknown weighs a
+  ;; predicate's #f against the RECORD, and the record is what stops a #f
+  ;; from turning a confirmed commit into a retryable 'gone: against
+  ;; 'committed-then-failed a #f is a contradiction and is refused, while
+  ;; against 'commit-uncertain-then-failed the same #f is the fact that
+  ;; settles it. This entry point does not return the record, so a caller
+  ;; who takes an 'unknown from here and applies its own predicate cannot
+  ;; make that distinction -- it would answer 'gone for a commit this
+  ;; library watched succeed, which is a licence to do the work twice.
+  ;;
+  ;; So the two calls can genuinely disagree about one id, and the
+  ;; unbounded conversation-peek is the one to use when a predicate is
+  ;; involved. Bounded is for "is there an answer right now", not for
+  ;; reconciliation.
+  ;;
+  ;; LOCAL ONLY IN THIS FORM. A forwarded peek answers 'unreachable rather
+  ;; than pretending: bounding it properly means carrying the caller's
+  ;; deadline to the owner, or the owner's worker keeps running to the
+  ;; forwarding TTL and only the caller has stopped waiting -- a bound in
+  ;; name. Carrying it means widening the forwarded frame, which is a
+  ;; mixed-version compatibility question of its own.
+  ;;
+  ;; The timeout has NO DEFAULT because there is no defensible one, and
+  ;; because the two ways of being wrong are not symmetric. Too large
+  ;; merely waits. Too small reports 'no-answer-yet for a healthy
+  ;; conversation the caller could have adopted, and reports it without an
+  ;; error, a log line, or any other signal -- a degradation that looks
+  ;; exactly like a correct answer.
+  ;;
+  ;; A request that was already asked when the limit expired is still
+  ;; QUEUED at the conversation and is answered when that step parks; the
+  ;; reply then goes nowhere. It costs a mailbox entry until then, so a
+  ;; caller retrying hard on a slow step accumulates them. (A limit short
+  ;; enough to expire before the question was asked leaves nothing queued
+  ;; -- which is not a reason to prefer one, only a reason not to read
+  ;; 'no-answer-yet as proof that anything was asked.)
+  ;;
+  ;; Peeks neither advance nor alter the conversation,
+  ;; so this is a memory and latency cost rather than a correctness one --
+  ;; but throttle on the calling side. Merging concurrent peeks inside the
+  ;; library would not remove the queue entry (the answer still comes from
+  ;; the conversation), only the duplicates, at the price of a long-lived
+  ;; table of waiters here.
+  ;;
+  ;; -> (values state token reply); state may be 'no-answer-yet
+  (define (conversation-peek/timeout id timeout-ms)
+    (unless (and (integer? timeout-ms) (exact? timeout-ms) (> timeout-ms 0))
+      (assertion-violation 'conversation-peek/timeout
+        "timeout must be a positive exact integer number of milliseconds"
+        timeout-ms))
+    (let ((owner (conv-owner id)))
+      (if (or (not owner) (eq? owner (node-self)))
+          (bounded-local-peek id timeout-ms)
+          (values 'unreachable #f #f))))
+
+  (define (bounded-local-peek id timeout-ms)
+    (let* ((caller self)
+           ;; Fresh per call, and matched on. Without it the late answer to
+           ;; call N is taken by call N+1 out of the same long-lived
+           ;; worker's mailbox -- one request served another's answer.
+           (ref (fresh-ref!))
+           (probe
+             ;; spawn, NOT spawn&link. A kill cascades along links, and the
+             ;; link here would run straight back to the caller: a
+             ;; non-trapping caller would die in the cascade it started, at
+             ;; its own timeout. Keep this unlinked -- it looks like an
+             ;; oversight and is not.
+             (spawn
+               (lambda ()
+                 ;; Nothing to answer if the caller is already gone: skip
+                 ;; the work rather than wake a parked conversation for it.
+                 ;; (monitor answers #f when the target is already dead.)
+                 ;; This catches a caller that died BEFORE the probe ran;
+                 ;; one that dies while the probe waits is caught by the
+                 ;; bound below, not by this monitor -- see local-peek*.
+                 (let ((m (monitor caller)))
+                   (when m
+                     (let-values (((state token reply rec)
+                                   (local-peek* id timeout-ms)))
+                       (demonitor m)
+                       ;; If the caller died meanwhile this is dropped: a
+                       ;; send to a dead process has nowhere to go.
+                       (send caller (vector 'conv-peek-bounded
+                                            ref state token reply)))))))))
+      (receive (after timeout-ms
+                  (begin
+                    ;; Kill FIRST, drain second. In this order the kill
+                    ;; establishes that no further message can be queued,
+                    ;; which is what makes the drain exhaustive rather than
+                    ;; a guess; draining first would leave the interval
+                    ;; between the two scans open.
+                    (kill probe 'peek-timeout)
+                    (receive (after 0 (values 'no-answer-yet #f #f))
+                      (`#(conv-peek-bounded ,@ref ,state ,token ,reply)
+                        (values state token reply)))))
+        (`#(conv-peek-bounded ,@ref ,state ,token ,reply)
+          (values state token reply)))))
+
   ;; -> (values state token last-reply record), the record as in local-resume
-  (define (local-peek id)
+  (define (local-peek id) (local-peek* id #f))
+
+  ;; limit-ms #f waits for the conversation however long it takes, which is
+  ;; what conversation-peek wants. A number bounds the wait and answers
+  ;; 'no-answer-yet instead, which is what the bounded probe needs -- and
+  ;; needs for its own sake, not the caller's. The probe cannot see its
+  ;; caller die: it is parked in the receive below, which matches the
+  ;; conversation's reply and the conversation's DOWN and nothing else, so
+  ;; a DOWN for the caller would sit unread behind them. A caller killed
+  ;; from outside before its own timeout fires therefore kills nobody, and
+  ;; an unbounded probe would then wait on a conversation that may never
+  ;; park again -- one stranded process per killed caller, permanently.
+  ;; The bound is what makes the probe's lifetime its own business.
+  (define (local-peek* id limit-ms)
     (let ((p (whereis (conversation-name id))))
       (if (not p)
           (let-values (((state rec) (settled-or-lost/record id)))
@@ -2894,14 +3266,27 @@
           (let ((ref (gensym))
                 (m (monitor p)))
             (send p (vector 'conv-peek self ref))
-            (receive
-              (`#(conv-peeked ,@ref ,state ,token ,reply)
-                (when m (demonitor m))
-                (flush-down! p)
-                (values state token reply record-not-read))
-              (`#(DOWN ,@p ,reason)
-                (let-values (((state rec) (settled-or-lost/record id)))
-                  (values state #f #f rec))))))))
+            (let ((answered
+                    (lambda (state token reply)
+                      (when m (demonitor m))
+                      (flush-down! p)
+                      (values state token reply record-not-read)))
+                  (died
+                    (lambda ()
+                      (let-values (((state rec) (settled-or-lost/record id)))
+                        (values state #f #f rec)))))
+              (if limit-ms
+                  (receive (after limit-ms
+                              (begin
+                                (when m (demonitor m))
+                                (values 'no-answer-yet #f #f record-not-read)))
+                    (`#(conv-peeked ,@ref ,state ,token ,reply)
+                      (answered state token reply))
+                    (`#(DOWN ,@p ,reason) (died)))
+                  (receive
+                    (`#(conv-peeked ,@ref ,state ,token ,reply)
+                      (answered state token reply))
+                    (`#(DOWN ,@p ,reason) (died)))))))))
 
   ;; The status predicates live in (igropyr conversation-status) and are
   ;; re-exported above. They are one-line eq? tests with no dependencies,

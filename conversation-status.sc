@@ -3,7 +3,7 @@
 ;;; and nothing else.
 ;;;
 ;;; SPLIT OUT SO THAT ASKING WHAT A STATUS MEANS COSTS NOTHING. The status
-;;; vocabulary is six one-line predicates, but they used to live in
+;;; vocabulary is seven one-line predicates, but they used to live in
 ;;; (igropyr conversation), which imports the actor scheduler, libuv and
 ;;; the node layer -- and whose body runs work at LOAD time: it stamps a
 ;;; clock and reads /dev/urandom for this process's incarnation. A caller
@@ -28,7 +28,7 @@
 (library (igropyr conversation-status)
   (export conversation-gone? conversation-stale? conversation-done?
           conversation-settled? conversation-unknown?
-          conversation-unreachable?)
+          conversation-unreachable? conversation-no-answer-yet?)
   (import (chezscheme))
 
   ;; THE ROLLBACK GUARANTEE, and the only answer that is one. A record
@@ -65,11 +65,12 @@
   ;; commit. Treat it exactly as 'unknown and reconcile; retrying is how a
   ;; partition turns into duplicated effects.
   ;;
-  ;; This predicate exists because the status does. Five of the six were
-  ;; exported and this one was not, which left every caller either writing
-  ;; (eq? x 'unreachable) beside five predicate calls, or abandoning the
-  ;; predicates entirely. An abstraction that covers all but one case is
-  ;; worse than none, because the gap is invisible until someone hits it.
+  ;; This predicate exists because the status does. Five of the six then
+  ;; defined were exported and this one was not, which left every caller
+  ;; either writing (eq? x 'unreachable) beside five predicate calls, or
+  ;; abandoning the predicates entirely. An abstraction that covers all
+  ;; but one case is worse than none, because the gap is invisible until
+  ;; someone hits it.
   (define (conversation-unreachable? x) (eq? x 'unreachable))
 
   ;; The flow returned: reply is its final answer, and no token continues
@@ -82,6 +83,26 @@
   ;; transactional flow this is the OPPOSITE of 'gone: it committed. Read
   ;; your own state for the details; do not resubmit.
   (define (conversation-settled? x) (eq? x 'settled))
+
+  ;; The bounded peek reached its limit with no answer in hand. This is a
+  ;; fact about the WAIT and nothing more. The usual cause is a
+  ;; conversation busy in a step -- it does not answer until it parks --
+  ;; but the limit can equally expire before the question was asked at
+  ;; all, or while the answer was on its way. All it establishes is that
+  ;; nothing arrived in time.
+  ;;
+  ;; Shares the prohibition of 'unknown and 'unreachable -- none of the
+  ;; three licenses a second attempt -- but not the remedy, and that is
+  ;; why it is a separate answer rather than folded into 'unknown. The
+  ;; other two mean the library cannot tell you what happened, so go read
+  ;; your own state. This one means nothing has been said in time: ask
+  ;; again. Reconciling on it risks reconciling against a conversation
+  ;; that is alive and was about to answer.
+  ;;
+  ;; Reading it as "no conversation" is the mistake to guard against: a
+  ;; timeout chosen too small produces exactly this answer for a perfectly
+  ;; healthy conversation, and produces it without any error anywhere.
+  (define (conversation-no-answer-yet? x) (eq? x 'no-answer-yet))
 
   ;; The request named a reply that is no longer the one being answered --
   ;; a duplicate, a retry, a second front end. It was NOT applied and will
