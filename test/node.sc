@@ -153,55 +153,98 @@
     (display "missing self monitors clean up exactly once ok\n")
 
     ;; The arming step itself: the rmonitors entry and the owner agent
-    ;; must appear in ONE atomic region, or a kill between them roots a
-    ;; dead process in a table nothing sweeps. Aiming a kill at a
-    ;; two-statement gap is hopeless -- but a kill can only land where
-    ;; the victim yields, and a yield inside the gap means another
-    ;; runnable process can OBSERVE it: rmonitors > owner-agents. So
-    ;; spin -- never sleep; sleeping parks this process and hands the
-    ;; whole machine back to the victim -- and watch for the imbalance,
-    ;; killing the victim the moment it shows. set-timer on the victim
-    ;; walks its preemption point across the call; when the tick budget
-    ;; dies inside an atomic region, delivery happens at region exit,
-    ;; which in a split arming is exactly the gap. Proven to discriminate:
-    ;; against a tree with the two regions split back apart, this loop
-    ;; catches the gap and the entry survives with no agent -- LEAKED.
-    ;; Note the benign look-alike: teardown stops the agent just before
-    ;; it deletes the entry, so a transient rmon > own is NOT the gap;
-    ;; only an entry that survives the kill is.
-    (let ((mstat (lambda (k) (cdr (assq k (node-monitor-stats))))))
-      (let sweep ((k 1) (armed-seen 0))
-        (if (> k 60)
-            (begin
-              ;; the probe must prove it reached the state it tests:
-              ;; a sweep that never saw an armed monitor tested nothing
-              (when (zero? armed-seen)
-                (fail! "arming-window-probe-blind" armed-seen))
-              (unless (and (zero? (mstat 'rmonitors))
-                           (zero? (mstat 'owner-agents)))
-                (fail! "arming-window-residue"
-                       (mstat 'rmonitors) (mstat 'owner-agents))))
-            (let ((v (spawn (lambda ()
-                              (set-timer k)
-                              (monitor-remote 'a 'main)))))
-              (let ((deadline (+ (now-ms) 60)) (seen armed-seen))
-                (let poll ()
-                  (let ((r (mstat 'rmonitors)) (o (mstat 'owner-agents)))
-                    (when (> r 0) (set! seen (+ seen 1)))
-                    (cond
-                      ((> r o)
-                       (kill v 'caught-in-gap)
-                       (sleep-ms 200)
-                       (when (> (mstat 'rmonitors) 0)
-                         (fail! "arming-window-leaked" k
-                                (mstat 'rmonitors) (mstat 'owner-agents))))
-                      ((not (process-alive? v)) 'round-over)
-                      ((< (now-ms) deadline) (poll)))))
-                (when (process-alive? v) (kill v 'round-over))
-                (let settle ((n 0))
-                  (when (and (> (mstat 'rmonitors) 0) (< n 20))
-                    (sleep-ms 20) (settle (+ n 1))))
-                (sweep (+ k 1) seen))))))
+    ;; must appear in ONE atomic region. The entry roots the caller's pcb,
+    ;; and when that caller dies the agent is the only thing that clears
+    ;; it (the other paths that delete an entry -- a target-side down, a
+    ;; link drop, an explicit demonitor -- all require the monitor to
+    ;; still be running somewhere). So a kill landing between two separate
+    ;; regions leaves an entry with nothing left to release it -- on a
+    ;; mesh that stays up, forever.
+    ;;
+    ;; Aiming a kill at the gap between two adjacent statements does not
+    ;; work, but the reason it does not is also the way in: a kill only
+    ;; lands where the victim yields, so a yield inside the gap is a
+    ;; yield another runnable process can SEE. This watches for that
+    ;; state rather than aiming at it -- rmonitors above owner-agents,
+    ;; read from ONE snapshot. Two calls would read the second count
+    ;; before an arming and the first count after it, manufacturing the
+    ;; very imbalance under test. The watcher spins rather than sleeps:
+    ;; sleeping makes it unrunnable, and an imbalance nobody is scheduled
+    ;; to observe passes unseen. set-timer walks the victim's preemption
+    ;; point across the call -- a tick budget that expires inside an
+    ;; atomic region is delivered when the outermost one exits, which in
+    ;; a split arming is exactly the gap.
+    ;;
+    ;; Two things keep the reading unambiguous. The victim PARKS instead
+    ;; of returning, for longer than a round is allowed to last, so its
+    ;; own teardown cannot be in flight while it is watched: teardown
+    ;; shows the same imbalance for a benign reason, since the owner
+    ;; agent deletes its own table entry first and the rmonitors entry
+    ;; second. And every round starts from a measured baseline, so the
+    ;; previous round's teardown cannot be read as this round's arming.
+    ;; With both, an imbalance can only be the split -- and killing the
+    ;; victim there and finding the entry still present is the leak
+    ;; itself rather than an inference about it.
+    ;;
+    ;; Each round must prove it ran the arming at all: it ends on a
+    ;; caught gap or on an observed entry, never on a clock. k is swept
+    ;; because a tick budget expires at compiler-inserted trap points,
+    ;; whose spacing is a property of the build; the range is empirical
+    ;; -- a tree with the two regions split apart is caught here at k=5,
+    ;; deterministically -- and is not a claim that 60 rounds cover every
+    ;; point on every build.
+    (let* ((tables '(rmonitors caller-agents owner-agents))
+           (at-baseline?
+             (lambda ()
+               (let ((s (node-monitor-stats)))
+                 (for-all (lambda (k) (zero? (cdr (assq k s)))) tables))))
+           (await-baseline!
+             (lambda (label k)
+               (let loop ((n 0))
+                 (cond ((at-baseline?) 'ok)
+                       ((= n 200) (fail! label k (node-monitor-stats)))
+                       (else (sleep-ms 10) (loop (+ n 1))))))))
+      (do ((k 1 (+ k 1))) ((> k 60))
+        (await-baseline! "arming-window-baseline" k)
+        (let* ((me self)
+               (v (spawn (lambda ()
+                           (send me (vector 'gap-ready))
+                           (receive (`#(gap-go) 'ok))
+                           (set-timer k)
+                           (monitor-remote 'a 'main)
+                           ;; park past the round's own bound: a victim
+                           ;; that returned would tear the monitor down
+                           ;; and produce the benign imbalance
+                           (receive (after 10000 'done))))))
+          ;; the victim has RUN before its budget is set -- a round that
+          ;; killed a process still sitting in the run queue would test
+          ;; nothing while looking exactly like a round that passed
+          (receive (after 2000 (fail! "arming-window-victim-never-ran" k))
+            (`#(gap-ready) 'ok))
+          (send v (vector 'gap-go))
+          (let ((deadline (+ (now-ms) 3000)))
+            (let poll ()
+              (let* ((s (node-monitor-stats))
+                     (r (cdr (assq 'rmonitors s)))
+                     (o (cdr (assq 'owner-agents s))))
+                (cond
+                  ((> r o)
+                   (kill v 'caught-in-gap)
+                   (sleep-ms 200)
+                   (let ((s2 (node-monitor-stats)))
+                     (if (> (cdr (assq 'rmonitors s2)) 0)
+                         (fail! "arming-window-leaked" k s s2)
+                         ;; the state itself should not exist on a merged
+                         ;; region; seeing it and then losing the race to
+                         ;; the kill is still a finding, not a pass
+                         (fail! "arming-window-imbalance-without-leak"
+                                k s s2))))
+                  ((> r 0) 'this-round-armed)
+                  ((> (now-ms) deadline)
+                   (fail! "arming-window-round-never-armed" k s))
+                  (else (poll))))))
+          (kill v 'round-over)))
+      (await-baseline! "arming-window-residue" 'end))
     (display "arming window: entry and agent inseparable under kill ok\n")
 
     ;; wrong secret: must never come up
