@@ -1354,6 +1354,65 @@ commits, parks, is resumed and only then fails is still `'unknown`, not
 (an escaping continuation, or `suspend!` called inside it) skips the mark
 and is outside the contract.
 
+#### A commit can also end in "maybe"
+
+A commit primitive is sometimes certain it succeeded, sometimes certain it
+never left, and sometimes **neither** — a request that timed out, a
+connection reset after the write, a cancelled call, a reply that would not
+parse. For that third case the thunk raises
+
+```scheme
+#(commit-uncertain reason)
+```
+
+from inside `commit!`, and the conversation is recorded as having a commit
+that **may** have landed.
+
+The mark behind `commit!` therefore has three values and only ever rises
+through them — no commit, a *maybe*, a confirmed one — never falling back.
+A flow that catches its own uncertainty and retries the same idempotent
+commit successfully ends at confirmed, which is the truth; one that raises
+uncertain again after a confirmed commit stays confirmed, because the
+first fact does not expire. An ordinary (untagged) exception never erases
+what an earlier attempt asserted.
+
+**What `settled?` means against each.** A later resume answers `'unknown`
+on the library's own evidence, where before it would have said `'gone` and
+invited a retry. It is *not* frozen there, and that is the whole point of
+keeping this separate from a confirmed commit:
+
+| the mark | a `settled?` predicate answering `#f` | result |
+|---|---|---|
+| a *maybe* | is the fact that **settles** it — the library only knew "possibly" | `'gone` |
+| confirmed | **contradicts** evidence the library holds: it watched the thunk return | stays `'unknown` |
+
+So the third outcome exists to make reconciliation *possible*, not to add
+a second way of refusing it. (That refusal needs a witness in hand for
+that call — read from this node's table, or carried back by an owner that
+read its own — and nothing caches one between calls.)
+
+**The adapter owes this for every ambiguous failure**, and the obligation
+is easy to under-fill. Anything a commit can raise after the request has
+been dispatched *and* that cannot authoritatively rule out its having
+taken effect — the timeout, the reset, the cancellation, the unparseable
+response, an exception in your own post-dispatch code — is a "maybe" and
+must arrive as this tag. (A definite, authoritative rejection is not
+ambiguous, even though the request did leave.) What the library reads into
+every **other** exception is that this attempt added no reason to think a
+commit landed. That is not a fact the library can establish about somebody
+else's driver; it is **an assertion your thunk makes by not raising the
+tag**.
+
+Raise it **inside the commit thunk** — that is the only place with a
+promise attached. The flow-exit path recognises the tag as well, so
+raising it elsewhere is usually still understood, but only usually: the
+flow's own `guard` may catch it first, and a kill discards winders so
+nothing recognises anything.
+
+The `reason` never reaches the record. The raise is passed on unchanged,
+so it travels wherever the flow lets it, but the tombstone holds a symbol
+and must stay small — log the detail before raising if you want it kept.
+
 ### Two phases, when the id has to exist first
 
 `conversation-start!` mints the conversation's id inside the same call
