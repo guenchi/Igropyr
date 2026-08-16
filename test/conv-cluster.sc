@@ -214,6 +214,42 @@
                       (else (sleep-ms 100) (settle (+ n 1))))))))))
     (display "killing an asker parked in a forwarded peek reclaims its monitor ok\n")
 
+    ;; ---- a stale remote-down does not decide anything -------------------
+    ;;
+    ;; A remote-down carries the exit reason of somebody else's process, or
+    ;; is left over from an earlier call -- it has no ref, so nothing ties
+    ;; it to this one. Ending the wait on it produced 'unreachable for an
+    ;; owner that was answering: a router killed with 'noconnection, a
+    ;; monitor armed while the link happened to be down, a leftover from
+    ;; the previous forward. The rule is now about the link itself, so a
+    ;; message like this can prompt a look and nothing more.
+    ;;
+    ;; Injected by hand here: forward-peek runs IN the asking process, so a
+    ;; message sent to that process arrives exactly where the real one
+    ;; would. The conversation is busy, so the peek is genuinely parked
+    ;; when it lands.
+    (let ((slow (receive (after 10000 (fail! "slow3-timeout"))
+                  (`#(conv-slow3 ,id ,tk) (cons id tk)))))
+      (spawn (lambda () (conversation-resume! (car slow) (cdr slow) 1)))
+      (sleep-ms 500)
+      (let* ((me self)
+             (asker (spawn (lambda ()
+                             (let-values (((st tk rp) (conversation-peek (car slow))))
+                               (send me (vector 'asked st)))))))
+        (sleep-ms 400)                  ; it is parked in the forward now
+        ;; the shape the node layer would deliver, with a reason that says
+        ;; nothing about this call
+        (send asker (vector 'remote-down 'b 'igropyr-conv-router 'overload))
+        (let ((answer (receive (after 9000 'still-waiting)
+                        (`#(asked ,st) st))))
+          ;; it must NOT have been ended by that message: either it is
+          ;; still waiting for the busy step, or it got the real answer
+          (when (eq? answer 'unreachable)
+            (fail! "a stale remote-down ended a wait on a healthy link" answer))
+          (display "  [info] after a stale remote-down the peek answered: ")
+          (display answer) (newline))))
+    (display "a stale remote-down does not end a wait on a live link ok\n")
+
     ;; ---- a link that really drops still ends the wait at once -----------
     ;;
     ;; What ends a forwarded wait is whether the link is up -- not what a

@@ -108,6 +108,22 @@
           (lambda (id token first-reply)
             (rsend 'a 'main (vector 'conv-slow2 id token))))))
 
+    ;; a third busy one: the stale-remote-down case needs its own, since
+    ;; the reclaim case above kills its asker and leaves that one running
+    (spawn
+      (lambda ()
+        (call-with-values
+          (lambda ()
+            (conversation-start!
+              (lambda (req suspend! commit!)
+                (let ((a (suspend! (vector 'ready3 req))))
+                  (sleep-ms 6000)
+                  (vector 'done3 a)))
+              0
+              30000))
+          (lambda (id token first-reply)
+            (rsend 'a 'main (vector 'conv-slow3 id token))))))
+
     (let loop ()
       (receive
         (`#(quit) (exit 0))
