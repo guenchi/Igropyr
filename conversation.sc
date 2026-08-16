@@ -648,11 +648,15 @@
                       ;; turns that into 'settled off the tombstone --
                       ;; which carries the one thing a client that lost its
                       ;; final reply needs to know: the flow RAN TO
-                      ;; COMPLETION, so whatever it was going to do it did,
-                      ;; and this is not a case for repeating it. (Not "it
-                      ;; committed": a flow that never calls commit! and
-                      ;; returns settles too. What settled rules out is the
-                      ;; rollback, not the flow's own business logic.)
+                      ;; COMPLETION -- it left through its own end and not
+                      ;; through its winders -- so no token continues it
+                      ;; and nothing here will re-run it. That is a fact
+                      ;; about the CONTROL FLOW, not about what the flow
+                      ;; did: one that never calls commit! settles, and so
+                      ;; does one that caught its own error and rolled its
+                      ;; transaction back deliberately before returning.
+                      ;; What settled rules out is this library answering
+                      ;; 'gone -- not a rollback.
                       ;; Answering 'stale first is true but poorer, and it
                       ;; wins the race.
                       (unless (eq? (step-state-phase st) 'completed)
@@ -748,9 +752,9 @@
   ;; restart. It cannot cover a conversation killed from outside or taken
   ;; down by a link, which leave a young id, an empty table, and no reason
   ;; at all. 'gone now comes from a 'rolled-back record -- written only
-  ;; where nothing had asserted a commit at all, not even a maybe -- and
-  ;; from nothing else, which subsumes every case this bounded the damage
-  ;; of.
+  ;; where nothing had asserted a commit at all, not even a maybe -- and,
+  ;; out of what this library itself can see, from nothing else, which
+  ;; subsumes every case this bounded the damage of.
   ;;
   ;; It is kept because the table still moves it and it costs one
   ;; comparison per eviction: how far back this node can speak is a true
@@ -1202,12 +1206,15 @@
   ;; 'gone would hand the caller a rollback guarantee this layer cannot
   ;; make, and a caller that retries on it duplicates the flow's effects.
   ;;
-  ;; Only local-resume can answer 'gone, and only because it can consult
-  ;; the RECORD ON THE OWNER'S OWN NODE. Note what does the work there: a
-  ;; record saying the flow left through its winders with no commit
-  ;; asserted, never the mere absence of a registry entry -- an absence
-  ;; says the process is not here and nothing more, which is why it
-  ;; answers 'unknown. A network failure cannot produce even that much.
+  ;; Nothing here DECIDES 'gone -- this function can only carry back one
+  ;; the owner's node already read from its RECORD. Note what does the work
+  ;; there: a record saying the flow left through its winders with no
+  ;; commit asserted, never the mere absence of a registry entry -- an
+  ;; absence says the process is not here and nothing more, which is why it
+  ;; answers 'unknown. A network failure cannot produce even that much. (A
+  ;; caller's own settled? predicate can also produce 'gone, on evidence
+  ;; this library does not hold -- see resolve-unknown, which is where that
+  ;; authority is bounded.)
   ;; -> (values reply status record), the same projection as forward-peek.
   (define (forward-resume owner id token req)
     (let ((reply-name (fresh-reply-name!))
@@ -2096,19 +2103,23 @@
                                       ;; settled-box -- there was nothing
                                       ;; to consult until commit! existed.
                                       ;;
-                                      ;; THE WITNESS CAN BE ONE INSTANT
-                                      ;; STALE, in either direction the
-                                      ;; thunk can end. A kill landing
-                                      ;; between the commit thunk's return
-                                      ;; and the mark being set reads #f;
-                                      ;; so does one landing between an
-                                      ;; ambiguous effect and the tagged
-                                      ;; raise that reports it. Either way
-                                      ;; the compensation runs after
-                                      ;; something may already have
-                                      ;; happened. The window is the exit
-                                      ;; from the thunk itself and cannot
-                                      ;; be closed from out here -- the two
+                                      ;; THE WITNESS CAN BE STALE, and not
+                                      ;; always by an instant. A kill
+                                      ;; landing between the commit
+                                      ;; thunk's return and the mark being
+                                      ;; set reads #f -- that part is one
+                                      ;; instant. But a driver that has
+                                      ;; dispatched its request and is
+                                      ;; waiting to learn the outcome has
+                                      ;; raised nothing yet, so a kill
+                                      ;; anywhere in that wait -- which
+                                      ;; can be the whole of a timeout --
+                                      ;; also reads #f, for a transaction
+                                      ;; that may well have taken effect.
+                                      ;; Either way the compensation runs
+                                      ;; after something may already have
+                                      ;; happened. Neither window can be
+                                      ;; closed from out here -- the two
                                       ;; facts live in different processes.
                                       ;; So this is not a guarantee that
                                       ;; compensation never follows a
@@ -2567,8 +2578,9 @@
   ;; Resume the conversation with the next request; parks until the flow
   ;; yields its reply. Returns 'gone when the record says the flow rolled
   ;; back -- for a transactional flow that is the rollback guarantee --
-  ;; and 'unknown when the conversation is not here and no record says
-  ;; what became of it.
+  ;; and 'unknown when the conversation is not here and nothing in reach
+  ;; establishes a rollback: no record at all, or a record that says
+  ;; something other than one.
   ;; TURNING 'unknown BACK INTO AN ANSWER.
   ;;
   ;; 'unknown is honest and useless: the caller is told not to resubmit and
@@ -2735,7 +2747,7 @@
   ;;   'stale         -- not applied, and will not be; reply is #f
   ;;   'settled       -- it finished earlier; the answer is not retained
   ;;   'gone          -- it rolled back, on the record; reply is #f
-  ;;   'unknown       -- not here and not knowable from here; reply is #f
+  ;;   'unknown       -- not here, and no rollback established; reply is #f
   ;;   'unreachable   -- the owner node could not be reached; reply is #f
   ;; WHAT THE RECORD MEANS. The only place in this library that turns a
   ;; tombstone into an answer, and the only place that decides what may be
@@ -2746,14 +2758,14 @@
   ;; what this function can see it comes from a record that says the flow
   ;; rolled back and from nothing else. (A caller's own settled? predicate
   ;; can also produce it, on evidence this library does not hold -- see
-  ;; resolve-unknown, which is where that authority is bounded.) It used to come from an ABSENCE as well -- no process, no
-  ;; record, and an id young enough that a record should still have been
-  ;; there -- which reads a positive claim off missing evidence, and every
-  ;; way of dying that writes no record made that claim false: a kill from
-  ;; outside, a link cascade, a VM going down mid-step. There is no
-  ;; enumerating those. Requiring
-  ;; the evidence closes all of them at once, at the cost of answering
-  ;; 'unknown where the old code guessed right.
+  ;; resolve-unknown, which is where that authority is bounded.) It used to
+  ;; come from an ABSENCE as well -- no process, no record, and an id young
+  ;; enough that a record should still have been there -- which reads a
+  ;; positive claim off missing evidence, and every way of dying that
+  ;; writes no record made that claim false: a kill from outside, a link
+  ;; cascade, a VM going down mid-step. There is no enumerating those.
+  ;; Requiring the evidence closes all of them at once, at the cost of
+  ;; answering 'unknown where the old code guessed right.
   ;;
   ;; A RECORD IS NOT AUTOMATICALLY A ROLLBACK EITHER, which is the other
   ;; half of the same rule. An exception leaving the flow proves its
@@ -2847,9 +2859,9 @@
   ;;                    and no token continues it
   ;;      'settled   -- it finished earlier; only the record is left
   ;;      'gone      -- the record says it rolled back
-  ;;      'unknown   -- not here, and nothing in reach settles what became
-  ;;                    of it: no record at all, or one that itself says
-  ;;                    the outcome is not knowable
+  ;;      'unknown   -- not here, and nothing in reach establishes a
+  ;;                    rollback: no record at all, or a record that says
+  ;;                    something other than one
   ;;      'unreachable -- the owner node could not be reached; nothing is
   ;;                    known, exactly as for a resume
   ;;
