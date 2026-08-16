@@ -59,6 +59,22 @@
         (exit 3))
       (rsend 'a 'main (vector 'conv-witness (vector-ref r 1))))
 
+    ;; ...and one whose commit is UNCERTAIN: the thunk signalled
+    ;; commit-uncertain -- it did something that may already have taken
+    ;; effect -- and the flow then died of it. The record here says
+    ;; commit-uncertain-then-failed, which answers 'unknown but, unlike a
+    ;; confirmed commit, does not outrank an authoritative #f.
+    (let ((r (guard (e (#t e))
+               (conversation-start!
+                 (lambda (req suspend! commit!)
+                   (commit! (lambda ()
+                              (raise (vector 'commit-uncertain 'timed-out)))))
+                 0))))
+      (unless (and (vector? r) (eq? (vector-ref r 0) 'conversation-uncertain))
+        (rsend 'a 'main (vector 'conv-uncertain-setup-failed r))
+        (exit 4))
+      (rsend 'a 'main (vector 'conv-uncertain (vector-ref r 1))))
+
     (let loop ()
       (receive
         (`#(quit) (exit 0))

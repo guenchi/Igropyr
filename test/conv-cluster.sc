@@ -149,6 +149,26 @@
         (fail! "an absent record no longer demotes across the link" st)))
     (display "no record on the owner still demotes to 'gone ok\n")
 
+    ;; ...and an UNCERTAIN commit crosses differently from a confirmed
+    ;; one, which is the whole reason the box has three states. Without a
+    ;; predicate the answer is 'unknown -- possibly effective, never
+    ;; 'gone. WITH an authoritative #f the demotion is legitimate: the
+    ;; owner's evidence is "maybe", the predicate's is "no", and maybe
+    ;; does not outrank no. (A single sticky box would have answered
+    ;; 'unknown here too, silently disabling negative reconciliation.)
+    (let ((uid (receive (after 10000 (fail! "uncertain-id-timeout"))
+                 (`#(conv-uncertain ,id) id)
+                 (`#(conv-uncertain-setup-failed ,r)
+                   (fail! "uncertain-setup-on-owner" r)))))
+      (let-values (((r st) (conversation-resume! uid "bogus" 'x)))
+        (unless (eq? st 'unknown)
+          (fail! "an uncertain commit did not answer unknown across the link" st)))
+      (let-values (((r st) (conversation-resume! uid "bogus" 'x
+                                                 (lambda (i) #f))))
+        (unless (eq? st 'gone)
+          (fail! "an authoritative #f could not resolve an uncertain commit" st))))
+    (display "an uncertain commit answers unknown, and yields to an authoritative no ok\n")
+
     (rsend 'b 'ctrl (vector 'quit))     ; let the owner exit promptly
     (sleep-ms 200)
     (display "ALL CONV-CLUSTER TESTS PASSED\n")

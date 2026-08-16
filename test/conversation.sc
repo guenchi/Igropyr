@@ -2447,5 +2447,150 @@
     (fail "start! does not report itself on bad ttl")))
 (display "validation names the entry point that was called ok\n")
 
+;; ---- a commit can end in "maybe", and maybe is not a rollback ------------
+;;
+;; The thunk raises #(commit-uncertain reason): it did something that may
+;; already have taken effect -- a timeout does not say whether the request
+;; is on the wire. Recorded as a rollback this answers 'gone and the
+;; retry creates the effect a second time.
+(let* ((h (conversation-prepare!
+            (lambda (req suspend! commit!)
+              (let ((a (suspend! (vector 'parked req))))
+                (commit! (lambda ()
+                           (raise (vector 'commit-uncertain 'timed-out))))
+                (vector 'unreachable a)))
+            'go 3000))
+       (id (conversation-ref-id h)))
+  (let-values (((tok first) (conversation-run! h)))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'cu st)))))
+      (receive (after 6000 (fail "uncertain-commit never answered" 'no-answer))
+        (`#(cu ,st)
+          (when (eq? st 'gone)
+            (fail "a possibly-effective commit was reported rolled back" st))
+          (unless (eq? st 'unknown)
+            (fail "uncertain commit got the wrong status" st))))))
+  ;; THE TRI-STATE DISCRIMINATOR. Against a mere "maybe", an authoritative
+  ;; #f is the fact that settles it: 'gone. A single sticky box -- maybe
+  ;; and confirmed conflated -- would refuse the predicate here and answer
+  ;; 'unknown, silently disabling negative reconciliation.
+  (let-values (((r st) (conversation-resume! id "bogus" 'x (lambda (i) #f))))
+    (unless (eq? st 'gone)
+      (fail "an authoritative #f could not resolve a maybe" st)))
+  (display "an uncertain commit answers 'unknown, and yields to an authoritative no ok\n"))
+
+;; ...and the mark only ever goes UP. A flow that catches the uncertainty,
+;; retries the same idempotent commit and succeeds is CONFIRMED: from then
+;; on even the authoritative #f is refused -- the library watched the
+;; second attempt return.
+(let* ((h (conversation-prepare!
+            (lambda (req suspend! commit!)
+              (let ((a (suspend! (vector 'parked req))))
+                (guard (e ((and (vector? e)
+                                (eq? (vector-ref e 0) 'commit-uncertain))
+                           ;; the retry, and this one lands
+                           (commit! (lambda () 'tx-landed))))
+                  (commit! (lambda ()
+                             (raise (vector 'commit-uncertain 'first-try)))))
+                (raise 'post-commit-failure)))
+            'go 3000))
+       (id (conversation-ref-id h)))
+  (let-values (((tok first) (conversation-run! h)))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'up st)))))
+      (receive (after 6000 (fail "upgrade case never answered" 'no-answer))
+        (`#(up ,st) 'ok))))
+  (let-values (((r st) (conversation-resume! id "bogus" 'x (lambda (i) #f))))
+    (unless (eq? st 'unknown)
+      (fail "a confirmed retry was still treated as a maybe" st)))
+  (display "a confirmed retry upgrades the mark, and it never falls back ok\n"))
+
+;; ...nor DOWN: after a confirmed commit, a later uncertainty signal --
+;; here escaping outside any commit!, which also exercises the flow-exit
+;; fallback -- cannot demote confirmed back to maybe.
+(let* ((h (conversation-prepare!
+            (lambda (req suspend! commit!)
+              (let ((a (suspend! (vector 'parked req))))
+                (commit! (lambda () 'tx))
+                (raise (vector 'commit-uncertain 'confused-cleanup))))
+            'go 3000))
+       (id (conversation-ref-id h)))
+  (let-values (((tok first) (conversation-run! h)))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'dn st)))))
+      (receive (after 6000 (fail "downgrade case never answered" 'no-answer))
+        (`#(dn ,st) 'ok))))
+  (let-values (((r st) (conversation-resume! id "bogus" 'x (lambda (i) #f))))
+    (unless (eq? st 'unknown)
+      (fail "a later uncertainty demoted a confirmed commit" st)))
+  (display "confirmed does not fall back to maybe ok\n"))
+
+;; ...and the tag escaping with NO commit! involved at all is still caught
+;; by the flow-exit fallback: 'unknown on its own, resolvable by the
+;; authoritative no.
+(let* ((h (conversation-prepare!
+            (lambda (req suspend! commit!)
+              (let ((a (suspend! (vector 'parked req))))
+                (raise (vector 'commit-uncertain 'raised-bare))))
+            'go 3000))
+       (id (conversation-ref-id h)))
+  (let-values (((tok first) (conversation-run! h)))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'bare st)))))
+      (receive (after 6000 (fail "bare-tag case never answered" 'no-answer))
+        (`#(bare ,st)
+          (unless (eq? st 'unknown)
+            (fail "a bare uncertainty tag was treated as a rollback" st))))))
+  (let-values (((r st) (conversation-resume! id "bogus" 'x (lambda (i) #f))))
+    (unless (eq? st 'gone)
+      (fail "a bare maybe did not yield to the authoritative no" st)))
+  (display "the flow-exit fallback recognises a bare uncertainty tag ok\n"))
+
+;; ...and on-killed is told #t -- a boolean, uncertain and confirmed on
+;; the same side -- when the flow signalled uncertainty and then wedged.
+(let ((seen (box 'unset)))
+  (let-values (((id tok first)
+                (conversation-start!
+                  (lambda (req suspend! commit!)
+                    (let ((a (suspend! (vector 'parked req))))
+                      (dynamic-wind
+                        (lambda () (void))
+                        (lambda ()
+                          (guard (e (#t (void)))   ; swallow, then wedge
+                            (commit! (lambda ()
+                                       (raise (vector 'commit-uncertain 'x)))))
+                          (vector 'never a))
+                        (lambda () (receive (after 60000 'never))))))
+                  'go 300 values
+                  (lambda (committed?) (set-box! seen committed?)))))
+    (let ((me self))
+      (spawn (lambda ()
+               (let-values (((r st)
+                             (guard (e (#t (values 'raised 'raised)))
+                               (conversation-resume! id tok 'go))))
+                 (send me (vector 'hk st)))))
+      (receive (after 6000 (fail "uncertain-then-wedged never answered" 'no-answer))
+        (`#(hk ,st) 'ok)))
+    (sleep-ms 600)
+    (unless (eq? #t (unbox seen))
+      (fail "the hook was not told #t after an uncertainty signal" (unbox seen)))
+    (display "on-killed is told #t for a possibly-effective commit ok\n")))
+
 (display "ALL CONVERSATION TESTS PASSED\n")
     (exit 0)))
