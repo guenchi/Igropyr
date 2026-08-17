@@ -2038,6 +2038,25 @@
            ;; both cheaper and sharper than looking more often.
            (watch-box (box #f))
            (conv
+             ;; SPAWN, NOT spawn&link, AND THE WHOLE give-up! SECTION IN THE
+             ;; HEADER RESTS ON THIS ONE WORD. Linking would make the
+             ;; conversation die with whoever called run! -- a worker pool
+             ;; killing a stuck handler, or giving up on a task, would take
+             ;; the transaction with it. That is the outcome this library
+             ;; exists to prevent: a commit that may already have landed,
+             ;; destroyed at an arbitrary instant and reported as though it
+             ;; never happened. The caller leaving is not a reason to end it;
+             ;; what ends it is its own ttl, and what compensates is
+             ;; on-killed.
+             ;;
+             ;; Nothing in the language marks this: linking here would
+             ;; compile, pass every other case, and turn that section into a
+             ;; harmful lie. test/conversation.sc's "killing the starter does
+             ;; not end the conversation" is what holds it -- it kills the
+             ;; starter and then drives the conversation to completion BY ID,
+             ;; because staying alive is not what the section promises and an
+             ;; aliveness check alone would pass on a conversation nobody can
+             ;; reach any more.
              (spawn
                (lambda ()
                  (register name self)
