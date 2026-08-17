@@ -875,18 +875,30 @@
                        ;; restarts, the process dies whatever the reason
                        (kill conn 'peer-went-away)
                        (sleep-ms 300)
-                       (list first
+                       (list 'ran first
                              (guard (e (#t (list 'raised e)))
                                (list 'returned
                                      (connpool-call conn "SELECT 2" cfg))))))
                    cfg))))
-        ;; the rebuild is backed off as a peer problem (~1s), so counting
-        ;; it immediately would count nothing and say the pool had reused
-        ;; the connection
-        (sleep-ms 1800)
-        (let* ((pair (and (pair? outcome) (= (length outcome) 2) outcome))
-               (first (and pair (car pair)))
-               (second (and pair (cadr pair))))
+        ;; WAIT FOR THE REBUILD, NOT FOR A DURATION. It is backed off as a
+        ;; peer problem, so reading the count at once would find nothing
+        ;; and report that the pool had reused the connection; picking a
+        ;; number larger than the backoff only moves that failure onto
+        ;; whichever machine is slower than the number.
+        (let await ((i 0))
+          (cond ((> spawned before) 'rebuilt)
+                ((> i 200) 'gave-up)          ; the check below reports it
+                (else (sleep-ms 50) (await (+ i 1)))))
+        ;; the two shapes are told apart by a tag rather than by length:
+        ;; a lease that raised as a whole is also a two-element list, and
+        ;; reading it as the other one reports the first statement going
+        ;; unanswered -- true-ish, and pointing the wrong way
+        (let* ((ran (and (pair? outcome) (eq? (car outcome) 'ran)))
+               (first (and ran (cadr outcome)))
+               (second (and ran (caddr outcome))))
+          (unless ran
+            (check "the lease itself completed" #f)
+            (display "  [info] the lease raised: ") (write outcome) (newline))
           (check "a statement on a live leased connection is answered"
                  (and (vector? first) (eq? (vector-ref first 0) 'fake-rows)))
           ;; the point: NOT answered by the sibling
