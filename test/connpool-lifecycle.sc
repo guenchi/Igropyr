@@ -841,6 +841,65 @@
                                   (number->string took) "ms (configured 200)\n")))
         (send pool (vector 'pool-quit))))
 
+
+    ;; ---- a lease is ONE connection, or it fails ---------------------------
+    ;;
+    ;; A borrower holds a connection so that a sequence of statements runs
+    ;; on one server session: that is the whole reason leases exist, and a
+    ;; transaction is only atomic because nothing else and nothing later
+    ;; runs somewhere else. The pool never substitutes: a connection that
+    ;; dies takes its lease down with it and is replaced by a DIFFERENT
+    ;; process, so a handle cannot quietly acquire a new session.
+    ;;
+    ;; That holds today because a connection worker never re-dials itself
+    ;; -- every rebuild is a fresh spawn from the pool -- but it holds as
+    ;; an accident of how the code is arranged, and a later "reconnect
+    ;; transparently, the caller need not care" would take it away with
+    ;; nothing to object. Consumers reason about transaction scope with
+    ;; it, so it is pinned here.
+    ;;
+    ;; AIMED AT THE BOUNDARY, not at the ordinary path: the pool is given
+    ;; TWO connections, so a healthy sibling exists to be substituted at
+    ;; the moment the leased one dies. With a single connection there is
+    ;; nothing to put in its place and any implementation passes.
+    (set! spawned 0)
+    (let ((pool (spawn (lambda () (connpool-loop 2 fake-spawn-conn! cfg)))))
+      (sleep-ms 300)
+      (let* ((before spawned)
+             (outcome
+               (guard (e (#t (list 'lease-raised e)))
+                 (connpool-lease pool
+                   (lambda (conn)
+                     (let ((first (connpool-call conn "SELECT 1" cfg)))
+                       ;; the session goes: the socket drops, the peer
+                       ;; restarts, the process dies whatever the reason
+                       (kill conn 'peer-went-away)
+                       (sleep-ms 300)
+                       (list first
+                             (guard (e (#t (list 'raised e)))
+                               (list 'returned
+                                     (connpool-call conn "SELECT 2" cfg))))))
+                   cfg))))
+        ;; the rebuild is backed off as a peer problem (~1s), so counting
+        ;; it immediately would count nothing and say the pool had reused
+        ;; the connection
+        (sleep-ms 1800)
+        (let* ((pair (and (pair? outcome) (= (length outcome) 2) outcome))
+               (first (and pair (car pair)))
+               (second (and pair (cadr pair))))
+          (check "a statement on a live leased connection is answered"
+                 (and (vector? first) (eq? (vector-ref first 0) 'fake-rows)))
+          ;; the point: NOT answered by the sibling
+          (check "a statement on a dead leased connection fails the lease"
+                 (and (pair? second) (eq? (car second) 'raised)
+                      (let ((r (cadr second)))
+                        (and (vector? r) (equal? (vector-ref r 1) "lost")))))
+          (check "the replacement is a new connection, not the same one"
+                 (> spawned before))
+          (display "  [info] lease outcome ") (write second)
+          (display ", connections spawned ") (display (- spawned before))
+          (newline))))
+
     (sleep-ms 100)
     (if (zero? failures)
         (begin (display "connpool-lifecycle: all tests passed\n") (exit 0))
