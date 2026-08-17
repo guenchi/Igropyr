@@ -252,11 +252,24 @@
 ;; check exists to compare against -- and losing it looks exactly like
 ;; not having it.
 (define python
-  (let try ((cs '("python3" "python3.13" "python3.12" "python3.11"
-                  "python3.10" "python")))
+  (let try ((cs (let ((named (getenv "IGROPYR_PYTHON")))
+                  (if named
+                      (list named)
+                      '("python3" "python3.14" "python3.13" "python3.12"
+                        "python3.11" "python3.10" "python")))))
     (cond ((null? cs) #f)
+          ;; the probe seals and opens, because that is what the peer
+          ;; script does. `import cryptography` succeeds on a package too
+          ;; old or too broken to provide AESGCM, and such a build would
+          ;; then be chosen over a working node and fail as an empty
+          ;; cross-check rather than as a missing peer.
           ((zero? (system (string-append (car cs)
-                            " -c 'import cryptography' >/dev/null 2>&1")))
+                            " -c 'from cryptography.hazmat.primitives.ciphers.aead"
+                            " import AESGCM;"
+                            " a=AESGCM(bytes(32));"
+                            " assert a.decrypt(bytes(12), a.encrypt(bytes(12),"
+                            " b\"x\", None), None)==b\"x\"'"
+                            " >/dev/null 2>&1")))
            (car cs))
           (else (try (cdr cs))))))
 

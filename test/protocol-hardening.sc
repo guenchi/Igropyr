@@ -22,23 +22,73 @@
       (begin (set! failures (+ failures 1))
              (display "FAIL  ") (display label) (newline))))
 
-;; THE INTERPRETER IS LOOKED UP, NOT ASSUMED. FreeBSD -- a platform
+;; THE INTERPRETER IS LOOKED UP, NOT ASSUMED (IGROPYR_PYTHON overrides). FreeBSD -- a platform
 ;; this library is deployed on -- installs python3.11 and no
 ;; `python3`, and what that produced here was not a missing
 ;; interpreter: system() reported nothing, the result file never
 ;; appeared, the poll below timed out, and the case announced that
 ;; the SERVER had sent zero bytes. It read as the exact defect
 ;; these two cases exist to catch, on both of the versions it was
-;; compared across, for months. A dependency this test cannot run
+;; compared across, on every version it was compared against. A dependency this test cannot run
 ;; without is either found or named -- never silently absent.
 (define python
-  (let try ((cs '("python3" "python3.13" "python3.12" "python3.11"
-                  "python3.10" "python")))
+  (let try ((cs (let ((named (getenv "IGROPYR_PYTHON")))
+                  ;; an explicit name wins: the list below goes stale every
+                  ;; year, and a host with only the newest python would
+                  ;; reproduce exactly the naming problem this is fixing
+                  (if named
+                      (list named)
+                      '("python3" "python3.14" "python3.13" "python3.12"
+                        "python3.11" "python3.10" "python")))))
     (cond ((null? cs) #f)
+          ;; the test is what the scripts need -- python 3 -- not merely
+          ;; something that can import socket, which python 2 can do too
+          ;; while dying on the first py3 line of the script
           ((zero? (system (string-append (car cs)
-                            " -c 'import socket' >/dev/null 2>&1")))
+                            " -c 'import sys; sys.exit(0 if sys.version_info[0]==3 else 1)'"
+                            " >/dev/null 2>&1")))
            (car cs))
           (else (try (cdr cs))))))
+
+
+;; Waits for the client to FINISH, not for it to produce output. A script
+;; that dies leaves no result file, and waiting on that file cannot tell
+;; "the client failed" from "the server said nothing" -- the confusion
+;; this whole file was reading backwards. The shell writes the exit
+;; status after the script returns, so the status file appearing means
+;; the run is over and its contents say how it went. On a bad exit the
+;; interpreter's stderr is printed: it is the only thing that separates a
+;; broken client from a silent server, and keeping it in a file nobody
+;; reads is the same as discarding it.
+(define (leading-number str)
+  (let loop ((i 0))
+    (if (and (< i (string-length str)) (char-numeric? (string-ref str i)))
+        (loop (+ i 1))
+        (and (> i 0) (string->number (substring str 0 i))))))
+
+(define (slurp path)
+  (guard (e (#t "")) (call-with-input-file path get-string-all)))
+
+(define (client-ran? py)
+  (let ((status (string-append py ".status"))
+        (err (string-append py ".err")))
+    (when (file-exists? status) (delete-file status))
+    (system (string-append "( " python " " py " >/dev/null 2>" err
+                           "; echo $? >" status " ) &"))
+    (let poll ((i 0))
+      (cond
+        ((file-exists? status)
+         (let ((code (leading-number (slurp status))))
+           (cond ((eqv? code 0) #t)
+                 (else
+                   (display "  [info] the half-close client exited ")
+                   (display code) (newline)
+                   (let ((e (slurp err)))
+                     (unless (string=? e "")
+                       (display "  [client stderr] ") (display e) (newline)))
+                   #f))))
+        ((< i 150) (sleep-ms 100) (poll (+ i 1)))
+        (else (display "  [info] the half-close client never finished\n") #f)))))
 
 (define port 18778)
 
@@ -176,17 +226,17 @@
         (check "a partial request is eventually reaped"
           (memq outcome '(answered closed))))
 
-      ;; Reported through this file's own counter, and the run stops
-      ;; here: the two cases below cannot be attempted without it, and
-      ;; attempting them anyway is what produced a server-shaped failure
-      ;; the last time. Nothing needs tearing down at this point -- the
-      ;; tail of this file only reports.
+      ;; Reported through this file's own counter, and then the two
+      ;; cases that need it are skipped -- not the file. Attempting them
+      ;; without an interpreter is what produced a server-shaped failure
+      ;; the last time; abandoning the file here would take four later
+      ;; cases that never touch python with it, and "not run" and "ran
+      ;; and passed" read the same afterwards.
       (unless python
         (check "python3 is available to drive a half-closing client" #f)
         (display "       looked for: python3 python3.13 python3.12 python3.11 python3.10 python\n")
-        (display "       these two cases need a client outside this library\n")
-        (display failures) (display " failures\n")
-        (exit 1))
+        (display "       these two cases are skipped; the rest of this file\n")
+        (display "       does not need one and still runs\n"))
 
       ;; ---- a client that half-closes after its request ------------------
       ;;
@@ -201,91 +251,91 @@
       ;; passed with -c, because quoting a multi-line program through the
       ;; shell is how the first version of this case silently measured
       ;; nothing at all.
-      (let ((py "/tmp/igropyr-halfclose.py")
-            (out "/tmp/igropyr-halfclose.txt"))
-        (system (string-append "rm -f " out))
-        (call-with-output-file py
-          (lambda (p)
-            (display "import socket\n" p)
-            (display "s=socket.create_connection(('127.0.0.1'," p)
-            (display port p) (display "),timeout=2)\n" p)
-            (display "s.sendall(b'GET /slowstream HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n')\n" p)
-            (display "s.shutdown(socket.SHUT_WR)\n" p)
-            (display "d=b''\n" p)
-            (display "try:\n" p)
-            (display "    while True:\n" p)
-            (display "        b=s.recv(4096)\n" p)
-            (display "        if not b: break\n" p)
-            (display "        d+=b\n" p)
-            (display "except Exception: pass\n" p)
-            (display "open('" p) (display out p) (display "','wb').write(d)\n" p))
-          'replace)
-        ;; IN THE BACKGROUND. system blocks the one OS thread, so a
-        ;; foreground python would wait for a response the scheduler cannot
-        ;; produce while it is blocked -- the first version of this case
-        ;; deadlocked exactly that way and reported zero bytes, which looks
-        ;; identical to the defect being tested.
-        ;; stderr is kept, not discarded: a script that dies halfway
-        ;; leaves the same empty result file as a server that said
-        ;; nothing, and only this file tells them apart
-        (system (string-append python " " py " >/dev/null 2>" py ".err &"))
-        (let poll ((i 0))
-          (when (and (< i 150) (not (file-exists? out)))
-            (sleep-ms 100)
-            (poll (+ i 1))))
-        (sleep-ms 200)
-        (let* ((raw (guard (e (#t "")) (call-with-input-file out get-string-all)))
-               (text (if (string? raw) raw "")))
-          (display "  [info] a half-closed client received ")
-          (display (string-length text)) (display " bytes\n")
-          ;; HTTP/1.1, so the body is chunked: the two writes arrive as
-          ;; separate chunks and "hello-world" is never contiguous
-          (check "a half-closed client still gets its response"
-            (and (str-has? text "200 OK")
-                 (str-has? text "hello-")
-                 (str-has? text "world")
-                 (str-has? text "0\r\n\r\n")))
-          (system (string-append "rm -f " py " " out))))
+      (when python
+        (let ((py "/tmp/igropyr-halfclose.py")
+              (out "/tmp/igropyr-halfclose.txt"))
+          (system (string-append "rm -f " out))
+          (call-with-output-file py
+            (lambda (p)
+              (display "import socket\n" p)
+              (display "s=socket.create_connection(('127.0.0.1'," p)
+              (display port p) (display "),timeout=2)\n" p)
+              (display "s.sendall(b'GET /slowstream HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n')\n" p)
+              (display "s.shutdown(socket.SHUT_WR)\n" p)
+              (display "d=b''\n" p)
+              (display "try:\n" p)
+              (display "    while True:\n" p)
+              (display "        b=s.recv(4096)\n" p)
+              (display "        if not b: break\n" p)
+              (display "        d+=b\n" p)
+              (display "except Exception: pass\n" p)
+              (display "open('" p) (display out p) (display "','wb').write(d)\n" p))
+            'replace)
+          ;; IN THE BACKGROUND. system blocks the one OS thread, so a
+          ;; foreground python would wait for a response the scheduler cannot
+          ;; produce while it is blocked -- the first version of this case
+          ;; deadlocked exactly that way and reported zero bytes, which looks
+          ;; identical to the defect being tested.
+          ;; nothing is asserted about a response that was never
+          ;; asked for: a client that failed to run would other-
+          ;; wise also produce a server-shaped failure beside its
+          ;; own, which is the reading this file is being cured of
+          (let ((ran (client-ran? py)))
+            (check "the half-close client ran" ran)
+            (when ran
+              (sleep-ms 200)
+              (let* ((raw (guard (e (#t "")) (call-with-input-file out get-string-all)))
+                   (text (if (string? raw) raw "")))
+              (display "  [info] a half-closed client received ")
+              (display (string-length text)) (display " bytes\n")
+              ;; HTTP/1.1, so the body is chunked: the two writes arrive as
+              ;; separate chunks and "hello-world" is never contiguous
+              (check "a half-closed client still gets its response"
+                (and (str-has? text "200 OK")
+                     (str-has? text "hello-")
+                     (str-has? text "world")
+                     (str-has? text "0\r\n\r\n")))
+              (system (string-append "rm -f " py " " out)))))))
 
       ;; ...and the same for a client that half-closes once the stream is
       ;; already running. That eof reaches await-streaming, which had the
       ;; identical mistake one level down: it ended the stream at whatever
       ;; had been sent so far.
-      (let ((py "/tmp/igropyr-halfclose2.py")
-            (out "/tmp/igropyr-halfclose2.txt"))
-        (system (string-append "rm -f " out))
-        (call-with-output-file py
-          (lambda (p)
-            (display "import socket\n" p)
-            (display "s=socket.create_connection(('127.0.0.1'," p)
-            (display port p) (display "),timeout=4)\n" p)
-            (display "s.sendall(b'GET /dripstream HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n')\n" p)
-            (display "d=s.recv(4096)\n" p)          ; read the head + first chunk
-            (display "s.shutdown(socket.SHUT_WR)\n" p)   ; half-close mid-stream
-            (display "try:\n" p)
-            (display "    while True:\n" p)
-            (display "        b=s.recv(4096)\n" p)
-            (display "        if not b: break\n" p)
-            (display "        d+=b\n" p)
-            (display "except Exception: pass\n" p)
-            (display "open('" p) (display out p) (display "','wb').write(d)\n" p))
-          'replace)
-        ;; stderr is kept, not discarded: a script that dies halfway
-        ;; leaves the same empty result file as a server that said
-        ;; nothing, and only this file tells them apart
-        (system (string-append python " " py " >/dev/null 2>" py ".err &"))
-        (let poll ((i 0))
-          (when (and (< i 150) (not (file-exists? out)))
-            (sleep-ms 100)
-            (poll (+ i 1))))
-        (sleep-ms 200)
-        (let* ((raw (guard (e (#t "")) (call-with-input-file out get-string-all)))
-               (text (if (string? raw) raw "")))
-          (display "  [info] half-closing mid-stream received ")
-          (display (string-length text)) (display " bytes\n")
-          (check "a stream survives a half-close in the middle of it"
-            (and (str-has? text "done") (str-has? text "0\r\n\r\n")))
-          (system (string-append "rm -f " py " " out))))
+      (when python
+        (let ((py "/tmp/igropyr-halfclose2.py")
+              (out "/tmp/igropyr-halfclose2.txt"))
+          (system (string-append "rm -f " out))
+          (call-with-output-file py
+            (lambda (p)
+              (display "import socket\n" p)
+              (display "s=socket.create_connection(('127.0.0.1'," p)
+              (display port p) (display "),timeout=4)\n" p)
+              (display "s.sendall(b'GET /dripstream HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n')\n" p)
+              (display "d=s.recv(4096)\n" p)          ; read the head + first chunk
+              (display "s.shutdown(socket.SHUT_WR)\n" p)   ; half-close mid-stream
+              (display "try:\n" p)
+              (display "    while True:\n" p)
+              (display "        b=s.recv(4096)\n" p)
+              (display "        if not b: break\n" p)
+              (display "        d+=b\n" p)
+              (display "except Exception: pass\n" p)
+              (display "open('" p) (display out p) (display "','wb').write(d)\n" p))
+            'replace)
+          ;; nothing is asserted about a response that was never
+          ;; asked for: a client that failed to run would other-
+          ;; wise also produce a server-shaped failure beside its
+          ;; own, which is the reading this file is being cured of
+          (let ((ran (client-ran? py)))
+            (check "the half-close client ran" ran)
+            (when ran
+              (sleep-ms 200)
+              (let* ((raw (guard (e (#t "")) (call-with-input-file out get-string-all)))
+                   (text (if (string? raw) raw "")))
+              (display "  [info] half-closing mid-stream received ")
+              (display (string-length text)) (display " bytes\n")
+              (check "a stream survives a half-close in the middle of it"
+                (and (str-has? text "done") (str-has? text "0\r\n\r\n")))
+              (system (string-append "rm -f " py " " out)))))))
 
       ;; ---- inbound framing the two ends could read differently ---------
       ;;
