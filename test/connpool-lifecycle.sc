@@ -32,11 +32,20 @@
 (define spawned 0)
 (define (bump!) (set! spawned (+ spawned 1)))
 
+;; ...and WHICH ones, for the case that has to say "a different process"
+;; rather than "one more process". A count cannot tell a replacement from
+;; a straggler still coming up, and it is recorded before the spawn it
+;; counts, so it is not even an ordering. These are the pids themselves,
+;; recorded after they exist.
+(define born '())
+(define (born! pid) (set! born (cons pid born)) pid)
+
 ;; A stand-in connection: reports up, waits to be adopted, then answers
 ;; queries instantly and pings idle, exactly like a driver worker.
 (define (fake-spawn-conn! notify report-to ref)
   (bump!)
-  (spawn
+  (born!
+    (spawn
     (lambda ()
       (send report-to (vector 'pool-up ref self 'ok))
       (receive (`#(pool-adopt) 'ok))
@@ -46,7 +55,7 @@
             (send from (vector 'pool-reply r (vector 'fake-rows sql)))
             (send notify (vector 'pool-idle self r))
             (loop))
-          (`#(pool-quit) 'done))))))
+          (`#(pool-quit) 'done)))))))
 
 ;; A stand-in that answers its caller itself and then reports the death,
 ;; which is the order a driver uses when its transport fails under a query.
@@ -863,9 +872,21 @@
     ;; the moment the leased one dies. With a single connection there is
     ;; nothing to put in its place and any implementation passes.
     (set! spawned 0)
+    (set! born '())
     (let ((pool (spawn (lambda () (connpool-loop 2 fake-spawn-conn! cfg)))))
-      (sleep-ms 300)
+      ;; WAIT FOR BOTH INITIAL CONNECTIONS, and wait for them by asking.
+      ;; A fixed sleep here does not merely risk being short: if the
+      ;; second one is still coming up when the baseline is taken, its
+      ;; arrival satisfies both the wait for a replacement and the
+      ;; assertion that one appeared -- while the sibling this case needs
+      ;; at the moment of death was never there. The boundary would be
+      ;; gone and the case would still pass.
+      (let settle ((i 0))
+        (cond ((= (length born) 2) 'up)
+              ((> i 200) (check "the pool brought up both connections" #f))
+              (else (sleep-ms 50) (settle (+ i 1)))))
       (let* ((before spawned)
+             (born-before born)
              (outcome
                (guard (e (#t (list 'lease-raised e)))
                  (connpool-lease pool
@@ -886,7 +907,7 @@
         ;; number larger than the backoff only moves that failure onto
         ;; whichever machine is slower than the number.
         (let await ((i 0))
-          (cond ((> spawned before) 'rebuilt)
+          (cond ((> (length born) (length born-before)) 'rebuilt)
                 ((> i 200) 'gave-up)          ; the check below reports it
                 (else (sleep-ms 50) (await (+ i 1)))))
         ;; the two shapes are told apart by a tag rather than by length:
@@ -906,8 +927,15 @@
                  (and (pair? second) (eq? (car second) 'raised)
                       (let ((r (cadr second)))
                         (and (vector? r) (equal? (vector-ref r 1) "lost")))))
-          (check "the replacement is a new connection, not the same one"
-                 (> spawned before))
+          ;; a DIFFERENT process, said as identity rather than as arithmetic:
+          ;; one more pid could be a straggler, and the counter is bumped
+          ;; before the spawn it counts
+          (let ((added (filter (lambda (p) (not (memq p born-before))) born)))
+            (check "the replacement is a new connection, not the same one"
+                   (and (= (length added) 1)
+                        (not (memq (car added) born-before))))
+            (display "  [info] replacement pids added ")
+            (display (length added)) (newline))
           (display "  [info] lease outcome ") (write second)
           (display ", connections spawned ") (display (- spawned before))
           (newline))))
