@@ -38,6 +38,10 @@
   (string-append (or (getenv "HOME") "")
                  "/.local/lib/igropyr/libquickjs-bellard.dylib"))
 
+(define macos?
+  (let* ((m (symbol->string (machine-type))) (n (string-length m)))
+    (and (>= n 3) (string=? (substring m (- n 3) n) "osx"))))
+
 (define staged "/tmp/igropyr-so-order-test")
 
 (define (skip! why)
@@ -45,16 +49,19 @@
   (exit 0))
 
 (cond
+  ;; Platform first. The other way round, a FreeBSD run said "no
+  ;; ...libquickjs-bellard.dylib (build one to cover this)" -- an
+  ;; instruction that cannot be carried out and would not help if it
+  ;; were, since the next clause skips there anyway. A skip that asks for
+  ;; the impossible is worse than one that says it is out of scope.
+  ((not macos?)
+   ;; The staging trick is DYLD_LIBRARY_PATH, which is macOS's; covering
+   ;; the same ordering hazard elsewhere would need its own mechanism.
+   (skip! "this case stages a library with DYLD_LIBRARY_PATH, so it only runs on macOS"))
   ((not (file-exists? bellard))
    ;; Named, not silent: this is real missing coverage.
    (skip! (string-append "no " bellard
                          " (build one from bellard/quickjs to cover this)")))
-  ((let* ((m (symbol->string (machine-type)))
-          (n (string-length m)))
-     (not (and (>= n 3) (string=? (substring m (- n 3) n) "osx"))))
-   ;; The staging trick is DYLD_LIBRARY_PATH, and the only bellard build
-   ;; kept around is a macOS dylib.
-   (skip! "the staged bellard build is a macOS dylib"))
   (else
    (system (string-append "rm -rf " staged " && mkdir -p " staged))
    (system (string-append "cp " bellard " " staged "/libquickjs.dylib"))

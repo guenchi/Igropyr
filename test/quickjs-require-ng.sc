@@ -15,9 +15,19 @@
 
 (import (chezscheme) (igropyr quickjs))
 
+(define shared-ext
+  ;; A bellard build is a .dylib on macOS and a .so everywhere else.
+  ;; Hardcoding one of them does not make this suite macOS-only, it makes
+  ;; it UNSATISFIABLE off macOS: the probe looks for a filename the
+  ;; platform never produces, so the skip message asks for something that
+  ;; would still not be found. That is how two other suites here went
+  ;; silently skipped on every machine for months.
+  (let* ((m (symbol->string (machine-type))) (n (string-length m)))
+    (if (and (>= n 3) (string=? (substring m (- n 3) n) "osx")) ".dylib" ".so")))
+
 (define path
   (string-append (or (getenv "HOME") "")
-                 "/.local/lib/igropyr/libquickjs-bellard.dylib"))
+                 "/.local/lib/igropyr/libquickjs-bellard" shared-ext))
 
 (cond
   ((not (file-exists? path))
