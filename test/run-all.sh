@@ -15,7 +15,15 @@ else
 fi
 
 export CHEZSCHEMELIBDIRS=.
-export CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so
+# THE OBJECT EXTENSION POINTS AT A SUFFIX THAT DOES NOT EXIST, so a
+# stale .so can never answer for a source file. Chez picks by timestamp,
+# which is why this has not bitten yet -- every edited source here is
+# newer than the objects left in the tree -- but "has not bitten" is not
+# a property: an object built after its source, from a tree that has
+# since moved, wins and nothing says so. Leaving the object extension
+# EMPTY does not do this; it still resolves to .so (measured). Naming an
+# extension nothing produces is what excludes them.
+export CHEZSCHEMELIBEXTS=.chezscheme.sls::.no-obj:.ss::.no-obj:.sls::.no-obj:.scm::.no-obj:.sch::.no-obj:.sc::.no-obj
 
 # A RUN THAT STOPPED EARLY MUST NOT READ LIKE A RUN THAT PASSED. set -e
 # is deliberate -- the suites are serial and expensive, and the first red

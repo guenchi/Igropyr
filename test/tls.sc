@@ -17,6 +17,19 @@
 (import (chezscheme) (igropyr http-client) (igropyr tls) (igropyr http)
         (igropyr actor) (igropyr libuv) (igropyr platform))
 
+;; NAMED IF ABSENT. Without the openssl CLI the s_server instances below
+;; never start, and every case fails on a connection that was refused --
+;; which reads as the client being broken rather than as a tool this
+;; suite needs and did not find. Checked here, before anything else, so
+;; the message is the first thing printed rather than a conclusion drawn
+;; from a page of refusals.
+(unless (zero? (system "command -v openssl >/dev/null 2>&1"))
+  (display "tls: openssl is not on PATH.\n")
+  (display "     This suite runs real handshakes against local\n")
+  (display "     `openssl s_server` instances and mints ephemeral certs\n")
+  (display "     with it (test/tls-certs.sh). Install openssl.\n")
+  (exit 1))
+
 ;; The shared error queue cases below need OpenSSL directly, both to plant
 ;; a foreign entry and to make the unprotected pairing they are about.
 (define _libcrypto

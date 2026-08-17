@@ -22,6 +22,18 @@
              (display "FAIL  ") (display label) (newline))))
 
 (system (string-append "rm -rf " dir " && mkdir -p " dir))
+;; NAMED IF ABSENT, never inferred from the wreckage. Without openssl the
+;; genpkey calls below fail quietly, the PEM files never appear, and the
+;; first jwks-load-key raises about a file -- a failure that reads as a
+;; fault in the library rather than as a tool this suite needs and did
+;; not find. (The same shape, from a missing python3, had two protocol
+;; cases blaming the server for months.)
+(unless (zero? (system "command -v openssl >/dev/null 2>&1"))
+  (display "jwks: openssl is not on PATH.\n")
+  (display "      This suite mints two throwaway RSA keys with it; there\n")
+  (display "      is nothing to test without them. Install openssl.\n")
+  (exit 1))
+
 (system (string-append "openssl genpkey -algorithm RSA -pkeyopt "
                        "rsa_keygen_bits:2048 -out " dir "/a.pem 2>/dev/null"))
 (system (string-append "openssl genpkey -algorithm RSA -pkeyopt "
