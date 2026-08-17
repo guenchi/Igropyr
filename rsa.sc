@@ -688,11 +688,21 @@
   ;; blocks forever, /dev/zero never reaches EOF, and either one -- executed
   ;; on the one OS thread this runtime has -- stops every green process,
   ;; every timer and all supervision, with no actor timeout able to
-  ;; interrupt it. So open with O_NONBLOCK (a FIFO returns a fd instead of
-  ;; parking), fstat THAT fd, accept only a regular file, and read at most
-  ;; one PEM's worth. Because the fstat and the read act on the opened
-  ;; inode, not on the path, the classic stat-then-open swap (regular file
-  ;; replaced by a FIFO in between) cannot reach the read. A caller who
+  ;; interrupt it. So: open with O_NONBLOCK (a FIFO returns a fd instead
+  ;; of parking), REJECT WHAT CANNOT SEEK, and read at most one PEM's
+  ;; worth. The seek test is what excludes the FIFO, the pipe and the
+  ;; socket -- the things that block forever -- and it is applied to the
+  ;; opened fd, not to the path, so the classic stat-then-open swap
+  ;; cannot reach the read.
+  ;;
+  ;; What that leaves in is anything seekable that is not a regular file:
+  ;; a character or block device, a directory. Those are not excluded,
+  ;; and the reason they are survivable is the byte cap rather than the
+  ;; seek test -- /dev/zero never reaches EOF but stops at
+  ;; rsa-max-pem-bytes and is refused for size, a directory fails its
+  ;; read. So the property being defended is "cannot stall the one OS
+  ;; thread", and it is the seek test AND the cap together that defend
+  ;; it; neither does it alone. A caller who
   ;; must not block AT ALL should read the bytes itself, asynchronously,
   ;; and use rsa-*-key-from-pem -- the interface these wrappers build on.
   (define (read-file-bytes who path)
@@ -702,10 +712,26 @@
       (when (fx< fd 0)
         (rsa-fail (string-append (symbol->string who) ": cannot open: " path)))
       ;; own the raw fd until it is either rejected (closed here) or handed
-      ;; to a port (closed with the port). A failure anywhere in this
-      ;; stretch -- an allocation that throws, a non-seekable verdict --
-      ;; must not strand it. close-on-exec was set atomically in the open
-      ;; flags, so no fork+exec can inherit it.
+      ;; to a port (closed with the port). Every RAISE in this stretch --
+      ;; an allocation that throws, a non-seekable verdict, a read that
+      ;; errors -- unwinds through the after-thunk below, which closes
+      ;; whichever of the two now owns it. Nothing may be inserted between
+      ;; the open above and the dynamic-wind: that gap is the one stretch
+      ;; a raise would cross uncovered, and it is empty on purpose.
+      ;;
+      ;; A KILL IS NOT COVERED, and no arrangement of this code covers it.
+      ;; @kill discards winders, so a process killed anywhere in here
+      ;; leaks the fd -- and moving the open into the before-thunk would
+      ;; not help, because a before-thunk that is interrupted never enters
+      ;; the extent and its after-thunk does not run either. What survives
+      ;; a kill is an owner monitoring the holder and reclaiming on DOWN;
+      ;; this fd has no owner and is not in libuv's table, so
+      ;; uv-owner-died! cannot reach it. One fd per killed load, bounded
+      ;; and known.
+      ;;
+      ;; close-on-exec was set atomically in the open flags, so no
+      ;; fork+exec can inherit it -- which is a different question from
+      ;; leaking it inside this process, and does not answer that one.
       (let ((port #f))
         (dynamic-wind
           (lambda () (void))

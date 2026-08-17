@@ -319,33 +319,69 @@
         #f
         (gzip-compress-in-range bv level)))
 
+  ;; NATIVE MEMORY ACROSS A RAISE, and what still is not covered.
+  ;;
+  ;; Three foreign-allocs and a zlib stream. Written as a straight let*
+  ;; with a cleanup called from each branch, a raise between the first
+  ;; allocation and the last -- an exhausted allocator on the second, a
+  ;; bad argument to a copy -- left the earlier blocks with nothing to
+  ;; free them, and a raise out of deflate* left the zlib stream's own
+  ;; internal state allocated as well.
+  ;;
+  ;; The allocations are in the BODY, not the before-thunk, and that is
+  ;; deliberate: a raise inside a before-thunk propagates without the
+  ;; dynamic extent ever being entered, so the after-thunk does not run
+  ;; and a partly-completed set of allocations would leak exactly as
+  ;; before. In the body, the extent is already entered when the second
+  ;; alloc raises, so the after-thunk runs and frees the first. Each free
+  ;; is guarded because the after-thunk sees whatever was reached.
+  ;;
+  ;; NOT COVERED: a kill. @kill discards winders, so a process killed in
+  ;; here frees none of this -- three buffers and an initialised zlib
+  ;; stream. The teardown that survives a kill is an owner monitoring the
+  ;; holder and reclaiming on DOWN, and there is no owner here: these
+  ;; blocks belong to whoever called. This is a known, bounded leak --
+  ;; bounded by one call's allocation -- and not something the winder
+  ;; below can be made to cover.
+  ;;
+  ;; Not wrapped in a non-preemptible region either, which would close the
+  ;; kill window: deflate of a large input runs long, and stopping every
+  ;; green process for its duration trades a bounded leak for a stalled
+  ;; runtime.
   (define (gzip-compress-in-range bv level)
     (let* ((n (bytevector-length bv))
-           (strm (foreign-alloc 128))                 ; >= z-stream-size, zeroed
-           (src (foreign-alloc (max 1 n)))
-           (bound (+ n (quotient n 1000) 128))        ; safe deflate upper bound
-           (dst (foreign-alloc bound)))
-      (define (cleanup) (foreign-free strm) (foreign-free src) (foreign-free dst))
-      (memset* strm 0 128)                            ; zalloc/zfree/opaque = 0
-      (memcpy-to-c src bv n)
-      (if (not (= Z-OK (deflate-init2 strm level Z-DEFLATED Z-GZIP-WINDOW
+           (bound (+ n (quotient n 1000) 128))   ; safe deflate upper bound
+           (strm #f) (src #f) (dst #f) (inited #f))
+      (dynamic-wind
+        (lambda () (void))
+        (lambda ()
+          (set! strm (foreign-alloc 128))       ; >= z-stream-size, zeroed
+          (set! src (foreign-alloc (max 1 n)))
+          (set! dst (foreign-alloc bound))
+          (memset* strm 0 128)                  ; zalloc/zfree/opaque = 0
+          (memcpy-to-c src bv n)
+          (and (= Z-OK (deflate-init2 strm level Z-DEFLATED Z-GZIP-WINDOW
                                       8 Z-DEFAULT-STRATEGY (zlib-version)
-                                      z-stream-size)))
-          (begin (cleanup) #f)
-          (begin
-            (foreign-set! 'void* strm 0 src)          ; next_in
-            (foreign-set! 'unsigned-32 strm 8 n)      ; avail_in
-            (foreign-set! 'void* strm 24 dst)         ; next_out
-            (foreign-set! 'unsigned-32 strm 32 bound) ; avail_out
-            (let ((rc (deflate* strm Z-FINISH)))
-              (let ((out-len (foreign-ref 'unsigned-long strm 40)))  ; total_out
-                (deflate-end strm)
-                (if (= rc Z-STREAM-END)
-                    (let ((res (make-bytevector out-len)))
-                      (memcpy-from-c res dst out-len)
-                      (cleanup)
-                      res)
-                    (begin (cleanup) #f))))))))
+                                      z-stream-size))
+               (begin
+                 (set! inited #t)
+                 (foreign-set! 'void* strm 0 src)          ; next_in
+                 (foreign-set! 'unsigned-32 strm 8 n)      ; avail_in
+                 (foreign-set! 'void* strm 24 dst)         ; next_out
+                 (foreign-set! 'unsigned-32 strm 32 bound) ; avail_out
+                 (let* ((rc (deflate* strm Z-FINISH))
+                        (out-len (foreign-ref 'unsigned-long strm 40)))
+                   (and (= rc Z-STREAM-END)
+                        (let ((res (make-bytevector out-len)))
+                          (memcpy-from-c res dst out-len)
+                          res))))))
+        (lambda ()
+          ;; deflate-end only if init succeeded: ending a stream that was
+          ;; never initialised is not a no-op
+          (when inited (deflate-end strm))
+          (when dst (foreign-free dst))
+          (when src (foreign-free src))
+          (when strm (foreign-free strm))))))
 
   ;; Inflate `gz` expecting exactly n bytes back; self-check only.
   (define (gunzip-for-self-check gz n)
