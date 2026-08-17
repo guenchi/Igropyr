@@ -18,25 +18,26 @@ This manual covers the architecture, design patterns, and implementation details
 12. [Authentication](#authentication)
 13. [Sessions](#sessions)
 14. [JSON Web Tokens (JWT)](#json-web-tokens-jwt)
-15. [Metrics](#metrics)
-16. [Outbound HTTP Client](#outbound-http-client)
-17. [Database Clients](#database-clients)
-18. [Async File Reads](#async-file-reads)
-19. [JSON and gzip](#json-and-gzip)
-20. [S-Expression RPC](#s-expression-rpc)
-21. [Distribution](#distribution)
-22. [Vector Scoring](#vector-scoring)
-23. [Embedded JavaScript](#embedded-javascript)
-24. [Cached SSR](#cached-ssr)
-25. [Object Storage and AWS](#object-storage-and-aws)
-26. [Password Hashing](#password-hashing)
-27. [Running and Building](#running-and-building)
-28. [Testing](#testing)
-29. [Development Contracts](#development-contracts)
-30. [Code Style](#code-style)
-31. [Common Pitfalls](#common-pitfalls)
-32. [Appendix: Performance Tips](#appendix-performance-tips)
-33. [Further Reading](#further-reading)
+15. [RSA Keys and Signatures](#rsa-keys-and-signatures)
+16. [Metrics](#metrics)
+17. [Outbound HTTP Client](#outbound-http-client)
+18. [Database Clients](#database-clients)
+19. [Async File Reads](#async-file-reads)
+20. [JSON and gzip](#json-and-gzip)
+21. [S-Expression RPC](#s-expression-rpc)
+22. [Distribution](#distribution)
+23. [Vector Scoring](#vector-scoring)
+24. [Embedded JavaScript](#embedded-javascript)
+25. [Cached SSR](#cached-ssr)
+26. [Object Storage and AWS](#object-storage-and-aws)
+27. [Password Hashing](#password-hashing)
+28. [Running and Building](#running-and-building)
+29. [Testing](#testing)
+30. [Development Contracts](#development-contracts)
+31. [Code Style](#code-style)
+32. [Common Pitfalls](#common-pitfalls)
+33. [Appendix: Performance Tips](#appendix-performance-tips)
+34. [Further Reading](#further-reading)
 
 ---
 
@@ -1452,6 +1453,17 @@ releases the flow and request it was holding; the handle is single-use in
 every direction, and a second `run!` (or an `abandon!` after one) is an
 `assertion-violation`.
 
+A `run!` that **raised** has been used up too, and that is the part worth
+knowing before you write the handler. The flow may have run part-way and
+had effects, so what the handle spent is its one chance to spawn — a
+second `run!` would be a second conversation wearing the first one's id.
+So do **not** call `abandon!` from a failure handler wrapped around
+`run!`: it raises an `assertion-violation` of its own and buries the
+error you were handling. `abandon!` is for the window **between**
+`prepare!` and `run!` — the claim collided, a gate closed, a hold expired
+— and once `run!` has been called, the way to settle what happened is to
+reconcile by **id**.
+
 #### Recovering a conversation whose starter died
 
 This is what the id bought. Persist it **before** `run!`; on recovery, ask
@@ -1639,6 +1651,53 @@ tell apart must not replay each other's replies — that is the case
 watchdog watching, so a key function that hangs does not park the
 conversation forever.
 
+### Asking without waiting for the step to finish
+
+`conversation-peek` waits for a running conversation to reach its next
+park, because that is when the conversation can answer. On a
+reconciliation path that is right. On a request path with a deadline of
+its own it is not, and the deadline that matters there belongs to the
+asker, not to the conversation.
+
+```scheme
+(let-values (((state token reply) (conversation-peek/timeout id 300)))
+  (cond ((conversation-no-answer-yet? state) 'ask-again-later)
+        ((eq? state 'parked) (adopt token))
+        (else (reconcile state))))
+```
+
+`'parked` and `'completed` are peek's own phases and have no predicates —
+the seven `conversation-...?` predicates cover the statuses a *resume*
+can also answer with, so compare those two directly.
+
+The timeout is **required and has no default**: how long to wait is a
+property of the caller's own budget, and no number the library picked
+would be about that.
+
+`'no-answer-yet` is a new status, and the thing to get right is that it
+is **not** `'unknown`. All three of `'no-answer-yet`, `'unknown` and
+`'unreachable` forbid the same thing — none of them licenses starting a
+second attempt — but they call for different next steps:
+
+| status | what it says | what to do |
+|---|---|---|
+| `'no-answer-yet` | nothing arrived within *your* limit | ask again |
+| `'unknown` | this node cannot say what became of it | reconcile against your own records |
+| `'unreachable` | no definite reply came back from the owner | reconcile against your own records |
+
+`'no-answer-yet` reports the **wait**, not the conversation. The usual
+cause is a conversation busy in a step — it does not answer until it
+parks — but the limit can equally expire before the question was asked
+at all. Read it as "no answer yet", never as "no conversation".
+
+Two more things follow from that. A request that was already asked stays
+queued at the conversation and is answered when the step parks, with the
+reply then going nowhere: retrying hard against a slow step accumulates
+those, so throttle on the calling side. And this entry point takes no
+`settled?` predicate — when a predicate is involved, use the unbounded
+`conversation-peek`, which is the one that can weigh a `#f` against the
+record.
+
 ### The `on-killed` hook
 
 `on-killed` runs after the watchdog kills an overrunning step. TTL
@@ -1778,6 +1837,31 @@ while it answered `'gone`. Retry on `'gone`; on `'unknown` and
 `crash`/`stuck` codes, that is the full remote transaction ring — the
 difference being that the ring now carries "I cannot say" as a
 first-class answer rather than guessing.
+
+### A host that gives up does not end the conversation
+
+The worker pool kills a handler it has declared stuck, and gives up on a
+task whose retries are spent. Either way the process that called `run!`
+goes away — and **the conversation does not**. It is spawned unlinked, so
+it keeps running, keeps holding whatever it holds, and may still commit.
+That is the intended semantics, not a missing feature.
+
+Reaping it along with the handler would manufacture the one outcome this
+whole mechanism exists to prevent: a transaction that **may already have
+committed**, destroyed on the way out and reported as though it never
+happened. The kill would land at an arbitrary instant, which is precisely
+the instant at which nobody can say which side of the commit it fell on.
+
+What bounds it instead:
+
+- **The conversation's own ttl.** It ends whether or not anyone is still
+  asking, so nothing runs forever on the strength of a caller that left.
+- **`on-killed`.** When the ttl does end it, the caller's own
+  compensation runs, with `committed?` saying which way to go.
+- **`prepare!` for the case that looks worst** — the client got a bare
+  500 and holds no id. Take the id *before* anything can have an effect
+  and persist it; the conversation is then reachable by id no matter what
+  became of the process that started it.
 
 ### Where to use it
 
@@ -2229,6 +2313,61 @@ RS256/ES256 (no RSA/EC in `(igropyr crypto)`), HS384/HS512 (no
 SHA-384/512), JWE, and multi-signature JWS JSON serialization are out of
 scope. Adding an algorithm means extending sign and verify in lockstep,
 with the verifier staying pinned to an explicit list.
+
+---
+
+## RSA Keys and Signatures
+
+`(igropyr rsa)` signs and verifies **arbitrary bytes** with RSA-SHA256
+(PKCS#1 v1.5 — what JOSE calls RS256 and what `openssl dgst -sha256
+-sign` produces). It knows about keys, byte strings and signatures, and
+nothing about tokens or claims.
+
+```scheme
+(import (igropyr rsa))
+(define k   (rsa-load-private-key "/etc/keys/signing.pem"))
+(define sig (rsa-sign-sha256 k (string->utf8 "any bytes at all")))
+
+(define pub (rsa-load-public-key "/etc/keys/signing.pub"))   ; or a cert
+(rsa-verify-sha256 pub (string->utf8 "any bytes at all") sig)  ; => #t
+```
+
+Loading: `rsa-private-key-from-pem` / `rsa-public-key-from-pem` from PEM
+text or bytes, `rsa-public-key-from-modulus` for formats that publish the
+raw magnitudes, and `rsa-load-private-key` / `rsa-load-public-key` from a
+path. Inspection: `rsa-key?`, `rsa-key-private?`, `rsa-key-bits`,
+`rsa-key-modulus`, `rsa-key-exponent`, `rsa-key-consistency-checked`.
+Release with `rsa-key-free!` when rotating; a key held for the life of
+the process needs none.
+
+`rsa-verify-sha256` answers `#t` or `#f` and never raises on a bad
+signature — a signature is attacker-supplied, so "no" is an answer, not
+an error. It *does* raise when the machine could not perform the check at
+all, because "this signature is forged" and "this host cannot check
+signatures" must not arrive as the same value.
+
+### A key that loaded is not a key that was checked
+
+A private key can be well-encoded and still not self-consistent — a PEM
+whose `d`/`p`/`q` do not match `n`/`e` decodes fine and cannot sign
+verifiably. Loading checks for that where it can, and
+`rsa-key-consistency-checked` reports what the check actually
+established:
+
+| value | meaning |
+|---|---|
+| `'checked` | the check ran and passed |
+| `'unavailable` | this libcrypto has no `EVP_PKEY_check` (before 1.1.1, and LibreSSL): nothing was judged |
+| `'not-implemented` | the provider declined to judge the key: nothing was judged |
+| `'not-applicable` | a public key, which has no parameters to cross-check |
+
+A key that is judged *bad* is refused at load, so these four are all
+"loaded". The two non-checked answers are deliberate — refusing to load
+on an older libcrypto would be a much larger change than this check is
+worth, and a provider that cannot judge must not thereby reject every key
+— but they were previously indistinguishable from a pass. Code that must
+not run on an unverified key asks for `'checked`; code that only wants a
+key ignores this, exactly as before.
 
 ---
 
@@ -2743,21 +2882,125 @@ It was written for the two SQL drivers and was called `sqlpool`. What it models 
 
 Exports:
 
-- `make-sql-cfg` — build the per-driver config record (once per driver): the driver's error *values* for lost / closed / query-timeout / checkout-timeout events, a predicate that recognizes an error reply, and the `BEGIN` statement (`"BEGIN"` / `"START TRANSACTION"`).
-- `sql-pool-loop` — the dispatcher loop: `(sql-pool-loop n spawn-conn! cfg)`, a fixed pool of `n` connection workers.
-- `sql-query` — run one statement on a connection or a pool.
-- `sql-transaction` / `sql-call-with-connection` — borrow a whole connection (with or without a transaction), with guaranteed return.
-- `sql-close!` — close a pool or a lone connection.
+- `make-connpool-cfg` — build the per-driver config record (once per driver): the driver's error *values* for lost / closed / query-timeout / checkout-timeout events, a predicate that recognizes an error reply, the `BEGIN` statement (`"BEGIN"` / `"START TRANSACTION"`), and optionally the query and checkout deadlines (both default to 60 s).
+- `connpool-loop` — the dispatcher loop: `(connpool-loop n spawn-conn! cfg)`, a fixed pool of `n` connection workers.
+- `connpool-call` — run one request on a connection or a pool.
+- `sql-transaction` / `connpool-lease` — borrow a whole connection (with or without a transaction), with guaranteed return.
+- `connpool-close!` — close a pool or a lone connection.
+- `connpool-check-size!` — reject a bad pool size where the caller wrote it, rather than inside a pool that then answers nothing.
+- `connpool-drain-stale!` / `connpool-stats` — recycle idle connections; read pool counters.
+- `connpool-cfg-set-observer!` / `connpool-observer-failures` — see *Watching every request* below.
 
 Each driver's connection process must speak a small message contract:
 
-- `#(db-query ,sql ,ref ,from)` — run `sql`, then reply `#(db-reply ,ref ,r)` to `from`.
-- `#(db-adopt)` / `#(db-quit)` — adoption handshake / shutdown.
-- `#(db-idle ,self)` — sent to its pool after each finished query.
-- `#(db-conn-dead ,self)` — sent to its pool when it has replied a transport error and is about to exit.
-- `#(db-up ,ref ,self ,status)` — reported by a connecting worker.
+- `#(pool-request ,req ,ref ,from)` — do `req`, then reply `#(pool-reply ,ref ,r)` to `from`.
+- `#(pool-adopt)` / `#(pool-quit)` — adoption handshake / shutdown.
+- `#(pool-idle ,self ,ref)` — sent to its pool after each finished request, naming the one it just finished, so a late idle cannot free a connection that has since been given something else.
+- `#(pool-conn-dead ,self)` — sent to its pool *before* it replies a transport error.
+- `#(pool-up ,ref ,self ,status)` — reported by a connecting worker.
+- `#(pool-stats ,ref ,from)` — answer `#(pool-stats-reply ,ref #f)`; answering is what stops the request sitting in the mailbox forever.
+
+A connection must also answer `pool-quit` and `pool-request-cancel` **while it is waiting** for the far side. A receive that matches only the socket strands both: the pool cannot reclaim it and the caller cannot abandon it.
 
 Query and checkout both time out at 60 s. Leases are per-checkout records (keyed by connection, carrying the borrower, its monitor and the checkout ref), so one borrower holding several leases never clobbers its own bookkeeping; a borrower killed mid-transaction is reclaimed by the pool's monitor (the actor's `@kill` discards `dynamic-wind` winders, so no checkin ever runs). Closing a pool quits leased connections immediately — a transaction still in flight on one times out on its next statement, so close a pool only after its borrowers are done.
+
+### What a lease guarantees
+
+`connpool-lease` hands one whole connection to `proc` for its extent. The
+promises are about the **pool**, and stop there:
+
+1. It never re-points a handle. For the extent of `proc` the handle
+   denotes the same connection process — no sibling is swapped in, not
+   even an idle one.
+2. Once that process is gone, **the next call on the old handle** raises
+   the driver's lost-error. Nothing watches the connection on `proc`'s
+   behalf, so a `proc` that simply stops calling returns normally: the
+   failure is delivered to the next call, not announced to the borrower.
+3. A dead worker's handle is never given to its replacement — **provided
+   the `spawn-conn!` you supplied returns a process id it has never
+   returned before.** That is the one clause here guaranteed by the
+   caller rather than by the pool: the message contract above does not
+   demand it, the pool does not check it, and a `spawn-conn!` that
+   recycled identities would break this with nothing noticing. The
+   bundled drivers satisfy it because each call is a fresh actor spawn.
+   (Connections themselves *are* reused across leases by later
+   borrowers; what is not reused is the identity of one that died.)
+
+**One peer session for the whole lease — the thing callers actually want
+— follows from (1) only if the driver's worker does not re-dial inside
+itself.** That is a condition on the driver, not a promise made here, and
+the pool can neither see nor report a breach of it: the process id is
+unchanged, so from where the pool stands nothing happened. Cite the
+condition along with the guarantee.
+
+Three things it does **not** say:
+
+- Nothing about what a driver does inside its worker (above).
+- Nothing about the peer's own continuity: a server that holds the socket
+  open while resetting what the session contains is outside this model.
+- A live handle is not an open transaction. If the borrower is killed its
+  winders are discarded and no check-in is sent; what keeps a half-open
+  transaction away from the next borrower is the pool's monitor
+  reclaiming and rebuilding on `DOWN`, not the lease.
+
+And the handle is a **capability**: exclusivity is the pool declining to
+lend the connection to anyone else, not a restriction on who may send to
+that worker. A handle that escapes `proc` — passed to another process, or
+kept past the lease — lets those calls land in the same session.
+Comparing handles with `eq?` establishes none of this: a worker that
+re-dialled its own socket is `eq?` to itself while the session behind it
+changed.
+
+### Watching every request
+
+An application that wraps its own query function sees its own statements
+and nothing else — the `BEGIN`, the `COMMIT` and the `ROLLBACK` are
+issued inside the engine. A trace built that way can show three
+statements in a row and still not distinguish one transaction from three,
+and cannot show that no `COMMIT` slipped in between, which is usually the
+only reason such a trace exists.
+
+Observing at dispatch puts all of them in one stream, already in order:
+
+```scheme
+(mysql-observe! (lambda (conn sql) (trace! conn sql)))
+```
+
+- `(connpool-cfg-set-observer! cfg proc)` — the primitive, for a driver
+  author. `proc` is `(conn sql)` and is called **when the request is
+  dispatched**, once; the outcome is the caller's own return value and is
+  deliberately not repeated here. `#f` clears it.
+- `(mysql-observe! proc)` — the same for `(igropyr mysql)`. Only this
+  driver has one because only this driver was asked for one; the
+  primitive is in the engine, so any other driver costs one line.
+- `(connpool-observer-failures)` — how many times an observer raised. It
+  is guarded at every call site, so a raise is counted and the statement
+  proceeds; this counter exists because there is no logging here and a
+  silently failing observer would otherwise look exactly like an idle
+  one.
+
+Four boundaries, each of which a reader will otherwise assume wrongly:
+
+- **Scope is one driver module, not one pool.** The config holding the
+  observer is built once per driver, so two pools opened through the same
+  driver report to the same observer, with nothing but the connection to
+  tell them apart. Install before there is traffic.
+- **It runs in the borrower's process**, which is why it is safe to
+  expose: a slow observer delays only the caller that provoked it and
+  cannot stall the pool.
+- **It is called on the exception path too.** The `ROLLBACK` is issued
+  from a `dynamic-wind` after-thunk, so an observer will find itself
+  running during an unwind, usually with an exception already in flight.
+  Raising there is a mistake.
+- **A killed borrower emits no `ROLLBACK`.** That rollback lives in a
+  winder, and a kill discards winders, so that path produces *no event at
+  all*. The absence of a rollback event therefore says neither "the
+  transaction is still open" nor "it committed" — what protects the next
+  borrower is the pool's monitor rebuilding the connection. Expect no
+  event and a rebuilt connection.
+
+An event is **evidence, not authority**. It reports what was dispatched;
+an observer is not a participant in the transaction it is watching.
 
 ---
 
