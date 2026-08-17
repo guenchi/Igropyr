@@ -60,7 +60,8 @@
   (export make-connpool-cfg
           connpool-loop connpool-call connpool-drain-stale! connpool-check-size!
           sql-transaction connpool-lease connpool-close!
-          connpool-stats)
+          connpool-stats
+          connpool-cfg-set-observer! connpool-observer-failures)
   (import (chezscheme) (igropyr actor) (igropyr libuv))
 
   (define default-query-ms 60000)
@@ -75,7 +76,7 @@
   (define-record-type (connpool-cfg make-cfg connpool-cfg?)
     (fields error? lost-err closed-err
             query-timeout-err checkout-timeout-err begin-sql
-            query-ms checkout-ms))
+            query-ms checkout-ms (mutable observer)))
 
   ;; The deadlines are OPTIONAL and default to a minute. A minute is the
   ;; right order of magnitude for a database and the wrong one for a
@@ -103,7 +104,86 @@
         (assertion-violation 'make-connpool-cfg
           "checkout timeout must be a positive exact integer (ms)" c))
       (make-cfg error? lost-err closed-err
-                query-timeout-err checkout-timeout-err begin-sql q c)))
+                query-timeout-err checkout-timeout-err begin-sql q c #f)))
+
+  ;; ---- request observation -----------------------------------------------
+  ;;
+  ;; Every statement this engine dispatches, handed to `proc` as
+  ;; (proc conn sql) at the moment it is sent. Off by default; when no
+  ;; observer is installed the dispatch path pays one #f test.
+  ;;
+  ;; WHY HERE AND NOT AROUND A TRANSACTION. A caller that wraps its own
+  ;; query function sees its own statements and nothing else -- the BEGIN,
+  ;; the COMMIT and the ROLLBACK are issued inside this engine, so a trace
+  ;; built that way can show three statements in a row and still not
+  ;; distinguish one transaction from three. It cannot even tell that no
+  ;; COMMIT slipped in between, which is the one thing such a trace is
+  ;; usually built to establish. Observing dispatch puts all of them in
+  ;; one stream, already in order, with nothing to interleave.
+  ;;
+  ;; "Transaction" is also not this engine's vocabulary -- it pools a
+  ;; scarce exclusive resource and a database is one instance -- so the
+  ;; hook is about REQUESTS, and a transaction boundary is simply a
+  ;; request whose text says so.
+  ;;
+  ;; SCOPE IS ONE DRIVER MODULE, NOT ONE POOL. The cfg holding the
+  ;; observer is built once per driver and shared by every pool that
+  ;; driver serves, so two pools opened through the same driver in one
+  ;; process report to the SAME observer, with no field distinguishing
+  ;; them beyond the connection. That is a consequence of where the
+  ;; observer lives, not an oversight; a caller that needs them apart
+  ;; must tell them apart by connection. Install before there is traffic:
+  ;; the field is mutable and nothing here orders an install against a
+  ;; dispatch already under way.
+  ;;
+  ;; IT RUNS IN THE BORROWER'S PROCESS, which is the reason this is safe
+  ;; to expose: a slow or wedged observer delays only the caller that
+  ;; provoked it and cannot stall the pool. It must not, however, break
+  ;; what it observes, so every call is guarded and a raise is counted
+  ;; rather than propagated -- see connpool-observer-failures, which
+  ;; exists because this library has no logging and a silently failing
+  ;; observer would otherwise look exactly like an idle one.
+  ;;
+  ;; AND IT IS CALLED ON THE EXCEPTION PATH TOO. The ROLLBACK below is
+  ;; issued from sql-transaction's after-thunk, so an observer will find
+  ;; itself running during an unwind, usually with an exception already in
+  ;; flight. Anything it does that assumes a normal return -- raising, in
+  ;; particular -- is wrong there.
+  ;;
+  ;; TWO THINGS IT DOES NOT ESTABLISH, both of which a reader will
+  ;; otherwise assume:
+  ;;
+  ;;   - A KILLED BORROWER EMITS NO ROLLBACK. sql-transaction rolls back
+  ;;     from a dynamic-wind after-thunk and @kill discards winders, so
+  ;;     that path produces NO event at all. The absence of a rollback
+  ;;     event therefore says neither "the transaction is still open" nor
+  ;;     "it committed" -- what actually protects the next borrower is the
+  ;;     pool's monitor reclaiming and rebuilding the connection on DOWN,
+  ;;     and what the observer sees of that is nothing. Expect no event
+  ;;     and a rebuilt connection.
+  ;;   - AN EVENT IS EVIDENCE, NOT AUTHORITY. It reports what was
+  ;;     dispatched. It confers nothing: an observer is not a participant
+  ;;     in the transaction it is watching, and "I saw X, so I may do Y"
+  ;;     does not follow from anything here.
+  (define observer-failures 0)
+  (define (connpool-observer-failures) observer-failures)
+
+  (define (connpool-cfg-set-observer! cfg proc)
+    (unless (or (not proc) (procedure? proc))
+      (assertion-violation 'connpool-cfg-set-observer!
+        "observer must be a procedure of two arguments, or #f" proc))
+    (connpool-cfg-observer-set! cfg proc)
+    (void))
+
+  ;; Guarded at every call site: an observer that raises is counted and
+  ;; the statement proceeds. It gets the connection and the request; the
+  ;; outcome is the caller's own return value and is deliberately not
+  ;; repeated here, so this cannot drift into being a second result path.
+  (define (observe! cfg conn sql)
+    (let ((proc (connpool-cfg-observer cfg)))
+      (when proc
+        (guard (e (#t (set! observer-failures (+ observer-failures 1))))
+          (proc conn sql)))))
 
   ;; A negative or non-integer pool size never satisfies (= i n), so the
   ;; startup loop spawns connection workers without end; nothing downstream
@@ -886,6 +966,7 @@
           ;; the DOWN at once, so this also covers a connection that died
           ;; between the checkout and here.
           (m (monitor h)))
+      (observe! cfg h sql)
       (send h (vector 'pool-request sql ref self))
       (receive (after (connpool-cfg-query-ms cfg)
                   ;; symmetric with connpool-checkout: tell the pool to drop the
@@ -943,6 +1024,11 @@
     (let ((m (monitor conn)) (ref (gensym)))
       (let ((broken
              (guard (e (#t #t))
+               ;; observed HERE and not via connpool-call, which this
+               ;; path deliberately bypasses: without this line the one
+               ;; statement a caller most wants to see is the only one
+               ;; missing, and the stream would look complete
+               (observe! cfg conn "ROLLBACK")
                (send conn (vector 'pool-request "ROLLBACK" ref self))
                (receive (after (connpool-cfg-query-ms cfg) #t)
                  (`#(pool-reply ,@ref ,r) ((connpool-cfg-error? cfg) r))

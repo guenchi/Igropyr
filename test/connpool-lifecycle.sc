@@ -940,6 +940,225 @@
           (display ", connections spawned ") (display (- spawned before))
           (newline))))
 
+
+    ;; ---- what the observer sees, and where it runs -----------------------
+    ;;
+    ;; A consumer wrapping its own query entry point sees its DML and
+    ;; nothing else: BEGIN and COMMIT are issued by sql-transaction and
+    ;; ROLLBACK by the check-in path, so "these three statements ran in one
+    ;; transaction" cannot be decided from outside. The dangerous shape is
+    ;; not a missing log line -- an extra commit in the middle ends the
+    ;; atomicity while every assertion about the DML stays green.
+    ;;
+    ;; THE POOL IS STARTED WITH THE PLAIN cfg AND ONLY THE CALLS CARRY THE
+    ;; OBSERVED ONE. That is what makes these cases say WHERE the observer
+    ;; runs rather than only THAT it ran: an implementation that hooked the
+    ;; pool loop, or the point where a queued job is forwarded to a
+    ;; connection, would see every one of these statements and pass a test
+    ;; that used the observed cfg on both sides.
+    (let ()
+      (define obs-log '())      ; (borrower conn sql), newest first
+      (define worker-log '())   ; what a connection was actually asked
+      (define (reset-logs!) (set! obs-log '()) (set! worker-log '()))
+      (define (obs-sql) (reverse (map caddr obs-log)))
+      (define (recording-conn! notify report-to ref)
+        (bump!)
+        (born!
+          (spawn
+            (lambda ()
+              (send report-to (vector 'pool-up ref self 'ok))
+              (receive (`#(pool-adopt) 'ok))
+              (let loop ()
+                (receive
+                  (`#(pool-request ,sql ,r ,from)
+                    (set! worker-log (cons sql worker-log))
+                    (send from (vector 'pool-reply r (vector 'fake-rows sql)))
+                    (send notify (vector 'pool-idle self r))
+                    (loop))
+                  (`#(pool-quit) 'done)))))))
+      ;; the setter answers with nothing, as a set!-shaped procedure
+      ;; should, so the cfg is what this hands back
+      (define (watch! proc)
+        (let ((c (copy-cfg))) (connpool-cfg-set-observer! c proc) c))
+      ;; a cfg of this file's own shape, so an observed one and a plain one
+      ;; are different objects and cannot be confused for each other
+      (define (copy-cfg)
+        (make-connpool-cfg
+          (lambda (r) (and (vector? r) (eq? (vector-ref r 0) 'fake-error)))
+          (vector 'fake-error "lost") (vector 'fake-error "closed")
+          (vector 'fake-error "query timeout")
+          (vector 'fake-error "checkout timeout")
+          "BEGIN"))
+      (define (up! n spawner c)
+        (set! born '())
+        (let ((pool (spawn (lambda () (connpool-loop n spawner c)))))
+          (let settle ((i 0))
+            (cond ((= (length born) n) pool)
+                  ((> i 200) (check "the pool came up" #f) pool)
+                  (else (sleep-ms 50) (settle (+ i 1)))))))
+
+      ;; ---- a committed transaction, end to end -------------------------
+      (reset-logs!)
+      (let* ((me self)
+             (ocfg (watch! (lambda (conn sql)
+                             (set! obs-log
+                               (cons (list self conn sql) obs-log)))))
+             (pool (up! 1 recording-conn! cfg))     ; plain cfg starts it
+             (lease-conn #f))
+        (sql-transaction pool
+          (lambda (conn)
+             (set! lease-conn conn)
+             (connpool-call conn "INSERT 1" ocfg))
+          ocfg)
+        (check "BEGIN, the statement and COMMIT are seen, in that order"
+               (equal? (obs-sql) (list "BEGIN" "INSERT 1" "COMMIT")))
+        ;; ...and the connection was actually asked for them: an observer
+        ;; that synthesised its events without a request behind them would
+        ;; satisfy the line above on its own
+        (check "the connection was asked for exactly those statements"
+               (equal? (reverse worker-log)
+                       (list "BEGIN" "INSERT 1" "COMMIT")))
+        (check "every event names the leased connection"
+               (and lease-conn
+                    (for-all (lambda (e) (eq? (cadr e) lease-conn)) obs-log)))
+        (check "every event ran in the borrowing process"
+               (for-all (lambda (e) (eq? (car e) me)) obs-log))
+        (display "  [info] observed: ") (write (obs-sql)) (newline)
+
+        ;; ---- ...and one that rolls back ---------------------------------
+        ;;
+        ;; ROLLBACK does not go through connpool-call: the check-in path
+        ;; sends it straight to the connection. An observer wired only into
+        ;; connpool-call would show every statement EXCEPT the one saying
+        ;; the transaction did not happen -- and would show it in green.
+        (reset-logs!)
+        (let ((escaped
+                (guard (e (#t e))
+                  (sql-transaction pool
+                    (lambda (conn)
+                      (connpool-call conn "INSERT 2" ocfg)
+                      (raise 'nope))
+                    ocfg))))
+          (check "a rollback shows as begin, statement, rollback"
+                 (equal? (obs-sql) (list "BEGIN" "INSERT 2" "ROLLBACK")))
+          (check "and the connection was asked to roll back"
+                 (equal? (reverse worker-log)
+                         (list "BEGIN" "INSERT 2" "ROLLBACK")))
+          (check "the transaction's own exception is what escaped"
+                 (eq? escaped 'nope)))
+        (send pool (vector 'pool-quit)))
+
+      ;; ---- an observer that raises cannot reach the caller ---------------
+      (reset-logs!)
+      (let* ((attempts 0)
+             (before (connpool-observer-failures))
+             (ocfg (watch! (lambda (conn sql)
+                             (set! attempts (+ attempts 1))
+                             (raise 'observer-broke))))
+             (pool (up! 1 recording-conn! cfg)))
+        (let ((r (guard (e (#t (list 'raised e)))
+                   (connpool-call pool "SELECT 1" ocfg))))
+          (check "a raising observer does not reach the caller"
+                 (equal? r (vector 'fake-rows "SELECT 1")))
+          (check "it was called once and counted once"
+                 (and (= attempts 1)
+                      (= (connpool-observer-failures) (+ before 1))))
+          (check "and the statement still reached the connection"
+                 (equal? (reverse worker-log) (list "SELECT 1"))))
+        (send pool (vector 'pool-quit)))
+
+      ;; ---- ...including on the rollback path ----------------------------
+      ;;
+      ;; That path calls the observer from inside an after-thunk, usually
+      ;; while an exception is already unwinding. An implementation that
+      ;; guarded the call in connpool-call and made a bare one here would
+      ;; pass every case above and lose the caller's exception here.
+      (reset-logs!)
+      (let* ((before (connpool-observer-failures))
+             (ocfg (watch! (lambda (conn sql)
+                             (when (string=? sql "ROLLBACK")
+                               (raise 'observer-broke-on-rollback)))))
+             (pool (up! 1 recording-conn! cfg)))
+        (let ((escaped
+                (guard (e (#t e))
+                  (sql-transaction pool
+                    (lambda (conn)
+                      (connpool-call conn "INSERT 3" ocfg)
+                      (raise 'nope))
+                    ocfg))))
+          (check "an observer raising on rollback keeps the exception"
+                 (eq? escaped 'nope))
+          (check "that failure is counted too"
+                 (= (connpool-observer-failures) (+ before 1)))
+          (check "and the rollback still reached the connection"
+                 (equal? (reverse worker-log)
+                         (list "BEGIN" "INSERT 3" "ROLLBACK"))))
+        (send pool (vector 'pool-quit)))
+
+      ;; ---- two observers do not share a stream --------------------------
+      ;;
+      ;; The observer belongs to the cfg it was installed on. Kept in one
+      ;; module-level place instead, the last installation would answer for
+      ;; every caller, and every case above would still pass.
+      (reset-logs!)
+      (let* ((a-log '()) (b-log '())
+             (a (watch! (lambda (c sql) (set! a-log (cons sql a-log)))))
+             (b (watch! (lambda (c sql) (set! b-log (cons sql b-log)))))
+             (pool (up! 1 recording-conn! cfg)))
+        (connpool-call pool "FOR A" a)
+        (connpool-call pool "FOR B" b)
+        (connpool-call pool "FOR A AGAIN" a)
+        (check "an observer sees only calls made through its own cfg"
+               (and (equal? (reverse a-log) (list "FOR A" "FOR A AGAIN"))
+                    (equal? (reverse b-log) (list "FOR B"))))
+        (send pool (vector 'pool-quit)))
+
+      ;; ---- a cfg with no observer behaves as it always did ---------------
+      (reset-logs!)
+      (let* ((before (connpool-observer-failures))
+             (pool (up! 1 recording-conn! cfg)))
+        (let ((r (connpool-call pool "PLAIN" cfg)))
+          (check "an unobserved call is answered normally"
+                 (equal? r (vector 'fake-rows "PLAIN")))
+          (check "it reached the connection exactly once"
+                 (equal? (reverse worker-log) (list "PLAIN")))
+          (check "and nothing was counted as an observer failure"
+                 (= (connpool-observer-failures) before)))
+        (send pool (vector 'pool-quit)))
+
+      ;; ---- a killed borrower issues no rollback, and none is invented ----
+      ;;
+      ;; @kill discards winders, so the after-thunk that would roll back
+      ;; never runs. What keeps the next borrower away from a half-open
+      ;; transaction is the pool reclaiming on DOWN -- not a rollback. A
+      ;; trace with no ROLLBACK in it therefore says nothing about whether
+      ;; one happened, and this case exists so that reading is written down
+      ;; somewhere that fails if the code ever starts inventing the event.
+      (reset-logs!)
+      (let* ((me self)
+             (ocfg (watch! (lambda (conn sql)
+                             (set! obs-log
+                               (cons (list self conn sql) obs-log)))))
+             (pool (up! 1 recording-conn! cfg))
+             (victim (spawn (lambda ()
+                              (sql-transaction pool
+                                (lambda (conn)
+                                  (connpool-call conn "INSERT 4" ocfg)
+                                  (send me (vector 'in-transaction))
+                                  (receive (after 10000 'done)))
+                                ocfg)))))
+        (receive (after 5000 (check "the victim reached its transaction" #f))
+          (`#(in-transaction) 'ok))
+        (kill victim 'killed-mid-transaction)
+        (sleep-ms 400)
+        (check "a killed borrower leaves begin and statement, no ending"
+               (equal? (obs-sql) (list "BEGIN" "INSERT 4")))
+        (check "and no ending was sent to the connection either"
+               (equal? (reverse worker-log) (list "BEGIN" "INSERT 4")))
+        (display "  [info] after a killed borrower: ")
+        (write (obs-sql)) (newline)
+        (send pool (vector 'pool-quit))))
+
     (sleep-ms 100)
     (if (zero? failures)
         (begin (display "connpool-lifecycle: all tests passed\n") (exit 0))

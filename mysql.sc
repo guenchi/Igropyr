@@ -24,7 +24,7 @@
 
 (library (igropyr mysql)
   (export mysql-connect mysql-pool mysql-query mysql-close! mysql-pool-stats
-          mysql-transaction call-with-mysql-connection)
+          mysql-transaction mysql-observe! call-with-mysql-connection)
   (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr connpool)
           (igropyr buffer)
           (only (igropyr crypto) sha1 sha256 base64-decode))
@@ -776,6 +776,20 @@
   ;; Run one SQL statement; blocks only the calling green process. A
   ;; timed-out statement's outcome is UNKNOWN -- it may still execute on
   ;; the server.
+  ;; Install a request observer for every statement this driver issues --
+  ;; the caller's own queries and the BEGIN/COMMIT/ROLLBACK that
+  ;; sql-transaction issues around them, in dispatch order. See the
+  ;; observation section in (igropyr connpool) for what the events do and
+  ;; do not establish; the scope note there applies directly, since the
+  ;; cfg below is this module's and is shared by every pool opened through
+  ;; it.
+  ;;
+  ;; Only this driver has one because only this driver was asked for one.
+  ;; The primitive is in connpool, so giving postgresql or qjspool the
+  ;; same costs one line each -- their absence here is a decision, not an
+  ;; omission.
+  (define (mysql-observe! proc) (connpool-cfg-set-observer! cfg proc))
+
   (define (mysql-query mc sql) (connpool-call mc sql cfg))
 
   ;; Borrow one whole connection from a POOL for the extent of proc, then

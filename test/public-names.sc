@@ -16,10 +16,12 @@
         (only (igropyr connpool)
               make-connpool-cfg connpool-loop connpool-call
               connpool-drain-stale! connpool-check-size!
-              sql-transaction connpool-lease connpool-close! connpool-stats)
+              sql-transaction connpool-lease connpool-close! connpool-stats
+              connpool-cfg-set-observer! connpool-observer-failures)
         (only (igropyr mysql)
               mysql-connect mysql-pool mysql-query mysql-close!
-              mysql-pool-stats mysql-transaction call-with-mysql-connection)
+              mysql-pool-stats mysql-transaction call-with-mysql-connection
+              mysql-observe!)
         (only (igropyr postgresql)
               postgresql-connect postgresql-pool postgresql-query
               postgresql-execute postgresql-close! postgresql-pool-stats
