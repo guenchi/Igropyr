@@ -956,7 +956,10 @@
 
   ;; Borrow one whole connection from a POOL for the extent of proc, then
   ;; return it -- even if proc raises or exits non-locally. proc receives the
-  ;; connection process; queries on it cannot interleave with other callers.
+  ;; connection process; queries on it cannot interleave with other
+  ;; callers -- provided the handle does not leave proc (see the lease
+  ;; contract below: it is a capability, and the pool cannot police
+  ;; where it travels).
   ;; Don't send queries (or a second checkout) to the pool itself while
   ;; holding a connection: an exhausted pool deadlocks the former and delays
   ;; the latter.
@@ -973,51 +976,80 @@
   ;;
   ;; ---- ONE LEASE IS ONE CONNECTION -------------------------------------
   ;;
-  ;; PROMISED, and meant to be relied on rather than re-derived:
+  ;; WHAT THE POOL PROMISES, all of it about the pool and none of it about
+  ;; the far side:
   ;;
-  ;;   1. For as long as proc holds it, the handle denotes the SAME
-  ;;      connection process. The pool never re-points a handle at a
-  ;;      different connection, so a sequence of statements on one lease
-  ;;      reaches one peer session -- which is what makes a transaction
-  ;;      across several statements mean anything.
-  ;;   2. If that process dies, THE LEASE FAILS WITH IT. The next call on
-  ;;      the handle raises cfg's lost-err; a healthy sibling is never
-  ;;      quietly put in its place, even when one is sitting idle.
-  ;;   3. The replacement is a NEW process. Handles are not recycled, so a
-  ;;      handle that still answers has not been re-pointed.
+  ;;   1. It never re-points a handle. For the extent of proc, the handle
+  ;;      denotes the same connection process; the pool will not swap in a
+  ;;      sibling, even an idle one, and not while the leased connection
+  ;;      is dying.
+  ;;   2. Once that process is gone, THE NEXT connpool-call ON THE OLD
+  ;;      HANDLE raises cfg's lost-err. Note the shape: nothing here
+  ;;      watches the connection on proc's behalf, so a proc that simply
+  ;;      stops calling returns normally. The failure is delivered to the
+  ;;      next call, not announced to the borrower.
+  ;;   3. It does not alter a handle it has already handed out, and it
+  ;;      never gives a dead worker's handle to that worker's
+  ;;      replacement. (Connections themselves ARE reused -- across
+  ;;      leases, by later borrowers. What is not reused is the identity
+  ;;      of one that died.)
   ;;
-  ;; The mechanism, so the promise can be checked rather than trusted:
-  ;; every rebuild goes through connect!, which is always a fresh
-  ;; spawn-conn!, and all three of its call sites run in the pool process.
-  ;; A connection worker never re-dials on its own: it signals by dying,
-  ;; and the POOL is what acts on that. Where the failure deserves a
-  ;; backoff the pool schedules its own retry -- 'pool-reconnect is a
-  ;; message it sends to ITSELF after a delay, not a request from a
-  ;; worker -- and the retry runs connect! like every other rebuild.
-  ;; There is no path by which an existing handle acquires a new socket.
+  ;; ONE PEER SESSION FOR THE WHOLE LEASE -- which is what a caller
+  ;; actually wants -- FOLLOWS FROM (1) ONLY IF the driver's worker does
+  ;; not re-dial inside itself. That is a condition on the driver, not a
+  ;; promise made here, and the pool can neither see nor report a breach
+  ;; of it: the pid is unchanged, so nothing is different from where the
+  ;; pool stands. State it as a condition when citing this.
   ;;
-  ;; NOT PROMISED, and each of these is a way the guarantee above can be
-  ;; true here and still not give a caller what it wanted:
+  ;; PRECONDITION ON spawn-conn!: it must return a pid it has never
+  ;; returned before. The bundled drivers do, since each call is a fresh
+  ;; actor spawn -- but spawn-conn! is injected, the protocol above does
+  ;; not demand this, and the pool does not check. A spawn-conn! that
+  ;; recycled identities would break (3) without the pool noticing.
   ;;
-  ;;   - NOTHING ABOUT WHAT A DRIVER DOES INSIDE ITS WORKER. spawn-conn! is
-  ;;     supplied by the caller. A worker that re-dials inside itself keeps
-  ;;     its pid, so the pool cannot see it and reports nothing: the
-  ;;     handle is stable while the session underneath it changed. This is
-  ;;     a promise about the POOL, not about the driver.
+  ;; THE MECHANISM, so this can be checked and not merely believed. Every
+  ;; rebuild goes through connect!, which calls the injected spawn-conn!,
+  ;; and all three of its call sites run in the pool process. A worker
+  ;; announces that it needs replacing in one of two ways, and both are
+  ;; worth following if you are checking the claim: by DYING, which the
+  ;; pool's monitor turns into a rebuild, or -- for a transport error it
+  ;; is still able to report -- by sending pool-conn-dead first, which
+  ;; marks it so that the DOWN behind it still rebuilds. Where the failure
+  ;; deserves a backoff, the pool spawns a timer process; that timer is
+  ;; what later sends pool-reconnect TO the pool, and the pool then runs
+  ;; connect!. No worker re-dials itself, and no worker's handle is
+  ;; carried across a rebuild.
+  ;;
+  ;; NOT PROMISED. Each of these is a way (1)-(3) can hold exactly as
+  ;; written and still not give a caller what it was after:
+  ;;
+  ;;   - NOTHING ABOUT WHAT A DRIVER DOES INSIDE ITS WORKER -- see the
+  ;;     condition above. This is the one that silently removes the
+  ;;     property most callers are really relying on.
   ;;   - NOTHING ABOUT THE PEER'S OWN CONTINUITY. A server that holds the
   ;;     socket open while resetting what the session contains is outside
-  ;;     this model entirely.
+  ;;     this model.
   ;;   - A LIVE HANDLE IS NOT AN OPEN TRANSACTION. If the borrower is
   ;;     killed its winders are discarded and no check-in is sent; what
   ;;     keeps a half-open transaction away from the next borrower is the
   ;;     pool's monitor reclaiming and rebuilding on DOWN, not the lease.
-  ;;     See sql-transaction, which states the same thing for its path.
+  ;;     See sql-transaction, which says the same for its own path.
+  ;;   - THE HANDLE IS A CAPABILITY, AND COPYING IT IS NOT DETECTABLE.
+  ;;     Exclusivity is the pool declining to lend the connection to
+  ;;     anyone else; it is not a restriction on who may send to that
+  ;;     worker. A handle that proc passes to another process, or retains
+  ;;     past the lease, lets those calls land in the same session --
+  ;;     interleaved with proc's own, or after the connection has been
+  ;;     lent to somebody else. Whoever holds the handle has the ability;
+  ;;     the pool does not police how it travels.
   ;;
-  ;; Comparing handles for eq? proves none of this. It reports what the
-  ;; pool happened to do on one run, cannot distinguish "not re-pointed"
-  ;; from "re-pointed to something equal", and has to be sampled at a
-  ;; moment of the caller's choosing -- which is a window the guarantee
-  ;; above does not have.
+  ;; Comparing handles with eq? does not establish any of this. The case
+  ;; it cannot see is exactly the one that matters: a worker that
+  ;; re-dialled its own socket is eq? to itself, while the session behind
+  ;; it changed -- so the comparison answers "same process", which was
+  ;; never in doubt, and stays silent about the thing being asked. It also
+  ;; has to be sampled at some moment of the caller's choosing, and the
+  ;; guarantee above has no such window.
   (define (connpool-lease pool proc cfg . rest)
     (let ((conn (connpool-checkout pool cfg))
           (broken-on-escape? (and (pair? rest) (car rest)))
