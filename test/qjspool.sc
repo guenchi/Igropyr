@@ -1115,6 +1115,17 @@ function eat(j){ return String(j.length); }
                       (warm-up! ca 913)
                       (let ((stop (box #f))
                             (accepted (box 0))
+                            ;; How often the pump had a full window with
+                            ;; libuv and nothing coming back, plus enough
+                            ;; of the pump's final state to tell the ways
+                            ;; it can end apart. Diagnostics for now: the
+                            ;; assertion below still judges on bytes, so
+                            ;; that a run where the old judge goes red can
+                            ;; be read for whether it was stalled or idle.
+                            (stalls (box 0))
+                            (pump-issued (box 0))
+                            (pump-done (box 0))
+                            (pump-why (box 'never-ran))
                             (props (make-string props-bytes #\x)))
                         ;; the requests and the announcement in one write,
                         ;; so the flood is strictly BEHIND them in the
@@ -1136,9 +1147,16 @@ function eat(j){ return String(j.length); }
                           (lambda ()
                             (let ((chunk (make-bytevector chunk-bytes 120))
                                   (w self))
+                              (define (finish! why i d)
+                                (set-box! pump-why why)
+                                (set-box! pump-issued i)
+                                (set-box! pump-done d)
+                                'done)
                               (let pump ((issued 0) (done 0))
                                 (cond
-                                  ((or (unbox stop) (>= issued max-chunks)) 'done)
+                                  ((unbox stop) (finish! 'answered issued done))
+                                  ((>= issued max-chunks)
+                                   (finish! 'max-chunks issued done))
                                   ((< (- issued done) window)
                                    (if (guard (e (#t #f))
                                          (tcp-write! ca chunk
@@ -1146,9 +1164,16 @@ function eat(j){ return String(j.length); }
                                                        (send w (vector 'wrote st))))
                                          #t)
                                        (pump (+ issued 1) done)
-                                       'done))
+                                       (finish! 'write-failed issued done)))
                                   (else
-                                   (receive (after 8000 'done)
+                                   ;; Reaching here is the whole point: a
+                                   ;; window's worth of writes -- 4 MiB --
+                                   ;; is with libuv and not one callback
+                                   ;; has come back, so the peer is not
+                                   ;; taking them. Count it.
+                                   (set-box! stalls (+ 1 (unbox stalls)))
+                                   (receive (after 8000
+                                              (finish! 'wait-timeout issued done))
                                      (`#(wrote ,st)
                                        (set-box! accepted
                                                  (+ (unbox accepted) chunk-bytes))
@@ -1162,7 +1187,11 @@ function eat(j){ return String(j.length); }
                           (if closed
                               (send me (vector 'flood
                                                (list (count-frames acc)
-                                                     (unbox accepted))))
+                                                     (unbox accepted)
+                                                     (unbox pump-issued)
+                                                     (unbox pump-done)
+                                                     (unbox stalls)
+                                                     (unbox pump-why))))
                               (begin
                                 (when (>= (count-frames acc) heavy)
                                   (set-box! stop #t))
@@ -1185,9 +1214,12 @@ function eat(j){ return String(j.length); }
                   ;; megabyte" and "eight kilobytes" call for completely
                   ;; different investigations, and the log is all anyone
                   ;; will have.
-                  (if (pair? r)
-                      (printf "  [info] flood probe: ~a of ~a answered, ~a bytes flooded\n"
-                              (car r) heavy (cadr r))
+                  (if (and (pair? r) (= 6 (length r)))
+                      (apply
+                        (lambda (answered flooded issued done stalls why)
+                          (printf "  [info] flood probe: ~a of ~a answered, ~a bytes flooded; pump issued ~a done ~a stalls ~a ended ~a\n"
+                                  answered heavy flooded issued done stalls why))
+                        r)
                       (printf "  [info] flood probe answered ~a\n" r))
                   (check "the pipelined requests are all answered under a flood"
                          (and (pair? r) (= (car r) heavy)))
