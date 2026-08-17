@@ -2690,5 +2690,61 @@
     (list 0 -1 1.5 'soon)))
 (display "a bounded peek refuses a timeout that is not a positive exact ms ok\n")
 
+;; ---- the starter's death does not end the conversation -----------------
+;;
+;; The library says, in as many words, that a host giving up on a request
+;; does not end the conversation: a pool that kills a handler it has
+;; declared stuck takes down the process that called run!, and the
+;; conversation keeps running because it is spawned UNLINKED. Everything
+;; in that passage rests on one bare `spawn` -- there is no test that
+;; would notice if it became `spawn&link`, and no compiler that would
+;; either. The prose would quietly turn into the opposite of the truth,
+;; and its readers are the people most likely to "fix" the behaviour it
+;; is there to defend.
+;;
+;; Alive is not enough to assert, because a conversation can be alive and
+;; unreachable. This drives it to completion through the id, which is the
+;; thing the passage actually promises.
+(let* ((ttl 5000)
+       (parent self)
+       (starter
+         (spawn
+           (lambda ()
+             (let-values (((id token reply)
+                           (conversation-start!
+                             (lambda (req suspend! commit!)
+                               (let ((a (suspend! (vector 'first req))))
+                                 (commit! (lambda () 'done))
+                                 (vector 'finished a)))
+                             'go
+                             ttl)))
+               (send parent (vector 'started id token reply))
+               ;; and now wait forever, the way a handler waits for the
+               ;; next round -- so that the kill below lands on a process
+               ;; that has not finished with the conversation
+               (receive))))))
+  (receive (after 2000 (fail "the starter never reported" 'timeout))
+    (`#(started ,id ,token ,reply)
+      (kill starter 'host-gave-up)
+      (unless (eq? #f (process-alive? starter))
+        (fail "the starter survived being killed" starter))
+      (let-values (((st tok last) (conversation-peek id)))
+        (unless (eq? st 'parked)
+          ;; 'unknown or 'gone here means the kill cascaded: the spawn
+          ;; that creates the conversation has acquired a link to its
+          ;; caller.
+          (fail "killing the starter ended the conversation" st))
+        (unless tok
+          (fail "the surviving conversation gave back no token" tok))
+        ;; and it is not merely alive: it still answers
+        (let-values (((reply2 st2) (conversation-resume! id tok 'more)))
+          (unless (and (vector? reply2)
+                       (eq? (vector-ref reply2 0) 'finished))
+            (fail "the surviving conversation gave the wrong final reply"
+                  reply2))
+          (unless (eq? st2 'done)
+            (fail "the surviving conversation would not resume" st2))))))
+  (display "killing the starter does not end the conversation ok\n"))
+
 (display "ALL CONVERSATION TESTS PASSED\n")
     (exit 0)))
