@@ -1223,8 +1223,20 @@ function eat(j){ return String(j.length); }
                       (printf "  [info] flood probe answered ~a\n" r))
                   (check "the pipelined requests are all answered under a flood"
                          (and (pair? r) (= (car r) heavy)))
-                  (check "the peer did get a flood onto the wire"
-                         (and (pair? r) (>= (cadr r) (* 1024 1024))))
+                  ;; JUDGED ON THE PUMP BEING BLOCKED, not on how many
+                  ;; bytes got through. The condition this stands for is
+                  ;; the peer not taking the flood, and the byte count
+                  ;; moves the other way under exactly that condition: the
+                  ;; harder the peer holds, the fewer writes complete.
+                  ;; Measured on FreeBSD, where the old form failed three
+                  ;; times in six -- every one of those runs had the pump
+                  ;; blocked (10 to 21 times), so it was not short of
+                  ;; pressure, the judge was reading pressure backwards.
+                  ;; A stall is a full window, 4 MiB, sitting with libuv
+                  ;; with no callback back; how much a platform buffers
+                  ;; delays that and does not change what it means.
+                  (check "the peer could not take the flood"
+                         (and (pair? r) (= 6 (length r)) (> (list-ref r 4) 0)))
                   ;; ...AND THE FLOOD DID NOT KEEP IT ALIVE. A connection
                   ;; whose deadline is renewed by unparseable bytes is the
                   ;; failure the half-frame deadline exists to stop, and a
