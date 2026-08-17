@@ -970,6 +970,54 @@
   ;;
   ;; Off by default, because for SQL an escape is usually just a statement
   ;; error and the connection is perfectly good.
+  ;;
+  ;; ---- ONE LEASE IS ONE CONNECTION -------------------------------------
+  ;;
+  ;; PROMISED, and meant to be relied on rather than re-derived:
+  ;;
+  ;;   1. For as long as proc holds it, the handle denotes the SAME
+  ;;      connection process. The pool never re-points a handle at a
+  ;;      different connection, so a sequence of statements on one lease
+  ;;      reaches one peer session -- which is what makes a transaction
+  ;;      across several statements mean anything.
+  ;;   2. If that process dies, THE LEASE FAILS WITH IT. The next call on
+  ;;      the handle raises cfg's lost-err; a healthy sibling is never
+  ;;      quietly put in its place, even when one is sitting idle.
+  ;;   3. The replacement is a NEW process. Handles are not recycled, so a
+  ;;      handle that still answers has not been re-pointed.
+  ;;
+  ;; The mechanism, so the promise can be checked rather than trusted:
+  ;; every rebuild goes through connect!, which is always a fresh
+  ;; spawn-conn!, and all three of its call sites run in the pool process.
+  ;; A connection worker never re-dials on its own: it signals by dying,
+  ;; and the POOL is what acts on that. Where the failure deserves a
+  ;; backoff the pool schedules its own retry -- 'pool-reconnect is a
+  ;; message it sends to ITSELF after a delay, not a request from a
+  ;; worker -- and the retry runs connect! like every other rebuild.
+  ;; There is no path by which an existing handle acquires a new socket.
+  ;;
+  ;; NOT PROMISED, and each of these is a way the guarantee above can be
+  ;; true here and still not give a caller what it wanted:
+  ;;
+  ;;   - NOTHING ABOUT WHAT A DRIVER DOES INSIDE ITS WORKER. spawn-conn! is
+  ;;     supplied by the caller. A worker that re-dials inside itself keeps
+  ;;     its pid, so the pool cannot see it and reports nothing: the
+  ;;     handle is stable while the session underneath it changed. This is
+  ;;     a promise about the POOL, not about the driver.
+  ;;   - NOTHING ABOUT THE PEER'S OWN CONTINUITY. A server that holds the
+  ;;     socket open while resetting what the session contains is outside
+  ;;     this model entirely.
+  ;;   - A LIVE HANDLE IS NOT AN OPEN TRANSACTION. If the borrower is
+  ;;     killed its winders are discarded and no check-in is sent; what
+  ;;     keeps a half-open transaction away from the next borrower is the
+  ;;     pool's monitor reclaiming and rebuilding on DOWN, not the lease.
+  ;;     See sql-transaction, which states the same thing for its path.
+  ;;
+  ;; Comparing handles for eq? proves none of this. It reports what the
+  ;; pool happened to do on one run, cannot distinguish "not re-pointed"
+  ;; from "re-pointed to something equal", and has to be sampled at a
+  ;; moment of the caller's choosing -- which is a window the guarantee
+  ;; above does not have.
   (define (connpool-lease pool proc cfg . rest)
     (let ((conn (connpool-checkout pool cfg))
           (broken-on-escape? (and (pair? rest) (car rest)))
