@@ -25,8 +25,12 @@
 ;;;   rsa-load-private-key / rsa-load-public-key   the same, from a file path
 ;;;
 ;;; Inspection: rsa-key? rsa-key-private? rsa-key-bits rsa-key-modulus
-;;; rsa-key-exponent. The two byte accessors hand back fresh copies, so a
-;;; caller cannot reach into a live key.
+;;; rsa-key-exponent rsa-key-consistency-checked. The two byte accessors
+;;; hand back fresh copies, so a caller cannot reach into a live key.
+;;; The last one answers what load time actually established about a
+;;; private key's self-consistency -- 'checked, or one of two ways the
+;;; question went unanswered -- because a key that loaded is not
+;;; necessarily a key that was checked.
 ;;;
 ;;; WHAT COUNTS AS A KEY. A key is accepted only if it is a plain RSA key
 ;;; (an RSA-PSS key is refused, see below) whose parameters pass every one
@@ -98,6 +102,7 @@
 
 (library (igropyr rsa)
   (export rsa-key? rsa-key-private? rsa-key-bits
+          rsa-key-consistency-checked
           rsa-key-modulus rsa-key-exponent rsa-key-free!
           rsa-private-key-from-pem rsa-public-key-from-pem
           rsa-public-key-from-modulus
@@ -323,8 +328,15 @@
 
   ;; pkey is mutable so rsa-key-free! can clear it; n/e/bits are read once at
   ;; load and never change, so inspection needs no native call.
+  ;; consistency-checked: what load time established about this key --
+  ;; 'checked / 'unavailable / 'not-implemented for a private key (see
+  ;; check-private-consistency!), 'not-applicable for a public one, whose
+  ;; parameters there is nothing to cross-check. A caller that must not
+  ;; run on an unverified key asks for 'checked; one that only wants a key
+  ;; ignores it, as before.
   (define-record-type (rsa-key mk-rsa-key rsa-key?)
-    (fields (mutable pkey) private? n-bytes e-bytes bits))
+    (fields (mutable pkey) private? n-bytes e-bytes bits
+            consistency-checked))
 
   (define (need-key who k)
     (unless (rsa-key? k)
@@ -498,8 +510,30 @@
   ;; A private key must be self-consistent, not merely well-encoded: a
   ;; PEM whose d/p/q do not match n/e decodes fine but cannot sign
   ;; verifiably. Reject it at load time rather than at first signature.
+  ;;
+  ;; -> what this load actually established, which is NOT always "the key
+  ;; was judged sound":
+  ;;   'checked         the check ran and passed
+  ;;   'unavailable     no EVP_PKEY_check in this libcrypto (before 1.1.1,
+  ;;                    and LibreSSL): nothing was judged
+  ;;   'not-implemented the provider declined to judge (-2): nothing was
+  ;;                    judged
+  ;; and it raises, rather than returning, when the key IS judged bad.
+  ;;
+  ;; SO A KEY THAT LOADED IS NOT A KEY THAT WAS CHECKED. Both non-checked
+  ;; answers are deliberate -- refusing to load on an older libcrypto
+  ;; would be a larger change than this check is worth, and a provider
+  ;; that cannot judge must not thereby reject every key -- but they were
+  ;; previously indistinguishable from a pass, and a caller that needs the
+  ;; guarantee had no way to ask. rsa-key-consistency-checked reports this
+  ;; per key.
+  ;;
+  ;; The reject path is fail-closed: 0 and every other negative are
+  ;; refused, so an internal error cannot read as a pass. That is a
+  ;; property of the branch below, not of key loading as a whole.
   (define (check-private-consistency! pk)
-    (when EVP_PKEY_check                    ; skipped on OpenSSL < 1.1.1
+    (if (not EVP_PKEY_check)
+        'unavailable
       (let ((ctx #f))
         ;; allocate inside the before-thunk so the free is registered
         ;; before the ctx exists to be leaked
@@ -508,17 +542,20 @@
             (set! ctx (EVP_PKEY_CTX_new pk 0))
             (when (zero? ctx) (rsa-fail "EVP_PKEY_CTX_new failed")))
           (lambda ()
-            ;; 1 = valid (accept); -2 = provider does not implement the
-            ;; check (cannot judge -> accept, so a provider lacking it does
-            ;; not reject every key); 0 and any other negative = invalid or
-            ;; check failed -> reject, so an internal error is fail-closed,
-            ;; never fail-open. A FIPS provider failing a mathematically
-            ;; sound key on policy also returns 0 and is refused here -- the
-            ;; return value cannot tell the two apart; such a key must be
-            ;; loaded through the raw-modulus API instead.
+            ;; 1 = valid; -2 = provider does not implement the check, which
+            ;; is reported rather than treated as a pass; 0 and any other
+            ;; negative = invalid or the check itself failed -> reject. A
+            ;; FIPS provider failing a mathematically sound key on policy
+            ;; also returns 0 and is refused here -- the return value
+            ;; cannot tell the two apart; such a key must be loaded through
+            ;; the raw-modulus API instead.
             (let ((r (EVP_PKEY_check ctx)))
-              (unless (or (fx= r 1) (fx= r -2))
-                (rsa-fail "inconsistent RSA private key (parameters do not agree)"))))
+              (cond ((fx= r 1) 'checked)
+                    ((fx= r -2) 'not-implemented)
+                    (else
+                      (rsa-fail (string-append
+                                  "inconsistent RSA private key "
+                                  "(parameters do not agree)"))))))
           (lambda () (when (and ctx (not (zero? ctx))) (EVP_PKEY_CTX_free ctx)))))))
 
   (define (pkey->rsa-key pk private?)
@@ -544,8 +581,11 @@
                       (list (bn->bytes n) (bn->bytes e) (BN_num_bits n)))))))
           (RSA_free rsa)
           (check-rsa-parts! (car parts) (cadr parts) (caddr parts))
-          (when private? (check-private-consistency! pk))
-          (mk-rsa-key pk private? (car parts) (cadr parts) (caddr parts))))))
+          (let ((checked (if private?
+                             (check-private-consistency! pk)
+                             'not-applicable)))
+            (mk-rsa-key pk private? (car parts) (cadr parts) (caddr parts)
+                        checked))))))
 
   (define (rsa-private-key-from-pem pem)
     (let ((bv (pem-bytes 'rsa-private-key-from-pem pem)))

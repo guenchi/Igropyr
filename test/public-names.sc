@@ -43,6 +43,19 @@
         ;; the same predicates again, from the library that has no
         ;; initialisation of its own: a pure consumer imports THIS one, and
         ;; that it exports the whole vocabulary is part of the public face
+        ;; rsa joins the list with rsa-key-consistency-checked, which is
+        ;; the whole point of that accessor: a caller that must not sign
+        ;; on an unverified key asks for it by name, and a rename that
+        ;; took the name away would leave the question unanswerable while
+        ;; every suite stayed green.
+        (only (igropyr rsa)
+              rsa-key? rsa-key-private? rsa-key-bits
+              rsa-key-consistency-checked
+              rsa-key-modulus rsa-key-exponent rsa-key-free!
+              rsa-private-key-from-pem rsa-public-key-from-pem
+              rsa-public-key-from-modulus
+              rsa-load-private-key rsa-load-public-key
+              rsa-sign-sha256 rsa-verify-sha256)
         (only (igropyr conversation-status)
               conversation-gone? conversation-stale? conversation-done?
               conversation-settled? conversation-unknown?

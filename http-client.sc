@@ -622,12 +622,28 @@
     ;; close the socket, and answer the caller with the message
     ;;
     ;; CONTRACT (behavioral guarantee, not an implementation detail):
-    ;; the on-chunk callback is invoked synchronously from the read loop,
-    ;; and socket reads are suspended for the duration of the callback.
-    ;; Downstream code may rely on this ordering -- chunks never interleave
-    ;; with callback execution, and no chunk is buffered behind a running
-    ;; callback. Changing this (e.g. queueing callbacks) is a breaking
-    ;; change to the streaming interface, not a refactor.
+    ;; the on-chunk callback is invoked SYNCHRONOUSLY from the read loop,
+    ;; ONE AT A TIME and IN ARRIVAL ORDER -- a callback never runs while
+    ;; another is running, and never sees chunks out of order -- and no
+    ;; FURTHER SOCKET READ is issued while one is running. Downstream code
+    ;; may rely on all of that; changing it (queueing callbacks, say) is a
+    ;; breaking change to the streaming interface, not a refactor.
+    ;;
+    ;; WHAT IT DOES NOT SAY IS THAT NOTHING IS BUFFERED, and a consumer
+    ;; that read it that way would be wrong in both directions. One TCP
+    ;; segment can carry several HTTP chunks, and the parser consumes the
+    ;; current one only after the callback returns, so the next chunk can
+    ;; already be sitting in the input buffer while the callback runs.
+    ;; Reads are stopped from inside emit!, which is later than the
+    ;; delivery of data that a single event-loop turn had already queued:
+    ;; those #(tcp-data ...) messages are in the mailbox before this
+    ;; process can ask for the stop. Suspending reads bounds what arrives
+    ;; NEXT; it does not empty what arrived already.
+    ;;
+    ;; So the back pressure is at the kernel's receive window (see below),
+    ;; not at "the buffer is empty when your callback runs". A consumer
+    ;; that must not have data waiting behind it has to bound that itself
+    ;; -- this interface does not.
     ;;
     ;; Reads are STOPPED around the handler. The handler is called
     ;; synchronously from this loop, and a handler that does real work --
