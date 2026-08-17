@@ -700,11 +700,24 @@ function eat(j){ return String(j.length); }
                 (`#(pair ,r)
                   (check "two whole requests in one write are both answered"
                          (eq? r 'both))
-                  (display (string-append "  [info] pipelined pair: "
-                                          (if (eq? r 'both) "both answered"
-                                              (string-append "only "
-                                                (number->string r)))
-                                          "\n")))))
+                  ;; r is 'both, a count, or a symbol saying the probe never
+                  ;; got that far ('no-connect, 'timeout). Assuming a number
+                  ;; here turned one failed check into a PANIC that took the
+                  ;; whole run with it and hid every suite after it -- the
+                  ;; line that describes a failure failing on the failure it
+                  ;; describes. Guarded the same way two probes above it
+                  ;; already are.
+                  (cond ((eq? r 'both)
+                         (display "  [info] pipelined pair: both answered\n"))
+                        ((number? r)
+                         (printf "  [info] pipelined pair: only ~a\n" r))
+                        (else
+                          ;; ~a takes whatever it is given, which is the
+                          ;; point: this line runs when the probe did
+                          ;; something unforeseen, and it must not be the
+                          ;; second thing that goes wrong.
+                          (printf "  [info] pipelined pair: probe answered ~a\n"
+                                  r))))))
 
             ;; ---- a whole frame behind a carried-in tail ------------------
             ;;
