@@ -1013,6 +1013,11 @@ function eat(j){ return String(j.length); }
                                   (send me (vector 'split 'closed)))))))))))
               (receive (after 12000 (fail "split-request probe never answered"))
                 (`#(split ,r)
+                  ;; 'timeout and 'closed are different accidents and want
+                  ;; different investigations; without this the log says
+                  ;; only that the answer was not 'answered.
+                  (unless (eq? r 'answered)
+                    (printf "  [info] split probe answered ~a\n" r))
                   (check "a request larger than one read is reassembled and answered"
                          (eq? r 'answered))
                   ;; ...BY THE RULE UNDER TEST. A reassembly that never
@@ -1174,6 +1179,16 @@ function eat(j){ return String(j.length); }
                   ;; requests were never answered, or in which the peer
                   ;; never got a megabyte onto the wire, proves nothing
                   ;; about where the bytes ended up.
+                  ;; Say what was measured, not just that it was short. A
+                  ;; precondition that fails silently on one platform is
+                  ;; the hardest kind to look into later: "under a
+                  ;; megabyte" and "eight kilobytes" call for completely
+                  ;; different investigations, and the log is all anyone
+                  ;; will have.
+                  (if (pair? r)
+                      (printf "  [info] flood probe: ~a of ~a answered, ~a bytes flooded\n"
+                              (car r) heavy (cadr r))
+                      (printf "  [info] flood probe answered ~a\n" r))
                   (check "the pipelined requests are all answered under a flood"
                          (and (pair? r) (= (car r) heavy)))
                   (check "the peer did get a flood onto the wire"
