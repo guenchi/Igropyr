@@ -165,6 +165,29 @@
 ;;;   AFTER A RESTART the process is gone and so is the conversation. A
 ;;;   local peek on an old id answers 'unknown; a remote one answers
 ;;;   'unreachable until the restarted owner has built its router.
+;;;
+;;;   A HOST THAT GIVES UP ON A REQUEST DOES NOT END THE CONVERSATION,
+;;;   and that is the semantics rather than a gap. A worker pool that
+;;;   kills a handler it has declared stuck, or abandons a task after its
+;;;   retries, takes down the process that CALLED run! -- the
+;;;   conversation is spawned unlinked, so it keeps running, keeps
+;;;   holding whatever it holds, and may still commit.
+;;;
+;;;   Making the host reap it would produce the one outcome this library
+;;;   exists to prevent: a transaction that MAY ALREADY HAVE COMMITTED,
+;;;   destroyed on the way out and reported as though it never happened.
+;;;   The kill would land at an arbitrary point, which is exactly the
+;;;   point where nobody can say which side of the commit it fell on.
+;;;
+;;;   What bounds it instead: the conversation's own ttl ends it whether
+;;;   or not anyone is still asking, so nothing runs forever on the
+;;;   strength of a caller that left; on-killed runs the caller's own
+;;;   compensation when that happens, with committed? telling it which
+;;;   way to go. And the case that looks worst -- the client got a bare
+;;;   500 and holds no id -- is what prepare! is for: take the id before
+;;;   anything can have an effect, persist it, and the conversation is
+;;;   reachable by id no matter what became of the process that started
+;;;   it.
 ;;;   That wait is not shortened by the router being absent. The
 ;;;   forwarding path does watch the owner's router, but only so the
 ;;;   watch can be cleaned up after a kill -- what ENDS the wait is the

@@ -52,29 +52,45 @@
 
   ;; The absolute path of the running executable, via
   ;; sysctl kern.proc.pathname; #f if the kernel will not say.
+  ;; The three buffers are freed by a winder rather than by the one exit
+  ;; below, so a raise between the first allocation and the last -- an
+  ;; exhausted allocator, a bad argument -- does not strand the earlier
+  ;; ones. They are allocated in the BODY, not the before-thunk: a raise
+  ;; inside a before-thunk propagates without the extent ever being
+  ;; entered, so the after-thunk would not run and a partly-completed set
+  ;; would leak exactly as before.
+  ;;
+  ;; This covers the RAISE path only. A winder does not survive a kill,
+  ;; and nothing here reclaims after one.
   (define (freebsd-executable-path)
     (let ((sysctl* (foreign-procedure "sysctl"
                      (void* unsigned-int void* void* void* size_t) int))
-          (mib (foreign-alloc 16))
-          (cap 1024))
-      (let ((buf (foreign-alloc cap))
-            (len (foreign-alloc 8)))
-        (foreign-set! 'int mib 0 1)          ; CTL_KERN
-        (foreign-set! 'int mib 4 14)         ; KERN_PROC
-        (foreign-set! 'int mib 8 12)         ; KERN_PROC_PATHNAME
-        (foreign-set! 'int mib 12 -1)        ; the calling process
-        (foreign-set! 'unsigned-long len 0 cap)
-        (let* ((rc (sysctl* mib 4 buf len 0 0))
-               (path (and (= rc 0)
-                          (let scan ((i 0) (acc '()))
-                            (and (< i cap)
-                                 (let ((b (foreign-ref 'unsigned-8 buf i)))
-                                   (if (fx= b 0)
-                                       (utf8->string
-                                         (u8-list->bytevector (reverse acc)))
-                                       (scan (fx+ i 1) (cons b acc)))))))))
-          (foreign-free mib) (foreign-free buf) (foreign-free len)
-          path))))
+          (cap 1024)
+          (mib #f) (buf #f) (len #f))
+      (dynamic-wind
+        (lambda () (void))
+        (lambda ()
+          (set! mib (foreign-alloc 16))
+          (set! buf (foreign-alloc cap))
+          (set! len (foreign-alloc 8))
+          (foreign-set! 'int mib 0 1)          ; CTL_KERN
+          (foreign-set! 'int mib 4 14)         ; KERN_PROC
+          (foreign-set! 'int mib 8 12)         ; KERN_PROC_PATHNAME
+          (foreign-set! 'int mib 12 -1)        ; the calling process
+          (foreign-set! 'unsigned-long len 0 cap)
+          (let ((rc (sysctl* mib 4 buf len 0 0)))
+            (and (= rc 0)
+                 (let scan ((i 0) (acc '()))
+                   (and (< i cap)
+                        (let ((b (foreign-ref 'unsigned-8 buf i)))
+                          (if (fx= b 0)
+                              (utf8->string
+                                (u8-list->bytevector (reverse acc)))
+                              (scan (fx+ i 1) (cons b acc)))))))))
+        (lambda ()
+          (when len (foreign-free len))
+          (when buf (foreign-free buf))
+          (when mib (foreign-free mib))))))
 
   ;; Addresses of the `wanted` dynamic symbols in a little-endian
   ;; non-PIE ELF64 executable, where link address = runtime address.
@@ -319,100 +335,198 @@
         #f
         (gzip-compress-in-range bv level)))
 
-  ;; NATIVE MEMORY ACROSS A RAISE, and what still is not covered.
+  ;; ---- native buffers that outlive a kill ---------------------------------
   ;;
-  ;; Three foreign-allocs and a zlib stream. Written as a straight let*
-  ;; with a cleanup called from each branch, a raise between the first
-  ;; allocation and the last -- an exhausted allocator on the second, a
-  ;; bad argument to a copy -- left the earlier blocks with nothing to
-  ;; free them, and a raise out of deflate* left the zlib stream's own
-  ;; internal state allocated as well.
+  ;; One compression owns three foreign-allocs and an initialised zlib
+  ;; stream. The dynamic-wind below frees all four on every path this
+  ;; process can take by itself -- a normal return, a raise from any of
+  ;; them. It cannot cover a KILL: the runtime discards winders, by
+  ;; design, so a process killed mid-compression runs no cleanup at all.
   ;;
-  ;; The allocations are in the BODY, not the before-thunk, and that is
-  ;; deliberate: a raise inside a before-thunk propagates without the
-  ;; dynamic extent ever being entered, so the after-thunk does not run
-  ;; and a partly-completed set of allocations would leak exactly as
-  ;; before. In the body, the extent is already entered when the second
-  ;; alloc raises, so the after-thunk runs and frees the first. Each free
-  ;; is guarded because the after-thunk sees whatever was reached.
+  ;; The teardown that survives a kill is an owner reclaiming on the
+  ;; holder's death. There is no owner here -- these blocks belong to
+  ;; whoever called -- so the owner is the collector: the three native
+  ;; pointers live in one record, together with the end function for
+  ;; whatever zlib initialised (the fourth resource is that internal
+  ;; state, which is not a pointer this code holds); the record is
+  ;; registered with a guardian, and a record that becomes unreachable is
+  ;; handed back and freed.
   ;;
-  ;; NOT COVERED: a kill. @kill discards winders, so a process killed in
-  ;; here frees none of this -- three buffers and an initialised zlib
-  ;; stream. The teardown that survives a kill is an owner monitoring the
-  ;; holder and reclaiming on DOWN, and there is no owner here: these
-  ;; blocks belong to whoever called. This is a known, bounded leak --
-  ;; bounded by one call's allocation -- and not something the winder
-  ;; below can be made to cover.
+  ;; WHAT PINS THE RECORD IS THE AFTER-THUNK, AND THAT IS THE WHOLE
+  ;; DESIGN. A guardian reports that an object is UNREACHABLE, which is
+  ;; not the same fact as "its holder died" -- a live process that simply
+  ;; stops mentioning the record makes it garbage just as effectively,
+  ;; and freeing those buffers would be a use-after-free on a
+  ;; compression still running. What keeps the two apart is that the
+  ;; after-thunk closes over the RECORD: a winder is reachable exactly
+  ;; while the process is inside the extent, which is exactly while the
+  ;; buffers are in use, and @kill clears the winder list, which is
+  ;; exactly the case being covered. Lifetime and use-interval are the
+  ;; same interval by construction, not by anyone remembering to keep a
+  ;; reference.
   ;;
-  ;; Not wrapped in a non-preemptible region either, which would close the
-  ;; kill window: deflate of a large input runs long, and stopping every
-  ;; green process for its duration trades a bounded leak for a stalled
-  ;; runtime.
+  ;; So: the after-thunk must mention the RECORD. Closing over the three
+  ;; pointers individually instead would read like a simplification and
+  ;; would remove the pin, and nothing would report it.
+  ;;
+  ;; RECLAMATION IS EVENTUAL AND HAS NO TIME BOUND. Foreign memory exerts
+  ;; no pressure on the collector, so nothing here provokes a collection.
+  ;; Two things have to happen, in order, and neither is on a clock: a
+  ;; collection that covers the record's generation has to find it
+  ;; unreachable and put it in the guardian's queue, and then some later
+  ;; call has to reach one of this library's entry points and drain that
+  ;; queue. A GC alone frees nothing here. In a process that keeps
+  ;; compressing this is self-limiting -- more compression means more
+  ;; Scheme garbage, a collection, and a poll -- but after a kill with no
+  ;; further compression the memory stays, however much other activity
+  ;; collects, because nothing polls. The bound is one compression's
+  ;; allocation per killed compression. Forcing a collection here would
+  ;; trade that bounded, quiet cost for an unpredictable full-heap pause,
+  ;; which is worse -- and it would still not free anything without a
+  ;; poll after it.
+  (define gz-guard (make-guardian))
+
+  ;; `ender` is the zlib end function for whatever was initialised on this
+  ;; stream -- deflate-end or inflate-end -- or #f if nothing was. Naming
+  ;; the function rather than a boolean is what lets both directions share
+  ;; one free path, and one free path is one thing to keep correct.
+  (define-record-type (gz-buf make-gz-buf gz-buf?)
+    (fields (mutable strm) (mutable src) (mutable dst)
+            (mutable ender) (mutable freed)))
+
+  ;; Free once, whoever gets there first. The check, the flag and the
+  ;; frees are one non-preemptible act: the normal path and the collector
+  ;; can both reach a record -- the normal path frees it, and the record
+  ;; becomes garbage afterwards and is handed back anyway -- so `freed`
+  ;; is what makes the second arrival a no-op instead of a double free.
+  (define (gz-free! e)
+    (with-interrupts-disabled
+      (unless (gz-buf-freed e)
+        (gz-buf-freed-set! e #t)
+        ;; only end a stream that was actually initialised: ending one
+        ;; that was not is not a no-op
+        (let ((end (gz-buf-ender e)))
+          (when end (end (gz-buf-strm e))))
+        (let ((d (gz-buf-dst e))) (when d (foreign-free d)))
+        (let ((s (gz-buf-src e))) (when s (foreign-free s)))
+        (let ((m (gz-buf-strm e))) (when m (foreign-free m))))))
+
+  ;; Collect whatever the guardian has for us. Called at the start of a
+  ;; compression: it is the one moment this library is certainly running,
+  ;; and it costs nothing when there is nothing to take.
+  ;;
+  ;; TAKING AND FREEING ARE ONE ACT. Reading from the guardian REMOVES the
+  ;; record from its queue, and nothing re-registers it, so a kill landing
+  ;; between the read and the free would drop the only remaining reference
+  ;; to buffers that will now never be handed back -- a permanent leak
+  ;; that `freed` cannot help with, since nothing would ever look at the
+  ;; record again. The region covers one record at a time rather than the
+  ;; whole queue: preemption stays off no longer than a single free.
+  (define (gz-drain-guard!)
+    (let loop ()
+      (when (with-interrupts-disabled
+              (let ((e (gz-guard)))
+                (and e (begin (gz-free! e) #t))))
+        (loop))))
+
   (define (gzip-compress-in-range bv level)
+    (gz-drain-guard!)
     (let* ((n (bytevector-length bv))
            (bound (+ n (quotient n 1000) 128))   ; safe deflate upper bound
-           (strm #f) (src #f) (dst #f) (inited #f))
+           (e (make-gz-buf #f #f #f #f #f)))
+      (gz-guard e)
       (dynamic-wind
         (lambda () (void))
         (lambda ()
-          (set! strm (foreign-alloc 128))       ; >= z-stream-size, zeroed
-          (set! src (foreign-alloc (max 1 n)))
-          (set! dst (foreign-alloc bound))
-          (memset* strm 0 128)                  ; zalloc/zfree/opaque = 0
-          (memcpy-to-c src bv n)
-          (and (= Z-OK (deflate-init2 strm level Z-DEFLATED Z-GZIP-WINDOW
-                                      8 Z-DEFAULT-STRATEGY (zlib-version)
-                                      z-stream-size))
-               (begin
-                 (set! inited #t)
-                 (foreign-set! 'void* strm 0 src)          ; next_in
-                 (foreign-set! 'unsigned-32 strm 8 n)      ; avail_in
-                 (foreign-set! 'void* strm 24 dst)         ; next_out
-                 (foreign-set! 'unsigned-32 strm 32 bound) ; avail_out
-                 (let* ((rc (deflate* strm Z-FINISH))
-                        (out-len (foreign-ref 'unsigned-long strm 40)))
-                   (and (= rc Z-STREAM-END)
-                        (let ((res (make-bytevector out-len)))
-                          (memcpy-from-c res dst out-len)
-                          res))))))
-        (lambda ()
-          ;; deflate-end only if init succeeded: ending a stream that was
-          ;; never initialised is not a no-op
-          (when inited (deflate-end strm))
-          (when dst (foreign-free dst))
-          (when src (foreign-free src))
-          (when strm (foreign-free strm))))))
+          ;; Each allocation is published into the record before a kill
+          ;; can land between the two: an allocation the record does not
+          ;; know about is one the collector cannot hand back. They are in
+          ;; the BODY rather than the before-thunk on purpose -- a raise
+          ;; inside a before-thunk propagates without the extent ever
+          ;; being entered, so the after-thunk would not run and a
+          ;; partly-completed set of allocations would leak.
+          (with-interrupts-disabled
+            (gz-buf-strm-set! e (foreign-alloc 128))   ; >= z-stream-size
+            (gz-buf-src-set! e (foreign-alloc (max 1 n)))
+            (gz-buf-dst-set! e (foreign-alloc bound)))
+          (let ((strm (gz-buf-strm e))
+                (src (gz-buf-src e))
+                (dst (gz-buf-dst e)))
+            (memset* strm 0 128)                ; zalloc/zfree/opaque = 0
+            (memcpy-to-c src bv n)
+            ;; init and recording the ender are one act: a kill in
+            ;; between would leave the collector freeing three buffers
+            ;; and leaving zlib's own state allocated
+            (and (with-interrupts-disabled
+                   (and (= Z-OK (deflate-init2 strm level Z-DEFLATED
+                                               Z-GZIP-WINDOW 8
+                                               Z-DEFAULT-STRATEGY
+                                               (zlib-version) z-stream-size))
+                        (begin (gz-buf-ender-set! e deflate-end) #t)))
+                 (begin
+                   (foreign-set! 'void* strm 0 src)          ; next_in
+                   (foreign-set! 'unsigned-32 strm 8 n)      ; avail_in
+                   (foreign-set! 'void* strm 24 dst)         ; next_out
+                   (foreign-set! 'unsigned-32 strm 32 bound) ; avail_out
+                   ;; deflate itself is deliberately NOT inside a
+                   ;; non-preemptible region: a large input takes real
+                   ;; time, and stopping every green process for it would
+                   ;; trade a bounded leak for a stalled runtime
+                   (let* ((rc (deflate* strm Z-FINISH))
+                          (out-len (foreign-ref 'unsigned-long strm 40)))
+                     (and (= rc Z-STREAM-END)
+                          (let ((res (make-bytevector out-len)))
+                            (memcpy-from-c res dst out-len)
+                            res)))))))
+        ;; mentions e, and that is the pin -- see above
+        (lambda () (gz-free! e)))))
 
   ;; Inflate `gz` expecting exactly n bytes back; self-check only.
+  ;; Same ownership shape as the compressor above, for the same reason:
+  ;; this runs once per process from the self-check, and a kill landing in
+  ;; it leaks exactly as the compressor would. Branch-per-exit cleanup
+  ;; does not even cover the raises -- a throw from the second allocation
+  ;; strands the first -- so the record, the guardian and the after-thunk
+  ;; go here too, and the after-thunk mentions the record for the same
+  ;; pinning reason spelled out above.
   (define (gunzip-for-self-check gz n)
+    (gz-drain-guard!)
     (let* ((glen (bytevector-length gz))
-           (strm (foreign-alloc 128))
-           (src (foreign-alloc (max 1 glen)))
-           (dst (foreign-alloc (max 1 n))))
-      (define (cleanup) (foreign-free strm) (foreign-free src) (foreign-free dst))
-      (memset* strm 0 128)
-      (memcpy-to-c src gz glen)
-      (if (not (= Z-OK (inflate-init2 strm Z-GZIP-WINDOW (zlib-version)
-                                      z-stream-size)))
-          (begin (cleanup) #f)
-          (begin
-            (foreign-set! 'void* strm 0 src)
-            (foreign-set! 'unsigned-32 strm 8 glen)
-            (foreign-set! 'void* strm 24 dst)
-            (foreign-set! 'unsigned-32 strm 32 n)
-            (let* ((rc (inflate* strm Z-FINISH))
-                   (out-len (foreign-ref 'unsigned-long strm 40))
-                   (in-len (foreign-ref 'unsigned-long strm 16))) ; total_in
-              (inflate-end strm)
-              ;; in-len = glen rejects a stream whose first member
-              ;; reproduces the sample but which carries trailing bytes
-              ;; -- Z_STREAM_END alone stops at the first member's end
-              (if (and (= rc Z-STREAM-END) (= out-len n) (= in-len glen))
-                  (let ((res (make-bytevector n)))
-                    (memcpy-from-c res dst n)
-                    (cleanup)
-                    res)
-                  (begin (cleanup) #f)))))))
+           (e (make-gz-buf #f #f #f #f #f)))
+      (gz-guard e)
+      (dynamic-wind
+        (lambda () (void))
+        (lambda ()
+          (with-interrupts-disabled
+            (gz-buf-strm-set! e (foreign-alloc 128))
+            (gz-buf-src-set! e (foreign-alloc (max 1 glen)))
+            (gz-buf-dst-set! e (foreign-alloc (max 1 n))))
+          (let ((strm (gz-buf-strm e))
+                (src (gz-buf-src e))
+                (dst (gz-buf-dst e)))
+            (memset* strm 0 128)
+            (memcpy-to-c src gz glen)
+            (and (with-interrupts-disabled
+                   (and (= Z-OK (inflate-init2 strm Z-GZIP-WINDOW
+                                               (zlib-version) z-stream-size))
+                        (begin (gz-buf-ender-set! e inflate-end) #t)))
+                 (begin
+                   (foreign-set! 'void* strm 0 src)
+                   (foreign-set! 'unsigned-32 strm 8 glen)
+                   (foreign-set! 'void* strm 24 dst)
+                   (foreign-set! 'unsigned-32 strm 32 n)
+                   (let* ((rc (inflate* strm Z-FINISH))
+                          (out-len (foreign-ref 'unsigned-long strm 40))
+                          (in-len (foreign-ref 'unsigned-long strm 16)))
+                     ;; in-len = glen rejects a stream whose first member
+                     ;; reproduces the sample but which carries trailing
+                     ;; bytes -- Z_STREAM_END alone stops at the first
+                     ;; member's end
+                     (and (= rc Z-STREAM-END) (= out-len n) (= in-len glen)
+                          (let ((res (make-bytevector n)))
+                            (memcpy-from-c res dst n)
+                            res)))))))
+        (lambda () (gz-free! e)))))
 
   ;; A load-time round trip through whatever was bound: compress a
   ;; sample and inflate it back, and refuse the binding unless the

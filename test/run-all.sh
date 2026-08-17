@@ -68,6 +68,13 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # process, deflate() faults or emits unbounded output with no error
 # code, so this script surviving is part of the check
 "$scheme_bin" --script igropyr/test/gzip.sc
+# a compression killed between its allocations and its winder must still
+# give the memory back. Separate from gzip.sc because that file is shared
+# with the standalone gzip repository and may import nothing but the
+# library itself; this one needs a scheduler to do the killing. Takes
+# about ten seconds: the discriminating part is a sweep over slice
+# lengths, since a kill aimed by wall-clock never lands in the window
+"$scheme_bin" --script igropyr/test/gzip-reclaim.sc
 "$scheme_bin" --script igropyr/test/sigv4.sc
 "$scheme_bin" --script igropyr/test/blas.sc
 "$scheme_bin" --script igropyr/test/quickjs.sc
