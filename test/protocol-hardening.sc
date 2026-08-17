@@ -76,19 +76,26 @@
     (system (string-append "( " python " " py " >/dev/null 2>" err
                            "; echo $? >" status " ) &"))
     (let poll ((i 0))
-      (cond
-        ((file-exists? status)
-         (let ((code (leading-number (slurp status))))
-           (cond ((eqv? code 0) #t)
-                 (else
-                   (display "  [info] the half-close client exited ")
-                   (display code) (newline)
-                   (let ((e (slurp err)))
-                     (unless (string=? e "")
-                       (display "  [client stderr] ") (display e) (newline)))
-                   #f))))
-        ((< i 150) (sleep-ms 100) (poll (+ i 1)))
-        (else (display "  [info] the half-close client never finished\n") #f)))))
+      ;; WAIT FOR A READABLE STATUS, NOT FOR THE FILE. `>` opens and
+      ;; truncates before echo writes, so the file exists and is empty
+      ;; for a window that widens exactly when the machine is loaded --
+      ;; which is the condition this whole change is about. Reading that
+      ;; window as a status would report a perfectly good run as having
+      ;; exited nothing, and it would do it intermittently: a flaky test
+      ;; produced by the fix for a flaky test.
+      (let ((code (and (file-exists? status) (leading-number (slurp status)))))
+        (cond
+          ((eqv? code 0) #t)
+          (code
+            (display "  [info] the half-close client exited ")
+            (display code) (newline)
+            (let ((e (slurp err)))
+              (unless (string=? e "")
+                (display "  [client stderr] ") (display e) (newline)))
+            #f)
+          ((< i 150) (sleep-ms 100) (poll (+ i 1)))
+          (else (display "  [info] the half-close client never finished\n")
+                #f))))))
 
 (define port 18778)
 
