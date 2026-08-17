@@ -15,6 +15,13 @@
 (import (chezscheme) (igropyr actor) (igropyr node)
         (igropyr redis) (igropyr cluster) (igropyr gen-server))
 
+;; The run may be using `chez` or $SCHEME_BIN rather than `scheme`, and a
+;; child started with the wrong name simply never appears -- which this
+;; suite would report as whatever it was waiting for timing out, not as a
+;; missing interpreter. run-all.sh exports the name it chose.
+(define scheme-bin (or (getenv "SCHEME_BIN") "scheme"))
+
+
 (define a-port 18093)
 (define secret "cluster-secret")
 
@@ -35,7 +42,7 @@
   (string-append "/tmp/igropyr-cluster-" name ".pid"))
 
 (define (spawn-child! name port strategy)
-  (system (string-append "scheme --script igropyr/test/cluster-child.sc "
+  (system (string-append scheme-bin " --script igropyr/test/cluster-child.sc "
                          name " " (number->string port) " " secret " "
                          strategy " " (number->string a-port)
                          " & echo $! > " (child-pid-file name))))

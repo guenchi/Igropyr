@@ -18,6 +18,13 @@
 (import (chezscheme) (igropyr actor) (igropyr node) (igropyr conversation)
         (only (igropyr libuv) now-ms))
 
+;; The run may be using `chez` or $SCHEME_BIN rather than `scheme`, and a
+;; child started with the wrong name simply never appears -- which this
+;; suite would report as whatever it was waiting for timing out, not as a
+;; missing interpreter. run-all.sh exports the name it chose.
+(define scheme-bin (or (getenv "SCHEME_BIN") "scheme"))
+
+
 (define port 18093)
 (define secret "conv-mesh-secret")
 
@@ -71,7 +78,7 @@
 
 (define (spawn-child!)
   (system (string-append
-            "scheme --script igropyr/test/conv-cluster-child.sc b "
+            scheme-bin " --script igropyr/test/conv-cluster-child.sc b "
             (number->string port) " " secret " &")))
 
 (start-scheduler

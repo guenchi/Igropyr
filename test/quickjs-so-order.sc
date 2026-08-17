@@ -26,6 +26,14 @@
 
 (import (chezscheme))
 
+;; The run may be using `chez` or $SCHEME_BIN rather than `scheme`, and a
+;; child started with the wrong name simply never appears -- which this
+;; suite would report as whatever it was waiting for timing out, not as a
+;; missing interpreter. run-all.sh exports the name it chose.
+(define scheme-bin (or (getenv "SCHEME_BIN") "scheme"))
+
+
+
 (define bellard
   (string-append (or (getenv "HOME") "")
                  "/.local/lib/igropyr/libquickjs-bellard.dylib"))
@@ -69,7 +77,7 @@
                  "DYLD_LIBRARY_PATH=" staged
                  " CHEZSCHEMELIBDIRS=\"" (or (getenv "CHEZSCHEMELIBDIRS") ".") "\""
                  " CHEZSCHEMELIBEXTS=\"" (or (getenv "CHEZSCHEMELIBEXTS") "") "\""
-                 " scheme --script " script " > " out " 2>&1"))))
+                 " " scheme-bin " --script " script " > " out " 2>&1"))))
        (let ((text (call-with-input-file out get-string-all)))
          (system (string-append "rm -rf " staged))
          (cond

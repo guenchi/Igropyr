@@ -14,6 +14,13 @@ else
   scheme_bin=scheme
 fi
 
+# Suites that start child processes read this rather than hardcoding a
+# name. Without it they invoke `scheme` while the run itself may be using
+# `chez` or $SCHEME_BIN, and the child simply never starts -- which the
+# parent reports as whatever it was waiting for timing out, never as a
+# missing interpreter.
+export SCHEME_BIN="$scheme_bin"
+
 export CHEZSCHEMELIBDIRS=.
 # THE OBJECT EXTENSION POINTS AT A SUFFIX THAT DOES NOT EXIST, so a
 # stale .so can never answer for a source file. Chez picks by timestamp,

@@ -17,7 +17,15 @@
 
 (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr qjspool)
         (only (igropyr ssr) make-ssr ssr-render ssr-try-render ssr-invalidate! ssr-stats)
+
         (only (igropyr quickjs) qjs-boot! qjs-call/bytes))
+
+;; The run may be using `chez` or $SCHEME_BIN rather than `scheme`, and a
+;; child started with the wrong name simply never appears -- which this
+;; suite would report as whatever it was waiting for timing out, not as a
+;; missing interpreter. run-all.sh exports the name it chose.
+(define scheme-bin (or (getenv "SCHEME_BIN") "scheme"))
+
 
 (define failures 0)
 (define (fail label . info)
@@ -349,7 +357,7 @@ function eat(j){ return String(j.length); }
 
 (define (spawn-worker! name port timeout-ms . partial)
   (system (string-append "rm -f " (trace-file name) "; "
-                         "scheme --script igropyr/qjs-worker.sc 127.0.0.1 "
+                         scheme-bin " --script igropyr/qjs-worker.sc 127.0.0.1 "
                          (number->string port) " " bundle-path
                          " timeout-ms=" (number->string timeout-ms)
                          ;; short enough to be observable: the default is

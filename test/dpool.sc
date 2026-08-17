@@ -10,6 +10,14 @@
 
 (import (chezscheme) (igropyr actor) (igropyr node) (igropyr dpool))
 
+;; The run may be using `chez` or $SCHEME_BIN rather than `scheme`, and a
+;; child started with the wrong name simply never appears -- which this
+;; suite would report as whatever it was waiting for timing out, not as a
+;; missing interpreter. run-all.sh exports the name it chose.
+(define scheme-bin (or (getenv "SCHEME_BIN") "scheme"))
+
+
+
 (define port 18092)
 (define secret "dpool-secret")
 
@@ -21,7 +29,7 @@
 
 (define (spawn-child! name)
   (system (string-append
-            "scheme --script igropyr/test/dpool-child.sc "
+            scheme-bin " --script igropyr/test/dpool-child.sc "
             name " " (number->string port) " " secret " &")))
 
 (define (await-node-up! who)
