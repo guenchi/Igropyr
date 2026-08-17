@@ -35,6 +35,39 @@
         (lambda ()
           (mysql-pool 1 "127.0.0.1" 3306 "u" "p" #f
                       (list (cons 'tls (lambda args 'never)))))))
+    ;; ---- the installer writes the cfg the queries read -----------------
+    ;;
+    ;; mysql-observe! sets an observer on this module's cfg, and
+    ;; mysql-query closes over that same cfg. Those are two bindings, and
+    ;; nothing makes them one except that they are written that way today:
+    ;; give the driver a cfg per pool, or hand the installer a copy, and
+    ;; the observer is installed on something no statement reads. It
+    ;; would not raise, it would not warn -- it would see nothing, which
+    ;; is exactly what an unused observer looks like. That is the shape
+    ;; this whole feature was built to remove, so it is pinned in the
+    ;; place it can still occur.
+    ;;
+    ;; NO SERVER IS NEEDED for that: connpool is blind to what a
+    ;; connection speaks, so a process that answers pool-request is a
+    ;; connection as far as mysql-query is concerned -- while the cfg it
+    ;; consults is this module's real one, which is the thing under test.
+    (let ((seen '()))
+      (mysql-observe! (lambda (conn sql) (set! seen (cons sql seen))))
+      (let ((worker (spawn (lambda ()
+                             (let loop ()
+                               (receive
+                                 (`#(pool-request ,sql ,r ,from)
+                                   (send from
+                                     (vector 'pool-reply r
+                                             (vector 'rows sql)))
+                                   (loop))))))))
+        (let ((r (mysql-query worker "SELECT 1")))
+          (check "a statement through the driver's own entry is answered"
+                 (equal? r (vector 'rows "SELECT 1")))
+          (check "and the observer installed on the driver saw exactly it"
+                 (equal? (reverse seen) (list "SELECT 1")))))
+      (mysql-observe! #f))
+
     (if (zero? failures)
         (begin (display "mysql-opts: all tests passed\n") (exit 0))
         (begin (display failures) (display " failures\n") (exit 1)))))
