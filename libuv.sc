@@ -18,7 +18,8 @@
           file-stream-read! file-stream-close!
           file-stream-own! file-stream-raw! file-stream-chunk-ptr
           fs-open-async! fs-write-async! fs-fsync-async!
-          fs-rename-async! fs-close-async! fs-job-count
+          fs-rename-async! fs-close-async! fs-job-count fs-fd-count
+          fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc fs-o-excl
           fs-count
           tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
@@ -123,6 +124,28 @@
   (define O-CLOEXEC
     (case platform-os ((linux) #o2000000) ((macos) #x1000000)
                       ((freebsd) #x100000) (else 0)))
+  ;; THE WRITE SIDE'S open(2) FLAGS, exported for the same reason the
+  ;; group above is defined here rather than at each use: the values
+  ;; differ by Unix family, and a caller that hardcodes one set is
+  ;; correct on the machine it was written on and wrong on the next.
+  ;; The BSDs agree with each other and Linux does not, which is the
+  ;; combination that hides the mistake -- developed on macOS, deployed
+  ;; on FreeBSD, and only a third platform reveals it.
+  ;;
+  ;; Measured, compiled against <fcntl.h>: macOS 15 (arm64) gives
+  ;; O_WRONLY 1, O_CREAT 512, O_TRUNC 1024, O_EXCL 2048. The Linux
+  ;; column is the documented asm-generic set; a Linux deployment should
+  ;; compile them there before trusting this line, exactly as the
+  ;; durable library's note says of its own constants.
+  (define fs-o-rdonly O-RDONLY)
+  (define fs-o-wronly 1)
+  (define fs-o-creat
+    (case platform-os ((linux) #o100) ((macos freebsd) #o1000) (else 0)))
+  (define fs-o-trunc
+    (case platform-os ((linux) #o1000) ((macos freebsd) #o2000) (else 0)))
+  (define fs-o-excl
+    (case platform-os ((linux) #o200) ((macos freebsd) #o4000) (else 0)))
+
   (define UV-EINVAL -22)
   (define S-IFMT #o170000)
   (define S-IFREG #o100000)
@@ -779,6 +802,15 @@
 
   (define (fsw-count) (hashtable-size fsw-table))
   (define (fs-job-count) (fsw-count))
+
+  ;; HOW MANY DESCRIPTORS THIS SIDE IS HOLDING FOR CALLERS. Without it
+  ;; the death cleanup above is code that was reviewed rather than
+  ;; behaviour that is watched: a test can kill a process holding an fd,
+  ;; but with nothing to read it cannot tell a close that happened from
+  ;; one that did not. Approximate in the same sense as the job count --
+  ;; it is read outside any lock and a job in flight may be about to
+  ;; change it.
+  (define (fs-fd-count) (hashtable-size fsw-fds))
 
   (define (fsw-free! job req)
     (when (> (fsw-job-data job) 0) (foreign-free (fsw-job-data job)))
