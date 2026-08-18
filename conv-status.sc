@@ -28,7 +28,8 @@
 (library (igropyr conv-status)
   (export conversation-gone? conversation-stale? conversation-done?
           conversation-settled? conversation-unknown?
-          conversation-unreachable? conversation-no-answer-yet?)
+          conversation-unreachable? conversation-overloaded?
+          conversation-no-answer-yet?)
   (import (chezscheme))
 
   ;; THE ROLLBACK GUARANTEE, and the only answer that is one. A record
@@ -72,6 +73,20 @@
   ;; but one case is worse than none, because the gap is invisible until
   ;; someone hits it.
   (define (conversation-unreachable? x) (eq? x 'unreachable))
+
+  ;; THE OWNER SPOKE, AND SAID NOT NOW. It is the difference between
+  ;; silence and a refusal, and the two call for opposite responses: an
+  ;; 'unreachable may mean the request arrived and is being worked on, so
+  ;; it has to be reconciled rather than retried, while 'overloaded is
+  ;; the owner declining before any of that -- the conversation was not
+  ;; touched, and asking again later is the right move.
+  ;;
+  ;; Without a word of its own, a busy owner reached the asker as
+  ;; 'unreachable: the deadline expired with nothing said, which reads as
+  ;; a broken link. That sent callers to reconcile a conversation nobody
+  ;; had started working on, and hid load behind a word that means
+  ;; something else.
+  (define (conversation-overloaded? x) (eq? x 'overloaded))
 
   ;; The flow returned: reply is its final answer, and no token continues
   ;; it. Distinguishing this from 'gone is what tells a caller whether the

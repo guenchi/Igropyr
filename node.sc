@@ -741,6 +741,24 @@
   (define (node-start! name secret . rest)
     (unless (and (symbol? name) (string? secret))
       (assertion-violation 'node-start! "want (name-symbol secret-string)" name))
+    ;; A NAME CANNOT CONTAIN `~`, and the refusal belongs here rather
+    ;; than wherever the damage shows up. Conversation ids are minted as
+    ;; "<node>~<body>" and parsed by splitting at the first tilde, so a
+    ;; node called a~b mints ids that parse as owned by `a`: every resume
+    ;; is forwarded off the very node holding the conversation, and comes
+    ;; back 'unreachable while the conversation sits parked in the
+    ;; process doing the asking. Nothing about that failure points here,
+    ;; and it appears hours later at the first resume rather than at the
+    ;; call that caused it.
+    (when (let loop ((i 0))
+            (cond ((= i (string-length (symbol->string name))) #f)
+                  ((char=? (string-ref (symbol->string name) i) #\~) #t)
+                  (else (loop (+ i 1)))))
+      (assertion-violation 'node-start!
+        (string-append
+          "`~` separates the node name from the id body; a name"
+          " containing it mis-routes every clustered id this node mints")
+        name))
     ;; A short secret makes the HMAC handshake brute-forceable; an empty
     ;; one disables auth entirely. Refuse both. (The length is reported,
     ;; never the secret itself.)

@@ -481,7 +481,9 @@
           ;; importing this library still gives the whole vocabulary
           conversation-gone? conversation-stale? conversation-done?
           conversation-settled? conversation-unknown?
-          conversation-unreachable? conversation-no-answer-yet?)
+          conversation-unreachable? conversation-overloaded?
+          conversation-no-answer-yet?
+          conversation-forward-stats conv-set-forward-limit!)
   (import (chezscheme) (igropyr actor)
           (igropyr conv-status)
           (only (igropyr libuv) now-ms)
@@ -1112,6 +1114,98 @@
   ;; is an integer (equal?-matchable across the codec).
 
   (define conv-router-name 'igropyr-conv-router)
+  ;; ---- forwarding admission -------------------------------------------
+  ;;
+  ;; A FORWARD SPAWNS A PROCESS ON THE OWNER, and until this cap there was
+  ;; nothing counting them. The shape is taken from the rcall shed in the
+  ;; node layer: check and register inside ONE atomic region, because
+  ;; testing the count and then incrementing it lets two admissions past a
+  ;; ceiling of one.
+  ;;
+  ;; 256 is not an independent guess. The node layer already settled the
+  ;; size of this same kind of thing (max-rcall-serving), and one runtime
+  ;; giving two numbers to one quantity is worse than either number.
+  ;;
+  ;; REFUSING IS THE POINT, not a side effect of running out. Without it
+  ;; an overloaded owner queues forwards behind each other on a single
+  ;; scheduler thread until the asker's deadline expires, and the asker
+  ;; is told 'unreachable -- which says the link is broken when the truth
+  ;; is that the owner is busy. A refusal turns a silent collapse into an
+  ;; answer the caller can act on.
+  (define max-forwards-hosted 256)
+  (define forwards-hosted 0)
+
+  (define (forward-slot-take!)
+    (with-interrupts-disabled
+      (and (fx< forwards-hosted max-forwards-hosted)
+           (begin (set! forwards-hosted (fx+ forwards-hosted 1)) #t))))
+
+  (define (forward-slot-free!)
+    (with-interrupts-disabled
+      (when (fx> forwards-hosted 0)
+        (set! forwards-hosted (fx- forwards-hosted 1)))))
+
+  (define (conv-set-forward-limit! n)
+    (unless (and (integer? n) (exact? n) (> n 0))
+      (assertion-violation 'conv-set-forward-limit!
+        "limit must be a positive exact integer" n))
+    (with-interrupts-disabled (set! max-forwards-hosted n)))
+
+  ;; THE SLOT IS RELEASED WHEN THE WORKER DIES, and the release is bound
+  ;; to death by a monitor rather than to the body by a winder. Both of
+  ;; the obvious alternatives are wrong here, for reasons this tree has
+  ;; already written down:
+  ;;
+  ;;   - the last line of the spawned procedure, which is how the rcall
+  ;;     shed this copies does it. Sound there -- its worker catches
+  ;;     everything it calls, and that layer kills nothing abruptly (its
+  ;;     own note says shutdown is a message, not a kill). Neither holds
+  ;;     here: a forward worker awaits a user's flow.
+  ;;   - a dynamic-wind. The scheduler discards a victim's after-thunks
+  ;;     when it kills it -- deliberately, since a killer must not run
+  ;;     arbitrary user cleanup in its own context -- so a winder is not
+  ;;     a release mechanism for anything killable. The note at that code
+  ;;     prescribes the remedy directly: have the resource's owner
+  ;;     monitor the holder and reclaim on DOWN.
+  ;;
+  ;; A slot never freed is not a slow leak here. It is permanent: fill
+  ;; the cap that way and the owner refuses every forward for the life of
+  ;; the node.
+  (define (spawn-forward! thunk)
+    (let ((p (spawn thunk)))
+      (monitor p)
+      p))
+
+  ;; ---- forwarding counters ---------------------------------------------
+  ;;
+  ;; Monotonic, never reset by reading, and approximate in the same sense
+  ;; as the hook stats: they are read outside any lock. Kept apart from
+  ;; conversation-hook-stats deliberately -- that one answers "are the
+  ;; caller's hooks healthy", and mixing transport counts into it would
+  ;; dilute a question that is already easy to misread.
+  (define fwd-attempted 0)
+  (define fwd-refused 0)
+  (define fwd-completed 0)
+  (define fwd-unreachable 0)
+
+  (define (fwd-bump! which)
+    (with-interrupts-disabled
+      (case which
+        ((attempted) (set! fwd-attempted (+ fwd-attempted 1)))
+        ((refused) (set! fwd-refused (+ fwd-refused 1)))
+        ((completed) (set! fwd-completed (+ fwd-completed 1)))
+        ((unreachable) (set! fwd-unreachable (+ fwd-unreachable 1)))
+        (else (void)))))
+
+  (define (conversation-forward-stats)
+    (with-interrupts-disabled
+      (list (cons 'attempted fwd-attempted)
+            (cons 'refused fwd-refused)
+            (cons 'completed fwd-completed)
+            (cons 'unreachable fwd-unreachable)
+            (cons 'hosted forwards-hosted)
+            (cons 'limit max-forwards-hosted))))
+
   ;; THE DEFAULT, not the only value: callers may pass their own on
   ;; resume and peek. Not on peek/timeout, which never forwards -- see
   ;; the note there. How long to wait for a forwarded
@@ -1211,25 +1305,49 @@
         ;; Anything not a negative fixnum answers narrow, so a malformed or
         ;; unexpected ref degrades to today's behaviour rather than to a
         ;; frame the peer cannot match.
+        ;; THE REFUSAL IS ADDRESSED TO THE REPLY NAME, like the answer it
+        ;; stands in for. That is what keeps a late refusal from piling
+        ;; up in the asker's mailbox: once the asker unregisters the
+        ;; name, name dispatch drops anything still arriving for it
+        ;; rather than delivering it to a process that will never look.
+        ;;
+        ;; It is guarded because a refusal must not become a second
+        ;; failure -- the same rule the node layer follows where it sheds
+        ;; rcalls.
         (`#(conv-peek-fwd ,from-node ,reply-name ,ref ,id)
-          (spawn
-            (lambda ()
-              (let-values (((state token reply rec) (local-peek id)))
-                (rsend from-node reply-name
-                       (if (wide-ref? ref)
-                           (vector 'conv-peek-reply ref state token reply
-                                   (rec->evidence rec))
-                           (vector 'conv-peek-reply ref state token reply))))))
+          (if (forward-slot-take!)
+              (spawn-forward!
+                (lambda ()
+                  (let-values (((state token reply rec) (local-peek id)))
+                    (rsend from-node reply-name
+                           (if (wide-ref? ref)
+                               (vector 'conv-peek-reply ref state token reply
+                                       (rec->evidence rec))
+                               (vector 'conv-peek-reply ref state token
+                                       reply))))))
+              (guard (e (#t (void)))
+                (rsend from-node reply-name (vector 'conv-overload ref))))
           (loop))
         (`#(conv-resume ,from-node ,reply-name ,ref ,id ,token ,req)
-          (spawn
-            (lambda ()
-              (let-values (((reply status rec) (local-resume id token req)))
-                (rsend from-node reply-name
-                       (if (wide-ref? ref)
-                           (vector 'conv-forward-reply ref reply status
-                                   (rec->evidence rec))
-                           (vector 'conv-forward-reply ref reply status))))))
+          (if (forward-slot-take!)
+              (spawn-forward!
+                (lambda ()
+                  (let-values (((reply status rec)
+                                (local-resume id token req)))
+                    (rsend from-node reply-name
+                           (if (wide-ref? ref)
+                               (vector 'conv-forward-reply ref reply status
+                                       (rec->evidence rec))
+                               (vector 'conv-forward-reply ref reply
+                                       status))))))
+              (guard (e (#t (void)))
+                (rsend from-node reply-name (vector 'conv-overload ref))))
+          (loop))
+        ;; a forward worker finished, raised, or was killed -- all three
+        ;; arrive here, which is the point of binding the release to
+        ;; death rather than to the body
+        (`#(DOWN ,pid ,why)
+          (forward-slot-free!)
           (loop))
         (,_ (loop)))))
 
@@ -1334,6 +1452,7 @@
   ;; remote cost with a graceful ceiling in place of an unbounded local
   ;; leak that never self-heals -- but it is a trade, not a free win.
   (define (forward-peek owner id ttl-ms)
+    (fwd-bump! 'attempted)
     (let ((reply-name (fresh-reply-name!))
           ;; negative: this node can read the wide reply (see the router)
           (ref (- (fresh-ref!)))
@@ -1364,13 +1483,20 @@
                         ;; original single receive, since it deliberately
                         ;; does not match remote-down (see below).
                         (receive (after 0
+                                    (fwd-bump! 'unreachable)
                                     (values 'unreachable
                                             #f #f record-not-read))
                           (`#(conv-peek-reply ,@ref ,state ,token ,reply ,ev)
+                            (fwd-bump! 'completed)
                             (values state token reply (evidence->rec ev)))
                           (`#(conv-peek-reply ,@ref ,state ,token ,reply)
-                            (values state token reply record-not-read)))
+                            (fwd-bump! 'completed)
+                            (values state token reply record-not-read))
+                          (`#(conv-overload ,@ref)
+                            (fwd-bump! 'refused)
+                            (values 'overloaded #f #f record-not-read)))
                         (receive (after left
+                                    (fwd-bump! 'unreachable)
                                     (values 'unreachable
                                             #f #f record-not-read))
                           ;; wide first: an owner that answers narrow is
@@ -1387,9 +1513,15 @@
                           ;; The mesh floor is the node protocol, not this
                           ;; file's.
                           (`#(conv-peek-reply ,@ref ,state ,token ,reply ,ev)
+                            (fwd-bump! 'completed)
                             (values state token reply (evidence->rec ev)))
                           (`#(conv-peek-reply ,@ref ,state ,token ,reply)
+                            (fwd-bump! 'completed)
                             (values state token reply record-not-read))
+                          ;; the owner refused rather than went quiet
+                          (`#(conv-overload ,@ref)
+                            (fwd-bump! 'refused)
+                            (values 'overloaded #f #f record-not-read))
                           (`#(remote-down ,@owner ,@router ,why)
                             (if (memq owner (node-peers))
                                 (loop deadline)
@@ -1447,7 +1579,8 @@
             ;; stay in a mailbox this process does not own for long.
             (receive (after 0 'ok)
               (`#(conv-peek-reply ,@ref ,a ,b ,c ,d) 'ok)
-              (`#(conv-peek-reply ,@ref ,a ,b ,c) 'ok)))))))
+              (`#(conv-peek-reply ,@ref ,a ,b ,c) 'ok)
+              (`#(conv-overload ,@ref) 'ok)))))))
 
   ;; Forward a resume to the owner node and wait for its reply.
   ;;
@@ -1471,6 +1604,7 @@
   ;; Watches the owner's router rather than the node, and for the same
   ;; kill-safety reason -- see forward-peek, where it is written out.
   (define (forward-resume owner id token req ttl-ms)
+    (fwd-bump! 'attempted)
     (let ((reply-name (fresh-reply-name!))
           (ref (- (fresh-ref!)))
           (router conv-router-name))
@@ -1499,17 +1633,35 @@
                         ;; without it a stale remote-down consumed at the
                         ;; deadline would hide an answer queued behind it
                         (receive (after 0
+                                    (fwd-bump! 'unreachable)
                                     (values #f 'unreachable record-not-read))
                           (`#(conv-forward-reply ,@ref ,reply ,status ,ev)
+                            (fwd-bump! 'completed)
                             (values reply status (evidence->rec ev)))
                           (`#(conv-forward-reply ,@ref ,reply ,status)
-                            (values reply status record-not-read)))
-                        (receive (after left
-                                    (values #f 'unreachable record-not-read))
-                          (`#(conv-forward-reply ,@ref ,reply ,status ,ev)
-                            (values reply status (evidence->rec ev)))
-                          (`#(conv-forward-reply ,@ref ,reply ,status)
+                            (fwd-bump! 'completed)
                             (values reply status record-not-read))
+                          ;; a refusal already queued when the deadline
+                          ;; arrived is still a refusal: without this the
+                          ;; scan falls through and reports silence
+                          (`#(conv-overload ,@ref)
+                            (fwd-bump! 'refused)
+                            (values #f 'overloaded record-not-read)))
+                        (receive (after left
+                                    (fwd-bump! 'unreachable)
+                                    (values #f 'unreachable record-not-read))
+                          (`#(conv-forward-reply ,@ref ,reply ,status ,ev)
+                            (fwd-bump! 'completed)
+                            (values reply status (evidence->rec ev)))
+                          (`#(conv-forward-reply ,@ref ,reply ,status)
+                            (fwd-bump! 'completed)
+                            (values reply status record-not-read))
+                          ;; the owner said "not now" rather than saying
+                          ;; nothing: a different answer from silence, and
+                          ;; the caller is told so
+                          (`#(conv-overload ,@ref)
+                            (fwd-bump! 'refused)
+                            (values #f 'overloaded record-not-read))
                           (`#(remote-down ,@owner ,@router ,why)
                             ;; see forward-peek: the LINK's current state
                             ;; decides, not the reason. Here a premature
@@ -1540,7 +1692,11 @@
             ;; one scan, both shapes -- see forward-peek's drain
             (receive (after 0 'ok)
               (`#(conv-forward-reply ,@ref ,a ,b ,c) 'ok)
-              (`#(conv-forward-reply ,@ref ,a ,b) 'ok)))))))
+              (`#(conv-forward-reply ,@ref ,a ,b) 'ok)
+              ;; a refusal that raced the unregister. After it, name
+              ;; dispatch drops these before they reach a mailbox at all,
+              ;; so this covers only the window, not the general case.
+              (`#(conv-overload ,@ref) 'ok)))))))
 
   ;; ---- on-killed health ---------------------------------------------------
   ;;
