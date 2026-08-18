@@ -1993,14 +1993,70 @@ function eat(j){ return String(j.length); }
                                                   "{\"name\":\"y\"}")))
                 (check "the connection survives its callers' bad requests" k))
               (check "...without a single reconnect" (equal? (stat3) base)))
-            ;; post-write: kill the worker mid-conversation; the transport
-            ;; path must go on retiring exactly as before
-            (kill-worker! "bound")
-            (let-values (((k v) (qjspool-render pool "hello" "{}")))
-              (check "a dead worker still fails the render" (not k)))
-            (let ((after (stat3)))
-              (check "a transport failure still costs the connection"
-                     (or (> (cadr after) 0) (> (caddr after) 0))))
+            ;; the OTHER local reason: a deadline used up before the write.
+            ;; A second pool whose render budget is one millisecond fails
+            ;; every render at the pre-write check -- and must lose no
+            ;; connection doing it. Without this, "local by position"
+            ;; could quietly shrink back to "local means unencodable"
+            ;; a 1ms budget alone is NOT enough: the whole loopback round
+            ;; trip fits inside one now-ms tick (probed: it renders). The
+            ;; deadline has to be SPENT, so the encode is given four
+            ;; megabytes to chew through first
+            (let ((tight (qjspool (list (cons "127.0.0.1" bound-port))
+                                  '((size . 1) (render-timeout-ms . 1)))))
+              (let-values (((k v) (qjspool-render tight "hello"
+                                    (string-append
+                                      "{\"name\":\""
+                                      (make-string (* 4 1024 1024) #\b)
+                                      "\"}"))))
+                (check "a spent deadline is answered before the write"
+                       (and (not k)
+                            (let ((n (string-length "before it was")))
+                              (let loop ((i 0))
+                                (cond ((> (+ i n) (string-length v)) #f)
+                                      ((string=? (substring v i (+ i n))
+                                                 "before it was") #t)
+                                      (else (loop (+ i 1)))))))))
+              (let ((st (qjspool-stats tight)))
+                (check "...and it cost nothing but the answer"
+                       (and (= 0 (cond ((assq 'connections-discarded st) => cdr)
+                                       (else 0)))
+                           (= 0 (cond ((assq 'connections-lost st) => cdr)
+                                      (else 0))))))
+              (qjspool-close! tight))
+            ;; the lone-connection path (qjspool-connect) shares the
+            ;; boundary: same local failure, same kept connection.
+            ;; (Removing the lone branch's own local guard leaves this
+            ;; green -- the outer render/bytes guard already converts any
+            ;; raise, and a lone handle has no pool to book it broken in.
+            ;; That guard is symmetry, not load-bearing, and this comment
+            ;; is the record of having checked.)
+            (let ((lone (qjspool-connect "127.0.0.1" bound-port
+                                         '((render-timeout-ms . 2000)))))
+              (let-values (((k v) (qjspool-render lone
+                                    (make-string 70000 #\a) "{}")))
+                (check "the lone connection answers a local failure" (not k)))
+              (let-values (((k v) (qjspool-render lone "hello"
+                                                  "{\"name\":\"z\"}")))
+                (check "...and renders on afterwards, unretired" k))
+              (qjspool-close! lone))
+            ;; post-write: the request must be PROVABLY on the wire before
+            ;; the failure -- a worker killed while it spins on our render
+            ;; has necessarily read it. Killing before the call would let
+            ;; an implementation mislabel the write as local and still
+            ;; pass on the idle-EOF's own counter movement
+            (let ((me self))
+              (spawn (lambda ()
+                       (let-values (((k v) (qjspool-render pool "spin" "{}")))
+                         (send me (vector 'spin-back k)))))
+              (sleep-ms 150)               ; loopback: read and rendering
+              (kill-worker! "bound")
+              (receive (after 8000 (fail "the killed render never answered"))
+                (`#(spin-back ,k)
+                  (check "a mid-render kill still fails the caller" (not k))))
+              (let ((after (stat3)))
+                (check "a failure after the write still costs the connection"
+                       (or (> (cadr after) 0) (> (caddr after) 0)))))
             (qjspool-close! pool)))
       (kill-worker! "bound")
       (kill-worker! "good")
