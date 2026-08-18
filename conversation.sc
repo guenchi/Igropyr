@@ -1011,22 +1011,44 @@
   ;; second, larger failure. Swallowed, and counted so the swallowing is
   ;; visible.
   ;;
-  ;; IT RUNS IN THE CONVERSATION'S OWN PROCESS, WITH INTERRUPTS ENABLED.
-  ;; Every path commits its record inside whatever atom it already holds
-  ;; and calls the writer after leaving it, so a writer that blocks --
-  ;; waits on a message, waits on a disk -- suspends that one conversation
-  ;; and nothing else. The watchdog that bounds it keeps running, and the
-  ;; record is already in memory before the writer is called -- see the
-  ;; ordering below for what that does and does not buy.
+  ;; IT RUNS WITH INTERRUPTS ENABLED. Every path commits its record inside
+  ;; whatever atom it already holds and calls the writer after leaving it,
+  ;; so a writer that YIELDS -- waits on a message, sleeps, parks -- gives
+  ;; the scheduler its turn and suspends only the conversation it belongs
+  ;; to. That is what the earlier arrangement could not do: calling the
+  ;; writer where the record was made put it inside those atoms, where a
+  ;; writer waiting on another process could never be answered, because
+  ;; the process that would answer it could not run. The VM stopped, for
+  ;; good, watchdog included.
   ;;
-  ;; It was not always so, and the earlier arrangement is worth naming:
-  ;; calling the writer where the record was made put it inside those
-  ;; atoms, where this runtime's single OS thread makes any wait a
-  ;; stop-the-world. The flagship adapter is (igropyr durable), whose
-  ;; writes are synchronous fsyncs -- so the recommended use was also the
-  ;; one that froze the VM once per outcome, and a writer that waited
-  ;; froze it for good, watchdog included. A comment asking callers to
-  ;; keep it short is not a bound on application code.
+  ;; INTERRUPTS ARE NOT A SECOND THREAD, and this is the limit of what
+  ;; moving the call out of the atom achieves. A writer that makes a
+  ;; BLOCKING FOREIGN CALL still stops every green process for its whole
+  ;; duration: there is one OS thread, and an fsync that has not returned
+  ;; is not a point at which anything can be scheduled. That is the
+  ;; recommended adapter's normal mode of operation -- (igropyr durable)
+  ;; writes synchronously -- so the cost did not go away, it became
+  ;; bounded by the syscall instead of by application logic. Measured: a
+  ;; 192 MiB durable-write-file! took 72ms and the longest gap between two
+  ;; scheduler turns in that run was 72ms, against 12ms otherwise.
+  ;;
+  ;; WHICH PROCESS IT RUNS IN DEPENDS ON WHO PUBLISHED. The completion
+  ;; path and the failing flow publish from the conversation's own
+  ;; process. The watchdog's two paths -- the backstop for a process that
+  ;; died some way it never described, and the kill it performs itself --
+  ;; publish from the WATCHDOG's process, because that is who is left. A
+  ;; writer that reads `self`, or anything process-local, sees a different
+  ;; process on those paths; and on those paths there is no further
+  ;; watchdog behind it, since the watchdog is the one running the writer.
+  ;;
+  ;; ONE MORE THING THE WATCHDOG DOES: it re-inserts from the
+  ;; conversation's outcome-box, not from the table, so a record that was
+  ;; PRUNED between its publication and a later kill is written -- and
+  ;; published -- a second time, with the same value. First write wins is
+  ;; a rule about the table, and a pruned entry is not a first write any
+  ;; more (see the note on that above). A writer must therefore be
+  ;; idempotent in (id, outcome): storing it twice must be storing it
+  ;; once. Appending is not.
   ;;
   ;; TWO STEPS, AND THE ORDER IS THE POINT. The local record is committed
   ;; first and alone; only then is the writer called, and it is called
@@ -1044,14 +1066,22 @@
   ;; makes the correct answer survive the death of the process that knew
   ;; it, whether or not the durable copy was ever made.
   ;;
-  ;; It does not make the answer available EARLIER to a peek of that same
-  ;; conversation, and no ordering here could: while the writer runs, the
-  ;; conversation has not reached its next park, and conversation-peek
-  ;; waits for that park the way it waits out any slow step (measured: a
-  ;; peek issued during a 2s writer returns when the writer does).
-  ;; conversation-peek/timeout is the bounded form for a caller that
-  ;; cannot wait. What the ordering buys is that the answer, whenever it
-  ;; is given, is this outcome and not the last one.
+  ;; It does not make the answer available EARLIER to a peek that is
+  ;; waiting on the conversation itself, and no ordering here could: while
+  ;; the writer runs on the completion or failing-flow path, the
+  ;; conversation is still registered and has not reached its next park,
+  ;; and conversation-peek waits for that park the way it waits out any
+  ;; slow step (measured: a peek issued during a 2s writer returns when
+  ;; the writer does). conversation-peek/timeout is the bounded form for a
+  ;; caller that cannot wait.
+  ;;
+  ;; On the watchdog's paths a peek does NOT wait, and for a reason worth
+  ;; keeping straight: the conversation is already dead, so the peek finds
+  ;; no process, reads the table -- which the atom has already written --
+  ;; and answers immediately, while the writer is still running somewhere
+  ;; else. The answer is correct, and it is correct BECAUSE the table was
+  ;; written first. What the ordering buys is the same in both cases: the
+  ;; answer, whenever it is given, is this outcome and not the last one.
   ;;
   ;; The pair is captured with the record and not read again at
   ;; publication, so an uninstall that lands in between cannot leave a
