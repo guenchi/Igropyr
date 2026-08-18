@@ -1195,10 +1195,10 @@
   ;; different question -- who holds this name -- from the one the census
   ;; asks.
   ;;
-  ;; Reading the census repairs it, and so does every N-th admission --
-  ;; nothing sweeps on a timer, and neither path is the only one. A
-  ;; census read drops every dead entry it walks past; the periodic
-  ;; sweep exists for the node that never reads its own census.
+  ;; Reading the census repairs it, and so does an insert that finds the
+  ;; table has doubled -- nothing sweeps on a timer, and neither path is
+  ;; the only one. A census read drops every dead entry it walks past;
+  ;; the sweep exists for the node that never reads its own census.
   ;;
   ;; THIS AND COUNTING AT ADMISSION ARE ONE DECISION, not two that happen
   ;; to sit together. An entry is made when the handle is claimed, and at
@@ -1221,43 +1221,50 @@
   ;; while it exists, and eq? on it cannot be perturbed from outside.
   (define conv-census (make-eq-hashtable))
 
-  ;; PRUNED ON INSERT ONCE IT IS IMPLAUSIBLY LARGE, because reading is
-  ;; otherwise the only thing that removes a dead entry -- and a node
-  ;; whose conversations keep being killed while nobody asks for a census
-  ;; would accumulate them without limit. The threshold is not a capacity
-  ;; decision: a table this size is already mostly dead entries, since
-  ;; live conversations are bounded by what the machine can hold. Paying
-  ;; one sweep at that point also keeps the first census from being the
-  ;; sweep, which would put an unbounded walk inside its region.
-  ;; SWEPT EVERY N ADMISSIONS, NOT EVERY ADMISSION PAST A SIZE. The first
-  ;; version swept whenever the table was larger than a threshold, on the
-  ;; reasoning that a table that big is mostly dead entries. Nothing
-  ;; guarantees that: a node legitimately holding more than the threshold
-  ;; would sweep on every single admission, find nothing to remove, and
-  ;; pay a walk of the whole table each time -- quadratic overall, and
-  ;; every one of those walks runs with interrupts off, so the scheduler
-  ;; and the event loop stop for its duration.
+  ;; SWEPT WHEN THE TABLE HAS DOUBLED SINCE THE LAST SWEEP, which is the
+  ;; only trigger of the three tried here that is actually amortised.
   ;;
-  ;; Counting admissions instead makes the cost amortised: one walk per N
-  ;; of them regardless of how many conversations are live. It exists
-  ;; because a kill and an uncaught raise both skip the removal below, so
-  ;; a node that never reads its own census would otherwise accumulate
-  ;; entries for processes long gone.
-  (define census-sweep-every 4096)
-  (define census-since-sweep 0)
+  ;;   - "whenever it is larger than a threshold" made a node legitimately
+  ;;     holding more than that sweep on every admission, delete nothing,
+  ;;     and pay a full walk each time;
+  ;;   - "every N admissions" divided that by N and no more. With a live
+  ;;     population growing linearly, the sweeps land at 4096, 8192,
+  ;;     12288 entries and cost their size each time, so the total is
+  ;;     still quadratic in the number of conversations. Calling it
+  ;;     amortised was wrong: the interval was constant, the work per
+  ;;     sweep was not;
+  ;;   - doubling makes the sweeps geometric, so their sizes form a
+  ;;     series that sums to a constant multiple of the table. That is
+  ;;     amortised whatever the population does, and it self-adjusts: a
+  ;;     table that is mostly dead shrinks at each sweep and the next
+  ;;     threshold comes down with it.
+  ;;
+  ;; IT IS STILL A PAUSE, AND THE PAUSE IS NOT BOUNDED. A sweep walks the
+  ;; whole table with interrupts disabled, so the scheduler and the event
+  ;; loop stop for a time proportional to the live population -- rarely,
+  ;; and less often the longer the node runs, but not never and not by a
+  ;; fixed amount. "Amortised" is a statement about total work, not about
+  ;; the longest stop.
+  ;;
+  ;; It exists at all because a kill and an uncaught raise both skip the
+  ;; removal below, so a node that never reads its own census would
+  ;; otherwise hold entries for processes long gone.
+  (define census-sweep-floor 4096)
+  (define census-sweep-next 4096)
 
   (define (census-sweep!)
-    (set! census-since-sweep 0)
     (for-each
       (lambda (p)
         (unless (process-alive? p) (hashtable-delete! conv-census p)))
-      (vector->list (hashtable-keys conv-census))))
+      (vector->list (hashtable-keys conv-census)))
+    (set! census-sweep-next
+          (max census-sweep-floor (* 2 (hashtable-size conv-census)))))
 
   (define (census-add! p running-box settled-box)
     (with-interrupts-disabled
-      (set! census-since-sweep (+ census-since-sweep 1))
-      (when (> census-since-sweep census-sweep-every) (census-sweep!))
-      (hashtable-set! conv-census p (vector running-box settled-box))))
+      (hashtable-set! conv-census p (vector running-box settled-box))
+      (when (> (hashtable-size conv-census) census-sweep-next)
+        (census-sweep!))))
 
   (define (census-drop! p)
     (with-interrupts-disabled (hashtable-delete! conv-census p)))
