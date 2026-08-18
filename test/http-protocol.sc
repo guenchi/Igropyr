@@ -288,20 +288,66 @@
     ;; every byte; retaining the fallback state keeps the scan linear. The
     ;; old test ended the boundary in "x", so it covered repeated prefixes
     ;; but never reached this full-match rejection path.
-    (let* ((pboundary (make-string 70 #\-))
+    (let* ((payload (make-string 750000 #\-))
+           (pboundary (make-string 70 #\-))
            (pbody (string-append
                     "--" pboundary
                     "\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\n"
-                    (make-string 750000 #\-)
+                    payload
                     "\r\n--" pboundary "--\r\n"))
-           (t0 (real-time)))
+           ;; the CONTROL: the same boundary over a payload sharing no
+           ;; prefix with it, so every position fails its first byte and
+           ;; a naive scanner is exactly as fast as a linear one. NOT a
+           ;; boundary ending in "x" over the dash payload -- that is the
+           ;; other pathological shape (69 matching bytes, then a
+           ;; mismatch every position), and a naive scanner slows down
+           ;; on BOTH, which took the ratio right back to 1 (measured:
+           ;; 110ms vs 104ms under the naive mutant).
+           (gbody (string-append
+                    "--" pboundary
+                    "\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\n"
+                    (make-string 750000 #\a)
+                    "\r\n--" pboundary "--\r\n")))
       (expect "multipart repeated-prefix search"
         (multipart-request pboundary pbody) "200" "safe")
-      ;; ~13 ms linear vs ~100 ms naive, end to end; 50 ms sits between them
-      ;; with room on both sides so load does not make this flaky
-      (let ((ms (- (real-time) t0)))
-        (unless (< ms 50)
-          (error 'http-protocol "repeated-prefix search too slow (ms)" ms))))
+      ;; JUDGED AS A RATIO, not in wall milliseconds. An absolute bound
+      ;; here measured the machine: 50ms held for years and then failed
+      ;; at 57ms on a loaded host -- while the comment above it promised
+      ;; load could not do that. What the case is about is the 70-byte
+      ;; recomparison a naive scanner pays at every byte of this payload
+      ;; (~an order of magnitude, size-independent), and dividing by the
+      ;; benign scan cancels what the machine and the fixed HTTP
+      ;; overhead contribute to both. Scaling the payload instead would
+      ;; cancel NOTHING: with the boundary length fixed, naive and
+      ;; linear both grow linearly in the payload, so a ratio of sizes
+      ;; cannot tell them apart -- only a ratio of shapes can.
+      ;;
+      ;; min of three: a load spike lands on one run, not on the
+      ;; smallest of three. The absolute ceiling is a backstop against
+      ;; catastrophic regressions that a ratio could mask (both sides
+      ;; slow), wide enough that no machine reaches it honestly.
+      (let ()
+        (define (timed! boundary body)
+          (let ((t0 (real-time)))
+            (let ((r (raw-request (multipart-request boundary body))))
+              (unless (string-contains? r "HTTP/1.1 200 ")
+                (error 'http-protocol "prefix-search probe non-200" r))
+              (- (real-time) t0))))
+        (define (min3! th) (min (th) (th) (th)))
+        (let* ((tg (min3! (lambda () (timed! pboundary gbody))))
+               (tb (min3! (lambda () (timed! pboundary pbody))))
+               (ratio (/ tb (max tg 1))))
+          (display "prefix-search cost: benign ")
+          (display tg) (display "ms, pathological ")
+          (display tb) (display "ms, ratio ")
+          (display (exact->inexact ratio)) (display "\n")
+          (unless (< tb 2000)
+            (error 'http-protocol
+                   "repeated-prefix search pathologically slow (ms)" tb))
+          (unless (< ratio 3)
+            (error 'http-protocol
+                   "repeated-prefix scan costs a multiple of the benign scan"
+                   (exact->inexact ratio))))))
     ;; Handler-provided bytes are suppressed for bodyless status codes.
     (let ((r (raw-request
                "GET /status204 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")))
