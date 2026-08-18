@@ -1682,6 +1682,13 @@ conversation and nothing else. Two consequences worth planning for:
   it waits out any slow step. Use `conversation-peek/timeout` where the
   asker has a deadline of its own.
 
+A conversation whose writer is still running counts as `lingering` in
+`conversation-census`, so **draining a node waits for its record writes
+to finish** rather than cutting them off: the process is alive until the
+writer returns, and a drain is not done while any conversation remains.
+That is the behaviour you want on the way out, and it is also why a
+writer that never returns will hold a drain open indefinitely.
+
 **A record read through the hook is a record like any other**, including
 against the `settled?` predicate: a `'committed-then-failed` from disk
 contradicts a predicate answering `#f` and holds the answer at
