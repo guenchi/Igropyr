@@ -1935,11 +1935,16 @@ the `limit`. The counters are monotonic and reading does not reset them.
 
 **They are two ledgers in one alist.** `attempted`, `refused`, `completed`
 and `unreachable` count what this node asked of others; `hosted` and
-`reaped` count what others asked of it. The asking side balances on its own
-— `attempted = completed + refused + unreachable + still waiting` — but
-mixing `hosted` into that equation compares two different populations. On a
-single node they coincide, which is exactly what a local test sees, so a
-local test cannot notice the difference.
+`reaped` count what others asked of it. Mixing `hosted` into an equation
+with the asking counts compares two different populations — and on a single
+node they coincide, which is exactly what a local test sees, so a local test
+cannot notice the difference.
+
+**Do not expect any of them to balance.** Even within the asking side an
+attempt need not reach an outcome: an asker killed while waiting is neither
+still waiting nor ever recorded as completed, refused or unreachable, and
+that shortfall grows with every such death. Read these as rates and ratios,
+not as a conservation law.
 
 > The node layer has its own unrelated `'overload`, answered when it sheds a
 > cross-node call. The spellings differ deliberately: `'overloaded` is a
