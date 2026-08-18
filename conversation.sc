@@ -465,7 +465,33 @@
 ;;; the topology, a policy for choosing among paths, and a story for
 ;;; loops and for a relay that dies mid-hop -- none of which this
 ;;; library has anywhere to put, and all of which the distribution layer
-;;; is the right place for if they are ever wanted. Forwarded req and reply cross a link, so
+;;; is the right place for if they are ever wanted.
+;;;
+;;; UPGRADING A MESH HAS A DIRECTION, and it is not symmetric. An owner
+;;; that refuses a forward answers with a frame older code does not
+;;; know. A new entry node reads it and reports 'overloaded; an old one
+;;; matches nothing, waits out its deadline, reports 'unreachable, and
+;;; leaves the frame in the asking process's mailbox, where nothing
+;;; collects it -- one per refusal, in a process that is often
+;;; long-lived.
+;;;
+;;; So upgrade ENTRY NODES FIRST. Entry-first has no window at all: by
+;;; the time any owner can refuse, every asker understands a refusal.
+;;; Owner-first opens one that lasts until the last entry node is
+;;; upgraded, and pays for it in the two ways above -- a busy owner
+;;; reported as an unreachable one, and a slow accumulation nobody is
+;;; watching.
+;;;
+;;; A SEPARATE PREREQUISITE, and it is not fixed by upgrade order: a
+;;; node already deployed under a name containing `~` is mis-routing
+;;; TODAY. The id parser has always split at the first one, so every
+;;; clustered id such a node minted already resolves to the wrong owner;
+;;; the new check refuses the name at startup, which means that node
+;;; will not start until it is renamed. Rename it -- and accept that ids
+;;; it minted under the old name are already unreachable -- BEFORE
+;;; upgrading, not after.
+;;;
+;;; Forwarded req and reply cross a link, so
 ;;; they must be extended-wire-safe (as with rsend / rcall). With one
 ;;; node (node-start! never called) the id has no prefix and every
 ;;; resume stays local -- no dependency on the distribution layer at
