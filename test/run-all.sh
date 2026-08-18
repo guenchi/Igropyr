@@ -55,6 +55,12 @@ fi' EXIT
 # the status vocabulary must stay importable without the runtime: its own
 # process, so what it loads is observable at all
 "$scheme_bin" --script igropyr/test/conv-status.sc
+# the durable write is a SEQUENCE, and a sequence is the one thing reading
+# the file back cannot check: leave the directory flush out and every
+# read-after-write still passes. So this asserts the order of the calls,
+# and says nothing about whether anything reached the medium -- that is
+# not observable from inside this process.
+"$scheme_bin" --script igropyr/test/durable.sc
 IGROPYR_CONTRACTS=full "$scheme_bin" --script igropyr/test/checked-full.sc
 env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/smoke-actor.sc

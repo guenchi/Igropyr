@@ -19,6 +19,7 @@
     ("igropyr/checked.sc" . 2)
     ("igropyr/buffer.sc" . 2)
     ("igropyr/platform.sc" . 2)
+    ("igropyr/durable.sc" . 2)
     ("igropyr/quickjs.sc" . 2)
     ("igropyr/crypto.sc" . 2)
     ("igropyr/blas.sc" . 2)
