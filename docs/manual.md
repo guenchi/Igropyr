@@ -1619,6 +1619,40 @@ transaction as the effect** hands the library the truth: durable, atomic
 with the thing it describes, and outliving both the record and the
 process.
 
+#### Setting the forwarding deadline
+
+The same two procedures take an optional forwarding deadline in
+milliseconds — `(conversation-resume! id token req 12000)` — bounding how
+long a resume or peek forwarded to another node waits before answering
+`'unreachable`. It defaults to 300000, which stays the value when nothing
+is passed.
+
+How long to wait belongs to the caller's budget rather than to this
+library: a payment step and a status poll want different numbers, and one
+constant can only give them the same. On a call that is not forwarded it
+does nothing — there is no wait to bound.
+
+**The two optionals are told apart by type, not by position.** A procedure
+is the predicate, a positive integer is the deadline, either may be given
+without the other, and in either order:
+
+```scheme
+(conversation-peek id settled?)          ; predicate only
+(conversation-peek id 12000)             ; deadline only
+(conversation-peek id settled? 12000)    ; both, either order
+```
+
+An argument that is neither is refused by name rather than ignored. The
+reason it works this way: with positions, a caller who wanted only a
+deadline would have to pass a predicate first — and the predicate decides
+how `'unknown` is interpreted, which is not a thing to invent in order to
+reach a different parameter.
+
+`conversation-peek/timeout` does **not** take it, because it never
+forwards: against a remote owner it answers `'unreachable` immediately
+rather than pretending. A forwarding deadline there would control nothing
+while reading as though it bounded a forwarded peek.
+
 #### A local witness beats the predicate
 
 Where this node's own record
