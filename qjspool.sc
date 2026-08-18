@@ -119,11 +119,36 @@
   (define default-checkout-ms 2000)
 
   ;; ---- errors --------------------------------------------------------------
-  ;; Transport only. A JS error is not one of these: it comes back as an
-  ;; ordinary reply, because the connection is still perfectly good.
-  (define (qjs-err msg) (vector 'qjs-error msg))
+  ;; A JS error is not one of these at all: it comes back as an ordinary
+  ;; reply, because the connection is still perfectly good and the worker
+  ;; did its job -- the answer is just that the render raised.
+  ;;
+  ;; THE KIND IS WHICH SIDE OF THE WRITE IT HAPPENED ON, and it decides
+  ;; whether the connection survives. `transport` means bytes may have
+  ;; left this process: the worker's state is unknown, the framing is in
+  ;; doubt, and the connection is discarded. `local` means the request
+  ;; never reached the socket, so there is nothing to be in doubt about
+  ;; and the connection is exactly as it was.
+  ;;
+  ;; Transport is the default because every raise that is not from the two
+  ;; named sites in render-on! is either past the write or from a layer
+  ;; that cannot say -- and of the two possible mistakes, retiring a good
+  ;; connection costs a reconnect while keeping a doubtful one costs the
+  ;; next caller's answer.
+  ;;
+  ;; One tag with a field that tells them apart, as (igropyr mysql) does
+  ;; with #(mysql-error code msg) and (igropyr postgresql) with its
+  ;; 'transport state, rather than a second tag every predicate would
+  ;; have to learn. None of this escapes the library: the public calls
+  ;; answer with text.
+  (define (qjs-err msg) (vector 'qjs-error 'transport msg))
+  (define (qjs-local-err msg) (vector 'qjs-error 'local msg))
   (define (qjs-error? r) (and (vector? r) (eq? (vector-ref r 0) 'qjs-error)))
-  (define (qjs-error-text r) (vector-ref r 1))
+  (define (qjs-error-local? r)
+    (and (qjs-error? r) (eq? (vector-ref r 1) 'local)))
+  (define (qjs-error-text r) (vector-ref r 2))
+  ;; Wrapping something that is not one of ours: transport, per the
+  ;; default above. A local failure is only ever raised as one already.
   (define (as-qjs-error e context)
     (if (qjs-error? e)
         e
@@ -1211,18 +1236,45 @@
   ;; thing that keeps their order predictable.
   ;; The id is per connection and only has to distinguish THIS request from
   ;; the one before it on the same stream, so a counter is enough.
+  ;; THE WRITE IS THE LINE. Everything above (tcp-write! …) failed with the
+  ;; request still in this process; everything from it onward failed with
+  ;; bytes possibly on the wire. That is the whole of what decides whether
+  ;; the connection is kept, because retrying somewhere else only makes
+  ;; sense when the failure had something to do with where it ran -- and a
+  ;; failure this process can reproduce on its own is not changed by
+  ;; handing it to another worker.
+  ;;
+  ;; The two local sites are not the same in character and are treated the
+  ;; same on purpose: a request that cannot be encoded will fail identically
+  ;; forever, while one that ran out of time before it was sent might well
+  ;; succeed on a later attempt. Neither justifies discarding this
+  ;; connection, which is what the kind governs; whether the CALLER retries
+  ;; is the caller's to decide and it is told which happened.
   (define (render-on! c buf req render-ms ref id)
-    (let ((deadline (+ (now-ms) render-ms))
-          (frame (guard (e (#t #f)) (encode-request id (car req) (cdr req)))))
+    (let* ((deadline (+ (now-ms) render-ms))
+           ;; WHY it could not be encoded, not just that it could not.
+           ;; encode-request raises with the reason -- a function name past
+           ;; the length field, a request over the frame limit -- and this
+           ;; used to replace all of them with one sentence that told the
+           ;; caller nothing about the input it has to fix. The point of
+           ;; answering a local failure to the caller is that the caller
+           ;; can act on it.
+           (frame-err #f)
+           (frame (guard (e (#t (set! frame-err (as-qjs-error e "request")) #f))
+                    (encode-request id (car req) (cdr req)))))
       (guard (e (#t (as-qjs-error e "render failed")))
-        (unless frame (raise (qjs-err "render request could not be encoded")))
+        (unless frame
+          (raise (qjs-local-err
+                   (if frame-err
+                       (qjs-error-text frame-err)
+                       "render request could not be encoded"))))
         ;; CHECKED AGAIN before the write. Encoding is proportional to the
         ;; props and the runtime can stall for longer than the whole
         ;; deadline, and sending a request we have already given up on
         ;; starts a render nobody will read -- on a worker that cannot be
         ;; told to stop.
         (when (>= (now-ms) deadline)
-          (raise (qjs-err "render timed out before it was sent")))
+          (raise (qjs-local-err "render timed out before it was sent")))
         (tcp-write! c frame #f)
         (read-response c buf deadline ref id))))
 
@@ -1241,7 +1293,25 @@
             (serve-loop* c buf notify render-ms max-id next-id)))
       (`#(pool-request ,req ,ref ,from)
         (let ((r (render-on! c buf req render-ms ref next-id)))
-          (if (qjs-error? r)
+          (cond
+            ;; NOTHING LEFT THIS PROCESS, so there is nothing wrong with
+            ;; this connection: no half-written frame, no reply owed, no
+            ;; doubt about what the worker is doing -- it was never asked.
+            ;; Retiring it here spent a reconnect to punish a connection
+            ;; for the caller's argument, and under a caller that keeps
+            ;; sending the same bad request it retired the pool one worker
+            ;; at a time.
+            ;;
+            ;; The id does NOT advance: it exists to stop a reply to the
+            ;; previous request being accepted as the answer to this one,
+            ;; and no request went out under this one. Advancing would
+            ;; leave a gap that means nothing on a stream whose ids are
+            ;; only ever compared to the one outstanding.
+            ((qjs-error-local? r)
+             (send from (vector 'pool-reply ref r))
+             (when notify (send notify (vector 'pool-idle self ref)))
+             (serve-loop* c buf notify render-ms max-id next-id))
+            ((qjs-error? r)
               (begin
           ;; THE POOL FIRST, then the caller. Telling the caller first
           ;; releases it, and its check-in can reach the pool before this
@@ -1257,7 +1327,8 @@
           ;; duplicate one. That is a narrower window and a milder failure.
                 (when notify (send notify (vector 'pool-conn-dead self)))
                 (send from (vector 'pool-reply ref r))
-                (tcp-close! c))                    ; exit -> DOWN -> rebuild
+                (tcp-close! c)))                   ; exit -> DOWN -> rebuild
+            (else
               ;; SAME ORDER AS THE ERROR BRANCH ABOVE, and for the same
               ;; reason: when this answer is the connection's last, the
               ;; pool has to hear that before the caller is released, or
@@ -1301,7 +1372,7 @@
                     (tcp-close! c)
                     (begin
                       (when notify (send notify (vector 'pool-idle self ref)))
-                      (serve-loop* c buf notify render-ms max-id (+ next-id 1))))))))
+                      (serve-loop* c buf notify render-ms max-id (+ next-id 1)))))))))
       ;; connpool-call sends this to whatever handle it was given when a call
       ;; times out; only a pool acts on it. Consumed here so it does not sit
       ;; in the mailbox slowing every later selective receive.
@@ -1518,7 +1589,13 @@
     ;; what the contract promises.
     (guard (e (#t (values #f (qjs-error-text (as-qjs-error e "render failed")))))
       (let ((r (render-through p (cons fn props))))
-        (values (car r) (cdr r)))))
+        ;; A local failure arrives as a VALUE rather than a raise -- see
+        ;; render-through for why it must not escape the lease -- so it is
+        ;; unwrapped here. Both kinds reach the caller as the same
+        ;; (values #f text) they always did.
+        (if (qjs-error? r)
+            (values #f (qjs-error-text r))
+            (values (car r) (cdr r))))))
 
   ;; TWO deadlines, because a render has two ways to be slow and they call
   ;; for different answers. Waiting for a free worker means the pool is
@@ -1540,8 +1617,25 @@
           ;; worker, so the connection goes back broken. Handing it back
           ;; clean lets the pool lend a worker that is still busy with the
           ;; request its caller has already abandoned.
-          (connpool-lease h (lambda (conn) (connpool-call conn req cfg)) cfg #t)
-          (connpool-call h req cfg))))
+          ;; A LOCAL FAILURE RETURNS RATHER THAN ESCAPING, and that is the
+          ;; whole of what keeps the connection. connpool-call RAISES every
+          ;; error, and an escape from this thunk is exactly what the #t
+          ;; above turns into pool-checkin-broken -- so a request refused
+          ;; before it was ever written still had its connection discarded
+          ;; by the layer above, no matter what the serve loop decided.
+          ;; (Measured before this line existed: six local failures, six
+          ;; connections discarded and six reconnects, while the serve loop
+          ;; was already keeping every one of them.)
+          ;;
+          ;; Transport errors must go on escaping: for those the #t is
+          ;; right, because the render may still be running on the worker.
+          (connpool-lease h
+            (lambda (conn)
+              (guard (e ((qjs-error-local? e) e))
+                (connpool-call conn req cfg)))
+            cfg #t)
+          (guard (e ((qjs-error-local? e) e))
+            (connpool-call h req cfg)))))
 
   ;; the same, decoded to a string on success
   (define (qjspool-render p fn props)
