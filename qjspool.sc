@@ -1637,10 +1637,12 @@
     ;; what the contract promises.
     (guard (e (#t (values #f (qjs-error-text (as-qjs-error e "render failed")))))
       (let ((r (render-through p (cons fn props))))
-        ;; A local failure arrives as a VALUE rather than a raise -- see
-        ;; render-through for why it must not escape the lease -- so it is
-        ;; unwrapped here. Both kinds reach the caller as the same
-        ;; (values #f text) they always did.
+        ;; A local failure from a POOLED render arrives as a VALUE rather
+        ;; than a raise -- see render-through for why it must not escape
+        ;; the lease -- so it is unwrapped here. From a lone connection it
+        ;; still arrives as a raise, and the guard around this let is what
+        ;; catches it. Both routes, and every failure kind, reach the
+        ;; caller as the same (values #f text) they always did.
         (if (qjs-error? r)
             (values #f (qjs-error-text r))
             (values (car r) (cdr r))))))
@@ -1665,6 +1667,7 @@
           ;; worker, so the connection goes back broken. Handing it back
           ;; clean lets the pool lend a worker that is still busy with the
           ;; request its caller has already abandoned.
+          ;;
           ;; A LOCAL FAILURE RETURNS RATHER THAN ESCAPING, and that is the
           ;; whole of what keeps the connection. connpool-call RAISES every
           ;; error, and an escape from this thunk is exactly what the #t
@@ -1682,8 +1685,22 @@
               (guard (e ((qjs-error-local? e) e))
                 (connpool-call conn req cfg)))
             cfg #t)
-          (guard (e ((qjs-error-local? e) e))
-            (connpool-call h req cfg)))))
+          ;; NO GUARD HERE, AND THE ASYMMETRY IS THE POINT. What the
+          ;; guard above does is not "catch a local error" -- it is
+          ;; "do not let one escape THE LEASE", and its value is entirely
+          ;; positional. A lone connection is not leased: there is no
+          ;; check-in to be told broken and no pool to tell, so an escape
+          ;; costs nothing and the outer guard in qjspool-render/bytes
+          ;; turns the raise into the same (values #f text) a returned
+          ;; error would have produced. Measured both ways: identical
+          ;; answer, identical connection, suite green either way.
+          ;;
+          ;; A copy of the guard here would therefore be an ornament that
+          ;; reads like a protection, which is worse than the asymmetry.
+          ;; The condition that would change this: if connpool ever
+          ;; marked a LONE handle broken on a non-local escape the way a
+          ;; lease does, this arm would need the guard the other one has.
+          (connpool-call h req cfg))))
 
   ;; the same, decoded to a string on success
   (define (qjspool-render p fn props)
