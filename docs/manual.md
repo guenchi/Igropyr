@@ -1955,6 +1955,51 @@ not as a conservation law.
 > cross-node call. The spellings differ deliberately: `'overloaded` is a
 > conversation status, `'overload` is an rcall error.
 
+### Taking a node out of rotation
+
+Two questions, both answered locally — nothing here crosses a link or changes
+a frame, so a mesh can run any mixture of versions while you use them.
+
+- `(conversation-census)` → alist of `running`, `parked`, `lingering` and
+  `total`. `running` is executing a step, `parked` is waiting in `suspend!`
+  for the next request, and `lingering` is the window after the flow
+  returned where its final reply can still be replayed. A lingering
+  conversation still holds its name, so **a drain is not finished while any
+  remain**.
+- `(conversation-quiesce! #t)` stops this node accepting **new**
+  conversations; `(conversation-quiesce! #f)` puts it back. It is a switch,
+  not a ratchet.
+- `(conversation-quiescing?)` → boolean.
+
+`conversation-run!` raises `#(conversation-quiescing <node>)` while quiescing,
+before the handle is claimed — so a refused run leaves it still prepared and
+runnable elsewhere. It raises rather than returning a status because a caller
+who ignored a status would carry on as though a conversation had started.
+
+**What quiesce does not stop is the point.** Resuming or peeking a
+conversation that is already here keeps working, including a resume forwarded
+from another node — those are how the conversations you are waiting for make
+progress, and a node that refused them could never finish draining.
+`prepare!` keeps working too; it has no effect to withhold, and the refusal
+lands at `run!`.
+
+Draining is a question you ask rather than a fourth call: quiescing, and a
+census `total` of zero.
+
+```scheme
+(conversation-quiesce! #t)
+(let wait ()
+  (unless (zero? (cdr (assq 'total (conversation-census))))
+    (sleep-ms 200)
+    (wait)))
+```
+
+Three words, three different situations, and they are worth keeping apart:
+`'unreachable` means nothing definite came back and the request may still
+have been acted on — reconcile. `'overloaded` means the owner is busy right
+now — retry shortly, here. Quiescing means this node is going away — go
+somewhere else, and do not wait for it.
+
 ### Upgrading a mesh has a direction
 
 An owner that refuses answers with a frame older code does not know. A new
