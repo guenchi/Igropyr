@@ -282,6 +282,39 @@
         (fail "the switch drifted during the drain"))
       (ok "drained: quiescing with an exactly-zero census"))
 
+    ;; ---- admitted means counted, before the process ever runs ----------
+    ;; spawn only queues. A probe woken BEFORE run! spawns the conversation
+    ;; sits ahead of it in the run queue, so it executes in the window
+    ;; between admission and the conversation's first instruction -- the
+    ;; exact instant where a census that counts late reports "quiescing
+    ;; and zero" while an accepted conversation is about to start. The
+    ;; drained node above is the known-zero baseline, so the probe must
+    ;; read exactly one.
+    (conversation-quiesce! #f)
+    (let* ((me self)
+           (probe (spawn
+                    (lambda ()
+                      (receive
+                        (`#(go)
+                          (conversation-quiesce! #t)
+                          (send me (vector 'probe
+                                           (conversation-census)
+                                           (conversation-quiescing?)))))))))
+      (sleep-ms 50)                       ; let the probe park first
+      (send probe (vector 'go))           ; runnable, ahead of the spawn
+      (let-values (((idp tp rp) (conversation-start! settle-flow 'hi 30000)))
+        (receive (after 5000 (fail "the probe never reported"))
+          (`#(probe ,c ,qs)
+            (unless qs (fail "the probe's quiesce did not take"))
+            (unless (= 1 (cdr (assq 'total c)))
+              (fail "an admitted conversation was invisible to the census"
+                    c))))
+        (ok "an admitted conversation is counted before it first runs")
+        ;; leave the node as drained as we found it
+        (kill (whereis (string->symbol (string-append "igropyr-conv-" idp)))
+              'census-drain)
+        (poll-census (census-of 0 0 0) "the probe's conversation lingered")))
+
     (ask (vector 'quit))
     (display "ALL CONV-CENSUS TESTS PASSED\n")
     (exit 0)))
