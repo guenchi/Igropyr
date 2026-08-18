@@ -23,21 +23,22 @@ This manual covers the architecture, design patterns, and implementation details
 17. [Outbound HTTP Client](#outbound-http-client)
 18. [Database Clients](#database-clients)
 19. [Async File Reads](#async-file-reads)
-20. [JSON and gzip](#json-and-gzip)
-21. [S-Expression RPC](#s-expression-rpc)
-22. [Distribution](#distribution)
-23. [Vector Scoring](#vector-scoring)
-24. [Embedded JavaScript](#embedded-javascript)
-25. [Cached SSR](#cached-ssr)
-26. [Object Storage and AWS](#object-storage-and-aws)
-27. [Password Hashing](#password-hashing)
-28. [Running and Building](#running-and-building)
-29. [Testing](#testing)
-30. [Development Contracts](#development-contracts)
-31. [Code Style](#code-style)
-32. [Common Pitfalls](#common-pitfalls)
-33. [Appendix: Performance Tips](#appendix-performance-tips)
-34. [Further Reading](#further-reading)
+20. [Durable Writes](#durable-writes)
+21. [JSON and gzip](#json-and-gzip)
+22. [S-Expression RPC](#s-expression-rpc)
+23. [Distribution](#distribution)
+24. [Vector Scoring](#vector-scoring)
+25. [Embedded JavaScript](#embedded-javascript)
+26. [Cached SSR](#cached-ssr)
+27. [Object Storage and AWS](#object-storage-and-aws)
+28. [Password Hashing](#password-hashing)
+29. [Running and Building](#running-and-building)
+30. [Testing](#testing)
+31. [Development Contracts](#development-contracts)
+32. [Code Style](#code-style)
+33. [Common Pitfalls](#common-pitfalls)
+34. [Appendix: Performance Tips](#appendix-performance-tips)
+35. [Further Reading](#further-reading)
 
 ---
 
@@ -3069,6 +3070,88 @@ If you need to read a file in a handler:
 ```
 
 ---
+## Durable Writes
+
+`(igropyr durable)` writes a file so that a crash cannot leave a reader looking at half of it, and so that what was written is still there after the machine loses power. It is a small library and the interesting part is not its API but its **order of operations**.
+
+### The sequence is the contract
+
+```
+write body -> fsync body -> close -> rename -> fsync PARENT DIRECTORY
+```
+
+Writing to a temporary file and renaming it into place is the well-known half. The half that gets left out is the last step: a rename is a change to a *directory*, and a directory is a file that has to be flushed like any other. Leave it out and the code still passes every test that writes a file and reads it back, on every machine that does not lose power during the test — which is why it is the step that goes missing.
+
+### API
+
+- `(durable-write-file! path bytes)` → path — write `bytes` (a bytevector) to `path` through a temporary file, a rename, and a directory flush. The target either holds the old contents or the new ones; a reader never sees a partial file
+- `(durable-dir-ensure! path)` → path — create the directory if it is not there and flush its parent. A second call on an existing directory does no writing at all
+- `(fs-trace-hook-set! hook)` → void — install a procedure `(hook op path outcome)` called around every filesystem operation, or `#f` to remove it
+- `(with-fs-trace hook thunk)` → any — run `thunk` with `hook` installed, restoring the previous hook on the way out, including when `thunk` raises
+
+### Errors
+
+Two kinds, raised differently on purpose:
+
+- **A mistake in the calling program** — a path that cannot name a file, a hook that is not a procedure — raises an `assertion-violation`, like the other startup checks in this framework.
+- **The world refusing** — a write, a rename or a flush that fails — raises a three-element tagged vector, the shape the other libraries here raise:
+
+```scheme
+(guard (e ((durable-error? e)
+           (log-error (durable-error-op e) (durable-error-path e))))
+  (durable-write-file! "state.json" bytes))
+```
+
+- `(durable-error? x)` → boolean
+- `(durable-error-op e)` → symbol — which step gave up
+- `(durable-error-path e)` → string — the path that step was working on
+
+**The arity and field order are part of the interface.** The predicate checks the length, and adding a field is a breaking change to be announced rather than a compatible addition. A sibling of this vector elsewhere in the framework once grew from two fields to three without changing its name, and callers matching on `vector-length` failed silently against the new one.
+
+**Failures from every step arrive in this shape**, including the steps that go through Chez rather than through libc — creating the temporary file, the rename, `mkdir`. Those would otherwise raise a Chez I/O condition, a second error shape to catch, and they are reached by exactly the environmental failures that most need to stop a write: a full disk, a missing directory, permissions.
+
+### What `op` tells you
+
+The step names are `'write`, `'open`, `'fsync`, `'fullfsync`, `'close`, `'rename`, `'mkdir` for the temporary file and the rename, and `'dir-open`, `'dir-fsync`, `'dir-fullfsync`, `'dir-close` for the parent directory flush.
+
+The directory flush has its own symbols because the distinction they draw is the reason the library exists:
+
+- a failure **before** the rename leaves the target untouched and its old contents intact — safe to retry;
+- a failure **flushing the directory** happens **after** the rename, so the new contents may already be visible and merely not yet durable.
+
+Those want different handling, and a caller should not have to compare path strings to tell them apart. **The set is not closed**: a step added later brings a symbol with it, so match with a fallback rather than exhaustively.
+
+`op` is for deciding what to do next. It is **not** a verdict on durability — nothing in this library can give one, for the reason in the next section.
+
+### What cannot be checked from inside the process
+
+Whether any of this reached the medium. `fsync` returning zero says the kernel believes it handed the data to the device; a device with a volatile write cache can say so and lose it. On macOS `F_FULLFSYNC` asks for more than `fsync` does, which is why it is issued there — and no other platform defines it.
+
+So the tests around this library assert the **call sequence** and the **error behaviour**, and claim nothing about durability itself. A test that claimed otherwise would be measuring its own expectations. If you write a test for your own use of this library, assert the same kind of thing.
+
+### It blocks the whole runtime
+
+Every call here is a synchronous syscall, and green processes share one OS thread — so an `fsync` stops **every process in the runtime** for as long as it takes, not just the caller.
+
+**The bound comes from the storage, not from how often you call it.** On a local disk it is milliseconds. On a network or fuse filesystem it can be seconds or longer, and an operation that eventually returns an error can take just as long to do it. "Call this rarely" is therefore not the same as "this is cheap": rare calls on slow storage still stop the world for as long as the storage takes.
+
+The right places are startup, configuration changes, and the handful of writes whose loss would actually matter. A hot path needs the file I/O moved off this thread entirely, which this library does not do.
+
+### The trace hook
+
+`fs-trace-hook-set!` installs a procedure called around every operation, which is how the ordering above is testable at all — the sequence is not visible in the resulting file.
+
+**It is one global, set once, and deliberately not a parameter.** A parameter would offer `parameterize`, which reads as "just for this extent" and is not: green processes here share one dynamic environment, so one process's binding is visible to every other, and two concurrent users interleave. Rather than document against a form the API invites, the form is not offered.
+
+`with-fs-trace` exists so that a caller who installs a hook has a way to take it back that survives an exception. **It is not isolation**: what it restores is that same single box, so two green processes using it at once still overwrite each other. What it buys is that a raise does not strand a hook for whatever runs next.
+
+Two properties of hook calls worth knowing:
+
+- **A hook that raises cannot turn one failure into two.** Every call is guarded and anything the hook raises is dropped, so reporting a failure can never replace the failure being reported.
+- **A hook that blocks is not defended against.** It runs on the one OS thread, so a hook that waits stops the runtime, and no wrapper here can make that safe. That one is the caller's responsibility.
+
+---
+
 
 ## JSON and gzip
 
