@@ -1197,6 +1197,15 @@
   ;;
   ;; Reading the census is what repairs it, so nothing sweeps on a timer.
   ;; Entries for processes that have died are dropped as they are found.
+  ;;
+  ;; THIS AND COUNTING AT ADMISSION ARE ONE DECISION, not two that happen
+  ;; to sit together. An entry is made when the handle is claimed, and at
+  ;; that instant the conversation has not run its first instruction, so
+  ;; it has not registered its name -- a check by name would find nothing
+  ;; there and drop the entry it had just been given. Whichever of the
+  ;; two is changed back alone, the census reports zero for a
+  ;; conversation that was accepted and is about to start, which is
+  ;; precisely the reading a drain must never get.
   (define conv-census (make-hashtable string-hash string=?))
 
   ;; PRUNED ON INSERT ONCE IT IS IMPLAUSIBLY LARGE, because reading is
