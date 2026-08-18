@@ -48,7 +48,16 @@
         (list 'done conversation-done? 'done)
         (list 'settled conversation-settled? 'settled)
         (list 'unknown conversation-unknown? 'unknown)
-        (list 'unreachable conversation-unreachable? 'unreachable)))
+        (list 'unreachable conversation-unreachable? 'unreachable)
+        (list 'overloaded conversation-overloaded? 'overloaded)))
+
+;; the two refusal-shaped statuses call for opposite responses --
+;; 'unreachable must be reconciled, 'overloaded may simply be retried --
+;; so the pair is checked against each other, not only against garbage
+(when (conversation-overloaded? 'unreachable)
+  (fail "overloaded? accepted 'unreachable"))
+(when (conversation-unreachable? 'overloaded)
+  (fail "unreachable? accepted 'overloaded"))
 
 (display "the status vocabulary loads nothing but itself ok\n")
 (display "ALL CONV-STATUS TESTS PASSED\n")

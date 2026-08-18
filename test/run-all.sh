@@ -195,6 +195,11 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # Covers the narrow-reply branch a positive ref lands in -- a branch no
 # all-new mesh ever takes. Skips (and says so) without full git history
 "$scheme_bin" --script igropyr/test/conv-mixed.sc
+# admission is judged by the PAIR (what came back, how fast): a refusal
+# that takes as long as the silence it replaces refuses nothing. Also the
+# only rig that can kill the router with live workers in flight, which is
+# what proved the slot accounting survives the router that took the slots
+"$scheme_bin" --script igropyr/test/conv-admission.sc
 "$scheme_bin" --script igropyr/test/tls.sc
 "$scheme_bin" --script igropyr/test/apple-jws.sc
 # needs the openssl CLI to mint its ephemeral RSA keys, same as tls.sc above
