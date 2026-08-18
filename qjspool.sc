@@ -75,10 +75,13 @@
 ;;; flight: it arrives later, on a connection that has since been returned
 ;;; to the pool and lent to somebody else, and answers THEIR render.
 ;;;
-;;; A JS error is a NORMAL response and the connection stays usable; only a
-;;; malformed or oversized frame is a transport failure, and that discards
-;;; the connection -- a stream whose framing is in doubt cannot be trusted
-;;; with the next reply.
+;;; A JS error is a NORMAL response and the connection stays usable. A
+;;; transport failure discards the connection instead, on the principle
+;;; that a stream whose framing is in doubt cannot be trusted with the
+;;; next reply. Malformed and oversized frames are the obvious ones, but
+;;; not the only ones: a worker that ends the stream partway through a
+;;; reply, and a render that outlives its deadline, are transport
+;;; failures too, and retire the connection the same way.
 ;;;
 ;;; WHAT partial-frame-ms ACTUALLY BOUNDS. It is measured from when this
 ;;; process got to LOOK at the bytes, not from when they reached the
@@ -210,11 +213,123 @@
   ;; connection.
   ;; A DIAGNOSTIC MUST NOT KILL WHAT IT IS DIAGNOSING. This runs at the
   ;; top of the read path, outside the guard that turns a framing error
-  ;; into a closed connection, so a full disk or an unlinked file would
-  ;; otherwise raise here and take down the connection's process -- while
-  ;; the listener stayed up, leaving a worker that holds its port and
-  ;; fails every render. The first failure turns tracing off for the life
-  ;; of the process and says so once; nothing after that can raise.
+  ;; into a closed connection, so a write that fails -- a full disk, a
+  ;; closed pipe -- would otherwise raise here and take down the
+  ;; connection's process, while the listener stayed up, leaving a worker
+  ;; that holds its port and fails every render. The first failure turns
+  ;; tracing off for the life of the process; nothing after that can
+  ;; raise.
+  ;;
+  ;; IT GOES SILENT WITHOUT SAYING SO, which is a gap and not an
+  ;; oversight. Reporting on stderr instead would not close it, and the
+  ;; reason is a level down: a worker is a separate process, so where its
+  ;; stderr goes is chosen by whatever launched it, and redirecting it
+  ;; away is ordinary -- the launcher in this repository's own tests
+  ;; sends it to /dev/null. A report on a channel the library cannot
+  ;; reach is worse than none, because it reads as coverage. The trace
+  ;; file is no better, its port being what just failed. What is true is
+  ;; not that no channel exists but that none is GUARANTEED here, and a
+  ;; gap admitted beats a report that may go nowhere.
+  ;;
+  ;; So a trace that stops partway is ambiguous: tracing broke, the
+  ;; worker was killed, or the process died. A fourth case leaves no
+  ;; trace of itself at all -- an open file that is unlinked keeps taking
+  ;; writes, so records keep being written to a path that no longer has
+  ;; them and this handler never runs. A reader has to separate all four
+  ;; by other means.
+  ;;
+  ;; WHAT IS GUARDED IS A WRITE THAT FAILS, NOT ONE THAT NEVER RETURNS,
+  ;; and the second is the worse of the two: a guard catches nothing from
+  ;; it, this is a synchronous write with interrupts disabled, and one OS
+  ;; thread runs every connection -- so a worker asked only to describe
+  ;; itself stops serving all of them. A slow write is the same shape as
+  ;; a stuck one here; the guard bounds neither, it only keeps a raise
+  ;; from killing the process.
+  ;;
+  ;; A FIFO is the sharpest case: opening one for writing WAITS for a
+  ;; reader, so a worker pointed at one never reaches its listener; and
+  ;; if a reader attaches and later stops, the pipe fills and every write
+  ;; after that blocks. But slow storage does the same thing without
+  ;; anyone choosing it -- a regular file on a network or fuse
+  ;; filesystem, or a congested device, can hang at the open or at a
+  ;; flush, and an operation that eventually returns an error can hang a
+  ;; long time first. So the stretches that write a trace are bounded by
+  ;; the STORAGE, not by anything arranged here, and claims elsewhere
+  ;; about their being bounded are conditional on that.
+  ;;
+  ;; A VALIDATION-TIME FIX WAS TRIED AND REVERTED -- rejecting a
+  ;; trace-file that exists and is not a regular file. Recorded because
+  ;; it is the obvious thing to reach for, and it dies three ways:
+  ;;
+  ;;   - It rejects working configurations. /dev/null is not a regular
+  ;;     file and is a perfectly good place to send a trace; nor is a
+  ;;     tty. Worse, /dev/stderr names fd 2, so it classifies as
+  ;;     whatever the launcher attached to stderr, and the same
+  ;;     configuration passes or fails depending on how the process was
+  ;;     started.
+  ;;   - It does not close the window it aims at. The check tests a path
+  ;;     and the open that follows resolves it again; anything able to
+  ;;     write the directory can put a FIFO there in between, and the
+  ;;     open blocks before there is a listener. Nor is "check after the
+  ;;     open instead" a fix on its own: an ordinary blocking open never
+  ;;     returns a descriptor to check. What settles THIS window is an
+  ;;     open whose result the path can no longer be swapped out from
+  ;;     under, which the next paragraph gets to.
+  ;;   - The class it claimed to exclude does not hold together. A
+  ;;     regular file on fuse CAN have its readiness decided by another
+  ;;     process -- not on every operation, since caching and writeback
+  ;;     can answer without the daemon, but on some -- and it passes.
+  ;;
+  ;; WHAT WOULD REFUSE A READER-LESS FIFO AT OPEN, in case the trade is
+  ;; ever worth making -- refuse at open, which is less than "handle the
+  ;; FIFO case": open O_WRONLY | O_NONBLOCK and let the open itself
+  ;; answer, instead of asking a proxy question about the path
+  ;; beforehand.
+  ;; Measured, the same three targets the check above got wrong:
+  ;;
+  ;;     FIFO with no reader   ENXIO      (refused, correctly)
+  ;;     regular file          succeeds   (accepted, correctly)
+  ;;     /dev/null             succeeds   (accepted -- the check
+  ;;                                       above refused it)
+  ;;
+  ;; The last line is where a proxy and the property part company: not
+  ;; being a regular file is not the same as being able to wait, and
+  ;; /dev/null is the ordinary case that shows it.
+  ;;
+  ;; NOT "an open that cannot wait", which overstates it twice over.
+  ;; O_NONBLOCK governs the reader-less FIFO; it does not make path
+  ;; resolution, a fuse OPEN round trip, or the storage behind a plain
+  ;; file asynchronous, so that open can still wait on exactly the
+  ;; targets the paragraph above says are left untouched. And it closes
+  ;; the swap window ONLY if the descriptor it returns becomes the trace
+  ;; port -- used as a probe, with the port opened by path afterwards,
+  ;; the window is exactly as wide as before, since the second open
+  ;; resolves the path again.
+  ;;
+  ;; AND IT SETTLES THE OPEN, NOT THE WRITES. What happens to a FIFO
+  ;; after the open splits in two, and they need different answers. With
+  ;; NO READER LEFT -- the last one closing, not just any one of several
+  ;; -- a write raises SIGPIPE, and returns EPIPE once the signal is
+  ;; handled some way other than by the default: blocked, ignored, or
+  ;; caught by a handler that returns. A version that leaves the default
+  ;; in place is taken down by the signal instead of being told its trace
+  ;; failed. With a READER STILL OPEN THAT HAS STOPPED READING the pipe
+  ;; fills instead, giving EAGAIN under O_NONBLOCK, and a large write may
+  ;; complete short of what it was given. So keeping the refusal means
+  ;; keeping O_NONBLOCK on that same open file description, giving
+  ;; SIGPIPE some disposition other than the default, turning EPIPE and
+  ;; EAGAIN alike into a visible failure rather than a quiet wait, and
+  ;; checking for a short write and deciding what a half record means.
+  ;; A version that gets the open right and lets the port block again has
+  ;; moved the wedge, not removed it. All of which needs platform
+  ;; constants through the FFI, a real cost for an opt-in diagnostic.
+  ;; Removing
+  ;; the exposure rather than detecting it takes a bounded queue drained
+  ;; by a separate OS thread, the worker doing only a non-blocking
+  ;; handoff -- a green process will not do, sharing the one thread.
+  ;;
+  ;; Deliberately none of those: the cost falls on an operator who turned
+  ;; tracing on, and it is written down here rather than discovered.
   ;; ONE RECORD, ONE WRITE, UNDER ONE LOCK. Built as a string first and
   ;; emitted inside a region where nothing else can run. A record made of
   ;; several displays is not atomic just because there is one OS thread:
@@ -275,23 +390,51 @@
   ;; park most of a frame's worth of buffer per connection and simply stop,
   ;; without ever sending a FIN that would end it.
   (define (worker-conn-loop c buf partial-ms)
-    (worker-conn-loop* c buf partial-ms #f))
+    (worker-conn-loop* c buf partial-ms #f #f))
 
   ;; `since` is the ABSOLUTE deadline of the frame currently half delivered,
   ;; or #f when nothing is. Re-arming a fresh timeout on every arrival made
   ;; this an inactivity timer, and an inactivity timer bounds nothing here:
   ;; a peer sending one byte just under the interval keeps the same half
   ;; frame -- and its process, its descriptor and most of a frame's worth of
-  ;; buffer -- alive indefinitely. The deadline is taken once, when the
-  ;; buffer stops being empty, and further bytes shorten the wait rather
+  ;; buffer -- alive indefinitely. The deadline is taken once, on the pass
+  ;; that finds something left over AFTER answering -- not when the buffer
+  ;; stops being empty, which is earlier and can be a whole synchronous
+  ;; render earlier, since the same callback may carry a complete slow
+  ;; request ahead of the tail. Further bytes shorten the wait rather
   ;; than renew it. It is also re-checked after answering, because the
   ;; renders in between are synchronous and nothing was counting during
   ;; them.
-  (define (worker-conn-loop* c buf partial-ms since)
-    (define (on-data bv)
-      ;; READING STOPS FOR THE LENGTH OF THIS PASS. The loop turns it back
-      ;; on only where it goes back to waiting, so bytes are pulled out of
-      ;; the kernel only while somebody is there to look at them. While it
+  ;; `grace` is the instant after which no further delivery round is
+  ;; offered -- see the close branch. #f until a round is first prepared,
+  ;; which is later than the deadline first expiring: an expired frame
+  ;; with queued bytes drains them one message per retry, and grace stays
+  ;; #f across all of that. It is scoped to its deadline: wherever the
+  ;; deadline is dropped or
+  ;; renewed below, grace goes with it, so each half frame gets its own
+  ;; and none inherits a spent one.
+  (define (worker-conn-loop* c buf partial-ms since grace)
+    ;; `grace` is a PARAMETER rather than the enclosing one, because the
+    ;; delivery round in the close branch has just taken a limit that the
+    ;; enclosing binding does not have yet, and re-entering here is how it
+    ;; carries it. Copying the first steps of this procedure into that
+    ;; branch instead worked, but put its trace ahead of the read-stop and
+    ;; left two entry points to drift apart.
+    (define (on-data bv grace)
+      ;; READING STOPS FOR THE LENGTH OF THIS PASS. The loop turns it
+      ;; back on where it goes back to waiting -- not only there, since
+      ;; the tail below starts reading before it has decided whether to
+      ;; wait at all, and an already-expired deadline closes instead --
+      ;; and a path that turns it on may also match at once and go
+      ;; straight back into a pass, when the same poll turn already
+      ;; delivered a second message. What holds is the other direction,
+      ;; and only for the stretch that matters: reading is off for every
+      ;; PARSE-AND-RENDER pass. Not for every stretch that does work --
+      ;; the close arms write their trace with reading still on, which
+      ;; the note further down sets out, and bytes libuv delivers during
+      ;; one of those is never looked at by anyone: the connection is
+      ;; closing. So what holds is about renders, not about every byte
+      ;; having a reader. While it
       ;; is off they stay in the socket's receive buffer, the window
       ;; closes, and the PEER's writes are what stall -- which is where
       ;; flow control belongs. An actor mailbox is not a substitute for
@@ -303,15 +446,23 @@
       ;; the parse would leave the renders -- the slowest thing this loop
       ;; does -- outside it.
       ;;
-      ;; HOW MUCH THIS BUYS TODAY IS SMALL, and honesty about that is
-      ;; worth more than the rule sounding stronger than it is. Reads
-      ;; happen only during an event loop poll, and a poll can only
-      ;; happen where this loop yields. A render yields nothing (a
-      ;; synchronous call made with interrupts disabled), and everything
-      ;; else in a pass is a primitive that burns no preemption ticks --
-      ;; measured, utf8->string of 8MiB lets a competing process run zero
-      ;; times. So a pass is currently never interrupted and reads were
-      ;; already confined to the waits. What this makes is the invariant
+      ;; WHAT THIS BUYS is easy to understate, and an earlier note here
+      ;; did: it said a pass could not be preempted at all, so the stop
+      ;; was only insurance against some future version. That is wrong
+      ;; on a batch. A render yields nothing (a synchronous call made
+      ;; with interrupts disabled) and a single parse step burns no
+      ;; preemption ticks -- measured, utf8->string of 8MiB lets a
+      ;; competing process run zero times -- but answer-all! LOOPS,
+      ;; and one 64KiB message can carry thousands of small requests
+      ;; through parse, answer and write. A batch long enough crosses
+      ;; the scheduler's quantum, the timer handler runs, and the poll
+      ;; it turns lands between two renders. So the stop is load
+      ;; bearing in the code as it stands, not only in some later one.
+      ;;
+      ;; Before the stop it is preemptible either way: a receive restores
+      ;; interrupts before running the clause it matched, which is why
+      ;; the stop is the first act rather than something done once per
+      ;; wait. What this makes is the invariant
       ;; STRUCTURAL rather than incidental: it does not depend on nothing
       ;; in the pass ever parking or ever being preempted, which is a
       ;; property of the primitives used here rather than anything the
@@ -349,10 +500,15 @@
       ;; inside it. Refusing them punishes a peer for our own scheduling.
       ;;
       ;; Nothing is lost by parsing first, because a peer that dribbles
-      ;; never completes a frame: it consumes nothing, keeps its original
-      ;; deadline, and is closed by the check BELOW on the very same read.
-      ;; What the check up here changed was only the case where the frame
-      ;; IS whole -- a real request, refused.
+      ;; never completes a frame: it consumes nothing and keeps its
+      ;; original deadline, so the check BELOW takes it -- not
+      ;; necessarily on this same read, and not necessarily by closing;
+      ;; see A DELIVERY ROUND BEFORE CLOSING (the expiry branch) for what
+      ;; that check does. Stated there and not restated here, because all
+      ;; this argument needs is that something downstream takes the
+      ;; dribbler, and every retelling of the rule has been a chance to
+      ;; get it wrong. What the check up here changed was only the case
+      ;; where the frame IS whole -- a real request, refused.
       ;; WHETHER WE WERE THE ONE RUNNING LATE, decided before the parse
       ;; because the parse moves the clock.
       ;;
@@ -375,10 +531,13 @@
       ;; accomplice keeping the worker busy could send one byte after each
       ;; deadline and be forgiven for it forever. What a late read does
       ;; say is that everything libuv has ALREADY handed up was delivered
-      ;; with nobody able to look at it -- so the rest of that delivery is
+      ;; with nobody able to look at it -- so more of that delivery is
       ;; taken below before any decision, and a peer that has sent nothing
-      ;; further has nothing to take.
-      (let retry ()
+      ;; further has nothing to take. More, not all of it: the drained
+      ;; branch takes one queued message per pass, so the run stops as
+      ;; soon as a pass answers something or raises, whatever is still
+      ;; queued behind it going with the connection.
+      (let retry ((grace grace))
        (let ((late? (and since (>= (now-ms) since)))
             (before (inbuf-length buf)))
         ;; EVENT TYPES DO NOT SHARE FIELD NAMES. A close line also
@@ -420,8 +579,13 @@
                    ;; is enforced on bytes that have already been queued,
                    ;; and inbuf-length cannot see the mailbox at all. What
                    ;; bounds that is the tcp-read-stop! at the top of
-                   ;; on-data. Reading is on only while this loop waits,
-                   ;; so a peer that writes faster than renders retire
+                   ;; on-data. Reading is on while this loop waits and
+                   ;; goes off as the first act of the pass that
+                   ;; follows, so it is off for the whole of a render --
+                   ;; which is what this argument needs, and is weaker
+                   ;; than "on only while waiting": a wake leaves it on
+                   ;; until that first act runs.
+                   ;; So a peer that writes faster than renders retire
                    ;; fills the kernel's receive buffer, has its window
                    ;; closed, and stalls on its own writes rather than
                    ;; having every segment copied into a mailbox nothing
@@ -433,10 +597,13 @@
                    ;; poll turn's delivery: libuv hands up everything
                    ;; readable in a turn, so several segments can already
                    ;; be in the mailbox before the first of them is
-                   ;; looked at. take-queued! below is what consumes
-                   ;; exactly those, which is why a delivery split across
-                   ;; messages is still seen whole rather than as its
-                   ;; first segment.
+                   ;; looked at. take-queued! below is what draws on
+                   ;; those, which is why a delivery split across
+                   ;; messages is usually seen whole rather than as its
+                   ;; first segment. One per pass, though, so it is not a
+                   ;; guarantee that a whole poll turn reaches the buffer
+                   ;; -- a pass that raises ends the run with the rest
+                   ;; still in the mailbox.
                    ;; Keying the reset on "the buffer emptied" instead meant
                    ;; a peer that always keeps a partial tail -- which is
                    ;; what pipelining looks like -- was closed at the first
@@ -444,12 +611,33 @@
                    ;; delivered in between. Our own client never pipelines,
                    ;; but answer-all! exists for clients that do.
                    (consumed (< rest before))
+                   ;; A RENEWED DEADLINE IS A NEW HALF FRAME, and grace is
+                   ;; scoped to the deadline it was taken for: it has to
+                   ;; die with that deadline or the next half frame
+                   ;; inherits a budget already spent and is closed
+                   ;; without the round this exists to give it. Clearing
+                   ;; it on rest = 0 alone was not enough -- a peer that
+                   ;; completes a frame while still owing the tail of the
+                   ;; next one, which is what pipelining looks like, never
+                   ;; passes through rest = 0.
+                   (renewed (and (> rest 0) (or consumed (not since))))
                    (deadline (cond ((= rest 0) #f)
-                                   ((or consumed (not since))
-                                    (+ (now-ms) partial-ms))
-                                   (else since))))
+                                   (renewed (+ (now-ms) partial-ms))
+                                   (else since)))
+                   ;; PAIRED WITH IT HERE, not at each use. A renewed
+                   ;; deadline can be expired by the time the branches
+                   ;; below run -- partial-ms is only required to be a
+                   ;; positive integer, so at 1 the clock ticking once
+                   ;; between these two bindings is enough -- and the
+                   ;; close branch would then read the PREVIOUS frame's
+                   ;; grace, find it spent, and close a frame that had
+                   ;; never been given a round. Deriving it once beside
+                   ;; the deadline it belongs to is what makes "one
+                   ;; deadline, one grace" hold on every path out of this
+                   ;; cond rather than on the ones that were remembered.
+                   (grace (if renewed #f grace)))
               (cond
-                ((= rest 0) (worker-conn-loop* c buf partial-ms #f))
+                ((= rest 0) (worker-conn-loop* c buf partial-ms #f #f))
                 ;; MORE OF THE SAME DELIVERY, before deciding against it.
                 ;; libuv hands up at most 64KiB per callback, so a request
                 ;; sent whole and in time still arrives in pieces; the
@@ -459,21 +647,238 @@
                 ;; which has nothing queued and is closed on the deadline
                 ;; it had.
                 ((and late? (not consumed) (take-queued! buf))
-                 (trace! "drained rest=" rest) (retry))
+                 (trace! "drained rest=" rest) (retry grace))
+                ;; A DELIVERY ROUND BEFORE CLOSING WHERE THE CAP LEAVES
+                ;; ROOM FOR ONE -- and none where it does not, which is
+                ;; the immediate close just below. Because an empty
+                ;; mailbox is not an idle peer. take-queued! above sees
+                ;; only what libuv has already handed up; bytes the peer
+                ;; wrote in time can still be in the write queue, in a
+                ;; socket buffer, or on the wire -- and they are exactly
+                ;; there when we have just spent a long render not
+                ;; reading, because the receive window was shut for all of
+                ;; it. Measured: a peer that handed a 192KiB frame to
+                ;; libuv 237ms INSIDE its window had 57KiB still in
+                ;; flight when the render ended, and was closed for it.
+                ;;
+                ;; So the check that decides against the peer asks the
+                ;; event loop once first. Reads go back on, and one
+                ;; millisecond is not a grace period granted to the peer
+                ;; -- it is the poll's own blocking bound. What it buys
+                ;; is a turn of the loop, NOT a filter on when the bytes
+                ;; were sent: a peer that writes a fresh byte after the
+                ;; read-start below is answered by the same round, and
+                ;; nothing here can tell that apart from a delivery
+                ;; already on its way. Which is the point of the cap --
+                ;; what bounds this is the total, not the length of one
+                ;; round.
+                ;;
+                ;; THIS IS A WAIT, NOT AN INTERRUPTED PASS. Reading is on
+                ;; while this loop is parked; this adds a third park
+                ;; rather than leaving reads on across work.
+                ;;
+                ;; AND IT IS CAPPED, or it would undo the rule the
+                ;; deadline exists for. Rounds are driven by bytes
+                ;; arriving, and a peer dribbling one byte per round has
+                ;; bytes arriving forever: without a cap this becomes the
+                ;; inactivity timer the comment on `since` rejects, with
+                ;; the interval cut from partial-ms to 1ms -- a bound of
+                ;; hours where there was one of a fraction of a second.
+                ;; The cap is one further partial-ms of rounds in total,
+                ;; taken once and not renewed by a round that succeeds.
+                ;;
+                ;; WHAT IT GATES IS THE NEXT ROUND, NOT WHETHER A
+                ;; FRAME IS STILL ACCEPTED. A round that hits goes on
+                ;; to answer whatever it completed even if the clock
+                ;; has passed `limit` by then: another connection's
+                ;; synchronous render stops the whole runtime for as
+                ;; long as it takes, and libuv is polled before timers
+                ;; are, so a delivery can beat the very timeout meant
+                ;; to end this.
+                ;;
+                ;; The other reading -- `limit` as an absolute deadline
+                ;; for ACCEPTING a frame -- was considered and
+                ;; rejected. Bytes in hand do not say when they were
+                ;; sent, so refusing them refuses the peer that
+                ;; dribbled past the cap AND the peer that delivered on
+                ;; time into a window we had frozen; the second is who
+                ;; this branch exists for, and a test of lateness that
+                ;; we can move by rendering longer is not a test of the
+                ;; peer. A frame already complete in the buffer is also
+                ;; cheaper to answer than to discard, since discarding
+                ;; it buys a retry -- the same render again, plus a
+                ;; reconnection. The bound that remains: crossing
+                ;; `limit` repeatedly requires completing frames, which
+                ;; is progress, and a round completing nothing meets
+                ;; the same spent `limit` at the next expiry and
+                ;; closes. Renewal on `consumed` is the pipelining
+                ;; decision above, not something this adds.
+                ;;
+                ;; IT STARTS WHEN THIS BRANCH IS FIRST REACHED, not at
+                ;; the deadline. Anchoring it at the deadline would spend
+                ;; the budget on the render we were blocked in -- a 745ms
+                ;; render leaves 55ms of a 400ms cap, and a longer one
+                ;; leaves none -- which is this very defect wearing a
+                ;; different number. What the budget pays for is draining
+                ;; the delivery chain once we are back, and that cannot
+                ;; begin before we are back.
+                ;;
+                ;; Reached, not merely due: an expired frame with queued
+                ;; bytes takes the drained branch above and retries,
+                ;; possibly several times, and `grace` is still #f
+                ;; through all of it -- so draining BEFORE the cap
+                ;; exists is not charged to it, and the cap starts on
+                ;; the pass that finds nothing left to take.
+                ;;
+                ;; Every drain before the cap exists, not just the first
+                ;; one: the drained branch takes a single queued tcp-data
+                ;; per retry, so what is owed to an incomplete frame
+                ;; arrives over several passes with grace still #f
+                ;; throughout. Not the whole mailbox -- take-queued!
+                ;; matches tcp-data alone, and a queued message that
+                ;; completes the frame ends the drain by making
+                ;; `consumed` true. Once a round
+                ;; has hit, the retry it re-enters carries the limit,
+                ;; and draining after that DOES spend it -- which is
+                ;; what makes a large negative grace-left readable
+                ;; rather than a puzzle: payload size turns into cap
+                ;; spent, one queued message at a time.
                 ((>= (now-ms) deadline)
-                 (trace! "close deadline rest=" rest
-                         " close-consumed=" (if consumed "1" "0")
-                         " close-late=" (if late? "1" "0"))
-                 (tcp-close! c))
-                (else (worker-conn-loop* c buf partial-ms deadline))))
-            (tcp-close! c)))))
-    ;; BACK TO WAITING, so reading goes back on. This is the only place
-    ;; this loop turns it on, as the tcp-read-stop! at the top of on-data
-    ;; is the only place it turns it off, and that is what makes the
-    ;; invariant readable in one sitting: reads are enabled exactly while
-    ;; this loop is parked in one of the two receives below. Deciding it
-    ;; here rather than in each of them also means a third wait could not
-    ;; be added without inheriting it.
+                 (let ((limit (or grace (+ (now-ms) partial-ms))))
+                   (if (>= (now-ms) limit)
+                       (let ((n (now-ms)))
+                         ;; MEASURED, not written as the constant the
+                         ;; branch implies: a branch taken says what was
+                         ;; true on the way in, and the cap can be
+                         ;; crossed after that while another connection's
+                         ;; render holds the runtime.
+                         ;;
+                         ;; ONE SAMPLE FEEDS BOTH FIELDS. Reading the
+                         ;; clock once per field let the pair contradict
+                         ;; itself -- grace-spent=0 printed beside
+                         ;; grace-left=-1, when the millisecond turned
+                         ;; between the two reads. Neither field is the
+                         ;; instant of the close, which no value printed
+                         ;; before it can be; what they are is a single
+                         ;; reading taken just before, and they agree
+                         ;; with each other.
+                         (trace! "close deadline rest=" rest
+                                 " close-consumed=" (if consumed "1" "0")
+                                 " close-late=" (if late? "1" "0")
+                                 " grace-spent=" (if (>= n limit) "1" "0")
+                                 " grace-left=" (- limit n))
+                         (tcp-close! c))
+                       (let ((t0 (now-ms)))
+                         (tcp-read-start! c)
+                         (receive (after 1
+                                    ;; hit=0 says THE TIMEOUT ARM WAS
+                                    ;; SELECTED, not that nothing has
+                                    ;; arrived: interrupts are back on
+                                    ;; before a timeout handler runs, so
+                                    ;; a tcp-data can reach the mailbox
+                                    ;; between the wake and this line and
+                                    ;; will not be re-scanned. Read it as
+                                    ;; "the round did not deliver", never
+                                    ;; as "the peer sent nothing".
+                                    (let ((n (now-ms)))
+                                      (trace! "delivery round rest=" rest
+                                              " hit=0 waited=" (- n t0))
+                                      (trace! "close deadline rest=" rest
+                                              " close-consumed="
+                                              (if consumed "1" "0")
+                                              " close-late="
+                                              (if late? "1" "0")
+                                              " grace-spent="
+                                              (if (>= n limit) "1" "0")
+                                              " grace-left=" (- limit n)))
+                                    (tcp-close! c))
+                           (`#(tcp-data ,bv)
+                             ;; STOP BEFORE RECORDING, so this entry
+                             ;; reaches the stop as directly as the
+                             ;; ordinary one does. Tracing first left the
+                             ;; loop preemptible with reads still on,
+                             ;; which is the one thing the invariant
+                             ;; above forbids; on-data stops again and
+                             ;; libuv answers a stop on a stream that is
+                             ;; not reading with success.
+                             (tcp-read-stop! c)
+                             (trace! "delivery round rest=" rest
+                                     " hit=1 waited=" (- (now-ms) t0))
+                             (on-data bv limit))
+                           ;; WHERE says which of the three waits ended,
+                           ;; since all three take the peer's end the
+                           ;; same way and only the site tells them
+                           ;; apart -- this one is the delivery round,
+                           ;; so an end seen here is the peer closing
+                           ;; while we were asking for the rest of a
+                           ;; frame it still owed.
+                           (`#(tcp-eof)
+                             (trace! "close eof where=round rest=" rest)
+                             (tcp-close! c))
+                           (`#(tcp-error ,e)
+                             (trace! "close error where=round rest=" rest)
+                             (tcp-close! c)))))))
+                (else (worker-conn-loop* c buf partial-ms deadline grace))))
+            ;; THE PASS RAISED, and the guard above turns that into a
+            ;; close. It used to be a silent one: the last thing in the
+            ;; trace was an ordinary read, which is what a peer that
+            ;; simply went away also leaves, so a malformed frame and a
+            ;; vanished peer were the same picture.
+            ;;
+            ;; `answer-failed` NAMES ONE CAUSE, NOT THE ONLY ONE, and
+            ;; which of them dominates is a property of the peer rather
+            ;; than of this code -- a client sending nothing but
+            ;; over-limit headers makes every one of these a take-frame!
+            ;; failure with answer never reached, and one sending nothing
+            ;; but zero-length frames makes every one of them the case
+            ;; the name has in mind. Both raise inside the guard: a frame
+            ;; whose header is well formed but whose body is too short to
+            ;; hold a request, and a length past the limit, which
+            ;; take-frame! refuses before answer is reached at all.
+            ;;
+            ;; A failed reply write is NOT among them, though it looks as
+            ;; if it should be: tcp-write! is called with no completion
+            ;; callback, so it reports an immediate failure by return
+            ;; value and drops a later one, and nothing raises past the
+            ;; guard. So read this line as "the pass raised", and do not
+            ;; attribute it to the renderer without something else
+            ;; saying so.
+            (begin
+              (trace! "close answer-failed rest=" (inbuf-length buf))
+              (tcp-close! c))))))
+    ;; BACK TO WAITING, so reading goes back on. WHAT HOLDS IS THAT NO
+    ;; PARK IS ENTERED WITH READS OFF, AND THAT READS ARE OFF FOR THE
+    ;; WHOLE OF A PASS -- a pass being the parse and the renders it runs,
+    ;; which is the only stretch long enough for the back-pressure
+    ;; argument above to need it. A pass entered from a receive turns
+    ;; them off as its first act; a pass re-entered from a drained retry
+    ;; does not need to, reading having never come back on since the
+    ;; first. The paths that close instead release the handle, which ends
+    ;; reading with it.
+    ;;
+    ;; NOT "reads are on exactly while parked", which this block claimed
+    ;; in two earlier forms and is false in both directions. A receive
+    ;; restores interrupts before running the arm it selected, so between
+    ;; a wake and that first act reads are on while nothing is parked.
+    ;; And the close arms -- timeout, EOF, error, and the already-expired
+    ;; branch below -- run their trace with reads still on before closing.
+    ;; Those stretches do no work that matters here, and are bounded so
+    ;; long as tracing is; a blocking trace target makes them unbounded
+    ;; and stops the worker outright, which the trace comment sets out.
+    ;; The claim is scoped to a pass because that is the stretch the
+    ;; argument actually rests on, not because the wider one was checked.
+    ;;
+    ;; SO ANYTHING ADDED BEFORE A CLOSE INHERITS NOTHING. The rule above
+    ;; says nothing about work placed between a wake and its close, and
+    ;; the traces sitting there are deliberate rather than covered.
+    ;;
+    ;; THREE PARKS, TWO ENABLING SITES: the delivery round in the close
+    ;; branch starts its own before its receive, and this one covers
+    ;; both receives below. A fourth wait needs an enabling site --
+    ;; sharing this one if it sits beside those two, or bringing its own
+    ;; if it sits where the round does. Not automatic either way, which
+    ;; is the cost of the round; what makes it checkable is that every
+    ;; receive here is reachable from one of the two.
     ;;
     ;; NO FLAG IS NEEDED, because both transitions are idempotent: libuv
     ;; answers a start on a stream that is already reading with
@@ -485,40 +890,180 @@
     ;; rather than waiting (an already-expired deadline, just below) costs
     ;; a start that closing the handle undoes.
     (tcp-read-start! c)
+    ;; EXPIRING HERE IS NOT THE CASE THE DELIVERY ROUND EXISTS FOR, and
+    ;; that is the whole of why this path has none. The round pays back
+    ;; time WE took: reads were off for the length of a render, so bytes
+    ;; the peer sent in time could not reach us and an empty mailbox said
+    ;; nothing about the peer. On this path reads were on for the entire
+    ;; wait -- anything in flight would have arrived as tcp-data and woken
+    ;; us -- so the mailbox being empty means what it appears to mean, and
+    ;; a round would be an inactivity extension with nothing to justify
+    ;; it. Adding one here would also not be capped by the same argument,
+    ;; since no render bounds how often this path is reached.
+    ;;
+    ;; THE ARGUMENT ABOVE COVERS THE WAIT, NOT THE BRANCH THAT NEVER
+    ;; WAITS. `left` can already be <= 0 here, and that close is reached
+    ;; without entering a receive at all -- so "reads were on throughout"
+    ;; is not true of it, and neither is the conclusion drawn from that.
+    ;; It can discard a delivery we have already been handed: libuv hands
+    ;; up a whole poll turn, so a second tcp-data can be sitting in the
+    ;; mailbox while on-data works on the first; if that pass saw a
+    ;; deadline still in the future it does not scan for queued bytes,
+    ;; and the clock reaching the deadline between there and here closes
+    ;; on a frame whose remaining bytes we hold. Narrow, but the same
+    ;; shape as the defect the delivery round exists for, and left
+    ;; standing here deliberately rather than by oversight.
+    ;;
+    ;; Both closes below say so, because an expiry decided here used to
+    ;; leave no record at all: a connection would end with a normal read
+    ;; as the last line and nothing after it, and telling this apart from
+    ;; the peer vanishing took a round of elimination. `parked` is
+    ;; MEASURED, not the timeout we asked for: a synchronous render on
+    ;; another connection stops the whole runtime, so the wait can overrun
+    ;; what was requested, and reporting the request instead would hide
+    ;; exactly the overruns worth seeing.
+    ;;
+    ;; IT IS THIS INVOCATION'S WAIT, NOT THE CONNECTION'S. A half frame
+    ;; can park most of its deadline, take a delivery at the last moment,
+    ;; recurse, and reach the branch below with the deadline already
+    ;; passed -- and that close prints 0 having listened for nearly the
+    ;; whole window. So 0 means "this invocation did not wait", never
+    ;; "we never waited"; summing a connection's waits needs the earlier
+    ;; lines, which is why they are all printed rather than only the
+    ;; last.
     (if (> (inbuf-length buf) 0)
         (let ((left (- (or since (+ (now-ms) partial-ms)) (now-ms))))
           (if (<= left 0)
-              (tcp-close! c)
-              (receive (after left (tcp-close! c))
-                (`#(tcp-data ,bv) (on-data bv))
-                (`#(tcp-eof) (tcp-close! c))
-                (`#(tcp-error ,e) (tcp-close! c)))))
+              (begin
+                (trace! "close idle-deadline rest=" (inbuf-length buf)
+                        " parked=0")
+                (tcp-close! c))
+              (let ((t0 (now-ms)))
+                (receive (after left
+                           (trace! "close idle-deadline rest="
+                                   (inbuf-length buf)
+                                   " parked=" (- (now-ms) t0))
+                           (tcp-close! c))
+                  (`#(tcp-data ,bv) (on-data bv grace))
+                  ;; where=parked: the peer ended while we were holding
+                  ;; a half frame and waiting out its deadline, so it
+                  ;; left bytes owed. Distinct from where=idle below,
+                  ;; where nothing was owed and going away is ordinary.
+                  (`#(tcp-eof)
+                    (trace! "close eof where=parked rest="
+                            (inbuf-length buf))
+                    (tcp-close! c))
+                  (`#(tcp-error ,e)
+                    (trace! "close error where=parked rest="
+                            (inbuf-length buf))
+                    (tcp-close! c))))))
         (receive
-          (`#(tcp-data ,bv) (on-data bv))
-          (`#(tcp-eof) (tcp-close! c))
-          (`#(tcp-error ,e) (tcp-close! c)))))
+          (`#(tcp-data ,bv) (on-data bv grace))
+          ;; where=idle: nothing half delivered, so the peer ending here
+          ;; is the ordinary way a connection finishes and this line is
+          ;; the one that says so rather than leaving the reader to
+          ;; infer it from a trace that simply stops.
+          (`#(tcp-eof)
+            (trace! "close eof where=idle rest=0")
+            (tcp-close! c))
+          (`#(tcp-error ,e)
+            (trace! "close error where=idle rest=0")
+            (tcp-close! c)))))
 
   ;; ONE message that libuv has already handed up, taken without waiting.
   ;; #t if there was one.
   ;;
-  ;; ONE, not all of them. A loop here looked like a snapshot of the
-  ;; mailbox and was not: receive re-enables interrupts before running a
-  ;; matched clause (actor.sc:632), so the append and the recursion are
-  ;; both preemptible, the event loop gets to poll in between, and a peer
-  ;; that keeps sending keeps the loop fed -- the connection never returns
-  ;; to the parser and the buffer grows the whole time. Taking one and
-  ;; going back through the parser also restores what the ordinary path
-  ;; has: the announced length is checked against the frame cap between
-  ;; every appended message, not after an unbounded run of them.
+  ;; ONE, not all of them, so that the announced length is checked
+  ;; against the frame cap between every appended message rather than
+  ;; after an unbounded run of them -- the same thing the ordinary path
+  ;; gets by returning to the parser each time.
+  ;;
+  ;; THAT IS THE WHOLE REASON, and an earlier note here gave a second
+  ;; one that cannot happen: that a peer which keeps sending would keep
+  ;; a loop here fed indefinitely. It could not. This runs only after
+  ;; on-data has stopped reading, so the connection produces no further
+  ;; read callbacks; what can be drained is the finite chain already
+  ;; delivered when the stop landed. The append and the recursion ARE
+  ;; preemptible -- receive restores interrupts before running a matched
+  ;; clause -- but being preemptible is not being refillable.
   (define (take-queued! buf)
     (receive (after 0 #f)
       (`#(tcp-data ,bv) (inbuf-append! buf bv) #t)))
 
-  ;; Every whole request the buffer holds, answered in order. A client that
-  ;; pipelines gets its replies in the order it asked; the pool never does,
-  ;; but a protocol that only works for one outstanding request would fail
-  ;; obscurely for anything else that speaks it.
-  ;; EVERY complete frame is answered. There was a version that stopped on
+  ;; Whole requests answered in order, for as long as they keep answering.
+  ;; A client that pipelines gets its replies in the order it asked; the
+  ;; pool never does, but a protocol that only works for one outstanding
+  ;; request would fail obscurely for anything else that speaks it.
+  ;; A frame that RAISES ends the loop and the connection -- whole at the
+  ;; framing layer is not the same as answerable, a frame too short to
+  ;; hold a request being the case that shows it -- so anything queued
+  ;; behind it goes unanswered, and is abandoned with the buffer rather
+  ;; than being skipped over.
+  ;;
+  ;; RAISES, not "fails": a render that never returns is not a failure
+  ;; anything here can see. The guard at the caller waits on the same
+  ;; thread, so a runaway builtin leaves the loop, the connection and
+  ;; whatever is queued behind it in place indefinitely -- the wedged
+  ;; worker the header describes, arriving through this door.
+  ;;
+  ;; And the buffer is not necessarily clear when a raise happens. It is
+  ;; clear of the frame being ANSWERED, since take-frame! consumes before
+  ;; answer runs; it is not clear when take-frame! is the one raising, on
+  ;; a length past the limit, because nothing has been consumed at that
+  ;; point. What holds either way is the part that matters: the close
+  ;; that follows is what stops anything left in the buffer from being
+  ;; mistaken for a partial tail and waited on -- the close, not the
+  ;; consuming.
+  ;;
+  ;; ON THE PATHS THAT REACH IT. The failure arm records before it
+  ;; closes, so a trace that BLOCKS INDEFINITELY stops the worker short
+  ;; of the close, leaving the connection open with whatever is still
+  ;; buffered -- which need not include the frame that failed: a frame
+  ;; answer raises on was consumed before answer ran, whereas a length
+  ;; take-frame! refuses is rejected before consuming anything, so what
+  ;; stays is the bytes already received, which may be no more than the
+  ;; four of the header -- and holding the one OS
+  ;; thread, so every other
+  ;; connection this worker serves stops with it. A trace that fails to
+  ;; return by taking the process down instead is a different story: the
+  ;; kernel closes the sockets on the way out. It is noted because the
+  ;; sentence above would otherwise read as unconditional.
+  ;;
+  ;; TRACE FIRST BECAUSE NO CLOSE IN THE WORKER'S CONNECTION LOOP
+  ;; PRECEDES ITS OWN RECORDING -- that loop and not this file, whose
+  ;; caller-side closes carry no trace at all and never claimed to.
+  ;; Narrower again than "the record cannot be lost", and between them
+  ;; those two limits are the whole of what the ordering buys. Both
+  ;; orderings have a window
+  ;; between the two steps where the process can die. Dying after the
+  ;; close, in the other ordering, leaves a connection that ended with
+  ;; nothing said about it -- a close no line accounts for, which is the
+  ;; thing these traces were added to abolish. Dying in this one leaves
+  ;; no close either, and the exit closes the socket on its way out.
+  ;;
+  ;; IT DOES NOT MEAN A RECORD EXISTS. Death can land inside the trace
+  ;; rather than after it, and a write that fails is swallowed where
+  ;; tracing is turned off -- so this ordering can still reach the close
+  ;; with nothing written. What it rules out is the close COMPLETING
+  ;; while the attempt to record is still ahead of it.
+  ;;
+  ;; The cost is real and is not only the pathological case: the close
+  ;; waits out whatever the trace takes, so a slow target -- a congested
+  ;; or remote one, seconds rather than forever -- holds up the close
+  ;; call by that much, and with it whatever end of the connection the
+  ;; peer would have seen. Not always a FIN: after a reset there is
+  ;; nothing left to deliver, and tcp-close! goes to uv_close rather
+  ;; than a shutdown in any case. Blocking is the extreme of this delay,
+  ;; not the only version of it.
+  ;;
+  ;; NOR IS THE DELAY THIS CONNECTION'S ALONE. The trace runs with
+  ;; interrupts disabled on the thread that serves every connection, so
+  ;; seconds spent writing one close record are seconds in which another
+  ;; connection's request is not read and its render deadline can pass.
+  ;; Paid anyway, because a silent close is the failure that costs a
+  ;; reader a whole round of elimination -- but paid, not free, and the
+  ;; bill is not confined to the connection being closed.
+  ;; There was a version that stopped on
   ;; the tail's deadline, so that a peer queueing slow renders ahead of its
   ;; tail could not buy it a render apiece -- and it dropped requests: the
   ;; loop stopped with a COMPLETE frame still in the buffer, the caller
@@ -529,10 +1074,15 @@
   ;; the thing that guard was for, whose whole cost is renders the peer
   ;; asked for and paid for.
   ;;
-  ;; What bounds a tail is the check AFTER this runs: a read that completes
-  ;; nothing keeps the deadline it came in with and is closed on that same
-  ;; read. There was a check before this one instead, and it refused whole
-  ;; frames that had arrived in time -- see the note at the caller.
+  ;; What bounds a tail is the check AFTER this runs: a read that
+  ;; completes nothing keeps the deadline it came in with, and that check
+  ;; takes it -- see A DELIVERY ROUND BEFORE CLOSING (the expiry branch)
+  ;; for when it closes and when it does not. Stated there and not
+  ;; restated here: this note needs only that the tail has something
+  ;; downstream backing it, and each retelling of the rule has been a
+  ;; chance to overstate it. There was a check before this one instead,
+  ;; and it refused whole frames that had arrived in time -- see the note
+  ;; at the caller.
   (define (answer-all! c buf)
     (let loop ()
       (let ((f (take-frame! buf)))

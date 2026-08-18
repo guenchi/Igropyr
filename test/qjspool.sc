@@ -96,7 +96,12 @@
              (if inside
                  (fail "on-data has a first expression")
                  (fail "on-data was found in the worker source")))
-            ((and (not inside) (has? (car ls) "(define (on-data bv)"))
+                        ;; matched WITHOUT the closing paren: the rule pinned here
+            ;; is about the first act inside on-data, not about its
+            ;; parameter list -- an added parameter turned the exact
+            ;; match into a miss and this sentinel red, which was the
+            ;; brittle coordinate failing, not the rule
+            ((and (not inside) (has? (car ls) "(define (on-data bv"))
              (scan (cdr ls) #t))
             ((not inside) (scan (cdr ls) #f))
             ((blank-or-comment? (car ls)) (scan (cdr ls) #t))
@@ -106,6 +111,53 @@
              (unless (has? (car ls) "(tcp-read-stop! c)")
                (display "  [info] on-data's first expression is instead: ")
                (display (car ls)) (newline))))))))
+
+;; ---- a second structural sentinel: grace is derived WITH deadline ------
+;;
+;; "One deadline, one grace" is enforced by a single let* binding that
+;; derives the grace beside the deadline it belongs to. Splitting that --
+;; clearing grace only on the recursion's way out, as an earlier version
+;; did -- reopens a window where an expiry read a budget already spent by
+;; the previous half frame. The window sits between the deadline binding
+;; and the cond that uses it, cannot be driven by peer behaviour, and no
+;; runtime probe can force it; like the read-stop rule above, what can be
+;; pinned is that the rule is still written down.
+;;
+;; Matched LOOSELY, on purpose: two fragments -- a `(grace` binding
+;; mentioning `renewed` -- within a few lines after `(deadline (cond`.
+;; The exact-string sentinel above went red over an added parameter; the
+;; brittle part of these checks is the coordinate, never the rule, so
+;; this one pins as little coordinate as it can. If a rename reddens it,
+;; update the fragments and keep the property.
+(let ()
+  (define path "igropyr/qjspool.sc")
+  (define (has? line sub)
+    (let ((n (string-length line)) (m (string-length sub)))
+      (let loop ((i 0))
+        (cond ((> (+ i m) n) #f)
+              ((string=? (substring line i (+ i m)) sub) #t)
+              (else (loop (+ i 1)))))))
+  (unless (file-exists? path)
+    (fail "worker source not found for the grace sentinel"))
+  (let scan ((ls (call-with-input-file path
+                   (lambda (p)
+                     (let go ((acc '()))
+                       (let ((l (get-line p)))
+                         (if (eof-object? l)
+                             (reverse acc)
+                             (go (cons l acc)))))))))
+    (cond
+      ((null? ls)
+       (fail "the deadline derivation was not found in the worker source"))
+      ((has? (car ls) "(deadline (cond")
+       (check "grace is derived beside the deadline it belongs to"
+              (let look ((rest (cdr ls)) (k 0))
+                (cond ((or (null? rest) (= k 20)) #f)
+                      ((and (has? (car rest) "(grace")
+                            (has? (car rest) "renewed"))
+                       #t)
+                      (else (look (cdr rest) (+ k 1)))))))
+      (else (scan (cdr ls))))))
 
 ;; (igropyr quickjs) is the pure-Scheme binding: it needs a stock shared
 ;; libquickjs. Gate on that so run-all stays green on hosts without QuickJS.
@@ -281,6 +333,16 @@ function eat(j){ return String(j.length); }
       (cond ((null? ls) #f)
             ((line-has? (car ls) want) (line-conn (car ls)))
             (else (loop (cdr ls)))))))
+
+;; like trace-count-of, but across every connection: for suites whose
+;; worker serves exactly one probe after `before`, where pinning a conn
+;; would need a warm-up these cases deliberately do not perform
+(define (trace-count-since name before sub)
+  (let loop ((k 0) (rest (trace-lines name)) (n 0))
+    (cond ((null? rest) n)
+          ((< k before) (loop (+ k 1) (cdr rest) n))
+          (else (loop (+ k 1) (cdr rest)
+                      (if (line-has? (car rest) sub) (+ n 1) n))))))
 
 (define (trace-count-of name conn before sub)
   (let loop ((k 0) (rest (trace-lines name)) (n 0))
@@ -562,7 +624,8 @@ function eat(j){ return String(j.length); }
             ;; open. IDLE is different and must stay unlimited: a pooled
             ;; connection is legitimately silent between renders, and the
             ;; checks above would fail if silence alone closed it.
-            (let ((me self))
+            (let ((me self)
+                  (hmark (trace-len "half")))
               (spawn
                 (lambda ()
                   (tcp-connect! "127.0.0.1" half-port self)
@@ -583,6 +646,17 @@ function eat(j){ return String(j.length); }
                 (`#(half ,r)
                   (check "a request that stops halfway does not hold the worker"
                          (and (number? r) (< r 5000)))
+                  ;; ...and closed BY THE PATH this case is about: nothing
+                  ;; more ever arrives, so the worker must expire on its
+                  ;; own receive -- the close that leaves idle-deadline in
+                  ;; the trace -- and no grace is ever spent. A close with
+                  ;; no footprint at all is the silent-exit regression.
+                  (check "the drop is the worker's own expiry, on the record"
+                         (and (>= (trace-count-since "half" hmark
+                                                     "close idle-deadline")
+                                  1)
+                              (= 0 (trace-count-since "half" hmark
+                                                      "grace-spent=1"))))
                   (display (string-append "  [info] half-delivered frame dropped after "
                                           (if (number? r) (number->string r) "never")
                                           "ms (configured 1200)\n")))))
@@ -595,7 +669,8 @@ function eat(j){ return String(j.length); }
             ;; its process, its descriptor and most of a frame's worth of
             ;; buffer -- alive for as long as it cares to. The deadline is
             ;; taken once, when the buffer stops being empty.
-            (let ((me self))
+            (let ((me self)
+                  (dmark (trace-len "half")))
               (spawn
                 (lambda ()
                   (tcp-connect! "127.0.0.1" half-port self)
@@ -624,6 +699,20 @@ function eat(j){ return String(j.length); }
                 (`#(drib ,r)
                   (check "dribbling bytes does not renew the half-frame deadline"
                          (and (number? r) (< r 4000)))
+                  ;; the close may land either way -- on the worker's own
+                  ;; receive, or found expired inside the pass a drip
+                  ;; triggers -- depending on where the drip falls against
+                  ;; the deadline. What must hold on both: a footprint,
+                  ;; and no grace ever spent (a drip every 400ms cannot
+                  ;; feed a 1ms round).
+                  (check "the drop left its footprint, with no grace spent"
+                         (and (>= (+ (trace-count-since "half" dmark
+                                                        "close idle-deadline")
+                                     (trace-count-since "half" dmark
+                                                        "close deadline"))
+                                  1)
+                              (= 0 (trace-count-since "half" dmark
+                                                      "grace-spent=1"))))
                   (display (string-append "  [info] dribbled half-frame dropped after "
                                           (if (number? r) (number->string r) "never")
                                           "ms (deadline 1200, a byte every 400)\n")))))
@@ -1053,6 +1142,363 @@ function eat(j){ return String(j.length); }
                   (unless (eq? r 'answered)
                     (display "  [info] split request: ") (write r) (newline)))))
 
+            ;; ---- a frame that outsizes one delivery round-trip -----------
+            ;;
+            ;; The split case above fits inside the kernel's buffers, so it
+            ;; fails only when one timing goes wrong -- measured at six
+            ;; runs in seventy-two. Two megabytes cannot fit: with the
+            ;; worker blind for one render, the tail must cross the
+            ;; loopback in several passes after reading resumes, so the
+            ;; mailbox runs dry mid-frame EVERY time and only asking the
+            ;; event loop brings the rest. Same defect, deterministic:
+            ;; before the delivery round existed this failed every run on
+            ;; both platforms.
+            ;;
+            ;; First against an idle worker, so that the second half is
+            ;; pinned on the interleaving and not on the size.
+            (let ((me self))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" carry-port self)
+                  (receive (after 3000 (send me (vector 'big 'no-connect)))
+                    (`#(tcp-connect-failed ,e)
+                      (send me (vector 'big 'no-connect)))
+                    (`#(tcp-connected ,ca)
+                      (tcp-read-start! ca)
+                      (unless (warm-up! ca 915)
+                        (send me (vector 'big 'warmup-failed)))
+                      ;; two mebibytes: larger than the default kernel
+                      ;; receive buffers on both platforms this runs on,
+                      ;; so the render case below cannot be handed the
+                      ;; whole tail in one post-render poll. NOT larger:
+                      ;; eight, tried against a host that autotunes big
+                      ;; buffers in theory, blew four real timing windows
+                      ;; on the slower real machine -- the tail's rounds
+                      ;; crowded the grace cap (once a round hits, every
+                      ;; later drain runs on that cap: retry carries the
+                      ;; limit, so payload size converts directly into
+                      ;; grace spent -- the same property codex derived
+                      ;; statically while this was measured, two legs on
+                      ;; one fact), and the fatter reply
+                      ;; delayed the probe (bv-append recopies the whole
+                      ;; accumulation per chunk) until frame B expired
+                      ;; before the drip ever left. Sized for the
+                      ;; machines that exist; the hypothetical one is
+                      ;; handled by the hit=1 note below.
+                      (let* ((big (make-string 2097152 #\x))
+                             (fa (qframe 15 "hello"
+                                         (string-append
+                                           "{\"name\":\"" big "\"}"))))
+                        (tcp-write! ca fa #f)
+                        (let wait ((acc (make-bytevector 0)))
+                          (if (>= (count-frames acc) 1)
+                              ;; the reply really is OURS: frame body
+                              ;; leads with the request id it answers
+                              (send me (vector 'big
+                                               (if (and (>= (bytevector-length
+                                                              acc) 8)
+                                                        (= 15
+                                                           (bytevector-u32-ref
+                                                             acc 4
+                                                             (endianness
+                                                               big))))
+                                                   'answered
+                                                   'wrong-reply)))
+                              (receive (after 10000
+                                         (send me (vector 'big 'timeout)))
+                                (`#(tcp-data ,bv) (wait (bv-append acc bv)))
+                                (`#(tcp-eof) (send me (vector 'big 'closed)))
+                                (`#(tcp-error ,e)
+                                  (send me (vector 'big 'closed)))))))))))
+              ;; the outer bound is the effective TOTAL timeout (the
+              ;; 10000ms receive above re-arms per chunk, so it bounds
+              ;; inactivity, not the whole exchange) and must exceed the
+              ;; sum of the stage bounds inside
+              (receive (after 18000 (fail "big-frame idle probe never answered"))
+                (`#(big ,r)
+                  (unless (eq? r 'answered)
+                    (printf "  [info] big-frame idle probe answered ~a\n" r))
+                  (check "two megabytes land whole on an idle worker"
+                         (eq? r 'answered)))))
+
+            ;; ...and now the same frame with a render blanking the reads.
+            (let ((me self)
+                  (mark (trace-len "carry")))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" carry-port self)
+                  (receive (after 3000 (send me (vector 'big2 'no-connect)))
+                    (`#(tcp-connect-failed ,e)
+                      (send me (vector 'big2 'no-connect)))
+                    (`#(tcp-connected ,ca)
+                      (tcp-read-start! ca)
+                      (unless (warm-up! ca 917)
+                        (send me (vector 'big2 'warmup-failed)))
+                      ;; the tail carries a SECOND frame's header behind
+                      ;; it: frame A completing while frame B's tail is
+                      ;; still owed is what renews the deadline, and the
+                      ;; grace must die with the deadline it was taken
+                      ;; for -- B gets its own round on its own budget,
+                      ;; not A's spent one. The drip after A's answer is
+                      ;; what forces B's expiry to be detected inside a
+                      ;; read pass, where the grace logic runs at all.
+                      (let* ((big (make-string 2097152 #\x))
+                             (fa (qframe 17 "hello"
+                                         (string-append
+                                           "{\"name\":\"" big "\"}")))
+                             (bh (let ((fb (qframe 19 "hello"
+                                                   "{\"name\":\"b\"}"))
+                                       (h (make-bytevector 6)))
+                                   (bytevector-copy! fb 0 h 0 6)
+                                   h))
+                             (n (bytevector-length fa))
+                             (p1 (make-bytevector 6))
+                             (p3 (make-bytevector (+ (- n 6) 6))))
+                        (bytevector-copy! fa 0 p1 0 6)
+                        (bytevector-copy! fa 6 p3 0 (- n 6))
+                        (bytevector-copy! bh 0 p3 (- n 6) 6)
+                        (tcp-write! ca p1 #f)      ; the window opens
+                        (sleep-ms 40)              ; ...and is read first
+                        (let ((probe self))
+                          (spawn
+                            (lambda ()
+                              (tcp-connect! "127.0.0.1" carry-port self)
+                              (receive (after 3000
+                                         (send probe
+                                               (vector 'rival2 'no-connect)))
+                                (`#(tcp-connect-failed ,e)
+                                  (send probe (vector 'rival2 'no-connect)))
+                                (`#(tcp-connected ,cb)
+                                  (tcp-read-start! cb)
+                                  (tcp-write! cb (qframe 16 "slow" "{}") #f)
+                                  ;; the probe holds the tail until this
+                                  ;; is SENT: a rival that had not even
+                                  ;; dispatched its request cannot be
+                                  ;; rendering when the tail lands
+                                  (send probe (vector 'rival2-sent))
+                                  (receive (after 5000
+                                             (send probe
+                                                   (vector 'rival2
+                                                           'no-answer)))
+                                    (`#(tcp-data ,bv)
+                                      (send probe
+                                            (vector 'rival2 'rendered)))
+                                    (`#(tcp-eof)
+                                      (send probe (vector 'rival2 'eof)))
+                                    (`#(tcp-error ,e)
+                                      (send probe
+                                            (vector 'rival2 'err)))))))))
+                        (receive (after 2000
+                                   (send me (vector 'big2 'rival-lost)))
+                          (`#(rival2-sent) 'ok))
+                        (sleep-ms 120)
+                        ;; whole and well inside the window, exactly as in
+                        ;; the split case -- only bigger than the kernel
+                        ;; will hold
+                        (tcp-write! ca p3 #f)
+                        (let wait ((acc (make-bytevector 0)) (rival #f))
+                          (if (and rival (>= (count-frames acc) 1))
+                              (if (eq? rival 'rendered)
+                                  ;; frame A landed; now B's half frame is
+                                  ;; alone on the wire. Left alone it would
+                                  ;; expire on the worker's own receive --
+                                  ;; a path with no grace logic at all
+                                  ;; (measured: parked=400, drip too late,
+                                  ;; nothing discriminated). So B's expiry
+                                  ;; is blanketed by a SECOND render, with
+                                  ;; a drip written during it: the render
+                                  ;; ends, the drip is delivered, and the
+                                  ;; expiry is found inside a read pass --
+                                  ;; the one place the grace question is
+                                  ;; asked. The close that follows is B's
+                                  ;; verdict, read off the trace below.
+                                  (let ((probe self))
+                                    (spawn
+                                      (lambda ()
+                                        (tcp-connect! "127.0.0.1"
+                                                      carry-port self)
+                                        (receive (after 2000
+                                                   (send probe
+                                                         (vector 'rival3
+                                                                 'no-connect)))
+                                          (`#(tcp-connect-failed ,e)
+                                            (send probe
+                                                  (vector 'rival3
+                                                          'no-connect)))
+                                          (`#(tcp-connected ,cc)
+                                            (tcp-read-start! cc)
+                                            (tcp-write! cc
+                                                        (qframe 18 "slow"
+                                                                "{}")
+                                                        #f)
+                                            (send probe
+                                                  (vector 'rival3-sent))
+                                            (receive (after 3000 'gone)
+                                              (`#(tcp-data ,bv) 'ok)
+                                              (`#(tcp-eof) 'ok)
+                                              (`#(tcp-error ,e) 'ok))))))
+                                    (receive (after 2000
+                                               (send me
+                                                     (vector 'big2
+                                                             'rival3-lost)))
+                                      (`#(rival3-sent) 'ok))
+                                    (sleep-ms 120)
+                                    (guard (e (#t (void)))
+                                      (tcp-write! ca (make-bytevector 1 7)
+                                                  #f))
+                                    (receive (after 3000
+                                               (send me
+                                                     (vector 'big2
+                                                             'b-never-closed)))
+                                      (`#(tcp-eof)
+                                        (send me (vector 'big2 'answered)))
+                                      (`#(tcp-error ,e)
+                                        (send me (vector 'big2 'answered)))))
+                                  (send me (vector 'big2
+                                                   (cons 'rival rival))))
+                              (receive (after 10000
+                                         (send me (vector 'big2 'timeout)))
+                                (`#(rival2 ,r) (wait acc r))
+                                (`#(tcp-data ,bv)
+                                  (wait (bv-append acc bv) rival))
+                                (`#(tcp-eof)
+                                  (send me (vector 'big2 'closed)))
+                                (`#(tcp-error ,e)
+                                  (send me (vector 'big2 'closed)))))))))))
+              (receive (after 20000
+                         (fail "big-frame render probe never answered"))
+                (`#(big2 ,r)
+                  (unless (eq? r 'answered)
+                    (printf "  [info] big-frame render probe answered ~a\n"
+                            r))
+                  (check "two megabytes land while a render blanks the reads"
+                         (eq? r 'answered))
+                  (let ((mine (trace-conn-of-id "carry" 917)))
+                    (check "the big-frame probe's connection is identified"
+                           (and mine #t))
+                    ;; ...through the mechanism under test. Structural on
+                    ;; any default kernel: 2MiB cannot be queued whole
+                    ;; when the mailbox first runs dry, so at least one
+                    ;; delivery round must have hit. If this reddens with
+                    ;; r = answered, either the render interleaving did
+                    ;; not establish, or the host autotunes multi-MiB
+                    ;; receive buffers -- an environmental miss, not the
+                    ;; regression (which reddens the answered check
+                    ;; above). For the buffering host, raise the payload
+                    ;; -- and mind that eight broke the slow machine's
+                    ;; timing windows; see the sizing note above.
+                    (check "the tail arrived through a delivery round"
+                           (> (trace-count-of "carry" mine mark "hit=1")
+                              0))
+                    ;; frame B expired on its OWN budget: its close says
+                    ;; grace-spent=0 (a fresh round, empty-handed). A
+                    ;; grace inherited from frame A -- already spent by
+                    ;; the time A answered -- closes B on the spot with
+                    ;; grace-spent=1 and no round at all.
+                    (check "the pipelined half frame got its own grace"
+                           (and (= 0 (trace-count-of "carry" mine mark
+                                                     "grace-spent=1"))
+                                (> (trace-count-of "carry" mine mark
+                                                   "grace-spent=0")
+                                   0)))))))
+
+            ;; ---- steady bytes cannot outlive the grace -------------------
+            ;;
+            ;; The delivery round must not hand a trickler the renewable
+            ;; deadline this file already refused once: a peer with a byte
+            ;; always in flight would hit every round, and without the
+            ;; grace ceiling the frame cap would be the only stop --
+            ;; hours, at a byte per millisecond.
+            ;;
+            ;; WHAT THIS CASE CANNOT REACH, so that nobody reads more into
+            ;; its green: the ceiling itself has no automated coverage.
+            ;; Feeding the rounds for a whole grace period needs bytes in
+            ;; flight for 400ms straight, and over loopback that peer
+            ;; cannot be built -- a 56MiB write arrives in ~84ms (~700MB/s
+            ;; measured), so any finite payload lands long before the
+            ;; deadline, and probe-paced feeding loses a scheduling race
+            ;; against the round's own 1ms poll (measured: 2790 hits, one
+            ;; miss, closed with the ceiling untouched). The renewable
+            ;; peer the ceiling guards against lives on real networks,
+            ;; where in-flight is a standing condition. What CAN be
+            ;; asserted is the bound: however the bytes come, the close
+            ;; lands within window + grace + slack. The take-once
+            ;; structure of the grace itself is carried by the code (a
+            ;; loop variable, not a re-read) and by review.
+            (let ((me self)
+                  (mark (trace-len "carry")))
+              (spawn
+                (lambda ()
+                  (tcp-connect! "127.0.0.1" carry-port self)
+                  (receive (after 3000 (send me (vector 'pump2 'no-connect)))
+                    (`#(tcp-connect-failed ,e)
+                      (send me (vector 'pump2 'no-connect)))
+                    (`#(tcp-connected ,ca)
+                      (tcp-read-start! ca)
+                      (warm-up! ca 919)
+                      ;; announce a frame far larger than anything sent:
+                      ;; every later byte is body for it -- never a
+                      ;; complete frame, never a render, only the
+                      ;; half-frame clock. ONE oversized write follows,
+                      ;; and libuv keeps it in flight by itself:
+                      ;; probe-driven feeding (a drip on a clock, then a
+                      ;; refilled window of small writes) lost a race
+                      ;; each way -- any scheduling gap in the feed chain
+                      ;; longer than the round's 1ms poll empties the
+                      ;; wire and the round legitimately misses (2790
+                      ;; hits, one miss, closed at 443ms with the ceiling
+                      ;; untouched). A single 56MiB write drains from
+                      ;; libuv's queue as fast as the worker reads, so
+                      ;; the wire stays loaded without the probe being
+                      ;; scheduled at all, and stays short of the 63MiB
+                      ;; announcement so the frame can never complete.
+                      (let ((h (make-bytevector 4))
+                            (body (make-bytevector (* 56 1024 1024) 120)))
+                        (bytevector-u32-set! h 0 (* 63 1024 1024)
+                                             (endianness big))
+                        (let ((t0 (now-ms)))
+                          (tcp-write! ca h #f)
+                          (tcp-write! ca body #f)
+                          (receive (after 4000
+                                     (send me (vector 'pump2
+                                                      'never-closed)))
+                            (`#(tcp-eof)
+                              (send me (vector 'pump2 (- (now-ms) t0))))
+                            (`#(tcp-error ,e)
+                              (send me (vector 'pump2
+                                               (- (now-ms) t0)))))))))))
+              (receive (after 7000 (fail "pump probe never answered"))
+                (`#(pump2 ,r)
+                  (unless (number? r)
+                    (printf "  [info] pump probe answered ~a\n" r))
+                  (check "steady bytes after the deadline still close"
+                         (number? r))
+                  ;; an upper bound only. The wire runs dry the moment
+                  ;; the payload has landed, so the worker may close on
+                  ;; its own receive earlier than the grace would allow
+                  ;; -- 401ms observed -- and that is a legitimate close,
+                  ;; not a failure of the ceiling.
+                  ;; the bound includes the synchronous cost of handing
+                  ;; 56MiB to libuv after t0 and cooperative delivery of
+                  ;; the close -- slack for a loaded machine, still an
+                  ;; order under any renewal
+                  (check "...within one grace of first being found late"
+                         (and (number? r) (< r 2000)))
+                  (let ((mine (trace-conn-of-id "carry" 919)))
+                    (printf
+                      "  [info] pump: closed after ~ams, rounds hit ~a, grace-spent ~a\n"
+                      r
+                      (and mine
+                           (trace-count-of "carry" mine mark "hit=1"))
+                      (and mine
+                           (trace-count-of "carry" mine mark
+                                           "grace-spent=1")))
+                    ;; no ceiling assertion, deliberately: two earlier
+                    ;; versions of this probe asserted their way onto the
+                    ;; ceiling path and were disproved by their own info
+                    ;; line (hit 0). The counts stay printed so a future
+                    ;; slow-delivery environment can promote them.
+                    (void)))))
             ;; ---- a peer that floods behind its own requests ---------------
             ;;
             ;; A peer that pipelines megabyte-sized requests and pushes the
@@ -1408,8 +1854,11 @@ function eat(j){ return String(j.length); }
                     ;; without this field a close for that reason counted
                     (check "it was refused on a late read with nothing left to take"
                            (> (trace-count-of "carry" mine mark "close-late=1") 0)))
-                  (display "  [info] half frame closed after ") (write r)
-                  (display "ms\n"))))
+                  ;; ~a takes the value as it is: a millisecond count in
+                  ;; the normal case, a symbol naming what the probe hit
+                  ;; instead -- never "no-connectms"
+                  (printf "  [info] half frame closed after ~a~a\n"
+                          r (if (number? r) "ms" "")))))
 
             ;; ---- the cap is checked where it is given --------------------
             ;;
