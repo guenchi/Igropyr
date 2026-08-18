@@ -1864,6 +1864,38 @@ What bounds it instead:
   and persist it; the conversation is then reachable by id no matter what
   became of the process that started it.
 
+### What the cluster has to look like
+
+Two constraints on the deployment, both of which are contracts rather than
+observations about the current implementation.
+
+**Forwarding needs a direct link from the entry node to the owner — in
+practice, a full mesh.** A resume that lands on the wrong node is forwarded
+one hop or not at all; there is no relay routing, by design. On a topology
+that is not fully connected — a star, or a mesh with a link down — nothing
+fails at startup. The symptom is that every resume for a conversation owned
+by an unreachable node answers `'unreachable` for as long as the gap lasts,
+and neither the entry node nor the caller can tell that from an owner that
+is simply down.
+
+Relaying is left out because routing is a different shape of problem from
+this library's: it needs a view of the topology, a policy for choosing among
+paths, and answers for loops and for a relay that dies mid-hop. The
+distribution layer is where those would belong if they are ever wanted.
+
+**The node name is part of every id that node mints**, which makes it a
+durable identifier rather than a label. Rename a node and every id it owns
+is orphaned: a resume carrying the old name is forwarded to a node nobody
+answers to and comes back `'unreachable`, while the conversations are still
+parked on the renamed node — alive, and no longer reachable by their own
+ids.
+
+There is deliberately no alias mechanism. One would have to be consulted on
+every forward, kept consistent across the cluster, and garbage-collected
+when the last id bearing an old name expired, which is a naming service
+rather than a feature of this library. Keep a node's name for at least as
+long as the conversations it owns, and drain a node before renaming it.
+
 ### Where to use it
 
 Critical transactional flows: payments against
