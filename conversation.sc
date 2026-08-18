@@ -532,7 +532,8 @@
           conversation-settled? conversation-unknown?
           conversation-unreachable? conversation-overloaded?
           conversation-no-answer-yet?
-          conversation-forward-stats conv-set-forward-limit!)
+          conversation-forward-stats conv-set-forward-limit!
+          conv-set-forward-hold-ms!)
   (import (chezscheme) (igropyr actor)
           (igropyr conv-status)
           (only (igropyr libuv) now-ms)
@@ -1206,6 +1207,23 @@
   ;; asker gets no answer at all, and the bad value survives to kill its
   ;; replacement. Refusing it here keeps the failure at the caller that
   ;; caused it, which is also where the fix is.
+  ;; HOW LONG A SLOT MAY BE HELD, which is not the same quantity as how
+  ;; long an asker waits, and is deliberately a separate field with its
+  ;; own name. The asker's ttl is its patience; this is the owner's slot
+  ;; lifetime. They default to the same number and mean different things,
+  ;; and merging them would tie one side's policy to the other's.
+  (define max-forward-hold-ms 300000)
+
+  ;; Fixnum, for the reason the limit is: the value is compared and
+  ;; passed to a timeout, and a validation domain wider than the use
+  ;; domain is exactly the gap that put a bignum into fx< and killed a
+  ;; router.
+  (define (conv-set-forward-hold-ms! n)
+    (unless (and (fixnum? n) (fx> n 0))
+      (assertion-violation 'conv-set-forward-hold-ms!
+        "hold must be a positive fixnum" n))
+    (with-interrupts-disabled (set! max-forward-hold-ms n)))
+
   (define (conv-set-forward-limit! n)
     (unless (and (fixnum? n) (fx> n 0))
       (assertion-violation 'conv-set-forward-limit!
@@ -1235,12 +1253,43 @@
   ;; ADMISSION, SPAWN AND REGISTRATION ARE ONE ACT. Checking the room and
   ;; then taking it lets two admissions past a ceiling of one; nothing
   ;; between these yields, and interrupts are off besides.
+  ;; A SLOT IS NOT HELD FOR EVER BY A WORKER NOBODY IS WAITING FOR. The
+  ;; table is accurate about a worker that is still running, which is
+  ;; exactly the problem: an asker whose deadline passed, or that was
+  ;; killed, sends nothing to say so, and the worker goes on waiting for
+  ;; a flow that may never park again. Its slot is then gone for the life
+  ;; of the node, and adoption cannot help -- adoption reaches the dead.
+  ;;
+  ;; An unbounded flow on its own costs one process. Behind a shared cap
+  ;; it costs a fraction of the whole node's forwarding capacity, so the
+  ;; admission that created the shared resource owes it a bound. The
+  ;; sibling shed in the node layer is already self-limiting this way:
+  ;; its worker calls a gen-server with a timeout.
+  ;;
+  ;; WHAT IS KILLED IS THE WAITING, NOT THE WORK. The forward worker is a
+  ;; courier: it asks the local conversation and carries the answer back.
+  ;; Killing it leaves the conversation process untouched -- the step
+  ;; finishes, its reply goes to a dead courier and is dropped, and the
+  ;; flow parks as it would have. The asker sees the deadline it would
+  ;; have seen anyway, which 'unreachable already covers: the request may
+  ;; have been acted on, so reconcile rather than retry. No new word is
+  ;; needed for it.
+  (define (spawn-reaper! w)
+    (spawn
+      (lambda ()
+        (monitor w)
+        (receive (after max-forward-hold-ms
+                   (fwd-bump! 'reaped)
+                   (kill w 'fwd-deadline))
+          (`#(DOWN ,@w ,_) 'ok)))))
+
   (define (admit-forward! thunk)
     (with-interrupts-disabled
       (and (fx< (forwards-hosted) max-forwards-hosted)
            (let ((p (spawn thunk)))
              (hashtable-set! forward-workers p #t)
              (monitor p)
+             (spawn-reaper! p)
              p))))
 
   ;; A NEW ROUTER ADOPTS THE OLD ONE'S WORKERS. Monitors belong to the
@@ -1291,6 +1340,7 @@
   ;; the outcome is recorded at the point the answer is read rather than
   ;; by a settlement pass, so an attempt in flight is simply not yet
   ;; anywhere. Read them as rates and ratios, not as a conservation law.
+  (define fwd-reaped 0)
   (define fwd-attempted 0)
   (define fwd-refused 0)
   (define fwd-completed 0)
@@ -1303,6 +1353,7 @@
         ((refused) (set! fwd-refused (+ fwd-refused 1)))
         ((completed) (set! fwd-completed (+ fwd-completed 1)))
         ((unreachable) (set! fwd-unreachable (+ fwd-unreachable 1)))
+        ((reaped) (set! fwd-reaped (+ fwd-reaped 1)))
         (else (void)))))
 
   (define (conversation-forward-stats)
@@ -1311,6 +1362,7 @@
             (cons 'refused fwd-refused)
             (cons 'completed fwd-completed)
             (cons 'unreachable fwd-unreachable)
+            (cons 'reaped fwd-reaped)
             (cons 'hosted (forwards-hosted))
             (cons 'limit max-forwards-hosted))))
 
