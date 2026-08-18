@@ -273,6 +273,43 @@
                (and (pair? t) (eq? (caddr (car (reverse t))) 'raised)))
              (trace)))))
 
+;; ---- a residual temp cannot be truncated by the next write --------------
+;; the collision that matters is not malicious: a write fails, its temp
+;; is deliberately preserved as the only flushed copy, the process
+;; exits, the pid is reused and the counter restarts -- and the next
+;; write to the same target would have opened that exact name. With
+;; exclusive creation it must step past it, leaving the residue intact.
+(let ((target (string-append root "/res.bin")))
+  (let ((w1 (box #f)))
+    (with-fs-trace (lambda (op path rc)
+                     (when (and (eq? op 'write) (not (unbox w1)))
+                       (set-box! w1 path)))
+      (lambda () (durable-write-file! target (string->utf8 "probe"))))
+    ;; plant a residue at the name the NEXT write would try first
+    (let ((residue (unbox w1)))
+      (call-with-port (open-file-output-port residue (file-options no-fail))
+                      (lambda (p) (put-bytevector p (string->utf8 "PRECIOUS"))))
+      (durable-write-file! target (string->utf8 "new content"))
+      (check "a residual temp survives the next write, bytes intact"
+             (equal? (string->utf8 "PRECIOUS")
+                     (call-with-port (open-file-input-port residue)
+                                     get-bytevector-all)))
+      (check "...and the write itself still landed"
+             (equal? (string->utf8 "new content")
+                     (call-with-port (open-file-input-port target)
+                                     get-bytevector-all)))
+      (delete-file residue))))
+
+;; ---- a hook that cannot take three arguments is refused -----------------
+;; a zero-argument hook raises on every call, the guard swallows it, and
+;; every action goes unrecorded -- installed and silent is the worst
+;; combination, so the arity is checked at the door
+(let ((r (guard (e (#t (if (assertion-violation? e) 'refused 'other)))
+           (fs-trace-hook-set! (lambda () 'no-args))
+           'accepted)))
+  (check "a hook of the wrong arity is refused at installation"
+         (eq? r 'refused) r))
+
 ;; ---- the error predicate is exactly as wide as the interface ------------
 ;; arity is part of the interface: the sibling vector that grew from two
 ;; elements to three, name unchanged, silently unmatched every caller
