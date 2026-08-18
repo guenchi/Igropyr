@@ -1566,6 +1566,7 @@ outcomes never share a position with it:
 | `'gone` | it left through its winders *before* `commit!` returned — for a transactional flow, rolled back |
 | `'unknown` | it is not here and this node cannot say whether it committed |
 | `'unreachable` | no definite reply came back from the owner node — equally consistent with the request having arrived and the owner still working on it |
+| `'overloaded` | the owner **refused** the forward before touching the conversation: it was already hosting its limit of them. Nothing was started, the token is still good, and asking again later is right |
 
 `conversation-done?`, `conversation-settled?`, `conversation-stale?`,
 `conversation-gone?`, `conversation-unknown?` and
@@ -1719,6 +1720,7 @@ second attempt — but they call for different next steps:
 | `'no-answer-yet` | nothing arrived within *your* limit | ask again |
 | `'unknown` | this node cannot say what became of it | reconcile against your own records |
 | `'unreachable` | no definite reply came back from the owner | reconcile against your own records |
+| `'overloaded` | the owner declined to start it | retry later; nothing to reconcile |
 
 `'no-answer-yet` reports the **wait**, not the conversation. The usual
 cause is a conversation busy in a step — it does not answer until it
@@ -1897,6 +1899,50 @@ What bounds it instead:
   500 and holds no id. Take the id *before* anything can have an effect
   and persist it; the conversation is then reachable by id no matter what
   became of the process that started it.
+
+### Refusing rather than going quiet
+
+An owner spawns a process per forwarded resume or peek, and hosts a bounded
+number of them (256 by default, `conv-set-forward-limit!`). Past that it
+**refuses**, and the asker gets `'overloaded`.
+
+The refusal is the point rather than a consequence of running out. Without
+it, forwards queue behind each other on the owner's single scheduler thread
+until the asker's deadline expires — and the asker is told `'unreachable`,
+which says the link is broken when the truth is that the owner is busy, and
+sends the caller to reconcile a conversation nobody had begun. `'overloaded`
+says the owner declined before touching anything: retry later, reconcile
+nothing.
+
+`conversation-forward-stats` reads the forwarding side: `attempted`,
+`refused`, `completed`, `unreachable`, the live `hosted` count and the
+`limit`. The counters are monotonic and reading does not reset them, and
+they satisfy `attempted = completed + refused + unreachable + hosted`. They
+are approximate in the same sense as the hook stats — read outside any lock
+— so do not build an equality assertion on a running system.
+
+> The node layer has its own unrelated `'overload`, answered when it sheds a
+> cross-node call. The spellings differ deliberately: `'overloaded` is a
+> conversation status, `'overload` is an rcall error.
+
+### Upgrading a mesh has a direction
+
+An owner that refuses answers with a frame older code does not know. A new
+entry node reads it and reports `'overloaded`. An old one matches nothing,
+waits out its deadline, reports `'unreachable`, and leaves the frame in the
+asking process's mailbox where nothing collects it — one per refusal, in a
+process that is often long-lived.
+
+**Upgrade entry nodes first.** That order has no window at all: by the time
+any owner can refuse, every asker understands a refusal. Owner-first opens
+one that lasts until the last entry node is upgraded.
+
+**Separately, and not fixed by upgrade order:** a node already deployed
+under a name containing `~` is mis-routing *today*. The id parser has
+always split at the first one, so every clustered id that node minted
+already resolves to the wrong owner. The name is now refused at startup,
+so such a node will not start until renamed — rename it before upgrading,
+and expect the ids it minted under the old name to be unreachable.
 
 ### What the cluster has to look like
 
