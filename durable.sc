@@ -52,11 +52,17 @@
   (define c-fsync (foreign-procedure "fsync" (int) int))
   (define c-fcntl (foreign-procedure "fcntl" (int int int) int))
 
-  ;; MEASURED, not remembered. Compiled against <fcntl.h> on macOS 15
-  ;; (arm64): O_RDONLY = 0, F_FULLFSYNC = 51. O_RDONLY is 0 on the other
-  ;; supported targets as well, but the value below has only been
-  ;; compiled out of the header on macOS -- if this library is ever
-  ;; taken somewhere new, compile it there rather than assuming.
+  ;; MEASURED, not remembered -- compiled against <fcntl.h> on each
+  ;; platform rather than taken from memory or from a table on the web:
+  ;;
+  ;;   macOS 15 (arm64)   O_RDONLY = 0, F_FULLFSYNC = 51
+  ;;   FreeBSD 15.0       O_RDONLY = 0
+  ;;
+  ;; A third platform means compiling it there too. The values are
+  ;; stable across the Unixes in practice, which is exactly what makes
+  ;; assuming them tempting and what would make a wrong one hard to
+  ;; notice: an O_RDONLY that is not 0 opens something, just not what
+  ;; was meant.
   ;;
   ;; F_FULLFSYNC IS macOS ONLY and is never issued anywhere else: it is
   ;; not that other platforms define it differently, it is that they do
