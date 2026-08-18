@@ -213,6 +213,7 @@
 ;;;
 ;;;   (conversation-resume! id token req)
 ;;;     ; -> (values reply next-token), or 'stale / 'gone / 'unreachable
+    ;    / 'overloaded (the owner refused: retry, do not reconcile)
 ;;;
 ;;; THE TOKEN NAMES THE REPLY BEING ANSWERED. A conversation hands one out
 ;;; with every reply, and the next request must present it; it is consumed
@@ -471,14 +472,36 @@
 ;;; that refuses a forward answers with a frame older code does not
 ;;; know. A new entry node reads it and reports 'overloaded; an old one
 ;;; matches nothing, waits out its deadline, reports 'unreachable, and
-;;; leaves the frame in the asking process's mailbox, where nothing
-;;; collects it -- one per refusal, in a process that is often
-;;; long-lived.
+;;; leaves the frame in the asking process's mailbox. Nothing in the
+;;; conversation layer takes it out again -- one per refusal, in a
+;;; process that is often long-lived. It is not there forever in the
+;;; strict sense: the mailbox goes when the process does, a refusal
+;;; arriving after the reply name is unregistered is dropped by name
+;;; dispatch before it ever lands, and application code with a broad
+;;; enough receive may consume it by accident, which is its own
+;;; surprise.
 ;;;
-;;; So upgrade ENTRY NODES FIRST. Entry-first has no window at all: by
-;;; the time any owner can refuse, every asker understands a refusal.
-;;; Owner-first opens one that lasts until the last entry node is
-;;; upgraded, and pays for it in the two ways above -- a busy owner
+;;; So upgrade ENTRY NODES FIRST -- with the caveat that makes it mean
+;;; anything. A node upgraded as an entry becomes a refusing OWNER at the
+;;; same instant, and on the symmetric deployment described above, where
+;;; any node may be an entry, that is every node. Upgrading A therefore
+;;; closes A's asking side and opens A's refusing side together, and a
+;;; not-yet-upgraded B forwarding to A meets exactly the frame it cannot
+;;; read.
+;;;
+;;; There is no ordering that removes the window on a symmetric mesh: the
+;;; two roles arrive in one deployment. What the order buys is the size
+;;; of it -- upgrading the nodes that take client traffic first means the
+;;; askers still able to reach an upgraded owner shrink with every step,
+;;; and finishing quickly matters more than the sequence.
+;;;
+;;; It is a real window only where roles are separate: a deployment with
+;;; dedicated entry nodes in front of dedicated owners can upgrade the
+;;; front rank first and have no window at all. Which shape a deployment
+;;; is decides whether the order is a fix or a mitigation, and that is
+;;; not something this library can tell.
+;;;
+;;; Either way the window costs the two things above -- a busy owner
 ;;; reported as an unreachable one, and a slow accumulation nobody is
 ;;; watching.
 ;;;
@@ -1176,10 +1199,17 @@
   (define (forward-slot-free! p)
     (with-interrupts-disabled (hashtable-delete! forward-workers p)))
 
+  ;; A FIXNUM, not merely a positive integer. The comparison below is
+  ;; fx<, so a bignum limit -- which "positive exact integer" admits --
+  ;; raises inside the router on the next forward rather than at the call
+  ;; that set it. The router has no guard around that, so it dies, the
+  ;; asker gets no answer at all, and the bad value survives to kill its
+  ;; replacement. Refusing it here keeps the failure at the caller that
+  ;; caused it, which is also where the fix is.
   (define (conv-set-forward-limit! n)
-    (unless (and (integer? n) (exact? n) (> n 0))
+    (unless (and (fixnum? n) (fx> n 0))
       (assertion-violation 'conv-set-forward-limit!
-        "limit must be a positive exact integer" n))
+        "limit must be a positive fixnum" n))
     (with-interrupts-disabled (set! max-forwards-hosted n)))
 
   ;; THE SLOT IS RELEASED WHEN THE WORKER DIES, and the release is bound
@@ -1221,9 +1251,21 @@
   ;; process reports it immediately rather than waiting for a death that
   ;; has already happened.
   ;;
-  ;; That is the whole recovery. It restores the invariant rather than
-  ;; compensating for its absence, so nothing has to sweep the table
-  ;; later or decide how often to.
+  ;; That is the whole recovery for the workers a router leaves behind.
+  ;; It restores the invariant rather than compensating for its absence,
+  ;; so nothing has to sweep the table on a schedule.
+  ;;
+  ;; IT DOES NOT MAKE A DEATH UNLOSABLE. A DOWN already queued for a
+  ;; router that is then killed goes with that router's mailbox, and the
+  ;; entry stays until some later router starts and monitors the pid
+  ;; again -- which reports it at once, because it is dead by then. So
+  ;; the claim is that a router which eventually starts repairs the
+  ;; table, not that a death is never mislaid in between.
+  ;;
+  ;; AND IT ONLY REACHES THE DEAD. A worker still running holds its slot
+  ;; correctly by this accounting, including one whose asker gave up long
+  ;; ago: nothing on this side cancels it, so an abandoned-but-live
+  ;; worker occupies its place until it finishes on its own.
   (define (adopt-forward-workers!)
     (with-interrupts-disabled
       (for-each (lambda (p) (monitor p))
@@ -1231,11 +1273,24 @@
 
   ;; ---- forwarding counters ---------------------------------------------
   ;;
-  ;; Monotonic, never reset by reading, and approximate in the same sense
-  ;; as the hook stats: they are read outside any lock. Kept apart from
+  ;; Monotonic and never reset by reading. Kept apart from
   ;; conversation-hook-stats deliberately -- that one answers "are the
   ;; caller's hooks healthy", and mixing transport counts into it would
   ;; dilute a question that is already easy to misread.
+  ;;
+  ;; THEY DO NOT BALANCE, and the reason is that they are not one
+  ;; population. attempted, completed, refused and unreachable count what
+  ;; THIS node asked of others; hosted counts what OTHERS asked of this
+  ;; one. On a node that both asks and answers they are two ledgers in
+  ;; one alist, and on a single-node system they coincide only because
+  ;; both are zero or both are the same traffic -- which is exactly the
+  ;; case a local test sees, so a local test cannot notice this.
+  ;;
+  ;; Nor are the four asking counts a closed account by themselves: an
+  ;; asker killed while waiting leaves an attempt with no outcome, and
+  ;; the outcome is recorded at the point the answer is read rather than
+  ;; by a settlement pass, so an attempt in flight is simply not yet
+  ;; anywhere. Read them as rates and ratios, not as a conservation law.
   (define fwd-attempted 0)
   (define fwd-refused 0)
   (define fwd-completed 0)
@@ -1585,9 +1640,13 @@
                           (`#(remote-down ,@owner ,@router ,why)
                             (if (memq owner (node-peers))
                                 (loop deadline)
-                                (values 'unreachable
-                                        #f #f record-not-read)))))))
-                (values 'unreachable #f #f record-not-read)))
+                                (begin
+                                  (fwd-bump! 'unreachable)
+                                  (values 'unreachable
+                                          #f #f record-not-read))))))))
+                (begin
+                  (fwd-bump! 'unreachable)
+                  (values 'unreachable #f #f record-not-read))))
           (lambda ()
             ;; Unregister and demonitor BEFORE draining. This closes more
             ;; than the other order did -- a reply arriving between a drain
@@ -1731,8 +1790,13 @@
                             ;; step that in fact ran.
                             (if (memq owner (node-peers))
                                 (loop deadline)
-                                (values #f 'unreachable record-not-read)))))))
-                (values #f 'unreachable record-not-read)))
+                                (begin
+                                  (fwd-bump! 'unreachable)
+                                  (values #f 'unreachable
+                                          record-not-read))))))))
+                (begin
+                  (fwd-bump! 'unreachable)
+                  (values #f 'unreachable record-not-read))))
           (lambda ()
             ;; stop new deliveries, then drain -- see forward-peek
             (unregister reply-name)
@@ -3327,6 +3391,10 @@
   ;;   'gone          -- it rolled back, on the record; reply is #f
   ;;   'unknown       -- not here, and no rollback established; reply is #f
   ;;   'unreachable   -- the owner node could not be reached; reply is #f
+  ;;   'overloaded    -- the owner REFUSED it: already hosting its limit
+  ;;                     of forwarded work. Nothing was started and the
+  ;;                     token is still good, so this is the one status
+  ;;                     here that says retry rather than reconcile
   ;; WHAT THE RECORD MEANS. The only place in this library that turns a
   ;; tombstone into an answer, and the only place that decides what may be
   ;; called 'gone -- everything else either writes a record or asks this.
@@ -3442,6 +3510,9 @@
   ;;                    something other than one
   ;;      'unreachable -- the owner node could not be reached; nothing is
   ;;                    known, exactly as for a resume
+  ;;      'overloaded -- the owner refused: it is already hosting its
+  ;;                    limit of forwarded work. Nothing was looked at,
+  ;;                    so ask again rather than reconciling
   ;;
   ;; conversation-peek/timeout answers from this same set plus one more,
   ;; 'no-answer-yet, which THIS entry point never returns: it waits.
