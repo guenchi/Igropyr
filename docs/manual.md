@@ -1914,12 +1914,32 @@ sends the caller to reconcile a conversation nobody had begun. `'overloaded`
 says the owner declined before touching anything: retry later, reconcile
 nothing.
 
+**A slot is not held for ever.** A worker whose asker gave up keeps running
+— nothing tells the owner the answer is no longer wanted — so each one is
+given a hold (`conv-set-forward-hold-ms!`, 300000 by default) after which
+the owner takes its slot back. That hold is the owner's slot lifetime, a
+different quantity from the asker's forwarding deadline even though they
+default to the same number: pass a longer call-level ttl and the owner may
+still give up first.
+
+What is reclaimed is the waiting, not the work. The forwarded worker is a
+courier; ending it leaves the conversation itself untouched, so the step
+finishes and the flow parks as it would have. The asker sees `'unreachable`,
+which already means the request may have been acted on — reconcile rather
+than retry. A rising `reaped` count is the signal that capacity is going to
+work nobody is waiting for.
+
 `conversation-forward-stats` reads the forwarding side: `attempted`,
-`refused`, `completed`, `unreachable`, the live `hosted` count and the
-`limit`. The counters are monotonic and reading does not reset them, and
-they satisfy `attempted = completed + refused + unreachable + hosted`. They
-are approximate in the same sense as the hook stats — read outside any lock
-— so do not build an equality assertion on a running system.
+`refused`, `completed`, `unreachable`, `reaped`, the live `hosted` count and
+the `limit`. The counters are monotonic and reading does not reset them.
+
+**They are two ledgers in one alist.** `attempted`, `refused`, `completed`
+and `unreachable` count what this node asked of others; `hosted` and
+`reaped` count what others asked of it. The asking side balances on its own
+— `attempted = completed + refused + unreachable + still waiting` — but
+mixing `hosted` into that equation compares two different populations. On a
+single node they coincide, which is exactly what a local test sees, so a
+local test cannot notice the difference.
 
 > The node layer has its own unrelated `'overload`, answered when it sheds a
 > cross-node call. The spellings differ deliberately: `'overloaded` is a
@@ -1933,9 +1953,17 @@ waits out its deadline, reports `'unreachable`, and leaves the frame in the
 asking process's mailbox where nothing collects it — one per refusal, in a
 process that is often long-lived.
 
-**Upgrade entry nodes first.** That order has no window at all: by the time
-any owner can refuse, every asker understands a refusal. Owner-first opens
-one that lasts until the last entry node is upgraded.
+**Upgrade entry nodes first — but know what that buys.** A node upgraded as
+an entry becomes a refusing *owner* at the same instant. On a symmetric
+deployment, where any node may be an entry, that is every node: upgrading A
+closes A's asking side and opens A's refusing side together, and a
+not-yet-upgraded B forwarding to A meets exactly the frame it cannot read.
+
+So on a symmetric mesh no ordering removes the window; entry-first only
+shrinks it, and finishing quickly matters more than the sequence. Where the
+roles are separate — dedicated entry nodes in front of dedicated owners —
+upgrading the front rank first does close it completely. Which shape your
+deployment has decides whether the order is a fix or a mitigation.
 
 **Separately, and not fixed by upgrade order:** a node already deployed
 under a name containing `~` is mis-routing *today*. The id parser has
