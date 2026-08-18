@@ -2025,12 +2025,13 @@ function eat(j){ return String(j.length); }
                                       (else 0))))))
               (qjspool-close! tight))
             ;; the lone-connection path (qjspool-connect) shares the
-            ;; boundary: same local failure, same kept connection.
-            ;; (Removing the lone branch's own local guard leaves this
-            ;; green -- the outer render/bytes guard already converts any
-            ;; raise, and a lone handle has no pool to book it broken in.
-            ;; That guard is symmetry, not load-bearing, and this comment
-            ;; is the record of having checked.)
+            ;; boundary: same local failure, same kept connection. It has
+            ;; no guard of its own to test -- a lone handle has no lease
+            ;; to escape and no pool to be booked broken in, so the
+            ;; render/bytes guard is the only converter on this path (a
+            ;; look-alike guard used to sit here and was removed as false
+            ;; symmetry; if connpool ever books a lone handle broken on
+            ;; escape, the pooled arm's guard is the shape to copy)
             (let ((lone (qjspool-connect "127.0.0.1" bound-port
                                          '((render-timeout-ms . 2000)))))
               (let-values (((k v) (qjspool-render lone
