@@ -1620,6 +1620,119 @@ transaction as the effect** hands the library the truth: durable, atomic
 with the thing it describes, and outliving both the record and the
 process.
 
+#### Keeping the record past the process
+
+The predicate above answers one conversation at a time, from a store the
+application already keeps. The other way round is to give the library
+somewhere to put the record itself:
+
+```scheme
+(conversation-record-hooks! writer reader)   ; both, or #f #f to uninstall
+```
+
+`writer` is called as `(writer id outcome)` the moment an outcome becomes
+final; `reader` as `(reader id)` when nothing local is left to answer
+from, and returns that outcome or `#f`. Together they extend the
+in-memory record past its bounds, past a restart, and past the death of
+the node that ran the conversation.
+
+**There is no translation table to learn, and deliberately so.** The
+outcome handed to the writer is the record itself — the same value the
+library keeps in memory — and the reader hands it straight back.
+`settled-or-lost-answer` in `conversation.sc` is the single place a
+record becomes a status, and it does not know or care whether the record
+came from memory or from a hook. Anything written here that restated
+that mapping would be a second copy of it, correct until the day it
+wasn't. Store the value; do not interpret it.
+
+What a record can be is fixed: `#t`, `'rolled-back`,
+`'committed-then-failed`, `'commit-uncertain-then-failed`, `'killed`.
+A reader answering with anything else is treated as having no record and
+counted in `conversation-hook-stats` — an invented word would otherwise
+fall through to `'unknown` in silence, and a reader inventing vocabulary
+is worth seeing.
+
+A minimal pair, durable because it goes through `(igropyr durable)`:
+
+```scheme
+(import (igropyr durable))
+
+(define (record-path id) (string-append "/var/lib/conv/" id))
+
+(conversation-record-hooks!
+  (lambda (id outcome)
+    (durable-write-file! (record-path id)
+                         (string->utf8 (format "~s" outcome))))
+  (lambda (id)
+    (and (file-exists? (record-path id))
+         (with-input-from-file (record-path id) read))))
+```
+
+**The writer runs in the conversation's own process, with interrupts
+enabled.** It may do file I/O, wait on a message, take as long as it
+takes: the record is committed to memory *before* it is called, and the
+scheduler keeps running throughout, so a slow writer costs that one
+conversation and nothing else. Two consequences worth planning for:
+
+- The final value is handed back only after the writer returns. That is
+  the point — a caller told "committed" after the durable copy exists,
+  not before — but it does put the writer's latency on the reply path,
+  and `durable-write-file!` is a synchronous `fsync`.
+- A `conversation-peek` of *that* conversation waits for it, exactly as
+  it waits out any slow step. Use `conversation-peek/timeout` where the
+  asker has a deadline of its own.
+
+**A record read through the hook is a record like any other**, including
+against the `settled?` predicate: a `'committed-then-failed` from disk
+contradicts a predicate answering `#f` and holds the answer at
+`'unknown`, while a `'commit-uncertain-then-failed` lets that same `#f`
+resolve to `'gone`. The distinction is the reason those are two records
+rather than one, and it survives the trip through storage.
+
+**A writer that raises cannot fail the transaction it is recording.** The
+raise is swallowed and counted, because a failure to *note* what happened
+must not become a second, larger failure on the path that has just
+finished the work. The counters are the only signal that this is
+happening, so watch them:
+
+```scheme
+(conversation-hook-stats)   ; => (... (record-writer-errors . 0)
+                            ;         (record-reader-errors . 0))
+```
+
+Installing validates the pair together — two procedures, or `#f` and
+`#f`. There is no half-installed state to be caught in, and an uninstall
+cannot interrupt a publication already decided on: the pair in force when
+the record was made is the pair that publishes it, exactly once.
+
+##### What the library cannot check for you
+
+The hooks are a capability, not a validation layer. The library asks the
+reader a question and believes the answer; a reader that says
+`'rolled-back` about a conversation that committed will produce a
+`'gone`, and a `'gone` is a licence to retry. **A lying reader is
+undetectable from in here** — there is nothing to compare it against, which
+is exactly why the record is worth keeping in the first place.
+
+That makes the integrity of the store the adapter's job, and it has a
+shape:
+
+- **Never rewrite a record.** First write wins in memory for a reason;
+  the same must hold on disk. In particular a `#t`,
+  `'committed-then-failed` or `'commit-uncertain-then-failed` must never
+  later become `'rolled-back` — that single edit converts "reconcile
+  this" into "retry this" and performs a committed transfer twice.
+- **Do not let a caller supply outcomes.** The writer is for the library;
+  an endpoint that accepts an id and an outcome from a request is a
+  double-charge primitive with an HTTP interface.
+- **Key it the way the id is keyed.** Ids are opaque strings and are
+  compared whole; a store that trims, folds case or truncates them can
+  answer one conversation's question with another's record.
+
+Where the store is shared between nodes, the same reader can answer for a
+conversation this node never ran — which is what makes the record outlive
+the node, and what makes the rules above load-bearing rather than tidy.
+
 #### Setting the forwarding deadline
 
 The same two procedures take an optional forwarding deadline in
