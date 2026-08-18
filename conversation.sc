@@ -599,14 +599,22 @@
   ;;   classify   -- the rules, in one place, valid in every phase
   ;;   serve-steps! -- the control structure, which knows no rules at all
   ;;
-  ;; phase is the single source of truth for "is a step running", and
-  ;; set-phase! is the only writer that ARMS the boxes the watchdog reads.
-  ;; That ordering was a defect once: publishing "running" before publishing
-  ;; WHEN it started let the watchdog kill a step against the previous
-  ;; step's clock. Writing it in one place is why that cannot come back.
-  ;; disarm-watchdog! below is the only other writer and it only ever
-  ;; clears the flag, so it cannot reintroduce that defect: there is no
-  ;; timestamp to publish alongside a stop.
+  ;; phase is the single source of truth for WHAT THE CONVERSATION IS
+  ;; DOING -- it is what a peek is told and what a replay is judged
+  ;; against -- and running-box is the watchdog's arming flag. They agree
+  ;; except in one place, deliberately: once a flow has raised, the step is
+  ;; over but the phase must not be rewritten to say so (see
+  ;; disarm-watchdog!), so the flag is cleared while the phase still reads
+  ;; 'running. Anything asking "should the watchdog fire" must read the
+  ;; flag; anything reporting what happened must read the phase.
+  ;;
+  ;; set-phase! is the only writer that ARMS. That ordering was a defect
+  ;; once: publishing "running" before publishing WHEN it started let the
+  ;; watchdog kill a step against the previous step's clock. Writing it in
+  ;; one place is why that cannot come back. disarm-watchdog! is the only
+  ;; other writer of the flag and it only ever clears it, so it cannot
+  ;; reintroduce that defect: there is no timestamp to publish alongside a
+  ;; stop.
 
   (define-record-type (step-state make-step-state step-state?)
     (fields (mutable phase)        ; 'running | 'parked | 'completed
@@ -1042,8 +1050,9 @@
   ;; IT RUNS WITH INTERRUPTS ENABLED. Every path commits its record inside
   ;; whatever atom it already holds and calls the writer after leaving it,
   ;; so a writer that YIELDS -- waits on a message, sleeps, parks -- gives
-  ;; the scheduler its turn and suspends only the conversation it belongs
-  ;; to. That is what the earlier arrangement could not do: calling the
+  ;; the scheduler its turn and suspends only the process that called it
+  ;; -- which is not always the conversation, see below. That is what the
+  ;; earlier arrangement could not do at all: calling the
   ;; writer where the record was made put it inside those atoms, where a
   ;; writer waiting on another process could never be answered, because
   ;; the process that would answer it could not run. The VM stopped, for
@@ -1068,6 +1077,9 @@
   ;; writer that reads `self`, or anything process-local, sees a different
   ;; process on those paths; and on those paths there is no further
   ;; watchdog behind it, since the watchdog is the one running the writer.
+  ;; It also decides who pays for a writer that waits: a conversation
+  ;; waiting on its own writer still has its census entry and still holds
+  ;; a drain, while a watchdog waiting on one is counted by nothing.
   ;;
   ;; ONE MORE THING THE WATCHDOG DOES: it re-inserts from the
   ;; conversation's outcome-box, not from the table, so a record that was
@@ -1084,8 +1096,12 @@
   ;;
   ;; Publishing first would be a hole rather than a style. The writer is
   ;; application code and can yield, so the window is as long as it cares
-  ;; to make it -- and a conversation can DIE inside that window: the
-  ;; watchdog kills it, the node stops, the VM goes down. With the writer
+  ;; to make it -- and a conversation can DIE inside that window: killed
+  ;; from outside, the node stops, the VM goes down. (Not by its own
+  ;; watchdog any more, on the paths where it publishes for itself: that
+  ;; is what disarm-watchdog! and the completion path's set-phase! are
+  ;; for. The other three remain, and none of them is rare.) With the
+  ;; writer
   ;; called first, what is left behind is a process that is gone, no entry
   ;; in the table, and a durable copy still showing what was true BEFORE
   ;; this outcome -- so a peek falls through to the reader and is answered
