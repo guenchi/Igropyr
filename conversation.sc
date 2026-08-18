@@ -1016,8 +1016,8 @@
   ;; and calls the writer after leaving it, so a writer that blocks --
   ;; waits on a message, waits on a disk -- suspends that one conversation
   ;; and nothing else. The watchdog that bounds it keeps running, and the
-  ;; record itself is already in memory, so a peek is answered correctly
-  ;; while the durable copy is still being written.
+  ;; record is already in memory before the writer is called -- see the
+  ;; ordering below for what that does and does not buy.
   ;;
   ;; It was not always so, and the earlier arrangement is worth naming:
   ;; calling the writer where the record was made put it inside those
@@ -1027,6 +1027,7 @@
   ;; one that froze the VM once per outcome, and a writer that waited
   ;; froze it for good, watchdog included. A comment asking callers to
   ;; keep it short is not a bound on application code.
+  ;;
   ;; TWO STEPS, AND THE ORDER IS THE POINT. The local record is committed
   ;; first and alone; only then is the writer called, and it is called
   ;; with the hooks captured at the moment of the decision.
