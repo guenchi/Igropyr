@@ -1707,10 +1707,18 @@ Three further consequences:
   conversation is already dead, so the peek reads the record straight
   out of the table. That answer is correct *because* the table is
   written first.
-- A conversation whose writer is still running on its own process counts
-  as `lingering` in `conversation-census`, so **draining a node waits
-  for those record writes** rather than cutting them off — and a writer
-  that never returns holds a drain open indefinitely.
+- A conversation whose writer is still running on its own process still
+  has a census entry, so **draining a node waits for those record
+  writes** rather than cutting them off — and a writer that never
+  returns holds a drain open indefinitely.
+- **The conversation's `ttl` does not bound the writer.** It bounds time
+  spent executing a step, and every publication happens after the step
+  it describes is over: the watchdog's clock is stopped before the
+  record is published, on the failing path as on the normal one. That is
+  deliberate — a writer killed part-way leaves an outcome that exists
+  only in memory, which is the failure the record was there to prevent —
+  but it means a writer is bounded by nothing except itself. Give one
+  that can wait its own deadline.
 
 **The writer must be idempotent in `(id, outcome)`.** Storing the same
 outcome twice has to be storing it once. First-write-wins governs the
