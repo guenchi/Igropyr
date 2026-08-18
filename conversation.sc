@@ -1195,8 +1195,10 @@
   ;; different question -- who holds this name -- from the one the census
   ;; asks.
   ;;
-  ;; Reading the census is what repairs it, so nothing sweeps on a timer.
-  ;; Entries for processes that have died are dropped as they are found.
+  ;; Reading the census repairs it, and so does every N-th admission --
+  ;; nothing sweeps on a timer, and neither path is the only one. A
+  ;; census read drops every dead entry it walks past; the periodic
+  ;; sweep exists for the node that never reads its own census.
   ;;
   ;; THIS AND COUNTING AT ADMISSION ARE ONE DECISION, not two that happen
   ;; to sit together. An entry is made when the handle is claimed, and at
@@ -1206,7 +1208,18 @@
   ;; two is changed back alone, the census reports zero for a
   ;; conversation that was accepted and is about to start, which is
   ;; precisely the reading a drain must never get.
-  (define conv-census (make-hashtable string-hash string=?))
+  ;; KEYED BY THE PROCESS, NOT BY THE ID. An id is a string the library
+  ;; hands to the caller, who is free to mutate it -- and a mutated
+  ;; string changes its hash, so an entry filed under it stops being
+  ;; findable while still being enumerable: the census would walk past a
+  ;; live conversation and report a total that is short by one, which is
+  ;; the false zero a drain must never see. Nothing in the API forbade
+  ;; that mutation, and no amount of copying at the boundary would make
+  ;; the id a good key while the caller holds one too.
+  ;;
+  ;; The process is what the census is actually counting, it is unique
+  ;; while it exists, and eq? on it cannot be perturbed from outside.
+  (define conv-census (make-eq-hashtable))
 
   ;; PRUNED ON INSERT ONCE IT IS IMPLAUSIBLY LARGE, because reading is
   ;; otherwise the only thing that removes a dead entry -- and a node
@@ -1216,24 +1229,38 @@
   ;; live conversations are bounded by what the machine can hold. Paying
   ;; one sweep at that point also keeps the first census from being the
   ;; sweep, which would put an unbounded walk inside its region.
-  (define census-prune-at 4096)
+  ;; SWEPT EVERY N ADMISSIONS, NOT EVERY ADMISSION PAST A SIZE. The first
+  ;; version swept whenever the table was larger than a threshold, on the
+  ;; reasoning that a table that big is mostly dead entries. Nothing
+  ;; guarantees that: a node legitimately holding more than the threshold
+  ;; would sweep on every single admission, find nothing to remove, and
+  ;; pay a walk of the whole table each time -- quadratic overall, and
+  ;; every one of those walks runs with interrupts off, so the scheduler
+  ;; and the event loop stop for its duration.
+  ;;
+  ;; Counting admissions instead makes the cost amortised: one walk per N
+  ;; of them regardless of how many conversations are live. It exists
+  ;; because a kill and an uncaught raise both skip the removal below, so
+  ;; a node that never reads its own census would otherwise accumulate
+  ;; entries for processes long gone.
+  (define census-sweep-every 4096)
+  (define census-since-sweep 0)
 
-  (define (census-prune!)
+  (define (census-sweep!)
+    (set! census-since-sweep 0)
     (for-each
-      (lambda (id)
-        (let ((e (hashtable-ref conv-census id #f)))
-          (when (and e (not (process-alive? (vector-ref e 0))))
-            (hashtable-delete! conv-census id))))
+      (lambda (p)
+        (unless (process-alive? p) (hashtable-delete! conv-census p)))
       (vector->list (hashtable-keys conv-census))))
 
-  (define (census-add! id p running-box settled-box)
+  (define (census-add! p running-box settled-box)
     (with-interrupts-disabled
-      (when (> (hashtable-size conv-census) census-prune-at)
-        (census-prune!))
-      (hashtable-set! conv-census id (vector p running-box settled-box))))
+      (set! census-since-sweep (+ census-since-sweep 1))
+      (when (> census-since-sweep census-sweep-every) (census-sweep!))
+      (hashtable-set! conv-census p (vector running-box settled-box))))
 
-  (define (census-drop! id)
-    (with-interrupts-disabled (hashtable-delete! conv-census id)))
+  (define (census-drop! p)
+    (with-interrupts-disabled (hashtable-delete! conv-census p)))
 
   ;; running -- the watchdog counts a step against this conversation.
   ;;            Usually that is the flow executing one; it also covers
@@ -1243,29 +1270,40 @@
   ;;            charged here", which is wider than "the flow is running".
   ;; parked  -- waiting in suspend! for the next request
   ;; lingering -- the flow returned and this is the window where the final
-  ;;              reply can still be replayed; it still holds its name, so
-  ;;              a drain is not finished while any remain
+  ;;              reply can still be replayed; it holds its name for
+  ;;              nearly all of that window, so a drain is not finished
+  ;;              while any remain
+  ;;
+  ;; SETTLED IS CHECKED FIRST, so the replay-key case above can only
+  ;; show up as running for a conversation that has NOT settled. Once it
+  ;; has, it reads as lingering whatever the watchdog is charging.
+  ;;
+  ;; A lingering one is counted for a moment longer than it holds its
+  ;; name: the ending sequence gives up the name, removes its entry and
+  ;; then returns, and a census between the first two steps still sees a
+  ;; live process. It over-counts rather than under-counts, which delays
+  ;; a drain instead of ending one early -- the direction to err in.
   (define (conversation-census)
     (with-interrupts-disabled
-      (let loop ((ks (vector->list (hashtable-keys conv-census)))
+      (let loop ((ps (vector->list (hashtable-keys conv-census)))
                  (running 0) (parked 0) (lingering 0))
-        (if (null? ks)
+        (if (null? ps)
             (list (cons 'running running)
                   (cons 'parked parked)
                   (cons 'lingering lingering)
                   (cons 'total (+ running parked lingering)))
-            (let* ((id (car ks))
-                   (e (hashtable-ref conv-census id #f)))
+            (let* ((p (car ps))
+                   (e (hashtable-ref conv-census p #f)))
               (cond
-                ((not e) (loop (cdr ks) running parked lingering))
-                ((not (process-alive? (vector-ref e 0)))
-                 (hashtable-delete! conv-census id)
-                 (loop (cdr ks) running parked lingering))
-                ((unbox (vector-ref e 2))
-                 (loop (cdr ks) running parked (+ lingering 1)))
+                ((not e) (loop (cdr ps) running parked lingering))
+                ((not (process-alive? p))
+                 (hashtable-delete! conv-census p)
+                 (loop (cdr ps) running parked lingering))
                 ((unbox (vector-ref e 1))
-                 (loop (cdr ks) (+ running 1) parked lingering))
-                (else (loop (cdr ks) running (+ parked 1) lingering))))))))
+                 (loop (cdr ps) running parked (+ lingering 1)))
+                ((unbox (vector-ref e 0))
+                 (loop (cdr ps) (+ running 1) parked lingering))
+                (else (loop (cdr ps) running (+ parked 1) lingering))))))))
 
   ;; QUIESCE STOPS NEW WORK, NOT WORK IN FLIGHT. It gates one thing --
   ;; starting a conversation -- and deliberately nothing else:
@@ -2495,8 +2533,10 @@
                  #f))
            (name (conversation-name id))
            ;; shared with the watchdog below: step-box counts completed
-           ;; suspends (progress), running-box says whether the flow is
-           ;; executing rather than parked waiting for the next request
+           ;; suspends (progress), running-box says whether the watchdog
+           ;; is charging time here -- usually the flow executing a step,
+           ;; but also work done on a parked conversation's behalf, such
+           ;; as computing a request key for a replay
            (step-box (box 0))
            (running-box (box #t))
            ;; when the step now running actually began. The watchdog used
@@ -3248,7 +3288,7 @@
                        (lambda (from ref2 token r) 'unreachable)
                        (lambda () 'done))
                      (unregister name)
-                     (census-drop! id)))))))
+                     (census-drop! self)))))))
          ;; COUNTED HERE, WITH THE CLAIM, and not by the conversation
          ;; itself. This runs inside the region that claims the handle,
          ;; while the process just spawned is only queued: spawn does not
@@ -3259,7 +3299,7 @@
          ;; drained while an accepted conversation is about to start. The
          ;; admission is the decision, so the admission is what the
          ;; census has to reflect.
-         (census-add! id conv running-box settled-box)
+         (census-add! conv running-box settled-box)
          conv)))))
 
   ;; Start the prepared conversation and park until its first suspend!.
