@@ -1011,18 +1011,63 @@
   ;; second, larger failure. Swallowed, and counted so the swallowing is
   ;; visible.
   ;;
-  ;; It is called where the record is made, which on some paths is inside
-  ;; a region with interrupts disabled. A writer that BLOCKS therefore
-  ;; stops every green process in the runtime, and no guard here can
-  ;; change that: it is the caller's to keep short. Writing through
-  ;; (igropyr durable) is a synchronous filesystem call, which is exactly
-  ;; the case to think about before doing it on every outcome.
-  (define (record-write! id what)
-    (let ((hs (unbox record-hooks)))
-      (when hs
-        (guard (e (#t (set-box! record-writer-errors
-                                (+ (unbox record-writer-errors) 1))))
-          ((car hs) id what)))))
+  ;; IT RUNS IN THE CONVERSATION'S OWN PROCESS, WITH INTERRUPTS ENABLED.
+  ;; Every path commits its record inside whatever atom it already holds
+  ;; and calls the writer after leaving it, so a writer that blocks --
+  ;; waits on a message, waits on a disk -- suspends that one conversation
+  ;; and nothing else. The watchdog that bounds it keeps running, and the
+  ;; record itself is already in memory, so a peek is answered correctly
+  ;; while the durable copy is still being written.
+  ;;
+  ;; It was not always so, and the earlier arrangement is worth naming:
+  ;; calling the writer where the record was made put it inside those
+  ;; atoms, where this runtime's single OS thread makes any wait a
+  ;; stop-the-world. The flagship adapter is (igropyr durable), whose
+  ;; writes are synchronous fsyncs -- so the recommended use was also the
+  ;; one that froze the VM once per outcome, and a writer that waited
+  ;; froze it for good, watchdog included. A comment asking callers to
+  ;; keep it short is not a bound on application code.
+  ;; TWO STEPS, AND THE ORDER IS THE POINT. The local record is committed
+  ;; first and alone; only then is the writer called, and it is called
+  ;; with the hooks captured at the moment of the decision.
+  ;;
+  ;; Publishing first would be a hole rather than a style. The writer is
+  ;; application code and can yield, so the window is as long as it cares
+  ;; to make it -- and a conversation can DIE inside that window: the
+  ;; watchdog kills it, the node stops, the VM goes down. With the writer
+  ;; called first, what is left behind is a process that is gone, no entry
+  ;; in the table, and a durable copy still showing what was true BEFORE
+  ;; this outcome -- so a peek falls through to the reader and is answered
+  ;; 'rolled-back for a conversation that has just committed, which is a
+  ;; retry granted for a transaction that stands. Writing the table first
+  ;; makes the correct answer survive the death of the process that knew
+  ;; it, whether or not the durable copy was ever made.
+  ;;
+  ;; It does not make the answer available EARLIER to a peek of that same
+  ;; conversation, and no ordering here could: while the writer runs, the
+  ;; conversation has not reached its next park, and conversation-peek
+  ;; waits for that park the way it waits out any slow step (measured: a
+  ;; peek issued during a 2s writer returns when the writer does).
+  ;; conversation-peek/timeout is the bounded form for a caller that
+  ;; cannot wait. What the ordering buys is that the answer, whenever it
+  ;; is given, is this outcome and not the last one.
+  ;;
+  ;; The pair is captured with the record and not read again at
+  ;; publication, so an uninstall that lands in between cannot leave a
+  ;; publication half-done: the one already decided on completes exactly
+  ;; once, and the uninstall governs everything after it.
+  (define (record-capture) (unbox record-hooks))
+
+  ;; OUTSIDE ANY REGION THAT HOLDS INTERRUPTS. A writer is application
+  ;; code and may be slow, may wait, may do file I/O -- and this runtime
+  ;; has one OS thread, so calling it with interrupts disabled stops
+  ;; every green process for as long as it takes. Each caller commits its
+  ;; record inside its own atom and calls this after leaving it.
+  (define (record-publish! hs id what)
+    (when hs
+      (guard (e (#t (set-box! record-writer-errors
+                              (+ (unbox record-writer-errors) 1))))
+        ((car hs) id what))))
 
   ;; The five words a record can be. A reader that answers with anything
   ;; else is treated as having no record and counted: settled-or-lost-
@@ -1050,24 +1095,34 @@
                               (+ (unbox record-reader-errors) 1))
                     #f))))))
 
+  ;; -> the hook pair to publish this record with, or #f when nothing was
+  ;; written (first-write-wins) or no hooks are installed. The caller
+  ;; publishes once it is out of its own atomic region.
   (define (tomb-insert-as! id what)
-    (unless (hashtable-contains? tombstones id)
-      (hashtable-set! tombstones id what)
-      (set! tomb-back (cons (cons id (now-ms)) tomb-back))
-      (set! tomb-n (+ tomb-n 1))
-      (record-write! id what)))
+    (and (not (hashtable-contains? tombstones id))
+         (begin
+           (hashtable-set! tombstones id what)
+           (set! tomb-back (cons (cons id (now-ms)) tomb-back))
+           (set! tomb-n (+ tomb-n 1))
+           (record-capture))))
 
   (define (tomb-insert! id) (tomb-insert-as! id #t))
+
+  ;; the shape every caller uses: whatever the insert handed back, publish
+  ;; it with the value that was written
+  (define (tomb-published! hs id what) (record-publish! hs id what))
 
   ;; THE ONE WRITER for a caller that is not already holding interrupts:
   ;; write, then prune outside the region. Every exit shape reaches the
   ;; table through this, so there is one place where a record is committed
   ;; and one place where the table is trimmed after it. (The completion
-  ;; path and the watchdog's kill both publish the record inside a larger
-  ;; atom of their own and call tomb-prune! themselves; see each.)
+  ;; path, the watchdog's kill and the failing flow each commit the record
+  ;; inside a larger atom of their own, then publish and prune once they
+  ;; are out of it; see each.)
   (define (tomb-record-as! id what)
-    (with-interrupts-disabled (tomb-insert-as! id what))
-    (tomb-prune!))
+    (let ((hs (with-interrupts-disabled (tomb-insert-as! id what))))
+      (tomb-published! hs id what)
+      (tomb-prune!)))
 
   ;; WHAT THE RECORD SAYS, or #f for no record. Reading it in one place is
   ;; what keeps the mapping from records to answers in one place too: see
@@ -2892,11 +2947,11 @@
                               ;; killed and reported rolled back.
                               (sleep-ms 1)
                               (let-values
-                                  (((killed run-hook?)
+                                  (((killed run-hook? pub-hooks pub-what)
                                     (with-interrupts-disabled
                                       (if (not (and (process-alive? watched)
                                                     (overrun?)))
-                                          (values #f #f)
+                                          (values #f #f #f #f)
                                           ;; READ BEFORE KILLING, INSIDE THE
                                           ;; ATOM. What decides whether the
                                           ;; hook runs is whether anything
@@ -2954,17 +3009,29 @@
                                               ;; there, tomb-insert-as! is
                                               ;; first-write-wins and this
                                               ;; changes nothing.)
-                                              (let ((o (cond
-                                                         (had had)
-                                                         ((unbox settled-box) #t)
-                                                         (else 'killed))))
-                                                (tomb-insert-as! id o)
+                                              (let* ((o (cond
+                                                          (had had)
+                                                          ((unbox settled-box) #t)
+                                                          (else 'killed)))
+                                                     ;; CAPTURED HERE, CALLED
+                                                     ;; OUTSIDE. The pair in
+                                                     ;; force at the instant
+                                                     ;; the record became
+                                                     ;; authoritative is the
+                                                     ;; pair that publishes
+                                                     ;; it; a writer is
+                                                     ;; application code and
+                                                     ;; running it here would
+                                                     ;; stop every process in
+                                                     ;; the VM, this watchdog
+                                                     ;; among them.
+                                                     (hs (tomb-insert-as! id o)))
                                                 (unless had
-                                                  (set-box! outcome-box o)))
-                                              ;; the hook is for a
-                                              ;; conversation nothing had
-                                              ;; described yet
-                                              (values #t (not had)))))))
+                                                  (set-box! outcome-box o))
+                                                ;; the hook is for a
+                                                ;; conversation nothing had
+                                                ;; described yet
+                                                (values #t (not had) hs o)))))))
                                 ;; DECLINING TO KILL IS NOT BEING DONE.
                                 ;; Before the grace period this branch
                                 ;; always killed, so falling out of it was
@@ -2988,6 +3055,7 @@
                                 ;; Outside the atom: pruning is bookkeeping
                                 ;; and does not belong in a region that
                                 ;; exists to make the kill indivisible.
+                                (tomb-published! pub-hooks id pub-what)
                                 (when killed (tomb-prune!))
                                 (if killed
                                     ;; ...BUT ONLY IF NOTHING SETTLED.
@@ -3330,13 +3398,16 @@
                    (let ((final (guard (e (#t (begin
                                                 (when (commit-uncertain? e)
                                                   (note-uncertain!))
-                                                (let ((o (case (unbox committed-box)
-                                                           ((confirmed) 'committed-then-failed)
-                                                           ((uncertain) 'commit-uncertain-then-failed)
-                                                           (else 'rolled-back))))
-                                                  (with-interrupts-disabled
-                                                    (set-box! outcome-box o)
-                                                    (tomb-insert-as! id o))
+                                                (let* ((o (case (unbox committed-box)
+                                                            ((confirmed) 'committed-then-failed)
+                                                            ((uncertain) 'commit-uncertain-then-failed)
+                                                            (else 'rolled-back)))
+                                                       (hs (with-interrupts-disabled
+                                                             (set-box! outcome-box o)
+                                                             (tomb-insert-as! id o))))
+                                                  ;; published after the
+                                                  ;; region, never inside it
+                                                  (tomb-published! hs id o)
                                                   (tomb-prune!)))
                                               (raise e)))
                                   (flow req suspend! commit!))))
@@ -3351,13 +3422,18 @@
                      ;; as a rollback guarantee. Committing and then being
                      ;; told it did not happen is the one outcome none of
                      ;; the rest of this file is worth anything without.
-                     (with-interrupts-disabled
-                       (step-state-reply-set! st final)
-                       (step-state-awaiting-set! st #f)
-                       (set-phase! st 'completed)
-                       (set-box! settled-box #t)
-                       (set-box! outcome-box #t)
-                       (tomb-insert! id))
+                     (let ((publish-hooks
+                             (with-interrupts-disabled
+                               (step-state-reply-set! st final)
+                               (step-state-awaiting-set! st #f)
+                               (set-phase! st 'completed)
+                               (set-box! settled-box #t)
+                               (set-box! outcome-box #t)
+                               (tomb-insert! id))))
+                       ;; published after the region: a writer is
+                       ;; application code and must not run with
+                       ;; interrupts held
+                       (tomb-published! publish-hooks id #t))
                      (tomb-prune!)
                      (when who
                        (send who (vector 'conv-reply tag final 'done))
