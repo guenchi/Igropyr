@@ -85,9 +85,11 @@
 ;;;                   be encoded, or its deadline was gone before the
 ;;;                   write. Nothing is in doubt because nothing was
 ;;;                   asked, so the connection stays usable too, and the
-;;;                   caller is told why -- it is the caller's input that
-;;;                   has to change, and no other worker would answer
-;;;                   differently.
+;;;                   failure is reported with its reason. The two causes
+;;;                   differ in whether trying again could help -- an
+;;;                   unencodable request never will, a spent deadline
+;;;                   might -- and the kind deliberately does not say
+;;;                   which: it is a statement about the connection.
 ;;;   transport    -- bytes may have left this process. The connection is
 ;;;                   discarded, on the principle that a stream whose
 ;;;                   framing is in doubt cannot be trusted with the next
@@ -1268,12 +1270,17 @@
   ;; failure this process can reproduce on its own is not changed by
   ;; handing it to another worker.
   ;;
-  ;; The two local sites are not the same in character and are treated the
-  ;; same on purpose: a request that cannot be encoded will fail identically
-  ;; forever, while one that ran out of time before it was sent might well
-  ;; succeed on a later attempt. Neither justifies discarding this
-  ;; connection, which is what the kind governs; whether the CALLER retries
-  ;; is the caller's to decide and it is told which happened.
+  ;; LOCAL IS NOT ONE KIND OF FAILURE, and treating them alike is a claim
+  ;; about the connection and nothing else. A request that cannot be
+  ;; encoded will fail the same way forever; one that ran out of time
+  ;; before it was sent may well succeed on the next attempt. What they
+  ;; share is that this connection was never used, which is the only
+  ;; question the kind answers.
+  ;;
+  ;; It does NOT answer whether to try again, and the caller is not told
+  ;; which of the two it was: every failure reaches it as (values #f
+  ;; text). A caller that needs to tell "certainly never sent" from "may
+  ;; have run on the worker" cannot get it from here today.
   (define (render-on! c buf req render-ms ref id)
     (let* ((deadline (+ (now-ms) render-ms))
            ;; WHY it could not be encoded, not just that it could not.
@@ -1341,7 +1348,16 @@
             ;; only ever compared to the one outstanding.
             ((qjs-error-local? r)
              (send from (vector 'pool-reply ref r))
-             (when notify (send notify (vector 'pool-idle self ref)))
+             ;; AND NO pool-idle. That message is what clears the pool's
+             ;; reconnect penalty -- it reads a finished request as the
+             ;; first evidence this endpoint works -- and a request the
+             ;; worker never saw is not evidence of anything about the
+             ;; worker. Sending it would let a caller hold an endpoint's
+             ;; backoff at zero by feeding it requests that fail before
+             ;; the write, which is exactly the endpoint most in need of
+             ;; being backed off. Nothing else is owed: a render is served
+             ;; under a lease, and it is the lease's check-in that returns
+             ;; the connection.
              (serve-loop* c buf notify render-ms max-id next-id))
             ((qjs-error? r)
               (begin
