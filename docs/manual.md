@@ -3077,15 +3077,17 @@ If you need to read a file in a handler:
 ### The sequence is the contract
 
 ```
-write body -> fsync body -> close -> rename -> fsync PARENT DIRECTORY
+write body -> close it -> fsync body -> rename -> fsync PARENT DIRECTORY
 ```
+
+The body is flushed through a descriptor opened for that purpose, after the writing port has been closed — a Chez port does not hand out its file descriptor, and `fsync` wants a descriptor for the file rather than a writable channel to it. One consequence is worth knowing: the temporary path is resolved a second time, so anything able to write that directory could swap what the name refers to in between. Closing that would need `O_NOFOLLOW`/`openat` or a flush on the writing descriptor itself, neither of which is reachable from here; it is recorded as a known limit rather than approximated.
 
 Writing to a temporary file and renaming it into place is the well-known half. The half that gets left out is the last step: a rename is a change to a *directory*, and a directory is a file that has to be flushed like any other. Leave it out and the code still passes every test that writes a file and reads it back, on every machine that does not lose power during the test — which is why it is the step that goes missing.
 
 ### API
 
 - `(durable-write-file! path bytes)` → path — write `bytes` (a bytevector) to `path` through a temporary file, a rename, and a directory flush. The target either holds the old contents or the new ones; a reader never sees a partial file
-- `(durable-dir-ensure! path)` → path — create the directory if it is not there and flush its parent. A second call on an existing directory does no writing at all
+- `(durable-dir-ensure! path)` → path — create the directory if it is not there and flush its parent. A second call on an existing directory does no writing at all. It makes **its own** creation durable and does not underwrite an unflushed one by another process: if someone else created the directory a moment ago without flushing, this call finds it present and returns, and a crash can still take it away. Losing a `mkdir` race is not an error — the directory is there, which is what was asked
 - `(fs-trace-hook-set! hook)` → void — install a procedure `(hook op path outcome)` called around every filesystem operation, or `#f` to remove it
 - `(with-fs-trace hook thunk)` → any — run `thunk` with `hook` installed, restoring the previous hook on the way out, including when `thunk` raises
 
