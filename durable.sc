@@ -47,6 +47,25 @@
           durable-error? durable-error-op durable-error-path)
   (import (chezscheme) (igropyr platform))
 
+  ;; REFUSED BEFORE ANYTHING ELSE IS TRIED, which is why it is a
+  ;; definition and not a call at the foot of the body: definition
+  ;; initialisers run in order, so this settles the platform before the
+  ;; loader below goes looking for a libc on it.
+  ;;
+  ;; TWO DEFENCES, COVERING DIFFERENT HOLES -- and neither stands in for
+  ;; the other. This one refuses a platform the framework does not
+  ;; recognise at all, where machine-type is simply unfamiliar and
+  ;; nothing has been verified. It says nothing about whether the
+  ;; constants below were compiled on a platform that DOES get through:
+  ;; the supported set is macOS, Linux and FreeBSD, and the table below
+  ;; covers two of them. On Linux this check passes and O_RDONLY is
+  ;; still a number nobody compiled there.
+  ;;
+  ;; So this answers "is the platform known", the table answers "were
+  ;; these numbers measured here", and taking the first as covering the
+  ;; second has the gap backwards.
+  (define platform-checked (begin (ensure-supported-platform!) #t))
+
   ;; libc, through the loader that already reports every candidate it
   ;; tried. A second copy of that loop is how the last library to need
   ;; one ended up with a candidate list that drifted from this one.
