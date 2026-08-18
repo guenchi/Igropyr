@@ -54,7 +54,7 @@ fi' EXIT
 "$scheme_bin" --script igropyr/test/public-names.sc
 # the status vocabulary must stay importable without the runtime: its own
 # process, so what it loads is observable at all
-"$scheme_bin" --script igropyr/test/conversation-status.sc
+"$scheme_bin" --script igropyr/test/conv-status.sc
 IGROPYR_CONTRACTS=full "$scheme_bin" --script igropyr/test/checked-full.sc
 env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/smoke-actor.sc

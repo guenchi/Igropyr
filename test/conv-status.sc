@@ -1,5 +1,5 @@
 #!chezscheme
-;;; (igropyr conversation-status) exists to be importable by code that
+;;; (igropyr conv-status) exists to be importable by code that
 ;;; wants none of the runtime. That is a property of what it LOADS, not of
 ;;; what it exports, so it cannot be checked from inside a process that
 ;;; also imports the rest -- by then everything is already resident. This
@@ -11,7 +11,7 @@
 ;;; the only thing lost is the reason the library was separated at all,
 ;;; and nothing else would notice.
 
-(import (chezscheme) (igropyr conversation-status))
+(import (chezscheme) (igropyr conv-status))
 
 (define (fail label . info)
   (display "FAIL ") (display label)
@@ -30,7 +30,7 @@
 (unless (= 1 (length loaded))
   (fail "importing the status vocabulary loaded more than itself" loaded))
 
-(unless (equal? (car loaded) '(igropyr conversation-status))
+(unless (equal? (car loaded) '(igropyr conv-status))
   (fail "the one library loaded is not the one imported" loaded))
 
 ;; ...and it is the whole vocabulary, answering for every status the
@@ -51,4 +51,4 @@
         (list 'unreachable conversation-unreachable? 'unreachable)))
 
 (display "the status vocabulary loads nothing but itself ok\n")
-(display "ALL CONVERSATION-STATUS TESTS PASSED\n")
+(display "ALL CONV-STATUS TESTS PASSED\n")

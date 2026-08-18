@@ -1,5 +1,5 @@
 #!chezscheme
-;;; (igropyr conversation-status) -- the answers a conversation can give,
+;;; (igropyr conv-status) -- the answers a conversation can give,
 ;;; and nothing else.
 ;;;
 ;;; SPLIT OUT SO THAT ASKING WHAT A STATUS MEANS COSTS NOTHING. The status
@@ -25,7 +25,7 @@
 ;;; follows is what each one licenses a caller to DO, which is the part
 ;;; that gets read at a call site.
 
-(library (igropyr conversation-status)
+(library (igropyr conv-status)
   (export conversation-gone? conversation-stale? conversation-done?
           conversation-settled? conversation-unknown?
           conversation-unreachable? conversation-no-answer-yet?)

@@ -457,13 +457,13 @@
           conversation-prepare! conversation-run! conversation-abandon!
           conversation-ref-id
           conversation-set-limits! conversation-hook-stats
-          ;; re-exported from (igropyr conversation-status), so that
+          ;; re-exported from (igropyr conv-status), so that
           ;; importing this library still gives the whole vocabulary
           conversation-gone? conversation-stale? conversation-done?
           conversation-settled? conversation-unknown?
           conversation-unreachable? conversation-no-answer-yet?)
   (import (chezscheme) (igropyr actor)
-          (igropyr conversation-status)
+          (igropyr conv-status)
           (only (igropyr libuv) now-ms)
           (only (igropyr node)
                 node-self rsend node-peers monitor-remote demonitor-remote))
@@ -3330,7 +3330,7 @@
                       (answered state token reply))
                     (`#(DOWN ,@p ,reason) (died)))))))))
 
-  ;; The status predicates live in (igropyr conversation-status) and are
+  ;; The status predicates live in (igropyr conv-status) and are
   ;; re-exported above. They are one-line eq? tests with no dependencies,
   ;; and keeping them here forced anyone who only wanted to CLASSIFY a
   ;; status to load the scheduler, libuv, the node layer, and this file's

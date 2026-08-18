@@ -58,7 +58,7 @@
               rsa-public-key-from-modulus
               rsa-load-private-key rsa-load-public-key
               rsa-sign-sha256 rsa-verify-sha256)
-        (only (igropyr conversation-status)
+        (only (igropyr conv-status)
               conversation-gone? conversation-stale? conversation-done?
               conversation-settled? conversation-unknown?
               conversation-unreachable? conversation-no-answer-yet?))
