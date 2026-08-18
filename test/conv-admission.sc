@@ -289,6 +289,14 @@
             (unless (eq? (cadr r) 'overloaded)
               (fail "a restarted router forgot the live workers" r)))
           (ok "a restarted router still counts the old workers")
+          ;; adopt AGAIN: kill the second router too, so the same live
+          ;; workers are adopted by a third. Each dead router held its
+          ;; own monitor on them; when a worker finally dies, only the
+          ;; live router's DOWN lands, and table deletion is idempotent
+          ;; besides -- so repeated adoption must not double-free
+          (kill (whereis 'igropyr-conv-router) 'admission-test-again)
+          (let-values (((idy ty ry) (conversation-start! echo-flow 'hi)))
+            'ok)
           (send (whereis 'g1) (vector 'go))
           (send (whereis 'g2) (vector 'go))
           (await tagA 15000 "blocked forward a never returned (round 2)")
