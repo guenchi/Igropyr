@@ -186,6 +186,11 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/fault-hook.sc
 "$scheme_bin" --script igropyr/test/conversation.sc
 "$scheme_bin" --script igropyr/test/conv-cluster.sc
+# rolling-upgrade, against a REAL old node: a worktree of the pre-wide
+# protocol revision runs node b from source while node a runs this tree.
+# Covers the narrow-reply branch a positive ref lands in -- a branch no
+# all-new mesh ever takes. Skips (and says so) without full git history
+"$scheme_bin" --script igropyr/test/conv-mixed.sc
 "$scheme_bin" --script igropyr/test/tls.sc
 "$scheme_bin" --script igropyr/test/apple-jws.sc
 # needs the openssl CLI to mint its ephemeral RSA keys, same as tls.sc above
