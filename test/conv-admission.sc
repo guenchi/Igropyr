@@ -307,7 +307,47 @@
                              15000 "admission after router restart")))
             (unless (equal? (car r) (vector 'echo 1 2))
               (fail "the pool never recovered after the router restart" r))))
-        (ok "worker slots survive the router that took them")))
+        (ok "worker slots survive the router that took them"))
+
+      ;; ---- an abandoned wait gives its slot back; the work survives ---
+      ;; A flow that never returns would otherwise hold a slot forever --
+      ;; not a bookkeeping error (the table records a live worker
+      ;; truthfully) but capacity eaten for the life of the node, and a
+      ;; router restart re-adopts the living. The hold deadline kills THE
+      ;; WAIT, NOT THE WORK: the worker is a messenger, the flow keeps
+      ;; running, and the asker sees the same 'unreachable its own ttl
+      ;; was always going to give it.
+      (conv-set-forward-limit! 1)
+      (conv-set-forward-hold-ms! 500)
+      (let*-values (((id5 t5 r5) (conversation-start! (gated-flow 'g3) 'hi))
+                    ((id6 t6 r6) (conversation-start! echo-flow 'hi)))
+        (let ((reaped0 (stat (conversation-forward-stats) 'reaped))
+              (tagR (fresh-tag)))
+          (ask (vector 'resume-async tagR id5 t5 'block 3000))
+          (poll-hosted 1 "the doomed forward never occupied the slot")
+          ;; nothing releases the flow; only the reaper can free this
+          (poll-hosted 0 "the abandoned wait was never reaped")
+          (unless (= (stat (conversation-forward-stats) 'reaped)
+                     (+ reaped0 1))
+            (fail "the reap was not counted"))
+          ;; the slot is usable again WHILE the first asker still waits
+          (let ((r (ask/wait (lambda (tag) (vector 'resume tag id6 t6 9 10000))
+                             15000 "resume after a reap")))
+            (unless (equal? (car r) (vector 'echo 9 2))
+              (fail "the pool did not admit after the reap" r)))
+          ;; the abandoned asker gets what its own deadline always meant
+          (let ((ra (await tagR 15000 "the abandoned asker never returned")))
+            (unless (eq? (cadr ra) 'unreachable)
+              (fail "the reaped forward answered something else" ra))
+            (unless (>= (caddr ra) 2900)
+              (fail "the asker came back before its own ttl" (caddr ra))))
+          ;; ...and the flow was never the target: release it and it
+          ;; parks normally, its reply to the dead messenger dropped
+          (send (whereis 'g3) (vector 'go))
+          (let-values (((st tok last) (conversation-peek id5)))
+            (unless (and (eq? st 'parked) (eq? last 'unblocked))
+              (fail "the reap harmed the flow itself" st last)))
+          (ok "a reaped wait frees the slot, counts, and spares the flow"))))
 
     (ask (vector 'quit))
     (display "ALL CONV-ADMISSION TESTS PASSED\n")
