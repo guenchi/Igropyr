@@ -26,11 +26,15 @@
 ;;; lying reader safe; these tests pin where the library's own defence
 ;;; ends.
 ;;;
-;;; Writer timing is asserted, not assumed: it runs in the conversation's
-;;; own process with interrupts ON (a competitor ticks through a slow
-;;; writer), and the terminal reply is delivered only after it returns.
-;;; A peek issued while the writer runs waits for it -- same rule as any
-;;; slow step, and the reason conversation-peek/timeout exists.
+;;; Writer timing is asserted, not assumed -- with its scope said
+;;; plainly: the probe writer YIELDS (sleep-ms), so what the ticking
+;;; competitor proves is that interrupts are on and a yielding writer
+;;; blocks only its own conversation. A writer inside a BLOCKING syscall
+;;; (durable's fsync) still stops the single-threaded world for the
+;;; syscall's own duration -- measured at 72ms for a 192 MiB write when
+;;; this was gotten wrong in prose -- and a yielding probe cannot prove
+;;; anything about that case. The terminal reply waiting for the writer,
+;;; and a same-conversation peek waiting likewise, hold either way.
 
 (import (chezscheme) (igropyr actor) (igropyr node) (igropyr conversation)
         (only (igropyr libuv) now-ms))
@@ -369,7 +373,7 @@
             ;; and the conversation was visible the whole time: a drain
             ;; must not read zero while an outcome is still being written
             (void))))
-      (ok "a slow writer blocks only its conversation; the reply waits for it"))
+      (ok "a yielding writer blocks only its conversation; the reply waits"))
     (conversation-record-hooks! log-writer script-reader)
 
     ;; ---- forwarded lookups reach the owner's reader --------------------
