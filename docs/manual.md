@@ -1668,26 +1668,57 @@ A minimal pair, durable because it goes through `(igropyr durable)`:
          (with-input-from-file (record-path id) read))))
 ```
 
-**The writer runs in the conversation's own process, with interrupts
-enabled.** It may do file I/O, wait on a message, take as long as it
-takes: the record is committed to memory *before* it is called, and the
-scheduler keeps running throughout, so a slow writer costs that one
-conversation and nothing else. Two consequences worth planning for:
+**The writer is called with interrupts enabled**, after the record is
+already committed to memory. What that does and does not buy you is
+worth being precise about, because this runtime has one OS thread:
 
-- The final value is handed back only after the writer returns. That is
-  the point — a caller told "committed" after the durable copy exists,
-  not before — but it does put the writer's latency on the reply path,
-  and `durable-write-file!` is a synchronous `fsync`.
-- A `conversation-peek` of *that* conversation waits for it, exactly as
-  it waits out any slow step. Use `conversation-peek/timeout` where the
-  asker has a deadline of its own.
+- A writer that **yields** — waits on a message, sleeps, parks — gives
+  the scheduler its turn, and costs only the conversation it belongs to.
+  Under the earlier arrangement such a writer could never be answered at
+  all, because the process that would answer it could not run.
+- A writer that makes a **blocking call** still stops every green
+  process for its whole duration. Interrupts are not a second thread,
+  and a synchronous `fsync` that has not returned is not a point at
+  which anything can be scheduled. This is the normal mode of
+  `durable-write-file!`. Measured: a 192 MiB durable write took 72ms,
+  and the longest gap between two scheduler turns in that run was also
+  72ms, against 12ms otherwise. Size your records accordingly — the cost
+  is the syscall's, and it is charged to the whole node.
 
-A conversation whose writer is still running counts as `lingering` in
-`conversation-census`, so **draining a node waits for its record writes
-to finish** rather than cutting them off: the process is alive until the
-writer returns, and a drain is not done while any conversation remains.
-That is the behaviour you want on the way out, and it is also why a
-writer that never returns will hold a drain open indefinitely.
+**Which process it runs in depends on which path published.** Normal
+completion and a failing flow publish from the conversation's own
+process. The watchdog publishes from *its* process on two paths — the
+backstop for a conversation that died some way it never described, and
+a kill it performs itself. A writer that reads `self` or anything
+process-local sees a different process there.
+
+Three further consequences:
+
+- The final value is handed back only after the writer **returns or
+  raises**. A caller is therefore told "committed" after the write was
+  *attempted*, not after it succeeded: a writer that raises is swallowed
+  and counted, and the reply goes out regardless. If a durable copy is a
+  precondition for answering, the writer must be the thing that reports
+  failure — the counters are the only other signal.
+- A `conversation-peek` waits for the writer where the conversation is
+  still alive to be asked — normal completion, a failing flow — exactly
+  as it waits out any slow step; `conversation-peek/timeout` is the
+  bounded form. On the watchdog's paths it does not wait: the
+  conversation is already dead, so the peek reads the record straight
+  out of the table. That answer is correct *because* the table is
+  written first.
+- A conversation whose writer is still running on its own process counts
+  as `lingering` in `conversation-census`, so **draining a node waits
+  for those record writes** rather than cutting them off — and a writer
+  that never returns holds a drain open indefinitely.
+
+**The writer must be idempotent in `(id, outcome)`.** Storing the same
+outcome twice has to be storing it once. First-write-wins governs the
+in-memory table, and an entry that has been pruned is no longer a first
+write: a conversation whose record was evicted and which is later killed
+has that outcome re-established from the conversation's own state, and
+published again with the same value. Overwrite a row or a file; do not
+append.
 
 **A record read through the hook is a record like any other**, including
 against the `settled?` predicate: a `'committed-then-failed` from disk
@@ -1709,8 +1740,10 @@ happening, so watch them:
 
 Installing validates the pair together — two procedures, or `#f` and
 `#f`. There is no half-installed state to be caught in, and an uninstall
-cannot interrupt a publication already decided on: the pair in force when
-the record was made is the pair that publishes it, exactly once.
+cannot interrupt a publication already decided on: the pair in force
+when the record was made is the pair that publishes it, and it is called
+once for that decision. (Once *per decision* — which is not the same as
+once per conversation; see the idempotence requirement above.)
 
 ##### What the library cannot check for you
 
@@ -1736,9 +1769,15 @@ shape:
   compared whole; a store that trims, folds case or truncates them can
   answer one conversation's question with another's record.
 
-Where the store is shared between nodes, the same reader can answer for a
-conversation this node never ran — which is what makes the record outlive
-the node, and what makes the rules above load-bearing rather than tidy.
+A shared store lets a **restarted** node answer for conversations its
+previous incarnation ran, which is what makes the record outlive the
+process and the VM. It does not make any node able to answer for any
+other: a clustered id names its owner, and a resume or peek for it is
+forwarded to that owner rather than answered from the local reader — if
+the owner cannot be reached the answer is `'unreachable`, and no reader
+is consulted. The reader answers where the question is answered
+locally: an unclustered id, or a node that has come back under the same
+identity.
 
 #### Setting the forwarding deadline
 
