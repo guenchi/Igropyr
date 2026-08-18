@@ -65,6 +65,10 @@ IGROPYR_CONTRACTS=full "$scheme_bin" --script igropyr/test/checked-full.sc
 env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/smoke-actor.sc
 "$scheme_bin" --script igropyr/test/file-read.sc
+# the async write bindings are judged by what runs BESIDE the write: a
+# green process must keep ticking while an 8 MiB write sits on the pool
+# thread. Wrapping a synchronous call in the async API scores zero there.
+"$scheme_bin" --script igropyr/test/libuv-fs-write.sc
 "$scheme_bin" --script igropyr/test/crypto.sc
 "$scheme_bin" --script igropyr/test/sexpr.sc
 "$scheme_bin" --script igropyr/test/sexpr-http.sc
