@@ -600,10 +600,13 @@
   ;;   serve-steps! -- the control structure, which knows no rules at all
   ;;
   ;; phase is the single source of truth for "is a step running", and
-  ;; set-phase! is the only writer of the boxes the watchdog reads. That
-  ;; ordering was a defect once: publishing "running" before publishing WHEN
-  ;; it started let the watchdog kill a step against the previous step's
-  ;; clock. Writing it in one place is why that cannot come back.
+  ;; set-phase! is the only writer that ARMS the boxes the watchdog reads.
+  ;; That ordering was a defect once: publishing "running" before publishing
+  ;; WHEN it started let the watchdog kill a step against the previous
+  ;; step's clock. Writing it in one place is why that cannot come back.
+  ;; disarm-watchdog! below is the only other writer and it only ever
+  ;; clears the flag, so it cannot reintroduce that defect: there is no
+  ;; timestamp to publish alongside a stop.
 
   (define-record-type (step-state make-step-state step-state?)
     (fields (mutable phase)        ; 'running | 'parked | 'completed
@@ -620,6 +623,31 @@
   ;; 'running -- so a restore that restamped would refund whatever the key
   ;; function had just spent, and a slow one would quietly hand the step a
   ;; second full allowance of the very limit the watchdog is there to keep.
+  ;; STOP THE CLOCK WITHOUT CLAIMING THE STEP FINISHED. The ttl measures
+  ;; time spent EXECUTING A STEP; once a flow has raised, the step is over
+  ;; and what remains is bookkeeping about it, which that limit was never
+  ;; measuring. Leaving the flag set through the record's publication let
+  ;; the watchdog kill the process part-way through the writer -- and
+  ;; because the tombstone was already in the table, the watchdog's own
+  ;; publication found nothing to write and did not make up for it, so the
+  ;; outcome survived only in memory. A durable record that a kill can
+  ;; erase is the one thing this mechanism exists to prevent.
+  ;;
+  ;; NOT set-phase! 'completed, which would be the obvious way to disarm
+  ;; and is wrong: the phase is answered to a peek verbatim, and a replay
+  ;; against a 'completed phase is told 'done and handed step-state-reply
+  ;; -- so a flow that RAISED would report itself finished and replay a
+  ;; reply that was never its answer. The watchdog's flag is what needs to
+  ;; stop; the phase is a different statement and stays true.
+  ;;
+  ;; The cost is deliberate and one-directional: a writer that never
+  ;; returns now holds its process forever with nothing left to kill it.
+  ;; That is visible -- the conversation keeps its census entry and a drain
+  ;; will not finish while it is there -- where the outcome it would
+  ;; otherwise lose is not visible at all.
+  (define (disarm-watchdog! st)
+    (set-box! (step-state-running-box st) #f))
+
   (define (set-phase! st phase)
     (let ((entering (and (eq? phase 'running)
                          (not (eq? (step-state-phase st) 'running)))))
@@ -3454,6 +3482,11 @@
                                                             (else 'rolled-back)))
                                                        (hs (with-interrupts-disabled
                                                              (set-box! outcome-box o)
+                                                             ;; in the same
+                                                             ;; atom as the
+                                                             ;; decision: see
+                                                             ;; disarm-watchdog!
+                                                             (disarm-watchdog! st)
                                                              (tomb-insert-as! id o))))
                                                   ;; published after the
                                                   ;; region, never inside it
