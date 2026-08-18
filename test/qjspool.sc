@@ -216,6 +216,7 @@ function eat(j){ return String(j.length); }
 (define carry-port 19734)
 (define spin-port 19732)
 (define half-port 19733)
+(define bound-port 19736)
 
 (define (write-bundle!)
   (when (file-exists? bundle-path) (delete-file bundle-path))
@@ -1946,6 +1947,62 @@ function eat(j){ return String(j.length); }
                     (check "the in-process render froze the scheduler outright"
                            (= in-process 0))))
                 (qjspool-close! spool)))))
+      ;; ---- the wire is the boundary --------------------------------------
+      ;; A render that never reached it keeps its connection. Before this,
+      ;; a pre-write failure escaped the lease and was booked broken: six
+      ;; bad requests dismantled six healthy connections. The judge is the
+      ;; stats staying FLAT -- connects, discarded and lost are three
+      ;; different signals and all three must hold still, because the two
+      ;; layers (lease guard, serve loop) each fail into a different one.
+      ;; A post-write failure must go on retiring: the render may be
+      ;; running on a worker whose state nobody can know.
+      (kill-worker! "bound")
+      (spawn-worker! "bound" bound-port 800)
+      (if (not (await-worker! bound-port 50))
+          (fail "the boundary worker never came up")
+          (let ((pool (qjspool (list (cons "127.0.0.1" bound-port))
+                               '((size . 1) (render-timeout-ms . 2000)))))
+            (define (stat3)
+              (let ((st (qjspool-stats pool)))
+                (map (lambda (k) (cond ((assq k st) => cdr) (else 0)))
+                     '(connects connections-discarded connections-lost))))
+            ;; a warm, counted baseline
+            (let-values (((k v) (qjspool-render pool "hello" "{\"name\":\"x\"}")))
+              (check "the boundary worker renders before the probes" k))
+            (let ((base (stat3)))
+              ;; the reason comes through verbatim: the whole point of
+              ;; answering a local failure is that the caller can fix its
+              ;; own input
+              (let-values (((k v) (qjspool-render pool
+                                    (make-string 70000 #\a) "{}")))
+                (check "an unencodable request is answered, not raised"
+                       (not k))
+                (check "...and the reason names the input to fix"
+                       (let loop ((i 0))
+                         (cond ((> (+ i 8) (string-length v)) #f)
+                               ((string=? (substring v i (+ i 8)) "too long") #t)
+                               (else (loop (+ i 1)))))))
+              ;; six more of the same: the pool must not shrink by one
+              ;; worker per bad request
+              (do ((i 0 (+ i 1))) ((= i 6))
+                (qjspool-render pool (make-string 70000 #\a) "{}"))
+              (check "seven local failures moved no connection counter"
+                     (equal? (stat3) base))
+              ;; the same connection still answers: no retirement happened
+              (let-values (((k v) (qjspool-render pool "hello"
+                                                  "{\"name\":\"y\"}")))
+                (check "the connection survives its callers' bad requests" k))
+              (check "...without a single reconnect" (equal? (stat3) base)))
+            ;; post-write: kill the worker mid-conversation; the transport
+            ;; path must go on retiring exactly as before
+            (kill-worker! "bound")
+            (let-values (((k v) (qjspool-render pool "hello" "{}")))
+              (check "a dead worker still fails the render" (not k)))
+            (let ((after (stat3)))
+              (check "a transport failure still costs the connection"
+                     (or (> (cadr after) 0) (> (caddr after) 0))))
+            (qjspool-close! pool)))
+      (kill-worker! "bound")
       (kill-worker! "good")
       (kill-worker! "spin")
       (kill-worker! "half")
