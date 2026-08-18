@@ -447,9 +447,13 @@
 ;;; yields 'unreachable, not 'gone: a broken link says nothing about
 ;;; whether the process behind it died.
 ;;;
-;;; FORWARDING REQUIRES A DIRECT LINK FROM THE ENTRY NODE TO THE OWNER,
-;;; which in practice means a full mesh. There is no relay routing, by
-;;; design: a resume is forwarded one hop or not at all. On a topology
+;;; FORWARDING REQUIRES A DIRECT LINK FROM THE ENTRY NODE TO THE OWNER.
+;;; There is no relay routing, by design: a resume is forwarded one hop
+;;; or not at all. A full mesh is the usual way to satisfy that, and is
+;;; required only when any node may be the entry point for any
+;;; conversation -- which is what a load balancer in front of every node
+;;; produces. A deployment with a few fixed entry nodes needs those
+;;; linked to every owner and nothing more. On a topology
 ;;; that is not fully connected -- a star, or a mesh with one link down
 ;;; -- the symptom is not an error at startup but every resume for a
 ;;; conversation owned by an unreachable node answering 'unreachable,
@@ -957,12 +961,26 @@
   ;;   "<node>~<base36 ms>-<hex>"  clustered
   ;;   "<base36 ms>-<hex>"         single node
   ;;
-  ;; THE NODE NAME IS PART OF EVERY ID THAT NODE MINTS, so the name is a
-  ;; durable identifier and not a label. Rename a node and every id it
-  ;; owns is orphaned: a resume carrying the old name is forwarded to a
-  ;; node nobody answers to and comes back 'unreachable, while the
-  ;; conversations themselves are still parked on the renamed node,
-  ;; alive and now unreachable by their own ids.
+  ;; THE NODE NAME IS PART OF EVERY CLUSTERED ID THAT NODE MINTS -- ids
+  ;; minted before node-start! carry no name and are always local, as the
+  ;; shapes above show -- so for a named node the name is a durable
+  ;; identifier and not a label. Ids already issued under the old name
+  ;; are orphaned by a rename: a resume carrying one is forwarded to a
+  ;; node nobody answers to and comes back 'unreachable.
+  ;;
+  ;; A NAME CANNOT CONTAIN `~`, which is the separator above. node-start!
+  ;; accepts any symbol, and one holding a tilde mints ids that this
+  ;; library's own parser reads as belonging to the prefix before it: on
+  ;; node `a~b` every id parses as owned by `a`, so every resume is
+  ;; forwarded off a node that is holding the conversation itself, and
+  ;; answers 'unreachable while the conversation is parked in the same
+  ;; process asking.
+  ;;
+  ;; The rename case is a deployment rule rather than a live one: a node
+  ;; will not rename itself while running (node-start! refuses a second
+  ;; call), so the way a name changes is a restart, and the parked
+  ;; conversations do not survive that either. What survives are the ids
+  ;; already handed to clients and written into their records.
   ;;
   ;; There is deliberately no alias mechanism. One would have to be
   ;; consulted on every forward, kept consistent across the cluster, and
@@ -1095,7 +1113,8 @@
 
   (define conv-router-name 'igropyr-conv-router)
   ;; THE DEFAULT, not the only value: callers may pass their own on
-  ;; resume, peek and peek/timeout. How long to wait for a forwarded
+  ;; resume and peek. Not on peek/timeout, which never forwards -- see
+  ;; the note there. How long to wait for a forwarded
   ;; answer is a property of the caller's own budget -- a payment step
   ;; and a status poll want different numbers -- and a module constant
   ;; can only give them the same one.
@@ -3013,10 +3032,23 @@
   ;; caller would get a number they did not ask for applied to a wait
   ;; they did not know about.
   (define (opt-of rest who pred what)
-    (let loop ((r rest))
-      (cond ((null? r) #f)
-            ((pred (car r)) (car r))
-            (else (loop (cdr r))))))
+    (let loop ((r rest) (found #f))
+      (cond ((null? r) found)
+            ((pred (car r))
+             ;; TWICE IS AN ERROR, NOT A PREFERENCE FOR THE FIRST. Taking
+             ;; the first and dropping the rest is what the rule stated
+             ;; above forbids, and the cost is not cosmetic: two
+             ;; deadlines means the caller waits a length they did not
+             ;; choose, and two predicates means one of them decides
+             ;; whether an 'unknown becomes 'gone -- which is a licence
+             ;; to do the work again.
+             (when found
+               (assertion-violation who
+                 (string-append "two " (symbol->string what)
+                                " arguments were given")
+                 rest))
+             (loop (cdr r) (car r)))
+            (else (loop (cdr r) found)))))
 
   (define (check-opts! rest who)
     (for-each
