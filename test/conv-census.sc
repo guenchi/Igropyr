@@ -310,6 +310,17 @@
               (fail "an admitted conversation was invisible to the census"
                     c))))
         (ok "an admitted conversation is counted before it first runs")
+        ;; the id handed to the caller is a mutable string, and a census
+        ;; keyed by its content would lose a LIVE conversation to one
+        ;; string-set! -- enumerable but unreachable, another false zero.
+        ;; The census must be keyed by something the caller cannot bend
+        (let ((c0 (string-ref idp 0)))
+          (string-set! idp 0 #\Z)
+          (unless (= 1 (cdr (assq 'total (conversation-census))))
+            (fail "mutating the returned id string bent the census"
+                  (conversation-census)))
+          (string-set! idp 0 c0))
+        (ok "the census survives the caller mutating the id string")
         ;; leave the node as drained as we found it
         (kill (whereis (string->symbol (string-append "igropyr-conv-" idp)))
               'census-drain)
