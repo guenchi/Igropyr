@@ -1082,19 +1082,38 @@
         (eq? x 'commit-uncertain-then-failed)
         (eq? x 'killed)))
 
+  (define (count-reader-error!)
+    (set-box! record-reader-errors (+ (unbox record-reader-errors) 1)))
+
+  ;; Not a record, not #f, and not anything a reader can return: the mark
+  ;; for "answered with the wrong NUMBER of values", which has to be told
+  ;; apart from every legal answer including #f.
+  (define record-bad-arity (list 'record-bad-arity))
+
   (define (record-read id)
     (let ((hs (unbox record-hooks)))
       (and hs
-           (let ((v (guard (e (#t (set-box! record-reader-errors
-                                            (+ (unbox record-reader-errors) 1))
-                                  #f))
-                      ((cdr hs) id))))
-             (cond ((not v) #f)
+           ;; CALL-WITH-VALUES AND A VARIADIC CONSUMER, BOTH INSIDE THE
+           ;; GUARD -- the shape resolve-unknown already uses, for the same
+           ;; reason. A reader that returns no value or several is not
+           ;; raising: the wrong-number-of-values condition is signalled
+           ;; where its result meets a single-value binding. With the guard
+           ;; around the call alone, that point is OUTSIDE it, so the
+           ;; condition escaped through conversation-peek and
+           ;; conversation-resume! -- taking down the public call that a
+           ;; misbehaving reader was only supposed to leave unanswered, and
+           ;; counting nothing.
+           (let ((v (guard (e (#t (count-reader-error!) #f))
+                      (call-with-values
+                        (lambda () ((cdr hs) id))
+                        (lambda vs
+                          (if (and (pair? vs) (null? (cdr vs)))
+                              (car vs)
+                              record-bad-arity))))))
+             (cond ((eq? v record-bad-arity) (count-reader-error!) #f)
+                   ((not v) #f)
                    ((record-value? v) v)
-                   (else
-                    (set-box! record-reader-errors
-                              (+ (unbox record-reader-errors) 1))
-                    #f))))))
+                   (else (count-reader-error!) #f))))))
 
   ;; -> the hook pair to publish this record with, or #f when nothing was
   ;; written (first-write-wins) or no hooks are installed. The caller
