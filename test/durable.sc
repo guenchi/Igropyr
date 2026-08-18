@@ -34,8 +34,14 @@
   (let* ((m (symbol->string (machine-type))) (n (string-length m)))
     (and (>= n 3) (string=? (substring m (- n 3) n) "osx"))))
 
+;; The workspace parent is overridable so this suite can be pointed at
+;; any mounted filesystem -- a file-backed ZFS pool, an NFS mount --
+;; without editing anything: the sequence under test is pure POSIX, and
+;; where it runs is exactly the variable worth varying.
 (define root
-  (format "/tmp/igropyr-durable-test-~a-~a" (get-process-id) (real-time)))
+  (format "~a/igropyr-durable-test-~a-~a"
+          (or (getenv "IGROPYR_DURABLE_TEST_ROOT") "/tmp")
+          (get-process-id) (real-time)))
 (system (string-append "rm -rf " root "; mkdir -p " root))
 
 ;; ---- trace collection ---------------------------------------------------
