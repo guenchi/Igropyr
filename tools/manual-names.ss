@@ -56,7 +56,10 @@
      ("ws-send!"          . "Goeteia's (web ws), shown as the browser side")
      ("sse-connect!"      . "Goeteia's (web sse), shown as the browser side"))
     ("igropyr-dev.md"
-     ("conversation-parked?" . "printed on purpose as the example of an invented name; the passage is about the fact that it does not exist"))))
+     ("conversation-parked?" . "printed on purpose as the example of an invented name; the passage is about the fact that it does not exist")
+     ("-extended" . "the sexpr row names the string->sexpr-extended variants by their suffix; the full names exist")
+     ("node-cron" . "the porting map's LEFT column: the Node package being ported FROM, not a claim about this library")
+     ("app-get/" . "a truncated elision (app-get/...) in the Router row; the trailing dots are cell prose"))))
 
 (define (accepted? file tok)
   (let loop ((rest ACCEPTED))
@@ -132,6 +135,20 @@
                (else (scan (+ j 1))))))
       (else (loop (+ i 1) out)))))
 
+;; A table row is names in the open: the module map and the contract
+;; tables print exported identifiers as bare cell text, with no backticks
+;; around them. Those tables are where names are densest and where an
+;; invented one reads most plausibly -- and for a while this tool never
+;; looked at them: it reported "1 hit" on a document whose whole point is
+;; a table of exports, and its pass line read like a clean sweep. A guard
+;; whose coverage silently excludes the richest input is worse than no
+;; guard, because the green is indistinguishable from not having looked.
+(define (table-line? line)
+  (let skip ((k 0))
+    (cond ((>= k (string-length line)) #f)
+          ((char=? (string-ref line k) #\space) (skip (+ k 1)))
+          (else (char=? (string-ref line k) #\|)))))
+
 (define (fence-line? line)
   (let skip ((k 0))
     ;; a closing fence is exactly three characters long, so this is > and
@@ -140,6 +157,34 @@
     (cond ((> (+ k 3) (string-length line)) #f)
           ((char=? (string-ref line k) #\space) (skip (+ k 1)))
           (else (string=? (substring line k (+ k 3)) "```")))))
+
+;; A slash compound may be one real name (conversation-peek/timeout) or a
+;; documentation ELISION packing several names into one cell
+;; (app-get/post/put/delete, conversation-gone?/-stale?/...). Only after
+;; the whole token misses is it read as an elision: every segment must
+;; then be either a plain tail with no hyphen (post, run!), a real name
+;; itself, or a "-tail" that becomes real when given the first segment's
+;; prefix. One unresolvable segment fails the whole token, so an invented
+;; name cannot hide inside a list of real ones.
+(define (elision-resolves? tok name-set)
+  (let ((segs (let loop ((i 0) (start 0) (out '()))
+                (cond ((>= i (string-length tok))
+                       (reverse (cons (substring tok start i) out)))
+                      ((char=? (string-ref tok i) #\/)
+                       (loop (+ i 1) (+ i 1)
+                             (cons (substring tok start i) out)))
+                      (else (loop (+ i 1) start out))))))
+    (and (> (length segs) 1)
+         (let ((prefix (head-segment (car segs))))
+           (for-all
+             (lambda (seg)
+               (or (string=? seg "")
+                   (not (memv #\- (string->list seg)))
+                   (hashtable-ref name-set seg #f)
+                   (and (char=? (string-ref seg 0) #\-)
+                        (hashtable-ref name-set
+                                       (string-append prefix seg) #f))))
+             segs)))))
 
 (define (head-segment s)
   (let loop ((i 0))
@@ -189,7 +234,11 @@
                      (for-each (lambda (n) (hashtable-set! h (head-segment n) #t))
                                names)
                      h))
-         (hits '()))
+         (hits '())
+         ;; how many tokens LOOKED like claims about this library --
+         ;; printed beside the hit count, so "0 hits from 4 candidates"
+         ;; and "0 hits from 400" stop reading identically
+         (candidates 0))
     (when (null? files)
       (printf "manual-names: SKIPPED -- ~a holds no .sc sources\n" libdir)
       (exit 2))
@@ -211,19 +260,27 @@
                                      ;; elision, not a name
                                      (not (char=? #\- (string-ref
                                             tok (- (string-length tok) 1))))
-                                     (hashtable-ref head-set (head-segment tok) #f)
-                                     (not (hashtable-ref name-set tok #f)))
-                            (set! hits (cons (cons tok lineno) hits))))
+                                     (hashtable-ref head-set (head-segment tok) #f))
+                            (set! candidates (+ candidates 1))
+                            (unless (or (hashtable-ref name-set tok #f)
+                                        (elision-resolves? tok name-set))
+                              (set! hits (cons (cons tok lineno) hits)))))
                         (if in-block
                             (call-position-tokens span)
                             (tokens-in span))))
-                    (if in-block (list line) (backtick-spans line)))
+                    (cond (in-block (list line))
+                          ;; a table row is scanned WHOLE: its cells hold
+                          ;; bare names, and tokens-in also picks up any
+                          ;; backticked ones, so the row replaces the
+                          ;; span scan rather than adding to it
+                          ((table-line? line) (list line))
+                          (else (backtick-spans line))))
                   (loop (+ lineno 1) in-block))))))))
     (let* ((hits (reverse hits))
            (unexplained
              (filter (lambda (h) (not (accepted? manual (car h)))) hits)))
-      (printf "manual-names: ~a name prefixes, ~a hit~a, ~a accepted\n"
-              (hashtable-size head-set) (length hits)
+      (printf "manual-names: ~a name prefixes, ~a candidates examined, ~a hit~a, ~a accepted\n"
+              (hashtable-size head-set) candidates (length hits)
               (if (= 1 (length hits)) "" "s")
               (- (length hits) (length unexplained)))
       (cond
