@@ -218,6 +218,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/connpool-stats.sc
 # mysql option validation (no server needed, always runs)
 "$scheme_bin" --script igropyr/test/mysql-opts.sc
+# mysql-observe! and mysql-query share one cfg object (no server needed,
+# always runs): the engine is covered elsewhere against fake cfgs; only
+# driving the real driver cfg can see an install that wrote into a copy
+"$scheme_bin" --script igropyr/test/mysql-observe.sc
 # mysql wire-level, against an in-process fake server (always runs): the
 # handshake, a result set reassembled across 256 fragment boundaries, and
 # refusal of a packet the 24-bit length field cannot describe
