@@ -2211,8 +2211,8 @@ and expect the ids it minted under the old name to be unreachable.
 
 ### What the cluster has to look like
 
-Two constraints on the deployment, both of which are contracts rather than
-observations about the current implementation.
+Three constraints on the deployment, all of which are contracts rather
+than observations about the current implementation.
 
 **Forwarding needs a direct link from the entry node to the owner — in
 practice, a full mesh.** A resume that lands on the wrong node is forwarded
@@ -2228,8 +2228,29 @@ this library's: it needs a view of the topology, a policy for choosing among
 paths, and answers for loops and for a relay that dies mid-hop. The
 distribution layer is where those would belong if they are ever wanted.
 
+One hop is also what the cost is: a forwarded resume or peek is one
+request and one reply across the link, so it completes in one round trip
+and no more. Measured on an intercontinental link of about 199 ms RTT,
+that is what both cost — and a refusal costs the same, so `'overloaded`
+comes back within a round trip rather than at a timeout. That matters
+more at real latency than at loopback: it is what keeps "busy" and
+"unreachable" distinguishable by how fast they answer, instead of both
+arriving as a wait that ran out.
+
+**A node accepts peers on 127.0.0.1 unless told otherwise.**
+`(node-start! name secret [port [host]])` binds the loopback address when
+the fourth argument is omitted, which is the right default for a single
+machine and silently wrong for a mesh spanning several: the listener
+starts, the node looks healthy, and peers on other machines simply cannot
+reach it. Nothing reports a misconfiguration — the first symptom is that
+every cross-machine forward times out, which reads exactly like a peer
+that is down. Pass the address the other nodes will dial (`"0.0.0.0"`, or
+the interface the private network is on).
+
 **The node name is part of every id that node mints**, which makes it a
-durable identifier rather than a label. Rename a node and every id it owns
+durable identifier rather than a label — and it may not contain `~`,
+which is what separates the node name from the id body; `node-start!`
+refuses one that does. Rename a node and every id it owns
 is orphaned: a resume carrying the old name is forwarded to a node nobody
 answers to and comes back `'unreachable`, while the conversations are still
 parked on the renamed node — alive, and no longer reachable by their own
