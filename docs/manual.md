@@ -1585,14 +1585,24 @@ off any of them is a positive claim derived from missing evidence.
 Never from a record that merely says the flow raised, either: that is
 what `commit!` splits in two.
 
-The library keeps four outcomes apart, and every answer is read off one:
+The library keeps five outcomes apart, and every answer is read off one:
 
 | record | meaning | answer |
 |---|---|---|
 | settled | the flow returned | `'settled` |
 | rolled back | left through its winders, `commit!` had not returned | `'gone` |
 | committed then failed | left through its winders *after* `commit!` returned | `'unknown` |
+| commit uncertain then failed | left through its winders after `commit!` reported the commit as a *maybe* | `'unknown` |
 | killed / no record | stopped in flight, or stopped in a way nothing recorded | `'unknown` |
+
+The last three answer alike here and are still three records, not one.
+The two failure records part company under a `settled?` predicate
+answering `#f`: against a commit this library watched return that is a
+contradiction and the answer stays `'unknown`, while against a commit
+the flow only called a maybe it is the new information that settles the
+question, and the answer becomes `'gone`. Folding them together would
+close the one reconciliation route that is legitimate — see *Answering
+`'unknown` yourself* below.
 
 `'unknown` licenses one thing less than `'gone`: **do not resubmit**.
 Reconcile against your own state, which is where the truth still is. It
@@ -1673,9 +1683,13 @@ already committed to memory. What that does and does not buy you is
 worth being precise about, because this runtime has one OS thread:
 
 - A writer that **yields** — waits on a message, sleeps, parks — gives
-  the scheduler its turn, and costs only the conversation it belongs to.
+  the scheduler its turn, and costs only the process that called it.
   Under the earlier arrangement such a writer could never be answered at
-  all, because the process that would answer it could not run.
+  all, because the process that would answer it could not run. Which
+  process pays depends on the path: on the two below where the
+  conversation publishes for itself, the conversation waits and is still
+  counted by a drain; on the watchdog's paths the conversation is
+  already gone and the waiting is the watchdog's, which nothing counts.
 - A writer that makes a **blocking call** still stops every green
   process for its whole duration. Interrupts are not a second thread,
   and a synchronous `fsync` that has not returned is not a point at
@@ -1711,14 +1725,15 @@ Three further consequences:
   has a census entry, so **draining a node waits for those record
   writes** rather than cutting them off — and a writer that never
   returns holds a drain open indefinitely.
-- **The conversation's `ttl` does not bound the writer.** It bounds time
-  spent executing a step, and every publication happens after the step
-  it describes is over: the watchdog's clock is stopped before the
-  record is published, on the failing path as on the normal one. That is
-  deliberate — a writer killed part-way leaves an outcome that exists
-  only in memory, which is the failure the record was there to prevent —
-  but it means a writer is bounded by nothing except itself. Give one
-  that can wait its own deadline.
+- **The conversation's `ttl` does not bound the writer, on any path.**
+  It bounds time spent executing a step. Where the conversation
+  publishes for itself — normal completion, a failing flow — the
+  watchdog's clock is stopped first, deliberately: a writer killed
+  part-way leaves an outcome that exists only in memory, which is the
+  failure the record was there to prevent. Where the watchdog publishes,
+  the writer is running *in the watchdog*, and there is no second
+  watchdog behind it. Either way a writer is bounded by nothing but
+  itself. Give one that can wait its own deadline.
 
 **The writer must be idempotent in `(id, outcome)`.** Storing the same
 outcome twice has to be storing it once. First-write-wins governs the
