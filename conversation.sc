@@ -2548,12 +2548,16 @@
              ;; reach any more.
              (spawn
                (lambda ()
-                 (register name self)
-                 ;; booked where the name is taken and dropped where it is
-                 ;; given up, so the table changes exactly when the
-                 ;; registry does -- except for a kill, which the census
-                 ;; reconciles when it is read
-                 (census-add! id self running-box settled-box)
+                 ;; ONE ACT, because between them the conversation is
+                 ;; registered and not yet counted: a census taken in that
+                 ;; instant reports one fewer than exist, and a drain
+                 ;; reading zero there would be reading a lie. (The
+                 ;; opposite direction is already covered -- an entry
+                 ;; whose name no longer resolves to it is dropped when
+                 ;; the census is read.)
+                 (with-interrupts-disabled
+                   (register name self)
+                   (census-add! id self running-box settled-box))
                  ;; A WATCHDOG, because the TTL below only bounds time spent
                  ;; parked in suspend!. A step that runs long -- slow I/O, a
                  ;; wait that never returns, a CPU loop -- leaves that receive
@@ -3231,17 +3235,7 @@
   (define (conversation-run! h)
     (unless (conv-handle? h)
       (assertion-violation 'conversation-run! "not a conversation handle" h))
-    ;; REFUSED BEFORE ANYTHING HAPPENS. This is the only place new work
-    ;; is turned away, and it is placed ahead of the claim, so a refused
-    ;; run leaves the handle exactly as it was: still prepared, still
-    ;; runnable, on this node later or on another one now.
-    ;;
-    ;; It raises rather than returning a status because a caller that
-    ;; ignored a status here would proceed as though a conversation had
-    ;; started. The irritant carries the node so a caller behind a load
-    ;; balancer can tell which one is leaving.
-    (when (unbox conv-quiescing)
-      (raise (vector 'conversation-quiescing (node-self))))
+
     (let ((id (conv-handle-id h)))
       (let* ((ref (gensym))
              (starter self)
@@ -3273,6 +3267,21 @@
                (with-interrupts-disabled
                  (let ((s (conv-handle-state h)))
                    (cond
+                     ;; QUIESCING IS READ IN HERE, with the claim, for the
+                     ;; same reason the node check is. Read outside, the
+                     ;; answer can go stale before it is used: a run! that
+                     ;; saw #f, was preempted while another process
+                     ;; quiesced the node and watched the census reach
+                     ;; zero, and then resumed, would claim and spawn a
+                     ;; conversation on a node that had already been
+                     ;; declared drained. "Quiescing and a total of zero
+                     ;; means no more will start" is the whole of what a
+                     ;; drain promises, and a check outside this region is
+                     ;; exactly the gap that breaks it.
+                     ;;
+                     ;; Still ahead of every effect: the refusal leaves
+                     ;; the handle prepared and runnable elsewhere.
+                     ((unbox conv-quiescing) (cons 'quiescing (node-self)))
                      ((not (eq? s 'prepared)) (cons 'bad s))
                      ((not (eq? (conv-handle-owner h) (node-self)))
                       (cons 'node (list 'prepared-under (conv-handle-owner h)
@@ -3297,6 +3306,15 @@
                          (ensure-router!)
                          (cons 'ok (launch starter ref)))))))))
         ;; raised out here, as everywhere else in this file
+        ;;
+        ;; A raise rather than a status, because a caller who ignored a
+        ;; status would carry on as though a conversation had started.
+        ;; The bare vector matches how this library already reports a
+        ;; refusal a caller may want to match on, and it carries the node
+        ;; so a caller behind a load balancer can tell which one is
+        ;; leaving.
+        (when (eq? (car claim) 'quiescing)
+          (raise (vector 'conversation-quiescing (cdr claim))))
         (when (eq? (car claim) 'bad)
           (assertion-violation 'conversation-run!
             "conversation handle is not prepared" (cdr claim)))
