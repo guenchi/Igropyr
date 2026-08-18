@@ -1927,7 +1927,12 @@ courier; ending it leaves the conversation itself untouched, so the step
 finishes and the flow parks as it would have. The asker sees `'unreachable`,
 which already means the request may have been acted on — reconcile rather
 than retry. A rising `reaped` count is the signal that capacity is going to
-work nobody is waiting for.
+work nobody is waiting for — read it as pressure rather than as a tally, since
+a worker that finishes at the instant its hold expires is counted too.
+
+Each admitted forward costs the owner two processes, the worker and the one
+watching its deadline, so a node at the default limit carries 512 of them
+rather than 256.
 
 `conversation-forward-stats` reads the forwarding side: `attempted`,
 `refused`, `completed`, `unreachable`, `reaped`, the live `hosted` count and
