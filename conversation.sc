@@ -534,7 +534,8 @@
           conversation-unreachable? conversation-overloaded?
           conversation-no-answer-yet?
           conversation-forward-stats conv-set-forward-limit!
-          conv-set-forward-hold-ms!)
+          conv-set-forward-hold-ms!
+          conversation-census conversation-quiesce! conversation-quiescing?)
   (import (chezscheme) (igropyr actor)
           (igropyr conv-status)
           (only (igropyr libuv) now-ms)
@@ -1165,6 +1166,94 @@
   ;; is an integer (equal?-matchable across the codec).
 
   (define conv-router-name 'igropyr-conv-router)
+  ;; ---- census and quiesce -----------------------------------------------
+  ;;
+  ;; BOTH ARE NODE-LOCAL. Nothing here crosses a link, adds a frame or
+  ;; changes one, so a mesh may run any mixture of versions while this is
+  ;; in use: an older node simply does not have the questions.
+  ;;
+  ;; THE CENSUS KEEPS ITS OWN BOOKS rather than scanning the process
+  ;; registry for names that begin with the conversation prefix. A naming
+  ;; convention is not a semantic test -- it would count anything else
+  ;; that adopted the prefix and miss a conversation that ever stopped
+  ;; using it, and it would make the prefix load-bearing in a way nothing
+  ;; declares.
+  ;;
+  ;; But the books are a HINT, not the truth. A conversation killed
+  ;; outright is unregistered by the scheduler, which knows nothing about
+  ;; this table, so an entry can name a pid that is gone or a name now
+  ;; held by something else. The registry is the source of truth: each
+  ;; entry is checked against it when the census is taken, and one that
+  ;; no longer matches is dropped there and then. That makes reading the
+  ;; census the thing that repairs it, so nothing has to sweep on a timer.
+  (define conv-census (make-hashtable string-hash string=?))
+
+  (define (census-add! id p running-box settled-box)
+    (with-interrupts-disabled
+      (hashtable-set! conv-census id (vector p running-box settled-box))))
+
+  (define (census-drop! id)
+    (with-interrupts-disabled (hashtable-delete! conv-census id)))
+
+  ;; running -- the flow is executing a step
+  ;; parked  -- waiting in suspend! for the next request
+  ;; lingering -- the flow returned and this is the window where the final
+  ;;              reply can still be replayed; it still holds its name, so
+  ;;              a drain is not finished while any remain
+  (define (conversation-census)
+    (with-interrupts-disabled
+      (let loop ((ks (vector->list (hashtable-keys conv-census)))
+                 (running 0) (parked 0) (lingering 0))
+        (if (null? ks)
+            (list (cons 'running running)
+                  (cons 'parked parked)
+                  (cons 'lingering lingering)
+                  (cons 'total (+ running parked lingering)))
+            (let* ((id (car ks))
+                   (e (hashtable-ref conv-census id #f)))
+              (cond
+                ((not e) (loop (cdr ks) running parked lingering))
+                ((not (eq? (whereis (conversation-name id)) (vector-ref e 0)))
+                 (hashtable-delete! conv-census id)
+                 (loop (cdr ks) running parked lingering))
+                ((unbox (vector-ref e 2))
+                 (loop (cdr ks) running parked (+ lingering 1)))
+                ((unbox (vector-ref e 1))
+                 (loop (cdr ks) (+ running 1) parked lingering))
+                (else (loop (cdr ks) running (+ parked 1) lingering))))))))
+
+  ;; QUIESCE STOPS NEW WORK, NOT WORK IN FLIGHT. It gates one thing --
+  ;; starting a conversation -- and deliberately nothing else:
+  ;;
+  ;;   - a resume or peek of a conversation already here still works.
+  ;;     Refusing those would strand exactly the dialogues the drain is
+  ;;     waiting for, so a node that refused them could never finish
+  ;;     draining;
+  ;;   - a resume forwarded from another node still works, for the same
+  ;;     reason: it is how a conversation owned here makes progress;
+  ;;   - prepare! still works. It has no effect to withhold; what it
+  ;;     hands back is an id, and the refusal lands at run! before
+  ;;     anything can have happened.
+  ;;
+  ;; It is a switch and not a ratchet: turning it off resumes normal
+  ;; service, so a node pulled from a rotation can be put back.
+  (define conv-quiescing (box #f))
+
+  (define (conversation-quiesce! on?)
+    (unless (boolean? on?)
+      (assertion-violation 'conversation-quiesce!
+        "argument must be #t or #f" on?))
+    (with-interrupts-disabled (set-box! conv-quiescing on?))
+    on?)
+
+  (define (conversation-quiescing?) (unbox conv-quiescing))
+
+  ;; DRAINED IS A QUESTION THE CALLER ASKS, not a fourth entry point:
+  ;; quiescing and a census total of zero. A hook that announced it would
+  ;; be an addition, and can be one later; a predicate that merely reads
+  ;; two things this file already exposes would be a third name for what
+  ;; the caller can already see.
+
   ;; ---- forwarding admission -------------------------------------------
   ;;
   ;; A FORWARD SPAWNS A PROCESS ON THE OWNER, and until this cap there was
@@ -2460,6 +2549,11 @@
              (spawn
                (lambda ()
                  (register name self)
+                 ;; booked where the name is taken and dropped where it is
+                 ;; given up, so the table changes exactly when the
+                 ;; registry does -- except for a kill, which the census
+                 ;; reconciles when it is read
+                 (census-add! id self running-box settled-box)
                  ;; A WATCHDOG, because the TTL below only bounds time spent
                  ;; parked in suspend!. A step that runs long -- slow I/O, a
                  ;; wait that never returns, a CPU loop -- leaves that receive
@@ -3113,7 +3207,8 @@
                      (serve-steps! st (+ (now-ms) ttl) safe-key
                        (lambda (from ref2 token r) 'unreachable)
                        (lambda () 'done))
-                     (unregister name)))))))
+                     (unregister name)
+                     (census-drop! id)))))))
          conv)))))
 
   ;; Start the prepared conversation and park until its first suspend!.
@@ -3136,6 +3231,17 @@
   (define (conversation-run! h)
     (unless (conv-handle? h)
       (assertion-violation 'conversation-run! "not a conversation handle" h))
+    ;; REFUSED BEFORE ANYTHING HAPPENS. This is the only place new work
+    ;; is turned away, and it is placed ahead of the claim, so a refused
+    ;; run leaves the handle exactly as it was: still prepared, still
+    ;; runnable, on this node later or on another one now.
+    ;;
+    ;; It raises rather than returning a status because a caller that
+    ;; ignored a status here would proceed as though a conversation had
+    ;; started. The irritant carries the node so a caller behind a load
+    ;; balancer can tell which one is leaving.
+    (when (unbox conv-quiescing)
+      (raise (vector 'conversation-quiescing (node-self))))
     (let ((id (conv-handle-id h)))
       (let* ((ref (gensym))
              (starter self)
