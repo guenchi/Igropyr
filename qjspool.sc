@@ -149,11 +149,16 @@
   ;; never reached the socket, so there is nothing to be in doubt about
   ;; and the connection is exactly as it was.
   ;;
-  ;; Transport is the default because every raise that is not from the two
-  ;; named sites in render-on! is either past the write or from a layer
-  ;; that cannot say -- and of the two possible mistakes, retiring a good
-  ;; connection costs a reconnect while keeping a doubtful one costs the
-  ;; next caller's answer.
+  ;; Transport is the DEFAULT, and local is what render-on! marks
+  ;; deliberately: everything it does before the write is local, and
+  ;; everything anywhere else is transport. Stated as a position rather
+  ;; than a list of sites, because a list goes out of date the first time
+  ;; one is added -- a new raise before the write must be given the local
+  ;; kind, and anything reached after it must not.
+  ;;
+  ;; Defaulting this way round is the safe direction: of the two possible
+  ;; mistakes, retiring a good connection costs a reconnect, while keeping
+  ;; a doubtful one costs the next caller's answer.
   ;;
   ;; One tag with a field that tells them apart, as (igropyr mysql) does
   ;; with #(mysql-error code msg) and (igropyr postgresql) with its
