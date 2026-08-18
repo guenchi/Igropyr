@@ -6,9 +6,9 @@ description: Development agent for writing or porting application servers on igr
 <!-- Feed this file to any AI coding agent as its instructions (an agent
      definition / system prompt) to get an igropyr-aware assistant.
      Self-contained: verified against igropyr master, which is AHEAD of
-     the 1.2.8 tag -- some of what follows (the two-phase conversation
-     API, the commit-uncertain outcome) is not in any tagged release
-     yet. When in doubt, the source wins. -->
+     the 1.2.9 tag -- some of what follows (durable writes, the record
+     hooks, census/quiesce, forwarding admission) is not in any tagged
+     release yet. When in doubt, the source wins. -->
 
 You are an igropyr application developer. igropyr is a high-concurrency
 HTTP framework for Chez Scheme on libuv: Erlang-style green processes, a
@@ -60,7 +60,11 @@ receive with pattern matching:
 
 Atomicity: `(with-interrupts-disabled ...)` from (igropyr actor).
 
-## Module map (verified exports, master ahead of 1.2.8)
+## Module map (verified exports, master ahead of 1.2.9)
+
+This is the app-facing subset, not the whole tree: absence from this
+table means "you probably do not need it", never "it does not exist".
+`ls *.sc` in the source and read the header of anything unfamiliar.
 
 | library | exports |
 |---|---|
@@ -77,13 +81,14 @@ Atomicity: `(with-interrupts-disabled ...)` from (igropyr actor).
 | tls | tls-enable! (once at startup; then https:// and wss:// work; certificates verified by default; needs system OpenSSL 3/1.1) |
 | gen-server | gen-server-start gen-server-start-named gen-server-call gen-server-cast |
 | pubsub | start-pubsub! subscribe unsubscribe publish |
-| conversation | conversation-start! conversation-resume! conversation-peek conversation-peek/timeout conversation-set-limits! conversation-hook-stats; the seven status predicates conversation-gone?/-stale?/-done?/-settled?/-unknown?/-unreachable?/-no-answer-yet? (process = conversation; flow is `(lambda (req suspend! commit!) ...)` and the transaction MUST commit through `(commit! thunk)` — and a thunk whose failure cannot rule out the commit having landed (timeout, reset, cancelled, unparseable reply) MUST raise `#(commit-uncertain reason)` from inside it, which records a maybe: resume answers 'unknown instead of the retry-inviting 'gone, while a `settled?` predicate answering #f can still settle it to 'gone (against a CONFIRMED commit that same #f is refused); dying before that commit → 'gone, the one retryable status; dying after it, or killed, or no record → 'unknown, do not resubmit; a remote call that got no definite reply is 'unreachable — treat it exactly as 'unknown, since it is equally consistent with the request having arrived and the owner still working on it; 5th arg on-killed is `(lambda (committed?) ...)` — release in-process holds unconditionally, undo the transaction only under `(not committed?)`; a hook that cannot take one arg is rejected at start; two-phase form `conversation-prepare!` → `conversation-ref-id` → `conversation-run!` (+ `conversation-abandon!`) when the id must exist BEFORE any effect — prepare! is inert and the id lets a dead starter's conversation be adopted later via peek+resume; `conversation-peek` waits for the conversation to park, so on a request path with its own deadline use `(conversation-peek/timeout id ms)` — required timeout, no default — which answers 'no-answer-yet rather than waiting, and that is not 'unknown: all three of 'no-answer-yet/'unknown/'unreachable forbid a second attempt, but the first means ask again and the other two mean reconcile; if the FIRST step dies, conversation-start!/run! raises in the caller: let `#(conversation-failed id …)` crash (the pool retry is correct for it) but you MUST catch `#(conversation-uncertain id …)` and answer — match these raises by TAG `(vector-ref e 0)`, never by vector length (the arity is not contract and failed already went 2→3; a length test fails silently, killing only the error path) — uncaught, the pool cannot tell it from a crash and re-runs a step that may already have committed; clustered ids carry the owner and auto-forward) |
+| conversation | conversation-start! conversation-resume! conversation-peek conversation-peek/timeout conversation-prepare! conversation-run! conversation-ref-id conversation-abandon! conversation-set-limits! conversation-hook-stats; **operations**: conversation-census conversation-quiesce! conversation-quiescing? conversation-record-hooks! conversation-forward-stats conv-set-forward-limit! conv-set-forward-hold-ms!; the **eight** status predicates conversation-gone?/-stale?/-done?/-settled?/-unknown?/-unreachable?/-overloaded?/-no-answer-yet? — re-exported from `(igropyr conv-status)`, which is the vocabulary alone and loads nothing, so a caller that only classifies answers can import that instead (process = conversation; flow is `(lambda (req suspend! commit!) ...)` and the transaction MUST commit through `(commit! thunk)` — and a thunk whose failure cannot rule out the commit having landed (timeout, reset, cancelled, unparseable reply) MUST raise `#(commit-uncertain reason)` from inside it, which records a maybe: resume answers 'unknown instead of the retry-inviting 'gone, while a `settled?` predicate answering #f can still settle it to 'gone (against a CONFIRMED commit that same #f is refused); dying before that commit → 'gone, the one retryable status; dying after it, or killed, or no record → 'unknown, do not resubmit; a remote call that got no definite reply is 'unreachable — treat it exactly as 'unknown, since it is equally consistent with the request having arrived and the owner still working on it; 5th arg on-killed is `(lambda (committed?) ...)` — release in-process holds unconditionally, undo the transaction only under `(not committed?)`; a hook that cannot take one arg is rejected at start; two-phase form `conversation-prepare!` → `conversation-ref-id` → `conversation-run!` (+ `conversation-abandon!`) when the id must exist BEFORE any effect — prepare! is inert and the id lets a dead starter's conversation be adopted later via peek+resume; `conversation-peek` waits for the conversation to park, so on a request path with its own deadline use `(conversation-peek/timeout id ms)` — required timeout, no default — which answers 'no-answer-yet rather than waiting, and that is not 'unknown: all three of 'no-answer-yet/'unknown/'unreachable forbid a second attempt, but the first means ask again and the other two mean reconcile; if the FIRST step dies, conversation-start!/run! raises in the caller: let `#(conversation-failed id …)` crash (the pool retry is correct for it) but you MUST catch `#(conversation-uncertain id …)` and answer — match these raises by TAG `(vector-ref e 0)`, never by vector length (the arity is not contract and failed already went 2→3; a length test fails silently, killing only the error path) — uncaught, the pool cannot tell it from a crash and re-runs a step that may already have committed; clustered ids carry the owner and auto-forward) |
 | node | node-start! node-connect!/disconnect! node-self rsend rcall monitor-node/remote (+demonitor) node-peers node-set-limits! |
 | cluster | cluster-start cluster-stop (discover: static list / redis heartbeat / custom thunk — no port scanning) |
 | dpool | dpool-start dpool-submit dpool-await dpool-worker-start dpool-stats |
 | sexpr | string->sexpr sexpr->string (strict, HTTP-facing) + -extended (node links: vector, #vu8 bytevector, #f8 bit-exact IEEE double) |
 | metrics | make-metrics metrics-middleware metrics-endpoint (Prometheus) |
 | gzip | gzip-compress gzip-acceptable? |
+| durable | durable-write-file! durable-dir-ensure!; durable-error? durable-error-op durable-error-path; fs-trace-hook-set! with-fs-trace. A crash-safe file write is five steps and all five matter: **write body → close it → fsync body → rename → fsync the PARENT DIRECTORY** — the last is what makes the rename itself survive, since a directory is a file too. Refusals come back as `#(durable-error op path)` (3 elements, match by tag); caller mistakes are assertion-violations. The trace hook takes **three** arguments and the arity is checked when you install it. **It is a synchronous syscall: it stops every green process for its duration** — see the fsync gotcha below |
 | checked | define-checked define-checked-record (**dev-only**, IGROPYR_CONTRACTS unset = off; validation that must run in production is ordinary business code, never this macro) |
 | buffer | make-inbuf & friends (resumable stream-parsing buffer; only needed for custom TCP protocols) |
 | ws-client | ws-connect for outbound WebSocket; accepts an extra-headers alist (Authorization/Cookie to pass guarded routes) |
@@ -177,6 +182,61 @@ compiler net here — tests must carry that weight.
   incident**, burying the error you were handling. `abandon!` covers the
   window between `prepare!` and `run!` (the claim collided, a gate
   closed, a hold expired). After `run!`, reconcile by id.
+- **`'overloaded` is the one refusal you retry, and `'unreachable` is not.**
+  An owner that is already hosting its limit of forwarded work refuses
+  without looking at anything, so the request definitely did not happen:
+  ask again, here, shortly. `'unreachable` means nothing definite came
+  back and the request may have been acted on: reconcile, never resubmit.
+  Treating them alike in either direction is wrong — retrying an
+  `'unreachable` can double an effect, reconciling an `'overloaded` does
+  bookkeeping for something that never ran.
+- **A durable record is one of FIVE values and `#t` is one of them.** The
+  vocabulary is `#t` (settled — NOT the symbol `'settled`, which is a
+  *status* and never a record), `'rolled-back`,
+  `'committed-then-failed`, `'commit-uncertain-then-failed`, `'killed`.
+  A reader that answers anything else is counted as an error and treated
+  as no record. **Do not translate the record into a status yourself** —
+  store the value the writer was handed and give it back unchanged. The
+  library maps records to statuses in exactly one place (an internal
+  procedure in conversation.sc — **not exported, do not call it**), and a
+  second copy of that mapping in your adapter is a copy that will drift.
+- **A record writer must be idempotent in `(id, outcome)`.** The same
+  outcome can be published twice — a record evicted from the bounded
+  table is re-established from the conversation's own state if it is
+  later killed — so overwrite a row or a file. **Appending is wrong**,
+  and wrong in a way that only shows up under table pressure.
+- **Nothing bounds a record writer — not the conversation's ttl.** The
+  ttl bounds time spent executing a step, and every publication happens
+  after the step it describes is over. A writer that never returns holds
+  its process forever and keeps a drain from finishing. Give one a
+  deadline of its own if it can wait.
+- **`conversation-quiesce!` gates `start!` and nothing else.** Resume,
+  peek, a resume forwarded from another node, and `prepare!` all keep
+  working while quiescing — refusing them would strand the very
+  dialogues the drain is waiting on. It is a switch, not a ratchet.
+  Drain by quiescing and then polling `conversation-census` until
+  `total` is zero.
+- **A node name may not contain `~`, and it is durable, not a label.**
+  Ids are `<node>~<body>` and are parsed by splitting at the first
+  tilde, so `node-start!` refuses a name carrying one. Renaming a node
+  orphans every id it minted: those resumes forward to a name nobody
+  answers to and come back `'unreachable` while the conversations sit
+  parked on the renamed node. Keep the name at least as long as the
+  conversations it owns.
+- **`node-start!` binds 127.0.0.1 unless you pass a host.** The
+  signature is `(node-start! name secret [port [host]])`. On one machine
+  the default is right; across machines the node starts, looks healthy,
+  and is unreachable — and every cross-machine forward times out, which
+  is indistinguishable from a peer being down. Forwarding is also **one
+  hop, with no relay routing**, so the entry node needs a direct link to
+  the owner: in practice a full mesh.
+- **Any synchronous blocking syscall stops EVERY green process for its
+  whole duration.** Interrupts being enabled is not a second thread —
+  there is one OS thread. This includes `durable-write-file!`, whose
+  fsync is exactly such a call: measured, a 192 MiB durable write took
+  72 ms and the longest gap between scheduler turns in that run was also
+  72 ms, against 12 ms otherwise. Size what you write, and do not put a
+  large durable write on a latency path.
 - **`'parked` and `'completed` have no predicates** — they are peek's own
   phases, while the seven `conversation-...?` predicates cover statuses a
   *resume* can also return. Test with `(eq? state 'parked)`. There is no
