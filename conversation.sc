@@ -1180,22 +1180,58 @@
   ;; declares.
   ;;
   ;; But the books are a HINT, not the truth. A conversation killed
-  ;; outright is unregistered by the scheduler, which knows nothing about
-  ;; this table, so an entry can name a pid that is gone or a name now
-  ;; held by something else. The registry is the source of truth: each
-  ;; entry is checked against it when the census is taken, and one that
-  ;; no longer matches is dropped there and then. That makes reading the
-  ;; census the thing that repairs it, so nothing has to sweep on a timer.
+  ;; outright -- by a kill, or by an uncaught raise, which reaches the
+  ;; same place -- never runs the code that would remove its entry, so
+  ;; the table outlives it.
+  ;;
+  ;; WHAT SETTLES IT IS WHETHER THE PROCESS IS STILL ALIVE, which is the
+  ;; question being asked rather than a stand-in for it. An earlier
+  ;; version checked whether the registered name still resolved to the
+  ;; recorded pid, and the name is a proxy: re-register the name to
+  ;; something else and the conversation is dropped from the count while
+  ;; it is still running, register a dead pid under it and a finished
+  ;; conversation is counted for ever. Neither is a case anyone would
+  ;; hit by accident, and both showed that the name was answering a
+  ;; different question -- who holds this name -- from the one the census
+  ;; asks.
+  ;;
+  ;; Reading the census is what repairs it, so nothing sweeps on a timer.
+  ;; Entries for processes that have died are dropped as they are found.
   (define conv-census (make-hashtable string-hash string=?))
+
+  ;; PRUNED ON INSERT ONCE IT IS IMPLAUSIBLY LARGE, because reading is
+  ;; otherwise the only thing that removes a dead entry -- and a node
+  ;; whose conversations keep being killed while nobody asks for a census
+  ;; would accumulate them without limit. The threshold is not a capacity
+  ;; decision: a table this size is already mostly dead entries, since
+  ;; live conversations are bounded by what the machine can hold. Paying
+  ;; one sweep at that point also keeps the first census from being the
+  ;; sweep, which would put an unbounded walk inside its region.
+  (define census-prune-at 4096)
+
+  (define (census-prune!)
+    (for-each
+      (lambda (id)
+        (let ((e (hashtable-ref conv-census id #f)))
+          (when (and e (not (process-alive? (vector-ref e 0))))
+            (hashtable-delete! conv-census id))))
+      (vector->list (hashtable-keys conv-census))))
 
   (define (census-add! id p running-box settled-box)
     (with-interrupts-disabled
+      (when (> (hashtable-size conv-census) census-prune-at)
+        (census-prune!))
       (hashtable-set! conv-census id (vector p running-box settled-box))))
 
   (define (census-drop! id)
     (with-interrupts-disabled (hashtable-delete! conv-census id)))
 
-  ;; running -- the flow is executing a step
+  ;; running -- the watchdog counts a step against this conversation.
+  ;;            Usually that is the flow executing one; it also covers
+  ;;            work done on its behalf while parked, such as computing
+  ;;            the request key for a replay. The phase this reads was
+  ;;            made for the watchdog, so it answers "is time being
+  ;;            charged here", which is wider than "the flow is running".
   ;; parked  -- waiting in suspend! for the next request
   ;; lingering -- the flow returned and this is the window where the final
   ;;              reply can still be replayed; it still holds its name, so
@@ -1213,7 +1249,7 @@
                    (e (hashtable-ref conv-census id #f)))
               (cond
                 ((not e) (loop (cdr ks) running parked lingering))
-                ((not (eq? (whereis (conversation-name id)) (vector-ref e 0)))
+                ((not (process-alive? (vector-ref e 0)))
                  (hashtable-delete! conv-census id)
                  (loop (cdr ks) running parked lingering))
                 ((unbox (vector-ref e 2))
@@ -2548,16 +2584,7 @@
              ;; reach any more.
              (spawn
                (lambda ()
-                 ;; ONE ACT, because between them the conversation is
-                 ;; registered and not yet counted: a census taken in that
-                 ;; instant reports one fewer than exist, and a drain
-                 ;; reading zero there would be reading a lie. (The
-                 ;; opposite direction is already covered -- an entry
-                 ;; whose name no longer resolves to it is dropped when
-                 ;; the census is read.)
-                 (with-interrupts-disabled
-                   (register name self)
-                   (census-add! id self running-box settled-box))
+                 (register name self)
                  ;; A WATCHDOG, because the TTL below only bounds time spent
                  ;; parked in suspend!. A step that runs long -- slow I/O, a
                  ;; wait that never returns, a CPU loop -- leaves that receive
@@ -3213,6 +3240,17 @@
                        (lambda () 'done))
                      (unregister name)
                      (census-drop! id)))))))
+         ;; COUNTED HERE, WITH THE CLAIM, and not by the conversation
+         ;; itself. This runs inside the region that claims the handle,
+         ;; while the process just spawned is only queued: spawn does not
+         ;; run it. A conversation that counted itself with its own first
+         ;; instruction would be absent from the census for as long as it
+         ;; sat in the run queue -- and in that gap another process can
+         ;; quiesce the node, read a total of zero, and call the node
+         ;; drained while an accepted conversation is about to start. The
+         ;; admission is the decision, so the admission is what the
+         ;; census has to reflect.
+         (census-add! id conv running-box settled-box)
          conv)))))
 
   ;; Start the prepared conversation and park until its first suspend!.
@@ -3279,8 +3317,16 @@
                      ;; drain promises, and a check outside this region is
                      ;; exactly the gap that breaks it.
                      ;;
-                     ;; Still ahead of every effect: the refusal leaves
-                     ;; the handle prepared and runnable elsewhere.
+                     ;; The refusal leaves the handle prepared -- state
+                     ;; and launch are touched only in the branch below --
+                     ;; so it can be run once this node stops quiescing,
+                     ;; or by another process here. NOT on another node:
+                     ;; the handle carries a closure that must not cross a
+                     ;; link, and its owner is pinned to the node that
+                     ;; prepared it. The node in the refusal says which
+                     ;; one is leaving, so a caller can prepare afresh
+                     ;; somewhere else; it does not make this handle
+                     ;; portable.
                      ((unbox conv-quiescing) (cons 'quiescing (node-self)))
                      ((not (eq? s 'prepared)) (cons 'bad s))
                      ((not (eq? (conv-handle-owner h) (node-self)))
@@ -3304,6 +3350,17 @@
                          ;; the router cannot be left outside the atom.
                          ;; It is idempotent and does nothing unclustered.
                          (ensure-router!)
+                         ;; COUNTED HERE, WITH THE CLAIM, and not by the
+                         ;; conversation itself. spawn queues a process;
+                         ;; it does not run it. A conversation counted by
+                         ;; its own first instruction is therefore absent
+                         ;; from the census for as long as it sits in the
+                         ;; run queue -- and in that gap another process
+                         ;; can quiesce the node, read a total of zero,
+                         ;; and conclude the node is drained while an
+                         ;; accepted conversation is about to begin. The
+                         ;; admission is what the census must reflect,
+                         ;; because the admission is the decision.
                          (cons 'ok (launch starter ref)))))))))
         ;; raised out here, as everywhere else in this file
         ;;
