@@ -17,6 +17,8 @@
           file-stream-open! file-stream-open-under!
           file-stream-read! file-stream-close!
           file-stream-own! file-stream-raw! file-stream-chunk-ptr
+          fs-open-async! fs-write-async! fs-fsync-async!
+          fs-rename-async! fs-close-async! fs-job-count
           fs-count
           tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
@@ -74,6 +76,15 @@
   (define uv-fs-get-result (foreign-procedure "uv_fs_get_result" (void*) ssize_t))
   (define uv-fs-get-statbuf (foreign-procedure "uv_fs_get_statbuf" (void*) void*))
   (define uv-fs-req-cleanup (foreign-procedure "uv_fs_req_cleanup" (void*) void))
+  ;; write side. Same shapes as their read-side siblings above; rename
+  ;; takes two paths and no descriptor.
+  (define uv-fs-write
+    (foreign-procedure "uv_fs_write"
+      (void* void* int void* unsigned-int long void*) int))
+  (define uv-fs-fsync
+    (foreign-procedure "uv_fs_fsync" (void* void* int void*) int))
+  (define uv-fs-rename
+    (foreign-procedure "uv_fs_rename" (void* void* string string void*) int))
   (define uv-tcp-bind    (foreign-procedure "uv_tcp_bind" (void* void* unsigned-int) int))
   (define uv-tcp-nodelay (foreign-procedure "uv_tcp_nodelay" (void* int) int))
   (define uv-listen      (foreign-procedure "uv_listen" (void* int void*) int))
@@ -252,6 +263,38 @@
                 ((conn)
                  (let ((c (hashtable-ref conn-table key #f)))
                    (when (and c (eq? (conn-owner c) owner)) (tcp-close! c))))
+                ;; A DESCRIPTOR THE DEAD PROCESS STILL HELD. The write
+                ;; side hands fds back to the caller and takes them again
+                ;; one syscall at a time, so a process that dies between
+                ;; two of its own calls leaves one open with nobody left
+                ;; to close it. Closed synchronously here: the fd is
+                ;; already ours to release and there is no one to tell.
+                ;;
+                ;; IT IS A RESOURCE BACKSTOP, NOT A TRANSACTION. What the
+                ;; descriptor pointed at may be a half-written file, and
+                ;; that is left exactly as it lies -- nothing here
+                ;; truncates, deletes or rolls anything back. Reconciling
+                ;; a partial write is the caller's protocol, and reading
+                ;; this as "the framework tidied up" would be reading it
+                ;; as the one thing it does not do.
+                ((fsfd)
+                 (let ((o (hashtable-ref fsw-fds key #f)))
+                   (when (eq? o owner)
+                     (hashtable-delete! fsw-fds key)
+                     (let ((creq (foreign-alloc fs-req-size)))
+                       (uv-fs-close uv-loop creq key 0)
+                       (uv-fs-req-cleanup creq)
+                       (foreign-free creq)))))
+                ;; An in-flight job: the callback is still coming and
+                ;; still has to free the request, so only the delivery is
+                ;; suppressed. Clearing the owner is what does that --
+                ;; the callback checks it before delivering. Deleting the
+                ;; entry instead would lose the record that this request
+                ;; is outstanding.
+                ((fsjob)
+                 (let ((j (hashtable-ref fsw-table key #f)))
+                   (when (and j (eq? (fsw-job-owner j) owner))
+                     (fsw-job-owner-set! j #f))))
                 ;; A connect request cannot be synchronously cancelled on
                 ;; every supported libuv. Clear its owner instead; on-connect
                 ;; then closes a late successful handle rather than
@@ -680,6 +723,152 @@
 
   ;; Lock the callback code objects forever: libuv holds raw entry-point
   ;; pointers into them for the whole process lifetime.
+
+  ;; ---- fs write side: one syscall per job -------------------------------
+  ;;
+  ;; DELIBERATELY NOT THE SHAPE OF THE READ SIDE ABOVE. That one hides a
+  ;; composite sequence -- open, fstat, read, close -- behind a phase
+  ;; machine and delivers once at the end, which is right when the library
+  ;; owns the whole sequence. Here the caller owns it: a durable write is
+  ;; write, flush, rename, flush the directory, and which of those to do,
+  ;; in what order, and what to do when one fails are the caller's
+  ;; decisions. So each job is one syscall, and the caller awaits them in
+  ;; its own green process.
+  ;;
+  ;; WHAT THIS BUYS is the only reason it exists: the syscall runs on a
+  ;; libuv thread-pool thread, so the scheduler keeps running. The
+  ;; synchronous equivalents stop every green process in the runtime for
+  ;; the duration -- measured elsewhere in this tree at 641ms for one
+  ;; call on a busy filesystem.
+  ;;
+  ;; THE POOL IS SHARED AND SMALL. Four threads by default, shared with
+  ;; DNS, and UV_THREADPOOL_SIZE is read once when the pool is first used
+  ;; -- so it must be set in the environment before the process starts,
+  ;; not from inside it. Enough concurrent file jobs will queue behind
+  ;; each other and behind name resolution.
+  ;;
+  ;; The sequence a durable write needs is plain POSIX. ZFS honours it
+  ;; with stronger semantics rather than weaker (the flush goes through
+  ;; the intent log, rename is transactional, and the directory flush
+  ;; degrades to a harmless no-op), so nothing here probes for a
+  ;; filesystem or branches on one.
+  (define fsw-table (make-eqv-hashtable))
+
+  ;; fd -> owner, for the death cleanup below. A descriptor opened here
+  ;; belongs to the caller between calls, which is what "one syscall per
+  ;; job" means -- and a caller that dies holding one would otherwise
+  ;; leak it with no signal at all. That silent shape is the one this
+  ;; library keeps removing; it is not going to be reintroduced by a new
+  ;; entry point.
+  (define fsw-fds (make-eqv-hashtable))
+
+  (define fsw-next-id 0)
+
+  (define (fsw-fresh-id!)
+    (set! fsw-next-id (+ fsw-next-id 1))
+    fsw-next-id)
+
+  (define-record-type (fsw-job make-fsw-job fsw-job?)
+    (fields
+      (immutable id fsw-job-id)
+      (mutable owner fsw-job-owner fsw-job-owner-set!)
+      (immutable kind fsw-job-kind)         ; open|write|fsync|rename|close
+      (immutable fd fsw-job-fd)             ; the fd acted on, or -1
+      (mutable data fsw-job-data fsw-job-data-set!)   ; C copy of the bytes
+      (mutable buf fsw-job-buf fsw-job-buf-set!)))    ; uv_buf_t
+
+  (define (fsw-count) (hashtable-size fsw-table))
+  (define (fs-job-count) (fsw-count))
+
+  (define (fsw-free! job req)
+    (when (> (fsw-job-data job) 0) (foreign-free (fsw-job-data job)))
+    (when (> (fsw-job-buf job) 0) (foreign-free (fsw-job-buf job)))
+    (unindex-owner! (fsw-job-owner job) 'fsjob req)
+    (hashtable-delete! fsw-table req)
+    (uv-fs-req-cleanup req)
+    (foreign-free req))
+
+  ;; A job whose owner died is completed and dropped rather than
+  ;; delivered: the callback still runs, and it still has to free the
+  ;; request and the copied bytes.
+  (define on-fsw-code
+    (foreign-callable
+      (lambda (req)
+        (let ((job (hashtable-ref fsw-table req #f)))
+          (when job
+            (let ((rc (uv-fs-get-result req))
+                  (owner (fsw-job-owner job)))
+              ;; an open that succeeded hands the caller a descriptor, so
+              ;; it goes on the books; a close that succeeded takes it off
+              (case (fsw-job-kind job)
+                ((open)
+                 (when (and (>= rc 0) owner)
+                   (hashtable-set! fsw-fds rc owner)
+                   (index-owner! owner 'fsfd rc)))
+                ((close)
+                 (let ((fd (fsw-job-fd job)))
+                   (hashtable-delete! fsw-fds fd)
+                   (unindex-owner! owner 'fsfd fd)))
+                (else (void)))
+              (when owner
+                (deliver owner (vector 'fs-done (fsw-job-id job) rc)))
+              (fsw-free! job req)))))
+      (void*) void))
+
+  ;; Submit one job. The id comes back at once and names the completion;
+  ;; without it two jobs from the same process would arrive as the same
+  ;; message and could not be told apart.
+  (define (fsw-submit! owner kind fd data buf go)
+    (let* ((req (foreign-alloc fs-req-size))
+           (job (make-fsw-job (fsw-fresh-id!) owner kind fd data buf)))
+      (hashtable-set! fsw-table req job)
+      (index-owner! owner 'fsjob req)
+      (let ((r (go req)))
+        (if (< r 0)
+            ;; refused before it ever reached the pool: no callback is
+            ;; coming, so report here and release everything now
+            (begin
+              (when owner
+                (deliver owner (vector 'fs-done (fsw-job-id job) r)))
+              (fsw-free! job req)
+              (fsw-job-id job))
+            (fsw-job-id job)))))
+
+  (define (fs-open-async! path flags mode owner)
+    (fsw-submit! owner 'open -1 0 0
+      (lambda (req)
+        (uv-fs-open uv-loop req path flags mode on-fsw-entry))))
+
+  ;; THE BYTES ARE COPIED INTO C MEMORY, and that copy is not free on a
+  ;; large payload. It is not avoidable: the collector may move a
+  ;; bytevector, and libuv reads the buffer on a pool thread at a moment
+  ;; nothing here controls.
+  (define (fs-write-async! fd bytes offset owner)
+    (let* ((n (bytevector-length bytes))
+           (data (foreign-alloc (max n 1)))
+           (buf (foreign-alloc 16)))
+      (let loop ((i 0))
+        (when (< i n)
+          (foreign-set! 'unsigned-8 data i (bytevector-u8-ref bytes i))
+          (loop (+ i 1))))
+      (foreign-set! 'void* buf 0 data)
+      (foreign-set! 'unsigned-64 buf 8 n)
+      (fsw-submit! owner 'write fd data buf
+        (lambda (req)
+          (uv-fs-write uv-loop req fd buf 1 offset on-fsw-entry)))))
+
+  (define (fs-fsync-async! fd owner)
+    (fsw-submit! owner 'fsync fd 0 0
+      (lambda (req) (uv-fs-fsync uv-loop req fd on-fsw-entry))))
+
+  (define (fs-rename-async! from to owner)
+    (fsw-submit! owner 'rename -1 0 0
+      (lambda (req) (uv-fs-rename uv-loop req from to on-fsw-entry))))
+
+  (define (fs-close-async! fd owner)
+    (fsw-submit! owner 'close fd 0 0
+      (lambda (req) (uv-fs-close uv-loop req fd on-fsw-entry))))
+
   (define locked-callbacks
     (begin
       (lock-object on-alloc-code)
@@ -690,11 +879,14 @@
       (lock-object on-connect-code)
       (lock-object on-getaddrinfo-code)
       (lock-object on-fs-code)
+      (lock-object on-fsw-code)
       (lock-object on-timer-code)
       (vector on-alloc-code on-read-code on-close-code
               on-write-code on-connection-code on-connect-code
-              on-getaddrinfo-code on-fs-code on-timer-code)))
+              on-getaddrinfo-code on-fs-code on-fsw-code
+              on-timer-code)))
 
+  (define on-fsw-entry (foreign-callable-entry-point on-fsw-code))
   (define on-alloc-entry (foreign-callable-entry-point on-alloc-code))
   (define on-read-entry (foreign-callable-entry-point on-read-code))
   (define on-close-entry (foreign-callable-entry-point on-close-code))
