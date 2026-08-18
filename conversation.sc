@@ -535,7 +535,8 @@
           conversation-no-answer-yet?
           conversation-forward-stats conv-set-forward-limit!
           conv-set-forward-hold-ms!
-          conversation-census conversation-quiesce! conversation-quiescing?)
+          conversation-census conversation-quiesce! conversation-quiescing?
+          conversation-record-hooks!)
   (import (chezscheme) (igropyr actor)
           (igropyr conv-status)
           (only (igropyr libuv) now-ms)
@@ -966,11 +967,95 @@
   ;; classification across an eviction is the conversation's own
   ;; outcome-box, which the kill path re-inserts from. This function is
   ;; the tie-breaker between two live writers, not the memory.
+  ;; ---- an outcome record that can outlive the process ------------------
+  ;;
+  ;; THE LIBRARY DOES NOT PERSIST ANYTHING. The table above is memory, so
+  ;; a restart forgets every outcome and every question about a
+  ;; conversation from before it answers 'unknown. Where those outcomes
+  ;; should live -- a file, a row, a log, nowhere -- is a question about
+  ;; the application's storage, its durability requirements and its
+  ;; retention rules, none of which this library is in a position to
+  ;; decide. So it opens the boundary instead: somewhere to hand each
+  ;; record as it is made, and somewhere to ask when this node has never
+  ;; heard of an id.
+  ;;
+  ;; A SECOND LEVEL, NOT A SECOND SUPPLIER. The reader is consulted only
+  ;; when the table has no record, and what it returns is a RECORD VALUE
+  ;; -- the same five words the table holds -- which then goes through
+  ;; settled-or-lost-answer like any other. There is deliberately no
+  ;; translation table beside it: a second mapping is a second thing to
+  ;; keep in step, and the first time they disagree the same record means
+  ;; one thing found in memory and another found on disk.
+  ;;
+  ;; Installed as a pair and never one at a time, so no observer sees a
+  ;; writer from one configuration with a reader from another.
+  (define record-hooks (box #f))
+
+  (define record-writer-errors (box 0))
+  (define record-reader-errors (box 0))
+
+  (define (conversation-record-hooks! writer reader)
+    (cond ((and (not writer) (not reader))
+           (set-box! record-hooks #f))
+          ((and (procedure? writer) (procedure? reader))
+           (set-box! record-hooks (cons writer reader)))
+          (else
+           (assertion-violation 'conversation-record-hooks!
+             "want two procedures, or #f and #f" (list writer reader))))
+    (unbox record-hooks))
+
+  ;; WRITING A RECORD MUST NOT UNDO THE THING IT RECORDS. The writer is
+  ;; application code on the path that has just classified a finished
+  ;; conversation, and a raise from it here would propagate into whatever
+  ;; is completing -- so a failure to note what happened would become a
+  ;; second, larger failure. Swallowed, and counted so the swallowing is
+  ;; visible.
+  ;;
+  ;; It is called where the record is made, which on some paths is inside
+  ;; a region with interrupts disabled. A writer that BLOCKS therefore
+  ;; stops every green process in the runtime, and no guard here can
+  ;; change that: it is the caller's to keep short. Writing through
+  ;; (igropyr durable) is a synchronous filesystem call, which is exactly
+  ;; the case to think about before doing it on every outcome.
+  (define (record-write! id what)
+    (let ((hs (unbox record-hooks)))
+      (when hs
+        (guard (e (#t (set-box! record-writer-errors
+                                (+ (unbox record-writer-errors) 1))))
+          ((car hs) id what)))))
+
+  ;; The five words a record can be. A reader that answers with anything
+  ;; else is treated as having no record and counted: settled-or-lost-
+  ;; answer would fall through to 'unknown for an unknown symbol anyway,
+  ;; but silently -- and a reader inventing vocabulary is a fault worth
+  ;; seeing rather than absorbing.
+  (define (record-value? x)
+    (or (eq? x #t)
+        (eq? x 'rolled-back)
+        (eq? x 'committed-then-failed)
+        (eq? x 'commit-uncertain-then-failed)
+        (eq? x 'killed)))
+
+  (define (record-read id)
+    (let ((hs (unbox record-hooks)))
+      (and hs
+           (let ((v (guard (e (#t (set-box! record-reader-errors
+                                            (+ (unbox record-reader-errors) 1))
+                                  #f))
+                      ((cdr hs) id))))
+             (cond ((not v) #f)
+                   ((record-value? v) v)
+                   (else
+                    (set-box! record-reader-errors
+                              (+ (unbox record-reader-errors) 1))
+                    #f))))))
+
   (define (tomb-insert-as! id what)
     (unless (hashtable-contains? tombstones id)
       (hashtable-set! tombstones id what)
       (set! tomb-back (cons (cons id (now-ms)) tomb-back))
-      (set! tomb-n (+ tomb-n 1))))
+      (set! tomb-n (+ tomb-n 1))
+      (record-write! id what)))
 
   (define (tomb-insert! id) (tomb-insert-as! id #t))
 
@@ -990,8 +1075,12 @@
   ;; decides what a record MEANS.
   (define (tomb-outcome id)
     (tomb-prune!)
-    (with-interrupts-disabled
-      (hashtable-ref tombstones id #f)))
+    (let ((local (with-interrupts-disabled
+                   (hashtable-ref tombstones id #f))))
+      ;; the reader is asked only when this node has nothing, so an
+      ;; installed reader cannot shadow or contradict a record already
+      ;; here
+      (or local (record-read id))))
 
   ;; Size the record of completed conversations. #f leaves one alone.
   (define (conversation-set-limits! max-entries ttl-ms)
@@ -2167,7 +2256,9 @@
             (cons 'timed-out (unbox hook-timed-out))
             (cons 'killed (unbox hook-killed))
             (cons 'running (unbox hook-running))
-            (cons 'last-failure (unbox hook-last-failure)))))
+            (cons 'last-failure (unbox hook-last-failure))
+            (cons 'record-writer-errors (unbox record-writer-errors))
+            (cons 'record-reader-errors (unbox record-reader-errors)))))
 
   ;; Run on-killed in its own supervised process, and outlive it either way.
   ;;
