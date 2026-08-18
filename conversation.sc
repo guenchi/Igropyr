@@ -443,8 +443,9 @@
 ;;; that owner ("<node>~<hex>"), so conversation-resume! on ANY node
 ;;; reaches the right one: a resume that lands elsewhere (round-robin LB,
 ;;; a reconnect landing on a different node) is forwarded to the owner
-;;; over the node mesh, concurrently -- one process per forwarded resume,
-;;; never a serial router. A forward that cannot reach the owner node
+;;; over the node mesh, concurrently -- a process per forwarded resume
+;;; and a second watching its deadline, never a serial router. A forward
+;;; that cannot reach the owner node
 ;;; yields 'unreachable, not 'gone: a broken link says nothing about
 ;;; whether the process behind it died.
 ;;;
@@ -1260,9 +1261,15 @@
   ;; a flow that may never park again. Its slot is then gone for the life
   ;; of the node, and adoption cannot help -- adoption reaches the dead.
   ;;
-  ;; An unbounded flow on its own costs one process. Behind a shared cap
-  ;; it costs a fraction of the whole node's forwarding capacity, so the
-  ;; admission that created the shared resource owes it a bound. The
+  ;; An unbounded flow on its own costs the process running it. Behind a
+  ;; shared cap it costs a fraction of the whole node's forwarding
+  ;; capacity, so the admission that created the shared resource owes it
+  ;; a bound.
+  ;;
+  ;; THE BOUND IS PAID FOR IN PROCESSES: one reaper per admitted forward,
+  ;; so an owner at the default limit carries 256 workers and 256 reapers
+  ;; rather than 256 processes. They are cheap and they are not free, and
+  ;; a capacity estimate that counts only workers is out by half. The
   ;; sibling shed in the node layer is already self-limiting this way:
   ;; its worker calls a gen-server with a timeout.
   ;;
@@ -1278,6 +1285,12 @@
     (spawn
       (lambda ()
         (monitor w)
+        ;; `reaped` COUNTS THIS BRANCH, not a confirmed killing. A worker
+        ;; that finishes in the same instant the hold expires is counted
+        ;; here and then killed as a no-op, because a kill against a dead
+        ;; process does nothing and reports nothing. So the number is an
+        ;; upper bound on slots actually taken back, exact except at that
+        ;; boundary -- read a rising one as pressure, not as a tally.
         (receive (after max-forward-hold-ms
                    (fwd-bump! 'reaped)
                    (kill w 'fwd-deadline))
@@ -1313,8 +1326,9 @@
   ;;
   ;; AND IT ONLY REACHES THE DEAD. A worker still running holds its slot
   ;; correctly by this accounting, including one whose asker gave up long
-  ;; ago: nothing on this side cancels it, so an abandoned-but-live
-  ;; worker occupies its place until it finishes on its own.
+  ;; ago -- adoption has nothing to reclaim there. What ends that case is
+  ;; the hold above, not this: the reaper kills the worker when the hold
+  ;; expires, and the slot comes back through the ordinary DOWN.
   (define (adopt-forward-workers!)
     (with-interrupts-disabled
       (for-each (lambda (p) (monitor p))
