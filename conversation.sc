@@ -1133,17 +1133,22 @@
   ;; is that the owner is busy. A refusal turns a silent collapse into an
   ;; answer the caller can act on.
   (define max-forwards-hosted 256)
-  (define forwards-hosted 0)
 
-  (define (forward-slot-take!)
-    (with-interrupts-disabled
-      (and (fx< forwards-hosted max-forwards-hosted)
-           (begin (set! forwards-hosted (fx+ forwards-hosted 1)) #t))))
+  ;; THE OCCUPANTS, NOT A COUNT OF THEM. A bare integer decremented on
+  ;; DOWN loses a slot whenever the DOWN goes missing, and it goes
+  ;; missing for a reason the design allows: the monitor belongs to the
+  ;; router that took the slot, and a router can be killed and rebuilt
+  ;; while its workers are still running. Their deaths were then reported
+  ;; to a dead process and dropped, and the count stuck high for the life
+  ;; of the node -- refusing every forward from then on. Holding the pids
+  ;; means the occupancy can be REBUILT from what is actually alive,
+  ;; instead of being a number that can only drift.
+  (define forward-workers (make-eq-hashtable))
 
-  (define (forward-slot-free!)
-    (with-interrupts-disabled
-      (when (fx> forwards-hosted 0)
-        (set! forwards-hosted (fx- forwards-hosted 1)))))
+  (define (forwards-hosted) (hashtable-size forward-workers))
+
+  (define (forward-slot-free! p)
+    (with-interrupts-disabled (hashtable-delete! forward-workers p)))
 
   (define (conv-set-forward-limit! n)
     (unless (and (integer? n) (exact? n) (> n 0))
@@ -1171,10 +1176,32 @@
   ;; A slot never freed is not a slow leak here. It is permanent: fill
   ;; the cap that way and the owner refuses every forward for the life of
   ;; the node.
-  (define (spawn-forward! thunk)
-    (let ((p (spawn thunk)))
-      (monitor p)
-      p))
+  ;; ADMISSION, SPAWN AND REGISTRATION ARE ONE ACT. Checking the room and
+  ;; then taking it lets two admissions past a ceiling of one; nothing
+  ;; between these yields, and interrupts are off besides.
+  (define (admit-forward! thunk)
+    (with-interrupts-disabled
+      (and (fx< (forwards-hosted) max-forwards-hosted)
+           (let ((p (spawn thunk)))
+             (hashtable-set! forward-workers p #t)
+             (monitor p)
+             p))))
+
+  ;; A NEW ROUTER ADOPTS THE OLD ONE'S WORKERS. Monitors belong to the
+  ;; process that made them, so a rebuilt router is watching nothing --
+  ;; and re-monitoring here repairs both halves of that: a worker still
+  ;; running is watched again, and one that died while there was no
+  ;; router gets its DOWN delivered at once, because monitoring a dead
+  ;; process reports it immediately rather than waiting for a death that
+  ;; has already happened.
+  ;;
+  ;; That is the whole recovery. It restores the invariant rather than
+  ;; compensating for its absence, so nothing has to sweep the table
+  ;; later or decide how often to.
+  (define (adopt-forward-workers!)
+    (with-interrupts-disabled
+      (for-each (lambda (p) (monitor p))
+                (vector->list (hashtable-keys forward-workers)))))
 
   ;; ---- forwarding counters ---------------------------------------------
   ;;
@@ -1203,7 +1230,7 @@
             (cons 'refused fwd-refused)
             (cons 'completed fwd-completed)
             (cons 'unreachable fwd-unreachable)
-            (cons 'hosted forwards-hosted)
+            (cons 'hosted (forwards-hosted))
             (cons 'limit max-forwards-hosted))))
 
   ;; THE DEFAULT, not the only value: callers may pass their own on
@@ -1315,8 +1342,7 @@
         ;; failure -- the same rule the node layer follows where it sheds
         ;; rcalls.
         (`#(conv-peek-fwd ,from-node ,reply-name ,ref ,id)
-          (if (forward-slot-take!)
-              (spawn-forward!
+          (if (admit-forward!
                 (lambda ()
                   (let-values (((state token reply rec) (local-peek id)))
                     (rsend from-node reply-name
@@ -1329,8 +1355,7 @@
                 (rsend from-node reply-name (vector 'conv-overload ref))))
           (loop))
         (`#(conv-resume ,from-node ,reply-name ,ref ,id ,token ,req)
-          (if (forward-slot-take!)
-              (spawn-forward!
+          (if (admit-forward!
                 (lambda ()
                   (let-values (((reply status rec)
                                 (local-resume id token req)))
@@ -1347,7 +1372,7 @@
         ;; arrive here, which is the point of binding the release to
         ;; death rather than to the body
         (`#(DOWN ,pid ,why)
-          (forward-slot-free!)
+          (forward-slot-free! pid)
           (loop))
         (,_ (loop)))))
 
@@ -1357,7 +1382,10 @@
     (when (node-self)
       (with-interrupts-disabled
         (unless (whereis conv-router-name)
-          (register conv-router-name (spawn conv-router-loop))))))
+          (register conv-router-name
+                    (spawn (lambda ()
+                             (adopt-forward-workers!)
+                             (conv-router-loop))))))))
 
   ;; Forward a peek, with the same failure semantics as a forwarded resume:
   ;; anything that is not an answer is 'unreachable, never 'gone.
