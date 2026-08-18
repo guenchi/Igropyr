@@ -162,10 +162,16 @@
 ;; documentation ELISION packing several names into one cell
 ;; (app-get/post/put/delete, conversation-gone?/-stale?/...). Only after
 ;; the whole token misses is it read as an elision: every segment must
-;; then be either a plain tail with no hyphen (post, run!), a real name
-;; itself, or a "-tail" that becomes real when given the first segment's
-;; prefix. One unresolvable segment fails the whole token, so an invented
-;; name cannot hide inside a list of real ones.
+;; then resolve to a name that exists -- a plain tail (post) or a "-tail"
+;; (-stale?) given the first segment's prefix, or a full name on its own.
+;; One unresolvable segment fails the whole token, so an invented name
+;; cannot hide inside a list of real ones.
+;;
+;; THE PLAIN TAIL IS THE ONE THAT LOOKS HARMLESS. Accepting any segment
+;; without a hyphen on sight -- which is what this did first -- left the
+;; commonest shape in these tables wide open: app-get/post/put/flourish
+;; passed, and that is precisely where an invented name would sit. A
+;; segment is an abbreviation of something, so it has to name something.
 (define (elision-resolves? tok name-set)
   (let ((segs (let loop ((i 0) (start 0) (out '()))
                 (cond ((>= i (string-length tok))
@@ -179,7 +185,16 @@
            (for-all
              (lambda (seg)
                (or (string=? seg "")
-                   (not (memv #\- (string->list seg)))
+                   ;; A PLAIN TAIL IS STILL A CLAIM. `post` in
+                   ;; app-get/post/... abbreviates app-post, so it is
+                   ;; resolved the same way a "-tail" is and has to name
+                   ;; something. Accepting any hyphen-free segment on
+                   ;; sight was the hole this comment already claimed was
+                   ;; closed: app-get/post/put/flourish passed, which is
+                   ;; the commonest shape in these tables and exactly
+                   ;; where an invented name would sit.
+                   (hashtable-ref name-set
+                                  (string-append prefix "-" seg) #f)
                    (hashtable-ref name-set seg #f)
                    (and (char=? (string-ref seg 0) #\-)
                         (hashtable-ref name-set
