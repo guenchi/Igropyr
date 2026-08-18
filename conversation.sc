@@ -1094,7 +1094,12 @@
   ;; is an integer (equal?-matchable across the codec).
 
   (define conv-router-name 'igropyr-conv-router)
-  (define conv-forward-ttl-ms 300000)   ; forwarding-layer safety timeout
+  ;; THE DEFAULT, not the only value: callers may pass their own on
+  ;; resume, peek and peek/timeout. How long to wait for a forwarded
+  ;; answer is a property of the caller's own budget -- a payment step
+  ;; and a status poll want different numbers -- and a module constant
+  ;; can only give them the same one.
+  (define conv-forward-ttl-ms 300000)   ; forwarding-layer safety default
 
   (define reply-name-counter 0)
   (define (fresh-reply-name!)
@@ -1309,7 +1314,7 @@
   ;; watches fall back to the unwatched wait above. The trade is a bounded
   ;; remote cost with a graceful ceiling in place of an unbounded local
   ;; leak that never self-heals -- but it is a trade, not a free win.
-  (define (forward-peek owner id)
+  (define (forward-peek owner id ttl-ms)
     (let ((reply-name (fresh-reply-name!))
           ;; negative: this node can read the wide reply (see the router)
           (ref (- (fresh-ref!)))
@@ -1321,7 +1326,7 @@
           (lambda ()
             (if (rsend owner router
                        (vector 'conv-peek-fwd (node-self) reply-name ref id))
-                (let loop ((deadline (+ (now-ms) conv-forward-ttl-ms)))
+                (let loop ((deadline (+ (now-ms) ttl-ms)))
                   (let ((left (- deadline (now-ms))))
                     (if (<= left 0)
                         ;; ONE LAST LOOK BEFORE GIVING UP, and it is not
@@ -1446,7 +1451,7 @@
   ;; -> (values reply status record), the same projection as forward-peek.
   ;; Watches the owner's router rather than the node, and for the same
   ;; kill-safety reason -- see forward-peek, where it is written out.
-  (define (forward-resume owner id token req)
+  (define (forward-resume owner id token req ttl-ms)
     (let ((reply-name (fresh-reply-name!))
           (ref (- (fresh-ref!)))
           (router conv-router-name))
@@ -1468,7 +1473,7 @@
             (if (rsend owner router
                        (vector 'conv-resume (node-self) reply-name ref
                                id token req))
-                (let loop ((deadline (+ (now-ms) conv-forward-ttl-ms)))
+                (let loop ((deadline (+ (now-ms) ttl-ms)))
                   (let ((left (- deadline (now-ms))))
                     (if (<= left 0)
                         ;; last look before giving up -- see forward-peek:
@@ -2989,18 +2994,60 @@
                     (else 'unknown)))))
         status))
 
+  ;; THE OPTIONAL ARGUMENTS ARE TOLD APART BY TYPE, not by position, so
+  ;; that either can be given without the other. Position would mean a
+  ;; caller who wants only a forwarding deadline has to pass a settled?
+  ;; first -- and settled? decides how 'unknown gets interpreted, which
+  ;; is not a parameter to invent in order to reach a different one.
+  ;;
+  ;; It is safe here because the two types cannot be confused: a
+  ;; procedure is settled?, a positive integer is a millisecond
+  ;; deadline, and an argument that is neither is refused by name rather
+  ;; than ignored.
+  ;;
+  ;; THE RULE FOR ADDING A THIRD: its type must be distinguishable from
+  ;; every optional already here. If it is not -- a second integer, say
+  ;; -- then this whole group moves to an explicit form together. Do not
+  ;; add a partially type-dispatched argument: the third one colliding
+  ;; with the deadline would be read as a deadline, silently, and the
+  ;; caller would get a number they did not ask for applied to a wait
+  ;; they did not know about.
+  (define (opt-of rest who pred what)
+    (let loop ((r rest))
+      (cond ((null? r) #f)
+            ((pred (car r)) (car r))
+            (else (loop (cdr r))))))
+
+  (define (check-opts! rest who)
+    (for-each
+      (lambda (x)
+        (unless (or (procedure? x) (conv-ttl-arg? x))
+          (assertion-violation who
+            (string-append
+              "optional argument is neither a settled? procedure nor a"
+              " positive forward-ttl-ms")
+            x)))
+      rest))
+
+  (define (conv-ttl-arg? x)
+    (and (integer? x) (exact? x) (> x 0)))
+
   (define (opt-settled? rest who)
-    (if (pair? rest)
-        (let ((f (car rest)))
-          (unless (procedure? f)
-            (assertion-violation who
-              "settled? must be a procedure of one argument (the id)" f))
-          f)
-        #f))
+    (check-opts! rest who)
+    (opt-of rest who procedure? 'settled?))
+
+  ;; #f means "no override": the caller did not ask, so the default
+  ;; below stands. Every forwarding wait takes this, so a caller that
+  ;; sets it once gets it on the whole call rather than on one leg.
+  (define (opt-forward-ttl rest who)
+    (check-opts! rest who)
+    (or (opt-of rest who conv-ttl-arg? 'forward-ttl-ms)
+        conv-forward-ttl-ms))
 
   (define (conversation-resume! id token req . rest)
     (let ((owner (conv-owner id))
-          (settled? (opt-settled? rest 'conversation-resume!)))
+          (settled? (opt-settled? rest 'conversation-resume!))
+          (ttl-ms (opt-forward-ttl rest 'conversation-resume!)))
       ;; the forwarded path reads no table on this node, and says so
       (if (or (not owner) (eq? owner (node-self)))
           (let-values (((r status rec) (local-resume id token req)))
@@ -3008,7 +3055,8 @@
           ;; the verdict now comes FROM THE OWNER when the owner can send
           ;; one -- the whole point of the wide frame -- and this is its
           ;; projection; record-not-read otherwise, exactly as before
-          (let-values (((r status rec) (forward-resume owner id token req)))
+          (let-values (((r status rec)
+                        (forward-resume owner id token req ttl-ms)))
             (values r (resolve-unknown id status settled? rec))))))
 
   ;; Resume a conversation that lives on THIS node.
@@ -3167,11 +3215,13 @@
   ;; conversation's own, and for reconciliation that is worth waiting for.
   (define (conversation-peek id . rest)
     (let ((owner (conv-owner id))
-          (settled? (opt-settled? rest 'conversation-peek)))
+          (settled? (opt-settled? rest 'conversation-peek))
+          (ttl-ms (opt-forward-ttl rest 'conversation-peek)))
       (if (or (not owner) (eq? owner (node-self)))
           (let-values (((state token reply rec) (local-peek id)))
             (values (resolve-unknown id state settled? rec) token reply))
-          (let-values (((state token reply rec) (forward-peek owner id)))
+          (let-values (((state token reply rec)
+                        (forward-peek owner id ttl-ms)))
             (values (resolve-unknown id state settled? rec)
                     token reply)))))
 
