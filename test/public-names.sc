@@ -41,7 +41,11 @@
               conversation-set-limits! conversation-hook-stats
               conversation-prepare! conversation-run!
               conversation-abandon! conversation-ref-id
-              conversation-peek/timeout conversation-no-answer-yet?)
+              conversation-peek/timeout conversation-no-answer-yet?
+              conversation-overloaded? conversation-forward-stats
+              conv-set-forward-limit! conv-set-forward-hold-ms!
+              conversation-census conversation-quiesce!
+              conversation-quiescing?)
         ;; the same predicates again, from the library that has no
         ;; initialisation of its own: a pure consumer imports THIS one, and
         ;; that it exports the whole vocabulary is part of the public face
@@ -61,6 +65,7 @@
         (only (igropyr conv-status)
               conversation-gone? conversation-stale? conversation-done?
               conversation-settled? conversation-unknown?
-              conversation-unreachable? conversation-no-answer-yet?))
+              conversation-unreachable? conversation-no-answer-yet?
+              conversation-overloaded?))
 
 (display "public names: all present\n")
