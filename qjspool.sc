@@ -75,13 +75,32 @@
 ;;; flight: it arrives later, on a connection that has since been returned
 ;;; to the pool and lent to somebody else, and answers THEIR render.
 ;;;
-;;; A JS error is a NORMAL response and the connection stays usable. A
-;;; transport failure discards the connection instead, on the principle
-;;; that a stream whose framing is in doubt cannot be trusted with the
-;;; next reply. Malformed and oversized frames are the obvious ones, but
-;;; not the only ones: a worker that ends the stream partway through a
-;;; reply, and a render that outlives its deadline, are transport
-;;; failures too, and retire the connection the same way.
+;;; THREE WAYS A RENDER FAILS, AND ONLY ONE COSTS THE CONNECTION.
+;;;
+;;;   a JS error   -- the worker ran the render and it threw. A NORMAL
+;;;                   response (status 1), and the connection stays
+;;;                   usable: the worker did its job and the answer is
+;;;                   that the render raised.
+;;;   local        -- the request never reached the socket: it could not
+;;;                   be encoded, or its deadline was gone before the
+;;;                   write. Nothing is in doubt because nothing was
+;;;                   asked, so the connection stays usable too, and the
+;;;                   caller is told why -- it is the caller's input that
+;;;                   has to change, and no other worker would answer
+;;;                   differently.
+;;;   transport    -- bytes may have left this process. The connection is
+;;;                   discarded, on the principle that a stream whose
+;;;                   framing is in doubt cannot be trusted with the next
+;;;                   reply. Malformed and oversized frames are the
+;;;                   obvious ones, but not the only ones: a worker that
+;;;                   ends the stream partway through a reply, and a
+;;;                   render that outlives its deadline, are transport
+;;;                   failures too, and retire the connection the same
+;;;                   way.
+;;;
+;;; The dividing line between the last two is the write, and it is drawn
+;;; at that one call in render-on!. All three reach the caller as
+;;; (values #f text).
 ;;;
 ;;; WHAT partial-frame-ms ACTUALLY BOUNDS. It is measured from when this
 ;;; process got to LOOK at the bytes, not from when they reached the
@@ -1260,14 +1279,22 @@
            ;; answering a local failure to the caller is that the caller
            ;; can act on it.
            (frame-err #f)
-           (frame (guard (e (#t (set! frame-err (as-qjs-error e "request")) #f))
+           ;; LOCAL BY POSITION, whatever was raised. Encoding happens
+           ;; before the write by construction, so anything that comes out
+           ;; of it is local -- including a condition from below that
+           ;; as-qjs-error would otherwise label transport by default. The
+           ;; kind is decided here, where the position is known, rather
+           ;; than trusted to every raise site inside encode-request.
+           (frame (guard (e (#t (set! frame-err
+                                      (qjs-local-err
+                                        (qjs-error-text
+                                          (as-qjs-error e "request"))))
+                                #f))
                     (encode-request id (car req) (cdr req)))))
       (guard (e (#t (as-qjs-error e "render failed")))
         (unless frame
-          (raise (qjs-local-err
-                   (if frame-err
-                       (qjs-error-text frame-err)
-                       "render request could not be encoded"))))
+          (raise (or frame-err
+                     (qjs-local-err "render request could not be encoded"))))
         ;; CHECKED AGAIN before the write. Encoding is proportional to the
         ;; props and the runtime can stall for longer than the whole
         ;; deadline, and sending a request we have already given up on
