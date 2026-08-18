@@ -445,7 +445,23 @@
 ;;; over the node mesh, concurrently -- one process per forwarded resume,
 ;;; never a serial router. A forward that cannot reach the owner node
 ;;; yields 'unreachable, not 'gone: a broken link says nothing about
-;;; whether the process behind it died. Forwarded req and reply cross a link, so
+;;; whether the process behind it died.
+;;;
+;;; FORWARDING REQUIRES A DIRECT LINK FROM THE ENTRY NODE TO THE OWNER,
+;;; which in practice means a full mesh. There is no relay routing, by
+;;; design: a resume is forwarded one hop or not at all. On a topology
+;;; that is not fully connected -- a star, or a mesh with one link down
+;;; -- the symptom is not an error at startup but every resume for a
+;;; conversation owned by an unreachable node answering 'unreachable,
+;;; for as long as the gap lasts. The entry node cannot tell that case
+;;; from an owner that is merely down, and neither can the caller.
+;;;
+;;; Relaying is not left out because it is hard. Routing state is a
+;;; different shape of problem from this library's: it needs a view of
+;;; the topology, a policy for choosing among paths, and a story for
+;;; loops and for a relay that dies mid-hop -- none of which this
+;;; library has anywhere to put, and all of which the distribution layer
+;;; is the right place for if they are ever wanted. Forwarded req and reply cross a link, so
 ;;; they must be extended-wire-safe (as with rsend / rcall). With one
 ;;; node (node-start! never called) the id has no prefix and every
 ;;; resume stays local -- no dependency on the distribution layer at
@@ -940,6 +956,20 @@
   ;;
   ;;   "<node>~<base36 ms>-<hex>"  clustered
   ;;   "<base36 ms>-<hex>"         single node
+  ;;
+  ;; THE NODE NAME IS PART OF EVERY ID THAT NODE MINTS, so the name is a
+  ;; durable identifier and not a label. Rename a node and every id it
+  ;; owns is orphaned: a resume carrying the old name is forwarded to a
+  ;; node nobody answers to and comes back 'unreachable, while the
+  ;; conversations themselves are still parked on the renamed node,
+  ;; alive and now unreachable by their own ids.
+  ;;
+  ;; There is deliberately no alias mechanism. One would have to be
+  ;; consulted on every forward, kept consistent across the cluster, and
+  ;; garbage-collected when the last id bearing an old name expired --
+  ;; which is a naming service, not a line of code here. A node keeps
+  ;; its name for at least as long as the conversations it owns, and a
+  ;; deployment that must rename one drains it first.
   ;;
   ;; The hex stays unguessable; neither the node prefix nor the timestamp
   ;; is a secret, and neither is load-bearing for authorization -- see
