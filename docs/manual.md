@@ -1569,8 +1569,8 @@ outcomes never share a position with it:
 | `'overloaded` | the owner **refused** the forward before touching the conversation: it was already hosting its limit of them. Nothing was started, the token is still good, and asking again later is right |
 
 `conversation-done?`, `conversation-settled?`, `conversation-stale?`,
-`conversation-gone?`, `conversation-unknown?` and
-`conversation-unreachable?` are applied to the *status*.
+`conversation-gone?`, `conversation-unknown?`, `conversation-unreachable?`
+and `conversation-overloaded?` are applied to the *status*.
 
 #### `'unknown` is not `'gone`
 
@@ -1885,8 +1885,10 @@ asker, not to the conversation.
 ```
 
 `'parked` and `'completed` are peek's own phases and have no predicates —
-the seven `conversation-...?` predicates cover the statuses a *resume*
-can also answer with, so compare those two directly.
+the `conversation-...?` predicates cover the statuses a *resume* can also
+answer with, so compare those two directly. (Stated without a count on
+purpose: this sentence has already been wrong once, when `'overloaded`
+arrived and the number moved.)
 
 The timeout is **required and has no default**: how long to wait is a
 property of the caller's own budget, and no number the library picked
