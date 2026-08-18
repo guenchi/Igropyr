@@ -208,6 +208,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # census/quiesce spends its assertions on what must KEEP WORKING under
 # quiesce -- a node that refuses in-flight work can never finish draining
 "$scheme_bin" --script igropyr/test/conv-census.sc
+# outcome-record hooks: one mapping for both tiers, local evidence
+# shadows a lying reader, and the e2e leg proves records outlive the OS
+# process through durable's traced fsync/rename sequence
+"$scheme_bin" --script igropyr/test/conv-record.sc
 "$scheme_bin" --script igropyr/test/tls.sc
 "$scheme_bin" --script igropyr/test/apple-jws.sc
 # needs the openssl CLI to mint its ephemeral RSA keys, same as tls.sc above
