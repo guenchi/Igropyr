@@ -200,6 +200,11 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # only rig that can kill the router with live workers in flight, which is
 # what proved the slot accounting survives the router that took the slots
 "$scheme_bin" --script igropyr/test/conv-admission.sc
+# what a PRE-refusal asker experiences against a refusing owner, run
+# against the real pinned old code: full ttl then 'unreachable (its own
+# vocabulary), and the token untouched. Skips (and says so) without
+# full git history
+"$scheme_bin" --script igropyr/test/conv-mixed-overload.sc
 "$scheme_bin" --script igropyr/test/tls.sc
 "$scheme_bin" --script igropyr/test/apple-jws.sc
 # needs the openssl CLI to mint its ephemeral RSA keys, same as tls.sc above
