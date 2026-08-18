@@ -66,6 +66,7 @@
     ;; "manual.zh-cn.md", so nothing is inherited by accident, and a name
     ;; accepted for one file still has to be argued for the other.
     ("manual.zh-cn.md"
+     ("with-input-from-file" . "R6RS builtin used by the record-reader example")
      ("monitor-reference"  . "parameter name in the (demonitor ...) signature heading")
      ("load-routes!"       . "the example's own application code, marked as such")
      ("parse-auth-header"  . "the example's own application code")
