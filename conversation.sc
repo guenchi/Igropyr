@@ -1342,7 +1342,7 @@
         ;; failure -- the same rule the node layer follows where it sheds
         ;; rcalls.
         (`#(conv-peek-fwd ,from-node ,reply-name ,ref ,id)
-          (if (admit-forward!
+          (unless (admit-forward!
                 (lambda ()
                   (let-values (((state token reply rec) (local-peek id)))
                     (rsend from-node reply-name
@@ -1351,11 +1351,14 @@
                                        (rec->evidence rec))
                                (vector 'conv-peek-reply ref state token
                                        reply))))))
-              (guard (e (#t (void)))
-                (rsend from-node reply-name (vector 'conv-overload ref))))
+            ;; REFUSED is the branch that speaks. Admission spawns the
+            ;; worker and this arm is not reached; only a refusal sends
+            ;; anything back from here.
+            (guard (e (#t (void)))
+              (rsend from-node reply-name (vector 'conv-overload ref))))
           (loop))
         (`#(conv-resume ,from-node ,reply-name ,ref ,id ,token ,req)
-          (if (admit-forward!
+          (unless (admit-forward!
                 (lambda ()
                   (let-values (((reply status rec)
                                 (local-resume id token req)))
@@ -1365,8 +1368,11 @@
                                        (rec->evidence rec))
                                (vector 'conv-forward-reply ref reply
                                        status))))))
-              (guard (e (#t (void)))
-                (rsend from-node reply-name (vector 'conv-overload ref))))
+            ;; REFUSED is the branch that speaks. Admission spawns the
+            ;; worker and this arm is not reached; only a refusal sends
+            ;; anything back from here.
+            (guard (e (#t (void)))
+              (rsend from-node reply-name (vector 'conv-overload ref))))
           (loop))
         ;; a forward worker finished, raised, or was killed -- all three
         ;; arrive here, which is the point of binding the release to
