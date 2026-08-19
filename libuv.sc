@@ -21,7 +21,7 @@
           fs-rename-async! fs-close-async! fs-mkdir-async!
           fs-job-count fs-fd-count
           fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc fs-o-excl
-          fs-o-directory
+          fs-o-directory fs-o-cloexec
           fs-count
           tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
@@ -171,6 +171,23 @@
   (define fs-o-directory
     (case platform-os
       ((linux) #o200000) ((macos) #o4000000) ((freebsd) #o400000) (else 0)))
+
+  ;; AND THE CLEAREST ARGUMENT FOR MEASURING EACH ONE. FreeBSD's
+  ;; O_CLOEXEC is 0o4000000 -- the same number as macOS's O_DIRECTORY
+  ;; above. A value carried across from one platform to the other does
+  ;; not fail here; it asks for a different flag and succeeds, which is
+  ;; the kind of wrong that no test reports.
+  ;;
+  ;; Measured, compiled against <fcntl.h>:
+  ;;   macOS 15 (arm64)      O_CLOEXEC = 0o100000000 (0x1000000)
+  ;;   FreeBSD 15.0-RELEASE  O_CLOEXEC = 0o4000000   (0x100000)
+  ;; Both runs also printed O_RDONLY, O_EXCL and O_DIRECTORY and matched
+  ;; what is recorded above. Linux is the documented asm-generic value
+  ;; and was NOT measured; compile it there before trusting it.
+  (define fs-o-cloexec
+    (case platform-os
+      ((linux) #o2000000) ((macos) #o100000000) ((freebsd) #o4000000)
+      (else 0)))
 
   (define UV-EINVAL -22)
   (define S-IFMT #o170000)
@@ -330,10 +347,20 @@
                  (let ((o (hashtable-ref fsw-fds key #f)))
                    (when (eq? o owner)
                      (hashtable-delete! fsw-fds key)
-                     (let ((creq (foreign-alloc fs-req-size)))
-                       (uv-fs-close uv-loop creq key 0)
-                       (uv-fs-req-cleanup creq)
-                       (foreign-free creq)))))
+                     ;; CLOSING MUST COME AFTER THE LAST JOB THAT NAMES
+                     ;; IT, or what gets closed is a NUMBER and not a
+                     ;; file. A job already handed to the pool has not
+                     ;; necessarily entered its syscall yet: close the
+                     ;; descriptor here and the number can be reissued to
+                     ;; something else before that thread runs, at which
+                     ;; point a late write lands in an unrelated file and
+                     ;; a late close shuts one. Owner death does not
+                     ;; cancel jobs -- it only stops their answers being
+                     ;; delivered -- so the wait is real and has to be
+                     ;; waited out.
+                     (if (fd-in-flight? key)
+                         (hashtable-set! fsw-closing key #t)
+                         (close-fd-now! key)))))
                 ;; An in-flight job: the callback is still coming and
                 ;; still has to free the request, so only the delivery is
                 ;; suppressed. Clearing the owner is what does that --
@@ -838,6 +865,36 @@
   ;; change it.
   (define (fs-fd-count) (hashtable-size fsw-fds))
 
+  ;; Hand a descriptor back to the kernel with no owner to tell. Used
+  ;; both when an owner dies and when one dies before its open finishes.
+  (define (close-fd-now! fd)
+    (let ((creq (foreign-alloc fs-req-size)))
+      (uv-fs-close uv-loop creq fd 0)
+      (uv-fs-req-cleanup creq)
+      (foreign-free creq)))
+
+  ;; Descriptors whose owner has died while a job still refers to them.
+  ;; See uv-owner-died!: closing one while a pool thread is about to act
+  ;; on it closes a NUMBER, not a file.
+  (define fsw-closing (make-eqv-hashtable))
+
+  (define (fd-in-flight? fd)
+    (let ((jobs (hashtable-values fsw-table)))
+      (let loop ((i 0))
+        (cond ((= i (vector-length jobs)) #f)
+              ((= (fsw-job-fd (vector-ref jobs i)) fd) #t)
+              (else (loop (+ i 1)))))))
+
+  ;; Called once a job has been removed from the table: if it was the
+  ;; last one holding a descriptor that was waiting to be closed, this is
+  ;; the moment the close is finally safe.
+  (define (close-if-drained! fd)
+    (when (and (>= fd 0)
+               (hashtable-ref fsw-closing fd #f)
+               (not (fd-in-flight? fd)))
+      (hashtable-delete! fsw-closing fd)
+      (close-fd-now! fd)))
+
   (define (fsw-free! job req)
     (when (> (fsw-job-data job) 0) (foreign-free (fsw-job-data job)))
     (when (> (fsw-job-buf job) 0) (foreign-free (fsw-job-buf job)))
@@ -860,17 +917,33 @@
               ;; it goes on the books; a close that succeeded takes it off
               (case (fsw-job-kind job)
                 ((open)
-                 (when (and (>= rc 0) owner)
-                   (hashtable-set! fsw-fds rc owner)
-                   (index-owner! owner 'fsfd rc)))
+                 (cond
+                   ((< rc 0) (void))
+                   (owner
+                    (hashtable-set! fsw-fds rc owner)
+                    (index-owner! owner 'fsfd rc))
+                   ;; AN OPEN THAT SUCCEEDED FOR A CALLER THAT IS GONE.
+                   ;; Nobody will ever be told this descriptor exists, so
+                   ;; it can never be closed by anyone: the owner sweep
+                   ;; has already run and found nothing, and it is not on
+                   ;; the books to be found later. The only correct thing
+                   ;; to do with it is give it straight back.
+                   (else (close-fd-now! rc))))
                 ((close)
                  (let ((fd (fsw-job-fd job)))
                    (hashtable-delete! fsw-fds fd)
-                   (unindex-owner! owner 'fsfd fd)))
+                   (unindex-owner! owner 'fsfd fd)
+                   ;; It is closed; whatever was waiting to close it has
+                   ;; had its wish and must not close the number again.
+                   (hashtable-delete! fsw-closing fd)))
                 (else (void)))
               (when owner
                 (deliver owner (vector 'fs-done (fsw-job-id job) rc)))
-              (fsw-free! job req)))))
+              (let ((fd (fsw-job-fd job)))
+                (fsw-free! job req)
+                ;; After the job leaves the table, so this cannot see
+                ;; itself as a reason to keep waiting.
+                (close-if-drained! fd))))))
       (void*) void))
 
   ;; Submit one job. The id comes back at once and names the completion;

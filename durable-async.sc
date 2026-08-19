@@ -71,6 +71,11 @@
 ;;; for a node serving requests, and choose the synchronous one for bulk
 ;;; work where nothing else is waiting.
 ;;;
+;;; The suite asserts the PROPERTY -- that the scheduler keeps running --
+;;; at a smaller payload, because that is what the property needs and a
+;;; multi-second write per platform per run is not. These figures are one
+;;; machine's magnitudes, not a contract, and nothing re-checks them.
+;;;
 ;;; ONE JOB IN FLIGHT PER CALL. Each step is submitted only after the
 ;;; previous one has completed. That is what makes the sequence a
 ;;; sequence: a pipelined implementation could have a rename in flight
@@ -109,6 +114,15 @@
                 durable-error? durable-error-op durable-error-path
                 fs-trace-step))
 
+  ;; CLOEXEC ON EVERY OPEN, AND DELIBERATELY UNLIKE THE SYNCHRONOUS
+  ;; LIBRARY. A descriptor here stays open across parks, so any other
+  ;; green process that spawns a child during that window hands the child
+  ;; a copy -- and closing it afterwards closes only this side's. The
+  ;; synchronous library holds its descriptors inside one uninterrupted
+  ;; run of the whole runtime, so it has no comparable window; that it
+  ;; opens through a Chez port, which sets no CLOEXEC, is a separate and
+  ;; older matter and is not changed here.
+  ;;
   ;; THE SAME SHAPE, and it has to be the same shape rather than merely
   ;; similar: a caller that catches durable-error? around one library
   ;; must catch it around the other, and durable-error-op has to answer
@@ -196,7 +210,8 @@
              (rc (fs-step 'open tmp
                    (lambda ()
                      (fs-open-async! tmp
-                       (bitwise-ior fs-o-wronly fs-o-creat fs-o-excl)
+                       (bitwise-ior fs-o-wronly fs-o-creat fs-o-excl
+                                    fs-o-cloexec)
                        ;; 0666, NOT 0600, AND THIS DECIDES THE TARGET'S
                        ;; PERMISSIONS. The rename gives the target the
                        ;; temporary's mode, so a stricter mode here is not
@@ -340,7 +355,8 @@
     (let ((fd (checked 'dir-open dir
                 (fs-step 'dir-open dir
                   (lambda ()
-                    (fs-open-async! dir fs-o-rdonly 0 self))))))
+                    (fs-open-async! dir
+                      (bitwise-ior fs-o-rdonly fs-o-cloexec) 0 self))))))
       (let ((rc (fs-step 'dir-fsync dir
                   (lambda () (fs-fsync-async! fd self)))))
         (when (< rc 0)
@@ -378,7 +394,8 @@
     (let ((rc (fs-step 'dir-open path
                 (lambda ()
                   (fs-open-async! path
-                    (bitwise-ior fs-o-rdonly fs-o-directory) 0 self)))))
+                    (bitwise-ior fs-o-rdonly fs-o-directory fs-o-cloexec)
+                    0 self)))))
       (cond ((>= rc 0)
              ;; The probe's own descriptor. Its close rc is not checked:
              ;; the question being answered is "is this a directory", it
