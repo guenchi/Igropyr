@@ -15,6 +15,38 @@
              (display "    got  ") (display got) (newline)
              (display "    want ") (display want) (newline))))
 
+;; ---- the hashes themselves ----------------------------------------------
+;;
+;; SHA-1 HAD NO ANCHOR ANYWHERE. Measured: corrupting one bit of its
+;; initialisation vector left the ENTIRE suite green, whole-run banner and
+;; all. Its real use -- the RFC 6455 accept key -- could not catch it
+;; either, because both ends of the WebSocket tests are this library: a
+;; server and a client computing the same wrong digest agree with each
+;; other perfectly. Testing a protocol against your own implementation of
+;; the other end proves interoperability with yourself.
+;;
+;; SHA-256 was anchored, by sigv4's AWS examples; the same one-bit
+;; experiment reds them. Its vectors here are therefore NOT new coverage,
+;; they move the dependency: a primitive should not have its only known
+;; answers inside a suite about request signing, where deleting that
+;; suite would silently unanchor it.
+;;
+;; FIPS 180-4 / RFC 3174 values, cross-checked against an independent
+;; implementation before being written down.
+(define (h1 s) (bytevector->hex (sha1 (string->utf8 s))))
+(define (h256 s) (bytevector->hex (sha256 (string->utf8 s))))
+
+(check "sha1 empty" (h1 "")
+  "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+(check "sha1 abc" (h1 "abc")
+  "a9993e364706816aba3e25717850c26c9cd0d89d")
+;; two blocks: the 448-bit message, which pads into a second block
+(check "sha1 two-block"
+  (h1 "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+  "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+(check "sha256 abc" (h256 "abc")
+  "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+
 (define (rep byte n)
   (let ((bv (make-bytevector n)))
     (do ((i 0 (+ i 1))) ((= i n) bv) (bytevector-u8-set! bv i byte))))

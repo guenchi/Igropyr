@@ -7,7 +7,7 @@
 
 (import (chezscheme) (igropyr http) (igropyr express) (igropyr session)
         (igropyr auth) (igropyr jwt) (igropyr ws-client)
-        (only (igropyr websocket) ws-conn ws-send-text! ws-close!)
+        (only (igropyr websocket) ws-conn ws-send-text! ws-close! ws-accept-key)
         (igropyr json) (igropyr sexpr) (igropyr libuv))
 
 (define port 18088)
@@ -281,6 +281,23 @@
     (unless bend (fail "rpc-post" resp))
     (cons (status-of resp)
           (string->sexpr (substring resp (+ bend 4) (string-length resp))))))
+
+;; ---- the handshake, anchored to the RFC and not to ourselves -----------
+;; Every other WebSocket case here has this library on BOTH ends, so a
+;; wrong accept key is agreed on by a server and a client computing it the
+;; same wrong way -- interoperability with oneself. RFC 6455 section 1.3
+;; publishes one worked example; it is the only thing in this suite that
+;; would notice a changed GUID, a reversed concatenation, or a base64 of
+;; the wrong bytes. (SHA-1 itself is anchored by test/crypto.sc, which had
+;; nothing until a one-bit IV corruption was measured passing the entire
+;; suite.)
+(unless (string=? (ws-accept-key "dGhlIHNhbXBsZSBub25jZQ==")
+                  "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+  (display "FAIL rfc6455-accept-key: ")
+  (display (ws-accept-key "dGhlIHNhbXBsZSBub25jZQ=="))
+  (newline)
+  (exit 1))
+(display "  ok  rfc6455 accept key matches the published example\n")
 
 (start-scheduler
   (lambda ()
