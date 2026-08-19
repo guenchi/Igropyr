@@ -100,6 +100,7 @@
 
 (library (igropyr durable-async)
   (export durable-write-file-async! durable-dir-ensure-async!
+          durable-fsync-dir-async!
           ;; RE-EXPORTED so that importing this library gives the whole
           ;; vocabulary. What it raises is #(durable-error op path), and a
           ;; caller that could not name the predicate for it would have to
@@ -360,12 +361,24 @@
   ;; directory is a file that has to be flushed like any other. Without
   ;; it the rename is in the kernel's memory and not on the medium, and a
   ;; crash here can leave neither the old file nor the new one.
+  ;; O_DIRECTORY, SO THAT THIS REFUSES WHAT IT CANNOT DO. Opening a path
+  ;; read-only succeeds for a regular file too, and fsync on that
+  ;; descriptor succeeds -- so without this flag a caller who passed a
+  ;; file where a directory was meant got no error at all, and flushed
+  ;; that file's CONTENTS while believing it had flushed a directory's
+  ;; entries. That is precisely the thing this operation documents itself
+  ;; as not doing, delivered silently. With the flag the mistake comes
+  ;; back as 'dir-open with -ENOTDIR.
+  ;;
+  ;; The internal callers pass a parent-of result, which is always a
+  ;; directory, so this only ever tightens the public entry point.
   (define (fsync-dir! dir)
     (let ((fd (checked 'dir-open dir
                 (fs-step 'dir-open dir
                   (lambda ()
                     (fs-open-async! dir
-                      (bitwise-ior fs-o-rdonly fs-o-cloexec) 0 self))))))
+                      (bitwise-ior fs-o-rdonly fs-o-directory fs-o-cloexec)
+                      0 self))))))
       (let ((rc (fs-step 'dir-fsync dir
                   (lambda () (fs-fsync-async! fd self)))))
         (when (< rc 0)
@@ -425,6 +438,41 @@
   ;; may have been made a moment ago by a process that has not flushed,
   ;; and a crash can still take it away. Losing a mkdir race is not an
   ;; error either: the directory is there, which is what was asked.
+  ;; FLUSH A DIRECTORY THAT IS ALREADY THERE. durable-dir-ensure-async!
+  ;; returns without flushing when the directory already exists, on
+  ;; purpose -- it did not create it and has no basis for claiming that
+  ;; somebody else's creation is durable. A caller that needs the entries
+  ;; of an existing directory on the medium has to ask for exactly that,
+  ;; and the alternative -- rewriting every file in it so the ensure has
+  ;; something to flush -- costs a full rewrite to buy one fsync.
+  ;;
+  ;; WHAT IT MAKES DURABLE: the directory's ENTRIES -- which names exist
+  ;; and which inode each one points at. That is what survives; it says
+  ;; nothing about the CONTENTS of the files named, which are each their
+  ;; own fsync. A directory flushed after a rename guarantees the rename;
+  ;; it does not guarantee the renamed file's bytes.
+  ;;
+  ;; WHAT IT DOES NOT DO: it does not recurse -- only this one level --
+  ;; and it does not touch the parent. A caller that needs the parent's
+  ;; entries too calls it again with the parent. Platform durability is
+  ;; the same as everywhere else in this library: on macOS this reaches
+  ;; fsync level and not F_FULLFSYNC, for the reason in the header.
+  ;;
+  ;; IT IS FULLY RE-ENTRANT AND KEEPS NO STATE. Every call performs the
+  ;; whole open/fsync/close, with nothing cached and no "already flushed"
+  ;; short circuit, so calling it repeatedly during a recovery pass is
+  ;; both safe and actually flushing each time -- there is no early
+  ;; return that could quietly do nothing.
+  ;;
+  ;; Errors are the same triple as everything else here, with `path` the
+  ;; directory that was passed in: 'dir-open, 'dir-fsync or 'dir-close.
+  ;; A path that is not a directory is refused as 'dir-open rather than
+  ;; silently flushing whatever it is.
+  (define (durable-fsync-dir-async! path)
+    (check-path! 'durable-fsync-dir-async! path)
+    (fsync-dir! path)
+    path)
+
   (define (durable-dir-ensure-async! path)
     (check-path! 'durable-dir-ensure-async! path)
     (let ((parent (parent-of 'durable-dir-ensure-async! path)))
