@@ -3479,34 +3479,107 @@ If you need to read a file in a handler:
 
 ### The write side
 
-There are asynchronous write primitives too — `fs-open-async!`,
-`fs-write-async!`, `fs-fsync-async!`, `fs-rename-async!`,
-`fs-close-async!` and `fs-mkdir-async!`, with the open flags
-`fs-o-rdonly`, `fs-o-wronly`, `fs-o-creat`, `fs-o-trunc`, `fs-o-excl`,
-`fs-o-directory` and `fs-o-cloexec`. They are lower level than the reads
-above: each submits one syscall to the pool and answers the owner with
-`#(fs-done ,job-id ,rc)`, where `job-id` is returned by the call and
-`rc` is the raw result — a negative errno on failure, never an
-exception. Waiting for a specific `job-id` rather than for any
-completion is what keeps two outstanding jobs from being confused for
-each other.
+The reads above are whole operations: ask for a file, get its bytes. The
+write primitives are one syscall each, and exist to be composed into
+sequences — because a durable write *is* a sequence, and which order it
+happens in is the whole of what it guarantees. *(igropyr durable-async)*
+below is the worked example; this is the layer it is built from.
 
-They exist to be composed into sequences, and *(igropyr durable-async)*
-below is the worked example of composing them.
+#### The completion protocol
 
-**One logical user per descriptor.** Submit a close only after your own
-jobs on that descriptor have completed. A descriptor number is a lease
-from the OS, not an identity: close it while a write you submitted is
-still queued and the number can be reissued before that write runs, so
-it lands in whatever file now holds the number. This is the same race a
-C program has when one thread writes a descriptor while another closes
-it, and no descriptor API can promise it away. What the framework does
-guarantee is its *own* closes — reclaiming after an owner dies, and
-returning a descriptor whose caller died before the open completed —
-which it orders after the last job it knows about.
+Every call submits one syscall to libuv's thread pool and returns a
+**job id** immediately. The owner process later receives:
 
-The per-call details are in the header of `libuv.sc`; a full reference
-for this side is still to be written.
+```scheme
+#(fs-done ,job-id ,rc)
+```
+
+`rc` is the **raw result**: a byte count or a file descriptor on
+success, and a **negative errno** on failure: ENOENT arrives as −2, EEXIST as
+−17, ENOTDIR as −20. Nothing here raises. A failed operation
+is a value you compare against zero, not an exception you guard.
+
+**Wait for your own job id, not for any completion.** A process may have
+several jobs outstanding, and may also be using these primitives
+elsewhere in its own code:
+
+```scheme
+(define (await id)
+  (receive (`#(fs-done ,@id ,rc) rc)))    ; ,@id — this job, not any job
+```
+
+Matching on the bare pattern would consume whichever completion arrived
+first and read its `rc` as this step's result.
+
+#### The calls
+
+- `(fs-open-async! path flags mode owner)` → job-id — `rc` is the new
+  descriptor, or a negative errno
+- `(fs-write-async! fd bytes offset owner)` → job-id — `rc` is the
+  number of bytes written, which **may be fewer than you gave it**; see
+  short writes below
+- `(fs-fsync-async! fd owner)` → job-id
+- `(fs-close-async! fd owner)` → job-id
+- `(fs-rename-async! from to owner)` → job-id
+- `(fs-mkdir-async! path mode owner)` → job-id — an existing directory
+  comes back as −17 (EEXIST) rather than as an error, so "make sure it
+  is there" needs no prior check. Note EEXIST also means *a regular file
+  of that name*; `fs-o-directory` below is how to tell them apart
+  without a stat
+
+Open flags, each a platform-correct constant: `fs-o-rdonly`,
+`fs-o-wronly`, `fs-o-creat`, `fs-o-trunc`, `fs-o-excl`,
+`fs-o-directory`, `fs-o-cloexec`. Combine them with `bitwise-ior`.
+
+`fs-o-directory` opens successfully **only** if the path is a directory
+and gives −20 (ENOTDIR) otherwise, which answers "is this a
+directory?" without a stat. `fs-o-cloexec` matters more here than it
+looks: a descriptor held across a park is visible to any child process
+spawned by *any* green process in that window, and closing it later
+closes only this side's copy.
+
+Two counters for tests and for watching: `(fs-job-count)` — jobs in
+flight — and `(fs-fd-count)` — descriptors this side is holding for
+callers. Both are approximate in the sense that they are read outside
+any lock.
+
+#### A short write is not an error
+
+`fs-write-async!` answers with a byte count, and a count smaller than
+the buffer is a legal partial write, not a failure. Treating one as done
+truncates the file silently. Resubmit the remainder from the offset it
+reached, and treat a **zero** count with bytes still outstanding as a
+failure rather than looping — a loop that makes no progress submits a
+job per turn and never answers its caller.
+
+#### One logical user per descriptor
+
+**Submit a close only after your own jobs on that descriptor have
+completed.** A descriptor number is a lease from the OS, not an
+identity: the kernel reissues the lowest free number, so closing one
+while a write you submitted is still queued lets the number be handed
+to something else before that write runs — and it then lands in whatever
+file now holds the number. This is the same race a C program has when
+one thread writes a descriptor while another closes it, and no
+descriptor API can promise it away.
+
+What the framework does guarantee is its **own** closes. If the owner
+process dies, its descriptors are reclaimed — and a reclaim waits for
+the last job that names the descriptor, precisely because closing it
+sooner would close a *number* rather than a file. A descriptor whose
+owner died before its `open` even completed is handed straight back,
+since nobody will ever be told it exists.
+
+#### The thread pool is shared and small
+
+Four threads by default, and file I/O shares them with DNS resolution,
+so a burst of writes and a burst of lookups contend for the same four.
+`UV_THREADPOOL_SIZE` changes the number and is read once at first use —
+it must be set **before the process starts**, not from inside it.
+
+The pool is what keeps the scheduler running while a write is in flight;
+it does not make the write cheaper. The physical cost is unchanged and
+is paid by the caller rather than by every process in the node.
 
 ---
 ## Durable Writes
