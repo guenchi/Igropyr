@@ -432,6 +432,23 @@ The Express layer provides a familiar web framework API. Most applications use E
 (app-delete app "/item/:id" (lambda (req res) ...))
 ```
 
+`(app-route-list app)` → list of `(method . pattern)` answers what an
+app actually ended up with, which is worth having in a test: a route
+registered in a loop, behind a condition, or by a helper is invisible to
+reading the source, and so is one that was later replaced.
+
+```scheme
+(app-route-list app)
+;; => ((GET . "/users/:id") (POST . "/api/data") ...)
+```
+
+The pattern is **rebuilt** from how the router stores the route, not the
+literal you passed: `"/a/b/"`, `"/a//b"` and `"/a/b"` all register one
+route and all read back as `"/a/b"`, and the root reads back as `"/"`.
+`:name` and `*` segments come back as written. The order is registration
+order, and re-registering a route moves it to the end. The list shares
+nothing with the app, so mutating it cannot reach the router.
+
 #### Path Parameters
 
 The pattern `:name` in a route captures a path segment. Extract with `(req-param req "name")`.
