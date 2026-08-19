@@ -143,6 +143,9 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # predicate call counter is the tripwire for raises the fail-closed
 # guard would otherwise silently absorb
 "$scheme_bin" --script igropyr/test/session-secure.sc
+# logging out must retire the identifier, not just empty it: the judge is
+# an attacker's copy of the sid, presented after the next login
+"$scheme_bin" --script igropyr/test/session-fixation.sc
 "$scheme_bin" --script igropyr/test/express-routes.sc
 # path normalization: middleware guards and the router must agree on the
 # path, or an extra slash routes to a handler while skipping its guard
