@@ -2560,12 +2560,55 @@ At boot, create a session store and register the middleware:
 ### API
 
 - `(make-session-store [ttl-ms])` → store — create a session store (default TTL 30 min = 1800000 ms)
-- `(session-middleware store)` → middleware — register the session middleware
+- `(session-middleware store [options])` → middleware — register the session middleware; see *Cookie options* below
 - `(req-session req)` → session object — get the current request's session (or create one)
 - `(session-get session key)` → value or #f — read a key from the session
 - `(session-set! session key value)` → void — write a key to the session
 - `(session-clear! session)` → void — clear all data and send a Set-Cookie with empty value
 - `(session-peek store sid)` → data alist or `#f` — read-only store lookup by sid: the `data` alist of a live session, or `#f`. Unlike `req-session`, it touches no request and persists nothing; it is the channel `(igropyr auth)`'s `session-guard` uses to authenticate a WebSocket upgrade, where the middleware never runs.
+
+### Cookie options, and the one that cannot be a constant
+
+`session-middleware` takes an options alist: `(cookie . "name")`,
+`(path . "/")`, `(same-site . "Lax")`, `(max-age . seconds)` and
+`(secure . …)`.
+
+`secure` defaults to `#t` and belongs there: the sid is a bearer
+credential — it is also what `session-guard` authenticates a WebSocket
+upgrade with — so the browser must never attach it to a plaintext
+request. `'((secure . #f))` is for local http development.
+
+**It also accepts a procedure of one argument**, called with the request
+each time a cookie is issued; a true answer attaches `Secure`. This
+exists for the deployment where a single process is reached both ways at
+once — public HTTPS through a proxy, and a plaintext tunnel on the
+inside — where a value fixed at construction is wrong for one of them.
+With `Secure` on, the tunnel side's browser refuses to store the cookie
+and the session disappears the moment it is created; with it off, the
+public side's sid travels in clear.
+
+```scheme
+(app-use app
+  (session-middleware store
+    (list (cons 'secure
+                (lambda (req)
+                  ;; whatever YOUR front end guarantees
+                  (equal? "https" (req-header req 'x-forwarded-proto)))))))
+```
+
+**The framework does not read `X-Forwarded-Proto` for you, deliberately.**
+Which header can be believed is a fact about a deployment — which proxy
+sets it, and whether anything upstream of that proxy can forge it — and
+a library that guessed would be guessing about somebody else's network.
+The example above is only correct if your front end overwrites that
+header on every inbound request.
+
+**A predicate that raises attaches `Secure`.** Of the two ways to be
+wrong, omitting it when it was needed hands the sid to the plaintext
+side; attaching it when it was not costs one refused cookie. The error
+goes to the side that is cheap to be wrong on. A predicate that cannot
+accept one argument is refused when the middleware is built, rather than
+failing silently into that same default on every request.
 
 ### Implementation Details
 
