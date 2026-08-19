@@ -1,12 +1,24 @@
 #!chezscheme
 ;;; DURABLE WRITES WITHOUT STOPPING THE WORLD.
 ;;;
-;;; (igropyr durable) performs the same sequence with synchronous
+;;; (igropyr durable) writes a file crash-safely with synchronous
 ;;; syscalls, which on one OS thread means every green process waits out
-;;; every fsync. This library performs it on libuv's thread pool: the
-;;; calling process parks between steps and the scheduler keeps running,
-;;; so the physical cost of an fsync does not go away -- it is charged to
-;;; the caller instead of to the whole node.
+;;; every fsync. This library reaches the same end state on libuv's
+;;; thread pool: the calling process parks between steps and the
+;;; scheduler keeps running, so the physical cost of an fsync does not go
+;;; away -- it is charged to the caller instead of to the whole node.
+;;;
+;;; THE SAME END STATE, NOT THE SAME STEPS. The synchronous library
+;;; writes through a port, closes it, and REOPENS the path to flush it,
+;;; because a Chez port does not hand out its descriptor. This one holds
+;;; the descriptor it created and flushes that, so its sequence is
+;;; open-write-fsync-close where the other's is write-open-fsync-close.
+;;; Two consequences, both in this library's favour and neither promised
+;;; away: there is no close-and-reopen window for another process to
+;;; substitute the path in, and there is no separate reopen step to fail
+;;; -- so the synchronous library's 'open failure after a successful
+;;; write has no counterpart here. What IS promised to match is the error
+;;; vocabulary and the outcome, not the order of the trace.
 ;;;
 ;;; WHICH ONE TO IMPORT. They are separate libraries and can be imported
 ;;; together; the exported names differ by suffix, so nothing collides.
@@ -82,7 +94,14 @@
 ;;; recovery story for somebody else's data.
 
 (library (igropyr durable-async)
-  (export durable-write-file-async! durable-dir-ensure-async!)
+  (export durable-write-file-async! durable-dir-ensure-async!
+          ;; RE-EXPORTED so that importing this library gives the whole
+          ;; vocabulary. What it raises is #(durable-error op path), and a
+          ;; caller that could not name the predicate for it would have to
+          ;; import a second library to catch the errors of the one it is
+          ;; using. Same reason (igropyr conversation) re-exports the
+          ;; status predicates from (igropyr conv-status).
+          durable-error? durable-error-op durable-error-path)
   (import (chezscheme)
           (igropyr actor)
           (igropyr libuv)
@@ -155,8 +174,13 @@
   ;; ---- the write sequence ------------------------------------------------
 
   ;; EXCLUSIVE, THEN A DIFFERENT NAME. Finding the name taken is not a
-  ;; failure: the synchronous library tries the next candidate, up to
-  ;; 1024 of them, and only a caller that exhausts every one is refused.
+  ;; failure: the synchronous library tries the next candidate and only a
+  ;; caller that exhausts them is refused. The bound counts from zero and
+  ;; continues while it is below 1024, so the candidates tried are
+  ;; numbered 0 through 1024 -- 1025 of them, not 1024. The synchronous
+  ;; library is off by the same one, so the two agree; the number is
+  ;; written out here rather than restated as a round figure because a
+  ;; round figure is what made it look checked.
   ;; That matters because a temporary is deliberately left behind by a
   ;; failed rename -- it holds the only copy of somebody's data -- and a
   ;; second run whose pid was reused and whose counter restarted at zero
@@ -173,7 +197,17 @@
                    (lambda ()
                      (fs-open-async! tmp
                        (bitwise-ior fs-o-wronly fs-o-creat fs-o-excl)
-                       #o600 self)))))
+                       ;; 0666, NOT 0600, AND THIS DECIDES THE TARGET'S
+                       ;; PERMISSIONS. The rename gives the target the
+                       ;; temporary's mode, so a stricter mode here is not
+                       ;; a stricter temporary -- it is a different
+                       ;; product. The synchronous library opens through a
+                       ;; Chez port, which creates 0666 and lets the umask
+                       ;; subtract; matching that is what keeps switching
+                       ;; between the two libraries from silently changing
+                       ;; who can read what an application writes. Policy
+                       ;; belongs to the caller's umask.
+                       #o666 self)))))
         (cond ((>= rc 0) (values tmp rc))
               ;; ONLY A COLLISION IS RETRIED. Retrying every failure was
               ;; wrong twice over: it spent 1024 pool jobs discovering
@@ -184,7 +218,15 @@
               ;; name exists; testing the rc for EEXIST asks the same
               ;; question without the stat it would otherwise need.
               ((and (= rc EEXIST) (< tries 1024)) (loop (+ tries 1)))
-              (else (fail! 'write tmp))))))
+              ;; RAISED THROUGH THE TRACE, not beside it. The step that
+              ;; failed was recorded as 'open with its rc, but what the
+              ;; caller is told is 'write -- so without this the trace
+              ;; holds no failed 'write at all and a reader comparing the
+              ;; two sees an error that never happened. The synchronous
+              ;; library raises this through its own step for the same
+              ;; reason.
+              (else (fs-trace-step 'write tmp
+                      (lambda () (fail! 'write tmp))))))))
 
   ;; A SHORT WRITE IS NOT AN ERROR AND NOT A COMPLETION. The synchronous
   ;; library writes through a port, which either writes everything or
@@ -196,8 +238,13 @@
   ;; from the offset it reached.
   (define (write-all! tmp fd bytes)
     (let ((n (bytevector-length bytes)))
+      ;; SUBMIT FIRST, THEN TEST. An empty payload still performs one
+      ;; write of zero bytes, because the synchronous library still
+      ;; records a 'write for it and a sequence that silently loses a
+      ;; step for one input is not the same sequence. (Measured: the
+      ;; primitive accepts a zero-length buffer and answers 0.)
       (let loop ((off 0))
-        (if (>= off n)
+        (if #f
             0
             (let ((rc (fs-step 'write tmp
                         (lambda ()
@@ -221,13 +268,39 @@
                                   rest))
                             off self)))))
               (when (< rc 0) (cleanup-temp! fd tmp) (fail! 'write tmp))
-              (loop (+ off rc)))))))
+              ;; NO PROGRESS IS A FAILURE. A zero return with bytes still
+              ;; to go leaves the offset where it was, so the same
+              ;; remainder is copied and submitted again for ever, one
+              ;; more pool job each time -- a livelock that never answers
+              ;; the caller rather than an error it can act on. A regular
+              ;; file should not do this; the loop exists for correctness,
+              ;; and "should not" is not a termination argument.
+              (when (and (= rc 0) (< off n))
+                (cleanup-temp! fd tmp) (fail! 'write tmp))
+              (let ((next (+ off rc)))
+                (if (>= next n) 0 (loop next))))))))
 
   ;; BEST EFFORT, AND NEVER THE REPORTED ERROR. Closing and unlinking are
   ;; how a failed write tidies up; either can fail on its own, and
   ;; neither is allowed to replace the reason the write failed.
+  ;; THROUGH THE TRACE LIKE EVERY OTHER STEP. A close on a cleanup path
+  ;; is still an operation this library performed, and the synchronous
+  ;; library records its own cleanup close; leaving these out made the
+  ;; trace show a descriptor being opened and never closed, which is
+  ;; exactly the shape a reader would investigate as a leak.
+  (define (close-quietly fd)
+    (guard (e (#t (void)))
+      (fs-step 'close "" (lambda () (fs-close-async! fd self)))))
+
   (define (cleanup-temp! fd tmp)
-    (guard (e (#t (void))) (await-job (fs-close-async! fd self)))
+    (close-quietly fd)
+    ;; DELIBERATELY SYNCHRONOUS, AND THE ONE PLACE THIS LIBRARY BLOCKS.
+    ;; There is no async unlink primitive to call. It runs only on the
+    ;; failed-write path, so the common path never reaches it -- but on a
+    ;; slow or networked filesystem it stops every green process for as
+    ;; long as the unlink takes, which is the one thing this library
+    ;; otherwise does not do. Removing it is a libuv-side addition
+    ;; (uv_fs_unlink), not something that can be fixed from here.
     (guard (e (#t (void))) (delete-file tmp)))
 
   ;; fsync the file this fd names, then close it. Both steps are the
@@ -235,9 +308,27 @@
   ;; write has returned, the temporary holds complete data, and removing
   ;; it would destroy the only copy while the target still holds what it
   ;; held before.
+  ;; TWO EXISTING SHAPES, SPLICED. Release the descriptor the way the
+  ;; directory flush does, and keep the temporary the way every phase
+  ;; after a successful body write does: the bytes are complete by now,
+  ;; so the temporary holds the only copy of them while the target still
+  ;; holds what it held before.
+  ;;
+  ;; A failing fsync used to raise with the descriptor still open. The
+  ;; caller is alive on that path -- it caught a durable-error and went
+  ;; on -- so the runtime's owner-died sweep never runs and nothing ever
+  ;; reclaims it. The same rule was already written into the directory
+  ;; flush below; it was missing here, which is what one rule in two
+  ;; places costs.
+  ;;
+  ;; A failing CLOSE is deliberately not retried: POSIX leaves the
+  ;; descriptor's state unspecified after one, and closing again can
+  ;; reach a descriptor number something else has since been given.
   (define (flush-and-close! tmp fd)
-    (checked 'fsync tmp
-      (fs-step 'fsync tmp (lambda () (fs-fsync-async! fd self))))
+    (let ((rc (fs-step 'fsync tmp (lambda () (fs-fsync-async! fd self)))))
+      (when (< rc 0)
+        (close-quietly fd)
+        (fail! 'fsync tmp)))
     (checked 'close tmp
       (fs-step 'close tmp (lambda () (fs-close-async! fd self)))))
 
@@ -289,8 +380,15 @@
                   (fs-open-async! path
                     (bitwise-ior fs-o-rdonly fs-o-directory) 0 self)))))
       (cond ((>= rc 0)
-             (fs-step 'dir-close path
-               (lambda () (fs-close-async! rc self)))
+             ;; The probe's own descriptor. Its close rc is not checked:
+             ;; the question being answered is "is this a directory", it
+             ;; has already been answered, and turning a failed close into
+             ;; a durable-error here would make classifying a path a
+             ;; second source of failure. The registration is dropped
+             ;; either way by the primitive.
+             (guard (e (#t (void)))
+               (fs-step 'dir-close path
+                 (lambda () (fs-close-async! rc self))))
              #t)
             (else #f))))
 
