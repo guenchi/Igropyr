@@ -344,10 +344,11 @@
                 ;; this as "the framework tidied up" would be reading it
                 ;; as the one thing it does not do.
                 ((fsfd)
-                 (let ((o (hashtable-ref fsw-fds key #f)))
-                   (when (eq? o owner)
+                 (let ((e (hashtable-ref fsw-fds key #f)))
+                   (when (and e (eq? (car e) owner))
+                     (let ((gen (cdr e)))
                      (hashtable-delete! fsw-fds key)
-                     ;; CLOSING MUST COME AFTER THE LAST JOB THAT NAMES
+                     ;; A RECLAIM MUST COME AFTER THE LAST JOB THAT NAMES
                      ;; IT, or what gets closed is a NUMBER and not a
                      ;; file. A job already handed to the pool has not
                      ;; necessarily entered its syscall yet: close the
@@ -358,9 +359,21 @@
                      ;; cancel jobs -- it only stops their answers being
                      ;; delivered -- so the wait is real and has to be
                      ;; waited out.
+                     ;;
+                     ;; THIS COVERS THE CLOSES THIS LIBRARY ISSUES -- the
+                     ;; reclaim here and the orphaned-open return -- and
+                     ;; not a close the CALLER submits. Ordering its own
+                     ;; close after its own outstanding jobs on the same
+                     ;; descriptor is the caller's, exactly as it is in C:
+                     ;; one thread writing a descriptor while another
+                     ;; closes it races the same reissue, and no
+                     ;; descriptor API promises otherwise. (igropyr
+                     ;; durable-async) is the worked example -- it keeps
+                     ;; one job in flight at a time, so the question never
+                     ;; arises for it.
                      (if (fd-in-flight? key)
-                         (hashtable-set! fsw-closing key #t)
-                         (close-fd-now! key)))))
+                         (hashtable-set! fsw-closing key gen)
+                         (close-fd-now! key))))))
                 ;; An in-flight job: the callback is still coming and
                 ;; still has to free the request, so only the delivery is
                 ;; suppressed. Clearing the owner is what does that --
@@ -850,6 +863,9 @@
       (mutable owner fsw-job-owner fsw-job-owner-set!)
       (immutable kind fsw-job-kind)         ; open|write|fsync|rename|close
       (immutable fd fsw-job-fd)             ; the fd acted on, or -1
+      ;; WHICH TENANCY OF THAT NUMBER THIS JOB MEANT. Captured when the
+      ;; job is submitted; see the generation note below.
+      (mutable gen fsw-job-gen fsw-job-gen-set!)
       (mutable data fsw-job-data fsw-job-data-set!)   ; C copy of the bytes
       (mutable buf fsw-job-buf fsw-job-buf-set!)))    ; uv_buf_t
 
@@ -886,6 +902,30 @@
   ;; event-loop callbacks -- both places where nothing else in the
   ;; runtime can run -- so a deep queue would turn a bookkeeping question
   ;; into a pause.
+  ;; A FILE DESCRIPTOR NUMBER IS A LEASE FROM THE OS, NOT AN IDENTITY.
+  ;; The kernel reissues the smallest free number, so the same integer
+  ;; names a different file the moment one is closed. Anything of ours
+  ;; keyed only by that integer will eventually be asked about a tenancy
+  ;; it was not talking about -- a close callback arriving after the
+  ;; number has been handed to a new open would strike that new
+  ;; registration off the books, and the descriptor it belongs to could
+  ;; then never be reclaimed.
+  ;;
+  ;; So identity here is the number PLUS a generation: fsw-fds holds
+  ;; (owner . gen), each job captures the generation current when it was
+  ;; submitted, and every place that removes an entry compares the two
+  ;; first. A stale callback finds a generation that is not its own and
+  ;; touches nothing. None of this reaches the public surface -- the
+  ;; primitives still take and return plain descriptors.
+  (define fsw-gen 0)
+  (define (fsw-next-gen!)
+    (set! fsw-gen (+ fsw-gen 1))
+    fsw-gen)
+
+  (define (fd-gen fd)
+    (let ((e (hashtable-ref fsw-fds fd #f)))
+      (and e (cdr e))))
+
   (define fsw-fd-refs (make-eqv-hashtable))
 
   (define (fd-ref+! fd)
@@ -905,12 +945,11 @@
   ;; Called once a job has been removed from the table: if it was the
   ;; last one holding a descriptor that was waiting to be closed, this is
   ;; the moment the close is finally safe.
-  (define (close-if-drained! fd)
-    (when (and (>= fd 0)
-               (hashtable-ref fsw-closing fd #f)
-               (not (fd-in-flight? fd)))
-      (hashtable-delete! fsw-closing fd)
-      (close-fd-now! fd)))
+  (define (close-if-drained! fd gen)
+    (let ((marked (and (>= fd 0) (hashtable-ref fsw-closing fd #f))))
+      (when (and marked (eqv? marked gen) (not (fd-in-flight? fd)))
+        (hashtable-delete! fsw-closing fd)
+        (close-fd-now! fd))))
 
   (define (fsw-free! job req)
     (fd-ref-! (fsw-job-fd job))
@@ -938,7 +977,7 @@
                  (cond
                    ((< rc 0) (void))
                    (owner
-                    (hashtable-set! fsw-fds rc owner)
+                    (hashtable-set! fsw-fds rc (cons owner (fsw-next-gen!)))
                     (index-owner! owner 'fsfd rc))
                    ;; AN OPEN THAT SUCCEEDED FOR A CALLER THAT IS GONE.
                    ;; Nobody will ever be told this descriptor exists, so
@@ -948,9 +987,16 @@
                    ;; to do with it is give it straight back.
                    (else (close-fd-now! rc))))
                 ((close)
-                 (let ((fd (fsw-job-fd job)))
-                   (hashtable-delete! fsw-fds fd)
-                   (unindex-owner! owner 'fsfd fd)
+                 (let* ((fd (fsw-job-fd job))
+                        (e (hashtable-ref fsw-fds fd #f)))
+                   ;; ONLY IF THE BOOKS STILL MEAN THE FILE WE CLOSED.
+                   ;; A callback that arrives after the number has been
+                   ;; reissued would otherwise strike off a registration
+                   ;; belonging to a live owner, whose descriptor could
+                   ;; then never be reclaimed.
+                   (when (and e (eqv? (cdr e) (fsw-job-gen job)))
+                     (hashtable-delete! fsw-fds fd)
+                     (unindex-owner! owner 'fsfd fd))
                    ;; STRUCK OFF WHETHER OR NOT IT CLOSED. On success it
                    ;; is closed and anything waiting to close it must not
                    ;; close the number again. On failure POSIX leaves the
@@ -962,15 +1008,17 @@
                    ;; failing one that means a descriptor the OS may still
                    ;; hold is no longer tracked, which is a real leak with
                    ;; no safe repair from here.
-                   (hashtable-delete! fsw-closing fd)))
+                   (let ((marked (hashtable-ref fsw-closing fd #f)))
+                     (when (and marked (eqv? marked (fsw-job-gen job)))
+                       (hashtable-delete! fsw-closing fd)))))
                 (else (void)))
               (when owner
                 (deliver owner (vector 'fs-done (fsw-job-id job) rc)))
-              (let ((fd (fsw-job-fd job)))
+              (let ((fd (fsw-job-fd job)) (gen (fsw-job-gen job)))
                 (fsw-free! job req)
                 ;; After the job leaves the table, so this cannot see
                 ;; itself as a reason to keep waiting.
-                (close-if-drained! fd))))))
+                (close-if-drained! fd gen))))))
       (void*) void))
 
   ;; Submit one job. The id comes back at once and names the completion;
@@ -988,8 +1036,11 @@
   ;; existing that nothing will finish.
   (define (fsw-submit! owner kind fd data buf go)
     (let* ((req (foreign-alloc fs-req-size))
-           (job (make-fsw-job (fsw-fresh-id!) owner kind fd data buf)))
+           (job (make-fsw-job (fsw-fresh-id!) owner kind fd #f data buf)))
       (let ((r (with-interrupts-disabled
+                 ;; Captured here, inside the atom that registers the
+                 ;; job: which tenancy of this number the job meant.
+                 (fsw-job-gen-set! job (fd-gen fd))
                  (hashtable-set! fsw-table req job)
                  (index-owner! owner 'fsjob req)
                  (fd-ref+! fd)
