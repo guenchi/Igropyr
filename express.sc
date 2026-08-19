@@ -1082,17 +1082,45 @@
                   pattern))))))
       segs))
 
+  ;; REPLACING A HANDLER MUST NOT MOVE ITS ROUTE. Dispatch is
+  ;; first-match-wins down this list in order, so a route's position IS
+  ;; its priority -- and re-registering used to drop the old entry and
+  ;; append the new one, which moved it to the end.
+  ;;
+  ;; That turned a hot swap of one handler into a change of routing.
+  ;; Register "/u/me" and then "/u/:id", and "/u/me" wins as intended;
+  ;; replace the handler for "/u/me" on a live server and it lands
+  ;; AFTER the wildcard, so the new handler is unreachable and every
+  ;; request for it silently goes to "/u/:id" instead. No exception, no
+  ;; log, and the order was correct until the moment somebody replaced
+  ;; something. Overlapping pairs like this are ordinary --
+  ;; /users/me against /users/:id, /api/health against /api/:resource.
+  ;;
+  ;; So a matching (method, segments) has its handler swapped where it
+  ;; already sits, and only a genuinely new route is appended. The
+  ;; contract that registration order decides priority is unchanged for
+  ;; new routes; what is withdrawn is an undocumented side effect of
+  ;; re-registration that nobody could have wanted -- lowering a route's
+  ;; priority is done by ordering the registrations, not by registering
+  ;; twice.
   (define (add-route! a method pattern handler)
     (let ((segs (split-segments pattern)))
       (check-splat! 'add-route! pattern segs)
       (check-params! 'add-route! pattern segs)
-      (app-routes-set! a
-        (append
-          (filter (lambda (r)
-                    (not (and (eq? (vector-ref r 0) method)
-                              (equal? (vector-ref r 1) segs))))
-                  (app-routes a))
-          (list (vector method segs handler))))))
+      (let* ((same? (lambda (r)
+                      (and (eq? (vector-ref r 0) method)
+                           (equal? (vector-ref r 1) segs))))
+             (replaced #f)
+             (kept (map (lambda (r)
+                          (if (same? r)
+                              (begin (set! replaced #t)
+                                     (vector method segs handler))
+                              r))
+                        (app-routes a))))
+        (app-routes-set! a
+          (if replaced
+              kept
+              (append kept (list (vector method segs handler))))))))
 
   ;; A READ-ONLY PROJECTION, NOT THE TABLE. What an app holds is a list
   ;; of #(method segments handler) with the segments already split the
@@ -1111,9 +1139,10 @@
   ;; "/a/b"; the root reads back as "/". Parameter and splat segments
   ;; come back as written (":id", "*").
   ;;
-  ;; Order is registration order, and a re-registration moves its route
-  ;; to the end, because that is what add-route! does -- the old entry is
-  ;; dropped and the new one appended.
+  ;; Order is registration order, and it is also dispatch priority:
+  ;; first match wins. Replacing a handler keeps its route where it was,
+  ;; precisely because moving it would be changing the routing rather
+  ;; than the handler (see add-route!).
   ;;
   ;; Nothing is shared with the app: the list, the pairs and the strings
   ;; are all fresh, so a caller cannot reach the router by mutating what
