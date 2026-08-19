@@ -2587,28 +2587,64 @@ With `Secure` on, the tunnel side's browser refuses to store the cookie
 and the session disappears the moment it is created; with it off, the
 public side's sid travels in clear.
 
+**Write the predicate so that only a positive identification turns
+`Secure` off.** Anything it does not recognise — a missing header, a
+different spelling, a chained value like `"https,http"`, a proxy whose
+configuration drifted — has to end up attaching `Secure`, because that
+is the direction where being wrong is survivable:
+
 ```scheme
 (app-use app
   (session-middleware store
     (list (cons 'secure
                 (lambda (req)
-                  ;; whatever YOUR front end guarantees
-                  (equal? "https" (req-header req 'x-forwarded-proto)))))))
+                  ;; #f ONLY for a channel this deployment knows is a
+                  ;; trusted plaintext one; everything else, including
+                  ;; anything unrecognised, keeps Secure.
+                  (not (equal? "internal-tunnel"
+                               (req-header req 'x-igropyr-channel))))))))
 ```
+
+A predicate written the other way round — `(equal? "https" …)` on a
+forwarded-proto header — is **fail-open**: every value it fails to match
+drops `Secure`, and those values are not errors, so nothing here catches
+them.
 
 **The framework does not read `X-Forwarded-Proto` for you, deliberately.**
 Which header can be believed is a fact about a deployment — which proxy
 sets it, and whether anything upstream of that proxy can forge it — and
 a library that guessed would be guessing about somebody else's network.
-The example above is only correct if your front end overwrites that
-header on every inbound request.
+Whatever header you choose, your front end must overwrite it on every
+inbound request, or a client can set it themselves.
 
-**A predicate that raises attaches `Secure`.** Of the two ways to be
-wrong, omitting it when it was needed hands the sid to the plaintext
-side; attaching it when it was not costs one refused cookie. The error
-goes to the side that is cheap to be wrong on. A predicate that cannot
-accept one argument is refused when the middleware is built, rather than
-failing silently into that same default on every request.
+**A predicate that raises attaches `Secure`, and that is not free.** The
+response carrying the cookie has already gone out over the plaintext
+side, so the sid has been in clear on the wire; `Secure` only stops the
+browser keeping it. The user sees a session that will not stick, retries,
+and mints another exposed sid each time. It is still the better
+direction — without `Secure` the browser *keeps* a plaintext cookie and
+re-sends it on every later request, turning one exposure into a standing
+one — but it converts an ongoing leak into a visible login failure
+rather than undoing the leak.
+
+Two things the guard does not cover: a predicate that escapes through a
+captured continuation (not a raise and not a return, so nothing runs),
+and a predicate whose own bug is silent — see below. A predicate that
+cannot accept one argument is refused when the middleware is built,
+rather than failing into the default on every request.
+
+**Guard inside your own predicate, and leave a trace.** If it raises —
+a name that is not in scope, an accessor that does not exist — the
+framework swallows it by design, because a security attribute that
+cannot be decided must not also take down the response. The cost of that
+choice is silence: every cookie gets `Secure`, nothing appears in any
+log, and the symptom is "the plaintext side suddenly cannot hold a
+session". Whoever debugs it will suspect the proxy, then the browser,
+then the framework, and their own predicate last. Worse, on a deployment
+that has *already* fixed a Secure-related bug once, this reproduces the
+old symptom exactly — so it reads as a regression rather than as a new
+fault. Catch and log inside the predicate; do not rely on the framework
+to tell you it failed.
 
 ### Implementation Details
 
