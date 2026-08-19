@@ -124,6 +124,51 @@
     ;; unmatched path is a 404
     (check "miss-404"      (equal? (car (get "/nope"))     "404"))
 
+    ;; ---- REPLACING A ROUTE MUST NOT MOVE IT ---------------------------
+    ;; Dispatch is first-match-wins over registration order, so a route's
+    ;; POSITION is part of its meaning. Re-registering a handler -- the
+    ;; hot-swap the framework advertises -- must therefore leave the
+    ;; position alone: appending the replacement puts a concrete route
+    ;; behind the splat that was registered after it, and the new handler
+    ;; becomes unreachable while requests silently take the other one.
+    ;; Nothing raises and nothing is logged; only a request tells you.
+    (check "concrete-wins-before-swap"
+           (equal? (get "/content/list") '("200" . "LIST")))
+    (begin
+      (app-get app "/content/list"
+        (lambda (req res) (send-text! res "LIST2")))
+      #t)
+    (check "the replaced handler is the one that answers"
+           (equal? (get "/content/list") '("200" . "LIST2")))
+    ;; ...and the list shows why: it kept its place ahead of the splat
+    (let* ((rs (app-route-list app))
+           (pos (lambda (pat)
+                  (let loop ((l rs) (i 0))
+                    (cond ((null? l) #f)
+                          ((equal? (cdar l) pat) i)
+                          (else (loop (cdr l) (+ i 1))))))))
+      (check "a replaced route keeps its position"
+             (and (pos "/content/list") (pos "/content/*")
+                  (< (pos "/content/list") (pos "/content/*")))))
+
+    ;; ---- what app-route-list is, and is not ---------------------------
+    ;; A projection, rebuilt: the router keeps split segments, not the
+    ;; string that was registered, so equivalent spellings read back in
+    ;; one canonical form. Asserted so the rebuild cannot quietly start
+    ;; leaking the internal shape.
+    (let ((rs (app-route-list app)))
+      (check "route list is (method . pattern) pairs"
+             (for-all (lambda (r) (and (pair? r) (symbol? (car r))
+                                       (string? (cdr r))))
+                      rs))
+      (check "patterns read back canonical"
+             (and (member '(GET . "/content/list") rs)
+                  (member '(GET . "/files/:id") rs)))
+      ;; mutating what it hands back must not reach the router
+      (set-cdr! (car rs) "/hijacked")
+      (check "the list does not share structure with the router"
+             (not (member '(GET . "/hijacked") (app-route-list app)))))
+
     (if (zero? failures)
         (begin (display "express-routes: all tests passed") (newline) (exit 0))
         (begin (display failures) (display " failures") (newline) (exit 1)))))
