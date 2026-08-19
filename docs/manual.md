@@ -2564,7 +2564,7 @@ At boot, create a session store and register the middleware:
 - `(req-session req)` → session object — get the current request's session (or create one)
 - `(session-get session key)` → value or #f — read a key from the session
 - `(session-set! session key value)` → void — write a key to the session
-- `(session-clear! session)` → void — clear all data and send a Set-Cookie with empty value
+- `(session-clear! session)` → void — clear the session's data. It does **not** rotate the session id and does **not** send a `Set-Cookie`: the browser keeps the same sid, now pointing at an empty session. **For a logout, call `session-regenerate!` as well** — otherwise an id captured before the logout still names the session the next login writes into
 - `(session-peek store sid)` → data alist or `#f` — read-only store lookup by sid: the `data` alist of a live session, or `#f`. Unlike `req-session`, it touches no request and persists nothing; it is the channel `(igropyr auth)`'s `session-guard` uses to authenticate a WebSocket upgrade, where the middleware never runs.
 
 ### Cookie options, and the one that cannot be a constant
