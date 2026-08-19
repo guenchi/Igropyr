@@ -2275,6 +2275,14 @@ step that waits on *human* think time while holding row locks: hold
 application-level reservations across human pauses, live transactions
 only across machine-paced rounds.
 
+**Distributed work is the other half of this.** A conversation is what
+turns a task that must not run twice into one whose interrupted attempts
+can be resolved — which is how a distributed task pool, whose honest
+options are only "never dropped" or "never duplicated", is given an
+exactly-once effect. The recipe, and the case where no recipe exists,
+are in *Building exactly-once out of the two honest extremes* under
+**Distribution**.
+
 ---
 
 ## Middleware Suite
@@ -4090,6 +4098,156 @@ API:
 - `(dpool-submit pool payload [opts])` → task-id — async; `opts` may override `mode`
 - `(dpool-await pool task-id [timeout])` → value — blocks; raises `#(dpool-error ,reason ,id)` (`task-error` / `node-down` / `await-timeout`)
 - `(dpool-stats pool)` → `((live . n) (inflight . n) (queued . n))`
+
+### Building exactly-once out of the two honest extremes
+
+The paragraph above is where most readers stop, and it is only half the
+story: dpool cannot give exactly-once *by itself*, and the cooperation it
+names is something this framework already has. What follows is the
+recipe, and — just as important — the case where no recipe exists.
+
+#### Which guarantee a task actually needs
+
+Two questions decide it, and only two: can the effect be applied twice
+without harm, and can the world be **asked afterwards** whether it was
+applied?
+
+| | the world can be asked | the world cannot be asked |
+|---|---|---|
+| **idempotent effect** | `at-least-once` | `at-least-once` |
+| **non-idempotent effect** | the conversation recipe below | **`at-most-once`, and this is its only home** |
+
+The top row needs no machinery at all: run it again, the second run
+costs nothing. Reach for a unique key, an upsert, a dedup id, and stay
+in that row if you can — everything below is what it costs to leave it.
+
+The bottom-left cell is what `(igropyr conversation)` is for. A charge,
+a transfer, a booking: applying it twice is a real loss, but the ledger
+can be read afterwards, so an interrupted attempt can be *resolved*
+rather than guessed at.
+
+**The bottom-right cell is the one worth naming, because it is where
+exactly-once does not exist** — not in this framework and not in any
+other. Sending an email, calling a third party that offers no way to ask
+"did you receive request X": if the process dies after the call and
+before recording it, nothing left alive can determine what happened.
+Wrapping it in a conversation does not help, and understanding why is
+the point: a conversation answers `'unknown` and instructs you to
+reconcile, and reconciling *presupposes a world that can be asked*. With
+no query interface there is nothing to reconcile against, and `'unknown`
+is where the matter permanently rests.
+
+So the choice in that cell belongs to the caller and is a choice between
+losses: `at-least-once` risks sending twice, `at-most-once` risks not
+sending at all. That is the whole of `at-most-once`'s territory — not
+"anything I am nervous about re-running", but this cell, plus whatever
+your own protocol with a counterparty says. It is not a weaker default
+to be grown out of; it is the honest answer to an unanswerable question.
+
+#### The recipe
+
+For the bottom-left cell, in four parts:
+
+1. **Submit `at-most-once`.** Never let dpool re-dispatch this task. A
+   re-dispatch is a second attempt made by a layer that cannot know
+   whether the first one had an effect — precisely the judgement the
+   recipe exists to place somewhere better.
+2. **Take the id before the effect can exist.** `conversation-prepare!`
+   mints the id without running anything; `conversation-ref-id` reads
+   it. That ordering is the whole point: an id that exists before the
+   first effect can be recorded before it too.
+3. **Claim it in shared storage, under the caller's own idempotency
+   key, with a primary key doing the work.** The claim row maps *your*
+   key (order 4711) to *this* conversation id. Inserting it is what
+   makes a second submission of the same intent find the first one's id
+   instead of minting a new conversation — the database's uniqueness
+   constraint is the arbiter, not this framework.
+4. **On a node death, ask the id.** `dpool-await` raises
+   `#(dpool-error node-down ,id)` and tells you nothing about the
+   effect. The conversation id does: `conversation-peek` answers
+   `'settled` (it completed — done, do nothing), `'gone` (it rolled
+   back — safe to submit once more), or `'unknown` / `'unreachable`
+   (reconcile against your own records; do not resubmit).
+
+Every step is load-bearing. Drop the claim and two submissions become
+two conversations; drop `prepare!` and there is a window in which an
+effect exists under an id nobody stored; drop `at-most-once` and dpool
+makes the retry decision before you can.
+
+#### Starting is not resuming
+
+A conversation-shaped task can safely be submitted `at-least-once`, but
+only the *resume* half is safe for free, and the difference is where
+this recipe is most often got wrong.
+
+**Resuming is naturally safe.** A token is single-use, so a duplicate
+resume carrying a spent token is `'stale` rather than a second
+application; and if the duplicate carries the *same* request, the
+`request-key` replay rule answers it with the original reply instead of
+advancing the flow. That also covers the case where a link dropped but
+the node did not die, so two dispatches genuinely execute at once: both
+arrive at the same owner process, which serves them one at a time.
+
+**Starting is not.** `request-key` is a replay key *within* an existing
+conversation — it is compared against the tokens that conversation has
+issued, and there is no conversation yet when the first request is
+being placed. Two `conversation-start!` calls with an identical request
+mint two ids and two independent conversations, and no key folds them
+together. The name suggests otherwise, which is exactly why it is worth
+saying: **deduplicating the start is the claim's job, and nothing
+else's.**
+
+The shape to remember: pick the *wide* delivery guarantee so nothing is
+lost, and narrow it at the effect layer where the evidence lives.
+
+#### Mixed nodes
+
+Mode is a property of a **task**, not of a node or a deployment:
+`(dpool-submit pool payload '((mode . at-most-once)))` overrides the
+pool default per task, so idempotent bulk work and conversation-backed
+transactions share one pool without either being compromised.
+
+A node can be both a dpool worker and a conversation owner at once.
+They are independent channels — a `dpool-worker-start` registration and
+the conversation router are separate processes reached by different
+messages — and no configuration connects them.
+
+#### What moves when a node dies, and what does not
+
+The two halves fail differently, and a deployment has to be built for
+the asymmetry rather than around it:
+
+- **dpool work redistributes by itself.** A dead member stops being
+  picked for new tasks the moment `monitor-node` reports it, with no
+  configuration. Its *in-flight* task is re-dispatched under
+  `at-least-once` — but under `at-most-once`, the mode this recipe uses,
+  it is failed rather than moved, which is the point: the caller decides
+  with the conversation id in hand.
+- **Conversations do not move at all.** A clustered id names its owner,
+  so every resume for it is forwarded to that node by name. While that
+  node is down the answer is `'unreachable`; when a node returns *under
+  the same name*, the ids resolve again.
+
+Two obligations follow, and both belong to the deployment rather than to
+the library:
+
+- **A node name must be unique across the cluster, at every instant.**
+  Two machines started under one name is split-brain: both mint ids
+  claiming to own the same node, and forwards resolve to whichever link
+  answers. Nothing in the protocol detects or arbitrates this — there is
+  no term, no fencing token, no election — so a stop-the-old-one-first
+  discipline is the whole of the defence.
+- **The window between a node dying and something deciding what to do
+  about it must be one the application can tolerate.** Conversations
+  owned by a dead node are unreachable until it returns or until an
+  operator drives their ids elsewhere; the library will not move them
+  and does not pretend to.
+
+Identity is deliberately decoupled from hardware — a node name plus a
+shared record store can be brought up somewhere else and its ids resolve
+again — while identity and *queryability* are deliberately not
+decoupled: a conversation is answered by its owner, and no other node
+answers on its behalf.
 
 For a **singleton** across the cluster (one global scheduler, one lock
 holder) rather than spread work, dpool is the wrong tool — that needs
