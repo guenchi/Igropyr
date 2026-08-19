@@ -169,11 +169,41 @@
             (remp (lambda (p) (eq? (car p) key)) (session-touched s))))
     (session-dirty?-set! s #t))
 
+  ;; CLEARING ENDS THE IDENTITY, NOT ONLY THE DATA. Emptying the data
+  ;; and leaving the id alone is not a logout: the browser keeps the same
+  ;; sid, and so does anyone who copied it. The next login writes into
+  ;; that same id, so a captured sid survives the logout meant to end it
+  ;; and comes back as a live authenticated session. The property to hold
+  ;; on to is one sentence: AFTER A CLEAR, THE OLD SID MUST NO LONGER BE
+  ;; A USABLE IDENTITY.
+  ;;
+  ;; ORDER MATTERS TWICE HERE.
+  ;;
+  ;; The data is emptied BEFORE rotating, because the rotation copies
+  ;; whatever the session holds at that moment into the new entry --
+  ;; rotate first and the new id starts life holding everything the clear
+  ;; was supposed to remove.
+  ;;
+  ;; The id is replaced AFTER the rotation returns, because publishing
+  ;; the replacement cookie can fail (the response may already have been
+  ;; sent) and a failure must leave the caller on an id that still
+  ;; resolves.
+  ;;
+  ;; A session that is already new is left alone, the way
+  ;; session-regenerate! leaves it: its id has not reached the client
+  ;; yet, so there is nothing to invalidate, and rotating anyway would
+  ;; put two Set-Cookie fields for the same session in one response.
   (define-checked (session-clear! (s session?))
     (session-data-set! s '())
     (session-touched-set! s '())
     (session-cleared?-set! s #t)
-    (session-dirty?-set! s #t))
+    (session-dirty?-set! s #t)
+    (unless (session-new? s)
+      (let ((old (session-sid s)) (fresh (new-sid)))
+        ((session-rotate s) 'session-clear! old fresh (session-data s))
+        (session-sid-set! s fresh)
+        (session-new?-set! s #t)))
+    (void))
 
   ;; Rotate an established identifier at an authentication or privilege
   ;; boundary. A cookie-less request already has a freshly generated,
@@ -193,7 +223,7 @@
         (let ((old (session-sid s)) (fresh (new-sid)))
           ;; Issue the replacement cookie before mutating the object; a bad
           ;; middleware option must fail without invalidating the live id.
-          ((session-rotate s) old fresh (session-data s))
+          ((session-rotate s) 'session-regenerate! old fresh (session-data s))
           (session-sid-set! s fresh)
           (session-new?-set! s #t)
           ;; The prepared store entry has the pre-rotation snapshot; mark the
@@ -320,15 +350,20 @@
             (issue-cookie-with! set-cookie-if-unanswered! sid))
           (define (drop! sid)
             (gen-server-cast (store-pid store) (vector 'drop sid)))
-          (define (rotate! old fresh data)
+          ;; `who` NAMES THE CALL THAT ASKED FOR THIS. Both
+          ;; session-regenerate! and session-clear! rotate, and a caller
+          ;; that rotated too late has to be told which of its own calls
+          ;; was too late -- an error naming the wrong one sends them
+          ;; looking at the wrong line.
+          (define (rotate! who old fresh data)
             ;; Publishing the replacement cookie and claiming a response race
             ;; on the same token. Whichever wins is definitive: a successful
             ;; publication is included in the responder's atomic header
             ;; snapshot; a claimed response makes this raise before either
             ;; store id moves. A separate res-answered? check has a TOCTOU gap.
             (unless (issue-cookie-if-unanswered! fresh)
-              (assertion-violation 'session-regenerate!
-                "response already sent -- the new cookie cannot reach the client; regenerate before answering"
+              (assertion-violation who
+                "response already sent -- the new cookie cannot reach the client; rotate the session before answering"
                 old))
             ;; Synchronous: session-regenerate! cannot return (and the handler
             ;; cannot send the cookie) until fresh is a valid store entry --
