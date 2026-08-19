@@ -185,6 +185,39 @@ compiler net here — tests must carry that weight.
   incident**, burying the error you were handling. `abandon!` covers the
   window between `prepare!` and `run!` (the claim collided, a gate
   closed, a hold expired). After `run!`, reconcile by id.
+- **Exactly-once is a recipe, not a mode — and one square of the grid
+  has none.** Two questions pick the guarantee: can the effect be
+  applied twice harmlessly, and can the world be *asked afterwards*
+  whether it landed? Idempotent → `at-least-once`, done. Non-idempotent
+  but checkable → `at-most-once` + `conversation-prepare!` for the id
+  *before* any effect + a claim row in shared storage under the caller's
+  own key (a primary key is the arbiter) + on `#(dpool-error node-down
+  ,id)` ask the id: `'settled` done, `'gone` submit once more,
+  `'unknown`/`'unreachable` reconcile. Non-idempotent AND uncheckable
+  (email, a third party with no query interface) → **no mechanism gives
+  exactly-once**; wrapping it in a conversation does not help, because
+  `'unknown` says "reconcile" and reconciling presupposes a world that
+  can be asked. That last square is `at-most-once`'s actual territory,
+  and the caller is choosing which loss to risk.
+- **`request-key` does not deduplicate `conversation-start!`.** It is a
+  replay key *inside* an existing conversation, compared against the
+  tokens that conversation has issued — and there is no conversation yet
+  when the first request is placed. Two starts with an identical request
+  are two independent conversations with two ids. Resuming is safe for
+  free (a token is single-use, and a repeat carrying the same request is
+  answered from the record rather than advancing the flow); **starting
+  is deduplicated by the claim and by nothing else.** Do not infer
+  otherwise from the name.
+- **Never invent an `'exactly-once` dpool mode.** The modes are
+  `at-least-once` and `at-most-once`; a wrapper claiming the third would
+  be a second place deciding retries, while the guarantee actually lives
+  in the claim and the conversation id, which are not dpool's to hold.
+- **Deployment obligations behind all of this**: a node name must be
+  unique at every instant (nothing in the protocol detects or arbitrates
+  two machines under one name), and conversations owned by a dead node
+  do not migrate — its dpool share redistributes automatically, its
+  conversations answer `'unreachable` until a node returns under the
+  same name.
 - **`'overloaded` is the one refusal you retry, and `'unreachable` is not.**
   An owner that is already hosting its limit of forwarded work refuses
   without looking at anything, so the request definitely did not happen:
