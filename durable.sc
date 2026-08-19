@@ -16,9 +16,38 @@
 ;;; AFTER the writing port has been closed, because a Chez port does not
 ;;; hand out its file descriptor. fsync takes a descriptor for the file
 ;;; and not a writable channel to it, so this is sound -- but it means
-;;; the path is resolved a second time, and an earlier version of this
+;;; THE PATH IS RESOLVED A SECOND TIME, and an earlier version of this
 ;;; note claimed the flush came before the close, which was never what
 ;;; the code did.
+;;;
+;;; WHAT THAT SECOND RESOLUTION COSTS, stated as a condition rather than
+;;; as a warning. "The data was durable before the rename" holds exactly
+;;; when all of these do:
+;;;
+;;;   a) the path the rename resolves is the same inode that was flushed;
+;;;   b) nothing changed the bytes between the flush and the rename;
+;;;   c) source and target are on one filesystem;
+;;;   d) the parent directory flush after the rename succeeded.
+;;;
+;;; Fail any of them and the guarantee is not weakened, it is absent, and
+;;; the shape that does not depend on (a) or (b) is the one that keeps
+;;; hold of the descriptor it wrote -- which is what (igropyr
+;;; durable-async) does, so (a) is structural there.
+;;;
+;;; HERE (a) AND (b) HOLD FOR A DIFFERENT REASON: the temporary is
+;;; created O_EXCL under a name no other writer proposes, and one writer
+;;; owns it from creation to rename. That is why this is a statement of
+;;; conditions and not a defect list -- nothing needs repairing while
+;;; those conditions are met, and a caller who breaks them (a second
+;;; process writing the same temporary, a target reached through a
+;;; symlink somebody can swap) has left the shape this reasoning
+;;; describes.
+;;;
+;;; NAME THE RISK ACCURATELY: it is not that the descriptor changed. It
+;;; is that RESOLVING THE NAME AGAIN can reach a different inode than the
+;;; first resolution did. Closing that from in here would need
+;;; O_NOFOLLOW/openat or a flush on the writing descriptor itself, and
+;;; neither is reachable through a Chez port.
 ;;;
 ;;; WHAT CANNOT BE CHECKED FROM IN HERE is whether any of it reached the
 ;;; medium. fsync returning zero says the kernel believes it handed the
@@ -91,6 +120,26 @@
       'igropyr-durable
       '("libc.dylib" "libc.so.7" "libc.so.6" "libc.so")))
 
+  ;; THIS DECLARATION CANNOT CARRY A MODE, AND open(2) IS VARIADIC.
+  ;; Only the first two arguments are named in C; `mode` lives in the
+  ;; `...`, so it is passed the way a variadic argument is passed. A
+  ;; fixed-arity FFI declaration passes the third argument the way a
+  ;; NAMED one goes -- on arm64, in a register -- while the callee reads
+  ;; it with va_arg, from the stack. The mode that arrives is whatever
+  ;; was there.
+  ;;
+  ;; Measured twice independently, on macOS 15 arm64 and in a consumer's
+  ;; own arm64 test, both asking for 0644 and both getting 0o010: a file
+  ;; created --x------, which its own owner cannot read back. The symptom
+  ;; does not look like a calling-convention bug, it looks like the
+  ;; filesystem is broken, which is why this note exists.
+  ;;
+  ;; SAFE TODAY BECAUSE NOTHING CREATES THROUGH IT. The one caller passes
+  ;; O_RDONLY, and mode is not read unless O_CREAT (or O_TMPFILE) is in
+  ;; the flags. Adding a creating call here is the change that breaks it.
+  ;; If one is ever needed: use libuv's uv_fs_open, whose signature takes
+  ;; mode as a real fixed parameter, or open with mode 0 and fchmod
+  ;; afterwards.
   (define c-open  (foreign-procedure "open"  (string int int) int))
   (define c-close (foreign-procedure "close" (int) int))
   (define c-fsync (foreign-procedure "fsync" (int) int))
