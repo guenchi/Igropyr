@@ -238,13 +238,28 @@
   ;; guessed would be guessing about somebody else's network. Read
   ;; whatever your own front end guarantees.
   ;;
-  ;; A PREDICATE THAT RAISES IS TREATED AS #t. Of the two ways to be
-  ;; wrong, omitting Secure when it was needed hands the sid to the
-  ;; plaintext side, while attaching it when it was not costs one
-  ;; refused cookie -- so an error goes to the expensive-to-lose side.
+  ;; A PREDICATE THAT RAISES IS TREATED AS #t, and the cost of that is
+  ;; worth stating honestly rather than talking down. Attaching Secure
+  ;; where it was not wanted does NOT cost merely one refused cookie:
+  ;; the response carrying it went out over the plaintext side anyway,
+  ;; so that sid has already been on the wire in clear, and Secure only
+  ;; stops the browser keeping it. The caller sees a session that will
+  ;; not stick, retries, and mints another exposed sid each time, each
+  ;; leaving an orphan entry until its TTL.
+  ;;
+  ;; It is still the better direction, for a reason that survives the
+  ;; correction: without Secure the browser KEEPS a plaintext-side
+  ;; cookie and re-sends it on every later request, so one leak becomes
+  ;; a standing one. Fail-closed converts an ongoing exposure into a
+  ;; visible failure to log in. It does not undo the exposure of the
+  ;; response that has already gone.
+  ;;
   ;; The same answer covers a predicate that returns no value or several,
   ;; which is not a raise and would otherwise escape the guard where its
-  ;; result meets a single-value binding.
+  ;; result meets a single-value binding. It does NOT cover a predicate
+  ;; that escapes through a captured continuation: that is not a raise
+  ;; and not a return, so nothing here runs -- the cookie, and possibly
+  ;; the request, simply go elsewhere.
   ;;
   ;; A session is persisted only when the handler actually WROTE to it.
   ;; Minting a store entry for every cookie-less request would (a) let
@@ -274,7 +289,11 @@
           secure-opt))
       (lambda (req res next)
         (let ((rotated-old #f) (rotated-fresh #f))
-          ;; The boolean path is the boolean path: no call, no guard.
+          ;; The boolean path is the boolean path: no call into the
+          ;; caller's code and no guard around anything. (There is an
+          ;; internal call and a boolean? test; what is promised is that
+          ;; nothing of the caller's runs and nothing of the caller's
+          ;; errors can be swallowed.)
           (define (secure-now?)
             (if (boolean? secure-opt)
                 secure-opt
