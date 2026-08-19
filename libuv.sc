@@ -18,7 +18,8 @@
           file-stream-read! file-stream-close!
           file-stream-own! file-stream-raw! file-stream-chunk-ptr
           fs-open-async! fs-write-async! fs-fsync-async!
-          fs-rename-async! fs-close-async! fs-job-count fs-fd-count
+          fs-rename-async! fs-close-async! fs-mkdir-async!
+          fs-job-count fs-fd-count
           fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc fs-o-excl
           fs-count
           tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
@@ -86,6 +87,8 @@
     (foreign-procedure "uv_fs_fsync" (void* void* int void*) int))
   (define uv-fs-rename
     (foreign-procedure "uv_fs_rename" (void* void* string string void*) int))
+  (define uv-fs-mkdir
+    (foreign-procedure "uv_fs_mkdir" (void* void* string int void*) int))
   (define uv-tcp-bind    (foreign-procedure "uv_tcp_bind" (void* void* unsigned-int) int))
   (define uv-tcp-nodelay (foreign-procedure "uv_tcp_nodelay" (void* int) int))
   (define uv-listen      (foreign-procedure "uv_listen" (void* int void*) int))
@@ -900,6 +903,14 @@
   (define (fs-close-async! fd owner)
     (fsw-submit! owner 'close fd 0 0
       (lambda (req) (uv-fs-close uv-loop req fd on-fsw-entry))))
+
+  ;; No fd and no buffer, like rename: the completion carries only the rc.
+  ;; An existing directory comes back as -EEXIST rather than as an error
+  ;; here, which is what lets a caller treat "already there" as success
+  ;; without a prior stat -- and a prior stat would be a race anyway.
+  (define (fs-mkdir-async! path mode owner)
+    (fsw-submit! owner 'mkdir -1 0 0
+      (lambda (req) (uv-fs-mkdir uv-loop req path mode on-fsw-entry))))
 
   (define locked-callbacks
     (begin
