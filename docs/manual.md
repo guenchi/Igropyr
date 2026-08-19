@@ -3477,6 +3477,37 @@ If you need to read a file in a handler:
           (send-text! res "read error"))))))
 ```
 
+### The write side
+
+There are asynchronous write primitives too — `fs-open-async!`,
+`fs-write-async!`, `fs-fsync-async!`, `fs-rename-async!`,
+`fs-close-async!` and `fs-mkdir-async!`, with the open flags
+`fs-o-rdonly`, `fs-o-wronly`, `fs-o-creat`, `fs-o-trunc`, `fs-o-excl`,
+`fs-o-directory` and `fs-o-cloexec`. They are lower level than the reads
+above: each submits one syscall to the pool and answers the owner with
+`#(fs-done ,job-id ,rc)`, where `job-id` is returned by the call and
+`rc` is the raw result — a negative errno on failure, never an
+exception. Waiting for a specific `job-id` rather than for any
+completion is what keeps two outstanding jobs from being confused for
+each other.
+
+They exist to be composed into sequences, and *(igropyr durable-async)*
+below is the worked example of composing them.
+
+**One logical user per descriptor.** Submit a close only after your own
+jobs on that descriptor have completed. A descriptor number is a lease
+from the OS, not an identity: close it while a write you submitted is
+still queued and the number can be reissued before that write runs, so
+it lands in whatever file now holds the number. This is the same race a
+C program has when one thread writes a descriptor while another closes
+it, and no descriptor API can promise it away. What the framework does
+guarantee is its *own* closes — reclaiming after an owner dies, and
+returning a descriptor whose caller died before the open completed —
+which it orders after the last job it knows about.
+
+The per-call details are in the header of `libuv.sc`; a full reference
+for this side is still to be written.
+
 ---
 ## Durable Writes
 
