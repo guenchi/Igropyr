@@ -114,14 +114,21 @@
                 durable-error? durable-error-op durable-error-path
                 fs-trace-step))
 
-  ;; CLOEXEC ON EVERY OPEN, AND DELIBERATELY UNLIKE THE SYNCHRONOUS
-  ;; LIBRARY. A descriptor here stays open across parks, so any other
-  ;; green process that spawns a child during that window hands the child
-  ;; a copy -- and closing it afterwards closes only this side's. The
-  ;; synchronous library holds its descriptors inside one uninterrupted
-  ;; run of the whole runtime, so it has no comparable window; that it
-  ;; opens through a Chez port, which sets no CLOEXEC, is a separate and
-  ;; older matter and is not changed here.
+  ;; CLOEXEC ON EVERY OPEN. A descriptor here stays open across parks, so
+  ;; any other green process that spawns a child during that window hands
+  ;; the child a copy -- and closing it afterwards closes only this
+  ;; side's.
+  ;;
+  ;; THE SYNCHRONOUS LIBRARY HAS THE SAME EXPOSURE, SMALLER, AND IT IS
+  ;; NOT FIXED HERE. It was tempting to say it has none because it runs
+  ;; without yielding; that is wrong. It calls the trace hook while its
+  ;; descriptor is open, the hook is application code that may spawn a
+  ;; child, and a Chez port carries no CLOEXEC (measured: F_GETFD on one
+  ;; reads 0). So the difference is the size of the window, not its
+  ;; existence -- this library's spans arbitrary scheduling, the other's
+  ;; spans a hook call. Repairing that one means changing how the
+  ;; synchronous library opens files, which is older ground than this
+  ;; change should stand on.
   ;;
   ;; THE SAME SHAPE, and it has to be the same shape rather than merely
   ;; similar: a caller that catches durable-error? around one library
@@ -298,17 +305,19 @@
   ;; BEST EFFORT, AND NEVER THE REPORTED ERROR. Closing and unlinking are
   ;; how a failed write tidies up; either can fail on its own, and
   ;; neither is allowed to replace the reason the write failed.
-  ;; THROUGH THE TRACE LIKE EVERY OTHER STEP. A close on a cleanup path
-  ;; is still an operation this library performed, and the synchronous
-  ;; library records its own cleanup close; leaving these out made the
-  ;; trace show a descriptor being opened and never closed, which is
-  ;; exactly the shape a reader would investigate as a leak.
-  (define (close-quietly fd)
+  ;; THROUGH THE TRACE LIKE EVERY OTHER STEP, WITH THE PATH IT ACTED ON.
+  ;; A close on a cleanup path is still an operation this library
+  ;; performed; leaving these out made the trace show a descriptor opened
+  ;; and never closed, which is exactly the shape a reader would
+  ;; investigate as a leak. The op and the path are the ones the failing
+  ;; phase used, so a reader can tell WHICH descriptor was released --
+  ;; an empty path here recorded the close and lost that.
+  (define (close-quietly kind path fd)
     (guard (e (#t (void)))
-      (fs-step 'close "" (lambda () (fs-close-async! fd self)))))
+      (fs-step kind path (lambda () (fs-close-async! fd self)))))
 
   (define (cleanup-temp! fd tmp)
-    (close-quietly fd)
+    (close-quietly 'close tmp fd)
     ;; DELIBERATELY SYNCHRONOUS, AND THE ONE PLACE THIS LIBRARY BLOCKS.
     ;; There is no async unlink primitive to call. It runs only on the
     ;; failed-write path, so the common path never reaches it -- but on a
@@ -342,7 +351,7 @@
   (define (flush-and-close! tmp fd)
     (let ((rc (fs-step 'fsync tmp (lambda () (fs-fsync-async! fd self)))))
       (when (< rc 0)
-        (close-quietly fd)
+        (close-quietly 'close tmp fd)
         (fail! 'fsync tmp)))
     (checked 'close tmp
       (fs-step 'close tmp (lambda () (fs-close-async! fd self)))))
@@ -360,7 +369,7 @@
       (let ((rc (fs-step 'dir-fsync dir
                   (lambda () (fs-fsync-async! fd self)))))
         (when (< rc 0)
-          (guard (e (#t (void))) (await-job (fs-close-async! fd self)))
+          (close-quietly 'dir-close dir fd)
           (fail! 'dir-fsync dir)))
       (checked 'dir-close dir
         (fs-step 'dir-close dir (lambda () (fs-close-async! fd self))))))

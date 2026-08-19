@@ -878,12 +878,29 @@
   ;; on it closes a NUMBER, not a file.
   (define fsw-closing (make-eqv-hashtable))
 
+  ;; HOW MANY IN-FLIGHT JOBS NAME EACH DESCRIPTOR. Counted rather than
+  ;; searched: the question is asked once per descriptor when an owner
+  ;; dies and again on every completion of a job that named a marked one,
+  ;; and a scan of the whole job table each time is quadratic in the
+  ;; queue. That work would happen inside owner teardown and inside
+  ;; event-loop callbacks -- both places where nothing else in the
+  ;; runtime can run -- so a deep queue would turn a bookkeeping question
+  ;; into a pause.
+  (define fsw-fd-refs (make-eqv-hashtable))
+
+  (define (fd-ref+! fd)
+    (when (>= fd 0)
+      (hashtable-set! fsw-fd-refs fd (+ 1 (hashtable-ref fsw-fd-refs fd 0)))))
+
+  (define (fd-ref-! fd)
+    (when (>= fd 0)
+      (let ((n (- (hashtable-ref fsw-fd-refs fd 0) 1)))
+        (if (<= n 0)
+            (hashtable-delete! fsw-fd-refs fd)
+            (hashtable-set! fsw-fd-refs fd n)))))
+
   (define (fd-in-flight? fd)
-    (let ((jobs (hashtable-values fsw-table)))
-      (let loop ((i 0))
-        (cond ((= i (vector-length jobs)) #f)
-              ((= (fsw-job-fd (vector-ref jobs i)) fd) #t)
-              (else (loop (+ i 1)))))))
+    (> (hashtable-ref fsw-fd-refs fd 0) 0))
 
   ;; Called once a job has been removed from the table: if it was the
   ;; last one holding a descriptor that was waiting to be closed, this is
@@ -896,6 +913,7 @@
       (close-fd-now! fd)))
 
   (define (fsw-free! job req)
+    (fd-ref-! (fsw-job-fd job))
     (when (> (fsw-job-data job) 0) (foreign-free (fsw-job-data job)))
     (when (> (fsw-job-buf job) 0) (foreign-free (fsw-job-buf job)))
     (unindex-owner! (fsw-job-owner job) 'fsjob req)
@@ -933,8 +951,17 @@
                  (let ((fd (fsw-job-fd job)))
                    (hashtable-delete! fsw-fds fd)
                    (unindex-owner! owner 'fsfd fd)
-                   ;; It is closed; whatever was waiting to close it has
-                   ;; had its wish and must not close the number again.
+                   ;; STRUCK OFF WHETHER OR NOT IT CLOSED. On success it
+                   ;; is closed and anything waiting to close it must not
+                   ;; close the number again. On failure POSIX leaves the
+                   ;; descriptor's state unspecified, and trying again can
+                   ;; reach a number that has since been reissued -- so
+                   ;; there is nothing safe left to do with it either. The
+                   ;; books are cleared in both cases because in neither
+                   ;; case may this side touch the number again; on the
+                   ;; failing one that means a descriptor the OS may still
+                   ;; hold is no longer tracked, which is a real leak with
+                   ;; no safe repair from here.
                    (hashtable-delete! fsw-closing fd)))
                 (else (void)))
               (when owner
@@ -949,12 +976,24 @@
   ;; Submit one job. The id comes back at once and names the completion;
   ;; without it two jobs from the same process would arrive as the same
   ;; message and could not be told apart.
+  ;; REGISTERING AND SUBMITTING ARE ONE ACT. Between the table entry and
+  ;; the call that hands the request to libuv, this process can be
+  ;; preempted and killed -- and then its continuation is discarded, `go`
+  ;; never runs, and no callback is ever coming for a job that is on the
+  ;; books. The owner sweep finds that job, waits for a completion that
+  ;; cannot arrive, and everything it names is stranded: the request, the
+  ;; copied bytes, and now the descriptor too, since a job that never
+  ;; completes keeps fd-in-flight? true for ever and the deferred close
+  ;; is never reached. Making the pair indivisible is what stops a job
+  ;; existing that nothing will finish.
   (define (fsw-submit! owner kind fd data buf go)
     (let* ((req (foreign-alloc fs-req-size))
            (job (make-fsw-job (fsw-fresh-id!) owner kind fd data buf)))
-      (hashtable-set! fsw-table req job)
-      (index-owner! owner 'fsjob req)
-      (let ((r (go req)))
+      (let ((r (with-interrupts-disabled
+                 (hashtable-set! fsw-table req job)
+                 (index-owner! owner 'fsjob req)
+                 (fd-ref+! fd)
+                 (go req))))
         (if (< r 0)
             ;; refused before it ever reached the pool: no callback is
             ;; coming, so report here and release everything now
