@@ -214,13 +214,37 @@
 
   (define (opt o k d) (let ((p (assq k o))) (if p (cdr p) d)))
 
-  ;; Options: (cookie . "name"), (secure . bool), (same-site . "Lax"),
-  ;; (max-age . seconds | #f), (path . "/").
+  ;; Options: (cookie . "name"), (secure . bool | procedure),
+  ;; (same-site . "Lax"), (max-age . seconds | #f), (path . "/").
   ;;
   ;; `secure` defaults to #t: the sid is a bearer credential (it is also
   ;; what session-guard authenticates a WebSocket upgrade with), so the
   ;; browser must never attach it to a plaintext request. Pass
   ;; '((secure . #f)) for local http development.
+  ;;
+  ;; IT MAY ALSO BE A PROCEDURE OF ONE ARGUMENT, called with the request
+  ;; at each point a cookie is issued; a true answer attaches Secure.
+  ;; One process can serve two schemes at once -- public HTTPS through a
+  ;; proxy and a plaintext tunnel on the inside -- and a value read once
+  ;; at construction cannot be right for both: with Secure on, the
+  ;; plaintext side's browser silently refuses to store the cookie and
+  ;; the session vanishes the instant it is created; with it off, the
+  ;; public side's sid travels in clear.
+  ;;
+  ;; WHAT DECIDES IS THE CALLER'S, and this framework deliberately does
+  ;; not read X-Forwarded-Proto or any relative for you. Which header can
+  ;; be believed is a fact about a deployment -- which proxy sets it,
+  ;; whether anything upstream of it can forge it -- and a library that
+  ;; guessed would be guessing about somebody else's network. Read
+  ;; whatever your own front end guarantees.
+  ;;
+  ;; A PREDICATE THAT RAISES IS TREATED AS #t. Of the two ways to be
+  ;; wrong, omitting Secure when it was needed hands the sid to the
+  ;; plaintext side, while attaching it when it was not costs one
+  ;; refused cookie -- so an error goes to the expensive-to-lose side.
+  ;; The same answer covers a predicate that returns no value or several,
+  ;; which is not a raise and would otherwise escape the guard where its
+  ;; result meets a single-value binding.
   ;;
   ;; A session is persisted only when the handler actually WROTE to it.
   ;; Minting a store entry for every cookie-less request would (a) let
@@ -237,15 +261,36 @@
            (path (opt o 'path "/"))
            (same-site (opt o 'same-site "Lax"))
            (max-age (opt o 'max-age #f))
-           (secure? (opt o 'secure #t)))
+           (secure-opt (opt o 'secure #t)))
+      ;; CHECKED WHERE IT IS ACCEPTED, not where it is used: a predicate
+      ;; that cannot take a request would otherwise raise on every cookie
+      ;; and be swallowed by the fail-closed guard, so every session would
+      ;; get Secure and nothing would say why.
+      (unless (or (boolean? secure-opt)
+                  (and (procedure? secure-opt)
+                       (logbit? 1 (procedure-arity-mask secure-opt))))
+        (assertion-violation 'session-middleware
+          "secure must be a boolean or a procedure accepting one argument"
+          secure-opt))
       (lambda (req res next)
         (let ((rotated-old #f) (rotated-fresh #f))
+          ;; The boolean path is the boolean path: no call, no guard.
+          (define (secure-now?)
+            (if (boolean? secure-opt)
+                secure-opt
+                (guard (e (#t #t))
+                  (call-with-values
+                    (lambda () (secure-opt req))
+                    (lambda vs
+                      (if (and (pair? vs) (null? (cdr vs)))
+                          (and (car vs) #t)
+                          #t))))))
           (define (issue-cookie-with! setter sid)
             (apply setter res cname sid
                    (string-append "Path=" path)
                    "HttpOnly"
                    (string-append "SameSite=" same-site)
-                   (append (if secure? '("Secure") '())
+                   (append (if (secure-now?) '("Secure") '())
                            (if max-age
                                (list (string-append "Max-Age="
                                                     (number->string max-age)))
