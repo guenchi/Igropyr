@@ -61,6 +61,10 @@ fi' EXIT
 # and says nothing about whether anything reached the medium -- that is
 # not observable from inside this process.
 "$scheme_bin" --script igropyr/test/durable.sc
+# the async variant's judge is a contrast pair over a real disk sync:
+# the sync write stops the scheduler (ticks 0), the async one must not
+# -- and at most one fs job in flight, or the trace is fiction
+"$scheme_bin" --script igropyr/test/durable-async.sc
 IGROPYR_CONTRACTS=full "$scheme_bin" --script igropyr/test/checked-full.sc
 env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 "$scheme_bin" --script igropyr/test/smoke-actor.sc

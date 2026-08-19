@@ -17,7 +17,7 @@
         (igropyr sigv4) (igropyr s3)
         (igropyr tls)
         (igropyr redis) (igropyr connpool) (igropyr mysql) (igropyr postgresql)
-        (igropyr durable)
+        (igropyr durable) (igropyr durable-async)
         (igropyr qjspool)
         (igropyr node) (igropyr dpool) (igropyr cluster))
 (display "ALL LIBRARIES IMPORTED\n")
