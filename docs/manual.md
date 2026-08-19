@@ -24,21 +24,22 @@ This manual covers the architecture, design patterns, and implementation details
 18. [Database Clients](#database-clients)
 19. [Async File Reads](#async-file-reads)
 20. [Durable Writes](#durable-writes)
-21. [JSON and gzip](#json-and-gzip)
-22. [S-Expression RPC](#s-expression-rpc)
-23. [Distribution](#distribution)
-24. [Vector Scoring](#vector-scoring)
-25. [Embedded JavaScript](#embedded-javascript)
-26. [Cached SSR](#cached-ssr)
-27. [Object Storage and AWS](#object-storage-and-aws)
-28. [Password Hashing](#password-hashing)
-29. [Running and Building](#running-and-building)
-30. [Testing](#testing)
-31. [Development Contracts](#development-contracts)
-32. [Code Style](#code-style)
-33. [Common Pitfalls](#common-pitfalls)
-34. [Appendix: Performance Tips](#appendix-performance-tips)
-35. [Further Reading](#further-reading)
+21. [Durable Writes Without Blocking](#durable-writes-without-blocking)
+22. [JSON and gzip](#json-and-gzip)
+23. [S-Expression RPC](#s-expression-rpc)
+24. [Distribution](#distribution)
+25. [Vector Scoring](#vector-scoring)
+26. [Embedded JavaScript](#embedded-javascript)
+27. [Cached SSR](#cached-ssr)
+28. [Object Storage and AWS](#object-storage-and-aws)
+29. [Password Hashing](#password-hashing)
+30. [Running and Building](#running-and-building)
+31. [Testing](#testing)
+32. [Development Contracts](#development-contracts)
+33. [Code Style](#code-style)
+34. [Common Pitfalls](#common-pitfalls)
+35. [Appendix: Performance Tips](#appendix-performance-tips)
+36. [Further Reading](#further-reading)
 
 ---
 
@@ -3769,6 +3770,118 @@ Two properties of hook calls worth knowing:
 
 ---
 
+
+## Durable Writes Without Blocking
+
+`(igropyr durable-async)` performs the same sequence as `(igropyr
+durable)` on libuv's thread pool. The calling process parks between
+steps, so the scheduler keeps running; the physical cost of an fsync
+does not go away, it is charged to the caller instead of to every
+process on the node.
+
+Both libraries can be imported together — the names differ by suffix.
+The synchronous one has no scheduler dependency at all and is the one to
+use before `start-scheduler`, in a tool, or from a script; this one needs
+a running scheduler, because parking is how it yields.
+
+### Choosing between them
+
+**It does not stop the world, and it is not faster.** Measured on one
+machine with a 192 MiB payload, against a process ticking every 2 ms:
+
+| | wall clock | competitor ticks |
+|---|---|---|
+| synchronous | 255 ms | **0** |
+| this library | 4094 ms | **1734** |
+
+The first number is the point: 255 ms during which nothing else in the
+node ran at all, against 4 s during which everything did. The second is
+the price, and most of it is copying the payload into C memory a byte at
+a time, which a payload this size makes the dominant cost. So it is a
+latency-isolation trade and not an optimisation — choose it when a pause
+would hurt more than a longer write, which is the usual case for a node
+serving requests, and choose the synchronous one for bulk work where
+nothing else is waiting.
+
+The suite asserts the *property* — that the scheduler keeps running — at
+a smaller payload. These figures are one machine's magnitudes, not a
+contract, and nothing re-checks them.
+
+### Platform durability is not uniform
+
+This is a selection criterion rather than a footnote:
+
+| | guarantee |
+|---|---|
+| Linux, FreeBSD | identical to the synchronous library — `fsync` is the whole story there |
+| macOS | this library reaches `fsync` level: the kernel has handed the data to the device. The synchronous library additionally issues `F_FULLFSYNC`, which forces the device itself to flush |
+
+A caller who needs `F_FULLFSYNC` on macOS must use the synchronous
+library there and pay the stop-the-world. libuv binds no `fcntl`, and
+running one on `uv_queue_work` does not help either: that callback runs
+on a pool thread, and a Chez foreign-callable cannot be entered from a
+thread Chez does not own. There is no pure-Scheme route.
+
+### API
+
+- `(durable-write-file-async! path bytes)` → path — write `bytes` through a temporary file, a rename and a directory flush. The target holds either the old contents or the new ones; a reader never sees a partial file
+- `(durable-dir-ensure-async! path)` → path — create the directory if absent and flush its parent. If it is already there this returns **without flushing**: it did not create it, and flushing would claim a durability it has no basis for — the directory may have been made a moment ago by a process that has not flushed
+- `(durable-fsync-dir-async! path)` → path — flush an existing directory, which is what `dir-ensure` deliberately will not do for you
+
+Errors are the same `#(durable-error op path)` triple as the synchronous
+library, recognised by the same `durable-error?`, and the same `op`
+vocabulary. Caller mistakes — a path that cannot name a file, a
+non-bytevector — are `assertion-violation`s raised before any work is
+submitted.
+
+### What a directory flush does and does not promise
+
+`durable-fsync-dir-async!` exists because a journal replay needs to make
+an existing directory's entries durable, and the alternative — rewriting
+every file in it so `dir-ensure` has something to flush — buys one fsync
+with a full rewrite.
+
+- **It makes the directory's *entries* durable**: which names exist and
+  which inode each points at. It says nothing about the **contents** of
+  the files named — those are each their own fsync. Flushing a directory
+  after a rename guarantees the rename, not the renamed file's bytes.
+- **It does not recurse, and does not touch the parent.** If you need
+  the parent's entries too, call it again with the parent.
+- **It is fully re-entrant and keeps no state.** Every call performs the
+  whole open/fsync/close, with nothing cached and no "already flushed"
+  short circuit — so calling it repeatedly during a recovery pass is both
+  safe and actually flushing each time. There is no early return that
+  could quietly do nothing.
+- **It refuses a path that is not a directory**, as `'dir-open`. Opening
+  a regular file read-only succeeds and fsyncing it succeeds, so without
+  that refusal a caller who passed a file would have flushed that file's
+  contents while believing it had flushed a directory's entries.
+
+### One job in flight, and what a kill leaves
+
+Each step is submitted only after the previous one completes. That is
+what makes the sequence a sequence: a pipelined implementation could
+have a rename in flight beside the fsync meant to precede it.
+
+A killed caller runs no winders, so there is no cleanup hook and the
+temporary is left wherever the sequence had got to — nothing before the
+open, a partial file if the write had begun, a complete one after the
+write returned, and nothing once the rename happened. They are named
+`<path>.<pid>.<n>.tmp` beside the target; reclaiming them is an external
+matter.
+
+The **trace hook is shared with the synchronous library** — one
+installed hook sees both, with one set of op names. Note that a kill
+inside `with-fs-trace` strands the shared hook, because the restore
+lives in a winder too.
+
+### The thread pool is shared and small
+
+Four threads by default, and file I/O shares them with DNS resolution.
+`UV_THREADPOOL_SIZE` changes the number and is read once at first use —
+it must be set **before the process starts**, not from inside it.
+
+---
 
 ## JSON and gzip
 
