@@ -62,6 +62,15 @@
               rsa-public-key-from-modulus
               rsa-load-private-key rsa-load-public-key
               rsa-sign-sha256 rsa-verify-sha256)
+        (only (igropyr durable)
+              durable-write-file! durable-dir-ensure!
+              fs-trace-hook-set! with-fs-trace
+              durable-error? durable-error-op durable-error-path)
+        (only (igropyr durable-async)
+              durable-write-file-async! durable-dir-ensure-async!
+              ;; re-exported: importing the async library alone must give
+              ;; the vocabulary to catch what it raises
+              durable-error? durable-error-op durable-error-path)
         (only (igropyr conv-status)
               conversation-gone? conversation-stale? conversation-done?
               conversation-settled? conversation-unknown?

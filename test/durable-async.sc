@@ -30,7 +30,8 @@
 ;;; POLICY is asserted after the fact instead).
 
 (import (chezscheme) (igropyr actor)
-        (only (igropyr libuv) fs-job-count fs-fd-count now-ms)
+        (only (igropyr libuv) fs-job-count fs-fd-count now-ms
+              fs-open-async! fs-o-wronly fs-o-creat)
         (igropyr durable-async)
         (only (igropyr durable)
               durable-write-file! durable-error? durable-error-op
@@ -118,6 +119,92 @@
                      '(open write fsync close rename
                        dir-open dir-fsync dir-close))
              (reverse ops)))
+
+    ;; ---- the same eight steps for an EMPTY payload ----------------------
+    ;; the write loop's first version tested the remaining count before
+    ;; submitting, so a zero-length payload skipped 'write entirely --
+    ;; same assertion, different input, different answer. An empty file
+    ;; is a real use (a marker, a truncation), not an edge to skip
+    (let ((ops '()))
+      (with-fs-trace
+        (lambda (op path detail) (set! ops (cons op ops)))
+        (lambda ()
+          (durable-write-file-async! (string-append root "/empty.bin")
+                                     (make-bytevector 0))))
+      (check "an empty payload still walks all eight steps"
+             (equal? (reverse ops)
+                     '(open write fsync close rename
+                       dir-open dir-fsync dir-close))
+             (reverse ops))
+      ;; an empty file reads back as EOF, not as a zero-length bytevector
+      (check "...and produces an empty file"
+             (and (file-exists? (string-append root "/empty.bin"))
+                  (eof-object?
+                    (call-with-port
+                      (open-file-input-port (string-append root "/empty.bin"))
+                      get-bytevector-all)))))
+
+    ;; ---- both variants produce the same file mode ----------------------
+    ;; the async library once hardcoded #o600 where the sync one lets
+    ;; umask govern 0666 -- switching variants silently changed who could
+    ;; read the product, because rename makes the temp's mode the
+    ;; target's mode
+    (let ((mode-of (lambda (path)
+                     (let ((p (process (string-append "ls -l " path))))
+                       (substring (get-line (car p)) 0 10)))))
+      (check "sync and async products carry the same permissions"
+             (equal? (mode-of (string-append root "/sync.bin"))
+                     (mode-of (string-append root "/async.bin")))
+             (mode-of (string-append root "/sync.bin"))
+             (mode-of (string-append root "/async.bin"))))
+
+    ;; ---- killed callers: the OS's fd count, not the library's ----------
+    ;; fs-fd-count counts the REGISTRY, and the leak class this guards
+    ;; against lives exactly on the paths that never register -- an open
+    ;; completing after its owner died, a close deferred past a kill. The
+    ;; witness has to be /dev/fd: the kernel's own ledger.
+    ;; IN-PROCESS directory-list, not a subprocess ls: these fds carry
+    ;; O_CLOEXEC, so a child's /dev/fd never shows them -- a subprocess
+    ;; witness is blind to exactly the leak class it is here to catch
+    (let ((os-fds (lambda () (length (directory-list "/dev/fd")))))
+      (let ((baseline (os-fds)))
+        (do ((i 0 (+ i 1))) ((= i 12))
+          (let ((victim (spawn
+                          (lambda ()
+                            (durable-write-file-async!
+                              (format "~a/victim-~a.bin" root i)
+                              (make-bytevector (* 2 1024 1024) 3))))))
+            ;; let it get into the middle of its sequence, then kill it
+            (sleep-ms 3)
+            (kill victim 'fd-accounting)))
+        ;; deferred closes complete as their jobs drain
+        (let poll ((k 0))
+          (cond ((= 0 (fs-job-count)) 'ok)
+                ((> k 400) (fail "killed callers' jobs never drained"
+                                 (fs-job-count)))
+                (else (sleep-ms 20) (poll (+ k 1)))))
+        (sleep-ms 100)
+        (let ((after (os-fds)))
+          (check "twelve mid-sequence kills leak no fd the KERNEL can see"
+                 (<= after baseline) baseline after))
+        ;; the deterministic orphan: submit an open and RETURN, so the
+        ;; owner is dead before the completion arrives, every time --
+        ;; a kill aimed from outside almost never lands in that window
+        ;; (measured: a 3ms-late kill misses it in twelve of twelve)
+        (do ((i 0 (+ i 1))) ((= i 30))
+          (spawn (lambda ()
+                   (fs-open-async!
+                     (format "~a/orphan-~a.bin" root i)
+                     (bitwise-ior fs-o-wronly fs-o-creat) #o644 self)
+                   'die)))
+        (let poll ((k 0))
+          (cond ((= 0 (fs-job-count)) 'ok)
+                ((> k 400) (fail "orphan opens never drained" (fs-job-count)))
+                (else (sleep-ms 20) (poll (+ k 1)))))
+        (sleep-ms 50)
+        (let ((after (os-fds)))
+          (check "thirty opens completing after their owners died leak nothing"
+                 (<= after baseline) baseline after))))
 
     ;; ---- fail fast: no job is ever submitted for a bad argument --------
     (let ((jobs-before (fs-job-count)))
