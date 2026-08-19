@@ -128,6 +128,11 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # race it exists to survive (a concurrent responder claiming the same token)
 "$scheme_bin" --script igropyr/test/response-header-claim.sc
 "$scheme_bin" --script igropyr/test/session-rotation-race.sc
+# the Secure attribute as a per-request predicate: every "omits Secure"
+# assertion is preceded by proof the probe sees a cookie at all, and the
+# predicate call counter is the tripwire for raises the fail-closed
+# guard would otherwise silently absorb
+"$scheme_bin" --script igropyr/test/session-secure.sc
 "$scheme_bin" --script igropyr/test/express-routes.sc
 # path normalization: middleware guards and the router must agree on the
 # path, or an extra slash routes to a handler while skipping its guard
