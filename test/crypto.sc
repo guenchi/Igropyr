@@ -15,6 +15,54 @@
              (display "    got  ") (display got) (newline)
              (display "    want ") (display want) (newline))))
 
+(define (rep byte n)
+  (let ((bv (make-bytevector n)))
+    (do ((i 0 (+ i 1))) ((= i n) bv) (bytevector-u8-set! bv i byte))))
+
+;; ---- RFC 4231: the exported HMAC-SHA256 primitive ------------------------
+;;
+;; THE PBKDF2 VECTORS DO NOT ANCHOR THIS. pbkdf2-hmac-sha256 builds its own
+;; ipad/opad and inlines the PRF -- deliberately, so the key schedule is not
+;; rebuilt on every one of hundreds of thousands of iterations -- so it never
+;; calls the procedure below. Measured before these cases existed: changing
+;; hmac-sha256's block size from 64 to 128, which breaks it completely, left
+;; the whole suite green. "PBKDF2 is HMAC-SHA256 underneath" is a statement
+;; about the algorithm, not about this code path, and a transitive anchor
+;; that does not pass through the code is not an anchor.
+;;
+;; The exported one is what webhook signature checks and other callers use,
+;; so it gets its own known answers. Constants transcribed from RFC 4231 and
+;; cross-checked against an independent implementation before being written
+;; down, so a typo here cannot quietly become the expected value.
+(define (hm key msg) (bytevector->hex (hmac-sha256 key msg)))
+
+(check "rfc4231-1 short key" (hm (rep #x0b 20) (string->utf8 "Hi There"))
+  "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+(check "rfc4231-2 key shorter than block"
+  (hm (string->utf8 "Jefe") (string->utf8 "what do ya want for nothing?"))
+  "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+(check "rfc4231-3 50-byte message" (hm (rep #xaa 20) (rep #xdd 50))
+  "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe")
+(check "rfc4231-4 non-repeating key"
+  (hm (let ((k (make-bytevector 25)))
+        (do ((i 0 (+ i 1))) ((= i 25) k) (bytevector-u8-set! k i (+ i 1))))
+      (rep #xcd 50))
+  "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b")
+;; 131 bytes: LONGER THAN THE BLOCK, so the key must be hashed first -- the
+;; branch a wrong block size gets wrong, and the one PBKDF2 never exercises
+;; because its key schedule is built once from a password it never rehashes
+(check "rfc4231-6 key longer than block"
+  (hm (rep #xaa 131)
+      (string->utf8 "Test Using Larger Than Block-Size Key - Hash Key First"))
+  "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
+(check "rfc4231-7 long key and long message"
+  (hm (rep #xaa 131)
+      (string->utf8 (string-append
+        "This is a test using a larger than block-size key and a larger "
+        "than block-size data. The key needs to be hashed before being "
+        "used by the HMAC algorithm.")))
+  "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2")
+
 (define (pb pw salt c dklen)
   (bytevector->hex
     (pbkdf2-hmac-sha256 (string->utf8 pw) (string->utf8 salt) c dklen)))
