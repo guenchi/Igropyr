@@ -21,6 +21,7 @@
           fs-rename-async! fs-close-async! fs-mkdir-async!
           fs-job-count fs-fd-count
           fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc fs-o-excl
+          fs-o-directory
           fs-count
           tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
@@ -148,6 +149,28 @@
     (case platform-os ((linux) #o1000) ((macos freebsd) #o2000) (else 0)))
   (define fs-o-excl
     (case platform-os ((linux) #o200) ((macos freebsd) #o4000) (else 0)))
+
+  ;; O_DIRECTORY IS THE ONE THAT DOES NOT MERGE. The four above share a
+  ;; value across macOS and FreeBSD, which is why they are written as one
+  ;; branch; this one does not, and a merged branch would have been wrong
+  ;; on whichever platform was not the one it was written on -- the same
+  ;; trap the note above describes, sprung by a fifth constant.
+  ;;
+  ;; Measured this time, compiled against <fcntl.h> on both:
+  ;;   macOS 15 (arm64)      O_DIRECTORY = 0o4000000  (0x100000)
+  ;;   FreeBSD 15.0-RELEASE  O_DIRECTORY = 0o400000   (0x20000)
+  ;; Each run also printed O_RDONLY, O_CREAT and O_EXCL and got the
+  ;; values already recorded above, which is what says the measurement
+  ;; itself is trustworthy rather than just plausible. The Linux column
+  ;; is again the documented asm-generic value and was NOT measured here;
+  ;; compile it there before trusting it.
+  ;;
+  ;; It exists so that a caller with no stat can still tell a directory
+  ;; from a file: opening a path with it succeeds only for a directory,
+  ;; and answers -ENOTDIR for anything else.
+  (define fs-o-directory
+    (case platform-os
+      ((linux) #o200000) ((macos) #o4000000) ((freebsd) #o400000) (else 0)))
 
   (define UV-EINVAL -22)
   (define S-IFMT #o170000)
