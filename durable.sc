@@ -44,7 +44,24 @@
 (library (igropyr durable)
   (export durable-write-file! durable-dir-ensure!
           fs-trace-hook-set! with-fs-trace
-          durable-error? durable-error-op durable-error-path)
+          durable-error? durable-error-op durable-error-path
+          ;; FOR A SECOND IMPLEMENTATION OF THIS SEQUENCE, and exported
+          ;; as the guarded CALL rather than as the hook: a variant that
+          ;; fetched the hook and invoked it would have to reproduce the
+          ;; discipline around it -- drop what it raises, record the
+          ;; attempt before letting an exception past -- and two copies
+          ;; of a rule are two places for it to drift. Handing out the
+          ;; step keeps that rule in one place, and keeps the hook box
+          ;; itself private, so there is exactly one trace and exactly
+          ;; one set of op names across every implementation.
+          ;;
+          ;; The thunk may park: nothing here depends on it returning
+          ;; promptly, so an implementation whose step is "submit and
+          ;; wait" wraps it the same way a synchronous one does. Its
+          ;; return value is the outcome the hook sees, which is what
+          ;; already makes a libc step's negative rc the recorded
+          ;; outcome rather than a raise.
+          (rename (traced fs-trace-step)))
   (import (chezscheme) (igropyr platform))
 
   ;; REFUSED BEFORE ANYTHING ELSE IS TRIED, which is why it is a
