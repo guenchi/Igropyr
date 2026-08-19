@@ -849,6 +849,8 @@
   ;; leak it with no signal at all. That silent shape is the one this
   ;; library keeps removing; it is not going to be reintroduced by a new
   ;; entry point.
+  ;; fd -> (owner . gen); see the generation note further down for why
+  ;; the owner alone is not enough to identify a descriptor.
   (define fsw-fds (make-eqv-hashtable))
 
   (define fsw-next-id 0)
@@ -883,6 +885,14 @@
 
   ;; Hand a descriptor back to the kernel with no owner to tell. Used
   ;; both when an owner dies and when one dies before its open finishes.
+  ;; ITS RESULT IS NOT READ, and the two callers say "closed" on the
+  ;; strength of that. If this close fails and the OS still holds the
+  ;; descriptor, it is now off every book here and nothing will reclaim
+  ;; it -- the same unrepairable leak the asynchronous close branch
+  ;; already admits to, reached a different way. Retrying is not the
+  ;; repair: POSIX leaves the descriptor's state unspecified after a
+  ;; failed close, so a second attempt can reach a number that has since
+  ;; been reissued.
   (define (close-fd-now! fd)
     (let ((creq (foreign-alloc fs-req-size)))
       (uv-fs-close uv-loop creq fd 0)
@@ -912,11 +922,26 @@
   ;; then never be reclaimed.
   ;;
   ;; So identity here is the number PLUS a generation: fsw-fds holds
-  ;; (owner . gen), each job captures the generation current when it was
-  ;; submitted, and every place that removes an entry compares the two
-  ;; first. A stale callback finds a generation that is not its own and
-  ;; touches nothing. None of this reaches the public surface -- the
-  ;; primitives still take and return plain descriptors.
+  ;; (owner . gen), and each job captures the generation current when it
+  ;; was submitted.
+  ;;
+  ;; WHAT EVERY REMOVAL SITE HAS IN COMMON is the intent -- establish
+  ;; that the entry on the books is the one this code is talking about
+  ;; before touching it. WHAT DIFFERS is the test, because they are
+  ;; answering different questions:
+  ;;
+  ;;   a completion that arrives late  compares the GENERATION
+  ;;                                   -- "is this still the tenancy I
+  ;;                                      acted on?"
+  ;;   the owner-death reclaim         compares the OWNER
+  ;;                                   -- "is this descriptor mine to
+  ;;                                      take back?", which a
+  ;;                                      generation cannot answer
+  ;;
+  ;; Stating it as one uniform rule was the earlier wording here, and it
+  ;; was wrong about the reclaim; the intent is shared, the test is not.
+  ;; None of this reaches the public surface -- the primitives still take
+  ;; and return plain descriptors.
   (define fsw-gen 0)
   (define (fsw-next-gen!)
     (set! fsw-gen (+ fsw-gen 1))
@@ -971,7 +996,9 @@
             (let ((rc (uv-fs-get-result req))
                   (owner (fsw-job-owner job)))
               ;; an open that succeeded hands the caller a descriptor, so
-              ;; it goes on the books; a close that succeeded takes it off
+              ;; it goes on the books; a close takes it off whether it
+              ;; succeeded or not, for the reason spelled out on that
+              ;; branch
               (case (fsw-job-kind job)
                 ((open)
                  (cond
@@ -1034,26 +1061,60 @@
   ;; completes keeps fd-in-flight? true for ever and the deferred close
   ;; is never reached. Making the pair indivisible is what stops a job
   ;; existing that nothing will finish.
+  ;; WHAT THIS REGION DOES NOT COVER. The request block, and for a write
+  ;; the C buffer and the byte-by-byte copy into it, are allocated by the
+  ;; caller of this procedure and therefore BEFORE the region opens. A
+  ;; process killed in the middle of that copy leaks exactly those
+  ;; allocations: nothing has them on any book yet, and the continuation
+  ;; that would free them is gone.
+  ;;
+  ;; Pulling them inside is not the repair it looks like. The copy is
+  ;; proportional to the payload -- a 192 MiB write is tens of
+  ;; milliseconds of it -- and running that with interrupts held would
+  ;; stop every green process for the duration, which is the single
+  ;; thing the asynchronous path exists to avoid. So the region covers
+  ;; what it can cover cheaply: from the moment anything is on the books
+  ;; to the moment the request is in libuv's hands. A descriptor is never
+  ;; stranded by the gap, because the reference count is not incremented
+  ;; until inside; what the gap can lose is C memory.
   (define (fsw-submit! owner kind fd data buf go)
-    (let* ((req (foreign-alloc fs-req-size))
-           (job (make-fsw-job (fsw-fresh-id!) owner kind fd #f data buf)))
-      (let ((r (with-interrupts-disabled
-                 ;; Captured here, inside the atom that registers the
-                 ;; job: which tenancy of this number the job meant.
-                 (fsw-job-gen-set! job (fd-gen fd))
-                 (hashtable-set! fsw-table req job)
-                 (index-owner! owner 'fsjob req)
-                 (fd-ref+! fd)
-                 (go req))))
-        (if (< r 0)
-            ;; refused before it ever reached the pool: no callback is
-            ;; coming, so report here and release everything now
-            (begin
-              (when owner
-                (deliver owner (vector 'fs-done (fsw-job-id job) r)))
-              (fsw-free! job req)
-              (fsw-job-id job))
-            (fsw-job-id job)))))
+    (with-interrupts-disabled
+      (let* ((req (foreign-alloc fs-req-size))
+             (job (make-fsw-job (fsw-fresh-id!) owner kind fd #f data buf)))
+        ;; Captured here, inside the atom that registers the job: which
+        ;; tenancy of this number the job meant.
+        (fsw-job-gen-set! job (fd-gen fd))
+        (hashtable-set! fsw-table req job)
+        (index-owner! owner 'fsjob req)
+        (fd-ref+! fd)
+        (let ((r (guard (e (#t
+                            ;; THE SUBMISSION RAISED, so no callback is
+                            ;; coming for a job that is on the books.
+                            ;; Releasing it here is the whole reason the
+                            ;; failure paths live inside this region: an
+                            ;; exception leaves the tables exactly as it
+                            ;; found them, which is not something the
+                            ;; region gives for free -- interrupts are
+                            ;; restored on the way out, table writes are
+                            ;; not.
+                            (fsw-free! job req)
+                            (raise e)))
+                   (go req))))
+          (if (< r 0)
+              ;; REFUSED BEFORE IT EVER REACHED THE POOL, and released
+              ;; INSIDE the region. Doing this after leaving it left a
+              ;; window of exactly the kind the region was added to
+              ;; close: the job was on the books, the reference was
+              ;; counted, no callback was ever coming, and a caller
+              ;; killed in that window discarded the continuation that
+              ;; was going to clean up -- stranding the request, the
+              ;; bytes, and a descriptor that could then never drain.
+              (begin
+                (when owner
+                  (deliver owner (vector 'fs-done (fsw-job-id job) r)))
+                (fsw-free! job req)
+                (fsw-job-id job))
+              (fsw-job-id job))))))
 
   (define (fs-open-async! path flags mode owner)
     (fsw-submit! owner 'open -1 0 0
