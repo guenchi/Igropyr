@@ -446,8 +446,15 @@ The pattern is **rebuilt** from how the router stores the route, not the
 literal you passed: `"/a/b/"`, `"/a//b"` and `"/a/b"` all register one
 route and all read back as `"/a/b"`, and the root reads back as `"/"`.
 `:name` and `*` segments come back as written. The order is registration
-order, and re-registering a route moves it to the end. The list shares
-nothing with the app, so mutating it cannot reach the router.
+order. The list shares nothing with the app, so mutating it cannot
+reach the router.
+
+**Order is registration order, and it is also priority** — dispatch
+takes the first match. Replacing a handler keeps its route where it
+was, so a hot swap changes the handler and not the routing; only a
+genuinely new route is appended. This matters wherever two patterns
+overlap: register `/users/me` before `/users/:id` and the specific one
+wins, and it goes on winning after you replace it.
 
 #### Path Parameters
 
