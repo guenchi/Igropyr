@@ -336,6 +336,57 @@
                  (and e (eq? (durable-error-op e) 'mkdir)
                       (equal? (durable-error-path e) f))))))
 
+    ;; ---- the directory flush, on its own -------------------------------
+    ;; The consumer that asked for this export needs it during recovery,
+    ;; where the same directory is flushed again and again. So the case
+    ;; that matters is not "does it flush" but "does it flush EVERY TIME":
+    ;; a cached or skip-if-already-done implementation would satisfy a
+    ;; single-call test and quietly do nothing on the second, which is
+    ;; exactly the path recovery runs on.
+    (let ((dir (string-append root "/flushme")))
+      (durable-dir-ensure-async! dir)
+      (let ((first '()) (second '()))
+        (with-fs-trace
+          (lambda (op path detail) (set! first (cons op first)))
+          (lambda () (durable-fsync-dir-async! dir)))
+        (with-fs-trace
+          (lambda (op path detail) (set! second (cons op second)))
+          (lambda () (durable-fsync-dir-async! dir)))
+        (check "a directory flush is exactly open, fsync, close"
+               (equal? (reverse first) '(dir-open dir-fsync dir-close))
+               (reverse first))
+        (check "...and the second call does the whole thing again"
+               (equal? (reverse second) '(dir-open dir-fsync dir-close))
+               (reverse second)))
+      (check "it answers with the path it was given"
+             (equal? (durable-fsync-dir-async! dir) dir)))
+    ;; a missing directory names the step that failed, on the path given
+    (let ((e (guard (e ((durable-error? e) e))
+               (durable-fsync-dir-async! (string-append root "/no-such-dir"))
+               (fail "flushing a missing directory did not raise") #f)))
+      (check "a missing directory fails at dir-open with that path"
+             (and e (eq? (durable-error-op e) 'dir-open)
+                  (equal? (durable-error-path e)
+                          (string-append root "/no-such-dir")))
+             (and e (list (durable-error-op e) (durable-error-path e)))))
+    ;; A REGULAR FILE MUST BE REFUSED. O_RDONLY opens one happily and
+    ;; fsync succeeds on it, so without O_DIRECTORY this call would
+    ;; silently flush that file's CONTENTS -- the one thing the function
+    ;; documents as not its guarantee. The boundary has to be in the
+    ;; implementation, not only in the prose.
+    (let* ((f (string-append root "/not-a-dir"))
+           (_ (call-with-output-file f (lambda (p) (display "x" p))))
+           (e (guard (e ((durable-error? e) e))
+                (durable-fsync-dir-async! f)
+                (fail "flushing a regular file silently succeeded") #f)))
+      (check "a regular file is refused at dir-open"
+             (and e (eq? (durable-error-op e) 'dir-open)
+                  (equal? (durable-error-path e) f))))
+    (guard (e (#t 'ok))
+      (durable-fsync-dir-async! (string-append root "/nul\x0;dir"))
+      (fail "a NUL path was accepted by the directory flush"))
+    (ok "the directory flush validates its path at the entry")
+
     ;; ---- nothing leaks ------------------------------------------------
     (check "no fs job outstanding" (= 0 (fs-job-count)) (fs-job-count))
     (check "no fs fd held" (= 0 (fs-fd-count)) (fs-fd-count))
