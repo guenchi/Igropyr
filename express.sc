@@ -18,6 +18,7 @@
 
 (library (igropyr express)
   (export create-app app-get app-post app-put app-delete app-patch
+          app-route-list
           app-use app-static app-ws app-listen app->handler
           req-param req-json req-form req-cookie
           set-cookie! set-cookie-if-unanswered!
@@ -1092,6 +1093,43 @@
                               (equal? (vector-ref r 1) segs))))
                   (app-routes a))
           (list (vector method segs handler))))))
+
+  ;; A READ-ONLY PROJECTION, NOT THE TABLE. What an app holds is a list
+  ;; of #(method segments handler) with the segments already split the
+  ;; way the router wants them; handing that out would make the router's
+  ;; internal shape a public contract, and the next change to matching
+  ;; would break whoever read it.
+  ;;
+  ;; This answers the question a caller actually has -- "what did this
+  ;; app end up with registered?" -- which is otherwise reachable only by
+  ;; scanning the source, a textual proxy for a semantic property.
+  ;;
+  ;; THE PATTERN IS REBUILT, NOT REMEMBERED. The original string is not
+  ;; kept, so this reconstructs a canonical form from the segments: it is
+  ;; not guaranteed to equal the literal that was registered. "/a/b/",
+  ;; "/a//b" and "/a/b" all register the same route and all read back as
+  ;; "/a/b"; the root reads back as "/". Parameter and splat segments
+  ;; come back as written (":id", "*").
+  ;;
+  ;; Order is registration order, and a re-registration moves its route
+  ;; to the end, because that is what add-route! does -- the old entry is
+  ;; dropped and the new one appended.
+  ;;
+  ;; Nothing is shared with the app: the list, the pairs and the strings
+  ;; are all fresh, so a caller cannot reach the router by mutating what
+  ;; it was given.
+  (define (segments->pattern segs)
+    (if (null? segs)
+        "/"
+        (let loop ((ss segs) (out ""))
+          (if (null? ss)
+              out
+              (loop (cdr ss) (string-append out "/" (car ss)))))))
+
+  (define-checked (app-route-list (a app?))
+    (map (lambda (r)
+           (cons (vector-ref r 0) (segments->pattern (vector-ref r 1))))
+         (app-routes a)))
 
   (define-checked (app-get (a app?) (pattern string?) (handler procedure?))
     (add-route! a 'GET pattern handler))
