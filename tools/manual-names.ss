@@ -286,6 +286,20 @@
                       (for-each
                         (lambda (tok)
                           (when (and (> (string-length tok) 2)
+                                     ;; A NUMBER IS NOT A NAME CLAIM. The
+                                     ;; manual prints negative errno values
+                                     ;; (`-20`, ENOTDIR) in code spans, and
+                                     ;; a leading minus is not an elision
+                                     ;; prefix -- without this a numeric
+                                     ;; literal is interrogated as an
+                                     ;; abbreviation of some export, which
+                                     ;; it can never be
+                                     (not (let all-digits ((i (if (char=? (string-ref tok 0) #\-) 1 0)))
+                                            (and (> (string-length tok) i)
+                                                 (let scan ((j i))
+                                                   (cond ((>= j (string-length tok)) #t)
+                                                         ((char-numeric? (string-ref tok j)) (scan (+ j 1)))
+                                                         (else #f))))))
                                      (memv #\- (string->list tok))
                                      ;; "conversation-..." in prose is an
                                      ;; elision, not a name
