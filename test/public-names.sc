@@ -62,6 +62,11 @@
               rsa-public-key-from-modulus
               rsa-load-private-key rsa-load-public-key
               rsa-sign-sha256 rsa-verify-sha256)
+        (only (igropyr express)
+              create-app app-use app-get app-post app-listen
+              ;; the assembled app's own answer to "what is registered",
+              ;; so a test need not scan source text for it
+              app-route-list)
         (only (igropyr durable)
               durable-write-file! durable-dir-ensure!
               fs-trace-hook-set! with-fs-trace
