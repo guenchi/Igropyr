@@ -21,6 +21,16 @@ fi
 # missing interpreter.
 export SCHEME_BIN="$scheme_bin"
 
+# OPTIONAL LOCAL CREDENTIALS, sourced if present. The database suites gate
+# themselves on IGROPYR_*_TEST and otherwise skip, which is right for a
+# machine that has no server -- but a machine that HAS one should not be
+# skipping them because nobody typed the variables that run. Put them in
+# this file (outside the repository, so no secret can be committed) and the
+# suites stop skipping here without changing anything anywhere else.
+if [ -f "${IGROPYR_TEST_ENV:-$HOME/.igropyr-test-env}" ]; then
+  . "${IGROPYR_TEST_ENV:-$HOME/.igropyr-test-env}"
+fi
+
 export CHEZSCHEMELIBDIRS=.
 # THE OBJECT EXTENSION POINTS AT A SUFFIX THAT DOES NOT EXIST, so a
 # stale .so can never answer for a source file. Chez picks by timestamp,
