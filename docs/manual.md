@@ -3703,7 +3703,7 @@ Writing to a temporary file and renaming it into place is the well-known half. T
 ### API
 
 - `(durable-write-file! path bytes)` → path — write `bytes` (a bytevector) to `path` through a temporary file, a rename, and a directory flush. The target either holds the old contents or the new ones; a reader never sees a partial file
-- `(durable-dir-ensure! path)` → path — create the directory if it is not there and flush its parent. A second call on an existing directory does no writing at all. It makes **its own** creation durable and does not underwrite an unflushed one by another process: if someone else created the directory a moment ago without flushing, this call finds it present and returns, and a crash can still take it away. Losing a `mkdir` race is not an error — the directory is there, which is what was asked
+- `(durable-dir-ensure! path)` → path — create the directory if it is not there and flush its parent. A second call on an existing directory does no writing at all: the question it answers is *is it there*, and an existence check gets asked on hot paths and in retry loops, so it does not pay for an fsync. A directory somebody else created a moment ago without flushing is therefore still at risk after this returns — flushing here *would* have persisted it, since `fsync` on a directory persists its entries whoever created them; it simply is not what this call is for. Losing a `mkdir` race is not an error — the directory is there, which is what was asked
 - `(fs-trace-hook-set! hook)` → void — install a procedure `(hook op path outcome)` called around every filesystem operation, or `#f` to remove it
 - `(with-fs-trace hook thunk)` → any — run `thunk` with `hook` installed, restoring the previous hook on the way out, including when `thunk` raises
 
@@ -3825,7 +3825,7 @@ thread Chez does not own. There is no pure-Scheme route.
 ### API
 
 - `(durable-write-file-async! path bytes)` → path — write `bytes` through a temporary file, a rename and a directory flush. The target holds either the old contents or the new ones; a reader never sees a partial file
-- `(durable-dir-ensure-async! path)` → path — create the directory if absent and flush its parent. If it is already there this returns **without flushing**: it did not create it, and flushing would claim a durability it has no basis for — the directory may have been made a moment ago by a process that has not flushed
+- `(durable-dir-ensure-async! path)` → path — create the directory if absent and flush its parent. If it is already there this returns **without flushing** — not because it could not, but because this call answers *is it there*, and charging an fsync for every existence check would tax the path that asks it most. Persisting the entries is a separate question with its own call
 - `(durable-fsync-dir-async! path)` → path — flush an existing directory, which is what `dir-ensure` deliberately will not do for you
 
 Errors are the same `#(durable-error op path)` triple as the synchronous
