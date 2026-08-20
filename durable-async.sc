@@ -431,18 +431,32 @@
              #t)
             (else #f))))
 
-  ;; IT MAKES ITS OWN CREATION DURABLE AND UNDERWRITES NOBODY ELSE'S.
-  ;; Finding the directory already there returns without flushing
-  ;; anything: this call did not create it, and flushing the parent would
-  ;; be claiming a durability this call has no basis for -- the directory
-  ;; may have been made a moment ago by a process that has not flushed,
-  ;; and a crash can still take it away. Losing a mkdir race is not an
-  ;; error either: the directory is there, which is what was asked.
+  ;; FINDING IT ALREADY THERE RETURNS WITHOUT FLUSHING, and the reason is
+  ;; cost and separation rather than capability. Flushing the parent here
+  ;; WOULD make the entry durable -- fsync on a directory persists its
+  ;; entries whatever process created them, which is the whole premise of
+  ;; durable-fsync-dir-async! and of every recovery pass that flushes
+  ;; entries a dead process left behind.
+  ;;
+  ;; It is not done because this call answers "is it there", and that
+  ;; question gets asked on hot paths and in retry loops. Charging every
+  ;; existence check an fsync would make the idempotent case the
+  ;; expensive one. Persisting the entry is a different question with its
+  ;; own call: ask both if you need both.
+  ;;
+  ;; So a directory created a moment ago by a process that has not
+  ;; flushed is still at risk after this returns -- not because nothing
+  ;; here could fix that, but because fixing it is not what was asked
+  ;; for. The synchronous library behaves the same way.
+  ;;
+  ;; Losing a mkdir race is not an error either: the directory is there,
+  ;; which is what was asked.
   ;; FLUSH A DIRECTORY THAT IS ALREADY THERE. durable-dir-ensure-async!
   ;; returns without flushing when the directory already exists, on
-  ;; purpose -- it did not create it and has no basis for claiming that
-  ;; somebody else's creation is durable. A caller that needs the entries
-  ;; of an existing directory on the medium has to ask for exactly that,
+  ;; purpose: it answers an existence question, and paying an fsync for
+  ;; every one of those would tax the hot path. A caller that needs the
+  ;; entries of an existing directory on the medium has to ask for
+  ;; exactly that,
   ;; and the alternative -- rewriting every file in it so the ensure has
   ;; something to flush -- costs a full rewrite to buy one fsync.
   ;;
