@@ -13,9 +13,19 @@
 (define auth-port 18112)
 (define authv-port 18113)
 (define hdr-port 18114)
-;; minted per run: a hardcoded acceptor cannot contain a value that did
-;; not exist until this process started
-(define hdr-secret (string-append "tk-" (number->string (real-time))))
+;; TWIN TOKENS, SAME SHAPE, MINTED PER RUN. Minting excludes acceptors
+;; whose accepted value is a source constant -- the value did not exist
+;; when the source was written. The twins close the other road: both
+;; are "tk-" + six digits, so an acceptor judging by shape treats them
+;; alike and must fail one of the two token cells below. Which twin is
+;; the good one is knowledge that exists only inside the verify closure.
+(random-seed (+ 1 (modulo (real-time) 1000000000)))
+(define (mint-token)
+  (string-append "tk-" (number->string (+ 100000 (random 900000)))))
+(define hdr-token-good (mint-token))
+(define hdr-token-twin
+  (let loop ((t (mint-token)))
+    (if (string=? t hdr-token-good) (loop (mint-token)) t)))
 
 (define failures 0)
 (define (check label ok)
@@ -156,13 +166,14 @@
       ;; an unconditional pass. So the example's auth expression is not
       ;; measured, it is MOUNTED: a fourth admin listener runs whatever
       ;; the example builds, and the requests judge that it GATES like
-      ;; auth -- three states, and the accepted token is MINTED AT RUN
-      ;; TIME: a middleware admitting every bearer fails the wrong-
-      ;; token state, and one hardcoded to accept some fixed string
-      ;; fails the right-token state, because the right token did not
-      ;; exist until this run. That is what ties the gate to the
-      ;; injected verify. (What lands in req-claims is pinned in
-      ;; test/jwt.sc -- test/auth.sc's own header says the HTTP
+      ;; auth, in three states against the twin tokens minted above.
+      ;; What each state pins has its own evidence: minting excludes a
+      ;; source-constant acceptor (the tk2-hardcoded mutation reds the
+      ;; good-token cell); the same-shape twin excludes a shape-judging
+      ;; acceptor (a "tk-"-prefix mutation reds the twin cell) -- the
+      ;; verdict differing between two same-shape tokens is not a
+      ;; function of their shape. (What lands in req-claims is pinned
+      ;; in test/jwt.sc -- test/auth.sc's own header says the HTTP
       ;; middleware is jwt.sc's to cover -- and no dashboard route
       ;; reads claims, so this fixture cannot observe them.)
       ;;
@@ -203,7 +214,7 @@
           (when (and (= 1 (length hits)) on-header-line?
                      libpos (< (car hits) libpos))
             (let ((built (eval `(let ((verify (lambda (t)
-                                                (and (equal? t ,hdr-secret)
+                                                (and (equal? t ,hdr-token-good)
                                                      '(("sub" . "hdr"))))))
                                   ,(read (open-input-string
                                            (substring src (+ (car hits) m) n))))
@@ -217,18 +228,20 @@
               (sleep-ms 80)
               (check "the mounted example refuses a tokenless request"
                 (= 401 (response-status (GET (url hdr-port "/data")))))
-              (check "...refuses a WRONG token, so the verify is consulted"
+              (check "...refuses the same-shape twin token"
                 (= 401 (response-status
                          (GET (url hdr-port "/data")
-                              '((headers . (("Authorization"
-                                             . "Bearer nope"))))))))
-              (check "...and admits the run-minted right token"
+                              `((headers . (("Authorization"
+                                             . ,(string-append
+                                                  "Bearer "
+                                                  hdr-token-twin)))))))))
+              (check "...and admits the run-minted good token"
                 (= 200 (response-status
                          (GET (url hdr-port "/data")
                               `((headers . (("Authorization"
                                              . ,(string-append
                                                   "Bearer "
-                                                  hdr-secret))))))))))))))
+                                                  hdr-token-good))))))))))))))
 
       ;; ---- injection guard: a quote in the data path is rejected ----
       (check "quote-in-path-rejected"
