@@ -972,6 +972,12 @@
       ;; it. (Bounding the printer first, print-level 1, is safe; the
       ;; rule is here because nothing makes a handler do that.)
       ;;
+      ;; What the id names, and where. Within one runtime it is exact:
+      ;; the counter only goes up and ids are never reused, so nothing
+      ;; else alive here answers to it. Across runtimes it names nothing
+      ;; -- pid-counter starts at 0 in every process -- so a `7' in an
+      ;; aggregated log is a pool on some node, not a pool.
+      ;;
       ;; Conditions are exempt and may carry the process itself, as the
       ;; `not a pool' report below does: `write` on a condition gives
       ;; #<compound condition> and never reaches the irritants, and
