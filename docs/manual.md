@@ -1162,7 +1162,7 @@ The default call timeout is 5 seconds. To customize:
 (gen-server-call counter-server 'get 10000)  ; 10-second timeout
 ```
 
-If the server crashes, the caller immediately gets `#(gen-server-error server-died reason)` (because the caller monitors the server). The last slot is a printable scalar: a reason that already is one — `'normal`, a symbol, a short string — arrives unchanged and stays `eq?`-comparable, and anything else arrives rendered under a bounded printer. That is so reading the error cannot walk into whatever the reason referred to; the same holds for the `timeout` and `calling-self` errors, whose slot is the caller's own message.
+If the server crashes, the caller immediately gets `#(gen-server-error server-died reason)` (because the caller monitors the server). The last slot is a printable scalar: a reason that already is one — `'normal`, a symbol, a short string — arrives unchanged and stays `eq?`-comparable, and anything else arrives rendered under a bounded printer. That is so reading the error cannot walk into whatever the reason referred to; the same holds for the `timeout` and `calling-self` errors, whose slot is a summary OF the caller's message rather than the message itself — a short symbol or string arrives as it was sent, anything larger arrives rendered and clipped to 200 characters.
 
 #### Registering a gen-server by Name
 
