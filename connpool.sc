@@ -949,26 +949,26 @@
       ;; and the third slot says WHICH pool stopped replying rather
       ;; than only that one has.
       ;;
-      ;; THE ID, NOT THE POOL, because a raised vector has no safe
-      ;; printer. A process is a pcb record whose fields include its
-      ;; continuation, its links and its inbox, so `write` on such a
-      ;; vector walks into a cycle and takes the runtime down -- and on
-      ;; the way it prints the mailbox, which for a pool holds the
-      ;; statements in flight. The operator reading the error is the one
-      ;; who triggers both. A condition is different and may carry the
-      ;; process itself, as the `not a pool' report below does:
-      ;; conditions print opaquely -- #<compound condition> -- and
-      ;; display-condition elides nested structure, so no standard
-      ;; printer walks one.
+      ;; THE ID, NOT THE POOL. A context slot holds a printable
+      ;; scalar. Not a style rule: `write` is unbounded by default, a
+      ;; process is a pcb record whose fields include its continuation,
+      ;; its links and its inbox, and so writing a vector that holds one
+      ;; walks into a cycle and takes the runtime down -- printing the
+      ;; mailbox on the way, which for a pool holds the statements in
+      ;; flight. The operator reading the error is the one who triggers
+      ;; it. (Bounding the printer first, print-level 1, is safe; the
+      ;; rule is here because nothing makes a handler do that.)
       ;;
-      ;; This follows #(durable-error op path) and #(dpool-error reason
-      ;; id), which name their subject with a scalar. It is NOT an
-      ;; invariant the tree already satisfies: gen-server-call puts the
-      ;; caller's own message in this position, and a message carrying
-      ;; a process -- which is how a request names its replier, this
-      ;; procedure included -- panics the same way. Fixing that changes
-      ;; a public shape and is its own decision; do not read this
-      ;; comment as saying the rest of the tree is clean.
+      ;; Conditions are exempt and may carry the process itself, as the
+      ;; `not a pool' report below does: `write` on a condition gives
+      ;; #<compound condition> and never reaches the irritants, and
+      ;; display-condition bounds what it descends into.
+      ;;
+      ;; #(durable-error op path) and #(dpool-error reason id) follow the
+      ;; rule. Known violator: gen-server-call, which puts the caller's
+      ;; own message in this position -- and a message carrying a process
+      ;; is how a request names its replier, this procedure included.
+      ;; It is in the ledger; it is not evidence the rule is optional.
       (receive (after 5000
                  (raise (vector 'connpool-error 'stats-timeout
                                 (process-id pool))))

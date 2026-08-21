@@ -14,9 +14,11 @@
 ;;;   (mysql-close! db)
 ;;;
 ;;; Values arrive as strings (MySQL text protocol); NULL is #f.
-;;; Errors raise #(mysql-error ,code ,message) in the caller. The one
-;;; exception is mysql-pool-stats, which is a thin pass-through and
-;;; raises the pool library's own shape -- see below.
+;;; Driver-generated operational errors raise #(mysql-error ,code ,message)
+;;; in the caller. Two things do not wear that tag: mysql-pool-stats,
+;;; a pass-through for the pool library's own shape (see below), and
+;;; whatever your own procedure raises inside call-with-mysql-connection
+;;; or mysql-transaction, which travels out unchanged.
 ;;;
 ;;; Authentication: caching_sha2_password (the only plugin in MySQL 9),
 ;;; both paths: the SHA-256 scramble fast path, and the full path where

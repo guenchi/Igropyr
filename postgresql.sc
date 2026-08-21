@@ -29,9 +29,11 @@
 ;;; connection asks for client_encoding UTF8 at startup, so text is
 ;;; always UTF-8 on the wire regardless of the database encoding.
 ;;;
-;;; Errors raise #(postgresql-error ,tag ,message) in the caller -- with
-;;; the single exception of postgresql-pool-stats, a thin pass-through
-;;; that raises the pool library's own shape (see below). The tag is one
+;;; Driver-generated operational errors raise #(postgresql-error ,tag ,message)
+;;; in the caller. Two things do not wear that tag: postgresql-pool-stats,
+;;; a pass-through for the pool library's own shape (see below), and
+;;; whatever your own procedure raises inside call-with-postgresql-connection
+;;; or postgresql-transaction, which travels out unchanged. The tag is one
 ;;; of exactly three shapes:
 ;;;   - a 5-char SQLSTATE string: a server-side SQL error; the
 ;;;     connection stays usable.
