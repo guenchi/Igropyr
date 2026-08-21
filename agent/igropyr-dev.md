@@ -35,11 +35,16 @@ not a checked one: read the `.sc` header when it matters.
 
 ## Core mental model
 
-**I/O is direct blocking style — no async/await, no callbacks, no
-promises.** `mysql-query`, `redis`, `http-get`, and `receive` block only
-their own green process; the OS thread keeps serving other requests.
-(Callbacks do exist where a *service* has behaviour to fill in, not
-where a call has a result to wait for: `gen-server` takes handle-call,
+**The I/O you call is direct blocking style — no async/await, no
+callbacks, no promises.** `mysql-query`, `redis`, `http-get`, and
+`receive` block only their own green process; the OS thread keeps
+serving other requests. This is about the APIs an application calls.
+Underneath, libuv delivers everything through C callbacks, and if you
+work on the framework itself you will be inside them — where you must
+not `receive`, sleep or otherwise yield, because a continuation captured
+across a C frame corrupts the runtime.
+(Callbacks are also part of the API where a *service* has behaviour to
+fill in, rather than where a call has a result to wait for: `gen-server` takes handle-call,
 handle-cast and handle-info, and the record hooks take a writer and a
 reader.)
 Node's `await fetch(); await db.query()` becomes two sequential lines.

@@ -2410,13 +2410,13 @@ Limit request rate by IP or custom key:
 (app-use app (rate-limit))
 
 ;; Or customize:
-(app-use app (rate-limit '((max-requests . 100)
-                            (window-ms . 60000)
-                            (key-fn . (lambda (req)
-                                        (req-header req 'x-forwarded-for))))))
+(app-use app (rate-limit `((max . 100)
+                           (window . 60000)
+                           (key . ,(lambda (req)
+                                     (req-header req 'x-forwarded-for))))))
 ```
 
-The default allows 100 requests per 60 seconds per IP. When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
+The keys are `max`, `window` and `key` — and note the quasiquote: a `key` under a plain `'(...)` is list data, not a procedure, and the whole alist would be ignored rather than refused. The default allows 100 requests per 60 seconds per IP. When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
 
 ### Error Handler
 
@@ -3423,7 +3423,7 @@ Pass the byte-codec connector from `(igropyr tls)` as the `'tls` option and the 
                     (list (cons 'tls tls-establish!)))
 ```
 
-The connector travels through the options alist, so this library never imports `(igropyr tls)` and stays free of the OpenSSL dependency unless the application opts in. If the server refuses TLS the connection **fails** — there is no silent plaintext fallback. Over TLS, SCRAM **channel binding** is automatic: when the server offers `SCRAM-SHA-256-PLUS` the client selects it and binds the authentication to this TLS channel's server certificate (RFC 5929 `tls-server-end-point`), so even a relay MITM holding a trusted certificate cannot forward the exchange. Without `'tls` the client speaks plaintext: an on-path attacker can read query text and results regardless of the auth method, so run plaintext connections only over a trusted network or a local socket.
+The connector travels through the options alist, so this library never imports `(igropyr tls)` and stays free of the OpenSSL dependency unless the application opts in. If the server refuses TLS the connection **fails** — there is no silent plaintext fallback. Over TLS, SCRAM **channel binding** is used when it can be: when a certificate hash is available for the channel *and* the server offers `SCRAM-SHA-256-PLUS`, the client selects it and binds the authentication to this TLS channel's server certificate (RFC 5929 `tls-server-end-point`), so even a relay MITM holding a trusted certificate cannot forward the exchange. Without `'tls` the client speaks plaintext: an on-path attacker can read query text and results regardless of the auth method, so run plaintext connections only over a trusted network or a local socket.
 
 #### Connection Pool and Transactions
 
