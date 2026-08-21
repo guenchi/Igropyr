@@ -29,8 +29,10 @@
 ;;; connection asks for client_encoding UTF8 at startup, so text is
 ;;; always UTF-8 on the wire regardless of the database encoding.
 ;;;
-;;; Errors raise #(postgresql-error ,tag ,message) in the caller, where
-;;; tag is one of exactly three shapes:
+;;; Errors raise #(postgresql-error ,tag ,message) in the caller -- with
+;;; the single exception of postgresql-pool-stats, a thin pass-through
+;;; that raises the pool library's own shape (see below). The tag is one
+;;; of exactly three shapes:
 ;;;   - a 5-char SQLSTATE string: a server-side SQL error; the
 ;;;     connection stays usable.
 ;;;   - 'transport: a connection/framing failure; the connection is torn
@@ -1148,5 +1150,8 @@
 
   ;; A snapshot of a pool: in-use, pending, checkout wait, query duration,
   ;; timeout counts and more. See (igropyr connpool) for the full key list.
+  ;; This one does NOT re-tag: a pool that stops answering raises
+  ;; #(connpool-error stats-timeout ,pool-id), not a postgresql-error.
+  ;; Wrapping it would claim the database said something when nothing did.
   (define (postgresql-pool-stats pool) (connpool-stats pool))
 )

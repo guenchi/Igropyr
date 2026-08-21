@@ -14,7 +14,9 @@
 ;;;   (mysql-close! db)
 ;;;
 ;;; Values arrive as strings (MySQL text protocol); NULL is #f.
-;;; Errors raise #(mysql-error ,code ,message) in the caller.
+;;; Errors raise #(mysql-error ,code ,message) in the caller. The one
+;;; exception is mysql-pool-stats, which is a thin pass-through and
+;;; raises the pool library's own shape -- see below.
 ;;;
 ;;; Authentication: caching_sha2_password (the only plugin in MySQL 9),
 ;;; both paths: the SHA-256 scramble fast path, and the full path where
@@ -815,5 +817,8 @@
 
   ;; A snapshot of a pool: in-use, pending, checkout wait, query duration,
   ;; timeout counts and more. See (igropyr connpool) for the full key list.
+  ;; This one does NOT re-tag: a pool that stops answering raises
+  ;; #(connpool-error stats-timeout ,pool-id), not a mysql-error. Wrapping
+  ;; it would claim the database said something when nothing did.
   (define (mysql-pool-stats pool) (connpool-stats pool))
 )

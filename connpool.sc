@@ -946,11 +946,24 @@
       ;; handler written to catch it catches theirs too, and vice
       ;; versa. The tagged shape is the one the rest of this framework
       ;; raises -- #(durable-error op path), #(dpool-error reason id) --
-      ;; and the third slot carries the pool whose stats went
-      ;; unanswered, which is what tells an operator WHICH pool has
-      ;; stopped replying rather than only that one has.
+      ;; and the third slot says WHICH pool stopped replying rather
+      ;; than only that one has.
+      ;;
+      ;; THE ID, NOT THE POOL. Every context slot in this framework
+      ;; holds a printable scalar, and that is not a style rule: a
+      ;; raised vector has no safe printer. A process is a pcb record
+      ;; whose fields include its continuation, its links, and its
+      ;; inbox, so `write` on this vector walks into a cycle and takes
+      ;; the runtime down with it -- and on the way it prints the
+      ;; mailbox, which for a pool holds the statements in flight. An
+      ;; operator reading the error is the one who triggers both.
+      ;; (A condition may carry the process itself, as the
+      ;; `not a pool' report below does: conditions print opaquely --
+      ;; #<compound condition> -- and display-condition elides nested
+      ;; structure, so no standard printer ever walks it.)
       (receive (after 5000
-                 (raise (vector 'connpool-error 'stats-timeout pool)))
+                 (raise (vector 'connpool-error 'stats-timeout
+                                (process-id pool))))
         (`#(pool-stats-reply ,@ref ,st)
           (or st
               (assertion-violation 'connpool-stats
