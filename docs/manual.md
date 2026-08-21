@@ -4805,8 +4805,9 @@ code.
 - `(qjs-call! fname arg)` → string — the raising variant.
 - `(qjs-healthy?)` / `(qjs-generation)` / `(qjs-shutdown!)`.
 
-It runs in **pure Scheme** over a stock shared `libquickjs`, bound directly
-through the FFI — no custom C. Two of `qjs-boot!`'s checks are about the
+It runs in **pure Scheme** over a stock shared QuickJS library, bound
+directly through the FFI — no custom C. Install quickjs-ng (`libqjs`); the
+gate is described below. Two of `qjs-boot!`'s checks are about the
 engine, as opposed to its arguments or the load itself. The library must
 export `JS_FreeValue` as a real function. And the global object's tag,
 read through this binding's `JSValue` ftype, must come back as
@@ -4838,8 +4839,8 @@ developed and measured against.
 
 | | library name | `JS_FreeValue` | here |
 |---|---|---|---|
-| [quickjs-ng](https://github.com/quickjs-ng/quickjs) 0.15+ | `libqjs` | exported as a real function | **required** |
-| [bellard/quickjs](https://bellard.org/quickjs/) | `libquickjs` | a header inline; only the `__JS_FreeValue` slow path is exported | refused at boot |
+| [quickjs-ng](https://github.com/quickjs-ng/quickjs) 0.15+ | `libqjs` | exported as a real function | **install this** |
+| [bellard/quickjs](https://bellard.org/quickjs/) | `libquickjs` | a header inline; only the `__JS_FreeValue` slow path is exported | refused at the gate |
 
 What the requirement buys: releasing a value is one FFI call. Supporting
 bellard meant reproducing the inline in Scheme — read the tag, compute the
