@@ -4825,8 +4825,8 @@ OS thread and each call runs with interrupts disabled, so a call blocks the
 scheduler for its duration (sub-millisecond typically, `timeout-ms` worst
 case) — cap input size on latency-sensitive paths.
 
-`qjs-boot!` reports if no library is found, and refuses one that does not
-export `JS_FreeValue` (see below); point it at a library with
+`qjs-boot!` reports if no library is found, and refuses to bind unless
+`JS_FreeValue` resolves (see below); point it at a library with
 `IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
 
 #### Which QuickJS: install quickjs-ng
@@ -4842,7 +4842,7 @@ developed and measured against.
 | | library name | `JS_FreeValue` | here |
 |---|---|---|---|
 | [quickjs-ng](https://github.com/quickjs-ng/quickjs) 0.15+ | `libqjs` | exported as a real function | **install this** |
-| [bellard/quickjs](https://bellard.org/quickjs/) | `libquickjs` | a header inline; only the `__JS_FreeValue` slow path is exported | does not get past the symbol check |
+| [bellard/quickjs](https://bellard.org/quickjs/) | `libquickjs` | a header inline; only the `__JS_FreeValue` slow path is exported | on its own, does not satisfy the check |
 
 What the requirement buys: releasing a value is one FFI call. Supporting
 bellard meant reproducing the inline in Scheme — read the tag, compute the
@@ -4857,8 +4857,8 @@ What it costs, measured on FreeBSD 15 / amd64, best of three runs of 20 000
 calls each, back when both still ran. **The bellard column is historical.**
 It was measured before the ref_count replica was deleted, and this tree has
 no executable path to re-measure it: `test/quickjs-bench.sc` runs against
-whatever library is loaded, and a bellard one is refused before the first
-benchmark.
+whatever library is loaded, and a bellard one on its own does not get
+past the symbol check, so no benchmark runs.
 
 | workload | quickjs-ng | bellard |
 |---|---|---|
@@ -4872,7 +4872,7 @@ FFI call each instead of a read-modify-write plus a conditional call — and
 raw interpreter speed is within 2 %. The regexp/string case is where the
 requirement costs something: bellard ran it more than twice as fast. If
 your bundle is dominated by such an operation, that is a reason to measure
-it, not a reason to reach for bellard; it will not boot.
+it, not a reason to reach for bellard; loaded on its own it does not boot.
 
 ### Fallback: the C-shim binding
 
