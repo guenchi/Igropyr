@@ -6,11 +6,12 @@
 
 (import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
         (igropyr http-client) (igropyr metrics) (igropyr dashboard)
-        (igropyr json) (igropyr sexpr))
+        (igropyr json) (igropyr sexpr) (igropyr auth))
 
 (define main-port 18110)
 (define admin-port 18111)
 (define auth-port 18112)
+(define authv-port 18113)
 
 (define failures 0)
 (define (check label ok)
@@ -97,6 +98,30 @@
                       '((headers . (("X-Admin-Token" . "s3cret"))))))))
       (check "auth-blocks-page"
         (= 401 (response-status (GET (url auth-port "/")))))
+
+      ;; ---- the composition the usage example teaches: (auth verify) ----
+      ;; This file's own header example once passed (token-guard verify)
+      ;; into the auth slot -- a one-argument request guard, where the
+      ;; slot takes app-use middleware. admin-listen installs whatever
+      ;; procedure it is given, so boot accepted it and the first admin
+      ;; request died on arity, answering 500: an admin surface closed by
+      ;; accident, not by design. This case runs the composition the
+      ;; example teaches NOW -- `auth' lifting a token verifier into
+      ;; middleware -- end to end, so the documented shape has a cell
+      ;; that goes red if it stops fitting the slot.
+      (admin-listen m srv
+        `((host . "127.0.0.1") (port . ,authv-port)
+          (auth . ,(auth (lambda (tok)
+                           (and (equal? tok "tk") '(("sub" . "ops"))))))))
+      (sleep-ms 80)
+      (check "verifier-composed auth refuses a tokenless request with 401"
+        (= 401 (response-status (GET (url authv-port "/data")))))
+      (check "...and a 500 would mean the shape no longer fits the slot"
+        (not (= 500 (response-status (GET (url authv-port "/data"))))))
+      (check "verifier-composed auth admits a bearer token"
+        (= 200 (response-status
+                 (GET (url authv-port "/data")
+                      '((headers . (("Authorization" . "Bearer tk"))))))))
 
       ;; ---- injection guard: a quote in the data path is rejected ----
       (check "quote-in-path-rejected"

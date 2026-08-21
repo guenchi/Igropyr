@@ -1159,6 +1159,53 @@
         (write (obs-sql)) (newline)
         (send pool (vector 'pool-quit))))
 
+    ;; ---- the stats timeout raises a structured error, not a bare symbol
+    ;; A pool that never answers #(pool-stats ...) leaves connpool-stats
+    ;; on its 5s deadline. What that deadline raises is part of the
+    ;; library's error surface: a bare symbol cannot be told apart from
+    ;; any other symbol in a guard, so the raise must carry the library
+    ;; tag and the reason. This cell waits the full deadline -- the cost
+    ;; of pinning the shape of a timeout is one timeout.
+    (let ((deaf (spawn (lambda () (receive (`#(never-sent) 'ok))))))
+      (let ((caught (guard (e (#t e))
+                      (connpool-stats deaf)
+                      'no-raise)))
+        (check "the stats deadline raises the library's error shape"
+               (and (vector? caught)
+                    (= (vector-length caught) 3)
+                    (eq? (vector-ref caught 0) 'connpool-error)
+                    (eq? (vector-ref caught 1) 'stats-timeout)))
+        ;; THE CONTEXT SLOT IS A PRINTABLE SCALAR, AND BOTH HALVES ARE
+        ;; ASSERTED. The first version of this error carried the pool
+        ;; itself -- a pcb record whose fields include the continuation
+        ;; and the inbox -- and `write` on the vector walked into a
+        ;; cycle and took the runtime down, printing the mailbox's
+        ;; in-flight statements on the way. The type check names the
+        ;; rule; the write below exercises the path that detonated, so
+        ;; an object in the slot goes loudly red here rather than in an
+        ;; operator's log.
+        ;;
+        ;; IF THIS SUITE DIES WITHOUT PRINTING ITS SUMMARY, LOOK HERE
+        ;; FIRST. A PANIC from that write kills the process before the
+        ;; report line, so in CI this cell's red does not look like an
+        ;; assertion failure -- it looks like an infrastructure fault
+        ;; (no output, nonzero exit). That is what it looked like when
+        ;; the object was in the slot: one FAIL line from the type
+        ;; check, then the runtime went down mid-suite.
+        (check "the context slot is a scalar id, not the pool object"
+               (and (vector? caught)
+                    (= (vector-length caught) 3)
+                    (let ((slot (vector-ref caught 2)))
+                      (or (fixnum? slot) (string? slot)))))
+        (check "the raised error survives being written"
+               (and (vector? caught)
+                    (string? (call-with-string-output-port
+                              (lambda (p) (write caught p))))))
+        (when (symbol? caught)
+          (display "  [info] raised a bare symbol: ")
+          (write caught) (newline))
+        (kill deaf 'cleanup)))
+
     (sleep-ms 100)
     (if (zero? failures)
         (begin (display "connpool-lifecycle: all tests passed\n") (exit 0))

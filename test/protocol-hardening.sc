@@ -177,8 +177,15 @@
           (res-write! res "hello-")
           (res-write! res "world")
           (res-end! res)))
-      ;; a WebSocket route, for the upgrade framing cases below
-      (app-ws app "/ws" (lambda (ws) (ws-close! ws)))
+      ;; a WebSocket route, for the upgrade framing cases below. The
+      ;; session takes (ws req) -- an earlier version wrote (lambda (ws))
+      ;; and nothing noticed, because every case here is refused BEFORE
+      ;; the handshake and the session never ran. A legal handshake
+      ;; against that fixture would have been answered 101 first, then
+      ;; had the arity exception swallowed by the session runner and the
+      ;; socket closed: the same shape-mismatch latency this fixture's
+      ;; own suite exists to prevent.
+      (app-ws app "/ws" (lambda (ws req) (ws-close! ws)))
       ;; a POST route that answers 200, so "refused" below cannot be
       ;; satisfied by a 404 from routing -- which is what the first version
       ;; of the HTTP/1.0-chunked case accidentally measured
