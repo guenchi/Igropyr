@@ -2448,11 +2448,32 @@ Catch unhandled exceptions and respond with a nice error page:
 ```scheme
 (app-use app (error-handler))
 
-;; Or customize the response:
-(app-use app (error-handler '((show-details . #f))))
+;; Or replace the response. The one option is `handler`, called as
+;; (handler e req res); note the comma, as for `key` above.
+(app-use app
+  (error-handler
+    `((handler . ,(lambda (e req res)
+                    (set-status! res 500)
+                    (send-json! res
+                      `((error . "internal server error")
+                        (detail . ,(cond
+                                     ((condition? e)
+                                      (with-output-to-string
+                                        (lambda () (display-condition e))))
+                                     ((and (vector? e) (fx> (vector-length e) 0))
+                                      (format "~s" (vector-ref e 0)))
+                                     (else "unrecognized raise"))))))))))
 ```
 
-When a handler raises an exception that the middleware chain doesn't catch, the error handler responds with HTTP 500 and a JSON error body. If `show-details` is true, includes the exception message (useful for development).
+Without a handler of your own, an uncaught exception becomes HTTP 500 with a
+JSON body naming nothing. Adding detail is a development choice and belongs in
+a handler you write, which is also where you decide what is safe to send.
+
+**Take the tag, not the value.** A raised vector can hold a live process — a
+`gen-server` timeout carries the caller's own message, which is how a request
+names its replier — and `write` on such a value walks a cycle and takes the
+runtime down. The tag in slot 0 is the part the framework promises and the
+part that is safe to print.
 
 ### Auth
 
