@@ -2516,6 +2516,13 @@ visible at boot. The shapes in play:
 | request guard `(lambda (req) claims-or-#f)` | `app-ws`, `app-rpc` |
 | middleware `(lambda (req res next))` | `app-use`, `admin-listen`'s `auth` option — and it is what `auth` *returns* |
 
+Those are the shapes that carry *claims*. They are not the only
+procedures a request path takes, and the neighbours are worth knowing
+because one of them has the same arity: `on-failure` is
+`(lambda (req res info))`, so a fault handler installed with `app-use`
+passes the procedure check and then runs `assq` against `next`, which is
+a thunk.
+
 `auth` lifts a verifier into middleware; `token-guard` lifts one into a
 request guard; `session-guard` is a request guard natively. Nothing
 converts the other way, because a request is not a credential. All of
@@ -3039,7 +3046,10 @@ counter family, refreshed every 2 s) and a turnkey admin listener.
 ;; surface is not reachable off-box unless you widen it:
 (define admin (admin-listen metrics srv `((port . 9090))))
 (admin-listen metrics srv `((host . "10.0.0.5") (port . 9090)
-                            (auth . ,(token-guard verify))))  ; internal + auth
+                            (auth . ,(auth verify))))         ; internal + auth
+;; NOT (token-guard verify): the `auth' option is app-use middleware,
+;; (lambda (req res next)). A request guard is a procedure too, so it is
+;; installed without complaint and raises on the first admin request.
 ```
 
 - `(mount-dashboard! app collector server [opts])` — register the data
@@ -3396,7 +3406,7 @@ The client authenticates with **SCRAM-SHA-256** (RFC 7677, the PostgreSQL defaul
   '((allow-cleartext-auth . #t)))
 ```
 
-SASLprep normalization is not implemented (its Unicode tables would dwarf the driver), so passwords outside **printable ASCII** — non-ASCII, or the control characters SASLprep prohibits — are rejected with a clear error in the caller — `postgresql-connect` and `postgresql-pool` raise an assertion up front — instead of failing with a baffling `28P01`. That check does not know what the server will ask for, and does not wait to find out: it runs before any connection, so a `trust` server that would never look at the password refuses one anyway. `'allow-cleartext-auth` skips it, and means what it says — if the server does ask for a cleartext password, this client sends one. `scram-auth!` keeps its own check as the backstop for that case. Printable-ASCII passwords are exact — SASLprep leaves them unchanged.
+SASLprep normalization is not implemented (its Unicode tables would dwarf the driver), so passwords outside **printable ASCII** — non-ASCII, or the control characters SASLprep prohibits — are rejected with a clear error in the caller — `postgresql-connect` and `postgresql-pool` raise an assertion up front — instead of failing with a baffling `28P01`. That check does not know what the server will ask for, and does not wait to find out: it runs before any connection, so a `trust` server that would never look at the password refuses one anyway. `'allow-cleartext-auth` skips *that upfront check*, and means what it says — if the server does ask for a cleartext password, this client sends one, unless the password holds a NUL, which `PasswordMessage` cannot represent. It does not make the driver accept such a password everywhere: if the server chooses SCRAM after all, `scram-auth!` refuses it there, which is the backstop. MD5 and unrecognized auth methods are refused regardless. Printable-ASCII passwords are exact — SASLprep leaves them unchanged.
 
 #### TLS
 
