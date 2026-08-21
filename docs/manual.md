@@ -2433,12 +2433,13 @@ If you do pass `key`, the value that arrives has to be the procedure itself:
 (app-use app (rate-limit `((max . 100) (key . ,my-key-fn))))   ; note the comma
 ```
 
-Without that unquote — inside a plain `'(...)`, or a quasiquote you forgot to
-unquote — the value is the *list* `(lambda (req) …)`, and nothing refuses it:
-`rate-limit` does not check `key`, and `app-use` only checks that `rate-limit`
-returned a procedure. The failure arrives with the first request, where the key
-is computed before anything else in the middleware runs — so the limiter does
-not fall back to a default, it does nothing at all and the request errors. When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
+Get that comma wrong and nothing refuses it — neither `rate-limit` nor
+`app-use` looks at `key` when the middleware is installed. It surfaces when a
+request reaches this middleware, and it is computed before the store is
+consulted, so that request is never counted; what the caller sees depends on
+the error handling in front of it.
+
+When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
 
 ### Error Handler
 
