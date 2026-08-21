@@ -1160,11 +1160,13 @@
         (send pool (vector 'pool-quit))))
 
     ;; ---- the stats timeout raises a structured error, not a bare symbol
-    ;; A pool that never answers #(pool-stats ...) leaves connpool-stats
-    ;; on its 5s deadline. The raise has two things to say -- which
-    ;; failure, and which pool -- and a symbol is one value; the vector
-    ;; carries both, in the same shape as #(durable-error op path) and
-    ;; #(dpool-error reason id). That is all these cells hold it to:
+    ;; A process that does not answer #(pool-stats ...) before the 5s
+    ;; deadline takes connpool-stats down its timeout path. The raise
+    ;; carries which failure occurred and which process the deadline
+    ;; expired on -- two things to say, and a symbol is one value; the
+    ;; vector carries both, in the same shape as #(durable-error op
+    ;; path) and #(dpool-error reason id). That is all these cells hold
+    ;; it to:
     ;; the shape does not establish provenance (anyone can raise a
     ;; vector with this tag) and is not the whole of this function's
     ;; error surface (the not-a-pool report below is a condition).
@@ -1201,14 +1203,14 @@
                     (= (vector-length caught) 3)
                     (let ((slot (vector-ref caught 2)))
                       (or (fixnum? slot) (string? slot)))))
-        ;; ...and it is THIS pool's id, not any scalar. "Which pool"
-        ;; (within this runtime -- ids restart from zero per process,
-        ;; so a number in an aggregated log names a pool on a node, not
-        ;; a pool) is the slot's reason to exist. One sample cannot rule
-        ;; out a constant that happens to equal it; the second probe
-        ;; below, against a different pool, can -- no single constant
-        ;; equals both ids.
-        (check "the context slot names the pool that went silent"
+        ;; The slot is THIS process's id, not merely any scalar. Within
+        ;; this runtime the monotonic, non-reused id identifies that
+        ;; process exactly. It does not establish that the process was
+        ;; a pool or remains alive; across runtimes the bare number
+        ;; identifies nothing. One sample cannot rule out a constant
+        ;; that happens to equal it; the second probe below, against a
+        ;; different process, can -- no single constant equals both ids.
+        (check "the context slot names the process the deadline expired on"
                (and (vector? caught)
                     (= (vector-length caught) 3)
                     (equal? (vector-ref caught 2) (process-id deaf))))
@@ -1219,14 +1221,14 @@
         (when (symbol? caught)
           (display "  [info] raised a bare symbol: ")
           (write caught) (newline))
-        ;; the second probe: a different deaf pool must yield ITS id --
-        ;; this is what rules out a constant fitted to the first sample.
-        ;; Another full deadline is the price.
+        ;; the second probe: a different deaf process must yield ITS id
+        ;; -- this is what rules out a constant fitted to the first
+        ;; sample. Another full deadline is the price.
         (let* ((deaf2 (spawn (lambda () (receive (`#(never-sent) 'ok)))))
                (caught2 (guard (e (#t e))
                           (connpool-stats deaf2)
                           'no-raise)))
-          (check "a second silent pool yields its own, different id"
+          (check "a second timed-out process yields its own, different id"
                  (and (vector? caught2)
                       (= (vector-length caught2) 3)
                       (equal? (vector-ref caught2 2) (process-id deaf2))
