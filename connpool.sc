@@ -993,10 +993,10 @@
       ;; display-condition bounds what it descends into.
       ;;
       ;; #(durable-error op path) and #(dpool-error reason id) follow the
-      ;; rule. Known violator: gen-server-call, which puts the caller's
-      ;; own message in this position -- and a message carrying a process
-      ;; is how a request names its replier, this procedure included.
-      ;; It is in the ledger; it is not evidence the rule is optional.
+      ;; rule, and so does gen-server-call, which used to put the caller's
+      ;; own message here -- a message carrying a process is how a request
+      ;; names its replier, this procedure included -- and now summarises
+      ;; it to a bounded scalar first.
       (receive (after 5000
                  (raise (vector 'connpool-error 'stats-timeout
                                 (process-id pool))))

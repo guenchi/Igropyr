@@ -20,6 +20,11 @@
 ;;; crash raises #(gen-server-error server-died reason) immediately
 ;;; instead of hanging until the timeout. Servers may be addressed by
 ;;; registered name (a symbol) or pid.
+;;;
+;;; The last slot of every #(gen-server-error ...) is a printable scalar:
+;;; a value that already is one is passed through so it stays
+;;; eq?-comparable, and anything else is rendered under bounds. See
+;;; scalar-summary for what that covers and what it does not.
 
 (library (igropyr gen-server)
   (export gen-server-start gen-server-start-named
@@ -39,10 +44,53 @@
       (set! ref-counter (+ ref-counter 1))
       ref-counter))
 
+  ;; ---- what goes in the error vector's last slot ------------------------
+  ;; That slot used to hold the caller's own message, or a DOWN reason,
+  ;; whatever they were. A message names its replier -- sending `self' is
+  ;; how a request says where to answer -- so the slot could hold a live
+  ;; process, and a process is a pcb record whose fields include its
+  ;; continuation, its links and its inbox. `write' on such a vector walks
+  ;; into a cycle and takes the runtime down, printing the mailbox on the
+  ;; way; the operator reading the error is the one who triggers it.
+  ;;
+  ;; So the slot holds a printable scalar. Values that already are one pass
+  ;; through UNCHANGED, which is what keeps 'server-died's `normal' and a
+  ;; registered name eq?-dispatchable at the call site. Anything else is
+  ;; rendered, and rendered BOUNDED: print-level and print-length bound the
+  ;; walk itself, so a cycle or a pcb is summarised rather than chased, and
+  ;; the clip afterwards bounds the string. Setting the bounds before the
+  ;; walk is the point -- clipping a string that was already built has no
+  ;; bound on what building it cost.
+  ;;
+  ;; WHAT THIS DOES NOT BOUND: a symbol passes through by length as well as
+  ;; by kind, so a caller who sends a megabyte-long symbol gets a
+  ;; megabyte-long slot. It cannot cycle and cannot reach a pcb, so it is
+  ;; not the hazard above; it is simply not covered.
+  ;;
+  ;; The three numbers are measured-enough values, not a contract: at
+  ;; level 3 / length 8 a pcb renders to about 185 characters, which
+  ;; identifies the message shape without becoming the message.
+  (define summary-print-level 3)
+  (define summary-print-length 8)
+  (define summary-max-chars 200)
+
+  (define (scalar-summary x)
+    (if (or (symbol? x) (fixnum? x) (boolean? x) (null? x)
+            (and (string? x) (<= (string-length x) summary-max-chars)))
+        x
+        (parameterize ((print-level summary-print-level)
+                       (print-length summary-print-length))
+          (let ((s (call-with-string-output-port
+                     (lambda (port) (write x port)))))
+            (if (> (string-length s) summary-max-chars)
+                (string-append (substring s 0 summary-max-chars) "...")
+                s)))))
+
   (define (resolve srv)
     (if (symbol? srv)
         (or (whereis srv)
-            (raise (vector 'gen-server-error 'no-such-server srv)))
+            (raise (vector 'gen-server-error 'no-such-server
+                           (scalar-summary srv))))
         srv))
 
   ;; init: () -> state
@@ -126,17 +174,20 @@
       ;; is. A handler that wants its own service should call the plain
       ;; procedure the handler calls, not route back through the mailbox.
       (when (eq? p self)
-        (raise (vector 'gen-server-error 'calling-self msg)))
+        (raise (vector 'gen-server-error 'calling-self
+                       (scalar-summary msg))))
       (let ((m (monitor p)))
         (send p (vector 'gen-call self ref msg))
         (receive (after timeout
                     (release-monitor! m p)
-                    (raise (vector 'gen-server-error 'timeout msg)))
+                    (raise (vector 'gen-server-error 'timeout
+                                   (scalar-summary msg))))
           (`#(gen-reply ,@ref ,reply)
             (release-monitor! m p)
             reply)
           (`#(DOWN ,@p ,reason)
-            (raise (vector 'gen-server-error 'server-died reason)))))))
+            (raise (vector 'gen-server-error 'server-died
+                           (scalar-summary reason))))))))
 
   (define (gen-server-cast srv msg)
     (send (resolve srv) (vector 'gen-cast msg)))
