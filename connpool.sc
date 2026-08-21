@@ -940,7 +940,17 @@
     (drain-stale!)
     (let ((ref (gensym)))
       (send pool (vector 'pool-stats ref self))
-      (receive (after 5000 (raise 'connpool-stats-timeout))
+      ;; STRUCTURED, NOT A BARE SYMBOL. A guard sees a raised symbol as
+      ;; a symbol and nothing more: it cannot tell this one from any
+      ;; other a caller might be using for its own control flow, so a
+      ;; handler written to catch it catches theirs too, and vice
+      ;; versa. The tagged shape is the one the rest of this framework
+      ;; raises -- #(durable-error op path), #(dpool-error reason id) --
+      ;; and the third slot carries the pool whose stats went
+      ;; unanswered, which is what tells an operator WHICH pool has
+      ;; stopped replying rather than only that one has.
+      (receive (after 5000
+                 (raise (vector 'connpool-error 'stats-timeout pool)))
         (`#(pool-stats-reply ,@ref ,st)
           (or st
               (assertion-violation 'connpool-stats
