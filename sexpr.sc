@@ -352,7 +352,7 @@
       ;; The same failure shape the symbol refusal already uses, because
       ;; a caller catching one has to catch the other: both are "this
       ;; datum cannot go on the wire", raised by the writer.
-      (sfail "token too long for the wire -- carry a value this large as a bytevector (#vu8)" 0))
+      (sfail "token too long for the wire -- carry a value this large as a bytevector, which needs the extended mode (sexpr->string-extended)" 0))
     (put-string p str))
 
   ;; A bare token is re-read by parse-atom, which tries a number first
