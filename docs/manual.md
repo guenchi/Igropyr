@@ -1610,8 +1610,9 @@ see *Asking without waiting for the step to finish*.
 `conversation-done?`, `conversation-settled?`, `conversation-stale?`,
 `conversation-gone?`, `conversation-unknown?`, `conversation-unreachable?`
 and `conversation-overloaded?` are applied to the *status*.
-`conversation-no-answer-yet?` is not in this list: it tests a state only
-`conversation-peek/timeout` produces.
+`conversation-no-answer-yet?` is not in this list. What it tests is not
+a status at all: `'no-answer-yet` reports on *your* deadline, not on the
+conversation, and only `conversation-peek/timeout` ever answers with it.
 
 #### `'unknown` is not `'gone`
 
@@ -1758,7 +1759,7 @@ backstop for a conversation that died some way it never described, and
 a kill it performs itself. A writer that reads `self` or anything
 process-local sees a different process there.
 
-Three further consequences:
+Further consequences:
 
 - The final value is handed back only after the writer **returns or
   raises**. A caller is therefore told "committed" after the write was
@@ -1938,7 +1939,9 @@ asker, not to the conversation.
 
 `'parked` and `'completed` are peek's own phases and have no predicates —
 the `conversation-...?` predicates cover the statuses a *resume* can also
-answer with, so compare those two directly. (Stated without a count on
+answer with, so compare those two directly. (`conversation-no-answer-yet?`
+is the exception, and for the opposite reason: what it tests is not a
+status either.) (Stated without a count on
 purpose: this sentence has already been wrong once, when `'overloaded`
 arrived and the number moved.)
 
@@ -1946,14 +1949,16 @@ The timeout is **required and has no default**: how long to wait is a
 property of the caller's own budget, and no number the library picked
 would be about that.
 
-`'no-answer-yet` is a new status, and the thing to get right is that it
-is **not** `'unknown`. All three of `'no-answer-yet`, `'unknown` and
+`'no-answer-yet` is a word only `conversation-peek/timeout` answers with,
+and it is not a status: it reports on your deadline, not on the
+conversation. The thing to get right is that it is **not** `'unknown`.
+All three of `'no-answer-yet`, `'unknown` and
 `'unreachable` forbid the same thing — none of them licenses starting a
 second attempt — but they call for different next steps:
 
-| status | what it says | what to do |
+| answer | what it says | what to do |
 |---|---|---|
-| `'no-answer-yet` | nothing arrived within *your* limit | ask again |
+| `'no-answer-yet` | nothing arrived within *your* limit — the only one here that is about the asking rather than the conversation | ask again |
 | `'unknown` | this node cannot say what became of it | reconcile against your own records |
 | `'unreachable` | no definite reply came back from the owner | reconcile against your own records |
 | `'overloaded` | the owner declined to start it | retry later; nothing to reconcile |
@@ -3240,12 +3245,14 @@ Return values:
 - **INSERT/UPDATE/DELETE**: `#(ok ,affected ,last-insert-id)`.
 - **Values**: Strings (MySQL text protocol). `NULL` → `#f`. Numeric strings are not converted.
 
-**Errors**: Driver-generated operational errors raise
-`#(mysql-error ,code ,message)` in the caller. Two things do not wear that
-tag: `mysql-pool-stats`, which passes the pool library's
-`#(connpool-error stats-timeout ,pool-id)` straight through, and anything
-raised by your own procedure inside `call-with-mysql-connection` or
-`mysql-transaction`, which travels out unchanged.
+**Errors**: `#(mysql-error ,code ,message)` is the shape of an *operational*
+error — one the database, the connection or a timeout produced on a valid
+call. Nothing else promises to wear that tag. Argument checks raise ordinary
+Chez conditions, `mysql-pool-stats` passes the pool library's
+`#(connpool-error stats-timeout ,pool-id)` straight through, and whatever
+your own procedure raises inside `call-with-mysql-connection` or
+`mysql-transaction` travels out unchanged. A guard that must not let
+anything past needs a clause for conditions as well as for the vector.
 
 #### Authentication
 
@@ -3350,12 +3357,15 @@ The result shapes are the same as `postgresql-query` (`#(rows ...)` / `#(ok ...)
 
 #### Errors
 
-Driver-generated operational errors raise `#(postgresql-error ,tag ,message)`
-in the caller, where `tag` is one of exactly three shapes. Two things do not
-wear that tag: `postgresql-pool-stats`, which passes the pool library's
-`#(connpool-error stats-timeout ,pool-id)` straight through, and anything
-raised by your own procedure inside `call-with-postgresql-connection` or
-`postgresql-transaction`, which travels out unchanged.
+`#(postgresql-error ,tag ,message)` is the shape of an *operational* error —
+one the database, the connection or a timeout produced on a valid call —
+and `tag` is one of exactly three shapes. Nothing else promises to wear that
+tag. Argument checks raise ordinary Chez conditions,
+`postgresql-pool-stats` passes the pool library's
+`#(connpool-error stats-timeout ,pool-id)` straight through, and whatever
+your own procedure raises inside `call-with-postgresql-connection` or
+`postgresql-transaction` travels out unchanged. A guard that must not let
+anything past needs a clause for conditions as well as for the vector.
 
 - **a 5-character SQLSTATE string** — a server-side SQL error (constraint violation, syntax error, …). The connection stays usable.
 - **`'transport`** — a connection or framing failure. The connection is torn down (and rebuilt by a pool).
