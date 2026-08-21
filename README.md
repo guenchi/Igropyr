@@ -1292,7 +1292,7 @@ client.sc  non-blocking outbound HTTP client (async DNS)
 sigv4.sc   AWS Signature V4 request signing (pure)
 s3.sc      S3-compatible object storage (AWS S3 / R2 / MinIO)
 blas.sc    vector scoring kernel: optional CBLAS sgemv, pure fallback
-quickjs.sc embed a JS engine in-process (QuickJS via a C shim)
+quickjs.sc embed a JS engine in-process (QuickJS, pure Scheme FFI)
 tls.sc     optional outbound TLS (OpenSSL memory-BIO codec) for https/wss
 redis.sc   non-blocking Redis client (RESP2), pipelined
 mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool

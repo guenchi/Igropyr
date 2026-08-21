@@ -37,9 +37,9 @@
 ;;;
 ;;; Why this exists: the by-value JSValue ABI and the refcount teardown are
 ;;; the tricky parts of embedding QuickJS from Scheme; both are handled here
-;;; (a JSValue is a 16-byte {u,tag} struct passed via (& ftype); JS_FreeValue
-;;; is a header inline, so its refcount decrement is reproduced faithfully and
-;;; the exported __JS_FreeValue is called only at ref-count zero).
+;;; (a JSValue is a 16-byte {u,tag} struct passed via (& ftype); releasing one
+;;; is a single call to the exported JS_FreeValue, which is the reason
+;;; quickjs-ng is required rather than preferred).
 ;;;
 ;;; Hardening (in-Scheme substitutes for the C shim's guards):
 ;;;   - JS_SetMemoryLimit  : allocation past the cap -> in-JS OOM exception.
@@ -220,12 +220,11 @@
       (lock-object cb)                    ; keep it pinned for the engine's life
       cb))
 
-  ;; ---- faithful JS_FreeValue (header inline): decrement the object's
-  ;; ref_count, and only at zero call the exported slow path. Needed for the
-  ;; per-call setup values (global, function, argument, result). --------------
-  ;; The exported JS_FreeValue owns the whole operation, including the
-  ;; has-ref-count test, so hand it the value as is. Nothing here reads the
-  ;; object's memory -- see bind! for why that matters.
+  ;; ---- release a JSValue: one call to the exported JS_FreeValue. Needed
+  ;; for the per-call setup values (global, function, argument, result). -----
+  ;; That export owns the whole operation, including the has-ref-count test,
+  ;; so hand it the value as is. Nothing here reads the object's memory --
+  ;; see bind! for why that matters.
   (define (js-free! v) (_free-value ctx v))
 
   ;; read a JS string value's UTF-8 bytes into a fresh bytevector (via one
@@ -259,7 +258,7 @@
   (define (arm-deadline! factor)
     (set! deadline (if (> timeout-ms 0) (+ (real-time) (* timeout-ms factor)) 0)))
 
-  ;; ---- ABI probe: DISCOVER ref_count's offset instead of hard-coding it ---
+  ;; ---- ABI probe: the JSValue layout, with no offset to discover ---------
   ;; Validate the JSValue struct layout: the global object's tag must read as
   ;; JS_TAG_OBJECT, which proves `u` is a real pointer and this is not a
   ;; NaN-boxed build. Cheap, and it reads only OUR OWN JSValue buffer, never
