@@ -161,8 +161,9 @@
                       (else (look (cdr rest) (+ k 1)))))))
       (else (scan (cdr ls))))))
 
-;; (igropyr quickjs) is the pure-Scheme binding: it needs a stock shared
-;; libquickjs. Gate on that so run-all stays green on hosts without QuickJS.
+;; (igropyr quickjs) is the pure-Scheme binding: it needs a shared
+;; QuickJS engine library -- quickjs-ng's libqjs is the one that binds.
+;; Gate on that so run-all stays green on hosts without QuickJS.
 (define (quickjs-present?)
   (or (let ((e (getenv "IGROPYR_LIBQUICKJS_SO"))) (and e (> (string-length e) 0) (file-exists? e)))
       (file-exists? "libquickjs.dylib") (file-exists? "libquickjs.so")
@@ -271,6 +272,11 @@ function eat(j){ return String(j.length); }
 ;; asserted nowhere, and a review round found each of them able to pass
 ;; with that precondition absent.
 (define (trace-file name) (string-append "/tmp/igropyr-qjsw-" name ".trace"))
+;; the worker's stderr is captured, not discarded: when a worker never
+;; comes up, the reason -- an engine refusal with its install advice, a
+;; bad bundle, a port in use -- was printed THERE, and dropping it left
+;; only "never came up", which reads like a suite defect
+(define (err-file name) (string-append "/tmp/igropyr-qjsw-" name ".err"))
 
 (define (trace-lines name)
   (let ((p (trace-file name)))
@@ -421,7 +427,7 @@ function eat(j){ return String(j.length); }
                          (+ n 1) n))))))))
 
 (define (spawn-worker! name port timeout-ms . partial)
-  (system (string-append "rm -f " (trace-file name) "; "
+  (system (string-append "rm -f " (trace-file name) " " (err-file name) "; "
                          scheme-bin " --script igropyr/qjs-worker.sc 127.0.0.1 "
                          (number->string port) " " bundle-path
                          " timeout-ms=" (number->string timeout-ms)
@@ -431,7 +437,8 @@ function eat(j){ return String(j.length); }
                          " partial-frame-ms="
                          (number->string (if (pair? partial) (car partial) 1200))
                          " trace-file=" (trace-file name)
-                         " >/dev/null 2>&1 & echo $! > " (pid-file name))))
+                         " >/dev/null 2>" (err-file name)
+                         " & echo $! > " (pid-file name))))
 
 (define (kill-worker! name)
   (system (string-append
@@ -479,6 +486,17 @@ function eat(j){ return String(j.length); }
          #t)
       (else
         (fail (string-append "the " label " worker never came up") port)
+        ;; the reason was printed on the worker's stderr; surface it, so
+        ;; a wrong engine does not read as a suite defect
+        (let ((ef (err-file label)))
+          (when (file-exists? ef)
+            (let ((text (call-with-input-file ef
+                          (lambda (p) (get-string-all p)))))
+              (when (string? text)
+                (display "  [info] the worker's own stderr said:\n")
+                (display text)))))
+        (display "  (a bellard libquickjs boots only far enough to be refused;\n")
+        (display "   install quickjs-ng -- libqjs -- or set IGROPYR_LIBQUICKJS_SO)\n")
         #f))))
 
 (start-scheduler
