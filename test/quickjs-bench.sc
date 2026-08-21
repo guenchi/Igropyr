@@ -1,19 +1,28 @@
 #!chezscheme
 ;;; QuickJS engine benchmark -- a MEASUREMENT, not a pass/fail test, so it
 ;;; is not part of run-all.sh. It backs the per-call-overhead numbers the
-;;; manual quotes when recommending quickjs-ng, and exists so those numbers
-;;; can be re-checked on any machine or engine build.
+;;; manual's engine table quotes, and re-runs on the engine the driver
+;;; accepts: quickjs-ng, or any build exporting a compatible JS_FreeValue.
+;;;
+;;; THE BELLARD COLUMN IN THE TABLE BELOW IS HISTORY, NOT RE-RUNNABLE
+;;; FROM THIS TREE. Those numbers were taken when this library still
+;;; carried the ref_count replica that made bellard's libquickjs
+;;; loadable; that machinery was deliberately deleted, and pointing
+;;; IGROPYR_LIBQUICKJS_SO at a bellard build is now refused at boot,
+;;; before any benchmark runs. Re-measuring that column would mean
+;;; resurrecting the replica in a scratch tree.
 ;;;
 ;;; It separates two effects a single end-to-end figure conflates:
 ;;;   (a) per-CALL overhead -- the FFI round trip and the JSValue release
-;;;       path, which is where the two upstreams genuinely differ
-;;;       (ng exports a real JS_FreeValue; bellard's is a header inline
-;;;       whose replica must read and write the ref_count itself)
-;;;   (b) interpreter speed -- the engine executing JS, where they are
+;;;       path, which is where the two upstreams genuinely differed
+;;;       (ng exports a real JS_FreeValue; bellard's is a header inline,
+;;;       and the replica this library once carried read and wrote the
+;;;       ref_count itself)
+;;;   (b) interpreter speed -- the engine executing JS, where they were
 ;;;       within a couple of percent
 ;;; A near-empty function is almost all (a); a heavy loop is almost all (b).
 ;;;
-;;; Run against a specific engine:
+;;; Run (the driver picks up the engine it accepts):
 ;;;   IGROPYR_LIBQUICKJS_SO=/usr/local/lib/libqjs.so \
 ;;;     scheme --script igropyr/test/quickjs-bench.sc
 ;;;
