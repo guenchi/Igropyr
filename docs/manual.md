@@ -1582,16 +1582,17 @@ A flow may
 legitimately return the symbol `'gone` as its final value, so control
 outcomes never share a position with it:
 
-This is the **status vocabulary** — eight words, and they are not eight
-ways a dialogue can end. A token string means it has not ended at all;
-`'done` and `'settled` are one completion seen at two moments, before
-and after the reply stops being retained. Drop the token and count that
-pair once and you get the **six outcomes** the README and the front page
-name.
+This is the **status vocabulary** — nine words, and they are not nine
+ways a dialogue can end. Two of them say it has not ended: a token
+string, and `'no-answer-yet`. `'done` and `'settled` are one completion
+seen at two moments, before and after the reply stops being retained.
+Drop the two that are not endings, count that pair once, and you get the
+**six outcomes** the README and the front page name.
 
 | status | meaning |
 |---|---|
 | a token string | the step ran — present it to continue |
+| `'no-answer-yet` | nothing had arrived when the deadline passed — only from `conversation-peek/timeout`, and not evidence that anything was asked |
 | `'done` | the flow finished; `reply` is its final answer |
 | `'settled` | it finished, but the answer is no longer retained |
 | `'stale` | not applied, and will not be |
@@ -1601,8 +1602,9 @@ name.
 | `'overloaded` | the owner **refused** the forward before touching the conversation: it was already hosting its limit of them. Nothing was started, the token is still good, and asking again later is right |
 
 `conversation-done?`, `conversation-settled?`, `conversation-stale?`,
-`conversation-gone?`, `conversation-unknown?`, `conversation-unreachable?`
-and `conversation-overloaded?` are applied to the *status*.
+`conversation-gone?`, `conversation-unknown?`, `conversation-unreachable?`,
+`conversation-overloaded?` and `conversation-no-answer-yet?` are applied
+to the *status*.
 
 #### `'unknown` is not `'gone`
 
@@ -1621,7 +1623,9 @@ A different quantity from the status vocabulary above: these are the
 **record values** — what is still known about a conversation once its
 process is gone, which is what a later question is answered from. Five
 of them, mapping onto the statuses above rather than corresponding to
-them one for one.
+them one for one. The last row pairs one with its own absence because
+they are answered alike; *no record* is not a sixth value, and a reader
+that returns it as one is a reader at fault.
 
 | record | meaning | answer |
 |---|---|---|
@@ -1629,7 +1633,7 @@ them one for one.
 | rolled back | left through its winders, `commit!` had not returned | `'gone` |
 | committed then failed | left through its winders *after* `commit!` returned | `'unknown` |
 | commit uncertain then failed | left through its winders after `commit!` reported the commit as a *maybe* | `'unknown` |
-| killed / no record | stopped in flight, or stopped in a way nothing recorded | `'unknown` |
+| killed *(or no record at all)* | stopped in flight, or stopped in a way nothing recorded | `'unknown` |
 
 The last three answer alike here and are still three records, not one.
 The two failure records part company under a `settled?` predicate
