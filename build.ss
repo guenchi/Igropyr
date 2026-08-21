@@ -25,6 +25,13 @@
     ("igropyr/blas.sc" . 2)
     ("igropyr/libuv.sc" . 2)
     ("igropyr/actor.sc" . 2)
+    ;; after actor and libuv, which it drives, and after durable, whose
+    ;; error predicates and traced step it re-uses. Missing from this
+    ;; list until now, which made it the one source-only library in the
+    ;; set -- and a source-only library takes a fresh UID per process, so
+    ;; anything compiled against it reloads silently. Same reason the
+    ;; sexpr note below gives.
+    ("igropyr/durable-async.sc" . 2)
     ("igropyr/json.sc" . 2)
     ("igropyr/gzip.sc" . 2)
     ;; sexpr must be compiled too: a source-only library gets a fresh
