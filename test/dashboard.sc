@@ -13,6 +13,9 @@
 (define auth-port 18112)
 (define authv-port 18113)
 (define hdr-port 18114)
+;; minted per run: a hardcoded acceptor cannot contain a value that did
+;; not exist until this process started
+(define hdr-secret (string-append "tk-" (number->string (real-time))))
 
 (define failures 0)
 (define (check label ok)
@@ -122,7 +125,8 @@
       ;; what a wreck looks like varies with when it happens (a 500
       ;; before the response begins; a closed connection after). So the
       ;; body is parsed as auth's JSON, the content type must be
-      ;; application/json exactly (or with parameters), and the
+      ;; application/json -- exact, or followed by ";" with whatever
+      ;; parameter text, which these cells do not validate -- and the
       ;; WWW-Authenticate challenge must be auth's default.
       (check "...and the refusal is auth's own JSON, not a wreck"
         (let ((r (GET (url authv-port "/data"))))
@@ -152,18 +156,24 @@
       ;; an unconditional pass. So the example's auth expression is not
       ;; measured, it is MOUNTED: a fourth admin listener runs whatever
       ;; the example builds, and the requests judge that it GATES like
-      ;; auth -- three states, because two are forgeable: no token and
-      ;; right token alone are satisfied by anything that admits every
-      ;; bearer; only wrong-token-refused pins that the injected verify
-      ;; is consulted. (What lands in req-claims is auth's contract and
-      ;; is pinned in test/auth.sc, not here: no dashboard route reads
-      ;; claims, so this fixture cannot observe them.)
+      ;; auth -- three states, and the accepted token is MINTED AT RUN
+      ;; TIME: a middleware admitting every bearer fails the wrong-
+      ;; token state, and one hardcoded to accept some fixed string
+      ;; fails the right-token state, because the right token did not
+      ;; exist until this run. That is what ties the gate to the
+      ;; injected verify. (What lands in req-claims is pinned in
+      ;; test/jwt.sc -- test/auth.sc's own header says the HTTP
+      ;; middleware is jwt.sc's to cover -- and no dashboard route
+      ;; reads claims, so this fixture cannot observe them.)
       ;;
       ;; The anchor must match exactly once (zero = the example moved:
       ;; fail loudly, do not skip; two = the anchor stopped being an
-      ;; anchor) and must sit BEFORE the (library ...) form -- the
-      ;; header commentary is everything above it, so a decoy in a
-      ;; comment or string further down cannot be what gets extracted.
+      ;; anchor), lie on a ";;;" line, and precede the first occurrence
+      ;; of the text "(library". In this file that text is the library
+      ;; form itself, so together these put the hit inside the header
+      ;; commentary. What is extracted and judged is the auth
+      ;; expression alone -- not the surrounding option-list, whose
+      ;; copy-paste integrity these cells do not claim.
       (let* ((src (call-with-input-file "dashboard.sc"
                     (lambda (p) (get-string-all p))))
              (pat "(auth . ,")
@@ -180,15 +190,24 @@
                      (let ((i (find-from pat k)))
                        (if i (loop (+ i 1) (cons i acc)) (reverse acc)))))
              (libpos (find-from "(library" 0)))
-        (check "the example anchor is unique and in the header block"
-          (and (= 1 (length hits)) libpos (< (car hits) libpos)))
-        (when (and (= 1 (length hits)) libpos (< (car hits) libpos))
-          (let ((built (eval `(let ((verify (lambda (t)
-                                              (and (equal? t "tk2")
-                                                   '(("sub" . "hdr"))))))
-                                ,(read (open-input-string
-                                         (substring src (+ (car hits) m) n))))
-                             (environment '(chezscheme) '(igropyr auth)))))
+        (let ((on-header-line?
+               (let ((ls (let loop ((k (car (append hits '(0)))))
+                           (if (or (= k 0)
+                                   (char=? (string-ref src (- k 1)) #\newline))
+                               k (loop (- k 1))))))
+                 (and (>= n (+ ls 3))
+                      (string=? (substring src ls (+ ls 3)) ";;;")))))
+          (check "the example anchor is unique, on a ;;; line, in the header"
+            (and (= 1 (length hits)) on-header-line?
+                 libpos (< (car hits) libpos)))
+          (when (and (= 1 (length hits)) on-header-line?
+                     libpos (< (car hits) libpos))
+            (let ((built (eval `(let ((verify (lambda (t)
+                                                (and (equal? t ,hdr-secret)
+                                                     '(("sub" . "hdr"))))))
+                                  ,(read (open-input-string
+                                           (substring src (+ (car hits) m) n))))
+                               (environment '(chezscheme) '(igropyr auth)))))
             (check "the extracted example builds a procedure"
               (procedure? built))
             (when (procedure? built)
@@ -203,11 +222,13 @@
                          (GET (url hdr-port "/data")
                               '((headers . (("Authorization"
                                              . "Bearer nope"))))))))
-              (check "...and admits the right token"
+              (check "...and admits the run-minted right token"
                 (= 200 (response-status
                          (GET (url hdr-port "/data")
-                              '((headers . (("Authorization"
-                                             . "Bearer tk2")))))))))))))
+                              `((headers . (("Authorization"
+                                             . ,(string-append
+                                                  "Bearer "
+                                                  hdr-secret))))))))))))))
 
       ;; ---- injection guard: a quote in the data path is rejected ----
       (check "quote-in-path-rejected"
