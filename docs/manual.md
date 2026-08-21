@@ -4806,11 +4806,13 @@ code.
 - `(qjs-healthy?)` / `(qjs-generation)` / `(qjs-shutdown!)`.
 
 It runs in **pure Scheme** over a stock shared `libquickjs`, bound directly
-through the FFI — no custom C. Two checks run at boot. The library must
-export `JS_FreeValue` as a real function, which is what pins the upstream
-(below). And the global object's tag must read as `JS_TAG_OBJECT`, which
-refuses a NaN-boxed or re-ordered `JSValue` layout rather than reading it
-wrong; that check touches only the driver's own JSValue buffer. The
+through the FFI — no custom C. Two of `qjs-boot!`'s checks are about the
+engine, as opposed to its arguments or the load itself. The library must
+export `JS_FreeValue` as a real function. And the global object's tag,
+read through this binding's `JSValue` ftype, must come back as
+`JS_TAG_OBJECT` — which catches a NaN-boxed or re-ordered layout, though
+not one that happens to put an object tag at the same place; that check
+touches only the driver's own buffer. The
 guards: a memory cap, a stack cap, a wall-clock interrupt deadline (a Chez
 `foreign-callable` the engine polls), an exception boundary, and
 **crash-only rebuild** — a throwing or runaway call discards the whole JS
@@ -4820,15 +4822,19 @@ OS thread and each call runs with interrupts disabled, so a call blocks the
 scheduler for its duration (sub-millisecond typically, `timeout-ms` worst
 case) — cap input size on latency-sensitive paths.
 
-`qjs-boot!` reports if no library is found; point it at one with
+`qjs-boot!` reports if no library is found, and refuses one that does not
+export `JS_FreeValue` (see below); point it at a library with
 `IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
 
-#### Which QuickJS: quickjs-ng, and only that
+#### Which QuickJS: install quickjs-ng
 
-This binding **requires quickjs-ng 0.15+** (`libqjs`). `qjs-boot!` refuses a
-library that does not export `JS_FreeValue` as a real function, and says so:
-it names bellard's `libquickjs` as the likely find and tells you to install
-quickjs-ng or point `IGROPYR_LIBQUICKJS_SO` at one.
+Install **quickjs-ng 0.15+** (`libqjs`). What the code checks is not the
+upstream's name or version but the symbol: `qjs-boot!` refuses a library
+that does not export `JS_FreeValue` as a real function, and says so —
+naming bellard's `libquickjs` as the likely find and telling you to install
+quickjs-ng or point `IGROPYR_LIBQUICKJS_SO` at one. Anything exporting a
+compatible `JS_FreeValue` gets past that gate; ng 0.15+ is what this is
+developed and measured against.
 
 | | library name | `JS_FreeValue` | here |
 |---|---|---|---|
