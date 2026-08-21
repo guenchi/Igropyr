@@ -87,6 +87,18 @@
                 (fail "a probed name is not on the export face" p)))
             probed))
 
+;; ...and each probe's NAME and PROCEDURE are the same export. The two
+;; directions above compare name-sets, not bindings: a probe pairing
+;; 'conversation-paused? with conversation-done? would pass both while
+;; conversation-paused? itself went unexercised. The library's own
+;; environment is the authority on which value a name denotes.
+(let ((env (environment '(igropyr conv-status))))
+  (for-each
+    (lambda (probe)
+      (unless (eq? (caddr probe) (eval (cadr probe) env))
+        (fail "probe's name and procedure disagree" (cadr probe))))
+    probes))
+
 ;; the two refusal-shaped statuses call for opposite responses --
 ;; 'unreachable must be reconciled, 'overloaded may simply be retried --
 ;; so the pair is checked against each other, not only against garbage

@@ -179,13 +179,16 @@
           (res-end! res)))
       ;; a WebSocket route, for the upgrade framing cases below. The
       ;; session takes (ws req) -- an earlier version wrote (lambda (ws))
-      ;; and nothing noticed, because every case here is refused BEFORE
-      ;; the handshake and the session never ran. A legal handshake
-      ;; against that fixture would have been answered 101 first, then
-      ;; had the arity exception swallowed by the session runner and the
-      ;; socket closed: the same shape-mismatch latency this fixture's
-      ;; own suite exists to prevent.
-      (app-ws app "/ws" (lambda (ws req) (ws-close! ws)))
+      ;; and nothing noticed, because the framing cases are refused
+      ;; BEFORE the handshake and never reach it, and the clean-upgrade
+      ;; case at the bottom asserted only the 101 -- which arrives before
+      ;; the session is called, so a session dying on arity inside the
+      ;; runner still passed it. The session therefore sends a frame, and
+      ;; the clean-upgrade case asserts the frame arrived: that is the
+      ;; only assertion that actually reaches the session's arity.
+      (app-ws app "/ws" (lambda (ws req)
+                          (ws-send-text! ws "alive")
+                          (ws-close! ws)))
       ;; a POST route that answers 200, so "refused" below cannot be
       ;; satisfied by a 404 from routing -- which is what the first version
       ;; of the HTTP/1.0-chunked case accidentally measured
@@ -398,7 +401,19 @@
       (let ((text (receive (after 9000 #f) (`#(raw ,t) t))))
         (check "a clean upgrade still gets its 101"
           (and text (>= (string-length text) 12)
-               (string=? (substring text 9 12) "101"))))
+               (string=? (substring text 9 12) "101")))
+        ;; the 101 is written before the session runs, so it cannot see
+        ;; a session that dies on arity. The frame can: a one-argument
+        ;; session raises inside the runner, the raise is swallowed, the
+        ;; socket closes, and "alive" never crosses.
+        (check "...and the session ran: its frame reached the client"
+          (and text
+               (let* ((needle "alive") (m (string-length needle))
+                      (n (string-length text)))
+                 (let loop ((k 0))
+                   (cond ((> (+ k m) n) #f)
+                         ((string=? (substring text k (+ k m)) needle) #t)
+                         (else (loop (+ k 1)))))))))
 
       (sleep-ms 100)
       (if (zero? failures)

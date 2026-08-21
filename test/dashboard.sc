@@ -116,12 +116,54 @@
       (sleep-ms 80)
       (check "verifier-composed auth refuses a tokenless request with 401"
         (= 401 (response-status (GET (url authv-port "/data")))))
-      (check "...and a 500 would mean the shape no longer fits the slot"
-        (not (= 500 (response-status (GET (url authv-port "/data"))))))
+      ;; the refusal must be AUTH'S OWN -- its 401 with its JSON body.
+      ;; A bare not-500 here discriminates nothing: any middleware
+      ;; failure is a 500 and any non-500 passes, so only the refusal's
+      ;; identity separates "refused by auth" from "died on the way".
+      (check "...and the refusal is auth's own JSON, not a wreck"
+        (let ((r (GET (url authv-port "/data"))))
+          (and (= 401 (response-status r))
+               (let* ((body (utf8->string (response-body r)))
+                      (needle "unauthorized") (m (string-length needle))
+                      (n (string-length body)))
+                 (let loop ((k 0))
+                   (cond ((> (+ k m) n) #f)
+                         ((string=? (substring body k (+ k m)) needle) #t)
+                         (else (loop (+ k 1)))))))))
       (check "verifier-composed auth admits a bearer token"
         (= 200 (response-status
                  (GET (url authv-port "/data")
                       '((headers . (("Authorization" . "Bearer tk"))))))))
+
+      ;; ---- the example itself, read out of dashboard.sc ----------------
+      ;; The three cells above run a COPY of the composition, and a copy
+      ;; guards nothing: roll the header example back to (token-guard
+      ;; verify) and the copy stays green. So the example's auth
+      ;; expression is extracted from the source file and evaluated, and
+      ;; the value it builds must have app-use middleware arity (mask 8,
+      ;; three arguments) -- (token-guard verify) builds a one-argument
+      ;; guard (mask 2) and goes red here. The anchor must match exactly
+      ;; once: zero means the example moved (fail loudly, do not skip),
+      ;; two means the anchor stopped being an anchor.
+      (check "the header example builds middleware, measured from the file"
+        (let* ((src (call-with-input-file "dashboard.sc"
+                      (lambda (p) (get-string-all p))))
+               (pat "(auth . ,")
+               (m (string-length pat))
+               (n (string-length src))
+               (hits (let loop ((k 0) (acc '()))
+                       (cond ((> (+ k m) n) (reverse acc))
+                             ((string=? (substring src k (+ k m)) pat)
+                              (loop (+ k 1) (cons k acc)))
+                             (else (loop (+ k 1) acc))))))
+          (and (= 1 (length hits))
+               (let* ((expr (read (open-input-string
+                                    (substring src (+ (car hits) m) n))))
+                      (built (eval `(let ((verify (lambda (t) #f))) ,expr)
+                                   (environment '(chezscheme)
+                                                '(igropyr auth)))))
+                 (and (procedure? built)
+                      (= 8 (procedure-arity-mask built)))))))
 
       ;; ---- injection guard: a quote in the data path is rejected ----
       (check "quote-in-path-rejected"

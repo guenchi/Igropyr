@@ -1162,10 +1162,14 @@
     ;; ---- the stats timeout raises a structured error, not a bare symbol
     ;; A pool that never answers #(pool-stats ...) leaves connpool-stats
     ;; on its 5s deadline. What that deadline raises is part of the
-    ;; library's error surface: a bare symbol cannot be told apart from
-    ;; any other symbol in a guard, so the raise must carry the library
-    ;; tag and the reason. This cell waits the full deadline -- the cost
-    ;; of pinning the shape of a timeout is one timeout.
+    ;; library's error surface. Not because a guard cannot match a bare
+    ;; symbol -- eq? does that fine -- but because a symbol carries one
+    ;; name and nothing else: no reason to branch on, no context to
+    ;; report, and the name is not even ours alone, since symbols are
+    ;; interned and a caller raising the same spelling for its own
+    ;; control flow raises the very same object. This cell waits the
+    ;; full deadline -- the cost of pinning the shape of a timeout is
+    ;; one timeout.
     (let ((deaf (spawn (lambda () (receive (`#(never-sent) 'ok))))))
       (let ((caught (guard (e (#t e))
                       (connpool-stats deaf)
