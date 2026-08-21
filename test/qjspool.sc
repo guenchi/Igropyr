@@ -12,8 +12,10 @@
 ;;; failed reply that leaves the connection usable, an unknown function,
 ;;; pool statistics, and a render against a worker that is not there.
 ;;;
-;;; SHIM-GATED like test/quickjs.sc: skips when no stock libquickjs is
-;;; present, because the worker process cannot boot an engine without one.
+;;; SHIM-GATED like test/quickjs.sc: skips when no QuickJS library is
+;;; present, because the worker process cannot boot an engine without
+;;; one. A bellard libquickjs counts as present and then fails loudly
+;;; at worker boot -- a wrong engine must not read as no engine.
 
 (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr qjspool)
         (only (igropyr ssr) make-ssr ssr-render ssr-try-render ssr-invalidate! ssr-stats)
@@ -182,8 +184,8 @@
 ;; a check had in fact failed would be the report this suite's
 ;; conventions exist to prevent.
 (unless (quickjs-present?)
-  (display "qjspool: no stock libquickjs found, WORKER tests skipped\n")
-  (display "  (install a stock libquickjs, or set IGROPYR_LIBQUICKJS_SO, to run them;\n")
+  (display "qjspool: no QuickJS library found, WORKER tests skipped\n")
+  (display "  (install quickjs-ng -- it ships libqjs -- or set IGROPYR_LIBQUICKJS_SO;\n")
   (display "   the structural check above needs no engine and did run)\n")
   (exit (if (= failures 0) 0 1)))
 

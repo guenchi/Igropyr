@@ -1,8 +1,8 @@
 #!chezscheme
 ;;; QuickJS engine benchmark -- a MEASUREMENT, not a pass/fail test, so it
 ;;; is not part of run-all.sh. It backs the per-call-overhead numbers the
-;;; manual's engine table quotes, and re-runs on the engine the driver
-;;; accepts: quickjs-ng, or any build exporting a compatible JS_FreeValue.
+;;; manual's engine table quotes, and re-runs on an engine that gets
+;;; past the driver's symbol check (see bind!): quickjs-ng in practice.
 ;;;
 ;;; THE BELLARD COLUMN IN THE TABLE BELOW IS HISTORY, NOT RE-RUNNABLE
 ;;; FROM THIS TREE. Those numbers were taken when this library still

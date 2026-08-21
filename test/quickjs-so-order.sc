@@ -3,8 +3,9 @@
 ;;; on the loader's search path.
 ;;;
 ;;; The two upstreams use different library names -- quickjs-ng ships libqjs,
-;;; bellard ships libquickjs -- and this driver requires ng (see the
-;;; JS_FreeValue check in bind!). The candidate list used to try libquickjs
+;;; bellard ships libquickjs -- and this driver refuses to bind unless
+;;; JS_FreeValue resolves, which bellard's build does not provide (a
+;;; header inline; see bind!). The candidate list used to try libquickjs
 ;;; first, so on a machine carrying both it dlopened the unusable one and the
 ;;; boot failed with ng installed and working right beside it.
 ;;;

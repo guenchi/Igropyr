@@ -1,6 +1,8 @@
 #!chezscheme
-;;; (igropyr quickjs) requires quickjs-ng: a build whose JS_FreeValue is not
-;;; exported must be refused at boot, not booted onto a different path.
+;;; (igropyr quickjs) refuses to bind unless JS_FreeValue resolves -- in
+;;; this suite's clean process, that is exactly "the loaded build exports
+;;; it" (bellard's is a header inline). Refused at boot, not booted onto
+;;; a different path.
 ;;;
 ;;; bellard/quickjs makes JS_FreeValue a header inline, which is what used to
 ;;; force this library to discover the ref_count offset by reading BOTH
