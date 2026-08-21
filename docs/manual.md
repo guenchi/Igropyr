@@ -122,6 +122,23 @@ Independent libraries:
     → else: close connection, yield
 ```
 
+### Which Scheme
+
+Chez Scheme is a requirement, not a preference. The scheduler is built
+directly on compiler internals that Gambit, Loko, Guile and the others do
+not have, so the lower layers do not port.
+
+| what it uses | what the scheduler needs it for |
+|---|---|
+| `#%$current-winders` | Every green process carries its own `dynamic-wind` winder chain. The scheduler swaps that chain on each context switch — **saved and restored, never run** — which is what makes "a kill discards winders" true. Three separate places are built on that: `conversation`'s `on-killed`, `connpool`'s broken check-in, and `durable`'s fd release. |
+| `#%$current-stack-link`, `#%$null-continuation` | Cut the stack chain when a process starts. Without the cut, a new process holds the continuation of whoever spawned it alive. |
+| `current-exception-state`, `create-exception-state` | A per-process exception state object, swapped on every switch, so one process's handlers are not another's. |
+| `set-timer` and the timer-interrupt handler | Chez's engine ticks. This is the basis of preemptive scheduling: a process that never yields is still interrupted. |
+| The FFI — `foreign-procedure`, `foreign-alloc`, `lock-object` — and helpers such as `procedure-arity-mask` | Chez's shapes, used throughout. |
+
+Porting to another implementation would mean rebuilding the scheduler on
+that engine's own internals, not translating this one.
+
 ---
 
 ## The Actor Model
