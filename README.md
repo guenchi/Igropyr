@@ -202,6 +202,30 @@ Igropyr selects the platform ABI and loads libuv, zlib, and the system C
 library automatically. Supported Chez machine types are macOS/Linux on
 x86_64 and arm64; an unsupported host fails at import time with a clear error.
 
+### Portability
+
+Chez Scheme is a requirement, not a preference: the actor runtime is
+built directly on Chez compiler internals that have no counterpart in
+Gambit, Loko, Guile or other Scheme implementations, so the lower
+layers do not port.
+
+- `#%$current-winders` — reads and swaps the `dynamic-wind` winder
+  stack. Each green process carries its own winder chain, and "kill
+  discards winders" is a semantic the whole library leans on:
+  conversation's `on-killed`, connpool's broken check-in and durable's
+  fd release are all built against it.
+- `#%$current-stack-link` / `#%$null-continuation` — cut the stack
+  chain when a new process starts.
+- `current-exception-state` / `create-exception-state` — a per-process
+  exception-state object, swapped on every context switch.
+- `set-timer` and the timer-interrupt handler — Chez's engine ticks,
+  the basis of preemptive scheduling.
+- The FFI — `foreign-procedure`, `foreign-alloc`, `lock-object` — and
+  helpers such as `procedure-arity-mask` are Chez's shapes throughout.
+
+Porting to another implementation would mean rebuilding the scheduler
+on that engine's own internals, not translating this one.
+
 ## Getting started
 
 Clone the repository into a directory named `igropyr` (the R6RS library name
