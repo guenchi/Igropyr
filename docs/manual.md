@@ -137,7 +137,7 @@ not have, so the lower layers do not port.
 | The FFI —<br>`foreign-procedure`,<br>`foreign-alloc`,<br>`lock-object` — and helpers such as `procedure-arity-mask` | Chez's shapes, used throughout. |
 
 Porting to another implementation would mean rebuilding the scheduler on
-that engine's own internals, not translating this one.
+that engine's own internals, not porting this one.
 
 ---
 
