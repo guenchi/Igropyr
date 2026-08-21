@@ -4806,9 +4806,11 @@ code.
 - `(qjs-healthy?)` / `(qjs-generation)` / `(qjs-shutdown!)`.
 
 It runs in **pure Scheme** over a stock shared `libquickjs`, bound directly
-through the FFI — no custom C. A boot-time ABI probe reads the JSValue
-`ref_count` offset from the loaded library (so it adapts across QuickJS
-builds) and refuses an unknown layout rather than corrupting memory. The
+through the FFI — no custom C. Two checks run at boot. The library must
+export `JS_FreeValue` as a real function, which is what pins the upstream
+(below). And the global object's tag must read as `JS_TAG_OBJECT`, which
+refuses a NaN-boxed or re-ordered `JSValue` layout rather than reading it
+wrong; that check touches only the driver's own JSValue buffer. The
 guards: a memory cap, a stack cap, a wall-clock interrupt deadline (a Chez
 `foreign-callable` the engine polls), an exception boundary, and
 **crash-only rebuild** — a throwing or runaway call discards the whole JS
@@ -4821,27 +4823,29 @@ case) — cap input size on latency-sensitive paths.
 `qjs-boot!` reports if no library is found; point it at one with
 `IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
 
-#### Which QuickJS: quickjs-ng is recommended
+#### Which QuickJS: quickjs-ng, and only that
 
-Two upstreams are supported and detected automatically — the binding picks
-its bindings from what the loaded library actually exports, so the same
-build runs against either:
+This binding **requires quickjs-ng 0.15+** (`libqjs`). `qjs-boot!` refuses a
+library that does not export `JS_FreeValue` as a real function, and says so:
+it names bellard's `libquickjs` as the likely find and tells you to install
+quickjs-ng or point `IGROPYR_LIBQUICKJS_SO` at one.
 
-| | library name | `JS_FreeValue` |
-|---|---|---|
-| [quickjs-ng](https://github.com/quickjs-ng/quickjs) (**recommended**) | `libqjs` | exported as a real function |
-| [bellard/quickjs](https://bellard.org/quickjs/) | `libquickjs` | a header inline; only the `__JS_FreeValue` slow path is exported |
+| | library name | `JS_FreeValue` | here |
+|---|---|---|---|
+| [quickjs-ng](https://github.com/quickjs-ng/quickjs) 0.15+ | `libqjs` | exported as a real function | **required** |
+| [bellard/quickjs](https://bellard.org/quickjs/) | `libquickjs` | a header inline; only the `__JS_FreeValue` slow path is exported | refused at boot |
 
-**quickjs-ng** is the recommended target for two reasons. It is the
-actively maintained fork; and because it exports a real `JS_FreeValue`,
-releasing a value is one FFI call instead of a hand-written replica of the
-inline function (read the tag, compute the `ref_count` address, decrement
-it, and call the slow path at zero). That replica depends on the private
-`ref_count` layout — which is exactly why the ABI probe exists — so with
-ng there is simply less to get wrong.
+What the requirement buys: releasing a value is one FFI call. Supporting
+bellard meant reproducing the inline in Scheme — read the tag, compute the
+`ref_count` address, decrement it, call the slow path at zero — and that
+address depends on a private layout that differs between the upstreams, so
+it had to be found at boot by reading **both** candidate offsets on a live
+object. One candidate sits four bytes *before* the object. Requiring the
+export removes that code rather than guarding it: there is no offset to
+find, so nothing reads outside an object.
 
-It is also measurably cheaper per call. Measured on FreeBSD 15 / amd64,
-best of three runs of 20 000 calls each:
+What it costs, measured on FreeBSD 15 / amd64, best of three runs of 20 000
+calls each, while both still ran:
 
 | workload | quickjs-ng | bellard |
 |---|---|---|
@@ -4850,13 +4854,12 @@ best of three runs of 20 000 calls each:
 | 200 000-iteration numeric loop | 5.05 ms/call | 4.96 ms/call |
 | `toLowerCase` + regexp replace | 5.15 µs/call | **2.35 µs/call** |
 
-Read that carefully before switching: the **call overhead** is ~30 % lower
-on ng (three JSValue releases per call, one FFI call each instead of a
-read-modify-write plus a conditional call), and raw interpreter speed is
-within 2 %. But engine internals differ per workload — the regexp/string
-case above is more than twice as fast on bellard. If your bundle is
-dominated by one such operation, measure your own bundle rather than
-trusting either default.
+Call overhead is ~30 % lower on ng — three JSValue releases per call, one
+FFI call each instead of a read-modify-write plus a conditional call — and
+raw interpreter speed is within 2 %. The regexp/string case is where the
+requirement costs something: bellard ran it more than twice as fast. If
+your bundle is dominated by such an operation, that is a reason to measure
+it, not a reason to reach for bellard; it will not boot.
 
 ### Fallback: the C-shim binding
 
