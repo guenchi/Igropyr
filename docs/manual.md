@@ -122,7 +122,7 @@ Independent libraries:
     → else: close connection, yield
 ```
 
-### Which Scheme
+### Why Chez Scheme
 
 Chez Scheme is a requirement, not a preference. The scheduler is built
 directly on compiler internals that Gambit, Loko, Guile and the others do
