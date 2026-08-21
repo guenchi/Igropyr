@@ -339,10 +339,32 @@
   ;; no escaped symbol form in this grammar, so such symbols are
   ;; refused by the writer (the whole point of the whitelist) rather
   ;; than silently corrupted in transit.
+  ;;
+  ;; THE QUESTION IS WHAT THE READER WILL DO WITH THE NAME, NOT WHAT
+  ;; CHEZ THINKS OF IT. string->number alone was the wrong judge, and
+  ;; the two are not even nested: parse-atom commits to reading a number
+  ;; the moment a token STARTS like one (a digit, or '-' then a digit)
+  ;; and then fails if the rest is not one. So |0x10| passed
+  ;; string->number's test -- Chez does not read it as a number -- went
+  ;; out on the wire bare, and came back as "bad number" at the far end:
+  ;; a datum this library wrote and could not read, which is the one
+  ;; failure a whitelist exists to prevent. |12abc|, |1/0| and |-1x| are
+  ;; the same shape.
+  ;;
+  ;; The reader's own test is mirrored here, so the two move together.
+  ;; string->number stays as well, and the overlap is not redundant: it
+  ;; refuses names the reader would accept, such as |+i|, which is an
+  ;; over-refusal rather than a corruption and costs a caller nothing
+  ;; but a rename.
   (define (wire-symbol? s)
     (let ((m (string-length s)))
       (and (> m 0)
            (not (string->number s))
+           ;; the reader's numeric-shape?, kept identical to it
+           (not (let ((c (string-ref s 0)))
+                  (or (char<=? #\0 c #\9)
+                      (and (char=? c #\-) (> m 1)
+                           (char<=? #\0 (string-ref s 1) #\9)))))
            (not (string=? s "."))
            (let lp ((i 0))
              (or (= i m)
