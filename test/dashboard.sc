@@ -12,6 +12,7 @@
 (define admin-port 18111)
 (define auth-port 18112)
 (define authv-port 18113)
+(define hdr-port 18114)
 
 (define failures 0)
 (define (check label ok)
@@ -116,20 +117,22 @@
       (sleep-ms 80)
       (check "verifier-composed auth refuses a tokenless request with 401"
         (= 401 (response-status (GET (url authv-port "/data")))))
-      ;; the refusal must be AUTH'S OWN -- its 401 with its JSON body.
-      ;; A bare not-500 here discriminates nothing: any middleware
-      ;; failure is a 500 and any non-500 passes, so only the refusal's
-      ;; identity separates "refused by auth" from "died on the way".
+      ;; the refusal must be AUTH'S OWN -- its 401 with its JSON body,
+      ;; parsed and matched structurally. A bare not-500 discriminates
+      ;; nothing (any wreck is a 500, any non-500 passed it), and a
+      ;; substring match would accept a hand-rolled text refusal that
+      ;; stopped being auth's.
       (check "...and the refusal is auth's own JSON, not a wreck"
         (let ((r (GET (url authv-port "/data"))))
           (and (= 401 (response-status r))
-               (let* ((body (utf8->string (response-body r)))
-                      (needle "unauthorized") (m (string-length needle))
-                      (n (string-length body)))
-                 (let loop ((k 0))
-                   (cond ((> (+ k m) n) #f)
-                         ((string=? (substring body k (+ k m)) needle) #t)
-                         (else (loop (+ k 1)))))))))
+               (let ((ct (response-header r 'content-type)))
+                 (and (string? ct)
+                      (>= (string-length ct) 16)
+                      (string=? (substring ct 0 16) "application/json")))
+               (equal? "unauthorized"
+                       (let ((d (string->json
+                                  (utf8->string (response-body r)))))
+                         (and (pair? d) (cdr (assoc "error" d))))))))
       (check "verifier-composed auth admits a bearer token"
         (= 200 (response-status
                  (GET (url authv-port "/data")
@@ -138,14 +141,18 @@
       ;; ---- the example itself, read out of dashboard.sc ----------------
       ;; The three cells above run a COPY of the composition, and a copy
       ;; guards nothing: roll the header example back to (token-guard
-      ;; verify) and the copy stays green. So the example's auth
-      ;; expression is extracted from the source file and evaluated, and
-      ;; the value it builds must have app-use middleware arity (mask 8,
-      ;; three arguments) -- (token-guard verify) builds a one-argument
-      ;; guard (mask 2) and goes red here. The anchor must match exactly
-      ;; once: zero means the example moved (fail loudly, do not skip),
-      ;; two means the anchor stopped being an anchor.
-      (check "the header example builds middleware, measured from the file"
+      ;; verify) and the copy stays green. And a SHAPE check on the
+      ;; extracted expression is a proxy: every three-argument procedure
+      ;; has app-use arity, including (lambda (req res next) (next)) --
+      ;; an unconditional pass. So the example's auth expression is not
+      ;; measured, it is MOUNTED: a fourth admin listener runs whatever
+      ;; the example builds, and the requests judge it as auth --
+      ;; refused without a token, admitted with one. The anchor must
+      ;; match exactly once (zero = the example moved: fail loudly, do
+      ;; not skip; two = the anchor stopped being an anchor) and must
+      ;; sit in the header commentary, so a stray copy elsewhere cannot
+      ;; be what gets extracted.
+      (check "the header example, mounted, refuses and admits like auth"
         (let* ((src (call-with-input-file "dashboard.sc"
                       (lambda (p) (get-string-all p))))
                (pat "(auth . ,")
@@ -157,13 +164,33 @@
                               (loop (+ k 1) (cons k acc)))
                              (else (loop (+ k 1) acc))))))
           (and (= 1 (length hits))
+               ;; the one hit lies on a ";;;" header-comment line
+               (let ((ls (let loop ((k (car hits)))
+                           (if (or (= k 0)
+                                   (char=? (string-ref src (- k 1)) #\newline))
+                               k (loop (- k 1))))))
+                 (and (>= n (+ ls 3))
+                      (string=? (substring src ls (+ ls 3)) ";;;")))
                (let* ((expr (read (open-input-string
                                     (substring src (+ (car hits) m) n))))
-                      (built (eval `(let ((verify (lambda (t) #f))) ,expr)
+                      (built (eval `(let ((verify (lambda (t)
+                                                    (and (equal? t "tk2")
+                                                         '(("sub" . "hdr"))))))
+                                      ,expr)
                                    (environment '(chezscheme)
                                                 '(igropyr auth)))))
                  (and (procedure? built)
-                      (= 8 (procedure-arity-mask built)))))))
+                      (begin
+                        (admin-listen m srv
+                          `((host . "127.0.0.1") (port . ,hdr-port)
+                            (auth . ,built)))
+                        (sleep-ms 80)
+                        (and (= 401 (response-status
+                                      (GET (url hdr-port "/data"))))
+                             (= 200 (response-status
+                                      (GET (url hdr-port "/data")
+                                           '((headers . (("Authorization"
+                                                          . "Bearer tk2"))))))))))))))
 
       ;; ---- injection guard: a quote in the data path is rejected ----
       (check "quote-in-path-rejected"

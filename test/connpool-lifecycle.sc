@@ -1161,15 +1161,15 @@
 
     ;; ---- the stats timeout raises a structured error, not a bare symbol
     ;; A pool that never answers #(pool-stats ...) leaves connpool-stats
-    ;; on its 5s deadline. What that deadline raises is part of the
-    ;; library's error surface. Not because a guard cannot match a bare
-    ;; symbol -- eq? does that fine -- but because a symbol carries one
-    ;; name and nothing else: no reason to branch on, no context to
-    ;; report, and the name is not even ours alone, since symbols are
-    ;; interned and a caller raising the same spelling for its own
-    ;; control flow raises the very same object. This cell waits the
-    ;; full deadline -- the cost of pinning the shape of a timeout is
-    ;; one timeout.
+    ;; on its 5s deadline. The raise has two things to say -- which
+    ;; failure, and which pool -- and a symbol is one value; the vector
+    ;; carries both, in the same shape as #(durable-error op path) and
+    ;; #(dpool-error reason id). That is all these cells hold it to:
+    ;; the shape does not establish provenance (anyone can raise a
+    ;; vector with this tag) and is not the whole of this function's
+    ;; error surface (the not-a-pool report below is a condition).
+    ;; This cell waits the full deadline -- the cost of pinning the
+    ;; shape of a timeout is one timeout.
     (let ((deaf (spawn (lambda () (receive (`#(never-sent) 'ok))))))
       (let ((caught (guard (e (#t e))
                       (connpool-stats deaf)
@@ -1201,6 +1201,14 @@
                     (= (vector-length caught) 3)
                     (let ((slot (vector-ref caught 2)))
                       (or (fixnum? slot) (string? slot)))))
+        ;; ...and it is THIS pool's id, not any scalar. "Which pool" is
+        ;; the slot's entire reason to exist: a constant, or another
+        ;; pool's id, satisfies scalar-ness and write-safety while
+        ;; telling the operator to go look at the wrong pool.
+        (check "the context slot names the pool that went silent"
+               (and (vector? caught)
+                    (= (vector-length caught) 3)
+                    (equal? (vector-ref caught 2) (process-id deaf))))
         (check "the raised error survives being written"
                (and (vector? caught)
                     (string? (call-with-string-output-port
