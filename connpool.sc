@@ -953,7 +953,8 @@
       ;; STRUCTURED, NOT A BARE SYMBOL. Not because a symbol is hard to
       ;; catch -- eq? picks one out exactly -- but because this raise has
       ;; two things to say and a symbol is one value: WHICH failure it
-      ;; was, and WHICH pool it was. Slots 1 and 2 carry them, the way
+      ;; was, and WHICH PROCESS did not answer. Slots 1 and 2 carry them,
+      ;; the way
       ;; #(durable-error op path) and #(dpool-error reason id) do.
       ;;
       ;; Two things it does NOT do, both of which have been claimed here
@@ -974,9 +975,13 @@
       ;;
       ;; What the id names, and where. Within one runtime it is exact:
       ;; the counter only goes up and ids are never reused, so nothing
-      ;; else alive here answers to it. Across runtimes it names nothing
-      ;; -- pid-counter starts at 0 in every process -- so a `7' in an
-      ;; aggregated log is a pool on some node, not a pool.
+      ;; else alive here answers to it. That is all it is. It does not
+      ;; say the process was a pool -- this procedure sends to whatever
+      ;; it was handed and a plain actor that ignores `pool-stats' times
+      ;; out the same way -- nor that it is still alive. And across
+      ;; runtimes it names nothing at all: pid-counter starts at 0 in
+      ;; every process, so a `7' in an aggregated log distinguishes
+      ;; nothing without the node it came from.
       ;;
       ;; Conditions are exempt and may carry the process itself, as the
       ;; `not a pool' report below does: `write` on a condition gives
