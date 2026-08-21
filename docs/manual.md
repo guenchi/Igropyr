@@ -2198,8 +2198,9 @@ not as a conservation law.
 
 ### Taking a node out of rotation
 
-Two questions, both answered locally — nothing here crosses a link or changes
-a frame, so a mesh can run any mixture of versions while you use them.
+Answered locally — nothing here crosses a link or changes a frame, so a mesh
+can run any mixture of versions while you use them. Two of the three ask
+something; `conversation-quiesce!` is the one that does something.
 
 - `(conversation-census)` → alist of `running`, `parked`, `lingering` and
   `total`. `running` is executing a step, `parked` is waiting in `suspend!`
@@ -2499,7 +2500,7 @@ concurrency.
 
 ## Authentication
 
-Authentication lives in its own library, `(igropyr auth)`. It is the *authentication role* layer — credential-format neutral — and it spans **both channels**: HTTP routes (via middleware) and WebSocket routes (via an upgrade guard checked before the handshake). Token *formats* live elsewhere; `(igropyr jwt)` is one such format today.
+Authentication lives in its own library, `(igropyr auth)`. It is the *authentication role* layer — credential-format neutral — and it covers every channel that takes a request: HTTP routes (via middleware), WebSocket routes (via an upgrade guard checked before the handshake) and sexpr RPC endpoints (via a guard on `app-rpc`). They are separate doors; guarding one is not guarding another. Token *formats* live elsewhere; `(igropyr jwt)` is one such format today.
 
 ```scheme
 (import (igropyr auth) (igropyr jwt))
@@ -3438,14 +3439,14 @@ This subsection is for authors building a **third** SQL driver; applications nev
 
 `(igropyr mysql)`, `(igropyr postgresql)` and `(igropyr qjspool)` sit on one shared engine, `(igropyr connpool)`. It owns the whole pool architecture — a fixed pool of connections behind a dispatcher, whole-connection leases, and monitor-based crash reclaim — while staying **protocol-blind**: the wire protocol, authentication and result parsing stay in each driver. Keeping it a single copy means a fix to a subtle race (checkout-cancel, reclaim of a borrower killed mid-lease, adoption of a worker that finished connecting after its pool is gone, refusing to re-lend a connection already on its way out) can never land in one driver but not the others.
 
-It was written for the two SQL drivers and was called `sqlpool`. What it models is both narrower than SQL and wider: a scarce **exclusive** resource whose work happens on the far side of a socket, borrowed for the length of one request. Adding the render pool as a third driver needed exactly one generalization — the deadlines moved from module constants into the per-driver config, because a minute is right for a database and wrong for a render — and nothing else.
+It was written for the two SQL drivers and was called `sqlpool`. What it models is both narrower than SQL and wider: a scarce **exclusive** resource whose work happens on the far side of a socket, borrowed for the length of one request. Adding the render pool as a third driver generalized it twice. The deadlines moved from module constants into the per-driver config, because a minute is right for a database and wrong for a render. And `connpool-lease` grew `broken-on-escape?`: when the borrowed procedure leaves non-locally, a SQL driver can hand the connection back clean, but a render that timed out may still be running on the far side, so the connection has to be treated as broken instead. `(igropyr qjspool)` passes `#t`. A fourth driver whose work can outlive the caller's deadline needs that argument; returning such a connection clean lets the next request share it with one still executing.
 
 Exports:
 
 - `make-connpool-cfg` — build the per-driver config record (once per driver): the driver's error *values* for lost / closed / query-timeout / checkout-timeout events, a predicate that recognizes an error reply, the `BEGIN` statement (`"BEGIN"` / `"START TRANSACTION"`), and optionally the query and checkout deadlines (both default to 60 s).
 - `connpool-loop` — the dispatcher loop: `(connpool-loop n spawn-conn! cfg)`, a fixed pool of `n` connection workers.
 - `connpool-call` — run one request on a connection or a pool.
-- `sql-transaction` / `connpool-lease` — borrow a whole connection (with or without a transaction), with guaranteed return.
+- `sql-transaction` / `connpool-lease` — borrow a whole connection (with or without a transaction), with guaranteed return. `connpool-lease` takes an optional `broken-on-escape?`: when `proc` leaves non-locally, `#f` (the default) returns the connection to the pool and `#t` retires it. Pass `#t` when the work can still be running on the far side after the caller has given up.
 - `connpool-close!` — close a pool or a lone connection.
 - `connpool-check-size!` — reject a bad pool size where the caller wrote it, rather than inside a pool that then answers nothing.
 - `connpool-drain-stale!` / `connpool-stats` — recycle idle connections; read pool counters.
