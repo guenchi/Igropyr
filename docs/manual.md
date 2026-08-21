@@ -2427,11 +2427,18 @@ then takes the Nth entry from the right, which is the last hop your own
 infrastructure wrote and the client cannot reach. With no proxy, leave it out
 and the peer address is used, which cannot be forged.
 
-If you do pass `key`, what reaches the middleware has to be an actual
-procedure — quasiquote it, or build the pair with `list`/`cons`. Writing the
-lambda inside a plain `'(...)` gives the *list* `(lambda (req) …)` instead, and
-nothing refuses it: `max` and `window` still take effect, and the first request
-calls a list as a procedure. When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
+If you do pass `key`, the value that arrives has to be the procedure itself:
+
+```scheme
+(app-use app (rate-limit `((max . 100) (key . ,my-key-fn))))   ; note the comma
+```
+
+Without that unquote — inside a plain `'(...)`, or a quasiquote you forgot to
+unquote — the value is the *list* `(lambda (req) …)`, and nothing refuses it:
+`rate-limit` does not check `key`, and `app-use` only checks that `rate-limit`
+returned a procedure. The failure arrives with the first request, where the key
+is computed before anything else in the middleware runs — so the limiter does
+not fall back to a default, it does nothing at all and the request errors. When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
 
 ### Error Handler
 
