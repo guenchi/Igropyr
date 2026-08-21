@@ -2460,8 +2460,10 @@ Catch unhandled exceptions and respond with a nice error page:
                                      ((condition? e)
                                       (with-output-to-string
                                         (lambda () (display-condition e))))
-                                     ((and (vector? e) (fx> (vector-length e) 0))
-                                      (format "~s" (vector-ref e 0)))
+                                     ((and (vector? e)
+                                           (fx> (vector-length e) 0)
+                                           (symbol? (vector-ref e 0)))
+                                      (symbol->string (vector-ref e 0)))
                                      (else "unrecognized raise"))))))))))
 ```
 
@@ -2469,11 +2471,18 @@ Without a handler of your own, an uncaught exception becomes HTTP 500 with a
 JSON body naming nothing. Adding detail is a development choice and belongs in
 a handler you write, which is also where you decide what is safe to send.
 
-**Take the tag, not the value.** A raised vector can hold a live process — a
-`gen-server` timeout carries the caller's own message, which is how a request
-names its replier — and `write` on such a value walks a cycle and takes the
-runtime down. The tag in slot 0 is the part the framework promises and the
-part that is safe to print.
+**Only before the response has started.** Once `res-begin!` has put the status
+line on the wire there is no 500 left to send, so this middleware aborts the
+connection instead and neither the default response nor your `handler` runs at
+all. A truncated stream is how HTTP says a response was cut short.
+
+**Take the tag, and check that it is one.** A raised vector can hold a live
+process — a `gen-server` timeout carries the caller's own message, and a
+message is how a request names its replier — and printing such a value walks a
+cycle and takes the runtime down. Slot 0 is the tag for the framework's own
+structured raises, and that promise does not extend to whatever an application
+raises, so the test above is `symbol?` and anything else falls through to a
+constant.
 
 ### Auth
 
