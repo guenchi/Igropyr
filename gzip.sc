@@ -212,8 +212,10 @@
   ;; the kernel copies from the address and reports EFAULT instead of
   ;; faulting the process, which covers unmapped pages and PROT_NONE
   ;; mappings alike -- mincore cannot (it reports existence, not
-  ;; readability), and a /dev/null fd cannot either (its driver never
-  ;; reads the buffer and reports success for any address; verified).
+  ;; readability), and a /dev/null fd cannot either: its driver never
+  ;; reads the buffer, so write(2) to it reports success for any
+  ;; address, mapped or not. (To re-check, write to /dev/null from an
+  ;; address the process never mapped and observe the byte count.)
   ;; The probe only runs on FreeBSD, and pipe2 is only resolved there;
   ;; the guard turns a host whose libc lacks the symbol (releases
   ;; before 10) into pipe2* = #f, which fails the probe below and

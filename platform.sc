@@ -58,9 +58,16 @@
         (else (loop (cdr xs))))))
 
   ;; LP64 struct addrinfo layouts differ in the ordering of ai_addr and
-  ;; ai_canonname. macOS and FreeBSD (BSD tradition -- verified against
-  ;; FreeBSD netdb.h) put ai_canonname first, so ai_addr sits at 32;
-  ;; Linux orders ai_addr first, at 24. ai_next is at 40 on all three.
+  ;; ai_canonname. macOS and FreeBSD put ai_canonname first, so ai_addr
+  ;; sits at 32; Linux orders ai_addr first, at 24. ai_next is at 40 on
+  ;; all three.
+  ;;
+  ;; NOTHING CHECKS THIS AT RUN TIME. A wrong offset here hands the
+  ;; resolver whatever those bytes happen to be, which is a pointer-
+  ;; shaped value that is not the address. The numbers came from the
+  ;; platforms' own netdb.h; to re-check one, print
+  ;; offsetof(struct addrinfo, ai_addr) and ai_next from C on that
+  ;; target rather than trusting this comment.
   (define addrinfo-address-offset
     (case platform-os ((macos freebsd) 32) ((linux) 24) (else 0)))
   (define addrinfo-next-offset 40)
