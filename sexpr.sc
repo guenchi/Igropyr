@@ -39,7 +39,12 @@
 ;;; The strict mode is untouched: it stays the HTTP-facing and
 ;;; Goeteia-compatible format, and still rejects all three.
 ;;;
-;;; Interop notes (verified against Goeteia's reader/writer): strings
+;;; Interop notes. These describe what Goeteia's reader/writer do; what
+;;; the tree checks is conformance TO THIS implementation --
+;;; test/sexpr-vectors.json names (igropyr sexpr) as the authority and
+;;; the commit it was generated from, and the other side is regenerated
+;;; against it. Two independent implementations agreeing is a different
+;;; claim and is not the one being made. Strings
 ;;; escape only \" and \\ on the wire -- a literal newline inside a
 ;;; string is legal; \n \t \r are also accepted when reading.
 

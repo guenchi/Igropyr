@@ -1355,8 +1355,10 @@ is a drop-in replacement.
 
 Profile-guided optimization (`build-profile.ss` to instrument,
 `/admin/profdump` to collect after driving load, `build-pgo.ss` to
-recompile with the profile) is available but **measured no improvement
-here** — for an I/O-bound server whose per-request cost is syscalls,
+recompile with the profile) is available but **made no measurable
+difference to keep-alive throughput on the machine quoted above**, which
+is the only thing that was measured — for an I/O-bound server whose
+per-request cost is syscalls,
 message passing, and scheduling, there is no hot/cold branch structure
 for PGO to reorder, and whole-program already inlines across libraries.
 Keep it in mind only if you add branch-heavy CPU-bound handlers.
