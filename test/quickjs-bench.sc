@@ -8,8 +8,8 @@
 ;;; FROM THIS TREE. Those numbers were taken when this library still
 ;;; carried the ref_count replica that made bellard's libquickjs
 ;;; loadable; that machinery was deliberately deleted, and pointing
-;;; IGROPYR_LIBQUICKJS_SO at a bellard build is now refused at boot,
-;;; before any benchmark runs. Re-measuring that column would mean
+;;; IGROPYR_LIBQUICKJS_SO at a bellard build, loaded on its own, is
+;;; refused at boot before any benchmark runs. Re-measuring that column would mean
 ;;; resurrecting the replica in a scratch tree.
 ;;;
 ;;; It separates two effects a single end-to-end figure conflates:

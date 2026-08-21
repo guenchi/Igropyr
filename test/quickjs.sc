@@ -7,10 +7,12 @@
 ;;; and the memory cap (an allocation bomb -> in-JS OOM, not process death).
 ;;; A perf probe reports the interrupt-handler's per-call overhead.
 ;;;
-;;; Needs a shared QuickJS engine library -- quickjs-ng's libqjs is the
-;;; one that binds: set IGROPYR_LIBQUICKJS_SO or install it on a standard
-;;; path. Skips cleanly (exit 0) when absent, so run-all stays green on
-;;; hosts without QuickJS.
+;;; Needs a shared QuickJS engine library that resolves JS_FreeValue --
+;;; install quickjs-ng (libqjs), or anything exporting the same
+;;; interface; bellard's build, loaded on its own, is refused. Set
+;;; IGROPYR_LIBQUICKJS_SO or install on a standard path. Skips cleanly
+;;; (exit 0) when absent, so run-all stays green on hosts without
+;;; QuickJS.
 
 (import (chezscheme) (igropyr quickjs))
 

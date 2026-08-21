@@ -12,8 +12,9 @@
         (only (igropyr redis) redis-connect redis redis-close!))
 
 ;; (igropyr quickjs) is the pure-Scheme binding: it needs a shared
-;; QuickJS engine library -- quickjs-ng's libqjs is the one that binds.
-;; Gate on that so run-all stays green on hosts without QuickJS.
+;; QuickJS engine library that resolves JS_FreeValue -- quickjs-ng's
+;; libqjs, or anything exporting the same interface. Gate on that so
+;; run-all stays green on hosts without QuickJS.
 (define (quickjs-present?)
   (or (let ((e (getenv "IGROPYR_LIBQUICKJS_SO"))) (and e (> (string-length e) 0) (file-exists? e)))
       (file-exists? "libquickjs.dylib") (file-exists? "libquickjs.so")

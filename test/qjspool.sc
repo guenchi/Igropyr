@@ -162,8 +162,9 @@
       (else (scan (cdr ls))))))
 
 ;; (igropyr quickjs) is the pure-Scheme binding: it needs a shared
-;; QuickJS engine library -- quickjs-ng's libqjs is the one that binds.
-;; Gate on that so run-all stays green on hosts without QuickJS.
+;; QuickJS engine library that resolves JS_FreeValue -- quickjs-ng's
+;; libqjs, or anything exporting the same interface. Gate on that so
+;; run-all stays green on hosts without QuickJS.
 (define (quickjs-present?)
   (or (let ((e (getenv "IGROPYR_LIBQUICKJS_SO"))) (and e (> (string-length e) 0) (file-exists? e)))
       (file-exists? "libquickjs.dylib") (file-exists? "libquickjs.so")
@@ -277,6 +278,29 @@ function eat(j){ return String(j.length); }
 ;; bad bundle, a port in use -- was printed THERE, and dropping it left
 ;; only "never came up", which reads like a suite defect
 (define (err-file name) (string-append "/tmp/igropyr-qjsw-" name ".err"))
+
+;; surface a dead worker's own stderr, then the wrong-engine hint. Every
+;; place that gives up on a worker calls this -- the first version lived
+;; only inside require-worker!, and the good/bound paths, which call
+;; await-worker! directly, kept reporting a bare "never came up". The
+;; header prints only when there ARE bytes: an empty .err presenting an
+;; empty explanation slot reads as "explained", worse than absent.
+;; (get-string-all answers eof, not "", on an empty file; both shapes
+;; are guarded.) A missing trailing newline is supplied so the hint
+;; lines do not glue onto the worker's last line.
+(define (explain-dead-worker! name)
+  (let ((ef (err-file name)))
+    (when (file-exists? ef)
+      (let ((text (call-with-input-file ef
+                    (lambda (p) (get-string-all p)))))
+        (when (and (string? text) (> (string-length text) 0))
+          (display "  [info] the worker's own stderr said:\n")
+          (display text)
+          (unless (char=? (string-ref text (- (string-length text) 1))
+                          #\newline)
+            (newline))))))
+  (display "  (a bellard libquickjs boots only far enough to be refused;\n")
+  (display "   install quickjs-ng -- libqjs -- or set IGROPYR_LIBQUICKJS_SO)\n"))
 
 (define (trace-lines name)
   (let ((p (trace-file name)))
@@ -445,8 +469,12 @@ function eat(j){ return String(j.length); }
             "kill -9 $(cat " (pid-file name) " 2>/dev/null) 2>/dev/null;"
             ;; the trace outlives the worker on purpose: it is what a
             ;; failing probe is read against afterwards, and spawn-worker!
-            ;; truncates it at the start of the next run
-            " rm -f " (pid-file name))))
+            ;; truncates it at the start of the next run. The .err does
+            ;; NOT outlive: its one reader is the failure report, which
+            ;; has already run by the time anyone kills the worker --
+            ;; leaving it behind litters /tmp with a file per worker name
+            ;; per interrupted run.
+            " rm -f " (pid-file name) " " (err-file name))))
 
 ;; Poll until the worker answers a render, rather than sleeping a guessed
 ;; interval: process start-up time is not a constant worth guessing at.
@@ -486,17 +514,7 @@ function eat(j){ return String(j.length); }
          #t)
       (else
         (fail (string-append "the " label " worker never came up") port)
-        ;; the reason was printed on the worker's stderr; surface it, so
-        ;; a wrong engine does not read as a suite defect
-        (let ((ef (err-file label)))
-          (when (file-exists? ef)
-            (let ((text (call-with-input-file ef
-                          (lambda (p) (get-string-all p)))))
-              (when (string? text)
-                (display "  [info] the worker's own stderr said:\n")
-                (display text)))))
-        (display "  (a bellard libquickjs boots only far enough to be refused;\n")
-        (display "   install quickjs-ng -- libqjs -- or set IGROPYR_LIBQUICKJS_SO)\n")
+        (explain-dead-worker! label)
         #f))))
 
 (start-scheduler
@@ -548,7 +566,8 @@ function eat(j){ return String(j.length); }
       (if (not probe)
           ;; ...but do not also blame the good worker for somebody else
           (when (and carry-up half-up spin-up)
-            (fail "the worker process never came up" good-port))
+            (fail "the worker process never came up" good-port)
+            (explain-dead-worker! "good"))
           (begin
             ;; readiness only, like the other three: the cases below open
             ;; their own pools, so holding this one just leaves a
@@ -1979,7 +1998,9 @@ function eat(j){ return String(j.length); }
       (kill-worker! "bound")
       (spawn-worker! "bound" bound-port 800)
       (if (not (await-worker! bound-port 50))
-          (fail "the boundary worker never came up")
+          (begin
+            (fail "the boundary worker never came up")
+            (explain-dead-worker! "bound"))
           (let ((pool (qjspool (list (cons "127.0.0.1" bound-port))
                                '((size . 1) (render-timeout-ms . 2000)))))
             (define (stat3)
