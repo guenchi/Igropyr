@@ -2427,10 +2427,11 @@ then takes the Nth entry from the right, which is the last hop your own
 infrastructure wrote and the client cannot reach. With no proxy, leave it out
 and the peer address is used, which cannot be forged.
 
-If you do pass `key`, it must be a procedure, so the alist has to be
-quasiquoted: under a plain `'(...)` the value is the *list* `(lambda (req) …)`,
-which is not refused — `max` and `window` still take effect, and the first
-request calls a list as a procedure. When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
+If you do pass `key`, what reaches the middleware has to be an actual
+procedure — quasiquote it, or build the pair with `list`/`cons`. Writing the
+lambda inside a plain `'(...)` gives the *list* `(lambda (req) …)` instead, and
+nothing refuses it: `max` and `window` still take effect, and the first request
+calls a list as a procedure. When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
 
 ### Error Handler
 
