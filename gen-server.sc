@@ -88,21 +88,31 @@
   (define summary-max-chars 200)
 
   ;; Take the body down to its budget FIRST, then frame it. The other
-  ;; order copies a megabyte-long name in full before any clip can see
-  ;; it -- which is the same mistake as printing a value to find out it
-  ;; was too big, one level down. (One copy of the name is still taken,
-  ;; by symbol->string; that is a string the caller already interned, not
-  ;; something generated from it.)
+  ;; order builds a megabyte-long label before any clip can see it --
+  ;; the same mistake as printing a value to find out it was too big,
+  ;; one level down. (symbol->string is not a copy: Chez hands back the
+  ;; name that is already there, at no allocation.)
+  ;;
+  ;; The result is at most summary-max-chars for ANY arguments, not only
+  ;; the four call sites below. Their frames are ten characters at most,
+  ;; so none of them can reach the branch that drops the body -- which is
+  ;; exactly why it is here: the next caller should not have to know that
+  ;; prefix and suffix must leave room.
   (define (framed prefix body suffix)
-    (let ((room (- summary-max-chars
-                   (string-length prefix) (string-length suffix)))
-          (n (string-length body)))
-      (string-append
-        prefix
-        (if (<= n room)
-            body
-            (string-append (substring body 0 (max 0 (- room 3))) "..."))
-        suffix)))
+    (let* ((frame (+ (string-length prefix) (string-length suffix)))
+           (room (- summary-max-chars frame)))
+      (if (< room 4)
+          (let ((bare (string-append prefix suffix)))
+            (if (> (string-length bare) summary-max-chars)
+                (string-append (substring bare 0 (- summary-max-chars 3)) "...")
+                bare))
+          (let ((n (string-length body)))
+            (string-append
+              prefix
+              (if (<= n room)
+                  body
+                  (string-append (substring body 0 (- room 3)) "..."))
+              suffix)))))
 
   ;; one bounded label, built without printing anything
   (define (label-of x)
