@@ -17,7 +17,7 @@
 ;;; boundary -- and it ran three times per boot, on every boot, including
 ;;; each crash-only rebuild.
 ;;;
-;;; Pinning the upstream deletes that machinery instead of guarding it: with
+;;; Requiring the export deletes that machinery instead of guarding it: with
 ;;; the offset gone there is nothing to discover and nothing reads outside an
 ;;; object. A build without the symbol is refused at boot with a clear
 ;;; message rather than silently taking a different path. Releasing a value
@@ -25,7 +25,7 @@
 ;;;
 ;;; A C-shim binding with the SAME exports lives at
 ;;;   https://github.com/guenchi/igropyr-quickjs
-;;; -- a drop-in replacement to use when a stock libquickjs is awkward to
+;;; -- a drop-in replacement to use when a stock shared library is awkward to
 ;;; obtain (e.g. Homebrew ships only a static archive) or when you want a
 ;;; self-contained, version-pinned artifact.
 ;;;
@@ -39,8 +39,8 @@
 ;;; Why this exists: the by-value JSValue ABI and the refcount teardown are
 ;;; the tricky parts of embedding QuickJS from Scheme; both are handled here
 ;;; (a JSValue is a 16-byte {u,tag} struct passed via (& ftype); releasing one
-;;; is a single call to the exported JS_FreeValue, which is the reason
-;;; quickjs-ng is required rather than preferred).
+;;; is a single call to the exported JS_FreeValue, which is what bind!
+;;; insists on).
 ;;;
 ;;; Hardening (in-Scheme substitutes for the C shim's guards):
 ;;;   - JS_SetMemoryLimit  : allocation past the cap -> in-JS OOM exception.
@@ -170,8 +170,16 @@
       ;; Requiring the exported symbol deletes that machinery rather than
       ;; guarding it: there is no offset to find, so nothing reads outside an
       ;; object. The cost is bellard/quickjs support, paid deliberately --
-      ;; a pinned upstream in exchange for no undefined behaviour at all.
+      ;; a narrower set of usable builds in exchange for deleting that
+      ;; out-of-bounds read.
       ;; Refuse loudly here rather than silently taking a different path.
+      ;; NOTE WHAT THIS ASKS. foreign-entry? resolves in the PROCESS's
+      ;; global symbol namespace, not in the library just loaded -- the
+      ;; same namespace whose hazards the candidate-order comment above
+      ;; describes. In a process that has loaded no other QuickJS it is
+      ;; the library just loaded that must export the symbol; in one that
+      ;; has, this passes on someone else's export and the mixed-ABI risk
+      ;; up there is live.
       (unless (foreign-entry? "JS_FreeValue")
         (assertion-violation 'qjs-boot!
           (string-append
@@ -223,9 +231,11 @@
       cb))
 
   ;; ---- release a JSValue: one call to the exported JS_FreeValue. On the
-  ;; successful call path that is three -- function, argument, result; the
-  ;; global is borrowed from g-cache and never freed. An error path frees
-  ;; whatever it got as far as. -------------------------------------------
+  ;; successful call path that is three -- function, argument, result. The
+  ;; global is borrowed from g-cache, so no call frees it; boot-locked!
+  ;; releases it once per (re)boot when it re-reads it. Error paths free
+  ;; the owned references they reached; some carry immediates such as
+  ;; JS_EXCEPTION, which need none. ----------------------------------------
   ;; That export owns the whole operation, including the has-ref-count test,
   ;; so hand it the value as is. The decrement still dereferences the object
   ;; pointer -- inside the library, where it belongs; what is gone is Scheme
@@ -290,7 +300,7 @@
     (set! ctx (let ((p (_new-context rt))) (and (not (eqv? p 0)) p)))
     (unless ctx (teardown!) (error 'qjs-boot! "JS_NewContext failed"))
     (_update-stack rt)
-    (validate-abi!)                       ; refuse a build whose JSValue layout differs
+    (validate-abi!)                       ; tag must read JS_TAG_OBJECT here
     (arm-deadline! 10)                    ; bundle parse gets 10x the call budget
     (_eval r-buf ctx bundle-bytes (- (bytevector-length bundle-bytes) 1) "<bundle>" 0)
     ;; NOTE: the deadline stays ARMED past _eval -- read-exception below

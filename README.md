@@ -713,15 +713,15 @@ counts rebuilds), so one bad call can't poison the next. The engine is
 serialized on the single OS thread and each call runs with interrupts
 disabled, so a call blocks the scheduler for its duration (sub-millisecond
 typically, `timeout-ms` worst case) — cap input size on latency-sensitive
-paths. `qjs-boot!` reports if no library is found, and refuses one that
-does not export `JS_FreeValue` as a real function -- which is what
-bellard's `libquickjs` does not, so it will not start on that. Point it at
-a library with `IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
+paths. `qjs-boot!` reports if no library is found, and refuses to bind
+unless `JS_FreeValue` resolves as a real function -- which bellard's
+`libquickjs` does not export, so it will not start on that. Point it at a
+library with `IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
 
 A **C-shim binding with identical exports** — self-contained, with QuickJS
 statically linked and version-pinned — is a drop-in fallback at
 [guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs),
-for when a stock libquickjs is awkward to obtain (e.g. Homebrew ships only a
+for when a stock shared library is awkward to obtain (e.g. Homebrew ships only a
 static archive).
 
 ## Cached SSR
@@ -1352,7 +1352,7 @@ point `IGROPYR_LIBQUICKJS_SO` / `(so-path . "...")` at one; bellard's
 BLAS for `(igropyr blas)`'s fast lane and OpenSSL for `(igropyr tls)`.
 Each degrades without its library — blas to the pure loop, tls/quickjs
 to a clear error — so this only bites the capability that needs it. When
-a stock libquickjs is awkward to obtain, the self-contained C-shim
+a stock shared library is awkward to obtain, the self-contained C-shim
 binding at [guenchi/igropyr-quickjs](https://github.com/guenchi/igropyr-quickjs)
 is a drop-in replacement.
 
