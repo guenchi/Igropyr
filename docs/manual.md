@@ -4810,8 +4810,10 @@ directly through the FFI — no custom C. Install quickjs-ng (`libqjs`); the
 gate is described below. Two of `qjs-boot!`'s checks are about the
 engine, as opposed to its arguments or the load itself. `JS_FreeValue`
 must resolve as a real function — in the process's global symbol
-namespace, which in a process that has loaded no other QuickJS means the
-library just loaded. And the global object's tag,
+namespace, so the question is whether that name is visible at all, by
+whoever made it so. If nothing else has, it is the library just loaded;
+if an ng loaded earlier, a shim, or any DSO exporting that name already
+has, the check passes on that one's export. And the global object's tag,
 read through this binding's `JSValue` ftype, must come back as
 `JS_TAG_OBJECT` — which catches a NaN-boxed or re-ordered layout, though
 not one that happens to put an object tag at the same place; that check
