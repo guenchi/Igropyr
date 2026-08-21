@@ -964,7 +964,7 @@
   ;; earlier, timed-out attempt -- then waits for adoption and serves
   ;; queries (notifying `notify` when idle). Every failure path closes the
   ;; socket: the uv handle is freed only by tcp-close!, so skipping it
-  ;; (e.g. on a failed auth, retried every second by a pool) would leak
+  ;; (e.g. on a failed auth, retried on a backoff by a pool) would leak
   ;; one fd per attempt until the process runs out.
   (define (start-connection host port user password db opts notify report-to ref)
     (spawn
@@ -1019,12 +1019,18 @@
     (values (if (and (pair? rest) (car rest)) (car rest) user)
             (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) '())))
 
-  ;; Without 'allow-cleartext-auth, SCRAM is the only auth this client
-  ;; can complete, so a password SCRAM must reject is statically doomed:
-  ;; fail HERE, in the caller. Inside a pool the connect worker's failure
-  ;; is invisible -- the pool retries every second and callers see only
-  ;; checkout timeouts. (scram-auth! keeps its own check as the backstop
-  ;; for the cleartext-opted case where the server picks SCRAM anyway.)
+  ;; Without 'allow-cleartext-auth, SCRAM is the only auth this client can
+  ;; complete that USES the password, so a password SCRAM must reject is
+  ;; statically doomed: fail HERE, in the caller. Inside a pool the connect
+  ;; worker's failure is invisible -- the pool retries on a backoff and the
+  ;; caller sees a timeout with nothing in it about the password.
+  ;; (scram-auth! keeps its own check as the backstop for the cleartext-
+  ;; opted case where the server picks SCRAM anyway.)
+  ;;
+  ;; THIS RUNS WHETHER OR NOT THE SERVER WILL ASK. A server on `trust'
+  ;; answers AuthenticationOk without looking at the password, and this
+  ;; check still refuses the connect. Say so rather than let the sentence
+  ;; above read as `this client can only do SCRAM'.
   (define (check-password! who password opts)
     (unless (or (scram-safe-password? password)
                 (assq-ref opts 'allow-cleartext-auth))

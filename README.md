@@ -52,11 +52,14 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   (file uploads included); `req-cookie` / `set-cookie!`
 - **Middleware suite** — cookie sessions (gen-server store, CSPRNG sids),
   CORS with preflight, security headers, and an access logger
-- **Authentication** — `(igropyr auth)` is the format-neutral *auth role*,
-  spanning both channels: the `auth` middleware guards HTTP routes with a
-  `Bearer` token (any verifier — `(jwt-verifier key)` today — 401
-  otherwise), and `token-guard` / `session-guard` guard WebSocket upgrades
-  before the handshake. `session-guard` takes an `origins` allow-list:
+- **Authentication** — `(igropyr auth)` is the format-neutral *auth role*.
+  Every channel that takes a request is guarded by the same protocol: the
+  `auth` middleware guards HTTP routes with a `Bearer` token (any
+  verifier — `(jwt-verifier key)` today — 401 otherwise), `token-guard` /
+  `session-guard` guard WebSocket upgrades before the handshake, and
+  `app-rpc` takes a guard of that same shape. Defend one and you have not
+  defended the others; they are separate doors.
+  `session-guard` takes an `origins` allow-list:
   the same-origin policy does not cover WebSockets and the browser attaches
   the session cookie whatever page opened the socket, so that list is what
   keeps a hostile page from holding an authenticated session. Browser
@@ -515,8 +518,10 @@ invalid JSON) and `send-json!` serializes:
 
 ## OTP building blocks
 
-Beyond raw `spawn`/`send`/`receive`, three OTP-style libraries make
-stateful services and fan-out easy.
+Beyond raw `spawn`/`send`/`receive`, OTP-style building blocks make
+stateful services and fan-out easy. Two are libraries — `(igropyr
+gen-server)` and `(igropyr pubsub)` — and the process registry is not: it
+is `register` / `unregister` / `whereis` in `(igropyr actor)` itself.
 
 A `gen-server` is a stateful service reduced to callbacks; calls carry a
 unique tag and monitor the server, so a crash surfaces immediately

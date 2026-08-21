@@ -23,13 +23,13 @@
 ;;; out unchanged. A guard that must not let anything past needs a clause
 ;;; for conditions as well as for the vector.
 ;;;
-;;; Authentication: caching_sha2_password (MySQL 9's default plugin --
-;;; what a given server offers is the server's business, and any plugin
-;;; other than the two named here is refused as unsupported),
-;;; both paths: the SHA-256 scramble fast path, and the full path where
-;;; the server's RSA public key encrypts the password (OAEP) over a
-;;; plain connection. mysql_native_password is also supported for older
-;;; servers via auth-switch.
+;;; Authentication: what a server offers is the server's business and not
+;;; something this library can state. What this driver does is accept
+;;; caching_sha2_password and mysql_native_password, and refuse every other
+;;; plugin as unsupported -- at the initial handshake and at auth-switch
+;;; alike. caching_sha2_password is served by both of its paths: the
+;;; SHA-256 scramble fast path, and the full path where the server's RSA
+;;; public key encrypts the password (OAEP) over a plain connection.
 
 (library (igropyr mysql)
   (export mysql-connect mysql-pool mysql-query mysql-close! mysql-pool-stats
@@ -677,7 +677,7 @@
   ;; earlier, timed-out attempt -- then waits for adoption and serves
   ;; queries (notifying `notify` when idle). Every failure path closes
   ;; the socket: the uv handle is freed only by tcp-close!, so skipping
-  ;; it (e.g. on a failed auth, retried every second by a pool) would
+  ;; it (e.g. on a failed auth, retried on a backoff by a pool) would
   ;; leak one fd per attempt until the process runs out.
   (define (start-connection host port user password db opts notify report-to ref)
     (spawn
