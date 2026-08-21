@@ -167,22 +167,26 @@
       ;; verify) and the copy stays green. And a SHAPE check on the
       ;; extracted expression is a proxy: every three-argument procedure
       ;; has app-use arity, including (lambda (req res next) (next)) --
-      ;; an unconditional pass. So the example's auth expression is not
-      ;; measured, it is MOUNTED -- twice. One listener gets a verify
-      ;; that accepts the good token; a second gets the SAME extracted
-      ;; expression with a verify that accepts nothing, and both
-      ;; receive the SAME request sequence. The differential is the
-      ;; judge: the same token answered 200 on one and 401 on the other
-      ;; is a verdict that varies with nothing but the injected
-      ;; verify's answer. An implementation that ignores verify --
-      ;; whether it keys on value, format, call order or mutable state
-      ;; -- evolves identically under identical sequences and answers
-      ;; both listeners alike, failing one side. (Each weaker probe
-      ;; earned its keep the hard way: value-keyed acceptors passed the
-      ;; single-token version, format-keyed ones passed the minted
-      ;; version, and an order-keyed one passed the twins.) These are
-      ;; behaviour samples, not a proof of internals beyond what they
-      ;; measure. (What lands in req-claims is pinned in test/jwt.sc --
+      ;; an unconditional pass. So the expression is extracted once and
+      ;; put to five cells, each fixing its own direction and none
+      ;; speaking for another:
+      ;;   anchor       locates the one header example;
+      ;;   structural   the extracted datum IS (auth verify);
+      ;;   build        under the current bindings it constructs a
+      ;;                procedure;
+      ;;   three gates  that composition's refuse/admit behaviour in
+      ;;                the admin slot -- the whole mounted path: auth
+      ;;                building middleware, the verifier's answer
+      ;;                reaching it, admin-listen installing it,
+      ;;                requests landing as 401/200;
+      ;;   differential the observed correlation between opposite
+      ;;                verify bindings and the good token's answer,
+      ;;                with its unisolated variables stated at the
+      ;;                cell -- bounded there, claimed nowhere else.
+      ;; (Each probe earned its place the hard way: value-keyed
+      ;; acceptors passed the single-token version, format-keyed ones
+      ;; passed the minted version, an order-keyed one passed the
+      ;; twins.) (What lands in req-claims is pinned in test/jwt.sc --
       ;; test/auth.sc's own header says the HTTP middleware is jwt.sc's
       ;; to cover -- and no dashboard route reads claims, so this
       ;; fixture cannot observe them.)
@@ -279,7 +283,11 @@
                 ;; that yields a procedure on the first evaluation and
                 ;; something else on the second would otherwise erase
                 ;; this whole arm with zero failures and zero skips --
-                ;; a bypass the suite's own summary cannot see.
+                ;; a bypass the suite's own summary cannot see. The
+                ;; cell covers the normal-return case; a second
+                ;; evaluation that raises or hangs never reaches it,
+                ;; and shows up as a loud nonzero exit instead of a
+                ;; registered failure.
                 (check "the differential arm builds a procedure"
                   (procedure? built2))
                 (when (procedure? built2)
