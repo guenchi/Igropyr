@@ -705,16 +705,18 @@ code:
 (qjs-call! "slugify" "Hello World")   ; -> "hello-world"
 ```
 
-It runs in **pure Scheme** over a stock shared `libquickjs`, bound directly
-through the FFI (no custom C): a memory cap, a stack cap, a wall-clock
+It runs in **pure Scheme** over a stock shared **quickjs-ng** (`libqjs`),
+bound directly through the FFI (no custom C): a memory cap, a stack cap, a wall-clock
 interrupt deadline, and **crash-only rebuild** — a throwing or runaway call
 discards the whole JS heap and reboots it from the bundle (`qjs-generation`
 counts rebuilds), so one bad call can't poison the next. The engine is
 serialized on the single OS thread and each call runs with interrupts
 disabled, so a call blocks the scheduler for its duration (sub-millisecond
 typically, `timeout-ms` worst case) — cap input size on latency-sensitive
-paths. `qjs-boot!` reports if no libquickjs is found; point it at one with
-`IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
+paths. `qjs-boot!` reports if no library is found, and refuses one that
+does not export `JS_FreeValue` as a real function -- which is what
+bellard's `libquickjs` does not, so it will not start on that. Point it at
+a library with `IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
 
 A **C-shim binding with identical exports** — self-contained, with QuickJS
 statically linked and version-pinned — is a drop-in fallback at
@@ -1344,8 +1346,9 @@ Re-run the build after editing any source. Interrupt traps stay enabled
 
 Native libraries are `dlopen`ed at runtime, not folded into `app.so` —
 compiling a library only compiles its Scheme. So if the app uses
-`(igropyr quickjs)`, make a stock `libquickjs` resolvable (or point
-`IGROPYR_LIBQUICKJS_SO` / `(so-path . "...")` at one); likewise a native
+`(igropyr quickjs)`, make a stock quickjs-ng (`libqjs`) resolvable (or
+point `IGROPYR_LIBQUICKJS_SO` / `(so-path . "...")` at one; bellard's
+`libquickjs` is refused at boot); likewise a native
 BLAS for `(igropyr blas)`'s fast lane and OpenSSL for `(igropyr tls)`.
 Each degrades without its library — blas to the pure loop, tls/quickjs
 to a clear error — so this only bites the capability that needs it. When

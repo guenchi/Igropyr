@@ -214,8 +214,11 @@
   ;; mappings alike -- mincore cannot (it reports existence, not
   ;; readability), and a /dev/null fd cannot either: its driver never
   ;; reads the buffer, so write(2) to it reports success for any
-  ;; address, mapped or not. (To re-check, write to /dev/null from an
-  ;; address the process never mapped and observe the byte count.)
+  ;; address, mapped or not. (Reproduced on macOS -- a 1-byte write to
+  ;; /dev/null from address 1 returns 1. The probe itself runs only on
+  ;; FreeBSD, and nothing here records the same measurement there; if
+  ;; that kernel validates the address before the device sees it, this
+  ;; reasoning does not carry over.)
   ;; The probe only runs on FreeBSD, and pipe2 is only resolved there;
   ;; the guard turns a host whose libc lacks the symbol (releases
   ;; before 10) into pipe2* = #f, which fails the probe below and

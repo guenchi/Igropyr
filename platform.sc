@@ -62,12 +62,12 @@
   ;; sits at 32; Linux orders ai_addr first, at 24. ai_next is at 40 on
   ;; all three.
   ;;
-  ;; NOTHING CHECKS THIS AT RUN TIME. A wrong offset here hands the
-  ;; resolver whatever those bytes happen to be, which is a pointer-
-  ;; shaped value that is not the address. The numbers came from the
-  ;; platforms' own netdb.h; to re-check one, print
-  ;; offsetof(struct addrinfo, ai_addr) and ai_next from C on that
-  ;; target rather than trusting this comment.
+  ;; NOTHING CHECKS THIS AT RUN TIME. The addrinfo comes from the
+  ;; resolver; a wrong offset makes addrinfo->ipv4 read the wrong field
+  ;; of it -- ai_canonname, a null, whatever sits there -- and use that
+  ;; as a sockaddr*, which is a wrong address or a fault inside the FFI
+  ;; call. To check one, print offsetof(struct addrinfo, ai_addr) and
+  ;; ai_next from C on that target; this comment is not evidence.
   (define addrinfo-address-offset
     (case platform-os ((macos freebsd) 32) ((linux) 24) (else 0)))
   (define addrinfo-next-offset 40)

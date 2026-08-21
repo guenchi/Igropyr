@@ -220,11 +220,14 @@
       (lock-object cb)                    ; keep it pinned for the engine's life
       cb))
 
-  ;; ---- release a JSValue: one call to the exported JS_FreeValue. Needed
-  ;; for the per-call setup values (global, function, argument, result). -----
+  ;; ---- release a JSValue: one call to the exported JS_FreeValue. Three
+  ;; per call -- function, argument, result; the global is borrowed from
+  ;; g-cache and not freed. -------------------------------------------------
   ;; That export owns the whole operation, including the has-ref-count test,
-  ;; so hand it the value as is. Nothing here reads the object's memory --
-  ;; see bind! for why that matters.
+  ;; so hand it the value as is. The decrement still dereferences the object
+  ;; pointer -- inside the library, where it belongs; what is gone is Scheme
+  ;; computing an offset and reading there itself. See bind! for why that
+  ;; distinction is the whole point.
   (define (js-free! v) (_free-value ctx v))
 
   ;; read a JS string value's UTF-8 bytes into a fresh bytevector (via one
