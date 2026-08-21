@@ -25,10 +25,15 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   round; unset, the plain 500 remains
 - **Conversations (process-per-dialogue)** — a multi-request dialogue
   (wizard, booking, transfer) runs as one green process holding live
-  state — even an open database transaction — across rounds;
-  `suspend!` answers and parks, `conversation-resume!` continues, and
-  death for any reason (crash, TTL) means guaranteed rollback: a later
-  resume gets `gone`
+  state — even an open database transaction — across rounds; `suspend!`
+  answers and parks, `conversation-resume!` continues with a token
+  naming the reply it answers, so a repeat replays that answer instead
+  of taking a step nobody asked for. Failure speaks a protocol — six
+  outcomes, each naming its evidence and its remedy: the answer itself
+  when it finished, retry only on `gone` (the rollback provably ran),
+  the replay on `stale`, reconcile on `unknown` and `unreachable`, come
+  back later on `overloaded`. The record outlives the process, so a
+  restart does not turn history into `unknown`
 - **Hot code swapping** — replace the handler (or individual routes) on a
   live server: the listener, open connections and worker pool stay up,
   in-flight requests finish on the old code
