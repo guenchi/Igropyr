@@ -12,11 +12,13 @@
 ;;; failed reply that leaves the connection usable, an unknown function,
 ;;; pool statistics, and a render against a worker that is not there.
 ;;;
-;;; SHIM-GATED like test/quickjs.sc: skips when no QuickJS library FILE
-;;; is present, because the worker process cannot boot an engine without
-;;; one. Whether the found build binds is decided at worker boot: a
-;;; bellard libquickjs counts as present and, loaded on its own, fails
-;;; loudly there -- a wrong engine must not read as no engine.
+;;; SHIM-GATED like test/quickjs.sc: skips when no candidate path holds
+;;; a file, because the worker process cannot boot an engine without
+;;; one. The gate checks nothing beyond existence -- not that the file
+;;; is QuickJS, not even that it is a loadable DSO; a wrong file fails
+;;; at load, a wrong build (bellard's, loaded on its own) fails at the
+;;; boot symbol check -- both loudly, past the gate, and a wrong engine
+;;; must not read as no engine.
 
 (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr qjspool)
         (only (igropyr ssr) make-ssr ssr-render ssr-try-render ssr-invalidate! ssr-stats)
@@ -165,8 +167,9 @@
 ;; (igropyr quickjs) is the pure-Scheme binding: it needs a shared
 ;; QuickJS engine library that resolves JS_FreeValue -- quickjs-ng's
 ;; libqjs, or anything exporting the same interface. The gate below is
-;; FILE presence only, so run-all stays green on hosts without QuickJS;
-;; whether the found build binds is decided at boot.
+;; candidate-path file presence only -- it does not check the file is
+;; QuickJS or even loadable -- so run-all stays green on hosts without
+;; QuickJS; everything past existence is decided at load and boot.
 (define (quickjs-present?)
   (or (let ((e (getenv "IGROPYR_LIBQUICKJS_SO"))) (and e (> (string-length e) 0) (file-exists? e)))
       (file-exists? "libquickjs.dylib") (file-exists? "libquickjs.so")
@@ -275,17 +278,20 @@ function eat(j){ return String(j.length); }
 ;; asserted nowhere, and a review round found each of them able to pass
 ;; with that precondition absent.
 (define (trace-file name) (string-append "/tmp/igropyr-qjsw-" name ".trace"))
-;; the worker's stderr is captured, not discarded: when a worker never
-;; comes up, the reason -- an engine refusal with its install advice, a
-;; bad bundle, a port in use -- was printed THERE, and dropping it left
-;; only "never came up", which reads like a suite defect
+;; the worker's stderr is captured, not discarded: whatever the worker
+;; said before going quiet -- an engine refusal with its install advice,
+;; a bad bundle, a port in use -- lands here instead of /dev/null, which
+;; used to leave only "never came up", reading like a suite defect.
+;; (Whether anything WAS said is the helper below's problem, not a
+;; promise this file makes.)
 (define (err-file name) (string-append "/tmp/igropyr-qjsw-" name ".err"))
 
 ;; surface whatever an unserved worker managed to say on stderr, then
 ;; the wrong-engine hint. "Unserved" is all await-worker! establishes:
-;; the worker may have died, may be alive and unresponsive, or may have
-;; been killed without a word -- in the last two cases the .err holds
-;; nothing and only the generic hint prints, so this is best-effort
+;; the worker may have died, may be alive and unresponsive (it can have
+;; printed a line before hanging), or may have been killed without a
+;; word -- only the last necessarily leaves an empty .err, but any of
+;; them MAY, and then only the generic hint prints: this is best-effort
 ;; evidence, not a guarantee that a reason exists. Every place that
 ;; gives up on a worker calls this -- the first version lived only
 ;; inside require-worker!, and the good/bound paths, which call
@@ -578,11 +584,14 @@ function eat(j){ return String(j.length); }
           ;; ...but do not also blame the good worker for somebody else.
           ;; THIS FAILURE BRANCH HAS NO COVERAGE: reaching it needs
           ;; "carry, half and spin came up, good alone did not", and no
-          ;; case constructs that. The helper it calls is exercised at
-          ;; the other two call sites; if you rewire this branch, hold
-          ;; good-port open before the spawn and watch it fire, because
-          ;; the two runs the suite normally sees -- all up, all down --
-          ;; both bypass it.
+          ;; case constructs that. Left uncovered as a COST decision --
+          ;; a permanent only-good-fails case buys three diagnostic
+          ;; lines with one more moving part -- not because it cannot
+          ;; be built deterministically: an external harness that binds
+          ;; good-port and confirms it is listening BEFORE starting
+          ;; this suite removes the race. If you rewire this branch, do
+          ;; that once and watch it fire; the two runs the suite
+          ;; normally sees -- all up, all down -- both bypass it.
           (when (and carry-up half-up spin-up)
             (fail "the worker process never came up" good-port)
             (explain-unserved-worker! "good"))
