@@ -251,6 +251,13 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # and against a second implementation in another process (python3's
 # cryptography, or node), which self-skips naming both
 "$scheme_bin" --script igropyr/test/aead.sc
+# the gen-server error slot is passthrough-or-label: writing the error
+# must never walk into the caller's message (the old shape PANICked the
+# runtime on a pid-carrying request), labels are constructed small
+# rather than clipped from big, and misbehaving record writers are
+# never invoked
+"$scheme_bin" --script igropyr/test/gen-server-error-scalar.sc
+
 # a gen-server must not run a call whose caller was killed while it
 # waited: the effects would be applied for nobody, and the retry
 # applies them again
