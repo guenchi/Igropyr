@@ -13,8 +13,9 @@
 
 ;; (igropyr quickjs) is the pure-Scheme binding: it needs a shared
 ;; QuickJS engine library that resolves JS_FreeValue -- quickjs-ng's
-;; libqjs, or anything exporting the same interface. Gate on that so
-;; run-all stays green on hosts without QuickJS.
+;; libqjs, or anything exporting the same interface. The gate below is
+;; FILE presence only, so run-all stays green on hosts without QuickJS;
+;; whether the found build binds is decided at boot.
 (define (quickjs-present?)
   (or (let ((e (getenv "IGROPYR_LIBQUICKJS_SO"))) (and e (> (string-length e) 0) (file-exists? e)))
       (file-exists? "libquickjs.dylib") (file-exists? "libquickjs.so")
@@ -32,9 +33,10 @@
       (file-exists? "/usr/lib/libquickjs.so")
       (file-exists? "/usr/lib/quickjs/libquickjs.so")))
 
-;; A bellard libquickjs also counts as "present": the suite then fails
-;; at engine boot with the driver's refusal naming the remedy -- loud on
-;; purpose, a wrong engine must not read as no engine.
+;; A bellard libquickjs also counts as "present": loaded on its own it
+;; does not resolve JS_FreeValue, so the suite then fails at engine boot
+;; with the driver's refusal naming the remedy -- loud on purpose, a
+;; wrong engine must not read as no engine.
 (unless (quickjs-present?)
   (display "ssr: no QuickJS library found, test skipped\n")
   (display "  (install quickjs-ng -- libqjs -- or set IGROPYR_LIBQUICKJS_SO)\n")

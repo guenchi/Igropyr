@@ -34,14 +34,16 @@
       (file-exists? "/usr/lib/quickjs/libquickjs.so")))
 
 ;; A bellard libquickjs also counts as "present" here, DELIBERATELY:
-;; the suite then fails at qjs-boot! with the driver's own refusal,
-;; which names the remedy. A wrong engine installed is an environment
-;; defect and must be loud; a skip would make it look like no engine.
+;; the gate is FILE presence, and whether the found build binds is
+;; decided at qjs-boot!, loudly, by the driver's own refusal naming the
+;; remedy (a bellard build loaded on its own does not resolve
+;; JS_FreeValue). A wrong engine installed is an environment defect and
+;; must be loud; a skip would make it look like no engine.
 (unless (raw-quickjs-present?)
   (display "quickjs: no QuickJS library found, test skipped\n")
   (display "  (install quickjs-ng -- it ships libqjs -- or point\n")
-  (display "   IGROPYR_LIBQUICKJS_SO at one; bellard's libquickjs boots\n")
-  (display "   only far enough to be refused)\n")
+  (display "   IGROPYR_LIBQUICKJS_SO at one; bellard's libquickjs, on its\n")
+  (display "   own, boots only far enough to be refused)\n")
   (exit 0))
 
 (define failures 0)
