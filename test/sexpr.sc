@@ -1,7 +1,7 @@
 #!chezscheme
 ;;; (igropyr sexpr) tests: whitelist round-trips, hostile input.
 
-(import (chezscheme) (igropyr sexpr))
+(import (chezscheme) (igropyr sexpr) (igropyr json))
 
 (define failures 0)
 (define (check label ok)
@@ -202,29 +202,36 @@
 (check "no-write-ratio-over-bound"
        (write-fails? (/ (expt 10 65536) 3)))
 
-;; ---- adversarial name corpus (61 names, cross-checked downstream) ------
-;; The accept/refuse split below was measured against this
-;; implementation and independently matched, name for name, by two
-;; downstream codecs. A name moving sides here is a wire-compat break,
-;; not a tuning knob. Written names must read back as themselves --
-;; the property the refusals exist to protect.
-(for-each
- (lambda (n)
-   (check (string-append "corpus-written |" n "|")
-          (let ((sym (string->symbol n)))
-            (eq? sym (string->sexpr (sexpr->string sym))))))
- '("--1" "+" "-" "..." "a1" "/" ".foo" "a.b" "OK" "_x" ":kw" "a@b"
-   "%x" "^x" "~x" "&x" "*x*" "<=>" "set!" "null?" "list->vector"
-   "e" "inf.0" "nan.0" "+." ".." "ok"))
-(for-each
- (lambda (n)
-   (check (string-append "corpus-refused |" n "|")
-          (write-fails? (string->symbol n))))
- (list "12" "-7" "1.5" "-7/2" "." "0x10" "1e3" "12abc" "+1" "-0" ".5"
-       "1." "1E3" "1e+3" "+inf.0" "-inf.0" "+nan.0" "1/2" "" "#x10"
-       "1+2i" "007" "-007" "1/-2" "1//2" "1/0" "a b" "7"
-       (string #\a #\tab #\b) (string #\a #\newline #\b)
-       "a(b" "a\"b" "\x4e2d;\x6587;" "\x1f600;"))
+;; ---- adversarial name matrix (fixture-driven, 190 names) ---------------
+;; test/sexpr-vectors.json is a vendored snapshot of the downstream
+;; conformance fixture: a SYSTEMATIC matrix, not a hand-picked list --
+;; a hand-picked predecessor was caught missing the entire
+;; complex-number family (+i, -i, +2i, +inf.0i). Its split was measured
+;; against this implementation at the commit its authority_commit field
+;; records, then matched name for name by two independent downstream
+;; codecs, so a name moving sides is a wire-compatibility break. To
+;; refresh, re-vendor the regenerated file; never edit names by hand --
+;; a second hand-maintained list is exactly the drift this replaces.
+(define name-matrix
+  (let* ((path (if (file-exists? "test/sexpr-vectors.json")
+                   "test/sexpr-vectors.json"
+                   "sexpr-vectors.json"))
+         (p (open-file-input-port path))
+         (bv (get-bytevector-all p)))
+    (close-port p)
+    (string->json (utf8->string bv))))
+(let ((entries (cdr (assoc "write_reject" name-matrix))))
+  (check "matrix-has-entries" (> (vector-length entries) 100))
+  (vector-for-each
+   (lambda (entry)
+     (let* ((name (cdr (assoc "sym" entry)))
+            (sym (string->symbol name)))
+       (if (cdr (assoc "rejected" entry))
+           (check (string-append "matrix-refused |" name "|")
+                  (write-fails? sym))
+           (check (string-append "matrix-written |" name "|")
+                  (eq? sym (string->sexpr (sexpr->string sym)))))))
+   entries))
 
 ;; the extension must not leak into strict mode
 (check "strict-still-no-vector" (parse-fails? "#(1 2 3)"))
