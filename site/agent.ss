@@ -41,7 +41,7 @@
                "ordinary sequential lines."))
           (div (@ (class "card"))
             (div (@ (class "ic")) "✓")
-            (h3 "Verified API, never guessed")
+            (h3 "Reads the source, never guesses")
             (p "Rule zero: it greps the " (code ".sc") " source headers before "
                "writing. A map of the app-facing modules stops it from "
                "hallucinating procedure names — it is a subset, not a census, so "
