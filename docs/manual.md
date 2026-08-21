@@ -2453,10 +2453,13 @@ Catch unhandled exceptions and respond with a nice error page:
 (app-use app
   (error-handler
     `((handler . ,(lambda (e req res)
+                    (define (clip s)
+                      (if (fx> (string-length s) 200) (substring s 0 200) s))
                     (set-status! res 500)
                     (send-json! res
                       `((error . "internal server error")
-                        (detail . ,(cond
+                        (detail . ,(clip
+                                   (cond
                                      ((condition? e)
                                       (with-output-to-string
                                         (lambda () (display-condition e))))
@@ -2464,25 +2467,21 @@ Catch unhandled exceptions and respond with a nice error page:
                                            (fx> (vector-length e) 0)
                                            (symbol? (vector-ref e 0)))
                                       (symbol->string (vector-ref e 0)))
-                                     (else "unrecognized raise"))))))))))
+                                     (else "unrecognized raise")))))))))))
 ```
 
 Without a handler of your own, an uncaught exception becomes HTTP 500 with a
-JSON body naming nothing. Adding detail is a development choice and belongs in
-a handler you write, which is also where you decide what is safe to send.
+JSON body naming nothing.
 
-**Only before the response has started.** Once `res-begin!` has put the status
-line on the wire there is no 500 left to send, so this middleware aborts the
-connection instead and neither the default response nor your `handler` runs at
-all. A truncated stream is how HTTP says a response was cut short.
+Two things shape the handler above. It takes the **tag** out of a raised vector
+rather than printing the value — a vector can carry a live process, and
+printing one of those walks a cycle and takes the runtime down — and it
+**clips** what it builds, because neither a symbol nor a condition's message
+has a length bound.
 
-**Take the tag, and check that it is one.** A raised vector can hold a live
-process — a `gen-server` timeout carries the caller's own message, and a
-message is how a request names its replier — and printing such a value walks a
-cycle and takes the runtime down. Slot 0 is the tag for the framework's own
-structured raises, and that promise does not extend to whatever an application
-raises, so the test above is `symbol?` and anything else falls through to a
-constant.
+A handler only helps while the response can still be replaced. Once bytes are
+on the wire, what it builds is discarded; and for a response already streaming,
+this middleware aborts the connection and does not call the handler at all.
 
 ### Auth
 
