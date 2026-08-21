@@ -43,8 +43,9 @@
             (div (@ (class "ic")) "✓")
             (h3 "Verified API, never guessed")
             (p "Rule zero: it greps the " (code ".sc") " source headers before "
-               "writing. A module map of every v1.1.8 export stops it from "
-               "hallucinating procedure names — when in doubt, the source wins."))
+               "writing. A map of the app-facing modules stops it from "
+               "hallucinating procedure names — it is a subset, not a census, so "
+               "when the map is silent the source wins."))
           (div (@ (class "card"))
             (div (@ (class "ic")) "◆")
             (h3 "Records first, contracts at the edges")
@@ -56,10 +57,10 @@
           (a (@ (class "btn primary") (href "agent/igropyr-dev.md") (download #t))
              "Download igropyr-dev.md")
           (a (@ (class "btn ghost") (href "agent/igropyr-dev.md")) "View raw"))
-        (p (@ (class "backlink")) "Covers the actor model, the whole module map, "
-           "records & contracts, the build/test incantation (" (code ".sc")
-           " extension mapping and all), and every gotcha — one Markdown file, "
-           "fed to any AI coding agent as its instructions.")))
+        (p (@ (class "backlink")) "Covers the actor model, the app-facing module "
+           "map, records & contracts, the build/test incantation (" (code ".sc")
+           " extension mapping and all), and the gotchas that bite first — one "
+           "Markdown file, fed to any AI coding agent as its instructions.")))
 
    ;; ---- agent 2: node-to-igropyr ----
    `(section (@ (id "port"))

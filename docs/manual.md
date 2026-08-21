@@ -2429,7 +2429,7 @@ When a handler raises an exception that the middleware chain doesn't catch, the 
 
 ### Auth
 
-Authentication lives in its own library, `(igropyr auth)`, because it spans both HTTP middleware and WebSocket upgrade guards — beyond this suite's request-decorator scope. See the [Authentication](#authentication) chapter.
+Authentication lives in its own library, `(igropyr auth)`, because it spans HTTP middleware, WebSocket upgrade guards and `app-rpc` guards — beyond this suite's request-decorator scope. See the [Authentication](#authentication) chapter.
 
 ### Request-Local Storage
 
@@ -2500,16 +2500,21 @@ concurrency.
 
 ## Authentication
 
-Authentication lives in its own library, `(igropyr auth)`. It is the *authentication role* layer — credential-format neutral — and it covers every channel that takes a request: HTTP routes (via middleware), WebSocket routes (via an upgrade guard checked before the handshake) and sexpr RPC endpoints (via a guard on `app-rpc`). They are separate doors; guarding one is not guarding another. Token *formats* live elsewhere; `(igropyr jwt)` is one such format today.
+Authentication lives in its own library, `(igropyr auth)`. It is the *authentication role* layer — credential-format neutral. It has a form for each of the three application protocols an app serves: HTTP routes (via middleware), WebSocket routes (via an upgrade guard checked before the handshake) and sexpr RPC endpoints (via a guard on `app-rpc`). They are separate doors; guarding one is not guarding another. Nor is any of this reached by a *second* app you build yourself — `admin-listen` makes its own app with its own `auth`, and a raw `http-listen` terminates requests with no app at all. Token *formats* live elsewhere; `(igropyr jwt)` is one such format today.
 
 ```scheme
 (import (igropyr auth) (igropyr jwt))
 ```
 
-All three channels — HTTP routes, WebSocket upgrades, and sexpr RPC
-endpoints (`app-rpc`) — share the same request-guard protocol
-`(lambda (req) claims-or-#f)`, so one guard works everywhere. Each leaves
-verified claims on a request-local slot, read the same way:
+All three leave verified claims on a request-local slot, read the same
+way — but they do **not** take the same thing, and the difference is not
+visible at boot. `app-ws` and `app-rpc` take a **request guard**,
+`(lambda (req) claims-or-#f)`. The `auth` middleware takes a **token
+verifier**, `(lambda (token) claims-or-#f)`, and builds the middleware
+around it. Both are procedures of one argument, so handing a
+`session-guard` to `auth` is accepted and then called with a token
+string. `token-guard` exists to lift a verifier into a guard; there is no
+lowering in the other direction, because a request is not a credential.
 
 - `(req-claims req)` → claims or `#f` — the claims left by `auth`, an `app-ws` guard, or an `app-rpc` guard.
 
@@ -3383,7 +3388,7 @@ The client authenticates with **SCRAM-SHA-256** (RFC 7677, the PostgreSQL defaul
   '((allow-cleartext-auth . #t)))
 ```
 
-SASLprep normalization is not implemented (its Unicode tables would dwarf the driver), so passwords outside **printable ASCII** — non-ASCII, or the control characters SASLprep prohibits — are rejected with a clear error: in the caller (`postgresql-connect`/`postgresql-pool` raise an assertion up front) when SCRAM is the only possible auth path, and during the exchange otherwise, instead of failing with a baffling `28P01`. Printable-ASCII passwords are exact — SASLprep leaves them unchanged.
+SASLprep normalization is not implemented (its Unicode tables would dwarf the driver), so passwords outside **printable ASCII** — non-ASCII, or the control characters SASLprep prohibits — are rejected with a clear error in the caller — `postgresql-connect` and `postgresql-pool` raise an assertion up front — instead of failing with a baffling `28P01`. That check does not know what the server will ask for, and does not wait to find out: it runs before any connection, so a `trust` server that would never look at the password refuses one anyway. `'allow-cleartext-auth` skips it, and means what it says — if the server does ask for a cleartext password, this client sends one. `scram-auth!` keeps its own check as the backstop for that case. Printable-ASCII passwords are exact — SASLprep leaves them unchanged.
 
 #### TLS
 
@@ -3439,7 +3444,7 @@ This subsection is for authors building a **third** SQL driver; applications nev
 
 `(igropyr mysql)`, `(igropyr postgresql)` and `(igropyr qjspool)` sit on one shared engine, `(igropyr connpool)`. It owns the whole pool architecture — a fixed pool of connections behind a dispatcher, whole-connection leases, and monitor-based crash reclaim — while staying **protocol-blind**: the wire protocol, authentication and result parsing stay in each driver. Keeping it a single copy means a fix to a subtle race (checkout-cancel, reclaim of a borrower killed mid-lease, adoption of a worker that finished connecting after its pool is gone, refusing to re-lend a connection already on its way out) can never land in one driver but not the others.
 
-It was written for the two SQL drivers and was called `sqlpool`. What it models is both narrower than SQL and wider: a scarce **exclusive** resource whose work happens on the far side of a socket, borrowed for the length of one request. Adding the render pool as a third driver generalized it twice. The deadlines moved from module constants into the per-driver config, because a minute is right for a database and wrong for a render. And `connpool-lease` grew `broken-on-escape?`: when the borrowed procedure leaves non-locally, a SQL driver can hand the connection back clean, but a render that timed out may still be running on the far side, so the connection has to be treated as broken instead. `(igropyr qjspool)` passes `#t`. A fourth driver whose work can outlive the caller's deadline needs that argument; returning such a connection clean lets the next request share it with one still executing.
+It was written for the two SQL drivers and was called `sqlpool`. What it models is both narrower than SQL and wider: a scarce **exclusive** resource whose work happens on the far side of a socket, borrowed for the length of one request. Adding the render pool as a third driver generalized it three times. The request became opaque — it had been SQL-shaped, down to the message names — so a driver's traffic no longer has to look like a statement. The deadlines moved from module constants into the per-driver config, because a minute is right for a database and wrong for a render. And `connpool-lease` grew `broken-on-escape?`: when the borrowed procedure leaves non-locally, a SQL driver can hand the connection back clean, but a render that timed out may still be running on the far side, so the connection has to be treated as broken instead. `(igropyr qjspool)` passes `#t`. A fourth driver whose work can outlive the caller's deadline needs that argument; returning such a connection clean lets the next request share it with one still executing. A fourth driver should also expect to find a fourth generalization: three is what has been needed so far, not a bound.
 
 Exports:
 
@@ -3463,7 +3468,7 @@ Each driver's connection process must speak a small message contract:
 
 A connection must also answer `pool-quit` and `pool-request-cancel` **while it is waiting** for the far side. A receive that matches only the socket strands both: the pool cannot reclaim it and the caller cannot abandon it.
 
-Query and checkout both time out at 60 s. Leases are per-checkout records (keyed by connection, carrying the borrower, its monitor and the checkout ref), so one borrower holding several leases never clobbers its own bookkeeping; a borrower killed mid-transaction is reclaimed by the pool's monitor (the actor's `@kill` discards `dynamic-wind` winders, so no checkin ever runs). Closing a pool quits leased connections immediately — a transaction still in flight on one times out on its next statement, so close a pool only after its borrowers are done.
+Query and checkout time out at whatever the driver's config says; 60 s each is the default, and what both SQL drivers take. A driver sets its own — `(igropyr qjspool)` runs far shorter, because a render that has not finished in seconds is not going to. Leases are per-checkout records (keyed by connection, carrying the borrower, its monitor and the checkout ref), so one borrower holding several leases never clobbers its own bookkeeping; a borrower killed mid-transaction is reclaimed by the pool's monitor (the actor's `@kill` discards `dynamic-wind` winders, so no checkin ever runs). Closing a pool quits leased connections immediately — a transaction still in flight on one times out on its next statement, so close a pool only after its borrowers are done.
 
 ### What a lease guarantees
 

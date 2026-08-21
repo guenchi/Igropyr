@@ -215,7 +215,7 @@
             (p "One event loop feeds thousands of parked processes. DNS, file "
                "reads and database round-trips park " (em "the calling process")
                ", never the thread. Non-blocking HTTP/WebSocket clients and "
-               "Redis/MySQL drivers included.")))
+               "Redis, MySQL and PostgreSQL drivers included.")))
         (div (@ (class "strip"))
           (div (div (@ (class "num")) "150k+") (div (@ (class "lbl")) "req/s, keep-alive, M4 Pro"))
           (div (div (@ (class "num")) "0") (div (@ (class "lbl")) "failed requests under ab -c 500"))
@@ -225,7 +225,7 @@
    ;; ---- full feature list ----
    `(section (@ (id "features"))
       (div (@ (class "wrap"))
-        (div (@ (class "kicker")) "Everything included")
+        (div (@ (class "kicker")) "What comes with it")
         (div (@ (class "fgrid"))
           ,(fitem "Core / framework split, like Node and Express"
              "the core exposes one entry point, " '(code "(http-listen port (lambda (req res) ...))")
@@ -294,9 +294,9 @@
              "preflight, security headers, and an access logger")
           ,(fitem "Chunked transfer-encoding"
              '(code "Transfer-Encoding: chunked") " request bodies are decoded transparently")
-          ,(fitem "Non-blocking Redis and MySQL clients"
+          ,(fitem "Non-blocking Redis, MySQL and PostgreSQL clients"
              "pure Scheme, same event loop; callers park their green process "
-             "while the OS thread keeps serving; MySQL comes with a self-healing connection pool")
+             "while the OS thread keeps serving; both SQL drivers come with a self-healing connection pool")
           ,(fitem "Non-blocking HTTP & WebSocket clients"
              "outbound " '(code "http-get") " / " '(code "http-post") " and "
              '(code "ws-connect") ", both with async DNS (libuv thread pool) and "
