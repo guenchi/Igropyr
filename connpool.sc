@@ -949,18 +949,26 @@
       ;; and the third slot says WHICH pool stopped replying rather
       ;; than only that one has.
       ;;
-      ;; THE ID, NOT THE POOL. Every context slot in this framework
-      ;; holds a printable scalar, and that is not a style rule: a
-      ;; raised vector has no safe printer. A process is a pcb record
-      ;; whose fields include its continuation, its links, and its
-      ;; inbox, so `write` on this vector walks into a cycle and takes
-      ;; the runtime down with it -- and on the way it prints the
-      ;; mailbox, which for a pool holds the statements in flight. An
-      ;; operator reading the error is the one who triggers both.
-      ;; (A condition may carry the process itself, as the
-      ;; `not a pool' report below does: conditions print opaquely --
-      ;; #<compound condition> -- and display-condition elides nested
-      ;; structure, so no standard printer ever walks it.)
+      ;; THE ID, NOT THE POOL, because a raised vector has no safe
+      ;; printer. A process is a pcb record whose fields include its
+      ;; continuation, its links and its inbox, so `write` on such a
+      ;; vector walks into a cycle and takes the runtime down -- and on
+      ;; the way it prints the mailbox, which for a pool holds the
+      ;; statements in flight. The operator reading the error is the one
+      ;; who triggers both. A condition is different and may carry the
+      ;; process itself, as the `not a pool' report below does:
+      ;; conditions print opaquely -- #<compound condition> -- and
+      ;; display-condition elides nested structure, so no standard
+      ;; printer walks one.
+      ;;
+      ;; This follows #(durable-error op path) and #(dpool-error reason
+      ;; id), which name their subject with a scalar. It is NOT an
+      ;; invariant the tree already satisfies: gen-server-call puts the
+      ;; caller's own message in this position, and a message carrying
+      ;; a process -- which is how a request names its replier, this
+      ;; procedure included -- panics the same way. Fixing that changes
+      ;; a public shape and is its own decision; do not read this
+      ;; comment as saying the rest of the tree is clean.
       (receive (after 5000
                  (raise (vector 'connpool-error 'stats-timeout
                                 (process-id pool))))
