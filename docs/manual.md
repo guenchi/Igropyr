@@ -1582,17 +1582,23 @@ A flow may
 legitimately return the symbol `'gone` as its final value, so control
 outcomes never share a position with it:
 
-This is the **status vocabulary** — nine words, and they are not nine
-ways a dialogue can end. Two of them say it has not ended: a token
-string, and `'no-answer-yet`. `'done` and `'settled` are one completion
+These are what `conversation-start!`, `conversation-resume!` and
+`conversation-run!` answer with. Stated without a count, for the reason
+given where `conversation-peek` is described: a count here has been
+wrong twice already, once when `'overloaded` arrived and again when this
+sentence tried to name a total.
+
+They are not one word per way a dialogue can end. A token string means
+it has not ended at all, and `'done` and `'settled` are one completion
 seen at two moments, before and after the reply stops being retained.
-Drop the two that are not endings, count that pair once, and you get the
-**six outcomes** the README and the front page name.
+Set the token aside, count that pair once, and what is left are the
+**six outcomes** the README and the front page name. `conversation-peek`
+answers from its own vocabulary, which overlaps this one but is not it —
+see *Asking without waiting for the step to finish*.
 
 | status | meaning |
 |---|---|
 | a token string | the step ran — present it to continue |
-| `'no-answer-yet` | nothing had arrived when the deadline passed — only from `conversation-peek/timeout`, and not evidence that anything was asked |
 | `'done` | the flow finished; `reply` is its final answer |
 | `'settled` | it finished, but the answer is no longer retained |
 | `'stale` | not applied, and will not be |
@@ -1602,9 +1608,10 @@ Drop the two that are not endings, count that pair once, and you get the
 | `'overloaded` | the owner **refused** the forward before touching the conversation: it was already hosting its limit of them. Nothing was started, the token is still good, and asking again later is right |
 
 `conversation-done?`, `conversation-settled?`, `conversation-stale?`,
-`conversation-gone?`, `conversation-unknown?`, `conversation-unreachable?`,
-`conversation-overloaded?` and `conversation-no-answer-yet?` are applied
-to the *status*.
+`conversation-gone?`, `conversation-unknown?`, `conversation-unreachable?`
+and `conversation-overloaded?` are applied to the *status*.
+`conversation-no-answer-yet?` is not in this list: it tests a state only
+`conversation-peek/timeout` produces.
 
 #### `'unknown` is not `'gone`
 
@@ -1623,9 +1630,14 @@ A different quantity from the status vocabulary above: these are the
 **record values** — what is still known about a conversation once its
 process is gone, which is what a later question is answered from. Five
 of them, mapping onto the statuses above rather than corresponding to
-them one for one. The last row pairs one with its own absence because
-they are answered alike; *no record* is not a sixth value, and a reader
-that returns it as one is a reader at fault.
+them one for one.
+
+**Having no record is not one of them.** A reader with nothing to return
+returns `#f`, and the conversation is `'unknown`. Returning `'killed`
+instead would be answered the same way today, which is exactly why the
+mistake survives: the two are indistinguishable from outside, so a
+reader that reports a missing row as a killed conversation loses the
+distinction silently and is never counted as the fault it is.
 
 | record | meaning | answer |
 |---|---|---|
@@ -1633,7 +1645,7 @@ that returns it as one is a reader at fault.
 | rolled back | left through its winders, `commit!` had not returned | `'gone` |
 | committed then failed | left through its winders *after* `commit!` returned | `'unknown` |
 | commit uncertain then failed | left through its winders after `commit!` reported the commit as a *maybe* | `'unknown` |
-| killed *(or no record at all)* | stopped in flight, or stopped in a way nothing recorded | `'unknown` |
+| killed | stopped in flight, or stopped in a way nothing recorded | `'unknown` |
 
 The last three answer alike here and are still three records, not one.
 The two failure records part company under a `settled?` predicate
@@ -3228,7 +3240,12 @@ Return values:
 - **INSERT/UPDATE/DELETE**: `#(ok ,affected ,last-insert-id)`.
 - **Values**: Strings (MySQL text protocol). `NULL` → `#f`. Numeric strings are not converted.
 
-**Errors**: Raise `#(mysql-error ,code ,message)` in the caller.
+**Errors**: Driver-generated operational errors raise
+`#(mysql-error ,code ,message)` in the caller. Two things do not wear that
+tag: `mysql-pool-stats`, which passes the pool library's
+`#(connpool-error stats-timeout ,pool-id)` straight through, and anything
+raised by your own procedure inside `call-with-mysql-connection` or
+`mysql-transaction`, which travels out unchanged.
 
 #### Authentication
 
@@ -3333,7 +3350,12 @@ The result shapes are the same as `postgresql-query` (`#(rows ...)` / `#(ok ...)
 
 #### Errors
 
-Errors raise `#(postgresql-error ,tag ,message)` in the caller, where `tag` is one of exactly three shapes:
+Driver-generated operational errors raise `#(postgresql-error ,tag ,message)`
+in the caller, where `tag` is one of exactly three shapes. Two things do not
+wear that tag: `postgresql-pool-stats`, which passes the pool library's
+`#(connpool-error stats-timeout ,pool-id)` straight through, and anything
+raised by your own procedure inside `call-with-postgresql-connection` or
+`postgresql-transaction`, which travels out unchanged.
 
 - **a 5-character SQLSTATE string** — a server-side SQL error (constraint violation, syntax error, …). The connection stays usable.
 - **`'transport`** — a connection or framing failure. The connection is torn down (and rebuilt by a pool).
