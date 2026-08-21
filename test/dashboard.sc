@@ -20,9 +20,9 @@
 ;; is possible, so "excludes source constants" would overclaim) and
 ;; excludes stateless format discriminators -- prefix, length, charset
 ;; -- since both tokens share the format. They do NOT by themselves
-;; prove the injected verify is consulted: an acceptor keyed on call
-;; order passes them (it did -- see the differential pair below, which
-;; is what actually measures consultation).
+;; establish consultation: an acceptor keyed on call order passes them
+;; (it did). The differential pair below records only the bounded
+;; observation stated at that cell.
 (random-seed (+ 1 (modulo (real-time) 1000000000)))
 (define (mint-token)
   (string-append "tk-" (number->string (+ 100000 (random 900000)))))
@@ -168,11 +168,13 @@
       ;; extracted expression is a proxy: every three-argument procedure
       ;; has app-use arity, including (lambda (req res next) (next)) --
       ;; an unconditional pass. So the expression is extracted once and
-      ;; put to five cells, each fixing its own direction and none
-      ;; speaking for another:
+      ;; checked in five roles, each fixing its own direction and none
+      ;; speaking for another (eight registered cells carry them --
+      ;; anchor runs before extraction, and each of the two mountings
+      ;; has its own build cell):
       ;;   anchor       locates the one header example;
       ;;   structural   the extracted datum IS (auth verify);
-      ;;   build        under the current bindings it constructs a
+      ;;   build        each of the two evaluations returns a
       ;;                procedure;
       ;;   three gates  that composition's refuse/admit behaviour in
       ;;                the admin slot -- the whole mounted path: auth
@@ -284,10 +286,11 @@
                 ;; something else on the second would otherwise erase
                 ;; this whole arm with zero failures and zero skips --
                 ;; a bypass the suite's own summary cannot see. The
-                ;; cell covers the normal-return case; a second
-                ;; evaluation that raises or hangs never reaches it,
-                ;; and shows up as a loud nonzero exit instead of a
-                ;; registered failure.
+                ;; cell covers only normal return. An evaluation that
+                ;; raises, hangs, or exits never reaches it and remains
+                ;; outside registered-cell accounting: an uncaught
+                ;; raise normally exits nonzero, while a hang requires
+                ;; an external timeout.
                 (check "the differential arm builds a procedure"
                   (procedure? built2))
                 (when (procedure? built2)
