@@ -5,7 +5,8 @@
 ;;; functions with one UTF-8 string argument and get a string back; user input
 ;;; is data, never code.
 ;;;
-;;; REQUIRES quickjs-ng (libqjs, 0.15+), which exports a real JS_FreeValue.
+;;; INSTALL quickjs-ng (libqjs); 0.15+ is what this is developed against.
+;;; What the code enforces is narrower: a real exported JS_FreeValue.
 ;;; bellard/quickjs makes JS_FreeValue a header inline and exports only the
 ;;; ref-count-zero slow path, which forced this library to reproduce the
 ;;; inline: decrement a ref_count whose offset differs between the two
@@ -30,7 +31,7 @@
 ;;;
 ;;;   (qjs-boot! bundle-source)
 ;;;   (qjs-boot! bundle-source '((mem-mb . 64) (stack-kb . 1024)
-;;;                              (timeout-ms . 2000) (so-path . "libquickjs.so")))
+;;;                              (timeout-ms . 2000) (so-path . "libqjs.so")))
 ;;;   (qjs-call  "fname" "arg")   ; -> (values ok? string)
 ;;;   (qjs-call! "fname" "arg")   ; -> string, raises on JS error
 ;;;   (qjs-healthy?) (qjs-generation) (qjs-shutdown!)
@@ -69,12 +70,12 @@
   ;; (64-bit build, NaN-boxing off.) This layout is an ABI assumption,
   ;; and the thing that keeps it from being a silent one is validate-abi!
   ;; below: qjs-boot! reads the tag of a known-object global through this
-  ;; ftype and refuses the build if it is not tag-object. A NaN-boxed or
-  ;; re-ordered libquickjs is rejected at startup, not discovered later
-  ;; through wrong tags. What that check cannot see is a layout that
-  ;; happens to put an object tag where this one expects it; to re-check
+  ;; ftype and refuses the build if it is not tag-object. That catches a
+  ;; NaN-boxed or re-ordered build at startup rather than later through
+  ;; wrong tags -- unless the other layout happens to put an object tag
+  ;; where this one expects it, which the check cannot see. To settle it
   ;; directly, print sizeof(JSValue) and offsetof(JSValue, tag) from C
-  ;; against the libquickjs actually being linked.
+  ;; against the library actually being linked.
   (define-ftype JSValue (struct (u unsigned-64) (tag integer-64)))
   (define tag-undefined 3)
   (define tag-exception 6)
@@ -93,8 +94,9 @@
                 ;; install either straight under lib/, not in a quickjs/
                 ;; subdirectory.
                 ;;
-                ;; libqjs FIRST, everywhere. This driver requires quickjs-ng
-                ;; (see the JS_FreeValue check in bind!), and on a machine
+                ;; libqjs FIRST, everywhere. What bind! enforces rules out
+                ;; bellard's build (see the JS_FreeValue check there), and
+                ;; on a machine
                 ;; carrying both builds the old order dlopened bellard's
                 ;; libquickjs first. That fails the bind -- and it fails it
                 ;; AFTER the library is in the process's global symbol
@@ -174,7 +176,7 @@
         (assertion-violation 'qjs-boot!
           (string-append
             "this QuickJS build does not export JS_FreeValue (quickjs-ng "
-            "0.15+ required; bellard/quickjs makes it inline). The library "
+            "exports it; bellard/quickjs makes it inline). The library "
             "found is most likely bellard's libquickjs; install quickjs-ng "
             "(libqjs) or point IGROPYR_LIBQUICKJS_SO at it. Loading another "
             "candidate instead is not attempted on purpose: this one is "
@@ -220,9 +222,10 @@
       (lock-object cb)                    ; keep it pinned for the engine's life
       cb))
 
-  ;; ---- release a JSValue: one call to the exported JS_FreeValue. Three
-  ;; per call -- function, argument, result; the global is borrowed from
-  ;; g-cache and not freed. -------------------------------------------------
+  ;; ---- release a JSValue: one call to the exported JS_FreeValue. On the
+  ;; successful call path that is three -- function, argument, result; the
+  ;; global is borrowed from g-cache and never freed. An error path frees
+  ;; whatever it got as far as. -------------------------------------------
   ;; That export owns the whole operation, including the has-ref-count test,
   ;; so hand it the value as is. The decrement still dereferences the object
   ;; pointer -- inside the library, where it belongs; what is gone is Scheme
@@ -262,12 +265,12 @@
     (set! deadline (if (> timeout-ms 0) (+ (real-time) (* timeout-ms factor)) 0)))
 
   ;; ---- ABI probe: the JSValue layout, with no offset to discover ---------
-  ;; Validate the JSValue struct layout: the global object's tag must read as
-  ;; JS_TAG_OBJECT, which proves `u` is a real pointer and this is not a
-  ;; NaN-boxed build. Cheap, and it reads only OUR OWN JSValue buffer, never
-  ;; the object's memory -- unlike the ref_count probe this replaces, which
-  ;; had to read both candidate offsets on a live object to find one of them.
-  ;; A wrong ABI is refused here, never guessed at.
+  ;; Read the global object's tag through this binding's ftype: it must be
+  ;; JS_TAG_OBJECT. A NaN-boxed or re-ordered build fails that unless its
+  ;; layout happens to agree at this one position (see the ftype comment).
+  ;; Cheap, and it reads only OUR OWN JSValue buffer, never the object's
+  ;; memory -- unlike the ref_count probe this replaces, which had to read
+  ;; both candidate offsets on a live object to find one of them.
   (define (validate-abi!)
     (_global g-buf ctx)
     (unless (= (ftype-ref JSValue (tag) g-buf) tag-object)

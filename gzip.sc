@@ -212,13 +212,14 @@
   ;; the kernel copies from the address and reports EFAULT instead of
   ;; faulting the process, which covers unmapped pages and PROT_NONE
   ;; mappings alike -- mincore cannot (it reports existence, not
-  ;; readability), and a /dev/null fd cannot either: its driver never
-  ;; reads the buffer, so write(2) to it reports success for any
-  ;; address, mapped or not. (Reproduced on macOS -- a 1-byte write to
-  ;; /dev/null from address 1 returns 1. The probe itself runs only on
-  ;; FreeBSD, and nothing here records the same measurement there; if
-  ;; that kernel validates the address before the device sees it, this
-  ;; reasoning does not carry over.)
+  ;; readability), and a /dev/null fd is no better: its driver has no
+  ;; reason to read the buffer. Measured on macOS, a 1-byte write to
+  ;; /dev/null from address 1 returns 1 -- success for memory the
+  ;; process never mapped. This probe runs only on FreeBSD and nothing
+  ;; here records that measurement there, so the pipe is chosen on the
+  ;; macOS observation plus the absence of a reason for the null device
+  ;; to touch the bytes. A FreeBSD that validated the address before
+  ;; the device saw it would make /dev/null work and this choice moot.
   ;; The probe only runs on FreeBSD, and pipe2 is only resolved there;
   ;; the guard turns a host whose libc lacks the symbol (releases
   ;; before 10) into pipe2* = #f, which fails the probe below and
