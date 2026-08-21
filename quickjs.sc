@@ -66,11 +66,14 @@
   (import (chezscheme) (igropyr platform))
 
   ;; ---- JSValue: a 16-byte struct { JSValueUnion u; int64_t tag; } --------
-  ;; (64-bit build, NaN-boxing off.) THIS LAYOUT IS AN ABI ASSUMPTION,
-  ;; not something the build checks: if a libquickjs is built with
-  ;; NaN-boxing on, or the struct changes upstream, nothing here fails
-  ;; loudly -- values come back with the wrong tag. Re-check with a C
-  ;; program printing sizeof(JSValue) and offsetof(JSValue, tag)
+  ;; (64-bit build, NaN-boxing off.) This layout is an ABI assumption,
+  ;; and the thing that keeps it from being a silent one is validate-abi!
+  ;; below: qjs-boot! reads the tag of a known-object global through this
+  ;; ftype and refuses the build if it is not tag-object. A NaN-boxed or
+  ;; re-ordered libquickjs is rejected at startup, not discovered later
+  ;; through wrong tags. What that check cannot see is a layout that
+  ;; happens to put an object tag where this one expects it; to re-check
+  ;; directly, print sizeof(JSValue) and offsetof(JSValue, tag) from C
   ;; against the libquickjs actually being linked.
   (define-ftype JSValue (struct (u unsigned-64) (tag integer-64)))
   (define tag-undefined 3)
