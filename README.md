@@ -938,7 +938,9 @@ listener that binds **loopback by default**:
 ;; mount onto an app you already have (guard it yourself):
 (mount-dashboard! app m srv)                 ; GET /dash , /dash/data[.sexpr]
 ;; or a dedicated admin port, 127.0.0.1 by default, with a guard:
-(admin-listen m srv `((port . 9090) (auth . ,(token-guard verify))))
+(admin-listen m srv `((port . 9090) (auth . ,(auth verify))))
+;; NOT (token-guard verify): this slot is app-use middleware, and a
+;; request guard installed here raises on the first admin request.
 ```
 
 The front-end is swappable: pass `(html . <string|procedure>)` to serve

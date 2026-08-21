@@ -38,6 +38,12 @@
 ;;; is installed and fails on the first request that reaches it -- as an
 ;;; arity exception for the middleware slot, or as a token string handed
 ;;; to something expecting a request. Nothing catches it at boot.
+;;;
+;;; Those three are the shapes that carry CLAIMS. The request path takes
+;;; other procedures, and one neighbour has the same arity as middleware:
+;;; on-failure is (lambda (req res info)). A fault handler installed with
+;;; app-use passes the procedure check and then runs assq against `next',
+;;; which is a thunk.
 ;;; token-guard lifts the former into the latter; session-guard is a
 ;;; request guard natively (the credential is the session cookie).
 ;;;
