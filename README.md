@@ -224,7 +224,7 @@ layers do not port.
   helpers such as `procedure-arity-mask` are Chez's shapes throughout.
 
 Porting to another implementation would mean rebuilding the scheduler
-on that engine's own internals, not translating this one.
+on that engine's own internals, not porting this one.
 
 ## Getting started
 
