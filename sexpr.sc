@@ -351,7 +351,11 @@
   ;; failure a whitelist exists to prevent. |12abc|, |1/0| and |-1x| are
   ;; the same shape.
   ;;
-  ;; The reader's own test is mirrored here, so the two move together.
+  ;; The reader's own test is mirrored here -- COPIED, not shared, which
+  ;; is a maintenance obligation and not a guarantee: whoever widens
+  ;; numeric-shape? in the reader has to widen this one in the same
+  ;; commit, or the same class of defect comes straight back. Keeping
+  ;; them textually identical is what makes that check a glance.
   ;; string->number stays as well, and the overlap is not redundant: it
   ;; refuses names the reader would accept, such as |+i|, which is an
   ;; over-refusal rather than a corruption and costs a caller nothing
