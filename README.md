@@ -715,7 +715,8 @@ disabled, so a call blocks the scheduler for its duration (sub-millisecond
 typically, `timeout-ms` worst case) — cap input size on latency-sensitive
 paths. `qjs-boot!` reports if no library is found, and refuses to bind
 unless `JS_FreeValue` resolves as a real function -- which bellard's
-`libquickjs` does not export, so it will not start on that. Point it at a
+`libquickjs` does not export, so a process loading only that one will not
+start. Point it at a
 library with `IGROPYR_LIBQUICKJS_SO` or `(so-path . "...")`.
 
 A **C-shim binding with identical exports** — self-contained, with QuickJS
@@ -1348,7 +1349,7 @@ Native libraries are `dlopen`ed at runtime, not folded into `app.so` —
 compiling a library only compiles its Scheme. So if the app uses
 `(igropyr quickjs)`, make a stock quickjs-ng (`libqjs`) resolvable (or
 point `IGROPYR_LIBQUICKJS_SO` / `(so-path . "...")` at one; bellard's
-`libquickjs` is refused at boot); likewise a native
+`libquickjs` alone does not satisfy that check); likewise a native
 BLAS for `(igropyr blas)`'s fast lane and OpenSSL for `(igropyr tls)`.
 Each degrades without its library — blas to the pure loop, tls/quickjs
 to a clear error — so this only bites the capability that needs it. When

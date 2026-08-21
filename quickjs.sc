@@ -1,6 +1,6 @@
 #!chezscheme
 ;;; (igropyr quickjs) -- embed a JavaScript engine (QuickJS) in-process, in
-;;; PURE Scheme: no custom C shim, it binds a stock shared libquickjs directly
+;;; PURE Scheme: no custom C shim, it binds a stock shared QuickJS library
 ;;; over the FFI. Load a fixed JS bundle at boot, then call its global
 ;;; functions with one UTF-8 string argument and get a string back; user input
 ;;; is data, never code.
@@ -19,8 +19,9 @@
 ;;;
 ;;; Requiring the export deletes that machinery instead of guarding it: with
 ;;; the offset gone there is nothing to discover and nothing reads outside an
-;;; object. A build without the symbol is refused at boot with a clear
-;;; message rather than silently taking a different path. Releasing a value
+;;; object. Loaded on its own, a build without the symbol is refused at
+;;; boot with a clear message rather than silently taking a different
+;;; path (what the check actually asks is at bind!). Releasing a value
 ;;; is also ~30% cheaper as one FFI call than as the reproduced inline.
 ;;;
 ;;; A C-shim binding with the SAME exports lives at
@@ -94,8 +95,8 @@
                 ;; install either straight under lib/, not in a quickjs/
                 ;; subdirectory.
                 ;;
-                ;; libqjs FIRST, everywhere. What bind! enforces rules out
-                ;; bellard's build (see the JS_FreeValue check there), and
+                ;; libqjs FIRST, everywhere. bellard's build alone does not
+                ;; satisfy bind! (see the JS_FreeValue check there), and
                 ;; on a machine
                 ;; carrying both builds the old order dlopened bellard's
                 ;; libquickjs first. That fails the bind -- and it fails it
@@ -176,10 +177,13 @@
       ;; NOTE WHAT THIS ASKS. foreign-entry? resolves in the PROCESS's
       ;; global symbol namespace, not in the library just loaded -- the
       ;; same namespace whose hazards the candidate-order comment above
-      ;; describes. In a process that has loaded no other QuickJS it is
-      ;; the library just loaded that must export the symbol; in one that
-      ;; has, this passes on someone else's export and the mixed-ABI risk
-      ;; up there is live.
+      ;; describes. The question is therefore whether JS_FreeValue is
+      ;; visible AT ALL, by whoever made it so. If nothing else has, this
+      ;; is the library just loaded and the two coincide. If something
+      ;; else already has -- an ng loaded earlier, a shim, any DSO
+      ;; exporting that name -- this passes on that one's export while
+      ;; the other entry points may resolve elsewhere, which is the
+      ;; mixed-ABI hazard described up there.
       (unless (foreign-entry? "JS_FreeValue")
         (assertion-violation 'qjs-boot!
           (string-append
@@ -232,10 +236,11 @@
 
   ;; ---- release a JSValue: one call to the exported JS_FreeValue. On the
   ;; successful call path that is three -- function, argument, result. The
-  ;; global is borrowed from g-cache, so no call frees it; boot-locked!
-  ;; releases it once per (re)boot when it re-reads it. Error paths free
-  ;; the owned references they reached; some carry immediates such as
-  ;; JS_EXCEPTION, which need none. ----------------------------------------
+  ;; global is borrowed from g-cache, so no CALL frees it. A successful
+  ;; boot takes and releases the global twice: once in the ABI probe, once
+  ;; more when g-cache is re-read. Error paths free the owned references
+  ;; they reached; some carry immediates such as JS_EXCEPTION, which need
+  ;; none. ------------------------------------------------------------------
   ;; That export owns the whole operation, including the has-ref-count test,
   ;; so hand it the value as is. The decrement still dereferences the object
   ;; pointer -- inside the library, where it belongs; what is gone is Scheme
