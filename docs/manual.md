@@ -2500,7 +2500,7 @@ concurrency.
 
 ## Authentication
 
-Authentication lives in its own library, `(igropyr auth)`. It is the *authentication role* layer — credential-format neutral. It has a form for each of the three application protocols an app serves: HTTP routes (via middleware), WebSocket routes (via an upgrade guard checked before the handshake) and sexpr RPC endpoints (via a guard on `app-rpc`). They are separate doors; guarding one is not guarding another. Nor is any of this reached by a *second* app you build yourself — `admin-listen` makes its own app with its own `auth`, and a raw `http-listen` terminates requests with no app at all. Token *formats* live elsewhere; `(igropyr jwt)` is one such format today.
+Authentication lives in its own library, `(igropyr auth)`. It is the *authentication role* layer — credential-format neutral. It has a form for each of the three application protocols an app serves: HTTP routes (via middleware), WebSocket routes (via an upgrade guard checked before the handshake) and sexpr RPC endpoints (via a guard on `app-rpc`). They are separate doors; guarding one is not guarding another. Nor is any of this reached by a *second* app you build yourself — `admin-listen` makes its own app, whose `auth` option defaults to `#f`, so unless you pass one the only thing protecting it is that it binds loopback by default; and a raw `http-listen` terminates requests with no app at all. Token *formats* live elsewhere; `(igropyr jwt)` is one such format today.
 
 ```scheme
 (import (igropyr auth) (igropyr jwt))
@@ -2508,13 +2508,21 @@ Authentication lives in its own library, `(igropyr auth)`. It is the *authentica
 
 All three leave verified claims on a request-local slot, read the same
 way — but they do **not** take the same thing, and the difference is not
-visible at boot. `app-ws` and `app-rpc` take a **request guard**,
-`(lambda (req) claims-or-#f)`. The `auth` middleware takes a **token
-verifier**, `(lambda (token) claims-or-#f)`, and builds the middleware
-around it. Both are procedures of one argument, so handing a
-`session-guard` to `auth` is accepted and then called with a token
-string. `token-guard` exists to lift a verifier into a guard; there is no
-lowering in the other direction, because a request is not a credential.
+visible at boot. The shapes in play:
+
+| shape | who takes it |
+|---|---|
+| token verifier `(lambda (token) claims-or-#f)` | `auth`, `token-guard` |
+| request guard `(lambda (req) claims-or-#f)` | `app-ws`, `app-rpc` |
+| middleware `(lambda (req res next))` | `app-use`, `admin-listen`'s `auth` option — and it is what `auth` *returns* |
+
+`auth` lifts a verifier into middleware; `token-guard` lifts one into a
+request guard; `session-guard` is a request guard natively. Nothing
+converts the other way, because a request is not a credential. All of
+them are procedures, so installing the wrong one is accepted and fails
+on the first request that reaches it — an arity exception in the
+middleware slot, or a token string handed to something expecting a
+request.
 
 - `(req-claims req)` → claims or `#f` — the claims left by `auth`, an `app-ws` guard, or an `app-rpc` guard.
 
@@ -3444,7 +3452,7 @@ This subsection is for authors building a **third** SQL driver; applications nev
 
 `(igropyr mysql)`, `(igropyr postgresql)` and `(igropyr qjspool)` sit on one shared engine, `(igropyr connpool)`. It owns the whole pool architecture — a fixed pool of connections behind a dispatcher, whole-connection leases, and monitor-based crash reclaim — while staying **protocol-blind**: the wire protocol, authentication and result parsing stay in each driver. Keeping it a single copy means a fix to a subtle race (checkout-cancel, reclaim of a borrower killed mid-lease, adoption of a worker that finished connecting after its pool is gone, refusing to re-lend a connection already on its way out) can never land in one driver but not the others.
 
-It was written for the two SQL drivers and was called `sqlpool`. What it models is both narrower than SQL and wider: a scarce **exclusive** resource whose work happens on the far side of a socket, borrowed for the length of one request. Adding the render pool as a third driver generalized it three times. The request became opaque — it had been SQL-shaped, down to the message names — so a driver's traffic no longer has to look like a statement. The deadlines moved from module constants into the per-driver config, because a minute is right for a database and wrong for a render. And `connpool-lease` grew `broken-on-escape?`: when the borrowed procedure leaves non-locally, a SQL driver can hand the connection back clean, but a render that timed out may still be running on the far side, so the connection has to be treated as broken instead. `(igropyr qjspool)` passes `#t`. A fourth driver whose work can outlive the caller's deadline needs that argument; returning such a connection clean lets the next request share it with one still executing. A fourth driver should also expect to find a fourth generalization: three is what has been needed so far, not a bound.
+It was written for the two SQL drivers and was called `sqlpool`. What it models is both narrower than SQL and wider: a scarce **exclusive** resource whose work happens on the far side of a socket, borrowed for the length of one request. Adding the render pool as a third driver generalized it three times. The request became opaque — it had been SQL-shaped, down to the message names — so a driver's traffic no longer has to look like a statement. The deadlines moved from module constants into the per-driver config, because a minute is right for a database and wrong for a render. And `connpool-lease` grew `broken-on-escape?`: when the borrowed procedure leaves non-locally, the question is whether the connection is safe to **lend again**. For a SQL connection it is — the worker serialises whatever is still in flight, and the next borrower waits behind it. For a render worker a cancelled job and a new one can race, so the connection is retired instead. (Not because a timed-out render may still be running and a timed-out statement may not: a timed-out statement's outcome is unknown too, and it may still execute on the server.) `(igropyr qjspool)` passes `#t`. A fourth driver needs that argument if an abandoned request and the next one can overlap on the same connection; returning it clean is what lets them. A fourth driver should also expect to find a fourth generalization: three is what has been needed so far, not a bound.
 
 Exports:
 
