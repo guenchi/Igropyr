@@ -2,8 +2,8 @@
 ;;; (igropyr conv-status) -- the answers a conversation can give,
 ;;; and nothing else.
 ;;;
-;;; SPLIT OUT SO THAT ASKING WHAT A STATUS MEANS COSTS NOTHING. The status
-;;; vocabulary is seven one-line predicates, but they used to live in
+;;; SPLIT OUT SO THAT ASKING WHAT A STATUS MEANS COSTS NOTHING. These are
+;;; one-line predicates, but they used to live in
 ;;; (igropyr conversation), which imports the actor scheduler, libuv and
 ;;; the node layer -- and whose body runs work at LOAD time: it stamps a
 ;;; clock and reads /dev/urandom for this process's incarnation. A caller

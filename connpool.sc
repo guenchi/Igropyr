@@ -17,9 +17,13 @@
 ;;; wider: a scarce EXCLUSIVE resource whose work happens on the far side
 ;;; of a socket, borrowed for the length of one request. (igropyr qjspool)
 ;;; -- QuickJS renders in worker processes -- is the third driver, and
-;;; needed one generalization to fit (the deadlines moved from module
-;;; constants into the config, because a minute is right for a database
-;;; and wrong for a render) and nothing else.
+;;; fitting it generalized this engine three times: the request became
+;;; opaque (it had been SQL-shaped, down to the message names); the
+;;; deadlines moved from module constants into the config, because a
+;;; minute is right for a database and wrong for a render; and
+;;; connpool-lease grew broken-on-escape?, because a render that timed
+;;; out may still be running on the far side while a query is not.
+;;; A fourth driver should expect to find a fourth.
 ;;;
 ;;; The engine is PROTOCOL-BLIND: the wire protocol, authentication and
 ;;; result parsing stay in each driver. The message contract a driver's

@@ -1031,6 +1031,13 @@
   ;; answers AuthenticationOk without looking at the password, and this
   ;; check still refuses the connect. Say so rather than let the sentence
   ;; above read as `this client can only do SCRAM'.
+  ;;
+  ;; The way out of that corner is 'allow-cleartext-auth, which skips this
+  ;; check -- and which means what it says: if the server then asks for a
+  ;; cleartext password, this client sends one. That is the option's
+  ;; semantics, not a side effect of using it here, and it is why the
+  ;; assertion below does not suggest it. An error message recommending an
+  ;; auth relaxation gets taken as the cure by people whose server does ask.
   (define (check-password! who password opts)
     (unless (or (scram-safe-password? password)
                 (assq-ref opts 'allow-cleartext-auth))

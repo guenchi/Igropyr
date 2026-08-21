@@ -1,7 +1,9 @@
 #!chezscheme
 ;;; (igropyr auth) -- authentication: the ROLE layer, credential-format
 ;;; neutral. Token formats live elsewhere ((igropyr jwt) today); this
-;;; library turns any verifier into request guards for both channels:
+;;; library turns a verifier into what each place that authenticates a
+;;; request needs. THE SHAPES ARE NOT THE SAME -- see below; a guard
+;;; written for one of these does not drop into another:
 ;;;
 ;;;   ;; HTTP routes: middleware, refuses with 401
 ;;;   (app-use app (auth (jwt-verifier key)))
@@ -13,12 +15,20 @@
 ;;;   (app-ws app "/feed" feed-session
 ;;;     (session-guard store '((origins . ("https://app.example")))))
 ;;;
-;;;   ;; both channels: claims in the handler / ws session
+;;;   ;; sexpr RPC: app-rpc takes a request guard, like app-ws
+;;;   (app-rpc app "/rpc" handlers (token-guard (jwt-verifier key)))
+;;;
+;;;   ;; all of them: claims in the handler / ws session / rpc handler
 ;;;   (req-claims req)
 ;;;
 ;;; Two verifier shapes:
 ;;;   token verifier  (lambda (token) claims | #f)   -- e.g. jwt-verifier
-;;;   request guard   (lambda (req) claims | #f)     -- what app-ws takes
+;;;                                                  -- what `auth' takes
+;;;   request guard   (lambda (req) claims | #f)     -- what app-ws and
+;;;                                                     app-rpc take
+;;; Passing a request guard where a token verifier belongs type-checks
+;;; (both are procedures of one argument) and then hands it a token
+;;; string. Nothing catches that at boot.
 ;;; token-guard lifts the former into the latter; session-guard is a
 ;;; request guard natively (the credential is the session cookie).
 ;;;

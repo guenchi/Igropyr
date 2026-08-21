@@ -53,12 +53,16 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
 - **Middleware suite** — cookie sessions (gen-server store, CSPRNG sids),
   CORS with preflight, security headers, and an access logger
 - **Authentication** — `(igropyr auth)` is the format-neutral *auth role*.
-  Every channel that takes a request is guarded by the same protocol: the
-  `auth` middleware guards HTTP routes with a `Bearer` token (any
+  The `auth` middleware guards HTTP routes with a `Bearer` token (any
   verifier — `(jwt-verifier key)` today — 401 otherwise), `token-guard` /
   `session-guard` guard WebSocket upgrades before the handshake, and
-  `app-rpc` takes a guard of that same shape. Defend one and you have not
-  defended the others; they are separate doors.
+  `app-rpc` takes a guard like the WebSocket one. **Two shapes, not one**:
+  `auth` takes a *token verifier* `(lambda (token) …)`, while `app-ws` and
+  `app-rpc` take a *request guard* `(lambda (req) …)`. Both are procedures
+  of one argument, so passing the wrong one is a runtime surprise, not a
+  boot-time error. And these are separate doors: guarding one is not
+  guarding another, nor does any of it reach an app you built yourself with
+  a second `app-listen` / `admin-listen`, or a raw `http-listen`.
   `session-guard` takes an `origins` allow-list:
   the same-origin policy does not cover WebSockets and the browser attaches
   the session cookie whatever page opened the socket, so that list is what
@@ -519,9 +523,11 @@ invalid JSON) and `send-json!` serializes:
 ## OTP building blocks
 
 Beyond raw `spawn`/`send`/`receive`, OTP-style building blocks make
-stateful services and fan-out easy. Two are libraries — `(igropyr
-gen-server)` and `(igropyr pubsub)` — and the process registry is not: it
-is `register` / `unregister` / `whereis` in `(igropyr actor)` itself.
+stateful services and fan-out easy: `(igropyr gen-server)` for stateful
+services, `(igropyr otp)` for a supervised worker pool, `(igropyr pubsub)`
+for fan-out, and `(igropyr dpool)` lifting the worker pool across a mesh.
+The process registry is not a library of its own — it is `register` /
+`unregister` / `whereis` in `(igropyr actor)` itself.
 
 A `gen-server` is a stateful service reduced to callbacks; calls carry a
 unique tag and monitor the server, so a crash surfaces immediately
