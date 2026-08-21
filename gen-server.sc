@@ -23,7 +23,8 @@
 ;;;
 ;;; The last slot of every #(gen-server-error ...) is a value at most 200
 ;;; characters long: a small one passes through and stays eq?-comparable,
-;;; anything else is replaced by a label describing its shape. Nothing
+;;; anything else is replaced by a label -- one naming its shape where
+;;; the kind is one this knows, "#<value>" where it is not. Nothing
 ;;; prints the caller's value to build that label -- printing is what was
 ;;; unbounded. (Writing a string slot adds Scheme's quoting on top of
 ;;; those 200.) See scalar-summary.
@@ -57,8 +58,11 @@
   ;;
   ;; So the slot holds a small value the caller may print freely. Values
   ;; that already are such pass through UNCHANGED, which keeps
-  ;; 'server-died's `normal' and a registered name eq?-dispatchable.
-  ;; Everything else is replaced by a LABEL describing its shape.
+  ;; 'server-died's `normal' and a registered name of at most 200
+  ;; characters eq?-dispatchable -- that threshold is a contract, and
+  ;; it is stated again below because it is easy to read as a detail.
+  ;; Everything else is replaced by a LABEL: one naming its shape when
+  ;; the kind is one this knows, "#<value>" when it is not.
   ;;
   ;; NOTHING HERE PRINTS THE VALUE, and that is the design, not an
   ;; optimisation. Bounding a rendering does not bound producing it: a
@@ -83,46 +87,70 @@
   ;; its pretty name in a label.
   (define summary-max-chars 200)
 
-  (define (clip s)
-    (if (> (string-length s) summary-max-chars)
-        (string-append (substring s 0 (- summary-max-chars 3)) "...")
-        s))
+  ;; Take the body down to its budget FIRST, then frame it. The other
+  ;; order copies a megabyte-long name in full before any clip can see
+  ;; it -- which is the same mistake as printing a value to find out it
+  ;; was too big, one level down. (One copy of the name is still taken,
+  ;; by symbol->string; that is a string the caller already interned, not
+  ;; something generated from it.)
+  (define (framed prefix body suffix)
+    (let ((room (- summary-max-chars
+                   (string-length prefix) (string-length suffix)))
+          (n (string-length body)))
+      (string-append
+        prefix
+        (if (<= n room)
+            body
+            (string-append (substring body 0 (max 0 (- room 3))) "..."))
+        suffix)))
 
   ;; one bounded label, built without printing anything
   (define (label-of x)
     (cond
       ((symbol? x)
        (if (gensym? x)
-           (clip (string-append "#<gensym " (symbol->string x) ">"))
-           (clip (symbol->string x))))
-      ((string? x) (clip x))
+           (framed "#<gensym " (symbol->string x) ">")
+           (framed "" (symbol->string x) "")))
+      ((string? x) (framed "" x ""))
       ((char? x) (string x))
       ((number? x) "#<number>")
       ((procedure? x) "#<procedure>")
       ((vector? x)
-       (let ((n (vector-length x)))
-         (if (and (fx> n 0) (symbol? (vector-ref x 0))
-                  (not (gensym? (vector-ref x 0))))
-             (clip (string-append "#(" (symbol->string (vector-ref x 0))
-                                  " ...)"))
-             "#(...)")))
+       ;; READ SLOT 0 ONCE. A vector the caller still holds can be
+       ;; mutated between a predicate and the accessor that trusted it,
+       ;; and the scheduler is preemptive, so classifying a second read
+       ;; is how symbol->string gets handed a fixnum.
+       (if (fx> (vector-length x) 0)
+           (let ((tag (vector-ref x 0)))
+             (if (and (symbol? tag) (not (gensym? tag)))
+                 (framed "#(" (symbol->string tag) " ...)")
+                 "#(...)"))
+           "#(...)"))
       ((pair? x) "(...)")
       ((null? x) "()")
       ((boolean? x) (if x "#t" "#f"))
+      ((bytevector? x) "#<bytevector>")
+      ((port? x) "#<port>")
       ((record? x)
-       (clip (string-append "#<"
-                            (symbol->string (record-type-name (record-rtd x)))
-                            ">")))
+       (framed "#<" (symbol->string (record-type-name (record-rtd x))) ">"))
       (else "#<value>")))
 
   (define (short-enough? s) (<= (string-length s) summary-max-chars))
 
+  ;; The kinds that pass through are the ones that are already small AND
+  ;; already eq?-dispatchable. Everything else gets a label, and the
+  ;; guard is the floor: whatever goes wrong building one, the caller
+  ;; still receives the gen-server-error it was about to get, not the
+  ;; failure of the thing describing it.
   (define (scalar-summary x)
-    (if (or (fixnum? x) (boolean? x) (null? x) (char? x)
-            (and (symbol? x) (not (gensym? x)) (short-enough? (symbol->string x)))
-            (and (string? x) (short-enough? x)))
-        x
-        (label-of x)))
+    (guard (e (#t "#<unsummarisable>"))
+      (if (or (fixnum? x) (boolean? x) (null? x) (char? x)
+              (eof-object? x) (eq? x (void))
+              (and (symbol? x) (not (gensym? x))
+                   (short-enough? (symbol->string x)))
+              (and (string? x) (short-enough? x)))
+          x
+          (label-of x))))
 
   (define (resolve srv)
     (if (symbol? srv)
