@@ -950,18 +950,17 @@
     (drain-stale!)
     (let ((ref (gensym)))
       (send pool (vector 'pool-stats ref self))
-      ;; STRUCTURED, NOT A BARE SYMBOL. A guard can pick a symbol out by
-      ;; eq?, so this is not about being unable to catch it. It is about
-      ;; there being nothing to catch: a symbol carries its name and
-      ;; nothing else -- no reason to branch on, no context to report --
-      ;; and the name is not ours. Symbols are interned by name, so a
-      ;; caller who raises `connpool-stats-timeout' for its own control
-      ;; flow raises THE SAME OBJECT, and neither side can tell which of
-      ;; them it came from. The tagged shape is the one the rest of this
-      ;; framework raises -- #(durable-error op path), #(dpool-error
-      ;; reason id) -- so one clause matching on the tag covers this
-      ;; library, and the third slot says WHICH pool stopped replying
-      ;; rather than only that one has.
+      ;; STRUCTURED, NOT A BARE SYMBOL. Not because a symbol is hard to
+      ;; catch -- eq? picks one out exactly -- but because this raise has
+      ;; two things to say and a symbol is one value: WHICH failure it
+      ;; was, and WHICH pool it was. Slots 1 and 2 carry them, the way
+      ;; #(durable-error op path) and #(dpool-error reason id) do.
+      ;;
+      ;; Two things it does NOT do, both of which have been claimed here
+      ;; before and are wrong. It says nothing about who raised it: those
+      ;; tag symbols are as public as any others and a caller can build
+      ;; the same vector. And it is not this procedure's whole error
+      ;; surface -- the `not a pool' case below raises a condition.
       ;;
       ;; THE ID, NOT THE POOL. A context slot holds a printable
       ;; scalar. Not a style rule: `write` is unbounded by default, a
