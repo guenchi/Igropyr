@@ -11,8 +11,8 @@
 ;;; install quickjs-ng (libqjs), or anything exporting the same
 ;;; interface; bellard's build, loaded on its own, is refused. Set
 ;;; IGROPYR_LIBQUICKJS_SO or install on a standard path. Skips cleanly
-;;; (exit 0) when absent, so run-all stays green on hosts without
-;;; QuickJS.
+;;; (exit 0) when no checked candidate path holds one, so run-all stays
+;;; green on hosts without QuickJS.
 
 (import (chezscheme) (igropyr quickjs))
 
@@ -42,7 +42,9 @@
 ;; environment defect and must be loud; a skip would make it look like
 ;; no engine.
 (unless (raw-quickjs-present?)
-  (display "quickjs: no QuickJS library found, test skipped\n")
+  (display "quickjs: no QuickJS library at any checked candidate path, test skipped\n")
+  (display "  (a libqjs visible only through LD_LIBRARY_PATH/DYLD_LIBRARY_PATH is\n")
+  (display "   not seen by this file check: set IGROPYR_LIBQUICKJS_SO)\n")
   (display "  (install quickjs-ng -- it ships libqjs -- or point\n")
   (display "   IGROPYR_LIBQUICKJS_SO at one; bellard's libquickjs, on its\n")
   (display "   own, boots only far enough to be refused)\n")

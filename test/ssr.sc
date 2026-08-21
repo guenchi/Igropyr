@@ -5,7 +5,8 @@
 ;;; a throwing render surfaces via ssr-try-render without being cached (engine
 ;;; recovers via crash-only rebuild). The redis-backend checks run only when a
 ;;; local Redis answers (else skipped). SHIM-GATED like test/quickjs.sc: skips
-;;; cleanly when the QuickJS dylib is absent, so run-all stays green without it.
+;;; cleanly when no checked candidate path holds a QuickJS library, so
+;;; run-all stays green without one.
 
 (import (chezscheme) (igropyr actor) (igropyr ssr)
         (only (igropyr quickjs) qjs-call!)
@@ -39,7 +40,9 @@
 ;; with the driver's refusal naming the remedy -- loud on purpose, a
 ;; wrong engine must not read as no engine.
 (unless (quickjs-present?)
-  (display "ssr: no QuickJS library found, test skipped\n")
+  (display "ssr: no QuickJS library at any checked candidate path, test skipped\n")
+  (display "  (a libqjs visible only through the loader's search path is not seen\n")
+  (display "   by this file check: set IGROPYR_LIBQUICKJS_SO)\n")
   (display "  (install quickjs-ng -- libqjs -- or set IGROPYR_LIBQUICKJS_SO)\n")
   (exit 0))
 

@@ -15,10 +15,14 @@
 ;;; SHIM-GATED like test/quickjs.sc: skips when no candidate path holds
 ;;; a file, because the worker process cannot boot an engine without
 ;;; one. The gate checks nothing beyond existence -- not that the file
-;;; is QuickJS, not even that it is a loadable DSO; a wrong file fails
-;;; at load, a wrong build (bellard's, loaded on its own) fails at the
-;;; boot symbol check -- both loudly, past the gate, and a wrong engine
-;;; must not read as no engine.
+;;; is QuickJS, not even that it is a loadable DSO. Past the gate: the
+;;; loader tries candidates IN ORDER and a bad one is skipped for the
+;;; next, so a broken file is loud only when every candidate fails
+;;; (platform.sc lists them all then) -- an unloadable explicit path
+;;; with a good libqjs behind it falls through silently, which is a
+;;; ledgered behaviour question, not this suite's to fix. A wrong BUILD
+;;; (bellard's, loaded on its own) fails loudly at the boot symbol
+;;; check, and a wrong engine must not read as no engine.
 
 (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr qjspool)
         (only (igropyr ssr) make-ssr ssr-render ssr-try-render ssr-invalidate! ssr-stats)
@@ -191,7 +195,9 @@
 ;; a check had in fact failed would be the report this suite's
 ;; conventions exist to prevent.
 (unless (quickjs-present?)
-  (display "qjspool: no QuickJS library found, WORKER tests skipped\n")
+  (display "qjspool: no QuickJS library at any checked candidate path, WORKER tests skipped\n")
+  (display "  (a libqjs visible only through the loader's search path -- LD_LIBRARY_PATH,\n")
+  (display "   DYLD_LIBRARY_PATH -- is not seen by this file check: set IGROPYR_LIBQUICKJS_SO)\n")
   (display "  (install quickjs-ng -- it ships libqjs -- or set IGROPYR_LIBQUICKJS_SO;\n")
   (display "   the structural check above needs no engine and did run)\n")
   (exit (if (= failures 0) 0 1)))
