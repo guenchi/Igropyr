@@ -135,6 +135,73 @@
         (let loop ((i 0) (s "42"))
           (if (= i 100) s (loop (+ i 1) (string-append "#(" s ")"))))))
 
+;; ---- writer/reader symbol agreement ------------------------------------
+;; The writer's question is "how will the READER read this name back",
+;; not "does Chez think it is a number". The gap between those two
+;; judgments was a self-incompatible wire: |0x10| went out bare and came
+;; back "bad number". A numeric-shaped name (leading digit, or '-' then
+;; a digit) is read as a number or refused -- never as a symbol -- so
+;; the writer must refuse it, in both modes.
+(check "no-write-hexlike-symbol" (write-fails? (string->symbol "0x10")))
+(check "no-write-digitlead-symbol" (write-fails? (string->symbol "12abc")))
+(check "no-write-zero-denom-symbol" (write-fails? (string->symbol "1/0")))
+(check "no-write-neg-digitlead-symbol" (write-fails? (string->symbol "-1x")))
+(check "ext-no-write-hexlike-symbol"
+       (ext-write-fails? (string->symbol "0x10")))
+;; the old refusals stay refusals
+(check "no-write-number-named-symbol" (write-fails? (string->symbol "12")))
+(check "no-write-dot-symbol" (write-fails? (string->symbol ".")))
+;; |+i| is Chez-number but NOT numeric-shaped: its refusal is supplied
+;; ONLY by the retained string->number check. Without this pin, an
+;; implementation that swapped that check for numeric-shape (instead of
+;; adding to it) would pass every other case here.
+(check "no-write-chez-number-symbol" (write-fails? (string->symbol "+i")))
+;; and every name the writer DOES pass must read back as itself -- the
+;; round-trip property the refusals exist to protect
+(check "symbol-write-read-identity"
+       (for-all (lambda (name)
+                  (let ((sym (string->symbol name)))
+                    (eq? sym (string->sexpr (sexpr->string sym)))))
+                '("a1" "x0x10" "a.b" "-" "+" "..." "-a" "a-1"
+                  "<=?" ":kw" "@x" "%raw" "a/b" "-x/y")))
+
+;; ---- depth: the exact boundary, both directions ------------------------
+;; depth-bomb (100) and depth-ok (50) bracket the limit without pinning
+;; it. 64 must round-trip and 65 must be refused by BOTH ends -- a
+;; writer that allowed 65 would emit wire the reader rejects, the same
+;; asymmetry class as the numeric-shape and token-length fixes.
+(check "depth-64-roundtrips"
+       (let ((x (let lp ((k 64) (x 42)) (if (zero? k) x (lp (- k 1) (list x))))))
+         (equal? x (string->sexpr (sexpr->string x)))))
+(check "no-write-depth-65"
+       (write-fails?
+        (let lp ((k 65) (x 42)) (if (zero? k) x (lp (- k 1) (list x))))))
+(check "no-read-depth-65"
+       (parse-fails?
+        (let lp ((k 65) (s "42"))
+          (if (zero? k) s (lp (- k 1) (string-append "(" s ")"))))))
+
+;; ---- token length: the writer honours the reader's bound ---------------
+;; The reader caps bare tokens at 65536 chars ("token too long"). A
+;; writer without the same cap emits wire the peer must reject -- the
+;; error surfaces at the WRONG end, after the bytes crossed. The bound
+;; is measured on the whole token, sign included: a length check that
+;; counts digits only passes the negative case below.
+(check "sym-at-bound-roundtrips"
+       (let ((sym (string->symbol (make-string 65536 #\a))))
+         (eq? sym (string->sexpr (sexpr->string sym)))))
+(check "no-write-sym-over-bound"
+       (write-fails? (string->symbol (make-string 65537 #\a))))
+(check "int-at-bound-roundtrips"
+       (let ((n (- (expt 10 65536) 1)))          ; 65536 digits
+         (= n (string->sexpr (sexpr->string n)))))
+(check "no-write-int-over-bound"
+       (write-fails? (expt 10 65536)))            ; 65537 digits
+(check "no-write-neg-int-at-digit-bound"
+       (write-fails? (- (expt 10 65535))))        ; sign makes it 65537
+(check "no-write-ratio-over-bound"
+       (write-fails? (/ (expt 10 65536) 3)))
+
 ;; the extension must not leak into strict mode
 (check "strict-still-no-vector" (parse-fails? "#(1 2 3)"))
 (check "strict-still-no-bv" (parse-fails? "#vu8\"AgM=\""))
