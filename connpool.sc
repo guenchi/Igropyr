@@ -953,8 +953,10 @@
       ;; STRUCTURED, NOT A BARE SYMBOL. Not because a symbol is hard to
       ;; catch -- eq? picks one out exactly -- but because this raise has
       ;; two things to say and a symbol is one value: WHICH failure it
-      ;; was, and WHICH PROCESS did not answer. Slots 1 and 2 carry them,
-      ;; the way
+      ;; was, and WHICH PROCESS the deadline expired on. (Not that it
+      ;; never answered: a reply arriving at 5001ms answered, late, and
+      ;; drain-stale! above discards exactly that.) Slots 1 and 2 carry
+      ;; them, the way
       ;; #(durable-error op path) and #(dpool-error reason id) do.
       ;;
       ;; Two things it does NOT do, both of which have been claimed here
@@ -980,8 +982,10 @@
       ;; it was handed and a plain actor that ignores `pool-stats' times
       ;; out the same way -- nor that it is still alive. And across
       ;; runtimes it names nothing at all: pid-counter starts at 0 in
-      ;; every process, so a `7' in an aggregated log distinguishes
-      ;; nothing without the node it came from.
+      ;; every process, so a `7' in an aggregated log needs the RUNTIME
+      ;; it came from to mean anything -- and a host or a service name is
+      ;; not that, because two processes on one host, or one process
+      ;; restarted, both count from 0 again.
       ;;
       ;; Conditions are exempt and may carry the process itself, as the
       ;; `not a pool' report below does: `write` on a condition gives
