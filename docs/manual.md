@@ -4808,8 +4808,10 @@ code.
 It runs in **pure Scheme** over a stock shared QuickJS library, bound
 directly through the FFI — no custom C. Install quickjs-ng (`libqjs`); the
 gate is described below. Two of `qjs-boot!`'s checks are about the
-engine, as opposed to its arguments or the load itself. The library must
-export `JS_FreeValue` as a real function. And the global object's tag,
+engine, as opposed to its arguments or the load itself. `JS_FreeValue`
+must resolve as a real function — in the process's global symbol
+namespace, which in a process that has loaded no other QuickJS means the
+library just loaded. And the global object's tag,
 read through this binding's `JSValue` ftype, must come back as
 `JS_TAG_OBJECT` — which catches a NaN-boxed or re-ordered layout, though
 not one that happens to put an object tag at the same place; that check
@@ -4830,8 +4832,8 @@ export `JS_FreeValue` (see below); point it at a library with
 #### Which QuickJS: install quickjs-ng
 
 Install **quickjs-ng 0.15+** (`libqjs`). What the code checks is not the
-upstream's name or version but the symbol: `qjs-boot!` refuses a library
-that does not export `JS_FreeValue` as a real function, and says so —
+upstream's name or version but the symbol: `qjs-boot!` refuses to bind
+unless `JS_FreeValue` resolves, and says so —
 naming bellard's `libquickjs` as the likely find and telling you to install
 quickjs-ng or point `IGROPYR_LIBQUICKJS_SO` at one. Anything exporting a
 compatible `JS_FreeValue` gets past that gate; ng 0.15+ is what this is
@@ -4840,7 +4842,7 @@ developed and measured against.
 | | library name | `JS_FreeValue` | here |
 |---|---|---|---|
 | [quickjs-ng](https://github.com/quickjs-ng/quickjs) 0.15+ | `libqjs` | exported as a real function | **install this** |
-| [bellard/quickjs](https://bellard.org/quickjs/) | `libquickjs` | a header inline; only the `__JS_FreeValue` slow path is exported | refused at the gate |
+| [bellard/quickjs](https://bellard.org/quickjs/) | `libquickjs` | a header inline; only the `__JS_FreeValue` slow path is exported | does not get past the symbol check |
 
 What the requirement buys: releasing a value is one FFI call. Supporting
 bellard meant reproducing the inline in Scheme — read the tag, compute the
