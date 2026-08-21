@@ -213,19 +213,52 @@
         (check "...allocating kilobytes, not the megabyte"
                (< delta 500000) delta)))
 
-    ;; ---- mechanism: a mutating message cannot break the error --------
-    ;; the slot is read once into a local before classification; under
-    ;; preemptive scheduling a concurrent flipper used to land between
-    ;; the reads and turn the raise into symbol->string blowing up
-    (let ((msg (vector 'tag 'x)) (bad 0))
-      (spawn (lambda ()
-               (do ((i 0 (+ i 1))) ((= i 200000))
-                 (vector-set! msg 0 (if (even? i) 'tag 17)))))
-      (do ((i 0 (+ i 1))) ((= i 3000))
-        (let ((e (catch (lambda () (gen-server-call self msg 100)))))
-          (unless (err? e 'calling-self) (set! bad (+ bad 1)))))
-      (check "3000 calls against a flipping message: every raise is the error"
-             (= bad 0) bad))
+    ;; ---- mechanism: the classified value IS the used value -----------
+    ;; DETERMINISTIC, NOT A RACE. A racy flipper cell stood here first
+    ;; and was judged non-discriminating: with the fallback guard in
+    ;; place, even the old three-read code delivered gen-server-error,
+    ;; so counting non-errors measured the guard, not the single read
+    ;; -- the defence we added made the probe for what it defends
+    ;; blind. Instead, label-of's own definition is extracted from
+    ;; gen-server.sc and re-evaluated with vector-ref replaced by a
+    ;; counting shim that mutates the slot right after the FIRST read:
+    ;; a single-read implementation reads once and labels the value it
+    ;; classified; the old shape read again after classifying and
+    ;; handed symbol->string a fixnum.
+    (let* ((raw-ref vector-ref)
+           (reads (box 0))
+           (probe-ref (lambda (v i)
+                        (set-box! reads (+ 1 (unbox reads)))
+                        (let ((answer (raw-ref v i)))
+                          (when (= 1 (unbox reads)) (vector-set! v i 17))
+                          answer)))
+           (find (lambda (pred x)
+                   (let loop ((x x))
+                     (cond ((pred x) x)
+                           ((pair? x) (or (loop (car x)) (loop (cdr x))))
+                           (else #f)))))
+           (form (call-with-input-file "gen-server.sc" read))
+           (defn (find (lambda (x)
+                         (and (pair? x) (eq? (car x) 'define)
+                              (pair? (cdr x)) (pair? (cadr x))
+                              (eq? (caadr x) 'label-of)))
+                       form)))
+      (check "label-of's definition is where this probe expects it"
+             (and defn #t))
+      (when defn
+        (let ((r (guard (e (#t (cons 'raised e)))
+                   (eval `(let ((vector-ref ',probe-ref)
+                                (framed (lambda (p b s)
+                                          (string-append p b s))))
+                            (letrec ((label-of
+                                       (lambda ,(cdr (cadr defn))
+                                         ,@(cddr defn))))
+                              (label-of (vector 'tag 'x))))
+                         (environment '(chezscheme))))))
+          (check "slot 0 is read exactly once" (= 1 (unbox reads))
+                 (unbox reads))
+          (check "...and the label is of the value that was classified"
+             (equal? r "#(tag ...)") r))))
 
     (if (zero? failures)
         (begin (display "gen-server-error-scalar: all tests passed\n")
