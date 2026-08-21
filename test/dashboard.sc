@@ -13,12 +13,16 @@
 (define auth-port 18112)
 (define authv-port 18113)
 (define hdr-port 18114)
-;; TWIN TOKENS, SAME SHAPE, MINTED PER RUN. Minting excludes acceptors
-;; whose accepted value is a source constant -- the value did not exist
-;; when the source was written. The twins close the other road: both
-;; are "tk-" + six digits, so an acceptor judging by shape treats them
-;; alike and must fail one of the two token cells below. Which twin is
-;; the good one is knowledge that exists only inside the verify closure.
+(define hdr2-port 18115)
+;; TWIN TOKENS, ONE LEXICAL SHAPE, MINTED PER RUN. Bounded claims, each
+;; with its evidence: the pair excludes the tested fixed-constant
+;; acceptor (the candidate space is small enough that a lucky constant
+;; is possible, so "excludes source constants" would overclaim) and
+;; excludes stateless format discriminators -- prefix, length, charset
+;; -- since both tokens share the format. They do NOT by themselves
+;; prove the injected verify is consulted: an acceptor keyed on call
+;; order passes them (it did -- see the differential pair below, which
+;; is what actually measures consultation).
 (random-seed (+ 1 (modulo (real-time) 1000000000)))
 (define (mint-token)
   (string-append "tk-" (number->string (+ 100000 (random 900000)))))
@@ -164,18 +168,24 @@
       ;; extracted expression is a proxy: every three-argument procedure
       ;; has app-use arity, including (lambda (req res next) (next)) --
       ;; an unconditional pass. So the example's auth expression is not
-      ;; measured, it is MOUNTED: a fourth admin listener runs whatever
-      ;; the example builds, and the requests judge that it GATES like
-      ;; auth, in three states against the twin tokens minted above.
-      ;; What each state pins has its own evidence: minting excludes a
-      ;; source-constant acceptor (the tk2-hardcoded mutation reds the
-      ;; good-token cell); the same-shape twin excludes a shape-judging
-      ;; acceptor (a "tk-"-prefix mutation reds the twin cell) -- the
-      ;; verdict differing between two same-shape tokens is not a
-      ;; function of their shape. (What lands in req-claims is pinned
-      ;; in test/jwt.sc -- test/auth.sc's own header says the HTTP
-      ;; middleware is jwt.sc's to cover -- and no dashboard route
-      ;; reads claims, so this fixture cannot observe them.)
+      ;; measured, it is MOUNTED -- twice. One listener gets a verify
+      ;; that accepts the good token; a second gets the SAME extracted
+      ;; expression with a verify that accepts nothing, and both
+      ;; receive the SAME request sequence. The differential is the
+      ;; judge: the same token answered 200 on one and 401 on the other
+      ;; is a verdict that varies with nothing but the injected
+      ;; verify's answer. An implementation that ignores verify --
+      ;; whether it keys on value, format, call order or mutable state
+      ;; -- evolves identically under identical sequences and answers
+      ;; both listeners alike, failing one side. (Each weaker probe
+      ;; earned its keep the hard way: value-keyed acceptors passed the
+      ;; single-token version, format-keyed ones passed the minted
+      ;; version, and an order-keyed one passed the twins.) These are
+      ;; behaviour samples, not a proof of internals beyond what they
+      ;; measure. (What lands in req-claims is pinned in test/jwt.sc --
+      ;; test/auth.sc's own header says the HTTP middleware is jwt.sc's
+      ;; to cover -- and no dashboard route reads claims, so this
+      ;; fixture cannot observe them.)
       ;;
       ;; The anchor must match exactly once (zero = the example moved:
       ;; fail loudly, do not skip; two = the anchor stopped being an
@@ -241,7 +251,35 @@
                               `((headers . (("Authorization"
                                              . ,(string-append
                                                   "Bearer "
-                                                  hdr-token-good))))))))))))))
+                                                  hdr-token-good)))))))))
+              ;; the differential pair: same expression, verify that
+              ;; accepts nothing, same request sequence -- the good
+              ;; token must now be REFUSED, which no verify-ignoring
+              ;; implementation can do while its sibling admits it
+              (let ((built2 (eval `(let ((verify (lambda (t) #f)))
+                                     ,(read (open-input-string
+                                              (substring src (+ (car hits) m)
+                                                         n))))
+                                  (environment '(chezscheme)
+                                               '(igropyr auth)))))
+                (when (procedure? built2)
+                  (admin-listen m srv
+                    `((host . "127.0.0.1") (port . ,hdr2-port)
+                      (auth . ,built2)))
+                  (sleep-ms 80)
+                  ;; identical sequence: tokenless, twin, good
+                  (GET (url hdr2-port "/data"))
+                  (GET (url hdr2-port "/data")
+                       `((headers . (("Authorization"
+                                      . ,(string-append "Bearer "
+                                                        hdr-token-twin))))))
+                  (check "the differential: same good token, opposite verify, 401"
+                    (= 401 (response-status
+                             (GET (url hdr2-port "/data")
+                                  `((headers . (("Authorization"
+                                                 . ,(string-append
+                                                      "Bearer "
+                                                      hdr-token-good)))))))))))))))))
 
       ;; ---- injection guard: a quote in the data path is rejected ----
       (check "quote-in-path-rejected"
