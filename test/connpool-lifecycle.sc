@@ -1201,10 +1201,13 @@
                     (= (vector-length caught) 3)
                     (let ((slot (vector-ref caught 2)))
                       (or (fixnum? slot) (string? slot)))))
-        ;; ...and it is THIS pool's id, not any scalar. "Which pool" is
-        ;; the slot's entire reason to exist: a constant, or another
-        ;; pool's id, satisfies scalar-ness and write-safety while
-        ;; telling the operator to go look at the wrong pool.
+        ;; ...and it is THIS pool's id, not any scalar. "Which pool"
+        ;; (within this runtime -- ids restart from zero per process,
+        ;; so a number in an aggregated log names a pool on a node, not
+        ;; a pool) is the slot's reason to exist. One sample cannot rule
+        ;; out a constant that happens to equal it; the second probe
+        ;; below, against a different pool, can -- no single constant
+        ;; equals both ids.
         (check "the context slot names the pool that went silent"
                (and (vector? caught)
                     (= (vector-length caught) 3)
@@ -1216,6 +1219,20 @@
         (when (symbol? caught)
           (display "  [info] raised a bare symbol: ")
           (write caught) (newline))
+        ;; the second probe: a different deaf pool must yield ITS id --
+        ;; this is what rules out a constant fitted to the first sample.
+        ;; Another full deadline is the price.
+        (let* ((deaf2 (spawn (lambda () (receive (`#(never-sent) 'ok)))))
+               (caught2 (guard (e (#t e))
+                          (connpool-stats deaf2)
+                          'no-raise)))
+          (check "a second silent pool yields its own, different id"
+                 (and (vector? caught2)
+                      (= (vector-length caught2) 3)
+                      (equal? (vector-ref caught2 2) (process-id deaf2))
+                      (not (equal? (vector-ref caught2 2)
+                                   (process-id deaf)))))
+          (kill deaf2 'cleanup))
         (kill deaf 'cleanup)))
 
     (sleep-ms 100)

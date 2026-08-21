@@ -117,18 +117,23 @@
       (sleep-ms 80)
       (check "verifier-composed auth refuses a tokenless request with 401"
         (= 401 (response-status (GET (url authv-port "/data")))))
-      ;; the refusal must be AUTH'S OWN -- its 401 with its JSON body,
-      ;; parsed and matched structurally. A bare not-500 discriminates
-      ;; nothing (any wreck is a 500, any non-500 passed it), and a
-      ;; substring match would accept a hand-rolled text refusal that
-      ;; stopped being auth's.
+      ;; the refusal must be AUTH'S OWN. A bare not-500 discriminated
+      ;; nothing, and identity -- not absence-of-500 -- is the judge:
+      ;; what a wreck looks like varies with when it happens (a 500
+      ;; before the response begins; a closed connection after). So the
+      ;; body is parsed as auth's JSON, the content type must be
+      ;; application/json exactly (or with parameters), and the
+      ;; WWW-Authenticate challenge must be auth's default.
       (check "...and the refusal is auth's own JSON, not a wreck"
         (let ((r (GET (url authv-port "/data"))))
           (and (= 401 (response-status r))
                (let ((ct (response-header r 'content-type)))
                  (and (string? ct)
-                      (>= (string-length ct) 16)
-                      (string=? (substring ct 0 16) "application/json")))
+                      (or (string=? ct "application/json")
+                          (and (> (string-length ct) 16)
+                               (string=? (substring ct 0 17)
+                                         "application/json;")))))
+               (equal? "Bearer" (response-header r 'www-authenticate))
                (equal? "unauthorized"
                        (let ((d (string->json
                                   (utf8->string (response-body r)))))
@@ -146,51 +151,63 @@
       ;; has app-use arity, including (lambda (req res next) (next)) --
       ;; an unconditional pass. So the example's auth expression is not
       ;; measured, it is MOUNTED: a fourth admin listener runs whatever
-      ;; the example builds, and the requests judge it as auth --
-      ;; refused without a token, admitted with one. The anchor must
-      ;; match exactly once (zero = the example moved: fail loudly, do
-      ;; not skip; two = the anchor stopped being an anchor) and must
-      ;; sit in the header commentary, so a stray copy elsewhere cannot
-      ;; be what gets extracted.
-      (check "the header example, mounted, refuses and admits like auth"
-        (let* ((src (call-with-input-file "dashboard.sc"
-                      (lambda (p) (get-string-all p))))
-               (pat "(auth . ,")
-               (m (string-length pat))
-               (n (string-length src))
-               (hits (let loop ((k 0) (acc '()))
-                       (cond ((> (+ k m) n) (reverse acc))
-                             ((string=? (substring src k (+ k m)) pat)
-                              (loop (+ k 1) (cons k acc)))
-                             (else (loop (+ k 1) acc))))))
-          (and (= 1 (length hits))
-               ;; the one hit lies on a ";;;" header-comment line
-               (let ((ls (let loop ((k (car hits)))
-                           (if (or (= k 0)
-                                   (char=? (string-ref src (- k 1)) #\newline))
-                               k (loop (- k 1))))))
-                 (and (>= n (+ ls 3))
-                      (string=? (substring src ls (+ ls 3)) ";;;")))
-               (let* ((expr (read (open-input-string
-                                    (substring src (+ (car hits) m) n))))
-                      (built (eval `(let ((verify (lambda (t)
-                                                    (and (equal? t "tk2")
-                                                         '(("sub" . "hdr"))))))
-                                      ,expr)
-                                   (environment '(chezscheme)
-                                                '(igropyr auth)))))
-                 (and (procedure? built)
-                      (begin
-                        (admin-listen m srv
-                          `((host . "127.0.0.1") (port . ,hdr-port)
-                            (auth . ,built)))
-                        (sleep-ms 80)
-                        (and (= 401 (response-status
-                                      (GET (url hdr-port "/data"))))
-                             (= 200 (response-status
-                                      (GET (url hdr-port "/data")
-                                           '((headers . (("Authorization"
-                                                          . "Bearer tk2"))))))))))))))
+      ;; the example builds, and the requests judge that it GATES like
+      ;; auth -- three states, because two are forgeable: no token and
+      ;; right token alone are satisfied by anything that admits every
+      ;; bearer; only wrong-token-refused pins that the injected verify
+      ;; is consulted. (What lands in req-claims is auth's contract and
+      ;; is pinned in test/auth.sc, not here: no dashboard route reads
+      ;; claims, so this fixture cannot observe them.)
+      ;;
+      ;; The anchor must match exactly once (zero = the example moved:
+      ;; fail loudly, do not skip; two = the anchor stopped being an
+      ;; anchor) and must sit BEFORE the (library ...) form -- the
+      ;; header commentary is everything above it, so a decoy in a
+      ;; comment or string further down cannot be what gets extracted.
+      (let* ((src (call-with-input-file "dashboard.sc"
+                    (lambda (p) (get-string-all p))))
+             (pat "(auth . ,")
+             (m (string-length pat))
+             (n (string-length src))
+             (find-from (lambda (needle from)
+                          (let ((w (string-length needle)))
+                            (let loop ((k from))
+                              (cond ((> (+ k w) n) #f)
+                                    ((string=? (substring src k (+ k w))
+                                               needle) k)
+                                    (else (loop (+ k 1))))))))
+             (hits (let loop ((k 0) (acc '()))
+                     (let ((i (find-from pat k)))
+                       (if i (loop (+ i 1) (cons i acc)) (reverse acc)))))
+             (libpos (find-from "(library" 0)))
+        (check "the example anchor is unique and in the header block"
+          (and (= 1 (length hits)) libpos (< (car hits) libpos)))
+        (when (and (= 1 (length hits)) libpos (< (car hits) libpos))
+          (let ((built (eval `(let ((verify (lambda (t)
+                                              (and (equal? t "tk2")
+                                                   '(("sub" . "hdr"))))))
+                                ,(read (open-input-string
+                                         (substring src (+ (car hits) m) n))))
+                             (environment '(chezscheme) '(igropyr auth)))))
+            (check "the extracted example builds a procedure"
+              (procedure? built))
+            (when (procedure? built)
+              (admin-listen m srv
+                `((host . "127.0.0.1") (port . ,hdr-port)
+                  (auth . ,built)))
+              (sleep-ms 80)
+              (check "the mounted example refuses a tokenless request"
+                (= 401 (response-status (GET (url hdr-port "/data")))))
+              (check "...refuses a WRONG token, so the verify is consulted"
+                (= 401 (response-status
+                         (GET (url hdr-port "/data")
+                              '((headers . (("Authorization"
+                                             . "Bearer nope"))))))))
+              (check "...and admits the right token"
+                (= 200 (response-status
+                         (GET (url hdr-port "/data")
+                              '((headers . (("Authorization"
+                                             . "Bearer tk2")))))))))))))
 
       ;; ---- injection guard: a quote in the data path is rejected ----
       (check "quote-in-path-rejected"
