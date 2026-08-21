@@ -1034,10 +1034,12 @@
   ;;
   ;; The way out of that corner is 'allow-cleartext-auth, which skips this
   ;; check -- and which means what it says: if the server then asks for a
-  ;; cleartext password, this client sends one. That is the option's
-  ;; semantics, not a side effect of using it here, and it is why the
-  ;; assertion below does not suggest it. An error message recommending an
-  ;; auth relaxation gets taken as the cure by people whose server does ask.
+  ;; cleartext password, this client sends one (except a password holding
+  ;; a NUL, which PasswordMessage cannot represent and which the cleartext
+  ;; path refuses on its own). That is the option's semantics, not a side
+  ;; effect of using it here, and it is why the assertion below does not
+  ;; suggest it: an error message recommending an auth relaxation gets
+  ;; taken as the cure by people whose server does ask.
   (define (check-password! who password opts)
     (unless (or (scram-safe-password? password)
                 (assq-ref opts 'allow-cleartext-auth))

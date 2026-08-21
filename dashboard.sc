@@ -13,7 +13,12 @@
 ;;;   ;;    monitoring surface is not reachable off-box unless you say so
 ;;;   (define admin (admin-listen m srv))            ; 127.0.0.1:9090
 ;;;   (admin-listen m srv `((host . "10.0.0.5") (port . 9090)
-;;;                         (auth . ,(token-guard verify))))  ; internal + auth
+;;;                         (auth . ,(auth verify))))         ; internal + auth
+;;;   ;; NOT (token-guard verify): the `auth' option is app-use-shaped
+;;;   ;; middleware, (lambda (req res next)), and token-guard makes a
+;;;   ;; one-argument request guard for app-ws/app-rpc. Both are
+;;;   ;; procedures, so the wrong one is taken at boot and raises an
+;;;   ;; arity exception on the first admin request.
 ;;;
 ;;;   ;; 3. bring your own front-end -- a static string, a handler, a
 ;;;   ;;    file kept OUTSIDE the web root, or a Goeteia app reading the

@@ -21,8 +21,14 @@
 ;;; opaque (it had been SQL-shaped, down to the message names); the
 ;;; deadlines moved from module constants into the config, because a
 ;;; minute is right for a database and wrong for a render; and
-;;; connpool-lease grew broken-on-escape?, because a render that timed
-;;; out may still be running on the far side while a query is not.
+;;; connpool-lease grew broken-on-escape?. (NOT because a timed-out
+;;; render may still be running while a query may not -- a timed-out
+;;; statement may still execute on the server too, as connpool-call
+;;; says below. The question the flag answers is narrower: after the
+;;; borrower leaves non-locally, is this connection safe to LEND AGAIN?
+;;; For a SQL connection the worker serialises what is left and the
+;;; answer is yes; for a render worker a cancelled job and a new one
+;;; can race, and the answer is no.)
 ;;; A fourth driver should expect to find a fourth.
 ;;;
 ;;; The engine is PROTOCOL-BLIND: the wire protocol, authentication and

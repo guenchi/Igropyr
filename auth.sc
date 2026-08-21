@@ -21,14 +21,23 @@
 ;;;   ;; all of them: claims in the handler / ws session / rpc handler
 ;;;   (req-claims req)
 ;;;
-;;; Two verifier shapes:
-;;;   token verifier  (lambda (token) claims | #f)   -- e.g. jwt-verifier
-;;;                                                  -- what `auth' takes
-;;;   request guard   (lambda (req) claims | #f)     -- what app-ws and
-;;;                                                     app-rpc take
-;;; Passing a request guard where a token verifier belongs type-checks
-;;; (both are procedures of one argument) and then hands it a token
-;;; string. Nothing catches that at boot.
+;;; The shapes in play, none of them interchangeable:
+;;;   token verifier  (lambda (token) claims | #f)  -- what `auth' and
+;;;                                                    token-guard take
+;;;   request guard   (lambda (req) claims | #f)    -- what app-ws and
+;;;                                                    app-rpc take
+;;;   middleware      (lambda (req res next))       -- what app-use and
+;;;                                                    admin-listen's
+;;;                                                    `auth' option take,
+;;;                                                    and what `auth'
+;;;                                                    RETURNS
+;;; `auth' lifts a verifier to middleware; token-guard lifts one to a
+;;; request guard; session-guard is a request guard natively. Nothing
+;;; converts the other way, because a request is not a credential.
+;;; ALL OF THEM ARE PROCEDURES, so the wrong one is accepted wherever it
+;;; is installed and fails on the first request that reaches it -- as an
+;;; arity exception for the middleware slot, or as a token string handed
+;;; to something expecting a request. Nothing catches it at boot.
 ;;; token-guard lifts the former into the latter; session-guard is a
 ;;; request guard natively (the credential is the session cookie).
 ;;;

@@ -56,13 +56,16 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   The `auth` middleware guards HTTP routes with a `Bearer` token (any
   verifier — `(jwt-verifier key)` today — 401 otherwise), `token-guard` /
   `session-guard` guard WebSocket upgrades before the handshake, and
-  `app-rpc` takes a guard like the WebSocket one. **Two shapes, not one**:
-  `auth` takes a *token verifier* `(lambda (token) …)`, while `app-ws` and
-  `app-rpc` take a *request guard* `(lambda (req) …)`. Both are procedures
-  of one argument, so passing the wrong one is a runtime surprise, not a
-  boot-time error. And these are separate doors: guarding one is not
-  guarding another, nor does any of it reach an app you built yourself with
-  a second `app-listen` / `admin-listen`, or a raw `http-listen`.
+  `app-rpc` takes a guard like the WebSocket one. **The shapes differ and
+  none of them is interchangeable**: `auth` and `token-guard` take a
+  *token verifier* `(lambda (token) …)`; `app-ws` and `app-rpc` take a
+  *request guard* `(lambda (req) …)`; `app-use` and `admin-listen`'s
+  `auth` option take *middleware* `(lambda (req res next))`, which is what
+  `auth` returns. All are procedures, so the wrong one is installed
+  without complaint and fails on the first request that reaches it. And
+  these are separate doors: guarding one is not guarding another, nor does
+  any of it reach an app you built yourself with a second `app-listen` /
+  `admin-listen`, or a raw `http-listen`.
   `session-guard` takes an `origins` allow-list:
   the same-origin policy does not cover WebSockets and the browser attaches
   the session cookie whatever page opened the socket, so that list is what
