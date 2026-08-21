@@ -1582,6 +1582,13 @@ A flow may
 legitimately return the symbol `'gone` as its final value, so control
 outcomes never share a position with it:
 
+This is the **status vocabulary** — eight words, and they are not eight
+ways a dialogue can end. A token string means it has not ended at all;
+`'done` and `'settled` are one completion seen at two moments, before
+and after the reply stops being retained. Drop the token and count that
+pair once and you get the **six outcomes** the README and the front page
+name.
+
 | status | meaning |
 |---|---|
 | a token string | the step ran — present it to continue |
@@ -1610,7 +1617,11 @@ off any of them is a positive claim derived from missing evidence.
 Never from a record that merely says the flow raised, either: that is
 what `commit!` splits in two.
 
-The library keeps five outcomes apart, and every answer is read off one:
+A different quantity from the status vocabulary above: these are the
+**record values** — what is still known about a conversation once its
+process is gone, which is what a later question is answered from. Five
+of them, mapping onto the statuses above rather than corresponding to
+them one for one.
 
 | record | meaning | answer |
 |---|---|---|
