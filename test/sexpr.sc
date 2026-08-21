@@ -202,6 +202,30 @@
 (check "no-write-ratio-over-bound"
        (write-fails? (/ (expt 10 65536) 3)))
 
+;; ---- adversarial name corpus (61 names, cross-checked downstream) ------
+;; The accept/refuse split below was measured against this
+;; implementation and independently matched, name for name, by two
+;; downstream codecs. A name moving sides here is a wire-compat break,
+;; not a tuning knob. Written names must read back as themselves --
+;; the property the refusals exist to protect.
+(for-each
+ (lambda (n)
+   (check (string-append "corpus-written |" n "|")
+          (let ((sym (string->symbol n)))
+            (eq? sym (string->sexpr (sexpr->string sym))))))
+ '("--1" "+" "-" "..." "a1" "/" ".foo" "a.b" "OK" "_x" ":kw" "a@b"
+   "%x" "^x" "~x" "&x" "*x*" "<=>" "set!" "null?" "list->vector"
+   "e" "inf.0" "nan.0" "+." ".." "ok"))
+(for-each
+ (lambda (n)
+   (check (string-append "corpus-refused |" n "|")
+          (write-fails? (string->symbol n))))
+ (list "12" "-7" "1.5" "-7/2" "." "0x10" "1e3" "12abc" "+1" "-0" ".5"
+       "1." "1E3" "1e+3" "+inf.0" "-inf.0" "+nan.0" "1/2" "" "#x10"
+       "1+2i" "007" "-007" "1/-2" "1//2" "1/0" "a b" "7"
+       (string #\a #\tab #\b) (string #\a #\newline #\b)
+       "a(b" "a\"b" "\x4e2d;\x6587;" "\x1f600;"))
+
 ;; the extension must not leak into strict mode
 (check "strict-still-no-vector" (parse-fails? "#(1 2 3)"))
 (check "strict-still-no-bv" (parse-fails? "#vu8\"AgM=\""))
