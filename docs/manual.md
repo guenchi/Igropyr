@@ -134,7 +134,7 @@ not have, so the lower layers do not port.
 | `#%$current-stack-link`,<br>`#%$null-continuation` | Cut the stack chain when a process starts. Without the cut, a new process holds the continuation of whoever spawned it alive. |
 | `current-exception-state`,<br>`create-exception-state` | A per-process exception state object, swapped on every switch, so one process's handlers are not another's. |
 | `set-timer` and the timer-interrupt handler | Chez's engine ticks. This is the basis of preemptive scheduling: a process that never yields is still interrupted. |
-| The FFI — `foreign-procedure`, `foreign-alloc`, `lock-object` — and helpers such as `procedure-arity-mask` | Chez's shapes, used throughout. |
+| The FFI —<br>`foreign-procedure`,<br>`foreign-alloc`,<br>`lock-object` —<br>and helpers such as `procedure-arity-mask` | Chez's shapes, used throughout. |
 
 Porting to another implementation would mean rebuilding the scheduler on
 that engine's own internals, not translating this one.
