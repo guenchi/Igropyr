@@ -4851,7 +4851,11 @@ export removes that code rather than guarding it: there is no offset to
 find, so nothing reads outside an object.
 
 What it costs, measured on FreeBSD 15 / amd64, best of three runs of 20 000
-calls each, while both still ran:
+calls each, back when both still ran. **The bellard column is historical.**
+It was measured before the ref_count replica was deleted, and this tree has
+no executable path to re-measure it: `test/quickjs-bench.sc` runs against
+whatever library is loaded, and a bellard one is refused before the first
+benchmark.
 
 | workload | quickjs-ng | bellard |
 |---|---|---|
