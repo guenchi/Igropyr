@@ -306,8 +306,20 @@
        (put-char p #\"))
       ((eq? x #t) (put-string p "#t"))
       ((eq? x #f) (put-string p "#f"))
-      ((and (integer? x) (exact? x)) (put-string p (number->string x)))
-      ((and (rational? x) (exact? x)) (put-string p (number->string x)))
+      ;; MEASURED ON THE NUMERAL, ONCE, AND WITH ITS SIGN. The reader
+      ;; caps a token at default-max-token characters, so a numeral
+      ;; longer than that is one this library can write and cannot read
+      ;; back -- the failure landing at the far end, after the sender saw
+      ;; success. Refusing here puts the error on the end that can still
+      ;; do something about it.
+      ;;
+      ;; The cap counts the whole token, sign included: -(10^65535) has
+      ;; 65536 digits and 65537 characters, and a check that counted
+      ;; digits would pass exactly the value the reader rejects. The
+      ;; string produced here is the one measured and the one written,
+      ;; so no numeral is rendered twice.
+      ((and (integer? x) (exact? x)) (put-numeral p (number->string x)))
+      ((and (rational? x) (exact? x)) (put-numeral p (number->string x)))
       ;; extended whitelist; in strict mode these fall through to the
       ;; refusal below, exactly as before
       ((and ext? (vector? x))
@@ -330,6 +342,18 @@
          (put-string p (base64-encode bv)))
        (put-char p #\"))
       (else (sfail "datum not in the wire whitelist" 0))))
+
+  ;; Exact integers and ratios reach the wire as their printed numeral,
+  ;; and the reader will not accept one past the token cap. Same limit,
+  ;; same constant -- there is one supplier of it in this file and both
+  ;; ends read it, which is a mechanism rather than an obligation.
+  (define (put-numeral p str)
+    (when (> (string-length str) default-max-token)
+      ;; The same failure shape the symbol refusal already uses, because
+      ;; a caller catching one has to catch the other: both are "this
+      ;; datum cannot go on the wire", raised by the writer.
+      (sfail "token too long for the wire -- carry a value this large as a bytevector (#vu8)" 0))
+    (put-string p str))
 
   ;; A bare token is re-read by parse-atom, which tries a number first
   ;; and treats "." as the improper-list marker. So a symbol whose name
@@ -363,6 +387,11 @@
   (define (wire-symbol? s)
     (let ((m (string-length s)))
       (and (> m 0)
+           ;; Before the character walk, because it is one comparison and
+           ;; the walk is not: a name past the reader's token cap comes
+           ;; back as "token too long" at the far end, so it is refused
+           ;; here for the same reason the numeric shapes are.
+           (<= m default-max-token)
            (not (string->number s))
            ;; the reader's numeric-shape?, kept identical to it
            (not (let ((c (string-ref s 0)))
