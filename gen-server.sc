@@ -21,10 +21,10 @@
 ;;; instead of hanging until the timeout. Servers may be addressed by
 ;;; registered name (a symbol) or pid.
 ;;;
-;;; The last slot of every #(gen-server-error ...) is a printable scalar:
-;;; a value that already is one is passed through so it stays
-;;; eq?-comparable, and anything else is rendered under bounds. See
-;;; scalar-summary for what that covers and what it does not.
+;;; The last slot of every #(gen-server-error ...) is a printable scalar
+;;; of at most 200 characters: a value that already is one is passed
+;;; through, so it stays eq?-comparable, and anything else is rendered
+;;; under bounds on both the walk and the output. See scalar-summary.
 
 (library (igropyr gen-server)
   (export gen-server-start gen-server-start-named
@@ -53,38 +53,71 @@
   ;; into a cycle and takes the runtime down, printing the mailbox on the
   ;; way; the operator reading the error is the one who triggers it.
   ;;
-  ;; So the slot holds a printable scalar. Values that already are one pass
-  ;; through UNCHANGED, which is what keeps 'server-died's `normal' and a
-  ;; registered name eq?-dispatchable at the call site. Anything else is
-  ;; rendered, and rendered BOUNDED: print-level and print-length bound the
-  ;; walk itself, so a cycle or a pcb is summarised rather than chased, and
-  ;; the clip afterwards bounds the string. Setting the bounds before the
-  ;; walk is the point -- clipping a string that was already built has no
-  ;; bound on what building it cost.
+  ;; So the slot holds a printable scalar of bounded length. A value that
+  ;; already is one passes through UNCHANGED, which is what keeps
+  ;; 'server-died's `normal' and a registered name eq?-dispatchable at the
+  ;; call site. Anything else is rendered, and the rendering is bounded on
+  ;; BOTH axes, because they fail differently:
   ;;
-  ;; WHAT THIS DOES NOT BOUND: a symbol passes through by length as well as
-  ;; by kind, so a caller who sends a megabyte-long symbol gets a
-  ;; megabyte-long slot. It cannot cycle and cannot reach a pcb, so it is
-  ;; not the hazard above; it is simply not covered.
+  ;;   - structure: print-level and print-length bound the walk, so a
+  ;;     cycle or a pcb is summarised rather than chased;
+  ;;   - output: the port itself stops accepting after the budget. Those
+  ;;     parameters do not bound an ATOM -- a 5000-character string, a
+  ;;     5000-digit bignum and a record whose writer emits 5000 characters
+  ;;     each render in full before any clip could see them -- so bounding
+  ;;     the walk alone would leave the cost unbounded and only the result
+  ;;     small.
+  ;;
+  ;; A writer that raises is caught: the slot becomes "<unprintable>"
+  ;; rather than the writer's exception replacing the gen-server-error the
+  ;; caller was about to receive. A writer that hangs is not covered;
+  ;; nothing here can bound it.
+  ;;
+  ;; Symbols are bounded BY LENGTH as well as by kind. A symbol cannot
+  ;; cycle and cannot reach a pcb, so a long one is not the hazard above,
+  ;; but "bounded scalar" is a claim other files make about this value,
+  ;; and a megabyte-long name would falsify it.
   ;;
   ;; The three numbers are measured-enough values, not a contract: at
   ;; level 3 / length 8 a pcb renders to about 185 characters, which
   ;; identifies the message shape without becoming the message.
   (define summary-print-level 3)
   (define summary-print-length 8)
-  (define summary-max-chars 200)
+  (define summary-max-chars 200)          ; of the RESULT, ellipsis included
+
+  (define summary-overflow (list 'gen-server-summary-overflow))
+
+  (define (render-bounded x)
+    (let* ((acc (open-output-string))
+           (budget (- summary-max-chars 3))   ; room for the ellipsis
+           (n 0))
+      (define (emit! str start count)
+        (let ((room (- budget n)))
+          (when (<= room 0) (raise summary-overflow))
+          (let ((take (if (< count room) count room)))
+            (put-string acc str start take)
+            (set! n (+ n take))
+            (when (< take count) (raise summary-overflow))
+            count)))
+      (let ((port (make-custom-textual-output-port
+                    "gen-server-error-summary" emit! #f #f #f)))
+        (guard (e ((eq? e summary-overflow)
+                   (string-append (get-output-string acc) "..."))
+                  (#t (string-append (get-output-string acc) "<unprintable>")))
+          (parameterize ((print-level summary-print-level)
+                         (print-length summary-print-length))
+            (write x port)
+            (flush-output-port port))
+          (get-output-string acc)))))
+
+  (define (short-enough? s) (<= (string-length s) summary-max-chars))
 
   (define (scalar-summary x)
-    (if (or (symbol? x) (fixnum? x) (boolean? x) (null? x)
-            (and (string? x) (<= (string-length x) summary-max-chars)))
+    (if (or (fixnum? x) (boolean? x) (null? x) (char? x)
+            (and (symbol? x) (short-enough? (symbol->string x)))
+            (and (string? x) (short-enough? x)))
         x
-        (parameterize ((print-level summary-print-level)
-                       (print-length summary-print-length))
-          (let ((s (call-with-string-output-port
-                     (lambda (port) (write x port)))))
-            (if (> (string-length s) summary-max-chars)
-                (string-append (substring s 0 summary-max-chars) "...")
-                s)))))
+        (render-bounded x)))
 
   (define (resolve srv)
     (if (symbol? srv)
