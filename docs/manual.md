@@ -2410,13 +2410,27 @@ Limit request rate by IP or custom key:
 (app-use app (rate-limit))
 
 ;; Or customize:
-(app-use app (rate-limit `((max . 100)
+(app-use app (rate-limit '((max . 100)
                            (window . 60000)
-                           (key . ,(lambda (req)
-                                     (req-header req 'x-forwarded-for))))))
+                           (trust-proxy . 1))))   ; one proxy of mine appends to XFF
 ```
 
-The keys are `max`, `window` and `key` — and note the quasiquote: a `key` under a plain `'(...)` is list data, not a procedure, and the whole alist would be ignored rather than refused. The default allows 100 requests per 60 seconds per IP. When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
+The keys are `max`, `window`, `trust-proxy` and `key`. The default allows
+100 requests per 60 seconds per IP.
+
+**Say how many proxies you have, do not key on the header.** `X-Forwarded-For`
+is written by the client, so keying on it directly — `(key . ,(lambda (req)
+(req-header req 'x-forwarded-for)))` — lets an attacker mint a fresh bucket per
+request: unlimited attempts, and a store that grows without bound.
+`(trust-proxy . N)` says *N proxies of mine append to XFF*, and the default key
+then takes the Nth entry from the right, which is the last hop your own
+infrastructure wrote and the client cannot reach. With no proxy, leave it out
+and the peer address is used, which cannot be forged.
+
+If you do pass `key`, it must be a procedure, so the alist has to be
+quasiquoted: under a plain `'(...)` the value is the *list* `(lambda (req) …)`,
+which is not refused — `max` and `window` still take effect, and the first
+request calls a list as a procedure. When a client exceeds the limit, they receive HTTP 429 (Too Many Requests).
 
 ### Error Handler
 

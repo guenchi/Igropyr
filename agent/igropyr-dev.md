@@ -41,8 +41,10 @@ callbacks, no promises.** `mysql-query`, `redis`, `http-get`, and
 serving other requests. This is about the APIs an application calls.
 Underneath, libuv delivers everything through C callbacks, and if you
 work on the framework itself you will be inside them — where you must
-not `receive`, sleep or otherwise yield, because a continuation captured
-across a C frame corrupts the runtime.
+not `receive`, sleep or otherwise yield, **and must not raise**: a
+continuation captured across a C frame corrupts the runtime, and an
+exception unwinds through the C stack. A libuv callback only copies
+data, mutates registries and delivers messages.
 (Callbacks are also part of the API where a *service* has behaviour to
 fill in, rather than where a call has a result to wait for: `gen-server` takes handle-call,
 handle-cast and handle-info, and the record hooks take a writer and a
