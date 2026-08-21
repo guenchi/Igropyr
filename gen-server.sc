@@ -21,10 +21,12 @@
 ;;; instead of hanging until the timeout. Servers may be addressed by
 ;;; registered name (a symbol) or pid.
 ;;;
-;;; The last slot of every #(gen-server-error ...) is a printable scalar
-;;; of at most 200 characters: a value that already is one is passed
-;;; through, so it stays eq?-comparable, and anything else is rendered
-;;; under bounds on both the walk and the output. See scalar-summary.
+;;; The last slot of every #(gen-server-error ...) is a value at most 200
+;;; characters long: a small one passes through and stays eq?-comparable,
+;;; anything else is replaced by a label describing its shape. Nothing
+;;; prints the caller's value to build that label -- printing is what was
+;;; unbounded. (Writing a string slot adds Scheme's quoting on top of
+;;; those 200.) See scalar-summary.
 
 (library (igropyr gen-server)
   (export gen-server-start gen-server-start-named
@@ -53,71 +55,74 @@
   ;; into a cycle and takes the runtime down, printing the mailbox on the
   ;; way; the operator reading the error is the one who triggers it.
   ;;
-  ;; So the slot holds a printable scalar of bounded length. A value that
-  ;; already is one passes through UNCHANGED, which is what keeps
-  ;; 'server-died's `normal' and a registered name eq?-dispatchable at the
-  ;; call site. Anything else is rendered, and the rendering is bounded on
-  ;; BOTH axes, because they fail differently:
+  ;; So the slot holds a small value the caller may print freely. Values
+  ;; that already are such pass through UNCHANGED, which keeps
+  ;; 'server-died's `normal' and a registered name eq?-dispatchable.
+  ;; Everything else is replaced by a LABEL describing its shape.
   ;;
-  ;;   - structure: print-level and print-length bound the walk, so a
-  ;;     cycle or a pcb is summarised rather than chased;
-  ;;   - output: the port itself stops accepting after the budget. Those
-  ;;     parameters do not bound an ATOM -- a 5000-character string, a
-  ;;     5000-digit bignum and a record whose writer emits 5000 characters
-  ;;     each render in full before any clip could see them -- so bounding
-  ;;     the walk alone would leave the cost unbounded and only the result
-  ;;     small.
+  ;; NOTHING HERE PRINTS THE VALUE, and that is the design, not an
+  ;; optimisation. Bounding a rendering does not bound producing it: a
+  ;; bignum's decimal expansion is built before any output port can
+  ;; refuse it (half a million digits costs ~90ms and ~9MB), and a record
+  ;; whose writer builds its string first spends whatever it likes before
+  ;; a single character is offered. A writer may also raise, or hang, or
+  ;; keep the port it was handed. Labels are built from predicates and
+  ;; accessors that run no user code at all, so none of that is reachable
+  ;; from here.
   ;;
-  ;; A writer that raises is caught: the slot becomes "<unprintable>"
-  ;; rather than the writer's exception replacing the gen-server-error the
-  ;; caller was about to receive. A writer that hangs is not covered;
-  ;; nothing here can bound it.
+  ;; What the slot is FOR is telling an operator WHICH call this was, and
+  ;; a request's tag does that: #(do-thing <pid>) becomes "#(do-thing
+  ;; ...)". It is not a rendering of the message and does not try to be.
   ;;
-  ;; Symbols are bounded BY LENGTH as well as by kind. A symbol cannot
-  ;; cycle and cannot reach a pcb, so a long one is not the hazard above,
-  ;; but "bounded scalar" is a claim other files make about this value,
-  ;; and a megabyte-long name would falsify it.
-  ;;
-  ;; The three numbers are measured-enough values, not a contract: at
-  ;; level 3 / length 8 a pcb renders to about 185 characters, which
-  ;; identifies the message shape without becoming the message.
-  (define summary-print-level 3)
-  (define summary-print-length 8)
-  (define summary-max-chars 200)          ; of the RESULT, ellipsis included
+  ;; PASSTHROUGH HAS A LENGTH LIMIT, and the limit is part of the
+  ;; contract: a symbol longer than 200 characters arrives as a string,
+  ;; so `(eq? some-registered-name (vector-ref e 2))` holds for names up
+  ;; to that length and not beyond. register accepts longer ones. A
+  ;; gensym never passes through -- its unique name goes on the wire when
+  ;; the caller writes it, and that name is unbounded -- so it arrives as
+  ;; its pretty name in a label.
+  (define summary-max-chars 200)
 
-  (define summary-overflow (list 'gen-server-summary-overflow))
+  (define (clip s)
+    (if (> (string-length s) summary-max-chars)
+        (string-append (substring s 0 (- summary-max-chars 3)) "...")
+        s))
 
-  (define (render-bounded x)
-    (let* ((acc (open-output-string))
-           (budget (- summary-max-chars 3))   ; room for the ellipsis
-           (n 0))
-      (define (emit! str start count)
-        (let ((room (- budget n)))
-          (when (<= room 0) (raise summary-overflow))
-          (let ((take (if (< count room) count room)))
-            (put-string acc str start take)
-            (set! n (+ n take))
-            (when (< take count) (raise summary-overflow))
-            count)))
-      (let ((port (make-custom-textual-output-port
-                    "gen-server-error-summary" emit! #f #f #f)))
-        (guard (e ((eq? e summary-overflow)
-                   (string-append (get-output-string acc) "..."))
-                  (#t (string-append (get-output-string acc) "<unprintable>")))
-          (parameterize ((print-level summary-print-level)
-                         (print-length summary-print-length))
-            (write x port)
-            (flush-output-port port))
-          (get-output-string acc)))))
+  ;; one bounded label, built without printing anything
+  (define (label-of x)
+    (cond
+      ((symbol? x)
+       (if (gensym? x)
+           (clip (string-append "#<gensym " (symbol->string x) ">"))
+           (clip (symbol->string x))))
+      ((string? x) (clip x))
+      ((char? x) (string x))
+      ((number? x) "#<number>")
+      ((procedure? x) "#<procedure>")
+      ((vector? x)
+       (let ((n (vector-length x)))
+         (if (and (fx> n 0) (symbol? (vector-ref x 0))
+                  (not (gensym? (vector-ref x 0))))
+             (clip (string-append "#(" (symbol->string (vector-ref x 0))
+                                  " ...)"))
+             "#(...)")))
+      ((pair? x) "(...)")
+      ((null? x) "()")
+      ((boolean? x) (if x "#t" "#f"))
+      ((record? x)
+       (clip (string-append "#<"
+                            (symbol->string (record-type-name (record-rtd x)))
+                            ">")))
+      (else "#<value>")))
 
   (define (short-enough? s) (<= (string-length s) summary-max-chars))
 
   (define (scalar-summary x)
     (if (or (fixnum? x) (boolean? x) (null? x) (char? x)
-            (and (symbol? x) (short-enough? (symbol->string x)))
+            (and (symbol? x) (not (gensym? x)) (short-enough? (symbol->string x)))
             (and (string? x) (short-enough? x)))
         x
-        (render-bounded x)))
+        (label-of x)))
 
   (define (resolve srv)
     (if (symbol? srv)
