@@ -223,11 +223,20 @@
                  libpos (< (car hits) libpos)))
           (when (and (= 1 (length hits)) on-header-line?
                      libpos (< (car hits) libpos))
+            (let ((extracted (read (open-input-string
+                                     (substring src (+ (car hits) m) n)))))
+            ;; STRUCTURAL IDENTITY FIRST. "Is the documented artifact
+            ;; the composition we say it is" is a datum comparison, not
+            ;; a behaviour inference -- and it is immune to every
+            ;; black-box residue the behaviour cells carry. The mounted
+            ;; cells then guard the other half: that this composition,
+            ;; in this slot, gates.
+            (check "the extracted expression IS (auth verify)"
+              (equal? extracted '(auth verify)))
             (let ((built (eval `(let ((verify (lambda (t)
                                                 (and (equal? t ,hdr-token-good)
                                                      '(("sub" . "hdr"))))))
-                                  ,(read (open-input-string
-                                           (substring src (+ (car hits) m) n))))
+                                  ,extracted)
                                (environment '(chezscheme) '(igropyr auth)))))
             (check "the extracted example builds a procedure"
               (procedure? built))
@@ -252,16 +261,27 @@
                                              . ,(string-append
                                                   "Bearer "
                                                   hdr-token-good)))))))))
-              ;; the differential pair: same expression, verify that
-              ;; accepts nothing, same request sequence -- the good
-              ;; token must now be REFUSED, which no verify-ignoring
-              ;; implementation can do while its sibling admits it
+              ;; the differential pair: the same extracted datum
+              ;; evaluated with a verify that accepts nothing, fed the
+              ;; same Authorization sequence. Bounded claim: under that
+              ;; sequence, the opposite verify binding correlates with
+              ;; the good token's 200 flipping to 401. This catches the
+              ;; tested constant, format and call-order substitutes;
+              ;; port, construction order and per-instance state remain
+              ;; unisolated variables, so it does not prove the
+              ;; verifier is the sole cause or was internally invoked.
+              ;; (The structural cell above is what pins identity.)
               (let ((built2 (eval `(let ((verify (lambda (t) #f)))
-                                     ,(read (open-input-string
-                                              (substring src (+ (car hits) m)
-                                                         n))))
+                                     ,extracted)
                                   (environment '(chezscheme)
                                                '(igropyr auth)))))
+                ;; a REGISTERED cell, not a when-gate: an expression
+                ;; that yields a procedure on the first evaluation and
+                ;; something else on the second would otherwise erase
+                ;; this whole arm with zero failures and zero skips --
+                ;; a bypass the suite's own summary cannot see.
+                (check "the differential arm builds a procedure"
+                  (procedure? built2))
                 (when (procedure? built2)
                   (admin-listen m srv
                     `((host . "127.0.0.1") (port . ,hdr2-port)
@@ -279,7 +299,7 @@
                                   `((headers . (("Authorization"
                                                  . ,(string-append
                                                       "Bearer "
-                                                      hdr-token-good)))))))))))))))))
+                                                      hdr-token-good))))))))))))))))))
 
       ;; ---- injection guard: a quote in the data path is rejected ----
       (check "quote-in-path-rejected"
