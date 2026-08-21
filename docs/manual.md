@@ -3995,6 +3995,17 @@ through as a symbol.
 - `(string->sexpr s [depth])` → one datum; raises `#(sexpr-error ,msg ,pos)` on bad input (default depth limit 64)
 - `(sexpr->string x)` → serialized string; raises on non-whitelist data (floats, vectors, procedures, cyclic lists)
 
+**A token is capped at 65536 characters, and the writer enforces the
+same cap the reader does.** The parser refuses a longer one, so a symbol
+name or a numeral past it would be a datum this codec writes and cannot
+read — with the failure landing on the receiver while the sender saw
+success. The writer refuses it instead, on the end that can still do
+something about it. The cap counts the whole token, sign included.
+
+If you need to carry something that large, carry it as bytes: a
+bytevector goes over the extended mode as `#vu8"<base64>"` with no such
+limit.
+
 #### Extended Wire Mode
 
 `string->sexpr-extended` / `sexpr->string-extended` add three types,
