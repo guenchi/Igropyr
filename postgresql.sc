@@ -29,12 +29,15 @@
 ;;; connection asks for client_encoding UTF8 at startup, so text is
 ;;; always UTF-8 on the wire regardless of the database encoding.
 ;;;
-;;; Driver-generated operational errors raise #(postgresql-error ,tag ,message)
-;;; in the caller. Two things do not wear that tag: postgresql-pool-stats,
-;;; a pass-through for the pool library's own shape (see below), and
-;;; whatever your own procedure raises inside call-with-postgresql-connection
-;;; or postgresql-transaction, which travels out unchanged. The tag is one
-;;; of exactly three shapes:
+;;; #(postgresql-error ,tag ,message) is the shape of an OPERATIONAL error
+;;; -- one the database, the connection or a timeout produced on a valid
+;;; call. Nothing else promises to wear that tag: argument checks raise
+;;; ordinary Chez conditions, postgresql-pool-stats passes the pool
+;;; library's shape through (see below), and whatever the caller's own
+;;; procedure raises inside call-with-postgresql-connection or
+;;; postgresql-transaction travels out unchanged. A guard that must not
+;;; let anything past needs a clause for conditions as well as for the
+;;; vector. The tag is one of exactly three shapes:
 ;;;   - a 5-char SQLSTATE string: a server-side SQL error; the
 ;;;     connection stays usable.
 ;;;   - 'transport: a connection/framing failure; the connection is torn

@@ -14,13 +14,18 @@
 ;;;   (mysql-close! db)
 ;;;
 ;;; Values arrive as strings (MySQL text protocol); NULL is #f.
-;;; Driver-generated operational errors raise #(mysql-error ,code ,message)
-;;; in the caller. Two things do not wear that tag: mysql-pool-stats,
-;;; a pass-through for the pool library's own shape (see below), and
-;;; whatever your own procedure raises inside call-with-mysql-connection
-;;; or mysql-transaction, which travels out unchanged.
+;;; #(mysql-error ,code ,message) is the shape of an OPERATIONAL error --
+;;; one the database, the connection or a timeout produced on a valid
+;;; call. Nothing else promises to wear that tag: argument checks raise
+;;; ordinary Chez conditions, mysql-pool-stats passes the pool library's
+;;; shape through (see below), and whatever the caller's own procedure
+;;; raises inside call-with-mysql-connection or mysql-transaction travels
+;;; out unchanged. A guard that must not let anything past needs a clause
+;;; for conditions as well as for the vector.
 ;;;
-;;; Authentication: caching_sha2_password (the only plugin in MySQL 9),
+;;; Authentication: caching_sha2_password (MySQL 9's default plugin --
+;;; what a given server offers is the server's business, and any plugin
+;;; other than the two named here is refused as unsupported),
 ;;; both paths: the SHA-256 scramble fast path, and the full path where
 ;;; the server's RSA public key encrypts the password (OAEP) over a
 ;;; plain connection. mysql_native_password is also supported for older
