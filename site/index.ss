@@ -34,8 +34,10 @@
       (div (@ (class "wrap"))
         (div (@ (class "kicker")) "01 · Fault tolerance")
         (h2 "Let It Crash")
-        (p (@ (class "lead")) "Every request runs in a supervised worker pool. "
-           "Handlers don't defend — they crash, and the system recovers.")
+        (p (@ (class "lead")) "HTTP requests run in a supervised worker pool. "
+           "Handlers don't defend — they crash, and the system recovers. "
+           "(A WebSocket session runs on its connection's own process, so "
+           "it is the connection that dies, not a pooled worker.)")
         (div (@ (class "feature"))
           (div (@ (class "txt"))
             (h3 "Crashes heal themselves")

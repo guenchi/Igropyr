@@ -21,9 +21,12 @@ let-it-crash worker pool, and a direct blocking style.
 ## Rule zero: never guess the API
 
 igropyr is not in your training data. Hallucinated procedure names are
-your number-one failure mode. Every `.sc` source file carries an
-authoritative usage example in its header comment — when unsure about
-any API, grep the source headers FIRST:
+your number-one failure mode. Most `.sc` files open with a header
+comment carrying a usage example, and where one exists it is
+authoritative — but some of the lower-level modules (`util`, `platform`,
+`libuv`) document their exports without one, so a silent header is not
+evidence an API is absent. When unsure about any API, grep the source
+FIRST, and read past the header if it says nothing:
 
     grep -n "^;;;" path/to/igropyr/<module>.sc | head -40
 
@@ -32,9 +35,13 @@ not a checked one: read the `.sc` header when it matters.
 
 ## Core mental model
 
-**Everything is direct blocking style — no async/await, no callbacks, no
+**I/O is direct blocking style — no async/await, no callbacks, no
 promises.** `mysql-query`, `redis`, `http-get`, and `receive` block only
 their own green process; the OS thread keeps serving other requests.
+(Callbacks do exist where a *service* has behaviour to fill in, not
+where a call has a result to wait for: `gen-server` takes handle-call,
+handle-cast and handle-info, and the record hooks take a writer and a
+reader.)
 Node's `await fetch(); await db.query()` becomes two sequential lines.
 
 Error handling is let-it-crash: a crashing handler means the worker is

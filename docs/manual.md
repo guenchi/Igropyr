@@ -1134,8 +1134,7 @@ The server's loop, request/reply matching, and timeout handling are implemented 
     ;; handle-call: (msg from state) -> (values reply new-state)
     (lambda (msg from state)
       (case msg
-        ((inc) (let ((new (+ state 1))
-                 (values new new)))
+        ((inc) (let ((new (+ state 1))) (values new new)))
         ((get) (values state state))
         (else (values 'unknown state))))
     
@@ -1151,6 +1150,7 @@ The server's loop, request/reply matching, and timeout handling are implemented 
 
 ```scheme
 (gen-server-call counter-server 'inc)      ; blocks, returns 1
+(gen-server-call counter-server 'inc)      ; blocks, returns 2
 (gen-server-call counter-server 'get)      ; blocks, returns 2
 (gen-server-cast counter-server 'reset)    ; returns immediately
 (gen-server-call counter-server 'get)      ; blocks, returns 0
@@ -1199,8 +1199,12 @@ In addition to handle-call and handle-cast, you can provide a handle-info callba
   (lambda (msg state) state)                     ; handle-cast
   (lambda (msg state)                            ; handle-info (optional)
     (if (and (vector? msg) (eq? (vector-ref msg 0) 'DOWN))
-        ;; A monitored process died; handle it
-        (display "dependency died\n")
+        ;; A monitored process died; handle it -- and still return the
+        ;; state. Every branch of handle-info must: the value it returns
+        ;; BECOMES the state, so falling out of a `display' installs an
+        ;; unspecified value and the next message that uses the state
+        ;; kills the server.
+        (begin (display "dependency died\n") state)
         state)))
 ```
 
@@ -3406,7 +3410,7 @@ The client authenticates with **SCRAM-SHA-256** (RFC 7677, the PostgreSQL defaul
   '((allow-cleartext-auth . #t)))
 ```
 
-SASLprep normalization is not implemented (its Unicode tables would dwarf the driver), so passwords outside **printable ASCII** — non-ASCII, or the control characters SASLprep prohibits — are rejected with a clear error in the caller — `postgresql-connect` and `postgresql-pool` raise an assertion up front — instead of failing with a baffling `28P01`. That check does not know what the server will ask for, and does not wait to find out: it runs before any connection, so a `trust` server that would never look at the password refuses one anyway. `'allow-cleartext-auth` skips *that upfront check*, and means what it says — if the server does ask for a cleartext password, this client sends one, unless the password holds a NUL, which `PasswordMessage` cannot represent. It does not make the driver accept such a password everywhere: if the server chooses SCRAM after all, `scram-auth!` refuses it there, which is the backstop. What this driver completes is a closed set: `AuthenticationOk`, SCRAM-SHA-256 (with channel binding where TLS is active), and cleartext when you have asked for it. Everything else is refused where it arrives — MD5 by name, GSSAPI, SSPI and any other method by code, and a SASL exchange offering no SCRAM-SHA-256 mechanism at the mechanism list. Printable-ASCII passwords are exact — SASLprep leaves them unchanged.
+SASLprep normalization is not implemented (its Unicode tables would dwarf the driver), so passwords outside **printable ASCII** — non-ASCII, or the control characters SASLprep prohibits — are rejected with a clear error in the caller — `postgresql-connect` and `postgresql-pool` raise an assertion up front — instead of failing with a baffling `28P01`. That check does not know what the server will ask for, and does not wait to find out: it runs before any connection, so a `trust` server that would never look at the password refuses one anyway. `'allow-cleartext-auth` skips *that upfront check*, and means what it says — if the server does ask for a cleartext password, this client sends one, unless the password holds a NUL, which `PasswordMessage` cannot represent. It does not make the driver accept such a password everywhere: if the server chooses SCRAM after all, `scram-auth!` refuses it there, which is the backstop. What this driver completes is a closed set: `AuthenticationOk`, SCRAM-SHA-256, and cleartext when you have asked for it. Any other method the *authentication loop* sees is refused there — MD5 by name, GSSAPI, SSPI and anything else by code, and a SASL exchange is refused at the mechanism list if it offers no SCRAM-SHA-256. (After `AuthenticationOk` the driver is past that loop: it consumes what the server streams until the first `ReadyForQuery`, so a further authentication request arriving there is ignored rather than refused.) Channel binding is used when three things hold at once — TLS is active, a certificate hash is available for it, and the server offers `SCRAM-SHA-256-PLUS`; with TLS but no binding the client says so explicitly (`y,,`) rather than pretending. Printable-ASCII passwords are exact — SASLprep leaves them unchanged.
 
 #### TLS
 
@@ -4102,8 +4106,12 @@ and still rejects all three.
 Strings escape only `\"` and `\\` on the wire; a literal newline inside
 a string is legal; `\n \t \r` are also accepted on read. These
 conventions match Goeteia's reader/writer exactly, so the two
-implementations round-trip byte for byte (verified both directions with
-a shared fixture of bignums, ratios, escaped strings, and dotted pairs).
+implementations round-trip byte for byte. What backs that is a fixture
+of bignums, ratios, escaped strings and dotted pairs with **one
+authority**: `test/sexpr-vectors.json` records `(igropyr sexpr)` as the
+authority and the commit it was generated from, and the Goeteia side is
+regenerated against it. So it is conformance to this implementation that
+is checked, not agreement between two independent ones.
 
 ### Express Integration
 
