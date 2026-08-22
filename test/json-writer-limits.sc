@@ -112,8 +112,18 @@
                  (call-with-input-file out get-string-all))))
     (check "a self-referential vector is refused, not chased"
            (and (= 0 status)
-                (>= (string-length text) 17)
-                (string=? (substring text 0 17) "nesting too deep"))
+                ;; the child prints the message and a newline; compare
+                ;; against the message's own length rather than a
+                ;; number typed here, which is where this cell was
+                ;; wrong once -- and the mistake hid, because the cell
+                ;; was already red on the status while the guard was
+                ;; missing, so the off-by-one only surfaced after the
+                ;; fix landed and the cell went on failing for a
+                ;; different reason under the same name
+                (let ((expected "nesting too deep"))
+                  (and (>= (string-length text) (string-length expected))
+                       (string=? (substring text 0 (string-length expected))
+                                 expected))))
            (list 'status status 'said text))
     ;; the timing IS the assertion here: exit 124 means the child hit
     ;; its deadline, which is what unbounded recursion looks like
