@@ -23,6 +23,22 @@
 ;;; string as something the grammar ALLOWS. A row whose anchor cannot
 ;;; be written down is a row somebody guessed.
 ;;;
+;;; AND WHATEVER A ROW CITES, ITS EVERY BOUNDARY GETS A ROW: each
+;;; interval endpoint, each member of a set, the gaps between them.
+;;; The rows that exposed the first survey -- x1F and x7F -- were both
+;;; endpoint neighbours of `unescaped`, missing because the table had
+;;; been built from imagined bad inputs instead of from the grammar's
+;;; own divisions.
+;;;
+;;; SO MOST OF THOSE ROWS HAVE NEVER BEEN RED, AND THAT IS NOT A
+;;; REASON TO DELETE THEM. A structural row exists because the
+;;; production has that boundary, not because it once caught
+;;; something: its green is the statement "this boundary was walked
+;;; and holds", which is what makes the coverage claim sayable at all.
+;;; Rows added from imagination are worth what they catch; rows added
+;;; from structure are worth what they let you say. Anyone trimming
+;;; this file for size should cut elsewhere.
+;;;
 ;;; The deviations, all measured by survey:
 ;;;
 ;;;   A. leading zeros in the integer part -- "01" "-01" "00" "01.5"
@@ -101,6 +117,37 @@
        (,(string #\" #\tab #\") ACCEPT "7: unescaped excludes %x00-1F")
        (,(string #\" #\nul #\") ACCEPT "7: unescaped excludes %x00-1F")
        (,(string #\" #\x1f #\") ACCEPT "7: unescaped starts at %x20")))
+
+;; ---- unescaped, endpoint by endpoint -----------------------------------
+;; ONE ROW PER INTERVAL ENDPOINT of the production being cited. The two
+;; rows that exposed the first survey's method -- x1F and x7F -- were
+;; both endpoint neighbours, and they were missing because the old table
+;; was built from imagined bad inputs rather than from the grammar's own
+;; divisions. Whatever a row cites, its every interval boundary gets a
+;; row: the bounds, and the gaps between them.
+(pin "unescaped endpoint"
+     `((,(string #\" #\x20 #\") ACCEPT "7: %x20-21, lower bound")
+       (,(string #\" #\x21 #\") ACCEPT "7: %x20-21, upper bound")
+       (,(string #\" #\x23 #\") ACCEPT "7: %x23-5B, lower bound")
+       (,(string #\" #\x5b #\") ACCEPT "7: %x23-5B, upper bound")
+       (,(string #\" #\x5d #\") ACCEPT "7: %x5D-10FFFF, lower bound")
+       (,(string #\" #\x10ffff #\") ACCEPT "7: %x5D-10FFFF, upper bound")
+       (,(string #\" #\xd7ff #\") ACCEPT "7: inside %x5D-10FFFF")
+       (,(string #\" #\xe000 #\") ACCEPT "7: inside %x5D-10FFFF")
+       ;; the gaps: %x22 and %x5C are excluded because they must be escaped
+       (,(string #\" #\x22 #\") REJECT "7: %x22 ends the string, must escape")
+       (,(string #\" #\x5c #\") REJECT "7: %x5C begins an escape")))
+
+;; ---- ws, member by member ----------------------------------------------
+;; ws = %x20 / %x09 / %x0A / %x0D: four members, so four rows, plus the
+;; near misses that are NOT whitespace in JSON however much they look it
+(pin "insignificant whitespace"
+     `((" 1 " ACCEPT "2: ws includes %x20 space")
+       (,(string #\tab #\1) ACCEPT "2: ws includes %x09 tab")
+       (,(string #\newline #\1) ACCEPT "2: ws includes %x0A line feed")
+       (,(string #\return #\1) ACCEPT "2: ws includes %x0D carriage return")
+       (,(string #\xb #\1) REJECT "2: ws has four members; %x0B is not one")
+       (,(string #\xc #\1) REJECT "2: ws has four members; %x0C is not one")))
 
 ;; ---- deviation D: escaped lone surrogates (shared, costed) -------------
 ;; the grammar allows these and section 9 says a parser MUST accept
