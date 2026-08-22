@@ -14,20 +14,33 @@
 ;;;
 ;;; The deviation set was measured by survey, not collected from
 ;;; reports: every token the number tokenizer can hand to Chez's
-;;; string->number was probed class by class. Three classes deviate:
+;;; string->number was probed class by class. TWO classes deviate,
+;;; and both are SHARED with the counterpart:
 ;;;
 ;;;   A. leading zeros in the integer part      "01" "-01" "00" "01.5"
-;;;   B. missing digits beside the dot          "5." "5.e3" "-.5"
-;;;      (both come from delegating the numeral to string->number,
-;;;       which accepts a superset of JSON's number grammar within
-;;;       the tokenizer's charset)
 ;;;   C. bare control characters inside strings (RFC requires \u
 ;;;      escapes; the scanner passes them through)
 ;;;
-;;; SELF-DESTRUCT CLAUSE, shared with the counterpart's survey: if a
-;;; row outside these three classes is ever found deviating, the
-;;; survey that produced this closed set has failed, and BOTH sides'
-;;; tables are re-surveyed whole -- do not just append the find.
+;;; Those two rows are ACCEPT because the counterpart accepts them too,
+;;; and that is the whole of the reason. IF BOTH SIDES EVER TIGHTEN
+;;; THEM IN ONE COORDINATED CHANGE, THESE ROWS AND THIS PARAGRAPH ARE
+;;; DELETED, NOT EDITED -- a retention clause that outlives its reason
+;;; keeps looking valid long after the world moved.
+;;;
+;;; A third class existed on this side alone -- missing digits beside
+;;; the dot ("5." "5.e3" "-.5"), out of the same string->number
+;;; delegation -- and was REMOVED rather than documented: the lockstep
+;;; rule forbids unilaterally tightening the SHARED surface, but a
+;;; deviation only one side has IS the asymmetry, and removing it is
+;;; the fix. The counterpart's hand-written grammar always rejected
+;;; these; the rows below now pin this side to the same answer.
+;;;
+;;; SELF-DESTRUCT CLAUSE, shared with the counterpart's row set: a
+;;; deviating row outside the shared classes A and C -- on either
+;;; side -- fails the survey that produced this table, and BOTH
+;;; sides' tables are re-surveyed whole; do not just append the find.
+;;; The row set here is the shared seed; the counterpart pins the
+;;; same rows with its own verdicts, and shared rows must agree.
 ;;;
 ;;; Duplicate keys are RFC 4 SHOULD territory, not a deviation. This
 ;;; side's semantics, pinned below: the alist RETAINS every pair in
@@ -62,9 +75,11 @@
 (pin '(("01" . ACCEPT) ("-01" . ACCEPT) ("00" . ACCEPT)
        ("01.5" . ACCEPT) ("-00" . ACCEPT))
      "deviation A, leading zeros")
-(pin `(("5." . ACCEPT) ("5.e3" . ACCEPT) ("1.e2" . ACCEPT)
-       ("-3." . ACCEPT) ("-.5" . ACCEPT))
-     "deviation B, missing digits beside the dot")
+;; the removed unilateral deviation: digits are required on both
+;; sides of a decimal point, as the counterpart always required
+(pin `(("5." . REJECT) ("5.e3" . REJECT) ("1.e2" . REJECT)
+       ("-3." . REJECT) ("-.5" . REJECT))
+     "converged: missing digits beside the dot")
 (pin `((,(string #\" #\newline #\") . ACCEPT)
        (,(string #\" #\tab #\") . ACCEPT)
        (,(string #\" #\nul #\") . ACCEPT))
@@ -88,8 +103,30 @@
      "required rejection")
 
 ;; ---- valid JSON that must stay accepted ---------------------------------
-(pin '(("0.5" . ACCEPT) ("1e+5" . ACCEPT) ("-0.5e01" . ACCEPT)
-       ("0" . ACCEPT) ("-0" . ACCEPT))
+;; THE SHOULD-BE-GREEN DIRECTION, ENUMERATED, NOT SAMPLED. Tightening
+;; the number grammar is the half of this file most able to overshoot:
+;; an implementation that demands a frac before an exp, or refuses a
+;; sign in the exponent, passes every REJECT row above while breaking
+;; ordinary documents. So the RFC's three number parts -- int, frac,
+;; exp -- are pinned across their present/absent combinations, plus
+;; the signs and the range edges each part allows.
+(pin '(;; int alone, both signs, the zero forms
+       ("0" . ACCEPT) ("-0" . ACCEPT) ("7" . ACCEPT) ("-7" . ACCEPT)
+       ("1234567890" . ACCEPT)
+       ;; int + frac
+       ("0.0" . ACCEPT) ("0.5" . ACCEPT) ("-0.0" . ACCEPT)
+       ("7.25" . ACCEPT) ("1.0000000001" . ACCEPT)
+       ;; int + exp, every sign form, both cases
+       ("1e5" . ACCEPT) ("1E5" . ACCEPT) ("1e+5" . ACCEPT)
+       ("1e-5" . ACCEPT) ("1E+5" . ACCEPT) ("1E-5" . ACCEPT)
+       ("0e0" . ACCEPT) ("-0e0" . ACCEPT)
+       ;; int + frac + exp together
+       ("1.5e10" . ACCEPT) ("-0.0e0" . ACCEPT) ("-1.5E-10" . ACCEPT)
+       ;; exponent with leading zeros is RFC-legal (exp = 1*DIGIT)
+       ("1e01" . ACCEPT) ("-0.5e01" . ACCEPT)
+       ;; magnitudes near, but inside, the representable range
+       ("1e308" . ACCEPT) ("1e-308" . ACCEPT)
+       ("179769313486231570000000000000000000000" . ACCEPT))
      "valid number")
 
 ;; ---- duplicate keys: both retained, json-ref answers the first ----------
