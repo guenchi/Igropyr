@@ -93,6 +93,12 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script igropyr/test/checked-off.sc
 # (an out-of-range exponent became +inf.0, which passes any real? guard --
 # including the one on a JWT expiry)
 "$scheme_bin" --script igropyr/test/json-numbers.sc
+
+# the reader's RFC 8259 acceptance surface, row-pinned: three documented
+# deviation classes shared in lockstep with the browser-side twin reader
+# -- flipping any row unilaterally manufactures a wire asymmetry, so a
+# red here means "coordinate", not "update the row"
+"$scheme_bin" --script igropyr/test/json-rfc-surface.sc
 # every byte in must come back out, checked against the system gzip(1)
 # tool in a separate process. Also the regression for zlib coexistence:
 # with the runtime's embedded zlib and a dlopened libz sharing one
