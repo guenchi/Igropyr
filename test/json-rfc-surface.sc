@@ -35,6 +35,16 @@
 ;;; the fix. The counterpart's hand-written grammar always rejected
 ;;; these; the rows below now pin this side to the same answer.
 ;;;
+;;; TWO SETS, NOT ONE. The deviation set answers "where does this
+;;; reader depart from RFC 8259"; the lockstep concern answers "where
+;;; do the two readers disagree with each other". A row can be in
+;;; either without the other: the finite-range refusal below is no
+;;; deviation (RFC 6 lets an implementation set limits) yet was an
+;;; asymmetry until the counterpart converged on it, and the dot rows
+;;; were a deviation this side held alone. Rows carry which one they
+;;; are, because the remedies differ -- a deviation is documented or
+;;; removed, an asymmetry is closed by whichever side is the outlier.
+;;;
 ;;; SELF-DESTRUCT CLAUSE, shared with the counterpart's row set: a
 ;;; deviating row outside the shared classes A and C -- on either
 ;;; side -- fails the survey that produced this table, and BOTH
@@ -129,6 +139,25 @@
        ("179769313486231570000000000000000000000" . ACCEPT))
      "valid number")
 
+;; ---- the round trip an accepted number must survive ---------------------
+;; The counterpart reached the null-round-trip through its reader; this
+;; side is shielded by refusing at read time, and this cell is what
+;; keeps that shield honest: whatever the reader accepts, the writer
+;; must emit as a number, never as null. A future widening of the
+;; reader that let a non-finite through would show up here rather than
+;; in someone's data.
+(for-each
+  (lambda (input)
+    (let* ((v (string->json input))
+           (out (json->string v)))
+      (check (string-append "accepted number survives the round trip: "
+                            input)
+             (and (string? out) (not (string=? out "null"))
+                  (not (string=? out "\"null\"")))
+             out)))
+  '("1e308" "1e-308" "0" "-0" "-0.0e0" "1.5e10"
+    "179769313486231570000000000000000000000"))
+
 ;; ---- duplicate keys: both retained, json-ref answers the first ----------
 (let ((d (string->json "{\"a\":1,\"a\":2}")))
   (check "duplicate keys: every pair retained, in order"
@@ -136,10 +165,16 @@
   (check "duplicate keys: json-ref answers the first"
          (eqv? 1 (json-ref d "a"))))
 
-;; range limits are allowed by RFC 8259 section 6, not a deviation;
-;; pinned so the refusal stays a refusal
+;; NOT a deviation -- RFC 8259 section 6 lets an implementation set
+;; range limits -- but it WAS an asymmetry: the counterpart accepted
+;; the literal as +inf.0, and its writer emits non-finite values as
+;; null, so a number survived one round trip as `null`. It converged
+;; on refusing at read time, which is where this side already stood.
+;; Pinned so the refusal stays a refusal.
 (check "an overflowing literal is refused, not wrapped"
        (eq? 'REJECT (status "1e309")))
+(check "...and the refusal is at read time, before any round trip"
+       (eq? 'REJECT (status "[1e309,1]")))
 
 (if (zero? failures)
     (begin (display "json-rfc-surface: all tests passed\n") (exit 0))
