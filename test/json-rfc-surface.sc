@@ -177,6 +177,49 @@
        ("\"\\x41\"" REJECT "7: x is not among the escapable characters")
        (,(string #\" #\x7f #\") ACCEPT "7: unescaped = ... %x5D-10FFFF")))
 
+;; ---- exp: 1*DIGIT has no upper bound on the digit count ---------------
+;; "one or more" is itself a dimension, and a table that only ever
+;; walks one and two digits never states that. The counterpart's
+;; reader capped exponent digits at three and refused "1e0001" -- a
+;; live asymmetry that survived both surveys because neither table had
+;; a multi-digit exponent row. It converged on accepting; these rows
+;; are what would have caught it here.
+(pin "exponent digit count"
+     '(("1e1" ACCEPT "6: exp = e [ minus / plus ] 1*DIGIT")
+       ("1e01" ACCEPT "6: 1*DIGIT, leading zeros included")
+       ("1e001" ACCEPT "6: 1*DIGIT, three digits")
+       ("1e0001" ACCEPT "6: 1*DIGIT, no upper bound on the count")
+       ("1e+0005" ACCEPT "6: sign then 1*DIGIT, no bound")
+       ("1e-0001" ACCEPT "6: sign then 1*DIGIT, no bound")
+       ("1e00000000005" ACCEPT "6: 1*DIGIT, eleven of them")
+       ;; the value, not the digit count, is what a limit may refuse
+       ("1e1000000" REJECT "9: an implementation may limit range")))
+
+;; ---- \u escape: four HEXDIG, by the branches the code actually has ----
+;; ENDPOINTS FOLLOW THE IMPLEMENTATION'S DIVISIONS, NOT THE SPEC'S
+;; CHARACTER CLASS. HEXDIG reads as two classes if you take the ABNF at
+;; face value; hex4 tests three independent ranges -- 0-9, a-f, A-F --
+;; so there are six endpoints, and a table built from the abstract class
+;; leaves the uppercase branch unwalked: break `F` and it stays green.
+;; The near misses matter for the same reason: each range's neighbour
+;; on both sides is what proves the bound is where the code says.
+(pin "hex escape digit"
+     '(("\"\\u0000\"" ACCEPT "7: HEXDIG 0, low end of the 0-9 branch")
+       ("\"\\u9999\"" ACCEPT "7: HEXDIG 9, high end of the 0-9 branch")
+       ("\"\\uaaaa\"" ACCEPT "7: HEXDIG a, low end of the a-f branch")
+       ("\"\\uffff\"" ACCEPT "7: HEXDIG f, high end of the a-f branch")
+       ("\"\\uAAAA\"" ACCEPT "7: HEXDIG A, low end of the A-F branch")
+       ("\"\\uFFFF\"" ACCEPT "7: HEXDIG F, high end of the A-F branch")
+       ("\"\\u000f\"" ACCEPT "7: lowercase in the last position")
+       ("\"\\u000F\"" ACCEPT "7: uppercase in the last position")
+       ;; neighbours just outside each branch
+       ("\"\\u:000\"" REJECT "7: ':' is one past '9'")
+       ("\"\\u`000\"" REJECT "7: '`' is one before 'a'")
+       ("\"\\u000g\"" REJECT "7: 'g' is one past 'f'")
+       ("\"\\uG000\"" REJECT "7: 'G' is one past 'F'")
+       ("\"\\u000G\"" REJECT "7: 'G' past 'F', last position")
+       ("\"\\u00 0\"" REJECT "7: four HEXDIG required, space is none")))
+
 ;; ---- rejections the grammar requires ----------------------------------
 (pin "required rejection"
      '(("[1,2,]" REJECT "5: array = [ value *( value-separator value ) ]")
