@@ -312,6 +312,50 @@
      '(("1e309" REJECT "9: an implementation may limit range")
        ("[1e309,1]" REJECT "9: the refusal is at read time")))
 
+;; ---- the third gate: the one that bounds WORK, not the value ----------
+;; Refusals here come from three separate gates, and only two of them
+;; are about what the number IS. The third is about what reading it
+;; COSTS: max-number-chars caps the token before the digits ever reach
+;; string->number, and on this side, where the exponent's digit count
+;; has no limit, that cap is the only thing standing between a request
+;; body and an arbitrarily long numeral.
+;;
+;; ITS REMOVAL DOES NOT MAKE THIS FILE RED. Measured: with the cap
+;; lifted, every row above still passes -- the finiteness check catches
+;; the same *values* -- while a 500000-digit integer takes 17 seconds
+;; and a 2000000-digit one does not finish inside a two-minute limit.
+;; So a later reader who finds the cap redundant ("the finite check
+;; already refuses these") would be reading the value dimension and
+;; deleting the cost one, and the consequence would not be a failure,
+;; it would be a timeout -- which in CI reads as infrastructure, not as
+;; a broken guard. That is why this section exists and says so.
+;;
+;; The rows assert WHICH gate fired, by its own message, so the three
+;; stay distinguishable: a change that makes one gate swallow another's
+;; input shows up as a wrong reason rather than as silence.
+(define (refusal-reason s)
+  (guard (e ((and (vector? e) (>= (vector-length e) 2)) (vector-ref e 1))
+            (#t 'other-error))
+    (string->json s)
+    'accepted))
+
+(check "the length gate names itself  [work: max-number-chars]"
+       (equal? "number too long" (refusal-reason (make-string 600 #\9)))
+       (refusal-reason (make-string 600 #\9)))
+(check "...and it fires before any digits are converted"
+       (equal? "number too long" (refusal-reason (make-string 500000 #\9)))
+       (refusal-reason (make-string 500000 #\9)))
+(check "the finiteness gate names itself  [value: 1e309]"
+       (equal? "number is not finite" (refusal-reason "1e309"))
+       (refusal-reason "1e309"))
+(check "the shape gate names itself  [grammar: 5.]"
+       (equal? "bad number" (refusal-reason "5."))
+       (refusal-reason "5."))
+;; a token just under the cap is still read, so the cap is a cap and
+;; not a blanket refusal of long numerals
+(check "just under the cap is still a number  [work gate has a boundary]"
+       (eq? 'accepted (refusal-reason (make-string 500 #\9))))
+
 ;; ---- the round trip an accepted number must survive -------------------
 ;; Whatever the reader accepts, the writer must emit as a number, never
 ;; as null: this is what keeps the read-time refusal above load-bearing
