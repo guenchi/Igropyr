@@ -157,6 +157,16 @@
                                   (write-char (integer->char v) p)
                                   (loop (+ i 6))))))
                          (else (jfail "bad escape" i)))))
+                    ;; SHARED DEPARTURE, held in lockstep: RFC 8259 says a
+                    ;; control character below U+0020 must be escaped, and
+                    ;; this branch copies whatever it finds -- a raw tab or
+                    ;; newline inside a string is taken. The browser-side
+                    ;; reader takes them too, so refusing here alone would
+                    ;; make the same document readable at one end and not
+                    ;; the other. The rows that pin this are in
+                    ;; test/json-rfc-surface.sc; when both sides refuse
+                    ;; together, in one change, this note and those rows
+                    ;; are deleted rather than reworded.
                     (else (write-char ch p) (loop (+ i 1))))))))
           values))
       ;; A number token is BOUNDED. Without a limit the whole run of digits
@@ -182,6 +192,94 @@
       ;; guards against. So 512 keeps the defence and drops the regression.
       (define max-number-chars 512)
 
+      ;; JSON's grammar wants a digit on BOTH sides of a decimal point and
+      ;; after an exponent marker. Chez's reader does not: string->number
+      ;; takes "5.", "5.e3", "1.e2", "-3." and "-.5", so a scanner that
+      ;; slices a token by character class and hands the whole thing over
+      ;; inherits that. This checks the token's SHAPE before delegating --
+      ;; one pass over characters already scanned, no allocation -- and
+      ;; leaves what the delegation is actually for untouched: magnitude,
+      ;; exactness, and the non-finite refusal below.
+      ;;
+      ;; WHAT IT DELIBERATELY DOES NOT ENFORCE: `int = 0 | [1-9]digit*`.
+      ;; A leading zero -- "01", "-00", "01.5" -- stays accepted. That
+      ;; laxity is SHARED with the browser-side reader; the missing digit
+      ;; beside a point was ours alone. Removing what only one side has
+      ;; converges the two; removing what both have makes them disagree.
+      ;; The distinction is the lockstep contract, not taste -- see the
+      ;; note on parse-number's acceptance surface below.
+      ;; ---- lockstep with the browser-side reader -------------------------
+      ;; A second reader for the same wire format lives on the browser
+      ;; side. Where the two disagree about accepting a document, the line
+      ;; is asymmetric: the same bytes mean different things depending on
+      ;; which end read them. So the ACCEPTANCE SURFACE is held in lockstep
+      ;; and the authority for it is the row set in
+      ;; test/json-rfc-surface.sc -- not this comment, and not a count.
+      ;;
+      ;; Two departures from RFC 8259 are SHARED and stay:
+      ;;   - a leading zero in the integer part: "01", "-00", "01.5";
+      ;;   - a bare control character inside a string (see parse-string).
+      ;; TIGHTENING EITHER ONE HERE ALONE WOULD BREAK THE LINE, not fix it.
+      ;; They come out when both sides come out together, in one change --
+      ;; and when that happens these lines are DELETED, not edited: a
+      ;; retained clause with no expiry goes on looking like it still holds.
+      ;;
+      ;; The dot rows above were different in kind: this side alone took
+      ;; them, so removing them converged the two readers rather than
+      ;; parting them. That is the whole test -- shared or ours alone --
+      ;; and it is why the leading zero survives three lines from code
+      ;; that refuses a missing digit.
+      ;;
+      ;; WHERE THE DELEGATION IS ALREADY NARROWED, and it matters for
+      ;; comparing the two: string->number would also take "+5", "1/2" and
+      ;; "#x10". None reach it, because the scanner's continuation set is
+      ;; digits and `. e E + -` and the entry test admits only `-` or a
+      ;; digit -- so `+` cannot open a number and `/` and `x` end the
+      ;; token. That cut is THIS implementation's, at that point. A reader
+      ;; that hands a whole token to Number() or parseFloat cuts somewhere
+      ;; else, which is the kind of difference the row set exists to catch.
+      ;;
+      ;; KNOWN, AND DELIBERATELY NOT A DEVIATION: char-numeric? is
+      ;; Unicode-aware, so an Arabic-Indic or fullwidth digit enters
+      ;; parse-number and is refused
+      ;; by string->number as "bad number", where a reader dispatching on
+      ;; /[0-9]/ refuses earlier. Both refuse. Lockstep is over the
+      ;; verdict, not the diagnostic -- error text and position are not a
+      ;; contract here -- so this is not a third shared departure and
+      ;; should not be reported as one.
+      (define (json-digit? c) (char<=? #\0 c #\9))
+
+      ;; index after a run of one or more digits from k, or #f for none
+      (define (digit-run k to)
+        (let loop ((k k) (any #f))
+          (if (and (fx< k to) (json-digit? (string-ref s k)))
+              (loop (fx+ k 1) #t)
+              (and any k))))
+
+      ;; [-] int [frac] [exp], a digit required in each part present
+      (define (number-shape? from to)
+        (let* ((k (if (and (fx< from to) (char=? (string-ref s from) #\-))
+                      (fx+ from 1)
+                      from))
+               (k (digit-run k to)))
+          (and k
+               (let ((k (if (and (fx< k to) (char=? (string-ref s k) #\.))
+                            (digit-run (fx+ k 1) to)
+                            k)))
+                 (and k
+                      (let ((k (if (and (fx< k to)
+                                        (memv (string-ref s k) '(#\e #\E)))
+                                   (let ((k (fx+ k 1)))
+                                     (digit-run
+                                       (if (and (fx< k to)
+                                                (memv (string-ref s k)
+                                                      '(#\+ #\-)))
+                                           (fx+ k 1)
+                                           k)
+                                       to))
+                                   k)))
+                        (and k (fx= k to))))))))
+
       (define (parse-number i)
         (let scan ((j (if (char=? (string-ref s i) #\-) (+ i 1) i))
                    (float? #f))
@@ -193,7 +291,9 @@
                          (memv c '(#\. #\e #\E #\+ #\-)))))
               (scan (+ j 1)
                     (or float? (memv (string-ref s j) '(#\. #\e #\E))))
-              (let ((v (string->number (substring s i j) 10)))
+              (let ()
+                (unless (number-shape? i j) (jfail "bad number" i))
+                (let ((v (string->number (substring s i j) 10)))
                 (unless v (jfail "bad number" i))
                 ;; An out-of-range exponent becomes +inf.0, which is a REAL
                 ;; and therefore passes any (real? v) guard downstream. jwt's
@@ -203,7 +303,7 @@
                 ;; the more faithful parse.
                 (when (and (real? v) (or (nan? v) (infinite? v)))
                   (jfail "number is not finite" i))
-                (values (if (and float? (exact? v)) (exact->inexact v) v) j)))))
+                (values (if (and float? (exact? v)) (exact->inexact v) v) j))))))
       ;; top level: one value, then only whitespace
       (let-values (((v end) (parse-value 0)))
         (unless (= (skip-ws end) n) (jfail "trailing characters" end))
