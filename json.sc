@@ -21,7 +21,18 @@
   (export string->json json->string json-ref)
   (import (chezscheme))
 
-  ;; nesting cap for untrusted input (same guard as (igropyr sexpr))
+  ;; nesting cap for untrusted input (same guard as (igropyr sexpr)).
+  ;;
+  ;; IT IS ALSO, TODAY, THE WRITER'S ONLY BOUND. json->string counts no
+  ;; depth of its own, so the deepest value a server can be handed is
+  ;; whatever this admits plus the constant number of layers the
+  ;; application wraps around it -- one {"result": ...} is enough to
+  ;; put a document that was accepted here past this limit on the way
+  ;; out, and our own reader then refuses to read the reply back.
+  ;; Raising or removing this number therefore removes the writer's
+  ;; bound as well, and nothing on the writing side says so. When the
+  ;; writer grows its own counter this paragraph goes away with the
+  ;; dependency it describes.
   (define max-depth 64)
 
   (define (jfail msg pos)
