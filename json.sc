@@ -216,9 +216,16 @@
       ;; and the authority for it is the row set in
       ;; test/json-rfc-surface.sc -- not this comment, and not a count.
       ;;
-      ;; Two departures from RFC 8259 are SHARED and stay:
+      ;; The LAXITIES BELOW stay, under the lockstep decisions the row
+      ;; set records -- both readers accept what RFC 8259 does not:
       ;;   - a leading zero in the integer part: "01", "-00", "01.5";
       ;;   - a bare control character inside a string (see parse-string).
+      ;; That is a warning about these two, not an inventory. Shared
+      ;; departures can also run the other way, both readers refusing what
+      ;; the grammar allows, and those are not repaired by loosening one
+      ;; side either. The row set owns the classification and the tally;
+      ;; what this comment owns is the instruction not to move these two
+      ;; alone. Never restate a count of deviations here.
       ;; TIGHTENING EITHER ONE HERE ALONE WOULD BREAK THE LINE, not fix it.
       ;; They come out when both sides come out together, in one change --
       ;; and when that happens these lines are DELETED, not edited: a
@@ -231,22 +238,28 @@
       ;; that refuses a missing digit.
       ;;
       ;; WHERE THE DELEGATION IS ALREADY NARROWED, and it matters for
-      ;; comparing the two: string->number would also take "+5", "1/2" and
-      ;; "#x10". None reach it, because the scanner's continuation set is
-      ;; digits and `. e E + -` and the entry test admits only `-` or a
-      ;; digit -- so `+` cannot open a number and `/` and `x` end the
-      ;; token. That cut is THIS implementation's, at that point. A reader
-      ;; that hands a whole token to Number() or parseFloat cuts somewhere
-      ;; else, which is the kind of difference the row set exists to catch.
+      ;; comparing the two: string->number would read "+5", "1/2" and
+      ;; "#x10". No whole spelling reaches it, but they are cut at two
+      ;; different points and only one of those points is in parse-number.
+      ;; "+5" and "#x10" are cut in parse-value*, whose dispatch admits
+      ;; only `-` or char-numeric?, so neither gets as far as this
+      ;; procedure. "1/2" does reach it -- the scanner stops at `/`,
+      ;; the legal prefix "1" IS delegated and does parse, and what
+      ;; refuses the document is the trailing content. Those cuts are THIS
+      ;; implementation's, at those points. A reader that hands a whole
+      ;; token to Number() or parseFloat cuts somewhere else, which is the
+      ;; kind of difference the row set exists to catch.
       ;;
       ;; KNOWN, AND DELIBERATELY NOT A DEVIATION: char-numeric? is
-      ;; Unicode-aware, so an Arabic-Indic or fullwidth digit enters
-      ;; parse-number and is refused
-      ;; by string->number as "bad number", where a reader dispatching on
-      ;; /[0-9]/ refuses earlier. Both refuse. Lockstep is over the
-      ;; verdict, not the diagnostic -- error text and position are not a
-      ;; contract here -- so this is not a third shared departure and
-      ;; should not be reported as one.
+      ;; Unicode-aware, so an Arabic-Indic or fullwidth digit passes the
+      ;; value dispatch and is taken into the token by the scanner. It is
+      ;; then refused as "bad number" when number-shape? below returns #f,
+      ;; its digit test being ASCII-only: that jfail dominates the
+      ;; delegation, so string->number is not reached. A reader
+      ;; dispatching on /[0-9]/ refuses one step earlier still. All
+      ;; refuse. Lockstep is over the verdict, not the diagnostic --
+      ;; error text and position are not a contract here -- so this is
+      ;; not an additional deviation and should not be reported as one.
       (define (json-digit? c) (char<=? #\0 c #\9))
 
       ;; index after a run of one or more digits from k, or #f for none
@@ -294,6 +307,17 @@
               (let ()
                 (unless (number-shape? i j) (jfail "bad number" i))
                 (let ((v (string->number (substring s i j) 10)))
+                ;; The shape check leaves string->number nothing to
+                ;; refuse in the shapes it admits: measured over the
+                ;; representative alphabet {0,1,9,.,e,E,+,-} to length 6,
+                ;; 8385 shaped tokens, none unreadable. That alphabet is
+                ;; one digit class and the punctuation, NOT the scanner's
+                ;; continuation set, which carries all ten digits and,
+                ;; through char-numeric?, non-ASCII ones as well. A
+                ;; bounded measurement, then, not a proof of
+                ;; unreachability. So this #f is a floor, not a filter --
+                ;; keep it, or a later loosening of the shape check
+                ;; returns a wrong value where it now raises.
                 (unless v (jfail "bad number" i))
                 ;; An out-of-range exponent becomes +inf.0, which is a REAL
                 ;; and therefore passes any (real? v) guard downstream. jwt's
