@@ -191,8 +191,19 @@
        ("1e0001" ACCEPT "6: 1*DIGIT, no upper bound on the count")
        ("1e+0005" ACCEPT "6: sign then 1*DIGIT, no bound")
        ("1e-0001" ACCEPT "6: sign then 1*DIGIT, no bound")
+       ;; ELEVEN DIGITS IS THE ROW A TRIM WOULD CUT FIRST, and it is the
+       ;; only one that catches an implementation quietly capping the
+       ;; count: it looks least like real input precisely because no
+       ;; ordinary document contains it. The counterpart capped at
+       ;; three; injecting that cap here reds this row and the two
+       ;; above, which is what a row of this kind is worth.
        ("1e00000000005" ACCEPT "6: 1*DIGIT, eleven of them")
-       ;; the value, not the digit count, is what a limit may refuse
+       ;; the value, not the digit count, is what a limit may refuse --
+       ;; two reasons, two rows, two anchors, and measured to be
+       ;; independent: dropping the non-finite refusal reds only the
+       ;; range rows, capping the exponent digits reds only the count
+       ;; rows. A mutation that reddened both would mean they are still
+       ;; entangled, and loosening the range would loosen the count.
        ("1e1000000" REJECT "9: an implementation may limit range")))
 
 ;; ---- \u escape: four HEXDIG, by the branches the code actually has ----
