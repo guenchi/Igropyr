@@ -159,12 +159,61 @@
   ;; exists, set by memory and time, and it has not been measured.
   (define write-guard-depth 1024)
 
+  ;; NAMES A KIND, FOR AN ERROR MESSAGE. Every answer is a literal in this
+  ;; file, so a message built from one has a size bound no matter what the
+  ;; value is -- which is the point: the two places that call this are
+  ;; refusing a value they must not print (see the writer's last branch for
+  ;; the measurements).
+  ;;
+  ;; THE LAST CLAUSE IS NOT THE END OF AN ENUMERATION, it is what keeps this
+  ;; honest. The set of Chez types is open and grows; a new one falls
+  ;; through to a coarser answer rather than to a wrong one. Do not replace
+  ;; it with a final specific kind.
+  ;;
+  ;; It stays neutral about CONTEXT. A caller that knows more about how a
+  ;; value reached it says so at its own site -- the writer knows that a
+  ;; pair which is not a list is improper or circular, and that is the
+  ;; writer's knowledge, not a fact about pairs.
+  (define (kind-of x)
+    (cond
+      ((string? x) "a string")
+      ((char? x) "a character")
+      ((symbol? x) "a symbol")
+      ((number? x) "a number")
+      ((boolean? x) "a boolean")
+      ((null? x) "the empty list")
+      ((vector? x) "a vector")
+      ((bytevector? x) "a bytevector")
+      ((fxvector? x) "an fxvector")
+      ((flvector? x) "a flvector")
+      ((procedure? x) "a procedure")
+      ((hashtable? x) "a hashtable")
+      ((port? x) "a port")
+      ((box? x) "a box")
+      ((eof-object? x) "the eof object")
+      ((pair? x) "a pair")
+      ((record? x) "a record")
+      (else "a value of some other type")))
+
+  ;; THE THIRD SLOT SAYS WHICH SIDE RAISED. Reading errors all come through
+  ;; here and carry an index into the input; writing errors carry #f, having
+  ;; no input to index. That split is exact today and is worth keeping,
+  ;; because a handler can dispatch on it -- an entry-check failure numbered
+  ;; #f would arrive looking like a writer's error. A NEW ERROR SITE MUST
+  ;; PICK A SIDE; do not introduce a third kind of third slot.
   (define (jfail msg pos)
     (raise (vector 'json-error msg pos)))
 
   ;; ---- parser -----------------------------------------------------------
 
   (define (string->json s)
+    ;; Without this the failure for a non-string was whatever string-length
+    ;; happened to raise, from inside a parser the caller never reached --
+    ;; a native condition naming neither this procedure nor what was wrong.
+    ;; The position is 0 rather than #f: nothing was consumed, and #f is
+    ;; the writing side's mark (see jfail).
+    (unless (string? s)
+      (jfail (string-append "string->json takes a string, not " (kind-of s)) 0))
     (let ((n (string-length s)))
       (define (skip-ws i)
         (if (and (< i n) (memv (string-ref s i) '(#\space #\tab #\newline #\return)))
@@ -560,11 +609,14 @@
       ;; (there is no single such predicate; number?, flonum?,
       ;; real-valued? are all things callers use). A choice does not
       ;; become better justified by acquiring a reason that is not true.
-      ;; It leaves as the same
-      ;; #(json-error "not a JSON value" #f) as a char or a port. It used
-      ;; to leave as an assertion-violation, which a guard written for
-      ;; json-error did not catch, and that was invisible only because
-      ;; every other branch here wrote "null" instead of raising at all.
+      ;; It leaves as #(json-error "not a JSON value: a complex number"
+      ;; #f) -- the same SHAPE as a char or a port, and a different
+      ;; message, because the branch knows what kind-of cannot: a complex
+      ;; is a number, and answering "a number" here would name the one
+      ;; thing about it that is not the problem. It used to leave as an
+      ;; assertion-violation, which a guard written for json-error did not
+      ;; catch, and that was invisible only because every other branch
+      ;; here wrote "null" instead of raising at all.
       ;;
       ;; SO "COMPLEX" IS TWO CASES HERE, NOT ONE, AND A TEST NEEDS BOTH.
       ;; A complex with a non-zero imaginary part is refused by real? and
@@ -582,7 +634,7 @@
       ;; why this is a cheaper thing to hunt than an input nobody thought
       ;; of.
       ((not (real? v))
-       (raise (vector 'json-error "not a JSON value" #f)))
+       (raise (vector 'json-error "not a JSON value: a complex number" #f)))
       ;; An exact integer is written exactly, at whatever width it takes
       ;; -- BUT THIS LIBRARY WILL NOT READ BACK WHAT IT WRITES HERE past
       ;; the reader's max-number-chars: 10^511 is 512 digits and comes
@@ -837,9 +889,30 @@
       ;;     (measured). This is true of every large value that reaches
       ;;     this branch and has nothing to do with cycles, which is why
       ;;     it, not the circular case, is the reason that generalises.
-      ;; The bounded, safe, locating form names the kind instead: "not a
-      ;; JSON value: a character". Do not "improve" this by adding ~s.
-      (else (raise (vector 'json-error "not a JSON value" #f)))))
+      ;; So the message names the KIND: "not a JSON value: a character".
+      ;; Bounded, safe, and enough to locate the mistake. Do not "improve"
+      ;; it by adding ~s.
+      ;;
+      ;; A pair reaching here is improper or circular, and is told so rather
+      ;; than called "a pair". Nothing else can be true of it: a proper list
+      ;; was taken by one of the two branches above, so list? answering #f
+      ;; while pair? answers #t is exactly the remaining case.
+      ;;
+      ;; It carries a second spelling as well, because the commonest way to
+      ;; arrive here is ("a" . 1) -- one object member written without the
+      ;; list around it. The writer cannot tell that from a genuinely
+      ;; malformed list, so it says both: the true thing about the value,
+      ;; and the shape that was probably meant. Neither is a guess, which
+      ;; is the whole reason two are given.
+      (else (raise (vector 'json-error
+                           (string-append
+                             "not a JSON value: "
+                             (if (pair? x)
+                                 (string-append
+                                   "an improper or circular list, and an "
+                                   "object with one member is ((\"k\" . v))")
+                                 (kind-of x)))
+                           #f)))))
 
   (define (json->string x)
     (call-with-string-output-port

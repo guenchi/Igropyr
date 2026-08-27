@@ -138,6 +138,11 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script test/checked-off.sc
 # belong to the sweeping verbs, the trailing thunk belongs to json-ref
 # only. Each cell owns one ruling from the export comment
 "$scheme_bin" --script test/json-ops.sc
+# every writer output judged by an independent RFC 8259 grammar, plus
+# exact-text cells for each escape row and container-structure decision.
+# Five mutations measured green under the old wrote? judge -- deleting
+# the quote escape among them -- all go red here
+"$scheme_bin" --script test/json-writer-syntax.sc
 # every byte in must come back out, checked against the system gzip(1)
 # tool in a separate process. Also the regression for zlib coexistence:
 # with the runtime's embedded zlib and a dlopened libz sharing one

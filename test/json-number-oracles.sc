@@ -66,7 +66,7 @@
 ;;; input; it is visible only in this file, by reading.
 
 (library (igropyr test json-number-oracles)
-  (export rfc-number-descent? rfc-number-machine?)
+  (export rfc-number-descent? rfc-number-machine? rfc-json-text?)
   (import (chezscheme))
 
   ;; ---- judge one: recursive descent over the productions ---------------
@@ -148,4 +148,116 @@
             ((exp-first)
              (and c (digit? c) (loop (fx+ i 1) 'exp-more)))
             (else #f))))))
+
+  ;; ---- judge three: a whole-document validator -------------------------
+  ;; Written from RFC 8259 sections 2-8, NOT from this library's reader:
+  ;; that reader deliberately accepts leading zeros and raw control
+  ;; characters, so asking it whether the writer's output is legal JSON
+  ;; would let both deviations pass in both directions at once. This is
+  ;; strict RFC: numbers via rfc-number-descent? on the number token,
+  ;; strings with the eight short escapes, \uXXXX with exactly four hex
+  ;; digits, no raw control characters below #x20; objects and arrays
+  ;; with exact comma/colon placement and no trailing comma; the six
+  ;; whitespace-free literals; exactly one top-level value; only JSON
+  ;; whitespace between tokens.
+  ;;
+  ;; IT VALIDATES SYNTAX AND NOTHING ELSE. It does not build a value, so
+  ;; it cannot be confused by representation choices, and it terminates
+  ;; on any string because it only moves forward.
+  (define (rfc-json-text? s)
+    (define n (string-length s))
+    (define (ws i)
+      (let loop ((i i))
+        (if (and (fx< i n)
+                 (memv (string-ref s i) '(#\space #\tab #\newline #\return)))
+            (loop (fx+ i 1))
+            i)))
+    (define (hex? c)
+      (or (char<=? #\0 c #\9) (char<=? #\a c #\f) (char<=? #\A c #\F)))
+    (define (str i)                       ; i is AFTER the opening quote
+      (let loop ((i i))
+        (cond
+          ((fx>= i n) #f)
+          ((char=? (string-ref s i) #\") (fx+ i 1))
+          ((char=? (string-ref s i) #\\)
+           (and (fx< (fx+ i 1) n)
+                (let ((c (string-ref s (fx+ i 1))))
+                  (cond
+                    ((memv c '(#\" #\\ #\/ #\b #\f #\n #\r #\t))
+                     (loop (fx+ i 2)))
+                    ((char=? c #\u)
+                     (and (fx< (fx+ i 5) n)
+                          (hex? (string-ref s (fx+ i 2)))
+                          (hex? (string-ref s (fx+ i 3)))
+                          (hex? (string-ref s (fx+ i 4)))
+                          (hex? (string-ref s (fx+ i 5)))
+                          (loop (fx+ i 6))))
+                    (else #f)))))
+          ((char<? (string-ref s i) #\x20) #f)   ; raw control character
+          (else (loop (fx+ i 1))))))
+    (define (number-token i)
+      ;; longest run of number characters, then judged as a whole token
+      (let loop ((j i))
+        (if (and (fx< j n)
+                 (let ((c (string-ref s j)))
+                   (or (char<=? #\0 c #\9)
+                       (memv c '(#\- #\+ #\. #\e #\E)))))
+            (loop (fx+ j 1))
+            (and (fx> j i)
+                 (rfc-number-descent? (substring s i j))
+                 j))))
+    (define (lit i word)
+      (let ((m (string-length word)))
+        (and (fx<= (fx+ i m) n)
+             (string=? (substring s i (fx+ i m)) word)
+             (fx+ i m))))
+    (define (value i)
+      (and (fx< i n)
+           (let ((c (string-ref s i)))
+             (cond
+               ((char=? c #\") (str (fx+ i 1)))
+               ((char=? c #\{) (object (ws (fx+ i 1))))
+               ((char=? c #\[) (array (ws (fx+ i 1))))
+               ((char=? c #\t) (lit i "true"))
+               ((char=? c #\f) (lit i "false"))
+               ((char=? c #\n) (lit i "null"))
+               ((or (char=? c #\-) (char<=? #\0 c #\9)) (number-token i))
+               (else #f)))))
+    (define (member* i)                   ; "key" ws : ws value
+      (and (fx< i n)
+           (char=? (string-ref s i) #\")
+           (let ((i (str (fx+ i 1))))
+             (and i
+                  (let ((i (ws i)))
+                    (and (fx< i n)
+                         (char=? (string-ref s i) #\:)
+                         (value (ws (fx+ i 1)))))))))
+    (define (object i)                    ; i is after "{" + ws
+      (cond
+        ((and (fx< i n) (char=? (string-ref s i) #\})) (fx+ i 1))
+        (else
+         (let loop ((i i))
+           (let ((i (member* i)))
+             (and i
+                  (let ((i (ws i)))
+                    (and (fx< i n)
+                         (case (string-ref s i)
+                           ((#\}) (fx+ i 1))
+                           ((#\,) (loop (ws (fx+ i 1))))
+                           (else #f))))))))))
+    (define (array i)                     ; i is after "[" + ws
+      (cond
+        ((and (fx< i n) (char=? (string-ref s i) #\])) (fx+ i 1))
+        (else
+         (let loop ((i i))
+           (let ((i (value i)))
+             (and i
+                  (let ((i (ws i)))
+                    (and (fx< i n)
+                         (case (string-ref s i)
+                           ((#\]) (fx+ i 1))
+                           ((#\,) (loop (ws (fx+ i 1))))
+                           (else #f))))))))))
+    (let ((i (value (ws 0))))
+      (and i (fx= (ws i) n) #t)))
 )

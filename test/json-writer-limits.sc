@@ -112,15 +112,15 @@
 
 (check "a cyclic list is refused, not written as null"
        (refused-as? (result (lambda () (json->string (cyclic-list))))
-                    "not a JSON value")
+                    "not a JSON value: an improper or circular list, and an object with one member is ((\"k\" . v))")
        (result (lambda () (json->string (cyclic-list)))))
 (check "...inside a vector too"
        (refused-as? (result (lambda () (json->string (vector (cyclic-list)))))
-                    "not a JSON value"))
+                    "not a JSON value: an improper or circular list, and an object with one member is ((\"k\" . v))"))
 (check "...and as an object's value"
        (refused-as? (result (lambda ()
                               (json->string (list (cons "k" (cyclic-list))))))
-                    "not a JSON value"))
+                    "not a JSON value: an improper or circular list, and an object with one member is ((\"k\" . v))"))
 
 ;; ---- the depth: a self-referential vector ------------------------------
 ;; RUN IN A CHILD PROCESS, because the failure this guards against has
@@ -189,21 +189,35 @@
 ;; refusing them is different.
 (for-each
   (lambda (entry)
-    (let ((name (car entry)) (make (cdr entry)))
+    (let ((name (car entry)) (make (cadr entry)) (msg (cddr entry)))
       (check (string-append "unrecognised value refused: " name)
              (refused-as? (result (lambda () (json->string (make))))
-                          "not a JSON value")
+                          msg)
              (result (lambda () (json->string (make)))))))
-  (list (cons "improper pair (1 . 2)" (lambda () (cons 1 2)))
-        (cons "improper pair (\"a\" . 1)" (lambda () (cons "a" 1)))
-        (cons "alist with a non-null tail"
-              (lambda () (cons (cons "k" 1) 7)))
-        (cons "char" (lambda () #\a))
-        (cons "bytevector" (lambda () (bytevector 1 2)))
-        (cons "procedure" (lambda () car))
-        (cons "hashtable" (lambda () (make-eq-hashtable)))
-        (cons "eof object" (lambda () (eof-object)))
-        (cons "void" (lambda () (void)))))
+  ;; each row now pins ITS OWN message: the refusal names a kind, and the
+  ;; pair rows get the two-part sentence -- the true thing about the
+  ;; value, and the shape that was probably meant. Neither half is a
+  ;; guess, which is why both are given. The last row is the open-set
+  ;; fallback, and it earned its keep: (void) is the input that proved
+  ;; the fallback reachable after seventeen hand-picked kinds never
+  ;; touched it.
+  (list (cons* "improper pair (1 . 2)" (lambda () (cons 1 2))
+               "not a JSON value: an improper or circular list, and an object with one member is ((\"k\" . v))")
+        (cons* "improper pair (\"a\" . 1)" (lambda () (cons "a" 1))
+               "not a JSON value: an improper or circular list, and an object with one member is ((\"k\" . v))")
+        (cons* "alist with a non-null tail"
+               (lambda () (cons (cons "k" 1) 7))
+               "not a JSON value: an improper or circular list, and an object with one member is ((\"k\" . v))")
+        (cons* "char" (lambda () #\a) "not a JSON value: a character")
+        (cons* "bytevector" (lambda () (bytevector 1 2))
+               "not a JSON value: a bytevector")
+        (cons* "procedure" (lambda () car) "not a JSON value: a procedure")
+        (cons* "hashtable" (lambda () (make-eq-hashtable))
+               "not a JSON value: a hashtable")
+        (cons* "eof object" (lambda () (eof-object))
+               "not a JSON value: the eof object")
+        (cons* "void" (lambda () (void))
+               "not a JSON value: a value of some other type")))
 
 ;; ---- and the values that must still be written -------------------------
 ;; The should-be-green half, enumerated across what the dispatch DOES
@@ -559,13 +573,12 @@
 (for-each
   (lambda (entry)
     (check (string-append "outside this writer's model, refused: " (car entry))
-           (refused-as? (result (lambda () (json->string ((cdr entry)))))
-                        "not a JSON value")
-           (result (lambda () (json->string ((cdr entry)))))))
-  (list (cons "fxvector" (lambda () (fxvector 1 2)))
-
-        (cons "flvector" (lambda () (flvector 1.0 2.0)))
-        (cons "box" (lambda () (box 1)))))
+           (refused-as? (result (lambda () (json->string ((cadr entry)))))
+                        (caddr entry))
+           (result (lambda () (json->string ((cadr entry)))))))
+  (list (list "fxvector" (lambda () (fxvector 1 2)) "not a JSON value: an fxvector")
+        (list "flvector" (lambda () (flvector 1.0 2.0)) "not a JSON value: a flvector")
+        (list "box" (lambda () (box 1)) "not a JSON value: a box")))
 
 ;; ---- one tag for every refusal, complex numbers included ---------------
 ;; A complex number used to leave as an assertion-violation while every
@@ -575,17 +588,17 @@
 ;; writing "null" -- and it became visible only once they did.
 (check "a complex number raises this library's error, not a condition"
        (refused-as? (result (lambda () (json->string (make-rectangular 1 2))))
-                    "not a JSON value")
+                    "not a JSON value: a complex number")
        (result (lambda () (json->string (make-rectangular 1 2)))))
 (check "...inside a vector too"
        (refused-as? (result (lambda ()
                               (json->string (vector (make-rectangular 1 2)))))
-                    "not a JSON value"))
+                    "not a JSON value: a complex number"))
 (check "...and as an object's value"
        (refused-as? (result (lambda ()
                               (json->string
                                (list (cons "k" (make-rectangular 1 2))))))
-                    "not a JSON value"))
+                    "not a JSON value: a complex number"))
 ;; the reals stay written: refusing complex is about the representation
 ;; not being real?, not about exactness. What "written" means for an
 ;; inexact conversion is bounded on both sides, and both bounds are
@@ -1089,12 +1102,54 @@
                (and (vector? e)
                     (= 3 (vector-length e))
                     (eq? 'json-error (vector-ref e 0))
-                    (equal? "not a JSON value" (vector-ref e 1))
+                    (equal? "not a JSON value: a complex number" (vector-ref e 1))
                     (eq? #f (vector-ref e 2))))
              (error-of (lambda () (json->string v))))))
   (list (cons (make-rectangular 1.0 0.0) "zero imaginary part, the one real? and real-valued? disagree on")
         (cons (make-rectangular 1 2) "non-zero imaginary part, exact")
         (cons (make-rectangular 0.0 1.0) "zero real part")))
+
+
+;; ---- the entry gate: string->json takes a string ----------------------
+;; A non-string input used to surface as a native condition from deep
+;; inside the parse -- raised where the caller's guard, written for
+;; #(json-error ...), could not catch it. The gate names the kind (never
+;; the value: kinds are bounded, values are not) and carries position 0.
+(for-each
+  (lambda (p)
+    (let ((v (car p)) (want (cadr p)) (what (caddr p)))
+      (check (string-append "entry gate: " what)
+             (let ((e (error-of (lambda () (string->json v)))))
+               (and (vector? e)
+                    (eq? 'json-error (vector-ref e 0))
+                    (equal? want (vector-ref e 1))
+                    (eqv? 0 (vector-ref e 2))))
+             (error-of (lambda () (string->json v))))))
+  (list (list 42 "string->json takes a string, not a number" "a number")
+        (list 'sym "string->json takes a string, not a symbol" "a symbol")
+        (list (vector 1) "string->json takes a string, not a vector" "a vector")
+        (list #t "string->json takes a string, not a boolean" "a boolean")
+        (list '() "string->json takes a string, not the empty list" "the empty list")
+        (list (bytevector 1) "string->json takes a string, not a bytevector"
+              "a bytevector: the caller decodes, this library does not guess an encoding")))
+
+;; ---- the third slot separates the sides, and now says so ---------------
+;; Every reader-side error carries an integer position; every writer-side
+;; error carries #f. That held by accident until the entry gate was
+;; added; jfail's comment now states it as a rule, and these two cells
+;; are the rule's owners -- one per side, including the newest member of
+;; each side.
+(check "reader-side errors, entry gate included, carry an integer position"
+       (and (integer? (vector-ref (error-of (lambda () (string->json 42))) 2))
+            (integer? (vector-ref (error-of (lambda () (string->json "@"))) 2))
+            (integer? (vector-ref (error-of (lambda () (string->json "[1,"))) 2)))
+       (list (error-of (lambda () (string->json 42)))
+             (error-of (lambda () (string->json "[1,")))))
+(check "writer-side errors, kind messages included, carry #f"
+       (and (eq? #f (vector-ref (error-of (lambda () (json->string #\a))) 2))
+            (eq? #f (vector-ref (error-of (lambda () (json->string 'oops))) 2))
+            (eq? #f (vector-ref (error-of (lambda () (json->string (cons 1 2)))) 2)))
+       (list (error-of (lambda () (json->string #\a)))))
 
 (if (zero? failures)
     (begin (display "json-writer-limits: all tests passed\n") (exit 0))
