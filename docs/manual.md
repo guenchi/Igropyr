@@ -432,8 +432,8 @@ The Express layer provides a familiar web framework API. Most applications use E
     (let ((id (req-param req "id"))
           (verbose? (assoc "verbose" (req-query req))))
       (if verbose?
-          (send-json! res (list (cons 'user id)
-                               (cons 'verbose #t)))
+          (send-json! res (list (cons "user" id)
+                               (cons "verbose" #t)))
           (send-text! res id)))))
 
 ;; POST /api/data with JSON body
@@ -441,9 +441,9 @@ The Express layer provides a familiar web framework API. Most applications use E
   (lambda (req res)
     (let ((body (req-json req)))
       (if body
-          (send-json! res (list (cons 'echo body)))
+          (send-json! res (list (cons "echo" body)))
           (begin (set-status! res 400)
-                 (send-json! res (list (cons 'error "bad json"))))))))
+                 (send-json! res (list (cons "error" "bad json"))))))))
 
 ;; PUT, DELETE likewise
 (app-put app "/item/:id" (lambda (req res) ...))
@@ -928,18 +928,24 @@ Use `http-stats` to inspect the pool and connection state:
 (let ((srv (app-listen app 8080)))
   (app-get app "/stats"
     (lambda (req res)
-      (send-json! res (http-stats srv)))))
+      (send-json! res (http-stats-json srv)))))
 ```
+
+`http-stats` returns a Scheme alist keyed by **symbol**, for callers that
+read it with `assq`. `http-stats-json` is the same snapshot with the keys
+spelled out as strings, which is what a JSON object key has to be — hand
+`http-stats` itself to a JSON writer and it is refused on its first
+member. Both are exported by `(igropyr http)`.
 
 Returns:
 
 ```scheme
-((idle . 5)          ; idle workers
- (busy . 2)          ; workers processing a task
- (pending . 1)       ; queued tasks waiting for a worker
- (total-requests . 12345)      ; cumulative requests served
- (active-connections . 23)     ; open TCP connections
- (uptime-ms . 3600000))        ; server uptime in milliseconds
+((connections . 23)    ; open TCP connections
+ (requests . 12345)    ; cumulative requests served
+ (uptime-ms . 3600000) ; server uptime in milliseconds
+ (idle . 5)            ; idle workers
+ (busy . 2)            ; workers processing a task
+ (pending . 1))        ; queued tasks waiting for a worker
 ```
 
 ### Graceful Shutdown
@@ -1077,23 +1083,26 @@ handlers in a blanket guard.
 
 ### Monitoring the Pool
 
-Use `(http-stats srv)` to get current pool state:
+Use `(http-stats srv)` to get current pool state, or
+`(http-stats-json srv)` for the same snapshot with string keys, ready for
+a JSON writer:
 
 ```scheme
 (app-get app "/stats"
   (lambda (req res)
-    (send-json! res (http-stats srv))))
+    (send-json! res (http-stats-json srv))))
 ```
 
-Returns:
+Returns (from `http-stats`; `http-stats-json` has the same values under
+`"connections"`, `"requests"` and so on):
 
 ```scheme
-((idle . 3)
+((connections . 12)
+ (requests . 5234)
+ (uptime-ms . 31234)
+ (idle . 3)
  (busy . 2)
- (pending . 1)
- (total-requests . 5234)
- (active-connections . 12)
- (uptime-ms . 31234))
+ (pending . 1))
 ```
 
 ### Handling Errors in the Handler
@@ -1119,9 +1128,9 @@ For known error cases, catch exceptions and respond appropriately:
           (b (string->number (req-param req "b"))))
       (guard (e ((and (number? e) (zero? e))
                  (set-status! res 400)
-                 (send-json! res (list (cons 'error "division by zero")))))
+                 (send-json! res (list (cons "error" "division by zero")))))
         (if (zero? b) (raise 0) #f)
-        (send-json! res (list (cons 'result (/ a b))))))))
+        (send-json! res (list (cons "result" (/ a b))))))))
 ```
 
 ---
@@ -1342,8 +1351,8 @@ express cannot happen.
                     300000
                     req-body)))          ; what identifies a retry
       ;; the token goes to the client and must come back with the next request
-      (send-json! res (cons (cons 'conv id)
-                            (cons (cons 'token token) reply))))))
+      (send-json! res (cons (cons "conv" id)
+                            (cons (cons "token" token) reply))))))
 
 (app-post app "/transfer/:id"
   (lambda (req res)
@@ -1355,15 +1364,15 @@ express cannot happen.
         (cond
           ((conversation-gone? status)             ; died: rolled back
            (set-status! res 410)
-           (send-json! res '((fault . "gone") (rolled-back . #t))))
+           (send-json! res '(("fault" . "gone") ("rolled-back" . #t))))
           ((conversation-settled? status)          ; finished; answer not kept
            (set-status! res 409)
-           (send-json! res '((fault . "settled") (committed . #t))))
+           (send-json! res '(("fault" . "settled") ("committed" . #t))))
           ((conversation-stale? status)            ; a different question
            (set-status! res 409)
-           (send-json! res '((fault . "stale") (applied . #f))))
+           (send-json! res '(("fault" . "stale") ("applied" . #f))))
           ((conversation-done? status) (send-json! res r))
-          (else (send-json! res (cons (cons 'token status) r))))))))
+          (else (send-json! res (cons (cons "token" status) r))))))))
 ```
 
 API: `(conversation-start! flow req [ttl-ms [request-key [on-killed]]])`
@@ -2524,7 +2533,7 @@ Middleware can pass data to downstream handlers via `req-local` and `req-set-loc
   (lambda (req res)
     (let ((user (req-local req 'user)))
       (if user
-          (send-json! res (list (cons 'name (car user))))
+          (send-json! res (list (cons "name" (car user))))
           (begin (set-status! res 403)
                  (send-text! res "Forbidden"))))))
 ```
@@ -2625,7 +2634,7 @@ Claims land on a request-local slot; read them in a handler with `(req-claims re
 (app-get app "/me"
   (lambda (req res)
     (let ((claims (req-claims req)))         ; guaranteed present here
-      (send-json! res (list (cons 'sub (json-ref claims "sub")))))))
+      (send-json! res (list (cons "sub" (json-ref claims "sub")))))))
 ```
 
 A missing or invalid token answers **401** with a `WWW-Authenticate: Bearer` header and a `{"error":"unauthorized"}` JSON body. Options:
@@ -2817,16 +2826,16 @@ If the same client makes two concurrent requests with the same session ID, both 
       (if (and username password (valid-password? (cdr username) (cdr password)))
           (let ((s (req-session req)))
             (session-set! s 'user (cdr username))
-            (send-json! res (list (cons 'ok #t))))
+            (send-json! res (list (cons "ok" #t))))
           (begin (set-status! res 401)
-                 (send-json! res (list (cons 'error "bad credentials"))))))))
+                 (send-json! res (list (cons "error" "bad credentials"))))))))
 
 (app-get app "/profile"
   (lambda (req res)
     (let ((s (req-session req)))
       (let ((user (session-get s 'user)))
         (if user
-            (send-json! res (list (cons 'user user)))
+            (send-json! res (list (cons "user" user)))
             (begin (set-status! res 403)
                    (send-text! res "Not logged in")))))))
 ```
@@ -2930,7 +2939,7 @@ claims on a request-local slot for `req-claims`:
 (app-get app "/me"
   (lambda (req res)
     (let ((claims (req-claims req)))        ; guaranteed present here
-      (send-json! res (list (cons 'sub (json-ref claims "sub")))))))
+      (send-json! res (list (cons "sub" (json-ref claims "sub")))))))
 ```
 
 Verification options ride along inside the verifier; `auth`'s own options
@@ -3396,11 +3405,11 @@ For applications with many concurrent workers, instead of one connection, use `m
     (let ((rows (mysql-query db "SELECT id, name FROM users")))
       (if (eq? (vector-ref rows 0) 'rows)
           (send-json! res (map (lambda (row)
-                                 (list (cons 'id (car row))
-                                       (cons 'name (cadr row))))
+                                 (list (cons "id" (car row))
+                                       (cons "name" (cadr row))))
                                (caddr rows)))
           (begin (set-status! res 500)
-                 (send-json! res (list (cons 'error "database error"))))))))
+                 (send-json! res (list (cons "error" "database error"))))))))
 ```
 
 From the HTTP perspective, the database query is non-blocking: the worker's process parks in `receive`, but the OS thread keeps serving other requests via other workers and connections.
@@ -4045,11 +4054,103 @@ JSON is mapped to Scheme types:
 - `true`, `false` → `#t`, `#f`
 - `null` → `'null`
 
+**One spelling per shape.** An array is a vector and nothing else; a key,
+and a string, is a string and nothing else. A list where an array was
+meant, and a symbol where a key or a string was meant, are *refused* —
+not converted. The reason is that a document keeps no memory of its
+spelling: if two different Scheme values could produce the same document,
+the document cannot say which one it came from, and at most one of them
+can come back as itself. Rather than pick a winner silently, the writer
+refuses the other spelling and says so.
+
+```scheme
+(json->string '(1 2 3))     ; "a JSON array is a vector, not a list: use list->vector"
+(json->string '((k . 1)))   ; "an object key must be a string, not k: an object member is ("k" . v), a nested array is #(#(...))"
+(json->string 'foo)         ; "a JSON string is a string, not the symbol foo: quote it"
+```
+
+Refusals name the offending value when naming it is bounded — a symbol,
+a literal pair, a truncated glimpse of a larger key — and otherwise name
+only its **kind**. A value that reaches a refusal may be circular, or a
+hundred thousand elements long, and an error path must stay small and
+quiet no matter what it is describing:
+
+```scheme
+(json->string #\a)          ; "not a JSON value: a character"
+(json->string 1+2i)         ; "not a JSON value: a complex number"
+(json->string '("a" . 1))   ; "not a JSON value: an improper or circular list, and an object with one member is (("k" . v))"
+```
+
+That last one gives two spellings because the writer genuinely cannot
+tell the two intentions apart: an improper pair *is* a malformed list, and
+it is also the commonest way to write a single object member without the
+list around it. Neither reading is a guess, which is why both are given.
+
 #### API
 
-- `(string->json s)` → parsed value; raises `#(json-error ,msg ,pos)` on bad input
-- `(json->string x)` → JSON string (alists → objects, vectors → arrays, plain lists also become arrays)
-- `(json-ref x key ...)` → value or #f; recursive descent by string/symbol key (objects) or integer index (arrays)
+- `(string->json s)` → parsed value; raises `#(json-error msg pos)` on bad
+  input, and on an argument that is not a string:
+  `"string->json takes a string, not a number"`
+- `(json->string x)` → JSON string; validates all the way down and raises
+  on anything outside the model above
+- `(json-object? x)`, `(json-array? x)`, `(json-null? x)` → classify a
+  value in this representation. Cheap and **non-recursive**, so they are
+  not writability checks: a value can satisfy `json-object?` and still be
+  refused by `json->string`
+
+**Errors are `#(json-error message position)`, and the position says which
+side raised.** Every reading error carries an index into the input; every
+writing error carries `#f`, having no input to index. A handler can
+dispatch on that. It is also why the argument check on `string->json`
+reports `0` — nothing was consumed — rather than `#f`.
+
+#### Reading and rewriting paths
+
+Six verbs, each in two layers. **The trailing `*` marks the lower layer**,
+not an enhanced variant — the opposite of the usual Scheme convention, and
+the same sense it has in `write-json*`. A starred procedure takes one
+locator and can be applied; the macro beside it takes a path written out
+at the call site and flattens it into nested calls.
+
+| one locator, applicable | over a path |
+| --- | --- |
+| `(json-ref* x k [absent])` | `(json-ref x k ... [absent])` |
+| `(json-set* x k v)` | `(json-set x k ... v)` |
+| `(json-drop* x sel)` | `(json-drop x k ... sel)` |
+| `(json-update* x sel p)` | `(json-update x k ... sel p)` |
+| `(json-push* x member)` | `(json-push x k ... member)` |
+| `(json-insert* x k member)` | `(json-insert x k ... loc member)` |
+
+```scheme
+(define doc (string->json "{\"a\":{\"b\":[10,20]}}"))
+(json-ref doc "a" "b" 1)                      ; => 20
+(json-ref doc "a" "z" (lambda () 'missing))   ; => missing
+(json-set doc "a" "b" 0 99)                   ; => (("a" ("b" . #(99 20))))
+(json-set doc "a" "z" 0 99)                   ; => #f
+```
+
+A **locator** is a string, a symbol, or an exact non-negative index. Note
+the asymmetry with stored keys: a symbol *key* is refused, but a symbol
+*locator* is fine — it is spelled to a string for the lookup, and nothing
+symbolic is ever stored, so no ambiguity follows.
+
+`sel`, in `json-drop` and `json-update`, is a locator, a predicate on the
+key, `#t` for every member, or `#f` for none. **Selecting nothing is not
+failing**: the container comes back, having had zero members changed. `#f`
+is reserved for an operation that did not complete — a broken path, or a
+locator that is not there.
+
+The macros read down to the innermost container, act there, and store each
+rebuilt container back into its parent. A break anywhere answers `#f` for
+the whole expression rather than storing `#f` a level up, and the original
+value is left alone. The container and every locator are evaluated
+**exactly once**. Only `json-ref` accepts a trailing thunk; the other
+verbs end in a value, and a value may well be a procedure.
+
+`json-update`'s procedure is called with the key (or index) and the old
+value. Nothing here promises to share structure with its argument or to
+copy it — both happen, and which one is an implementation choice — so code
+that needs to know whether a value was rebuilt must compare contents.
 
 The parser is a recursive-descent, safe for untrusted input.
 
@@ -4059,14 +4160,14 @@ The parser is a recursive-descent, safe for untrusted input.
 (let ((body (utf8->string (req-body req))))
   (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'json-error))
               (begin (set-status! res 400)
-                     (send-json! res (list (cons 'error "malformed json"))))))
+                     (send-json! res (list (cons "error" "malformed json"))))))
     (let ((data (string->json body)))
       ;; data is an alist
       (let ((name (assoc "name" data)))
         (if name
-            (send-json! res (list (cons 'greeting (string-append "hi " (cdr name)))))
+            (send-json! res (list (cons "greeting" (string-append "hi " (cdr name)))))
             (begin (set-status! res 400)
-                   (send-json! res (list (cons 'error "missing name")))))))))
+                   (send-json! res (list (cons "error" "missing name")))))))))
 ```
 
 Path access via `json-ref`:
@@ -5386,7 +5487,7 @@ Create a test script:
     (define app (create-app))
     (app-get app "/test"
       (lambda (req res)
-        (send-json! res (list (cons 'ok #t)))))
+        (send-json! res (list (cons "ok" #t)))))
     (app-listen app 8888)
     
     ;; Test 3: Query via curl (in real tests, use a Scheme HTTP client)
@@ -5662,14 +5763,14 @@ When a task crashes and is retried, the handler is called again with the same `r
 ;; ✓ Safe (stateless)
 (app-get app "/users/:id"
   (lambda (req res)
-    (send-json! res (list (cons 'id (req-param req "id"))))))
+    (send-json! res (list (cons "id" (req-param req "id"))))))
 
 ;; ✗ Unsafe (side effect will happen twice on retry)
 (define call-count 0)
 (app-get app "/users/:id"
   (lambda (req res)
     (set! call-count (+ call-count 1))
-    (send-json! res (list (cons 'calls call-count)))))
+    (send-json! res (list (cons "calls" call-count)))))
 ```
 
 Use process-local state (e.g., gen-server) or a database if the side effect must happen once.
