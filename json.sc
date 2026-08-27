@@ -161,9 +161,16 @@
 
   ;; NAMES A KIND, FOR AN ERROR MESSAGE. Every answer is a literal in this
   ;; file, so a message built from one has a size bound no matter what the
-  ;; value is -- which is the point: the two places that call this are
-  ;; refusing a value they must not print (see the writer's last branch for
-  ;; the measurements).
+  ;; value is.
+  ;;
+  ;; THIS IS NOT THE ONLY WAY TO NAME A VALUE SAFELY -- datum-name renders
+  ;; one, bounded, and is used where a glimpse of the value IS the
+  ;; diagnosis. The two are different jobs, not two answers to one
+  ;; question. A key that is the symbol sym is diagnosed by the word "sym"
+  ;; and by nothing else, so that site renders it; a character or a port in
+  ;; a value position is a category mistake, and "a character" says more
+  ;; about it than #\a would. Choose by which one the reader needs, not by
+  ;; which one is safer -- both are.
   ;;
   ;; THE LAST CLAUSE IS NOT THE END OF AN ENUMERATION, it is what keeps this
   ;; honest. The set of Chez types is open and grows; a new one falls
@@ -194,6 +201,41 @@
       ((pair? x) "a pair")
       ((record? x) "a record")
       (else "a value of some other type")))
+
+  ;; RENDERS A CALLER'S VALUE FOR AN ERROR MESSAGE, BOUNDED AND WITHOUT
+  ;; RAISING. Naming the value is worth a great deal when it is small -- a
+  ;; symbol key is the commonest mistake here and its name is the whole
+  ;; diagnosis -- but "~s" alone is not usable on an error path:
+  ;;
+  ;;   - IT HAS NO SIZE BOUND. A vector of 100000 elements used as a key
+  ;;     produced a 200098-character message (measured). print-length and
+  ;;     print-level both default to #f, so nothing stops it.
+  ;;   - ON A CYCLE IT RAISES. Chez detects the cycle and signals a
+  ;;     continuable warning before returning, and a warning is a
+  ;;     condition: a caller holding the ordinary (guard (e (#t ...))
+  ;;     (json->string x)) receives THE WARNING INSTEAD OF THE ERROR
+  ;;     (measured -- the handler saw a warning and never the json-error).
+  ;;     An error path that can hijack the caller's handler is worse than
+  ;;     one that merely prints.
+  ;;
+  ;; print-graph #t is what removes the second: with it there is no cycle
+  ;; to detect, so nothing is signalled and a cycle renders as #0=(...).
+  ;; print-length and print-level bound the traversal, and the final
+  ;; substring bounds what the two of them cannot -- one atom that is
+  ;; itself enormous, such as a symbol with a 100000-character name.
+  ;;
+  ;; The result is at most 51 characters for every input measured: a small
+  ;; symbol and a small pair come through unchanged, a million-element
+  ;; vector reads "#(7 7 7 7 ...)", a cycle reads "#0=(1 2 . #0#)". The
+  ;; work is bounded for structures and linear in the length of a single
+  ;; atom, which for a million characters measured 1ms -- stated rather
+  ;; than closed, since only the OUTPUT is bounded by construction.
+  (define (datum-name x)
+    (let ((t (parameterize ((print-length 4) (print-level 3) (print-graph #t))
+               (format "~s" x))))
+      (if (fx> (string-length t) 48)
+          (string-append (substring t 0 48) "...")
+          t)))
 
   ;; THE THIRD SLOT SAYS WHICH SIDE RAISED. Reading errors all come through
   ;; here and carry an index into the input; writing errors carry #f, having
@@ -684,7 +726,9 @@
       ;; is this representation's spelling of the JSON literal.
       ((symbol? x)
        (raise (vector 'json-error
-                      (format "a JSON string is a string, not the symbol ~s: quote it" x)
+                      (string-append
+                        "a JSON string is a string, not the symbol "
+                        (datum-name x) ": quote it")
                       #f)))
       ((vector? x)
        (put-char p #\[)
@@ -756,7 +800,11 @@
                      ;; list of lists meant as a nested array -- and the
                      ;; writer cannot tell which was intended.
                      (raise (vector 'json-error
-                                    (format "an object key must be a string, not ~s: an object member is (\"k\" . v), a nested array is #(#(...))" k)
+                                    (string-append
+                                      "an object key must be a string, not "
+                                      (datum-name k)
+                                      ": an object member is (\"k\" . v)"
+                                      ", a nested array is #(#(...))")
                                     #f))))
                p)
              (put-char p #\:)

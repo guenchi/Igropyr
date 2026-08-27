@@ -1151,6 +1151,24 @@
             (eq? #f (vector-ref (error-of (lambda () (json->string (cons 1 2)))) 2)))
        (list (error-of (lambda () (json->string #\a)))))
 
+;; ---- refusal messages are bounded ---------------------------------------
+;; The key message names the offending key with ~s. A symbol or a
+;; literal pair is caller-written source text and stays small; a key
+;; that is a hundred-thousand-element vector must NOT be transcribed
+;; into the message -- print-length defaults to #f, so ~s of it is the
+;; whole value. Written red against the unbounded message (200,098
+;; characters, measured); the bound asserts the fix.
+(check "a huge non-symbol key yields a bounded message"
+       (let ((e (error-of (lambda ()
+                            (json->string
+                             (list (cons (make-vector 100000 7) 1)))))))
+         (and (vector? e)
+              (< (string-length (vector-ref e 1)) 200)))
+       (let ((e (error-of (lambda ()
+                            (json->string
+                             (list (cons (make-vector 100000 7) 1)))))))
+         (and (vector? e) (string-length (vector-ref e 1)))))
+
 (if (zero? failures)
     (begin (display "json-writer-limits: all tests passed\n") (exit 0))
     (begin (display (number->string failures))

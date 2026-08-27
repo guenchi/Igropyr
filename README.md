@@ -515,6 +515,72 @@ Objects map to alists (string keys), arrays to vectors, `null` to
 (json-ref (string->json "{\"a\":{\"b\":9}}") "a" "b")  ; => 9
 ```
 
+**One spelling per shape.** An array is a vector and nothing else, and a
+key or a string is a string and nothing else. A list where an array was
+meant, and a symbol where a key or a string was meant, are refused rather
+than converted — two Scheme values that reached the same document could
+not both be read back, so the writer says so instead of choosing:
+
+```scheme
+(json->string '(1 2 3))     ; "a JSON array is a vector, not a list: use list->vector"
+(json->string '((k . 1)))   ; "an object key must be a string, not k: an object member is ("k" . v), a nested array is #(#(...))"
+```
+
+Refusals name the offending value where it is small — a symbol, a key —
+and otherwise name its KIND, never the value itself, since a value
+reaching a refusal may be circular or enormous:
+
+```scheme
+(json->string #\a)          ; "not a JSON value: a character"
+(json->string 1+2i)         ; "not a JSON value: a complex number"
+(string->json 42)           ; "string->json takes a string, not a number"
+```
+
+Errors are `#(json-error message position)`. **The position says which
+side raised**: reading errors carry an index into the input, writing
+errors carry `#f`. `(string->json 42)` reports `0` — nothing was
+consumed — rather than `#f`, so a handler can still dispatch on it.
+
+### Reading and rewriting paths
+
+Six verbs, each in two layers. The trailing `*` marks the **lower**
+layer, not an enhanced one: a starred procedure takes one locator and can
+be applied, while the macro takes a path written at the call site and
+flattens it. A locator is a string, a symbol, or an exact non-negative
+index; a symbol locator is spelled to a string for the lookup, so nothing
+symbolic is ever stored.
+
+| one locator, applicable | over a path |
+| --- | --- |
+| `(json-ref* x k [absent])` | `(json-ref x k ... [absent])` |
+| `(json-set* x k v)` | `(json-set x k ... v)` |
+| `(json-drop* x sel)` | `(json-drop x k ... sel)` |
+| `(json-update* x sel p)` | `(json-update x k ... sel p)` |
+| `(json-push* x member)` | `(json-push x k ... member)` |
+| `(json-insert* x k member)` | `(json-insert x k ... loc member)` |
+
+```scheme
+(define doc (string->json "{\"a\":{\"b\":[10,20]}}"))
+(json-ref doc "a" "b" 1)                      ; => 20
+(json-ref doc "a" "z" (lambda () 'missing))   ; => missing
+(json-set doc "a" "b" 0 99)                   ; => (("a" ("b" . #(99 20))))
+(json-set doc "a" "z" 0 99)                   ; => #f
+```
+
+`sel` selects: a locator, a predicate on the key, `#t` for every member,
+or `#f` for none. Selecting nothing is not failing — the container comes
+back, having had zero members changed — while `#f` means the operation
+did not complete. The macros read down and rebuild on the way out, so a
+break anywhere answers `#f` for the whole expression and the original is
+left alone; the container and every locator are evaluated exactly once.
+Only `json-ref` takes a trailing thunk, because the other verbs end in a
+value and a value may well be a procedure.
+
+`json-object?`, `json-array?` and `json-null?` classify a value in this
+representation. They are cheap and non-recursive, so they are not
+writability checks: a value can satisfy `json-object?` and still be
+refused by `json->string`, which validates all the way down.
+
 In a handler, `req-json` parses the request body (returns `#f` on
 invalid JSON) and `send-json!` serializes:
 
