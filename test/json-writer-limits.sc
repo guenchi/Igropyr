@@ -6,9 +6,12 @@
 ;;; others:
 ;;;
 ;;;   THE SPINE. A list closed into a cycle with set-cdr! is not deep,
-;;;   it is endless -- a depth counter is never consulted on that path.
-;;;   Chez's list? terminates on such a value (R6RS requires it) and
-;;;   answers #f, so the writer used to fall through to its catch-all.
+;;;   it is endless. The depth counter IS consulted -- it is checked on
+;;;   every value entered, this one included -- but it never gets the
+;;;   chance to grow, because nothing descends the spine: Chez's list?
+;;;   terminates on such a value (R6RS requires it) and answers #f, so
+;;;   the writer used to fall through to its catch-all instead. A limit
+;;;   on depth cannot catch a value whose problem is length.
 ;;;
 ;;;   THE DEPTH. A vector holding itself IS deep: the writer recurses
 ;;;   until the process dies. Measured before the fix, on the real
@@ -17,26 +20,35 @@
 ;;;   That is not a contained crash; it is roughly a gigabyte a second
 ;;;   of allocation, and the machine's other processes pay for it.
 ;;;
-;;;   THE CATCH-ALL. Nine kinds of value the writer does not recognise
-;;;   all produced the string "null" and a successful return -- a
-;;;   document that looks right and is not. Every one of them is a
-;;;   caller's type error, and none of them is a meaningful null, so
-;;;   the else branch raises now. (NaN and infinity are a different
-;;;   null: that one is deliberate, matches JSON.stringify, and is
-;;;   pinned in test/json-numbers.sc. Do not merge the two.)
+;;;   THE CATCH-ALL. Values the writer does not recognise all produced
+;;;   the string "null" and a successful return -- a document that
+;;;   looks right and is not. The kinds below are the ones measured,
+;;;   not a closed list: the branch is a catch-all and anything new
+;;;   this Scheme grows falls into it. Each measured kind is a caller's
+;;;   type error and none is a meaningful null, so the branch raises
+;;;   now. (NaN and infinity are a different null: that one is
+;;;   deliberate, and the cells below check it here rather than say
+;;;   another file does -- a sentence about another file's coverage is
+;;;   one this file cannot check.)
 ;;;
-;;; THE WRITER'S DEPTH LIMIT IS NOT THE READER'S. The reader's cap is a
-;;; wire contract, matched word for word with the browser-side twin;
-;;; the writer's is a local resource guard. They cannot be the same
-;;; number, because the pipeline is read, wrap, write: what the writer
-;;; sees is the reader's maximum PLUS however many layers the
-;;; application adds, and the library cannot know that constant. Set
-;;; them equal and a client's perfectly legal document, wrapped once by
-;;; the handler, raises on the way out -- turning a bad response into
-;;; an externally triggerable error. Hence a different number and a
-;;; different name; only the message is shared.
+;;; THE WRITER'S DEPTH LIMIT IS NOT THE READER'S, TODAY. The reader's
+;;; cap is a wire contract -- json.sc says what it is contracted with,
+;;; and that is where the claim belongs, since a statement about
+;;; another library goes stale in a file nobody opens when it changes.
+;;; The writer's is a local resource guard. They are currently different
+;;; numbers because the pipeline is read, wrap, write -- what the
+;;; writer sees is the reader's maximum plus however many layers the
+;;; application adds, and the library cannot know that constant, so
+;;; equal numbers would let a client's legal document raise on the way
+;;; out. The cost of them differing is the other side of the same
+;;; trade: the writer can emit documents deeper than any reader here
+;;; accepts. BOTH COSTS ARE REAL AND THE TRADE IS NOT SETTLED -- see
+;;; json.sc, where the trade is set out. The cells below pin what is
+;;; true now; they are not an argument that this is the right pair of
+;;; numbers.
 
-(import (chezscheme) (igropyr json))
+(import (chezscheme) (igropyr json)
+        (only (igropyr test json-number-oracles) rfc-number-descent?))
 
 (define failures 0)
 (define (fail label . info)
@@ -58,9 +70,40 @@
 
 (define (wrote? r) (and (pair? r) (eq? (car r) 'returned) (string? (cadr r))))
 
+;; The judge is rfc-number-descent? from test/json-number-oracles.sc,
+;; NOT this library's own reader: that reader deliberately accepts
+;; leading zeros, so asking it whether the writer's output is legal JSON
+;; would let "01" pass in both directions at once -- the check and the
+;; thing checked sharing one mistake.
+;;
+;; IT USED TO BE DEFINED HERE, and json-number-syntax.sc had a second,
+;; differently written judge of the same grammar. THE TWO WERE NOT
+;; EQUALLY EXPOSED, which is worth stating precisely rather than as a
+;; symmetrical-sounding story: that one had a corpus putting it opposite
+;; the production predicate, so its drift would have shown. THIS one had
+;; only the table below and then judged whatever the formatter emitted
+;; -- so it could have started accepting 1d0 with every suite green.
+;; Exporting it is what lets json-number-syntax.sc put it to a corpus
+;; too, which is the only thing that would notice.
+;;
+;; It still answers for itself here before anything is judged by it: a
+;; shared judge is not a trusted one, and this suite should say so on
+;; its own inputs rather than rely on the other file having asked.
+(for-each
+  (lambda (p)
+    (check (string-append "the shared descent judge: " (car p)
+                          (if (cdr p) " is a JSON number" " is not one"))
+           (eq? (cdr p) (and (rfc-number-descent? (car p)) #t))))
+  '(("0" . #t) ("-0" . #t) ("1.5" . #t) ("1e5" . #t) ("1E+5" . #t)
+    ("5e-324" . #t) ("1e-308" . #t) ("1e-5" . #t)
+    ("01" . #f) ("00" . #f) ("-00" . #f) ("01.5" . #f)
+    ("1e" . #f) ("5." . #f) (".5" . #f) ("+1" . #f)
+    ("5e-324|1" . #f) ("1|" . #f) ("1|junk" . #f)))
+
 ;; ---- the spine: a cyclic list ------------------------------------------
-;; It is NOT deep, so a depth counter never sees it. Before the fix this
-;; returned the string "null"; the cell asserts a refusal, and the
+;; It is NOT deep, so the depth counter -- which does see it, on entry --
+;; never rises. Before the fix this returned the string "null"; the cell
+;; asserts a refusal, and the
 ;; nested forms assert that the refusal survives being reached through a
 ;; container rather than only at the top.
 (define (cyclic-list)
@@ -98,8 +141,12 @@
     "             (begin (json->string v) 'returned)))"
     "  (newline))"))
 
-(let* ((src "/tmp/igropyr-json-selfvec-probe.sc")
-       (out "/tmp/igropyr-json-selfvec-probe.out"))
+;; UNIQUE PER PROCESS: two runs of this suite would otherwise write the
+;; same file, and a collision produces a red that looks like a defect
+;; and a green worth nothing. Same convention as gzip.sc.
+(let* ((tag (format "~a-~a" (get-process-id) (real-time)))
+       (src (format "/tmp/igropyr-json-selfvec-probe-~a.sc" tag))
+       (out (format "/tmp/igropyr-json-selfvec-probe-~a.out" tag)))
   (call-with-output-file src
     (lambda (p) (put-string p (self-vector-probe-source)))
     'truncate)
@@ -131,9 +178,14 @@
            (not (= 124 (if (fixnum? status) (div status 256) -1)))
            status)))
 
-;; ---- the catch-all: nine unrecognised kinds ----------------------------
-;; Enumerated, not sampled: these are every kind the dispatch does not
-;; name. Each one used to be written as "null".
+;; ---- the catch-all: the kinds that were measured -----------------------
+;; NOT A CLOSED LIST. The branch these fall into is a catch-all, so it
+;; holds whatever the dispatch does not name -- today's Scheme, a later
+;; Scheme, a record type someone defines tomorrow. What is enumerated
+;; here is what was measured returning "null" before the change, and
+;; the fxvector/flvector/box cells further down are more members of the
+;; same open set, listed separately only because the argument for
+;; refusing them is different.
 (for-each
   (lambda (entry)
     (let ((name (car entry)) (make (cdr entry)))
@@ -155,7 +207,10 @@
 ;; ---- and the values that must still be written -------------------------
 ;; The should-be-green half, enumerated across what the dispatch DOES
 ;; name: a catch-all that raises is one over-eager predicate away from
-;; refusing ordinary data.
+;; refusing values this library documents as writable. ("Ordinary data"
+;; stood here, and had no definition in the code -- the class this batch
+;; kept getting wrong is the one named by an adjective nobody can look
+;; up.)
 (for-each
   (lambda (entry)
     (let ((name (car entry)) (make (cdr entry)))
@@ -177,10 +232,13 @@
         (cons "nested containers"
               (lambda () (list (cons "a" (vector 1 (list (cons "b" 2)))))))))
 
-;; ---- the two limits are not the same number ----------------------------
-;; The reader's cap is a wire contract; the writer's is a local guard.
-;; A document at the reader's limit, wrapped the way a handler wraps it,
-;; must still be writable -- that is the whole reason the numbers differ.
+;; ---- the two limits, and what each side of the trade costs -------------
+;; They are different numbers today. A document at the reader's cap,
+;; wrapped the way a handler wraps it, must still be writable -- that is
+;; what equal numbers would cost. The other side of the same trade is
+;; that the writer can emit documents no reader here accepts, which is
+;; the gap recorded further down. Both costs are real and the trade is
+;; not settled; these cells pin what is true now.
 (define (nest-text k)
   (let loop ((k k) (s "1")) (if (zero? k) s (loop (- k 1) (string-append "[" s "]")))))
 
@@ -194,16 +252,820 @@
                           (list (cons "d" (list (cons "result"
                                                       (string->json (nest-text 64)))))))))))
 
-;; the writer's own limit does exist, well above the reader's
+;; the writer's own limit does exist, well above the reader's. Depths
+;; here and below are WRAPPING LAYERS -- the unit is defined in full
+;; further down. Depth numbers in this file are in that unit unless a
+;; cell says otherwise -- a file-wide claim is one nothing here checks.
 (define (nest-value k)
   (let loop ((k k) (v 1)) (if (zero? k) v (loop (- k 1) (vector v)))))
 
-(check "the writer's guard is far above the reader's cap"
+(check "the writer's guard is far above the reader's cap (512 layers)"
        (wrote? (result (lambda () (json->string (nest-value 512))))))
-(check "...but it is a guard, not an absence of one"
+(check "...but it is a guard, not an absence of one (2048 layers)"
        (refused-as? (result (lambda () (json->string (nest-value 2048))))
                     "nesting too deep")
        (result (lambda () (json->string (nest-value 2048)))))
+
+;; ---- the boundary, on each of the three descending paths ---------------
+;; The depth counter is incremented at three call sites -- a vector's
+;; elements, an object's values, a list's elements -- and a guard that
+;; reached only two of them would still pass a test that nests vectors.
+;; So each path is walked to the limit and one past it, separately.
+(define (nest-list k)
+  (let loop ((k k) (v 1)) (if (zero? k) v (loop (- k 1) (list v)))))
+(define (nest-alist k)
+  (let loop ((k k) (v 1)) (if (zero? k) v (loop (- k 1) (list (cons "k" v))))))
+
+(for-each
+  (lambda (entry)
+    (let ((name (car entry)) (build (cdr entry)))
+      (check (string-append name ": 1024 wrapping layers are written")
+             (wrote? (result (lambda () (json->string (build 1024))))))
+      (check (string-append name ": 1025 wrapping layers are refused")
+             (refused-as? (result (lambda () (json->string (build 1025))))
+                          "nesting too deep")
+             (result (lambda () (json->string (build 1025)))))))
+  (list (cons "vectors" nest-value)
+        (cons "lists" nest-list)
+        (cons "objects" nest-alist)))
+
+;; STATE THE UNIT BEFORE QUOTING THE NUMBER. What is counted is
+;; parent-to-child descents, the top-level value being 0, and the guard
+;; runs on every value entered, leaves included -- 64 containers around
+;; a number enters 65 values and passes at depth 64. So the same rule
+;; reads two ways that differ by one, and two people measuring
+;; correctly will think the other is wrong:
+;;
+;;   in WRAPPING LAYERS, the bottom makes no difference. 1024 vectors
+;;   around a number and 1024 around an empty vector both write; 1025
+;;   of either is refused, because whatever sits at the bottom is
+;;   charged too. The reader behaves the same way at 64 and 65.
+;;
+;;   in TOTAL CONTAINERS, an empty one at the bottom is worth a level:
+;;   counting the brackets in the output gives 1024 for the number
+;;   case and 1025 for the empty-vector case, both accepted.
+;;
+;; The cells below use the WRAPPING count. Neither number is "the
+;; maximum container nesting", and json.sc's own note states the same
+;; rule in the container reading -- the two are the same fact under
+;; different units, which is worth knowing before someone tries to
+;; make one of them match the other.
+;; BOTH SIDES OF THE BOUNDARY, because the claim is that an empty bottom
+;; is charged exactly like any other value -- and only the refusing side
+;; was checked here for a while. A rule that charged an empty container
+;; one extra level would refuse at 1025 just the same, and pass the cell
+;; that only asks for a refusal. It is the accepting side at 1024 that
+;; says the extra level is not being charged.
+(let ((nest-empty (lambda (k)
+                    (let loop ((k k) (v (vector)))
+                      (if (zero? k) v (loop (- k 1) (vector v)))))))
+  (check "an empty container at the bottom does not buy a level"
+         (refused-as? (result (lambda () (json->string (nest-empty 1025))))
+                      "nesting too deep"))
+  (check "...and one level less is written, so the bottom cost nothing"
+         (wrote? (result (lambda () (json->string (nest-empty 1024)))))
+         (result (lambda () (json->string (nest-empty 1024))))))
+(let ((deep (lambda (k)
+              (let loop ((k k) (s "[]"))
+                (if (zero? k) s (loop (- k 1) (string-append "[" s "]")))))))
+  (check "...and the reader charges the same way"
+         (refused-as? (result (lambda () (string->json (deep 65))))
+                      "nesting too deep"))
+  (check "...on both sides of its own boundary too"
+         (let ((r (result (lambda () (string->json (deep 64))))))
+           (and (pair? r) (eq? (car r) 'returned)))
+         (result (lambda () (string->json (deep 64))))))
+
+;; OBJECTS ARE NESTED CONTAINERS TOO, and the cells above only ever used
+;; arrays. "Both sides charge alike" was demonstrated for one of the two
+;; container kinds and stated for both -- a rule that counted object
+;; nesting differently would satisfy every cell above it.
+(let ((deep-obj (lambda (k)
+                  (let loop ((k k) (s "{}"))
+                    (if (zero? k) s (loop (- k 1)
+                                          (string-append "{\"a\":" s "}")))))))
+  (check "the reader charges object nesting the same as array nesting"
+         (refused-as? (result (lambda () (string->json (deep-obj 65))))
+                      "nesting too deep"))
+  (check "...and accepts one level less, as it does for arrays"
+         (let ((r (result (lambda () (string->json (deep-obj 64))))))
+           (and (pair? r) (eq? (car r) 'returned)))
+         (result (lambda () (string->json (deep-obj 64))))))
+
+;; WHAT EACH SCHEME SHAPE BECOMES, asserted as text. The prose in this
+;; batch says an empty list writes as an object, an alist writes as an
+;; object, and any other list writes as an array -- three classification
+;; claims, and until now the only thing checking them was wrote?, which
+;; asks whether a string came back. It cannot tell {} from [] and it
+;; cannot tell an object from an array. These claims belong to this
+;; batch: the sentence that makes them was rewritten here, and a claim
+;; is owed a cell by whoever writes it, not by whoever wrote the code.
+(for-each
+  (lambda (p)
+    (let ((v (car p)) (want (cadr p)) (what (caddr p)))
+      (check (string-append "classification: " what)
+             (equal? want (json->string v))
+             (json->string v))))
+  (list (list '() "{}" "the empty list is an object, not an empty array")
+        (list '(("a" . 1)) "{\"a\":1}" "a list of string-keyed pairs is an object")
+        (list '(("a" . 1) ("b" . 2)) "{\"a\":1,\"b\":2}" "...with every pair present, comma-separated")
+        (list '(1 2 3) "[1,2,3]" "any other list is an array")
+        (list (vector 1 2 3) "[1,2,3]" "a vector is an array")
+        ;; THE PAIR AND THE TWO-ELEMENT LIST ARE DIFFERENT DOCUMENTS, and
+        ;; the difference is one dot. ("a" . #("b")) has the vector as
+        ;; the value; ("a" #("b")) has a LIST containing the vector, so
+        ;; the value is a one-element array whose element is the array.
+        ;; This cell was first written with the dotted result expected
+        ;; for the undotted input, and it went red -- the expectation was
+        ;; wrong, not the writer. It is kept as a pair of cells because
+        ;; that is exactly the confusion the shape admits.
+        (list (list (cons "a" (vector "b"))) "{\"a\":[\"b\"]}"
+              "a dotted pair whose value is a vector")
+        (list '(("a" #("b"))) "{\"a\":[[\"b\"]]}"
+              "...and the undotted two-element list is one level deeper")
+        (list '(("a" "b")) "{\"a\":[\"b\"]}"
+              "a two-element list of strings reads as key and one-element array")
+        (list '(("a" . "b")) "{\"a\":\"b\"}"
+              "...while the dotted form of the same two strings is a plain value")))
+
+;; ---- the writer is not injective on this family ------------------------
+;; The cells above pin what each shape becomes. This one pins something
+;; stronger and less comfortable: THREE DIFFERENT SCHEME VALUES PRODUCE
+;; THE SAME DOCUMENT. A string key with a vector value, a two-element
+;; list, and a SYMBOL key with a vector value all write as {"a":["b"]}.
+;; (An introduction is read as scene-setting rather than as a claim,
+;; which is how this one once went on describing a shape the cells below
+;; no longer used.)
+;;
+;; The consequence is that json->string cannot be inverted here. Reading
+;; that document back gives the vector form, so exactly one of the three
+;; survives a round trip and the other two come back as something they
+;; were not. Nothing warns; both directions succeed.
+;;
+;; This is worth separating from the ambiguity on the reading side, which
+;; is "one document, two readings". This is "several inputs, one
+;; document" -- and it is the direction our writing about representation
+;; has not covered, because that writing has always been about readers.
+(let ((as-vector (list (cons "a" (vector "b"))))
+      (as-list   '(("a" "b")))
+      (as-symbol (list (cons 'a (vector "b")))))
+  ;; THE PREIMAGES ARE ASSERTED DISTINCT FIRST, because this cell was
+  ;; once written with three names for two values: (cons "a" (list "b"))
+  ;; IS ("a" "b"), the dot before a list being only another way to write
+  ;; the same pair. The old cell stayed green -- it compared three
+  ;; documents that were equal, and two of the three came from the same
+  ;; input. A collision cell that does not first prove its inputs differ
+  ;; is not a collision cell.
+  (check "the three inputs really are three different values"
+         (and (not (equal? as-vector as-list))
+              (not (equal? as-vector as-symbol))
+              (not (equal? as-list as-symbol)))
+         (list as-vector as-list as-symbol))
+  (check "...and all three write the same document"
+         (let ((a (json->string as-vector))
+               (b (json->string as-list))
+               (c (json->string as-symbol)))
+           (and (string=? a b) (string=? b c) (string=? a "{\"a\":[\"b\"]}")))
+         (list (json->string as-vector) (json->string as-list)
+               (json->string as-symbol)))
+  ;; STATE THE CONSEQUENCE AT THE RIGHT STRENGTH. "Reading it back does
+  ;; not give you what you wrote" is too strong and one example refutes
+  ;; it: exactly one member of the collision class does come back
+  ;; unchanged. What is true is that the DOCUMENT cannot say which
+  ;; preimage it came from, so the others return wearing the survivor's
+  ;; shape. The overstated version would have been demolished by the
+  ;; first cell below; the accurate one is what the cells actually show.
+  (check "one member of the collision class returns unchanged"
+         (equal? as-vector (string->json (json->string as-vector)))
+         (string->json (json->string as-vector)))
+  (check "...and the others come back as that one, not as themselves"
+         (and (not (equal? as-list (string->json (json->string as-list))))
+              (not (equal? as-symbol (string->json (json->string as-symbol))))
+              (equal? as-vector (string->json (json->string as-list)))
+              (equal? as-vector (string->json (json->string as-symbol))))
+         (list 'list (string->json (json->string as-list))
+               'symbol (string->json (json->string as-symbol)))))
+
+;; ---- the classifier looks at every entry, not just the first ----------
+;; Deciding "is this an alist" walks the whole list. Stopping after the
+;; first entry is a one-token edit, and it needs a NEAR MISS to catch:
+;; a list whose first entry has the alist shape and whose second does
+;; not. Everything else in this file misses it -- (1 2 3) fails at the
+;; first entry, and a two-entry alist has both entries legal, so it
+;; shows that the OUTPUT loop keeps the second pair, which is a
+;; different decision point entirely. One assertion was credited to
+;; both; it owns only the second.
+(check "a list whose first entry looks like a pair but whose second does not is not an object"
+       (refused-as? (result (lambda () (json->string '(("a" . 1) 2))))
+                    "not a JSON value")
+       (result (lambda () (json->string '(("a" . 1) 2)))))
+
+;; ---- symbols, by their text ------------------------------------------
+;; wrote? cannot tell "foo" from "null" or from "". These claims are in
+;; this batch's prose, so they are this batch's to own.
+(check "a symbol writes as a string, quoted"
+       (equal? "\"foo\"" (json->string 'foo)) (json->string 'foo))
+(check "...and a symbol key writes as a string key"
+       (equal? "{\"sym\":1}" (json->string '((sym . 1)))) (json->string '((sym . 1))))
+
+;; ---- what the reader gives back is a narrower vocabulary --------------
+;; The prose elsewhere says this reader NEVER produces the shapes the
+;; writer additionally accepts -- arrays as plain lists, symbols as
+;; values, symbols as keys. Nothing asserted any of it, and these three
+;; cells still do not assert "never": they assert what three documents
+;; produced, one per shape. That is a sample, and it is written down as
+;; a sample rather than dressed up, because "never" is a claim about a
+;; reader this file does not enumerate. What the sample is good for is
+;; the reason the claim exists at all: the writer's extra shapes are a
+;; convenience for callers, not a round-trip contract -- and the
+;; non-injectivity cells above show what the difference costs.
+(let ((arr (string->json "[1,2]"))
+      (obj (string->json "{\"a\":1}"))
+      (str (string->json "\"s\"")))
+  ;; the labels name what these three documents produced. The prose
+  ;; above withdrew the word "never"; leaving it in the labels would put
+  ;; the withdrawn claim back where it is most read.
+  (check "reading [1,2] gives a vector, not a plain list"
+         (and (vector? arr) (not (list? arr))) arr)
+  (check "reading {\"a\":1} gives an alist with a string key"
+         (and (list? obj) (pair? (car obj)) (string? (caar obj))) obj)
+  (check "reading a JSON string gives a string, not a symbol"
+         (and (string? str) (not (symbol? str))) str))
+
+;; ---- the two limits, put together in one direction --------------------
+;; Elsewhere this file proves the writer emits values deeper than 64 and
+;; that the reader refuses text deeper than 64. Those are two separate
+;; facts about two separate components; NEITHER hands the writer's actual
+;; output to the reader. This does, because the cost of the two limits
+;; differing is not hypothetical -- it is a document this library
+;; produces and this library will not read.
+(let* ((deep (let loop ((k 100) (v 1)) (if (zero? k) v (loop (- k 1) (vector v)))))
+       (text (result (lambda () (json->string deep)))))
+  ;; this one owns only "a string came back" -- deliberately, because
+  ;; the cell below is what owns the gap, and crediting this one with
+  ;; "and it was well-formed" would be crediting it with the next cell's
+  ;; work
+  (check "the writer returns a string for a value at depth 100"
+         (wrote? text) text)
+  (check "...and this library's own reader refuses to read it back"
+         (refused-as? (result (lambda () (string->json (cadr text))))
+                      "nesting too deep")
+         (result (lambda () (string->json (cadr text))))))
+
+;; ---- values this Scheme has and this writer's model does not ----------
+;; fxvector, flvector and box are ordinary containers here and are not
+;; in the model this library documents. Refusing them is a policy about
+;; that model and nothing more: the writer's vocabulary is what the
+;; documentation names, not everything this Scheme can hold, and a
+;; caller who wants one serialised converts it, which costs a line on
+;; the side that knows what it meant.
+;;
+;; One argument for refusing them was tried and dropped: that writing
+;; them would produce documents another implementation could read but
+;; never write. It needs a fact about that implementation, which this
+;; file cannot check, and it does not reach its own conclusion anyway
+;; -- a serialised fxvector is an ordinary array once it is text. It is
+;; recorded here as tried and not relied on, so the next reader does
+;; not spend the same afternoon on it.
+(for-each
+  (lambda (entry)
+    (check (string-append "outside this writer's model, refused: " (car entry))
+           (refused-as? (result (lambda () (json->string ((cdr entry)))))
+                        "not a JSON value")
+           (result (lambda () (json->string ((cdr entry)))))))
+  (list (cons "fxvector" (lambda () (fxvector 1 2)))
+
+        (cons "flvector" (lambda () (flvector 1.0 2.0)))
+        (cons "box" (lambda () (box 1)))))
+
+;; ---- one tag for every refusal, complex numbers included ---------------
+;; A complex number used to leave as an assertion-violation while every
+;; neighbour left as a json-error vector, so a guard written for this
+;; library's errors missed exactly one kind of value. It stayed
+;; invisible because the neighbours were not raising at all -- they were
+;; writing "null" -- and it became visible only once they did.
+(check "a complex number raises this library's error, not a condition"
+       (refused-as? (result (lambda () (json->string (make-rectangular 1 2))))
+                    "not a JSON value")
+       (result (lambda () (json->string (make-rectangular 1 2)))))
+(check "...inside a vector too"
+       (refused-as? (result (lambda ()
+                              (json->string (vector (make-rectangular 1 2)))))
+                    "not a JSON value"))
+(check "...and as an object's value"
+       (refused-as? (result (lambda ()
+                              (json->string
+                               (list (cons "k" (make-rectangular 1 2))))))
+                    "not a JSON value"))
+;; the reals stay written: refusing complex is about the representation
+;; not being real?, not about exactness. What "written" means for an
+;; inexact conversion is bounded on both sides, and both bounds are
+;; measured here rather than left to the word "lossy": a ratnum too
+;; large to convert becomes the same null every non-finite value gets,
+;; and one too small underflows to zero.
+(check "a ratnum still writes, as the flonum JSON can hold"
+       (equal? '(returned "0.3333333333333333")
+               (result (lambda () (json->string 1/3))))
+       (result (lambda () (json->string 1/3))))
+(check "an exact integer still writes exactly"
+       (equal? '(returned "5") (result (lambda () (json->string 5)))))
+(check "a ratnum that overflows the conversion joins the non-finite null"
+       (equal? '(returned "null")
+               (result (lambda () (json->string (/ (expt 10 4000) 3)))))
+       (result (lambda () (json->string (/ (expt 10 4000) 3)))))
+(check "...negative too"
+       (equal? '(returned "null")
+               (result (lambda () (json->string (- (/ (expt 10 4000) 3)))))))
+(check "...and the null it writes is legal JSON, unlike the +inf.0 it wrote before"
+       (equal? (list 'returned 'null)
+               (result (lambda ()
+                         (string->json
+                          (json->string (/ (expt 10 4000) 3))))))
+       (result (lambda ()
+                 (string->json (json->string (/ (expt 10 4000) 3))))))
+(check "a ratnum that underflows writes zero, losing the value quietly"
+       (equal? '(returned "0.0")
+               (result (lambda () (json->string (/ 1 (expt 10 400))))))
+       (result (lambda () (json->string (/ 1 (expt 10 400))))))
+
+;; ---- written wide, and refused on the way back in ----------------------
+;; An exact integer is written at whatever width it has, and the reader
+;; caps a numeral at max-number-chars, so this library writes integers
+;; it will not read. That is the same shape as the depth gap above --
+;; a reader-side limit with no writer-side counterpart -- and naming
+;; the family matters more than either instance: we hunted the depth
+;; one for three rounds while calling it "the depth gap", and the
+;; number-width one sat beside it the whole time. Both are recorded,
+;; neither is fixed here, and the cells state the boundary rather than
+;; a promise.
+(check "an integer just inside the reader's numeral cap comes back unchanged"
+       (equal? (list 'returned (expt 10 511))
+               (result (lambda ()
+                         (string->json (json->string (expt 10 511))))))
+       (result (lambda () (string->json (json->string (expt 10 511))))))
+(check "one past it is written as a legal numeral of the right width"
+       (let ((r (result (lambda () (json->string (expt 10 512))))))
+         (and (wrote? r)
+              (rfc-number-descent? (cadr r))
+              (= 513 (string-length (cadr r)))))
+       (result (lambda () (json->string (expt 10 512)))))
+(check "...and then refused by our own reader"
+       (refused-as?
+        (result (lambda ()
+                  (string->json (json->string (expt 10 512)))))
+        "number too long"))
+;; Two gaps of this shape are recorded here, and the set is not claimed
+;; closed. The method that found them can be rerun: walk every jfail in
+;; the reader and ask which of its limits the writer has no counterpart
+;; for. Strings, measured, are not among them -- neither side caps
+;; their length -- but "measured not to be" is a fact about the
+;; members checked, not a count of the family.
+;;
+;; A THIRD GAP OF THE SAME SYMPTOM HAS A DIFFERENT MECHANISM: the
+;; subnormal formatting below also produced text this library could not
+;; read back, and it comes from the formatter rather than from any
+;; reader limit -- which is why "gaps between writer and our own
+;; reader" and "reader limits without a writer counterpart" must not be
+;; counted as one set.
+;; The value read back is compared, not discarded. An earlier version of
+;; this cell ran the round trip and returned the string "OK", so it
+;; asserted only that neither direction raised -- a writer that turned
+;; the 5000 a's into any other legal JSON value passed it.
+(check "long strings round-trip: not a member of this family"
+       (let ((s (make-string 5000 #\a)))
+         (equal? (list 'returned s)
+                 (result (lambda () (string->json (json->string s)))))))
+
+;; ---- the formatter's own spelling is not JSON's ------------------------
+;; Chez writes a subnormal flonum with a precision annotation -- 5e-324
+;; comes back as "5e-324|1" -- which is a legal Scheme numeral and not a
+;; legal JSON number, so this library used to emit text it could not
+;; read. Every value sampled on the subnormal side was spelled that way
+;; and every one sampled above least-normal was not -- 2.2e-308 dirty,
+;; 2.3e-308 clean -- but that is a sample, not an enumeration of the
+;; formatter's behaviour, and nothing below leans on it being the whole
+;; set. What the cells hold is the output, checked against the grammar,
+;; whatever the formatter's reason for producing it.
+;;
+;; Both entries matter. The annotation is produced by the formatter, so
+;; it is reached by any value that arrives at it as a subnormal double
+;; -- a flonum written directly, and an exact ratnum that becomes one
+;; through the conversion. A repair attached to the flonum branch would
+;; miss the second; these cells hold it to the place the repair belongs,
+;; which is after the number has been turned into text.
+(for-each
+  (lambda (entry)
+    (let ((name (car entry)) (make (cdr entry)))
+      (let* ((r (result (lambda () (json->string (make)))))
+             (text (and (pair? r) (eq? (car r) 'returned) (cadr r))))
+        ;; judged by the grammar above, not by the absence of one
+        ;; character: "no pipe in it" would pass an output that is
+        ;; wrong some other way, and it is the borrowed formatter we
+        ;; are refusing to trust
+        (check (string-append "subnormal writes a JSON numeral: " name)
+               (and (string? text) (rfc-number-descent? text))
+               r)
+        (check (string-append "...and the value survives, bit for bit: " name)
+               (and (string? text)
+                    (let ((back (result (lambda () (string->json text)))))
+                      (and (pair? back) (eq? (car back) 'returned)
+                           (eqv? (cadr back) (exact->inexact (make))))))
+               r))))
+  (list (cons "least positive, as a flonum" (lambda () 5e-324))
+        (cons "negative least positive" (lambda () -5e-324))
+        (cons "1e-310" (lambda () 1e-310))
+        (cons "just under least-normal" (lambda () 2.2e-308))
+        ;; the exact ratnum entry: it is not a flonum until the
+        ;; conversion, so a repair bound to the flonum branch skips it
+        (cons "an exact ratnum that converts to a subnormal"
+              (lambda () (/ 1 (expt 2 1074))))))
+
+;; the clean side, so a repair cannot pass by mangling everything
+(for-each
+  (lambda (v)
+    (check (string-append "normal magnitudes are untouched: "
+                          (number->string v))
+           (equal? (list 'returned (number->string v))
+                   (result (lambda () (json->string v))))
+           (result (lambda () (json->string v)))))
+  (list 2.3e-308 1e-307 3.14159 1e308 1.7976931348623157e308 -0.0 0.1))
+
+;; SEVEN CLEAN VALUES AND FIVE DIRTY ONES DO NOT SHOW A REPAIR WORKS.
+;; They show it works on twelve values, and a repair hard-coded to those
+;; twelve would pass every cell above. So the subnormals are swept by
+;; bit pattern: every double whose payload is a power of two, plus a
+;; spread of dense payloads, written and read back and required to be
+;; eqv?. The sweep is what makes the cells above evidence rather than
+;; examples.
+(let ((bad-format 0) (bad-round 0) (checked 0) (not-subnormal 0)
+      (seen (make-eqv-hashtable)))
+  (define (sweep bits)
+    (let* ((v (* bits 4.9406564584124654e-324))   ; payload x 2^-1074
+           (r (result (lambda () (json->string v))))
+           (text (and (pair? r) (eq? (car r) 'returned) (cadr r))))
+      (set! checked (+ checked 1))
+      (hashtable-set! seen bits #t)
+      ;; The value is checked against the class this sweep claims to
+      ;; cover. Without this, the cells below hold for any payloads at
+      ;; all: multiplying every generated payload by three keeps the call
+      ;; count at 122 and the distinct count at 120, carries the largest
+      ;; values out of the subnormal range entirely, and leaves the
+      ;; format and round-trip cells green -- they judge any finite
+      ;; double perfectly well, subnormal or not, which is exactly why
+      ;; they cannot notice that the sweep stopped covering subnormals. The count said the sweep ran; nothing
+      ;; said what it ran over.
+      (unless (and (not (= v 0.0))
+                   (< (abs v) 2.2250738585072014e-308))   ; least normal
+        (set! not-subnormal (+ not-subnormal 1)))
+      (cond ((not (and (string? text) (rfc-number-descent? text)))
+             (set! bad-format (+ bad-format 1)))
+            (else
+             (let ((back (result (lambda () (string->json text)))))
+               (unless (and (pair? back) (eq? (car back) 'returned)
+                            (eqv? (cadr back) v))
+                 (set! bad-round (+ bad-round 1))))))))
+  ;; every power-of-two payload in the subnormal range, both signs
+  (do ((k 0 (+ k 1))) ((= k 52))
+    (sweep (expt 2 k))
+    (sweep (- (expt 2 k))))
+  ;; dense payloads: all ones, alternating bits, and a scatter
+  (for-each (lambda (b) (sweep b) (sweep (- b)))
+            (list 1 3 7 (- (expt 2 52) 1) #x5555555555 #xAAAAAAAAAA
+                  123456789 999999999999 (- (expt 2 51) 1)))
+  (check "every value swept really is subnormal"
+         (= 0 not-subnormal) (list 'not-subnormal not-subnormal 'of checked))
+  (check "every subnormal bit pattern swept writes a JSON numeral"
+         (= 0 bad-format) (list 'bad bad-format 'of checked))
+  (check "...and comes back eqv? to what went out"
+         (= 0 bad-round) (list 'bad bad-round 'of checked))
+  ;; This cell asserts the sweep RAN, and nothing more. It is not a
+  ;; coverage claim: 120 payloads out of 2^52 subnormals is not "most of
+  ;; them", and the two cells above are the ones that judge behaviour.
+  ;; What it catches is a sweep that silently stopped early -- a broken
+  ;; loop bound leaves the two cells above green, because zero failures
+  ;; out of zero runs is zero failures. The count is exact rather than a
+  ;; floor for the same reason: a floor still passes at 101. It is 120
+  ;; distinct payloads from 122 calls, because payload 1 is reached
+  ;; twice -- as 2^0 in the loop and again in the dense list -- and the
+  ;; duplicate is counted once here on purpose, so that this number
+  ;; measures the enumeration and not the number of times it was walked.
+  (check "...and the sweep ran over every payload it enumerates"
+         (and (= checked 122) (= (hashtable-size seen) 120))
+         (list 'calls checked 'distinct (hashtable-size seen))))
+
+;; ---- non-finite values, checked here rather than delegated -------------
+;; This file used to say another suite covered these. A statement about
+;; another file's coverage is one this file cannot check, and the
+;; writer's own entry points deserve their own cells: infinity and NaN
+;; leave as null, which is a deliberate choice and the same answer a
+;; ratnum that overflows the conversion now gets.
+(for-each
+  (lambda (entry)
+    (check (string-append "non-finite writes null: " (car entry))
+           (equal? '(returned "null")
+                   (result (lambda () (json->string ((cdr entry))))))
+           (result (lambda () (json->string ((cdr entry)))))))
+  (list (cons "+inf.0" (lambda () +inf.0))
+        (cons "-inf.0" (lambda () -inf.0))
+        (cons "+nan.0" (lambda () +nan.0))))
+
+;; ---- the third slot says whether there is a position at all ------------
+;; The reader's errors carry an index into the text they were reading.
+;; The writer has no text, so it carries #f -- not 0, which is a real
+;; position and would dress "does not apply" up as "at the beginning".
+;; The cost of getting this wrong is not visible from inside this file.
+;; The distinction it guards is for the caller who wants to tell a
+;; client's bad document (answer 4xx) from our own bad value (answer
+;; 5xx): with a fixed 0 the two shapes are identical -- same tag, same
+;; arity, same third slot -- leaving only the message text between
+;; them, and message text is not something to dispatch on. Whether
+;; anyone reads the slot today is a fact about other files, and a fact
+;; about other files is not something this one should assert; what
+;; these cells own is the shape itself.
+(define (error-of thunk)
+  (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'json-error)) e)
+            (#t #f))
+    (thunk)
+    #f))
+
+(let ((reader-err (error-of (lambda () (string->json "@"))))
+      (reader-err-late (error-of (lambda () (string->json "[1,"))))
+      (writer-type (error-of (lambda () (json->string #\a))))
+      (writer-depth (error-of (lambda ()
+                                (json->string (nest-value 2048))))))
+  (check "the reader reports a position, and it is an index"
+         (and (vector? reader-err) (fixnum? (vector-ref reader-err 2)))
+         reader-err)
+  (check "...including one past the start"
+         (and (vector? reader-err-late)
+              (fixnum? (vector-ref reader-err-late 2))
+              (> (vector-ref reader-err-late 2) 0))
+         reader-err-late)
+  (check "the writer reports #f: there is no text to point into"
+         (and (vector? writer-type) (eq? #f (vector-ref writer-type 2)))
+         writer-type)
+  (check "...for the depth guard too"
+         (and (vector? writer-depth) (eq? #f (vector-ref writer-depth 2)))
+         writer-depth)
+  ;; and the pair a future caller would have to separate
+  ;; The pair a future caller would have to separate. The reader error
+  ;; here must actually BE at offset 0 -- "@" is bad at the first
+  ;; character -- because the confusion being ruled out is between a
+  ;; writer's #f and a reader's 0, and a cell that only asked for
+  ;; "different from #f" was satisfied by any fixnum at all, including
+  ;; the -1 that would make the two indistinguishable in the other
+  ;; direction.
+  (check "the reader really is at offset 0 for a first-character fault"
+         (and (vector? reader-err) (eqv? 0 (vector-ref reader-err 2)))
+         reader-err)
+  (check "a writer error is distinguishable from an error at offset 0"
+         (and (vector? reader-err) (vector? writer-type)
+              (eqv? 0 (vector-ref reader-err 2))
+              (eq? #f (vector-ref writer-type 2)))
+         (list reader-err writer-type))
+  ;; the shape itself does not change: still three slots, still the tag
+  (for-each
+    (lambda (e)
+      (check "the error keeps its shape: tag and three slots"
+             (and (vector? e) (= 3 (vector-length e))
+                  (eq? 'json-error (vector-ref e 0))
+                  (string? (vector-ref e 1)))
+             e))
+    (list reader-err writer-type writer-depth)))
+
+;; ---- the last link in the chain, reached through a shadow library ----
+;; number-text answering #f is what json.sc turns into an internal error.
+;; NOTHING ELSE IN EITHER SUITE EXERCISES THAT: the direct cells call
+;; repair-precision-tag and never go through json.sc, and the formatter
+;; has never once produced a spelling the repair could not fix, so the #f
+;; branch is not reachable by any value. That left a mutation green in
+;; all three files -- replacing json.sc's
+;;
+;;     (or (number-text v) (raise ...))     with     (or (number-text v) "0")
+;;
+;; which turns "this Scheme emitted something we cannot write" into a
+;; document quietly containing 0.
+;;
+;; So what gets substituted here is not a value -- it is the LIBRARY. A
+;; shadow (igropyr json-internal) whose number-text always answers #f is
+;; put on the library path of a CHILD process, and the real json.sc is
+;; loaded against it.
+;;
+;; ONE VALUE IS NOT ENOUGH, and an earlier version of this cell used only
+;; the integer 7. json.sc reaches number-text from more than one place:
+;; exact integers take one branch, finite inexact reals another, and an
+;; exact non-integer is converted before it gets there. Mutating ONLY the
+;; inexact branch to fall back on "0" left every file green, because the
+;; probe never sent a value down it. Each call site is its own guard, and
+;; a guard is only covered by an input that reaches IT.
+;;
+;; WHAT THESE CELLS DO NOT CHECK: the other half of the requirement, that
+;; a SUCCESSFUL repair answer is passed through unchanged. The shadow
+;; always answers #f, so it can only exercise the refusing half. The
+;; passing half is held up elsewhere, and only partly here: the ordinary
+;; write cells notice a numeral that became illegal or changed value,
+;; but NOT a normalisation that stays legal and still reads back eqv? --
+;; upcasing a repaired exponent, say. That one is caught in
+;; json-number-syntax.sc, which compares json->string's text against
+;; number-text's directly. Neither file forces both halves together in
+;; one assertion, and that is worth knowing before reading these as
+;; complete.
+;;
+;; Three things the shadow directory must get right, each learned the
+;; hard way. The link to json.sc is ABSOLUTE -- not because the child
+;; runs elsewhere, it inherits this directory, but because a relative
+;; symlink target is resolved against the directory holding the LINK,
+;; which is the shadow, not the repository. Not one .so goes in it, or a
+;; stale object answers instead of the source. And nothing is ever
+;; written into the real tree,
+;; which is a working directory this suite shares. The directory name
+;; carries the process id, because a fixed name makes concurrent runs
+;; delete each other's shadow -- isolation has to come from the harness,
+;; not from nobody happening to run at the same time.
+;;
+;; IF YOU ARE ABOUT TO DELETE THESE CELLS, read this first.
+;; json-internal.sc states an end-to-end requirement. Word the handoff
+;; correctly, because an earlier version here did not: json.sc never
+;; sees the repair's answer. number-text does that handoff; json.sc
+;; receives number-text's answer, emits it unchanged, and turns #f into
+;; its internal error rather than into any text. THESE CELLS ARE THE ONLY CHECKER OF
+;; ITS REFUSING HALF. Removing them does not return the requirement to
+;; "documented but uncovered"; it leaves a written requirement with
+;; nothing in the world that would notice it being broken. The mutation
+;; they exist for was green in all three files before them.
+;;
+;; The self-check below is NOT what stops a false green -- an earlier
+;; comment here claimed that and was wrong. If the shadow silently
+;; stopped being loaded, the real number-text would answer "7", the
+;; child would return normally, and the behaviour cells would fail
+;; anyway, because they demand the error. What the self-check buys is
+;; DIAGNOSIS AND INDEPENDENCE: it says which of the two things broke,
+;; and it fails on its own evidence rather than on the same string the
+;; behaviour cells read. Measured both ways: break the chain and only
+;; the behaviour cells red; break the harness and the self-check reds
+;; too, first.
+(let* ((dir (format "/tmp/igropyr-json-shadow-~a-~a"
+                    (get-process-id) (real-time)))
+       (root (current-directory))
+       (q (lambda (x) (string-append "'" x "'"))))   ; the tree may sit under a path with spaces
+  (if (not (file-exists? (string-append root "/json.sc")))
+      ;; standalone invocation from somewhere else: say why, do not pretend
+      (fail "shadow-library cell: not run from the library root"
+            (list 'current-directory root))
+      (dynamic-wind
+        (lambda ()
+          (system (string-append "rm -rf " (q dir) " && mkdir -p " (q (string-append dir "/igropyr")))))
+        (lambda ()
+          (call-with-output-file (string-append dir "/igropyr/json-internal.sc")
+            (lambda (p)
+              (put-string p
+                (string-append
+                  "#!chezscheme\n"
+                  "(library (igropyr json-internal)\n"
+                  "  (export json-number-text? before-precision-tag\n"
+                  "          repair-precision-tag number-text)\n"
+                  "  (import (chezscheme))\n"
+                  "  (define (json-number-text? t) #f)\n"
+                  "  (define (before-precision-tag t) #f)\n"
+                  "  (define (repair-precision-tag t v) #f)\n"
+                  "  (define (number-text v) #f))\n")))
+            'truncate)
+          (system (string-append "ln -s " (q (string-append root "/json.sc"))
+                                 " " (q (string-append dir "/igropyr/json.sc"))))
+          (let* ((src (string-append dir "/probe.sc"))
+                 (out (string-append dir "/probe.out")))
+            (call-with-output-file src
+              (lambda (p)
+                (put-string p
+                  (string-append
+                    "(import (chezscheme) (igropyr json)"
+                    "        (only (igropyr json-internal) number-text))"
+                    ;; line 1 answers "is the shadow in front?" without
+                    ;; asking json.sc anything
+                    "(write (number-text 7)) (newline)"
+                    ;; One line per ENTRY into the guarded path, which
+                    ;; is not the same as one per call site: json.sc
+                    ;; calls checked-number-text from two places, one
+                    ;; for exact integers and one for finite inexact
+                    ;; reals, and an exact ratio is converted and
+                    ;; arrives through the second. BE HONEST ABOUT THE
+                    ;; THIRD: the ratio is redundant here. The shadow
+                    ;; refuses every argument alike, so it cannot see
+                    ;; whether the conversion happened -- an unconverted
+                    ;; 1/3 would produce the identical error. It stays
+                    ;; as a cheap second witness for the same call site;
+                    ;; the conversion itself is pinned elsewhere, by
+                    ;; "1/3 writes the same text its inexact conversion
+                    ;; does".
+                    ;; the WHOLE vector is printed, not just the tag and
+                    ;; message: this raise is its own (vector ...) in the
+                    ;; source, so its shape -- three slots, position #f --
+                    ;; is owned here or nowhere. The cells that pin the
+                    ;; shape for the catch-all and the depth guard do not
+                    ;; reach this construction site.
+                    "(for-each (lambda (v)"
+                    "  (write (guard (e ((and (vector? e)"
+                    "                         (eq? (vector-ref e 0) 'json-error))"
+                    "                    (list 'json-error (vector-length e)"
+                    "                          (vector-ref e 1) (vector-ref e 2)))"
+                    "                   (#t 'other-raise))"
+                    "           (list 'returned (json->string v))))"
+                    "  (newline))"
+                    "  (list 7 7.0 1/3))")))
+              'truncate)
+            (let* ((cmd (string-append
+                          "CHEZSCHEMELIBEXTS='" (or (getenv "CHEZSCHEMELIBEXTS") "") "' "
+                          "timeout 30 " (or (getenv "SCHEME_BIN") "scheme")
+                          " -q --libdirs " (q dir) " --script " (q src)
+                          " > " (q out) " 2>&1"))
+                   (status (system cmd))
+                   (text (guard (e (#t "")) (call-with-input-file out get-string-all)))
+                   (lines (let split ((i 0) (start 0) (acc '()))
+                            (cond ((= i (string-length text))
+                                   (reverse (if (> i start)
+                                                (cons (substring text start i) acc)
+                                                acc)))
+                                  ((char=? (string-ref text i) #\newline)
+                                   (split (+ i 1) (+ i 1)
+                                          (cons (substring text start i) acc)))
+                                  (else (split (+ i 1) start acc)))))
+                   (line (lambda (k) (if (> (length lines) k) (list-ref lines k) "")))
+                   ;; written with write, so the message keeps its quotes.
+                   ;; Three slots and a #f position are part of the string
+                   ;; compared, which is how the shape gets owned here.
+                   (want (string-append "(json-error 3 \"internal: number "
+                                        "formatted outside JSON syntax\" #f)")))
+              (check "the shadow library, not the real one, is what the child loaded"
+                     (and (= 0 status) (string=? (line 0) "#f"))
+                     (list 'status status 'text text))
+              (for-each
+                (lambda (k what)
+                  (check (string-append
+                           "a numeral this Scheme cannot write raises, and writes"
+                           " no document: " what)
+                         (and (= 0 status) (string=? (line k) want))
+                         (list 'status status 'line (line k))))
+                '(1 2 3)
+                ;; the third input's label says what it OWNS: it reaches
+                ;; the same call site the flonum does. It does not own
+                ;; "the conversion happened" -- the shadow refuses every
+                ;; argument alike, so an unconverted ratio would print
+                ;; the identical line. The conversion is pinned in
+                ;; json-number-syntax.sc instead.
+                ;; the third label names its ENTRY, not its route. That
+                ;; the ratio converts and arrives by the second call site
+                ;; is read from json.sc's source, not shown by this cell:
+                ;; the shadow refuses every argument alike, so a ratio
+                ;; wrongly routed to the FIRST call site would print the
+                ;; identical line. Kept as a redundant witness for an
+                ;; entry that is already witnessed, and owning nothing
+                ;; else.
+                '("exact integer"
+                  "finite inexact"
+                  "exact ratio, a second witness for the same entry")))
+))
+        (lambda ()
+          (system (string-append "rm -rf " (q dir))))))) 
+
+;; ---- complex numbers are not one kind here ----------------------------
+;; json.sc decides what is writable with real?, and the choice matters
+;; only for ONE member of this family: a complex whose imaginary part is
+;; zero. real? asks about the representation and says no; real-valued?
+;; asks about the value and says yes. For a complex with a non-zero
+;; imaginary part both say no, so a cell built from 1+2i cannot tell the
+;; two apart -- and every complex cell here was built from 1+2i.
+;;
+;; That was measured: swapping real? for real-valued? left all three
+;; files green while turning 1.0+0.0i from this library's refusal into a
+;; native condition raised deep inside nan?, which no caller of this
+;; library is expecting to catch.
+;;
+;; THE INPUT THAT SEPARATES THEM WAS ALREADY WRITTEN DOWN -- in json.sc,
+;; in the sentence explaining why real? was chosen. A comment that names
+;; the case distinguishing two options has named a missing cell; the
+;; thinking was done and only the feeding was missing. That is a cheaper
+;; thing to look for than an unimagined input, and this file had it
+;; sitting in view.
+(for-each
+  (lambda (p)
+    (let ((v (car p)) (what (cdr p)))
+      ;; THE SHAPE IS CHECKED HERE TOO, at this raise. The cells that pin
+      ;; "three slots, position #f" for the catch-all and the depth guard
+      ;; do not reach this one: a shape contract is owned per CONSTRUCTION
+      ;; SITE, not per error kind, and this is its own (vector ...) in the
+      ;; source. Measured: giving this raise a position of 0 instead of #f
+      ;; left every other cell in both files green.
+      (check (string-append "a complex is refused as this library's error: " what)
+             (let ((e (error-of (lambda () (json->string v)))))
+               (and (vector? e)
+                    (= 3 (vector-length e))
+                    (eq? 'json-error (vector-ref e 0))
+                    (equal? "not a JSON value" (vector-ref e 1))
+                    (eq? #f (vector-ref e 2))))
+             (error-of (lambda () (json->string v))))))
+  (list (cons (make-rectangular 1.0 0.0) "zero imaginary part, the one real? and real-valued? disagree on")
+        (cons (make-rectangular 1 2) "non-zero imaginary part, exact")
+        (cons (make-rectangular 0.0 1.0) "zero real part")))
 
 (if (zero? failures)
     (begin (display "json-writer-limits: all tests passed\n") (exit 0))

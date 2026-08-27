@@ -213,9 +213,36 @@
 ;; refresh, re-vendor the regenerated file; never edit names by hand --
 ;; a second hand-maintained list is exactly the drift this replaces.
 (define name-matrix
-  (let* ((path (if (file-exists? "test/sexpr-vectors.json")
-                   "test/sexpr-vectors.json"
-                   "sexpr-vectors.json"))
+  ;; The candidates are the working directories this file is actually
+  ;; started from: the library root (test/...), the test directory
+  ;; itself, and the workspace root that run-all.sh cd's to, where every
+  ;; script is named through the igropyr symlink. The third was missing,
+  ;; and the failure was an open-file error naming only the last
+  ;; candidate tried -- which reads like a lost fixture rather than a
+  ;; path this file never looked in. So the error below names all of
+  ;; them, and says what to do about it.
+  (let* ((candidates '("test/sexpr-vectors.json"
+                       "sexpr-vectors.json"
+                       "igropyr/test/sexpr-vectors.json"))
+         (path (let find ((c candidates))
+                 (cond ((null? c)
+                        (error 'sexpr-name-matrix
+                               (string-append
+                                 "vendored conformance fixture not found. "
+                                 "Looked for: "
+                                 (let join ((l candidates))
+                                   (if (null? (cdr l))
+                                       (car l)
+                                       (string-append (car l) ", "
+                                                      (join (cdr l)))))
+                                 " -- relative to the current directory, "
+                                 "which is where this suite was started "
+                                 "from. It is vendored in the repository "
+                                 "at test/sexpr-vectors.json; if it is "
+                                 "present there, this list is missing the "
+                                 "directory the runner uses.")))
+                       ((file-exists? (car c)) (car c))
+                       (else (find (cdr c))))))
          (p (open-file-input-port path))
          (bv (get-bytevector-all p)))
     (close-port p)
