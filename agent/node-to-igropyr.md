@@ -36,7 +36,7 @@ The mental-model conversions that matter:
 | `req.body` after `express.urlencoded()` / multipart | `(req-form req)` → alist; file fields are `#(file name content-type bytes)` | |
 | `req.headers['x-thing']` | `(req-header req 'x-thing)` | Header keys are **lowercase symbols**, not strings |
 | `req.cookies.sid` | `(req-cookie req "sid")` | |
-| `res.json(obj)` | `(send-json! res alist)` — objects are alists `(cons 'key val)`, arrays are lists | |
+| `res.json(obj)` | `(send-json! res alist)` — an object is an alist with **string** keys, `(cons "key" val)`; an array is a **vector**, `(vector 1 2)` | ⚠️ The two habits a JS background produces are both refused, by name: a list where an array was meant, and a symbol where a key or a string was meant. Nothing is converted silently |
 | `res.send(str)` / `res.type('html')` | `(send-text! res s)` / `(send-html! res s)` | |
 | `res.status(code)` | `(set-status! res code)` then a `send-*!` | |
 | `res.set('H', v)` | `(set-header! res "H" v)` (CRLF-injection values are dropped for you) | |
@@ -60,7 +60,7 @@ The mental-model conversions that matter:
 | `new Map()` shared mutable state | Chez `(make-hashtable ...)` *owned by one process*, or a gen-server if shared across requests | Never share mutable state between workers except through a process. |
 | Global rate limiter / auth middleware | `(igropyr middleware)`: `rate-limit`, `cors`, `security-headers`, `logger`, `error-handler` | |
 | `process.env.X` | `(getenv "X")` | |
-| `JSON.parse` / `JSON.stringify` | `(string->json s)` / `(json->string v)` | |
+| `JSON.parse` / `JSON.stringify` | `(string->json s)` / `(json->string v)` | `JSON.parse` coerces its argument to a string; `string->json` does not — a non-string is refused with `"string->json takes a string, not a number"` |
 
 ### Stateful modules → gen-server
 
@@ -163,7 +163,7 @@ Be honest about approximations. A correct "this npm feature has no equivalent; h
 - `(igropyr session)`: make-session-store session-middleware req-session session-get session-set! session-clear! session-peek
 - `(igropyr checked)`: define-checked define-checked-record contract-level (dev-only contracts; IGROPYR_CONTRACTS unset = off; never put a `-> pred` return contract on a tail-recursive procedure — it breaks TCO)
 - `(igropyr metrics)`: make-metrics metrics-middleware metrics-endpoint
-- `(igropyr json)`: string->json json->string json-ref
+- `(igropyr json)`: string->json json->string json-object? json-array? json-null? json-ref json-ref* json-set json-set* json-drop json-drop* json-push json-push* json-insert json-insert* json-update json-update* — an object is an alist with string keys, an array is a vector, `null` is `'null`; the starred procedures take one locator and can be applied, the macros take a path written at the call site
 - `(igropyr sexpr)`: string->sexpr sexpr->string (+ -extended variants for node links)
 - `(igropyr pubsub)`: start-pubsub! subscribe unsubscribe publish
 - `(igropyr redis)`: redis-connect redis redis-close!
