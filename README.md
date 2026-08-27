@@ -267,7 +267,7 @@ demand:
 
 (app-post app "/api/data"
   (lambda (req res)
-    (send-json! res (list (cons 'received (utf8->string (req-body req)))))))
+    (send-json! res (list (cons "received" (utf8->string (req-body req)))))))
 
 ;; middleware: call (next) to continue the chain
 (app-use app
@@ -341,7 +341,8 @@ Set status and extra headers first, then send exactly once:
 (set-header! res "X-Request-Id" "abc")
 (send-text! res "created")     ; text/plain        (express)
 (send-html! res "<h1>hi</h1>") ; text/html         (express)
-(send-json! res obj)           ; alist -> object, list -> array (express)
+(send-json! res obj)           ; alist (string keys) -> object,
+                               ; vector -> array              (express)
 (send-file! res "path/to/f")   ; MIME type from extension       (express)
 ```
 
@@ -521,7 +522,7 @@ invalid JSON) and `send-json!` serializes:
 (app-post app "/api"
   (lambda (req res)
     (let ((j (req-json req)))
-      (send-json! res (list (cons 'echo (json-ref j "name")))))))
+      (send-json! res (list (cons "echo" (json-ref j "name")))))))
 ```
 
 ## Forms and cookies
@@ -911,7 +912,7 @@ order matters (outermost first).
     (let* ((s (req-session req))
            (n (+ 1 (or (session-get s 'visits) 0))))
       (session-set! s 'visits n)             ; persisted automatically
-      (send-json! res (list (cons 'visits n))))))
+      (send-json! res (list (cons "visits" n))))))
 
 ;; Rotate an established anonymous id when authentication/privilege changes.
 ;; Must happen BEFORE the response goes out -- the replacement arrives as a
@@ -923,7 +924,7 @@ order matters (outermost first).
     (let ((s (req-session req)))
       (session-regenerate! s)                 ; prevents session fixation
       (session-set! s 'user "alice")
-      (send-json! res '((ok . #t))))))
+      (send-json! res '(("ok" . #t))))))
 ```
 
 Middleware can also stash arbitrary values on the request for later
@@ -1070,9 +1071,12 @@ worker):
 
 ```scheme
 (define srv (app-listen app 8080))
-(app-get app "/stats" (lambda (req res) (send-json! res (http-stats srv))))
+(app-get app "/stats" (lambda (req res) (send-json! res (http-stats-json srv))))
 ;;   => {"connections":12,"requests":34210,"uptime-ms":90000,
 ;;       "idle":5,"busy":3,"pending":0}
+;; http-stats itself keys by symbol, for Scheme callers reading it with
+;; assq; http-stats-json is the same snapshot with the keys spelled out,
+;; because a JSON object key is a string.
 (spawn (lambda () (http-shutdown! srv) (exit 0)))   ; graceful stop
 ```
 

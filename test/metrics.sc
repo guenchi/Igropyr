@@ -140,6 +140,17 @@
                (number? (cdr (assq 'requests s))))))
 
       ;; in-process callers can read the snapshot directly
+      ;; http-stats-json is the string-key adapter over http-stats; the
+      ;; raw form keeps symbol keys for its assq consumers, so the
+      ;; adapter is the only spelling that can flow into json->string.
+      ;; This cell owns the exported PART; the example wirings that call
+      ;; it live in files no runner executes, and are not covered here.
+      (let ((stats (string->json (json->string (http-stats-json srv)))))
+        (check "http-stats-json serializes, with string keys, and round-trips"
+               (and (json-object? stats)
+                    (number? (json-ref stats "connections"))
+                    (number? (json-ref stats "requests"))
+                    (number? (json-ref stats "uptime-ms")))))
       (check "snapshot-value"
         (number? (cdr (assoc "uptime_ms" (metrics-snapshot m srv)))))
 

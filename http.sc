@@ -28,7 +28,7 @@
 
 (library (igropyr http)
   (export http-listen http-swap! http-set-ws!
-          http-stats http-shutdown! http-write-timeout!
+          http-stats http-stats-json http-shutdown! http-write-timeout!
           http-request-deadline!
           ;; record predicates, exported for boundary contracts
           ;; ((igropyr checked) in the framework layers) and any
@@ -1833,6 +1833,29 @@
             (cons 'requests task-counter)
             (cons 'uptime-ms (- (now-ms) (http-server-started srv))))
       (pool-stats (http-server-sup srv))))
+
+  ;; THE SAME SNAPSHOT AS A JSON VALUE. http-stats is a Scheme-facing
+  ;; result read with assq, so its keys are symbols; (igropyr json)
+  ;; refuses a symbol key. Handing http-stats straight to a JSON writer
+  ;; therefore raises on its first member, and it did -- an endpoint
+  ;; built that way answered for as long as symbols were written as
+  ;; strings and stopped the day they were not. The conversion belongs
+  ;; here, beside the thing being converted, rather than in each caller:
+  ;; a caller-side adapter is invisible to the suites that own this
+  ;; library, and the two that existed both lived in files no runner
+  ;; executes.
+  ;;
+  ;; THE KEY NAMES ARE THE WIRE CONTRACT, so this spells each symbol and
+  ;; changes nothing else: connections, requests, uptime-ms, and whatever
+  ;; the pool contributes. Those are the exact names the endpoint emitted
+  ;; back when a symbol key was written as a string, which makes this a
+  ;; restoration rather than a redesign -- a client written against it
+  ;; keeps working. Prettier spellings were considered and rejected here:
+  ;; nothing in Scheme refers to these strings, so renaming one is
+  ;; invisible at compile time and breaks only the consumer.
+  (define (http-stats-json srv)
+    (map (lambda (kv) (cons (symbol->string (car kv)) (cdr kv)))
+         (http-stats srv)))
 
   ;; Graceful shutdown: stop accepting, then wait until every accepted
   ;; request has been answered (busy = pending = 0). Established

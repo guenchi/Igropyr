@@ -43,10 +43,10 @@
 
 (define info-json
   (string->utf8
-    (json->string (list (cons 'name "igropyr")
-                        (cons 'engine "chez-scheme")
-                        (cons 'io "libuv")
-                        (cons 'workers 8)))))
+    (json->string (list (cons "name" "igropyr")
+                        (cons "engine" "chez-scheme")
+                        (cons "io" "libuv")
+                        (cons "workers" 8)))))
 
 (app-get app "/json"
   (lambda (req res)
@@ -54,10 +54,8 @@
 
 (app-get app "/users/:id"
   (lambda (req res)
-    (send-json! res (list (cons 'user (req-param req "id"))
-                          (cons 'q (map (lambda (kv)
-                                          (cons (string->symbol (car kv)) (cdr kv)))
-                                        (req-query req)))))))
+    (send-json! res (list (cons "user" (req-param req "id"))
+                          (cons "q" (req-query req))))))
 
 (app-post app "/echo"
   (lambda (req res)
@@ -77,12 +75,10 @@
       (if (= (length runs) 1)
           (raise 'first-attempt-crash)
           (send-json! res
-            (list (cons 'attempt (length runs))
-                  (cons 'workers runs)
-                  (cons 'key k)
-                  (cons 'query (map (lambda (kv)
-                                      (cons (string->symbol (car kv)) (cdr kv)))
-                                    (req-query req)))))))))
+            (list (cons "attempt" (length runs))
+                  (cons "workers" runs)
+                  (cons "key" k)
+                  (cons "query" (req-query req))))))))
 
 (app-get app "/crash"
   (lambda (req res)
@@ -115,9 +111,9 @@
              (cons (car kv)
                    (let ((v (cdr kv)))
                      (if (vector? v)
-                         (list (cons 'filename (vector-ref v 1))
-                               (cons 'type (vector-ref v 2))
-                               (cons 'size (bytevector-length (vector-ref v 3))))
+                         (list (cons "filename" (vector-ref v 1))
+                               (cons "type" (vector-ref v 2))
+                               (cons "size" (bytevector-length (vector-ref v 3))))
                          v))))
            (req-form req)))))
 
@@ -143,9 +139,9 @@
   (lambda (req res)
     (let ((j (req-json req)))
       (if j
-          (send-json! res (list (cons 'hello (or (json-ref j "name") 'null))))
+          (send-json! res (list (cons "hello" (or (json-ref j "name") 'null))))
           (begin (set-status! res 400)
-                 (send-json! res (list (cons 'error "invalid json"))))))))
+                 (send-json! res (list (cons "error" "invalid json"))))))))
 
 ;; Server-Sent Events: five ticks, one per 300ms, then done. The stream
 ;; runs in its own process; the pool worker is released immediately.
@@ -187,7 +183,7 @@
     (let ((amt (or (string->number (utf8->string (req-body req))) 0)))
       (if (or (<= amt 0) (> amt (unbox account)))
           (begin (set-status! res 400)
-                 (send-json! res (list (cons 'error "bad amount"))))
+                 (send-json! res (list (cons "error" "bad amount"))))
           ;; ONE IDEMPOTENT RELEASER, used by every path that gives the
           ;; hold back. The flow's guard runs when the flow raises; the
           ;; on-killed hook runs when the watchdog kills a step, because
@@ -213,8 +209,8 @@
                           (lambda (req suspend! commit!)
                             (set-box! account (- (unbox account) amt))  ; hold
                             (guard (e (#t (release!) (raise e)))
-                              (let ((req2 (suspend! (list (cons 'step "confirm")
-                                                          (cons 'amount amt)))))
+                              (let ((req2 (suspend! (list (cons "step" "confirm")
+                                                          (cons "amount" amt)))))
                                 (if (equal? (utf8->string (req-body req2)) "confirm")
                                     (begin
                                       ;; committed: the hold becomes the
@@ -226,12 +222,12 @@
                                       ;; 'unknown, not 'gone, or the client
                                       ;; retries a transfer that happened.
                                       (commit! (lambda () (set-box! released #t)))
-                                      (list (cons 'done #t)
-                                            (cons 'balance (unbox account))))
+                                      (list (cons "done" #t)
+                                            (cons "balance" (unbox account))))
                                     (begin
                                       (release!)
-                                      (list (cons 'done #f)
-                                            (cons 'cancelled #t)))))))
+                                      (list (cons "done" #f)
+                                            (cons "cancelled" #t)))))))
                           req
                           15000                                         ; demo TTL 15s
                           ;; two retries of the same call are two different
@@ -256,8 +252,8 @@
             ;; what stops a double click or a retried request from advancing
             ;; the flow past a reply nobody read -- here, confirming a
             ;; transfer the user never saw the amount for.
-            (send-json! res (cons (cons 'conv id)
-                                  (cons (cons 'token token) reply)))))))))
+            (send-json! res (cons (cons "conv" id)
+                                  (cons (cons "token" token) reply)))))))))
 
 ;; The token comes back as ?token=N. A request without it, or with an old
 ;; one, is refused: it was written against a reply that is no longer the
@@ -271,7 +267,7 @@
         (cond
           ((conversation-gone? status)
            (set-status! res 410)
-           (send-json! res (list (cons 'fault "gone") (cons 'rolled-back #t))))
+           (send-json! res (list (cons "fault" "gone") (cons "rolled-back" #t))))
           ;; NOT 410, and note the absent rolled-back: this node cannot
           ;; say whether the transaction committed -- its record aged out,
           ;; was pushed out by newer ones, or belonged to an earlier
@@ -280,21 +276,21 @@
           ;; state, which is where the truth still is.
           ((conversation-unknown? status)
            (set-status! res 409)
-           (send-json! res (list (cons 'fault "unknown")
-                                 (cons 'resubmit #f))))
+           (send-json! res (list (cons "fault" "unknown")
+                                 (cons "resubmit" #f))))
           ;; 409: this request was NOT applied and will not be. It says
           ;; nothing about whether the request it duplicates succeeded --
           ;; read the current state rather than resubmitting.
           ((conversation-stale? status)
            (set-status! res 409)
-           (send-json! res (list (cons 'fault "stale")
-                                 (cons 'applied #f))))
+           (send-json! res (list (cons "fault" "stale")
+                                 (cons "applied" #f))))
           ((conversation-done? status) (send-json! res r))
-          (else (send-json! res (cons (cons 'token status) r))))))))
+          (else (send-json! res (cons (cons "token" status) r))))))))
 
 (app-get app "/transfer-balance"
   (lambda (req res)
-    (send-json! res (list (cons 'balance (unbox account))))))
+    (send-json! res (list (cons "balance" (unbox account))))))
 
 ;; Chat rooms: WebSocket + PubSub. Every message a client sends is
 ;; published to its room topic; a forwarder process per connection
@@ -346,4 +342,4 @@
       ;; runtime stats: connections, request count, uptime, pool state
       (app-get app "/stats"
         (lambda (req res)
-          (send-json! res (http-stats srv)))))))
+          (send-json! res (http-stats-json srv)))))))

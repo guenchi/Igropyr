@@ -13,13 +13,14 @@
 ;;;
 ;;; (string->json s)   parse; raises #(json-error msg pos) on bad input,
 ;;;                    pos being the index into s where it gave up
-;;; (json->string x)   serialize (alists -> objects, vectors -> arrays;
-;;;                    a list serializes as an array only when it is
-;;;                    NEITHER empty NOR shaped like an alist: '() is
-;;;                    written {}, and a list whose every element is a
-;;;                    pair with a string or symbol car is an object,
-;;;                    even when it was meant as an array of pairs);
-;;;                    raises the
+;;; (json->string x)   serialize. AN ARRAY IS A VECTOR AND NOTHING ELSE:
+;;;                    a list is either an object (every element a
+;;;                    pair), or '() which is written {}, or refused
+;;;                    with a message naming list->vector. A key that is
+;;;                    not a string is refused too, by name. It used to
+;;;                    serialize as an array,
+;;;                    which left the pair as the only thing separating
+;;;                    an array from an object. Raises the
 ;;;                    same #(json-error msg pos) shape with pos = #f,
 ;;;                    there being no text to point into. Both directions
 ;;;                    use one tag on purpose: a guard dispatching only
@@ -32,11 +33,66 @@
 ;;;                    any json-error will report our own serialisation
 ;;;                    fault as the client's. Anything richer wants its
 ;;;                    own tag, not a longer vector.
-;;; (json-ref x k ...) path access: string/symbol key for objects,
-;;;                    integer index for arrays; #f when absent
+;;; PATHS come in two layers, and the trailing * is THE LOWER ONE -- as
+;;; in write-json*, and unlike the convention elsewhere in Scheme where a
+;;; star means an enhanced variant. The starred procedures take a single
+;;; locator and can be applied; the macros take a path written out at
+;;; the call site and flatten it into nested calls to them. Each path
+;;; element is an expression, not a literal, and the container and every
+;;; locator are evaluated EXACTLY ONCE.
+;;;
+;;;   (json-ref*    x k [absent])  read one step; absent is a thunk
+;;;   (json-set*    x k v)         replace at an existing locator
+;;;   (json-drop*   x sel)         remove what sel selects
+;;;   (json-update* x sel p)       transform what sel selects; p takes
+;;;                                (key old) -- the index, for a vector
+;;;   (json-ref x k ... [absent]) and json-set / json-drop / json-update
+;;;                                likewise, over a written-out path.
+;;;                                Only json-ref takes the trailing
+;;;                                thunk; the others end in a value.
+;;;
+;;;   (json-object? x) (json-array? x) (json-null? x)
+;;;     classify a value in this representation. NOT writability checks:
+;;;     a value can satisfy json-object? and still be refused by
+;;;     json->string, which validates recursively.
+;;;
+;;; json-update* CALLS A PROCEDURE IN ITS VALUE POSITION rather than
+;;; storing it. That is a property of json-update*, not of the value
+;;; position in general: json-push* and json-insert* store whatever they
+;;; are given, a procedure included, and the writer refuses it later.
+;;; sel is a locator, a predicate on the key, #t for every member, or #f
+;;; for none.
+;;;
+;;; #f MEANS FOUR THINGS HERE and they are worth reading together:
+;;;   json-ref* -> #f      no value at that locator
+;;;   a writer  -> #f      the operation failed: broken path, or a
+;;;                        locator that is not there
+;;;   sel = #f             select nothing: the container comes back
+;;;                        unchanged, which is not a failure
+;;;   the datum #f         a JSON false, stored and read back like any
+;;;                        other value
+;;; A failing writer answers #f while one told to select nothing answers
+;;; the container, so those two are distinguishable. An absent member and
+;;; a member whose value is false are NOT, on a read with no thunk: pass
+;;; one, to either layer, to tell them apart.
+;;;
+;;; Selecting nothing is not failing. (json-update* x sel p) with a sel
+;;; that matches no member answers a container equal to x: zero members
+;;; were transformed, and that is what was asked for. EQUAL, not eq?.
+;;; Nothing here promises to share structure with its argument or to copy
+;;; it; both happen, and which one is an implementation choice that is
+;;; free to change. Code that needs to know whether a value was rebuilt
+;;; must compare contents.
 
 (library (igropyr json)
-  (export string->json json->string json-ref)
+  (export string->json json->string
+          json-object? json-array? json-null?
+          json-ref  json-ref*
+          json-set  json-set*
+          json-drop json-drop*
+          json-push json-push*
+          json-insert json-insert*
+          json-update json-update*)
   (import (chezscheme) (only (igropyr json-internal) number-text))
 
   ;; nesting cap for untrusted input. THIS ONE IS NOT ADJUSTABLE per
@@ -569,7 +625,15 @@
       ((eq? x 'null) (put-string p "null"))
       ((number? x) (put-string p (number->json x)))
       ((string? x) (write-json-string x p))
-      ((symbol? x) (write-json-string (symbol->string x) p))
+      ;; A SYMBOL IS NOT A STRING HERE. It was written as one, which made
+      ;; 'foo and "foo" the same document and left the wire unable to say
+      ;; which had been written. The one symbol that remains is null, and
+      ;; it is caught above: 'null is not a symbol used as a string, it
+      ;; is this representation's spelling of the JSON literal.
+      ((symbol? x)
+       (raise (vector 'json-error
+                      (format "a JSON string is a string, not the symbol ~s: quote it" x)
+                      #f)))
       ((vector? x)
        (put-char p #\[)
        (let ((n (vector-length x)))
@@ -578,57 +642,87 @@
            (write-json* (vector-ref x i) p (fx+ depth 1))))
        (put-char p #\]))
       ((null? x) (put-string p "{}"))
-      ;; THE WRITER IS NOT INJECTIVE over Scheme representations, and
-      ;; this branch is where it bites hardest, because (cdr kv) is
-      ;; taken as the value: (("a" . #("b"))) and (("a" "b")) both emit
-      ;; {"a":["b"]}, and the wire does not record whether the value was
-      ;; a vector in the cdr or a one-element list tail. It is not the
-      ;; only place -- the symbol x and the string "x" agree, so do the
-      ;; list (1) and the vector #(1), and so do a symbol key and a
-      ;; string key of the same name. What follows is NOT that a round
-      ;; trip changes the value -- one representative of each collision
-      ;; comes home unchanged, and here it is the vector form: read
-      ;; {"a":["b"]} and you get a string key with a vector value, equal?
-      ;; to the input that produced it. What follows is that the document
-      ;; cannot say WHICH preimage it came from, so a round trip is not
-      ;; guaranteed to return what was written -- the other members of
-      ;; the collision come back as the survivor. This is distinct from
-      ;; the reading-side ambiguity recorded elsewhere: there one shape
-      ;; had two readings, here two values have one document.
+      ;; HOW THE SHAPE COLLISIONS WERE CLOSED, since the way matters more
+      ;; than the fact. (("a" . #("b"))) and (("a" "b")) once emitted the
+      ;; same document; so did the list (1) and the vector #(1); so did
+      ;; the symbol x and the string "x", and a symbol key and a string
+      ;; key of the same name. NONE of those was closed by choosing a
+      ;; winner and writing it: each was closed by REFUSING the other
+      ;; spelling, so a caller who held the losing one is told, rather
+      ;; than quietly served the survivor's document. That is why the
+      ;; refusals above exist and why turning any of them back into a
+      ;; conversion reopens a collision rather than adding a convenience.
       ;;
-      ;; alist -> object. EVERY entry must be a pair with a string or
-      ;; symbol key: a list of lists (a nested array) also has a pair as
-      ;; its car, and treating it as an object used to crash on the
-      ;; non-string key. Note (("a" "b")) stays genuinely ambiguous --
-      ;; it is both a one-entry alist and a one-element array of
-      ;; strings -- and is still written as an object; use a vector for
-      ;; an unambiguous array.
+      ;; THE WRITER IS STILL NOT INJECTIVE, in the number domain: an
+      ;; exact ratio and its rounded decimal reach the same text, and
+      ;; every non-finite reaches null. Those are not shape collisions
+      ;; and are not closed by any refusal here. This comment does not
+      ;; say how many there are or which ones survive -- that set is
+      ;; defined by the number tests, and a count written here would go
+      ;; stale in a file that never has to be opened to change it.
+      ;;
+      ;; What non-injective means here is NOT that a round trip changes
+      ;; the value -- one representative of each collision comes home
+      ;; unchanged. It is that the document cannot say WHICH preimage it
+      ;; came from, so the other member comes back as the survivor. This
+      ;; is distinct from the reading-side ambiguity recorded elsewhere:
+      ;; there one shape had two readings, here two values have one
+      ;; document.
+      ;;
+      ;; alist -> object. EVERY entry must be a pair; the key inside it
+      ;; must be a string, and that is checked in the loop rather than
+      ;; here, so the message can name the key. Note (("a" "b")) is
+      ;; genuinely ambiguous -- it is both a one-entry alist and a
+      ;; one-element array of strings -- and it is NOT written: it
+      ;; classifies as an object, and then its value ("b") is a list,
+      ;; which the writer refuses. Use a vector for an unambiguous array.
+      ;; THE CLASSIFIER LOOKS AT SHAPE, NOT AT KEYS. Every element being
+      ;; a pair is what makes this an object; whether the keys are usable
+      ;; is then decided in the loop, where the offending key is in hand
+      ;; and can be named. Deciding it here instead sent a bad key to the
+      ;; list branch below, which answered that an array must be a vector
+      ;; -- a true statement about how the value was classified, and a
+      ;; false lead about what the caller did wrong.
       ((and (list? x) (pair? (car x))
             (let all ((l x))
-              (or (null? l)
-                  (and (pair? (car l))
-                       (let ((k (caar l))) (or (string? k) (symbol? k)))
-                       (all (cdr l))))))
+              (or (null? l) (and (pair? (car l)) (all (cdr l))))))
        (put-char p #\{)
        (let loop ((l x) (first #t))
          (unless (null? l)
            (unless first (put-char p #\,))
            (let ((kv (car l)))
              (write-json-string
-               (if (symbol? (car kv)) (symbol->string (car kv)) (car kv))
+               (let ((k (car kv)))
+                 (if (string? k)
+                     k
+                     ;; NAMING THE KEY IS THE WHOLE POINT. The condition
+                     ;; carries no path and no member ordinal, so without
+                     ;; the datum the caller is told a true thing about a
+                     ;; value they cannot find. Both spellings are offered
+                     ;; because this branch is reached by two different
+                     ;; mistakes -- a symbol where a key belongs, and a
+                     ;; list of lists meant as a nested array -- and the
+                     ;; writer cannot tell which was intended.
+                     (raise (vector 'json-error
+                                    (format "an object key must be a string, not ~s: an object member is (\"k\" . v), a nested array is #(#(...))" k)
+                                    #f))))
                p)
              (put-char p #\:)
              (write-json* (cdr kv) p (fx+ depth 1)))
            (loop (cdr l) #f)))
        (put-char p #\}))
-      ((list? x)                                   ; plain list -> array
-       (put-char p #\[)
-       (let loop ((l x) (first #t))
-         (unless (null? l)
-           (unless first (put-char p #\,))
-           (write-json* (car l) p (fx+ depth 1))
-           (loop (cdr l) #f)))
-       (put-char p #\]))
+      ;; A LIST IS NOT AN ARRAY HERE. It was once: a non-empty list that
+      ;; was not alist-shaped came out as a JSON array, which made the
+      ;; pair the only thing standing between an array and an object and
+      ;; put the decision inside the elements. (("a" . #("b"))) and
+      ;; (("a" "b")) then produced the same document. One spelling is
+      ;; enough, and the vector is the one that cannot be mistaken for
+      ;; an object, so a list reaching here is refused and told what to
+      ;; write instead.
+      ((list? x)
+       (raise (vector 'json-error
+                      "a JSON array is a vector, not a list: use list->vector"
+                      #f)))
       ;; NOT A JSON VALUE. This used to write "null", which is the one
       ;; answer a caller cannot tell from a real one: null is a value
       ;; they may legitimately have meant, so a mistyped field left the
@@ -657,9 +751,11 @@
       ;; The branches: booleans; the symbol null, which becomes the JSON
       ;; literal; numbers, the branch taken by number?, within which
       ;; real? decides and the non-finite ones become null; strings;
-      ;; symbols OTHER THAN null, which become JSON strings; vectors; the
-      ;; empty list; a non-empty alist-shaped list; a non-empty list that
-      ;; is not alist-shaped.
+      ;; symbols OTHER THAN null, which are refused and named; vectors;
+      ;; the empty list; a list whose every element is a pair. Any other
+      ;; non-empty list has its own branch and is refused there -- it is
+      ;; listed among the branches because it is one, not because it is
+      ;; accepted, and the same is true of the symbol branch above it.
       ;;
       ;; MOST OF THOSE CARRY QUALIFIERS AND THE QUALIFIERS ARE THE POINT.
       ;; A bare "numbers" readmits what the real? gate above turns away,
@@ -683,19 +779,38 @@
       ;; (list->vector (flvector->list v)), and the cost lands on the
       ;; side that knows what it meant.
       ;;
-      ;; AN ARGUMENT THAT WAS TRIED HERE AND IS NOT AVAILABLE, written
-      ;; down so the next reader does not spend the same afternoon on it:
-      ;; that admitting an fxvector would break symmetry with the second
-      ;; implementation. Whether it would cannot be settled in this file
-      ;; -- the claim is about another implementation's input domain, and
-      ;; nothing here can check that. Two attempts to rescue it also
-      ;; failed. Saying an fxvector "just becomes an array" needs the
-      ;; same unavailable fact. Saying we are already asymmetric -- this
-      ;; writer does accept a list that is neither empty nor alist-shaped
-      ;; as an array, a symbol as a
-      ;; string, a symbol as an object key, none of which its own reader
-      ;; produces -- is true and checkable, but it is about OUR reader,
-      ;; not the other one, so it does not reach the claim either.
+      ;; THE REASON, STATED POSITIVELY, because the argument that used to
+      ;; sit here has been withdrawn and a withdrawn argument must be
+      ;; replaced rather than patched.
+      ;;
+      ;; What this writer accepts in the SHAPE domain is now exactly what
+      ;; its reader produces: objects as alists with string keys, arrays
+      ;; as vectors, strings as strings. Narrowing arrays to vectors and
+      ;; refusing symbols closed the last two places where a caller could
+      ;; hand over a shape no document would ever have come from. An
+      ;; fxvector would reopen that: it is a shape with no counterpart on
+      ;; the reading side, and admitting it would mean the set of things
+      ;; that can be written is once again larger than the set of things
+      ;; that can be read back, for no reason except that the conversion
+      ;; is easy to write here rather than at the call site.
+      ;;
+      ;; THE NUMBER DOMAIN IS STILL WIDER, DELIBERATELY, and it is worth
+      ;; saying so rather than claiming a symmetry the file does not
+      ;; have: an exact ratio is accepted and rounded though no document
+      ;; yields one, a non-finite is accepted and written as null though
+      ;; the reader refuses non-finites, and an exact integer wider than
+      ;; the reader's number-token limit is written and cannot be read
+      ;; back. Those are numeric policies, taken here so that every call
+      ;; site does not have to take them; they are not a precedent for
+      ;; widening the shapes.
+      ;;
+      ;; (The withdrawn argument was that admitting an fxvector would
+      ;; break symmetry with a second implementation. It cannot be
+      ;; settled here -- the claim is about another implementation's
+      ;; input domain and nothing in this file can check that. It was
+      ;; rescued twice and both rescues failed the same way, by needing
+      ;; that same unavailable fact or by talking about OUR reader
+      ;; instead of the other one.)
       ;;
       ;; The policy above stands without it. It is a chosen data model,
       ;; and a chosen model needs no proof that the alternative is
@@ -704,27 +819,357 @@
       ;; values -- so this wording is not the reader's being reused. What
       ;; the second implementation's writer says is deliberately not
       ;; recorded here: it is not a fact this file can check.
+      ;;
+      ;; THIS MESSAGE MUST NAME A KIND AND NEVER THE VALUE, and the day
+      ;; someone improves the localisation here is the day to read this.
+      ;; Two reasons; the second is the wider one.
+      ;;   - A CIRCULAR VALUE LANDS HERE, because list? answers #f for
+      ;;     one. The objection is NOT that printing it would hang:
+      ;;     measured, Chez detects the cycle, prints "Warning in write:
+      ;;     cycle detected", switches to print-graph, and returns
+      ;;     "#0=(1 2 3 . #0#)" -- sixteen characters, exit 0. The
+      ;;     objection is that WARNING: an error path must not emit
+      ;;     console output of its own, and a caller who sees that line
+      ;;     has nothing telling them it came from here.
+      ;;   - print-length AND print-level BOTH DEFAULT TO #f, so a
+      ;;     message built from the value has no size bound. A
+      ;;     200000-element list formats to 400001 characters
+      ;;     (measured). This is true of every large value that reaches
+      ;;     this branch and has nothing to do with cycles, which is why
+      ;;     it, not the circular case, is the reason that generalises.
+      ;; The bounded, safe, locating form names the kind instead: "not a
+      ;; JSON value: a character". Do not "improve" this by adding ~s.
       (else (raise (vector 'json-error "not a JSON value" #f)))))
 
   (define (json->string x)
     (call-with-string-output-port
       (lambda (p) (write-json x p))))
 
-  ;; ---- path access -------------------------------------------------------
+  ;; ---- classifiers --------------------------------------------------------
+  ;;
+  ;; THESE CLASSIFY VALUES IN THIS LIBRARY'S REPRESENTATION -- what
+  ;; string->json produces, where a key is always a string and a value is
+  ;; always writable. They are NOT writability checks: a value can satisfy
+  ;; json-object? and still be refused by json->string, which validates
+  ;; recursively. (("a" "b")) is such a value: it is a pair whose car is a
+  ;; pair, so it classifies as an object, and its member's value is a list,
+  ;; which the writer refuses.
+  ;;
+  ;; WHAT json-object? ACTUALLY ADMITS is a pair whose car is a pair. It
+  ;; does not walk the spine and does not look at the keys, so ((1 . 2))
+  ;; and the improper (("a" . 1) . 2) both satisfy it. The second can make
+  ;; a path operation raise a native condition; that is the price of the
+  ;; one-pair test and it is written down here rather than implied.
+  ;;
+  ;; They are cheap on purpose. A stricter version is possible without
+  ;; going recursive -- walking the spine and requiring a string car at
+  ;; every member would cost O(members) and would not touch the values --
+  ;; and it was not chosen, because the writer must validate anyway and a
+  ;; second supplier of a decision is what this batch has been removing.
+  ;; That is a choice about duplication, not a claim that agreement would
+  ;; require recursion: FULL agreement would, spine agreement would not,
+  ;; and an earlier version of this paragraph offered only the first of
+  ;; those and read as though no cheaper option existed.
 
-  (define (ref1 x k)
+  (define (json-object? x)
+    (or (null? x) (and (pair? x) (pair? (car x)))))
+
+  (define (json-array? x) (vector? x))
+
+  (define (json-null? x) (eq? x 'null))
+
+  ;; ---- path access ---------------------------------------------------------
+  ;;
+  ;; #f MEANS FOUR DIFFERENT THINGS ACROSS THIS SECTION, and they are set
+  ;; out together here rather than left to be assembled from four places:
+  ;;
+  ;;   json-ref*    returns #f     the path had no value there
+  ;;   the writers  return #f      the operation failed: a broken path, or
+  ;;                               a locator that does not exist
+  ;;   sel = #f     returns the container unchanged: select nothing, so
+  ;;                               nothing is dropped or updated
+  ;;   the datum #f                a JSON false, which is a value like any
+  ;;                               other and can be stored and read back
+  ;;
+  ;; The first two are distinguishable from the third by what comes back: a
+  ;; failing writer answers #f, a writer told to select nothing answers the
+  ;; container. The first and the fourth are NOT distinguishable on a read
+  ;; with no thunk -- a member whose value is false reads the same as a
+  ;; member that is absent. Pass one, to either layer, to tell them apart.
+
+  ;; An index is a member of a vector only when it is an exact non-negative
+  ;; integer below the length. integer? alone is wider than that: 1.0
+  ;; satisfies it and vector-ref does not accept it, so a predicate written
+  ;; that way admits an input to an operation it cannot guard.
+  (define (index-of x k)
+    (and (vector? x) (exact? k) (integer? k)
+         (>= k 0) (< k (vector-length x)) k))
+
+  ;; A STORED KEY IS A STRING; A LOCATOR NEED NOT BE. The writer refuses a
+  ;; symbol key because two spellings of one object would reach the same
+  ;; document. Nothing of the kind is at stake when a symbol is used to
+  ;; POINT AT a member: it is spelled to a string, the lookup happens
+  ;; against the string that is really there, and no symbol is ever stored.
+  ;; The two rules look opposed and are not, but the asymmetry is real and
+  ;; a reader who has just met the writer's refusal will not expect it:
+  ;;
+  ;;   (json->string '((a . 1)))       refused, the key is a symbol
+  ;;   (json-ref* '(("a" . 1)) 'a)     1, the locator is a symbol
+  ;;
+  ;; It applies to every locator and selector position -- ref, set, drop,
+  ;; insert, update -- and not to json-push*, which takes a member rather
+  ;; than a locator and therefore stores what it is given.
+  (define (key-of k) (if (symbol? k) (symbol->string k) k))
+
+  (define (member-index x k)
+    (and (json-object? x) (not (null? x)) (or (string? k) (symbol? k))
+         (let ((key (key-of k)))
+           (let loop ((l x) (i 0))
+             (cond
+               ((null? l) #f)
+               ((and (pair? (car l)) (equal? (caar l) key)) i)
+               (else (loop (cdr l) (+ i 1))))))))
+
+  ;; Reads one step. With no thunk an absent member answers #f; with one,
+  ;; the thunk is called with no arguments and its value answers instead.
+  (define json-ref*
+    (case-lambda
+      ((x k) (json-ref* x k (lambda () #f)))
+      ((x k absent)
+       (let ((i (index-of x k)))
+         (if i
+             (vector-ref x i)
+             (let ((j (member-index x k)))
+               (if j (cdr (list-ref x j)) (absent))))))))
+
+  ;; A value position takes either a value or a procedure, and a procedure
+  ;; there is a transformation of the old value rather than a value to
+  ;; store. A procedure is not a JSON value, so nothing is lost by that
+  ;; reading, but it does mean a caller cannot store one.
+  (define (apply-value v old)
+    (if (procedure? v) (v old) v))
+
+  (define (list-set l i f)
+    (let loop ((l l) (i i) (acc '()))
+      (if (fx= i 0)
+          (append (reverse acc) (cons (f (car l)) (cdr l)))
+          (loop (cdr l) (fx- i 1) (cons (car l) acc)))))
+
+  (define (list-insert-at l i item)
+    (let loop ((l l) (i i) (acc '()))
+      (if (fx= i 0)
+          (append (reverse acc) (cons item l))
+          (loop (cdr l) (fx- i 1) (cons (car l) acc)))))
+
+  (define (list-drop-at l i)
+    (let loop ((l l) (i i) (acc '()))
+      (if (fx= i 0)
+          (append (reverse acc) (cdr l))
+          (loop (cdr l) (fx- i 1) (cons (car l) acc)))))
+
+  ;; Replaces the value at an existing locator. A locator that is not there
+  ;; is a failure, not an insertion -- adding is json-push* and json-insert*.
+  (define (json-set* x k v)
+    (let ((i (index-of x k)))
+      (cond
+        (i (let ((new (vector-copy x)))
+             (vector-set! new i (apply-value v (vector-ref x i)))
+             new))
+        ((member-index x k)
+         => (lambda (j)
+              (list-set x j (lambda (kv)
+                              (cons (car kv) (apply-value v (cdr kv)))))))
+        (else #f))))
+
+  ;; Removes what sel selects. sel is a key or index, a predicate on the
+  ;; key, #t for every member, or #f for none -- and #f answers the
+  ;; container, because selecting nothing is not a failure.
+  (define (selected? sel k)
     (cond
-      ((and (vector? x) (integer? k))
-       (and (>= k 0) (< k (vector-length x)) (vector-ref x k)))
-      ((and (list? x) (or (string? k) (symbol? k)))
-       (let ((key (if (symbol? k) (symbol->string k) k)))
-         (let loop ((l x))
-           (cond
-             ((null? l) #f)
-             ((and (pair? (car l)) (equal? (caar l) key)) (cdar l))
-             (else (loop (cdr l)))))))
+      ((eq? sel #t) #t)
+      ((eq? sel #f) #f)
+      ((procedure? sel) (and (sel k) #t))
+      ((string? sel) (and (string? k) (string=? sel k)))
+      ((symbol? sel) (and (string? k) (string=? (symbol->string sel) k)))
+      (else (equal? sel k))))
+
+  (define (json-drop* x sel)
+    (cond
+      ((eq? sel #f) (and (or (json-array? x) (json-object? x)) x))
+      ((json-array? x)
+       (let ((keep (let loop ((i 0) (acc '()))
+                     (if (fx= i (vector-length x))
+                         (reverse acc)
+                         (loop (fx+ i 1)
+                               (if (selected? sel i)
+                                   acc
+                                   (cons (vector-ref x i) acc)))))))
+         (if (fx= (length keep) (vector-length x))
+             (and (or (eq? sel #t) (procedure? sel)) x)
+             (list->vector keep))))
+      ((json-object? x)
+       ;; The empty object is an object here. Dropping every member of
+       ;; {} drops zero members and succeeds, the way updating zero
+       ;; members succeeds: #f is reserved for an operation that did
+       ;; not complete. Excluding it made these two verbs disagree on
+       ;; the same container.
+       (let ((keep (let loop ((l x) (acc '()))
+                     (cond
+                       ((null? l) (reverse acc))
+                       ((and (pair? (car l)) (selected? sel (caar l)))
+                        (loop (cdr l) acc))
+                       (else (loop (cdr l) (cons (car l) acc)))))))
+         (if (= (length keep) (length x))
+             (and (or (eq? sel #t) (procedure? sel)) x)
+             keep)))
       (else #f)))
 
-  (define (json-ref x . keys)
-    (fold-left (lambda (acc k) (and acc (ref1 acc k))) x keys))
+  ;; A member of an array is a VALUE; a member of an object is a PAIR.
+  ;; That is why these two take the member itself rather than a key and a
+  ;; value: three arguments cannot carry a container, a locator, a new key
+  ;; and a value, and an earlier shape that tried left the key with nowhere
+  ;; to come from on the object side.
+  (define (object-member? m) (and (pair? m) (string? (car m))))
+
+  (define (json-push* x v)
+    (cond
+      ((json-array? x) (list->vector (append (vector->list x) (list v))))
+      ((json-object? x) (and (object-member? v) (append x (list v))))
+      (else #f)))
+
+  (define (json-insert* x k v)
+    (let ((i (index-of x k)))
+      (if i
+          (list->vector (list-insert-at (vector->list x) i v))
+          (let ((j (and (json-object? x) (member-index x k))))
+            (and j (object-member? v) (list-insert-at x j v))))))
+
+  ;; Transforms what sel selects, leaving the rest. p is called with the key
+  ;; (or index) and the old value. Selecting nothing is not a failure: the
+  ;; container comes back unchanged, having had zero members transformed.
+  (define (json-update* x sel p)
+    (cond
+      ((eq? sel #f) (and (or (json-array? x) (json-object? x)) x))
+      ((json-array? x)
+       (let ((new (vector-copy x)))
+         (let loop ((i 0))
+           (if (fx= i (vector-length x))
+               new
+               (begin
+                 (when (selected? sel i)
+                   (vector-set! new i (p i (vector-ref x i))))
+                 (loop (fx+ i 1)))))))
+      ((json-object? x)
+       (map (lambda (kv)
+              (if (and (pair? kv) (selected? sel (car kv)))
+                  (cons (car kv) (p (car kv) (cdr kv)))
+                  kv))
+            x))
+      (else #f)))
+
+  ;; ---- paths -------------------------------------------------------------
+  ;;
+  ;; TWO LAYERS, AND THE STAR IS THE LOWER ONE. In this library a trailing
+  ;; * means the more primitive layer, as it does in write-json* -- it is
+  ;; NOT an enhanced variant, which is what the trailing star means in much
+  ;; of Scheme. The starred procedures take one locator and can be applied;
+  ;; the macros take a path of literal locators and flatten it into nested
+  ;; calls to them.
+  ;;
+  ;; The macros rebuild on the way out. A write into a path reads down to
+  ;; the innermost container, performs the operation there, and then stores
+  ;; each rebuilt container back into its parent -- so a failure anywhere
+  ;; on the way answers #f for the whole expression, rather than being
+  ;; stored as the value #f in the level above it.
+  ;;
+  ;; EACH LEVEL BINDS ITS CONTAINER AND ITS LOCATOR ONCE, before either
+  ;; pass. That is not tidiness. The two passes are two references to the
+  ;; same two expressions, and evaluating them twice meant the read and
+  ;; the write could reach different objects: a root expression with a
+  ;; side effect handed the second pass a different tree, and the rebuilt
+  ;; subtree was stored into a container it had never been read from.
+  ;; Nothing about that needs a second thread; the expression does it to
+  ;; itself. Any new macro here inherits the requirement.
+  ;;
+  ;; A path is written out at the call site: the elements are spliced at
+  ;; expansion, so their NUMBER is fixed there. Each element is an
+  ;; ordinary expression, evaluated at run time and evaluated EXACTLY
+  ;; ONCE, as is the container. A path whose length is decided at run
+  ;; time is what the starred layer is for.
+  ;;
+  ;; json-ref takes a trailing thunk, the way json-ref* does: if the last
+  ;; argument evaluates to a procedure it is the absent-thunk rather than a
+  ;; locator. The test is on the value, it happens at run time, and it is
+  ;; made only at the end of the path. Nothing else could be meant there,
+  ;; because no procedure is a valid locator -- a locator is a string, a
+  ;; symbol, or an exact non-negative integer. Only json-ref has this; the
+  ;; other macros end in a value, and a value may well be a procedure.
+  ;;
+  ;; The cost is that the SYNTAX no longer fixes the path length: whether
+  ;; (json-ref d "a" k) is a two-step read or a one-step read with a
+  ;; default depends on what k evaluates to, and a reader of that line
+  ;; cannot tell. It is a real cost, accepted because the alternative is
+  ;; that the macro layer cannot express a default at all.
+  ;;
+  ;; The thunk answers for a break at ANY level, not only the last one. A
+  ;; step that locates nothing answers #f, #f is not a container, so every
+  ;; remaining step also locates nothing, and the same final call is the
+  ;; one that runs the thunk. There is no separate not-found path to keep
+  ;; in step with this one.
+
+  (define-syntax json-ref
+    (syntax-rules ()
+      ((_ x) x)
+      ((_ x k) (json-ref* x k))
+      ((_ x k last)
+       (let ((end last))
+         (if (procedure? end)
+             (json-ref* x k end)
+             (json-ref* (json-ref* x k) end))))
+      ((_ x k rest ...) (json-ref (json-ref* x k) rest ...))))
+
+  (define-syntax json-set
+    (syntax-rules ()
+      ((_ x k v) (json-set* x k v))
+      ((_ x k rest ... v)
+       (let ((container x) (locator k))
+         (let* ((inner (json-ref* container locator))
+                (updated (json-set inner rest ... v)))
+           (and updated (json-set* container locator updated)))))))
+
+  (define-syntax json-drop
+    (syntax-rules ()
+      ((_ x sel) (json-drop* x sel))
+      ((_ x k rest ... sel)
+       (let ((container x) (locator k))
+         (let* ((inner (json-ref* container locator))
+                (updated (json-drop inner rest ... sel)))
+           (and updated (json-set* container locator updated)))))))
+
+  (define-syntax json-push
+    (syntax-rules ()
+      ((_ x v) (json-push* x v))
+      ((_ x k rest ... v)
+       (let ((container x) (locator k))
+         (let* ((inner (json-ref* container locator))
+                (updated (json-push inner rest ... v)))
+           (and updated (json-set* container locator updated)))))))
+
+  (define-syntax json-insert
+    (syntax-rules ()
+      ((_ x k v) (json-insert* x k v))
+      ((_ x k rest ... loc v)
+       (let ((container x) (locator k))
+         (let* ((inner (json-ref* container locator))
+                (updated (json-insert inner rest ... loc v)))
+           (and updated (json-set* container locator updated)))))))
+
+  (define-syntax json-update
+    (syntax-rules ()
+      ((_ x sel p) (json-update* x sel p))
+      ((_ x k rest ... sel p)
+       (let ((container x) (locator k))
+         (let* ((inner (json-ref* container locator))
+                (updated (json-update inner rest ... sel p)))
+           (and updated (json-set* container locator updated)))))))
 )

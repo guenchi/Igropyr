@@ -38,7 +38,11 @@
 ;;; jwt-verify have STRING keys ((igropyr json) object convention) --
 ;;; read them with json-ref, which accepts symbols too.
 ;;;
-;;; jwt-sign accepts claims with symbol or string keys. With
+;;; jwt-sign takes claims whose KEYS ARE STRINGS -- the same convention
+;;; the objects it produces use. A symbol key is refused by the writer,
+;;; with a message naming the fix; this procedure does not translate one
+;;; into the other, because a translation layer would make the accepted
+;;; spelling depend on which door a value came through. With
 ;;; '((expires-in . N)) it stamps iat = now and exp = now + N unless
 ;;; the caller already provided them. Registered claims are otherwise
 ;;; the caller's responsibility.
@@ -105,13 +109,9 @@
 
   (define (now-sec) (time-second (current-time)))
 
-  ;; claim lookup tolerating symbol or string keys on the sign side
+  ;; claim lookup: keys are strings on the sign side as everywhere else
   (define (claim-present? claims name)
-    (exists (lambda (kv)
-              (and (pair? kv)
-                   (let ((k (car kv)))
-                     (equal? name (if (symbol? k) (symbol->string k) k)))))
-            claims))
+    (exists (lambda (kv) (and (pair? kv) (equal? name (car kv)))) claims))
 
   ;; ---- sign ----------------------------------------------------------------
 

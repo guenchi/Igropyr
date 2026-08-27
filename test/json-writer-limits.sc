@@ -58,6 +58,7 @@
   (newline))
 (define (ok label) (display "  ok  ") (display label) (newline))
 (define (check label c . info) (if c (ok label) (apply fail label info)))
+(define (shown x) (let ((o (open-output-string))) (write x o) (get-output-string o)))
 
 (define (result thunk)
   (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'json-error))
@@ -219,8 +220,6 @@
              (result (lambda () (json->string (make)))))))
   (list (cons "empty list" (lambda () '()))
         (cons "alist" (lambda () (list (cons "k" "v"))))
-        (cons "alist with symbol keys" (lambda () (list (cons 'k 1))))
-        (cons "plain list" (lambda () (list 1 2 3)))
         (cons "vector" (lambda () (vector 1 2)))
         (cons "empty vector" (lambda () (vector)))
         (cons "string" (lambda () "s"))
@@ -266,13 +265,45 @@
                     "nesting too deep")
        (result (lambda () (json->string (nest-value 2048)))))
 
-;; ---- the boundary, on each of the three descending paths ---------------
-;; The depth counter is incremented at three call sites -- a vector's
-;; elements, an object's values, a list's elements -- and a guard that
-;; reached only two of them would still pass a test that nests vectors.
-;; So each path is walked to the limit and one past it, separately.
-(define (nest-list k)
-  (let loop ((k k) (v 1)) (if (zero? k) v (loop (- k 1) (list v)))))
+;; ---- lists are refused as arrays, with the repair in the message -------
+;; Narrowing arrays to vectors means every plain-list shape that used to
+;; write as an array now refuses, and refuses with the fix spelled out.
+;; The message is pinned exactly: an error that tells the reader what to
+;; do is part of the contract, not decoration.
+(for-each
+  (lambda (entry)
+    (let ((name (car entry)) (make (cdr entry)))
+      (check (string-append "a list is refused as an array, with repair: " name)
+             (refused-as? (result (lambda () (json->string (make))))
+                          "a JSON array is a vector, not a list: use list->vector")
+             (result (lambda () (json->string (make)))))))
+  (list (cons "top-level plain list" (lambda () (list 1 2 3)))
+        (cons "list of strings" (lambda () (list "a" "b")))
+        (cons "as an object's value" (lambda () (list (cons "a" (list "b")))))
+        (cons "nested inside a vector" (lambda () (vector (list 1))))
+        ;; a nested list whose FIRST member is not a pair stays in the
+        ;; array branch; all-pair members route to the object branch and
+        ;; its key message -- that case is pinned separately below
+        (cons "nested lists refuse at the first level" (lambda () (list 1 (list 2))))))
+
+;; THE MISCLASSIFIABLE CORNER, pinned honestly. ((1)) -- every member a
+;; pair, no string key -- cannot say whether its author meant a nested
+;; array or an object; routing it to the key message swapped the false
+;; lead's direction rather than removing it, so the message names BOTH
+;; spellings and guesses neither. This cell pins that whole sentence.
+(check "an all-pair list without string keys gets the key message, both repairs named"
+       (refused-as? (result (lambda () (json->string '(((1))))))
+                    "an object key must be a string, not (1): an object member is (\"k\" . v), a nested array is #(#(...))")
+       (result (lambda () (json->string '(((1)))))))
+
+;; ---- the boundary, on each descending path -----------------------------
+;; The depth counter is incremented where the writer recurses: a vector's
+;; elements and an object's values. (A third site -- a list's elements --
+;; existed until arrays were narrowed to vectors; nested plain lists now
+;; refuse at the first level and never reach the counter, so walking them
+;; proves nothing about it.) A guard reaching only one of the two sites
+;; would still pass a test that nests only vectors, so each is walked to
+;; the limit and one past it, separately.
 (define (nest-alist k)
   (let loop ((k k) (v 1)) (if (zero? k) v (loop (- k 1) (list (cons "k" v))))))
 
@@ -286,7 +317,6 @@
                           "nesting too deep")
              (result (lambda () (json->string (build 1025)))))))
   (list (cons "vectors" nest-value)
-        (cons "lists" nest-list)
         (cons "objects" nest-alist)))
 
 ;; STATE THE UNIT BEFORE QUOTING THE NUMBER. What is counted is
@@ -352,12 +382,13 @@
            (and (pair? r) (eq? (car r) 'returned)))
          (result (lambda () (string->json (deep-obj 64))))))
 
-;; WHAT EACH SCHEME SHAPE BECOMES, asserted as text. The prose in this
-;; batch says an empty list writes as an object, an alist writes as an
-;; object, and any other list writes as an array -- three classification
-;; claims, and until now the only thing checking them was wrote?, which
-;; asks whether a string came back. It cannot tell {} from [] and it
-;; cannot tell an object from an array. These claims belong to this
+;; WHAT EACH SCHEME SHAPE BECOMES, asserted as text. The claims: an
+;; empty list writes as an object, an alist writes as an object, and
+;; any other list REFUSES -- it stopped writing as an array when arrays
+;; narrowed to vectors, and the refusal cells above own that. Until
+;; these cells existed the only check was wrote?, which asks whether a
+;; string came back; it cannot tell {} from [] and cannot tell an
+;; object from an array. These claims belong to this
 ;; batch: the sentence that makes them was rewritten here, and a claim
 ;; is owed a cell by whoever writes it, not by whoever wrote the code.
 (for-each
@@ -369,7 +400,9 @@
   (list (list '() "{}" "the empty list is an object, not an empty array")
         (list '(("a" . 1)) "{\"a\":1}" "a list of string-keyed pairs is an object")
         (list '(("a" . 1) ("b" . 2)) "{\"a\":1,\"b\":2}" "...with every pair present, comma-separated")
-        (list '(1 2 3) "[1,2,3]" "any other list is an array")
+        ;; '(1 2 3) sat here as "any other list is an array" until arrays
+        ;; were narrowed to vectors; its refusal is owned by the repair
+        ;; cells above
         (list (vector 1 2 3) "[1,2,3]" "a vector is an array")
         ;; THE PAIR AND THE TWO-ELEMENT LIST ARE DIFFERENT DOCUMENTS, and
         ;; the difference is one dot. ("a" . #("b")) has the vector as
@@ -381,70 +414,52 @@
         ;; that is exactly the confusion the shape admits.
         (list (list (cons "a" (vector "b"))) "{\"a\":[\"b\"]}"
               "a dotted pair whose value is a vector")
-        (list '(("a" #("b"))) "{\"a\":[[\"b\"]]}"
-              "...and the undotted two-element list is one level deeper")
-        (list '(("a" "b")) "{\"a\":[\"b\"]}"
-              "a two-element list of strings reads as key and one-element array")
         (list '(("a" . "b")) "{\"a\":\"b\"}"
-              "...while the dotted form of the same two strings is a plain value")))
+              "the dotted pair of two strings is a plain value")))
 
-;; ---- the writer is not injective on this family ------------------------
-;; The cells above pin what each shape becomes. This one pins something
-;; stronger and less comfortable: THREE DIFFERENT SCHEME VALUES PRODUCE
-;; THE SAME DOCUMENT. A string key with a vector value, a two-element
-;; list, and a SYMBOL key with a vector value all write as {"a":["b"]}.
-;; (An introduction is read as scene-setting rather than as a claim,
-;; which is how this one once went on describing a shape the cells below
-;; no longer used.)
-;;
-;; The consequence is that json->string cannot be inverted here. Reading
-;; that document back gives the vector form, so exactly one of the three
-;; survives a round trip and the other two come back as something they
-;; were not. Nothing warns; both directions succeed.
+;; THE CONFUSABLE SHAPES NOW REFUSE INSTEAD OF WRITING SOMETHING ELSE.
+;; ("a" #("b")) and ("a" "b") -- the undotted forms, one dot away from
+;; the pairs above -- used to write one level deeper than their authors
+;; expected; the author of THIS file wrote the wrong expectation for one
+;; of them and a reviewer caught the other as a third preimage that was
+;; really a second. Narrowing arrays to vectors turns both mistakes from
+;; silently different documents into refusals with the repair named.
+(for-each
+  (lambda (v)
+    (check (string-append "a one-dot slip now refuses instead of writing: "
+                          (shown v))
+           (refused-as? (result (lambda () (json->string v)))
+                        "a JSON array is a vector, not a list: use list->vector")
+           (result (lambda () (json->string v)))))
+  (list '(("a" #("b"))) '(("a" "b"))))
+
+;; ---- the collision family, and how it was closed -----------------------
+;; This section once pinned an uncomfortable fact: several different
+;; Scheme values produced the same document. Three preimages of
+;; {"a":["b"]} at the worst -- string key with vector, two-element
+;; list, symbol key with vector. Narrowing arrays to vectors refused
+;; the list form; narrowing keys and values to strings refused the
+;; symbol form. What remains is one accepted spelling per document, in
+;; the shape domain. THAT IS NOT A CLAIM THAT THE WRITER IS INJECTIVE
+;; -- the numeric domain still collapses (1/3 and .3333333333333333
+;; write the same text; +inf.0 and +nan.0 both write null), and no cell
+;; here enumerates the whole value domain. The cells below pin the two
+;; closures and keep the one survivor honest.
 ;;
 ;; This is worth separating from the ambiguity on the reading side, which
 ;; is "one document, two readings". This is "several inputs, one
 ;; document" -- and it is the direction our writing about representation
 ;; has not covered, because that writing has always been about readers.
-(let ((as-vector (list (cons "a" (vector "b"))))
-      (as-list   '(("a" "b")))
+(let ((as-string (list (cons "a" (vector "b"))))
       (as-symbol (list (cons 'a (vector "b")))))
-  ;; THE PREIMAGES ARE ASSERTED DISTINCT FIRST, because this cell was
-  ;; once written with three names for two values: (cons "a" (list "b"))
-  ;; IS ("a" "b"), the dot before a list being only another way to write
-  ;; the same pair. The old cell stayed green -- it compared three
-  ;; documents that were equal, and two of the three came from the same
-  ;; input. A collision cell that does not first prove its inputs differ
-  ;; is not a collision cell.
-  (check "the three inputs really are three different values"
-         (and (not (equal? as-vector as-list))
-              (not (equal? as-vector as-symbol))
-              (not (equal? as-list as-symbol)))
-         (list as-vector as-list as-symbol))
-  (check "...and all three write the same document"
-         (let ((a (json->string as-vector))
-               (b (json->string as-list))
-               (c (json->string as-symbol)))
-           (and (string=? a b) (string=? b c) (string=? a "{\"a\":[\"b\"]}")))
-         (list (json->string as-vector) (json->string as-list)
-               (json->string as-symbol)))
-  ;; STATE THE CONSEQUENCE AT THE RIGHT STRENGTH. "Reading it back does
-  ;; not give you what you wrote" is too strong and one example refutes
-  ;; it: exactly one member of the collision class does come back
-  ;; unchanged. What is true is that the DOCUMENT cannot say which
-  ;; preimage it came from, so the others return wearing the survivor's
-  ;; shape. The overstated version would have been demolished by the
-  ;; first cell below; the accurate one is what the cells actually show.
-  (check "one member of the collision class returns unchanged"
-         (equal? as-vector (string->json (json->string as-vector)))
-         (string->json (json->string as-vector)))
-  (check "...and the others come back as that one, not as themselves"
-         (and (not (equal? as-list (string->json (json->string as-list))))
-              (not (equal? as-symbol (string->json (json->string as-symbol))))
-              (equal? as-vector (string->json (json->string as-list)))
-              (equal? as-vector (string->json (json->string as-symbol))))
-         (list 'list (string->json (json->string as-list))
-               'symbol (string->json (json->string as-symbol)))))
+  (check "the string-key form writes, and survives the round trip"
+         (and (string=? "{\"a\":[\"b\"]}" (json->string as-string))
+              (equal? as-string (string->json (json->string as-string))))
+         (json->string as-string))
+  (check "...and the symbol-key form that once collided with it now refuses"
+         (refused-as? (result (lambda () (json->string as-symbol)))
+                      "an object key must be a string, not a: an object member is (\"k\" . v), a nested array is #(#(...))")
+         (result (lambda () (json->string as-symbol)))))
 
 ;; ---- the classifier looks at every entry, not just the first ----------
 ;; Deciding "is this an alist" walks the whole list. Stopping after the
@@ -456,29 +471,43 @@
 ;; different decision point entirely. One assertion was credited to
 ;; both; it owns only the second.
 (check "a list whose first entry looks like a pair but whose second does not is not an object"
+       ;; refused as a list-shaped array now, not as "not a JSON value":
+       ;; failing the alist test routes it to the list branch, and that
+       ;; branch refuses with the repair. The discriminating power is
+       ;; unchanged -- a classifier that stopped at the first entry would
+       ;; call this an object and write it.
        (refused-as? (result (lambda () (json->string '(("a" . 1) 2))))
-                    "not a JSON value")
+                    "a JSON array is a vector, not a list: use list->vector")
        (result (lambda () (json->string '(("a" . 1) 2)))))
 
-;; ---- symbols, by their text ------------------------------------------
-;; wrote? cannot tell "foo" from "null" or from "". These claims are in
-;; this batch's prose, so they are this batch's to own.
-(check "a symbol writes as a string, quoted"
-       (equal? "\"foo\"" (json->string 'foo)) (json->string 'foo))
-(check "...and a symbol key writes as a string key"
-       (equal? "{\"sym\":1}" (json->string '((sym . 1)))) (json->string '((sym . 1))))
+;; ---- symbols refuse, except the one that is a literal ------------------
+;; Symbols used to write as strings, in both positions. Narrowing the
+;; representation to string keys and string values closed that: the only
+;; symbol with a meaning here is 'null, which is not "a symbol as a
+;; value" -- it IS the representation of null. Both refusals carry their
+;; repair, and both messages are pinned whole.
+(check "a symbol value refuses, naming the symbol, told to quote it"
+       (refused-as? (result (lambda () (json->string 'foo)))
+                    "a JSON string is a string, not the symbol foo: quote it")
+       (result (lambda () (json->string 'foo))))
+(check "...a symbol key refuses, naming the key, both repairs shown"
+       (refused-as? (result (lambda () (json->string '((sym . 1)))))
+                    "an object key must be a string, not sym: an object member is (\"k\" . v), a nested array is #(#(...))")
+       (result (lambda () (json->string '((sym . 1))))))
+(check "...and 'null still writes as null"
+       (equal? "null" (json->string 'null)) (json->string 'null))
+(check "...including as a value inside an object"
+       (equal? "{\"a\":null}" (json->string '(("a" . null))))
+       (json->string '(("a" . null))))
 
-;; ---- what the reader gives back is a narrower vocabulary --------------
-;; The prose elsewhere says this reader NEVER produces the shapes the
-;; writer additionally accepts -- arrays as plain lists, symbols as
-;; values, symbols as keys. Nothing asserted any of it, and these three
-;; cells still do not assert "never": they assert what three documents
-;; produced, one per shape. That is a sample, and it is written down as
-;; a sample rather than dressed up, because "never" is a claim about a
-;; reader this file does not enumerate. What the sample is good for is
-;; the reason the claim exists at all: the writer's extra shapes are a
-;; convenience for callers, not a round-trip contract -- and the
-;; non-injectivity cells above show what the difference costs.
+;; ---- the reader's output, sampled against the shared vocabulary --------
+;; The writer's shape vocabulary now equals the reader's output: the
+;; extra spellings it once accepted -- plain-list arrays, symbol values,
+;; symbol keys -- all refuse, and their refusal cells are above. These
+;; three cells pin the reader's side of that equation on three sample
+;; documents. They do not assert "never": a sample says what three
+;; documents produced, and "never" is a claim about a reader this file
+;; does not enumerate.
 (let ((arr (string->json "[1,2]"))
       (obj (string->json "{\"a\":1}"))
       (str (string->json "\"s\"")))

@@ -36,17 +36,17 @@
 
 (app-get app "/json"
   (lambda (req res)
-    (send-json! res (list (cons 'name "igropyr")
-                          (cons 'engine "chez-scheme")
-                          (cons 'io "libuv")
-                          (cons 'workers 8)))))
+    (send-json! res (list (cons "name" "igropyr")
+                          (cons "engine" "chez-scheme")
+                          (cons "io" "libuv")
+                          (cons "workers" 8)))))
 
 (app-get app "/users/:id"
   (lambda (req res)
-    (send-json! res (list (cons 'user (req-param req "id"))
-                          (cons 'q (map (lambda (kv)
-                                          (cons (string->symbol (car kv)) (cdr kv)))
-                                        (req-query req)))))))
+    (send-json! res (list (cons "user" (req-param req "id"))
+                          ;; a query key arrives as a string and stays one:
+                          ;; a JSON object key is a string
+                          (cons "q" (req-query req))))))
 
 (app-post app "/echo"
   (lambda (req res)
@@ -66,12 +66,10 @@
       (if (= (length runs) 1)
           (raise 'first-attempt-crash)
           (send-json! res
-            (list (cons 'attempt (length runs))
-                  (cons 'workers runs)
-                  (cons 'key k)
-                  (cons 'query (map (lambda (kv)
-                                      (cons (string->symbol (car kv)) (cdr kv)))
-                                    (req-query req)))))))))
+            (list (cons "attempt" (length runs))
+                  (cons "workers" runs)
+                  (cons "key" k)
+                  (cons "query" (req-query req))))))))
 
 (app-get app "/crash"
   (lambda (req res)
@@ -104,9 +102,9 @@
              (cons (car kv)
                    (let ((v (cdr kv)))
                      (if (vector? v)
-                         (list (cons 'filename (vector-ref v 1))
-                               (cons 'type (vector-ref v 2))
-                               (cons 'size (bytevector-length (vector-ref v 3))))
+                         (list (cons "filename" (vector-ref v 1))
+                               (cons "type" (vector-ref v 2))
+                               (cons "size" (bytevector-length (vector-ref v 3))))
                          v))))
            (req-form req)))))
 
@@ -132,9 +130,9 @@
   (lambda (req res)
     (let ((j (req-json req)))
       (if j
-          (send-json! res (list (cons 'hello (or (json-ref j "name") 'null))))
+          (send-json! res (list (cons "hello" (or (json-ref j "name") 'null))))
           (begin (set-status! res 400)
-                 (send-json! res (list (cons 'error "invalid json"))))))))
+                 (send-json! res (list (cons "error" "invalid json"))))))))
 
 ;; Server-Sent Events: five ticks, one per 300ms, then done. The stream
 ;; runs in its own process; the pool worker is released immediately.
@@ -212,4 +210,4 @@
       ;; runtime stats: connections, request count, uptime, pool state
       (app-get app "/stats"
         (lambda (req res)
-          (send-json! res (http-stats srv)))))))
+          (send-json! res (http-stats-json srv)))))))

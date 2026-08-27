@@ -181,7 +181,7 @@
             (begin
               (set-status! res 429)
               (set-header! res "Retry-After" (number->string (div window-ms 1000)))
-              (send-json! res (list (cons 'error "rate limit exceeded"))))))))
+              (send-json! res (list (cons "error" "rate limit exceeded"))))))))
 
   ;; ---- global error handler --------------------------------------------
   ;; Wraps the rest of the chain in a guard: an exception from any inner
@@ -216,7 +216,7 @@
   ;; was cut short.
   (define (default-error-response e req res)
     (set-status! res 500)
-    (send-json! res (list (cons 'error "internal server error"))))
+    (send-json! res (list (cons "error" "internal server error"))))
 
   (define (error-handler . rest)
     (let ((handle (opt (if (pair? rest) (car rest) '())

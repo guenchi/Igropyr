@@ -44,9 +44,14 @@
 ;;;     runner stops collecting satisfies THE FIRST THREE invariants above
 ;;;     and reaches none of them. Nor is being collected sufficient -- a
 ;;;     suite can be collected, print that it was reached, and skip past
-;;;     the three assertions before making them. What has to hold is that
-;;;     THE THREE DISCRIMINATING ASSERTIONS ARE EXECUTED AND PASS in a
-;;;     default run. This is not hypothetical -- a suite in this repository
+;;;     those assertions before making them. What has to hold is that ONE
+;;;     DISCRIMINATING ASSERTION PER GUARD IS EXECUTED AND PASSES in a
+;;;     default run. The number is deliberately written as "one per guard"
+;;;     and not as a figure: the guards are below, in this file, and adding
+;;;     one changes the requirement in the same edit that a reader is
+;;;     already making. A figure here would be a count of cells in another
+;;;     file, and nothing in that file's edit path passes through this
+;;;     paragraph. This is not hypothetical -- a suite in this repository
 ;;;     spent its whole life outside the runner before anyone noticed.
 ;;;
 ;;; WHAT THOSE FOUR DO NOT COVER, and it is worth being exact about the
@@ -100,11 +105,16 @@
 ;;; of this library rather than watching it work.
 ;;;
 ;;; SEGMENT 2 IS NOT ONE THING, and saying it is untested was wrong. It
-;;; has FIVE ways through and FOUR are covered by cells that drive the
-;;; real number-text. (An earlier line here said four and three: it
-;;; listed four covered ways and then added a fifth, uncovered one in
-;;; the next paragraph, without going back to the count. Adding a member
-;;; below a total is how a total goes stale.) The covered four:
+;;; has FIVE ways through -- that count is this file's control flow and
+;;; is owned here. HOW MANY OF THEM ARE COVERED IS NOT: that is decided
+;;; by cells in the JSON suites, which change without anyone opening this
+;;; file, so the ways are listed below with the reason each is reachable
+;;; and the coverage question is left to the suites to answer. Never
+;;; restate a coverage count here. (An earlier line did say four and
+;;; three: it listed four covered ways, added a fifth in the next
+;;; paragraph, and never went back to the total. Adding a member below a
+;;; total is how a total goes stale, and the repair is to stop keeping
+;;; the total, not to correct it.) The ways that a cell can drive:
 ;;;   - the grammar fast path -- any ordinary value;
 ;;;   - the repair succeeding -- the subnormals;
 ;;;   - the repair refusing an out-of-domain value -- 1/3, which is not
@@ -135,8 +145,10 @@
 ;;; saying the cells narrow them credits the tests with an activity that
 ;;; is entirely the reviewer's.
 ;;;
-;;; DELETING THIS FILE CANNOT FAIL SILENTLY -- both importers stop compiling
-;;; -- which is not the same as safe. The dangerous edit is quieter: keep the
+;;; DELETING THIS FILE CANNOT FAIL SILENTLY -- an import that does not
+;;; resolve is an immediate non-zero exit, for every importer there is;
+;;; how many there are is a question for the repository, not for this
+;;; line -- which is not the same as safe. The dangerous edit is quieter: keep the
 ;;; helper for the tests, and give production its own inlined copy. The tests
 ;;; then exercise dead code and NOTHING GOES RED.
 ;;;

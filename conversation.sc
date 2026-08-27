@@ -417,7 +417,7 @@
 ;;;                  ;; answered, so nothing re-runs it; the id goes to the
 ;;;                  ;; client (or an operator) to reconcile against
 ;;;                  (set-status! res 409)
-;;;                  (send-json! res `((fault . "uncertain")
+;;;                  (send-json! res `(("fault" . "uncertain")
 ;;;                                    (conv . ,(vector-ref e 1))
 ;;;                                    (resubmit . #f)))))
 ;;;         (conversation-start! flow req))

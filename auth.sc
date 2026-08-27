@@ -88,7 +88,7 @@
   (define (default-auth-fail req res)
     (set-status! res 401)
     (set-header! res "WWW-Authenticate" "Bearer")
-    (send-json! res '((error . "unauthorized"))))
+    (send-json! res '(("error" . "unauthorized"))))
 
   (define (auth verify . rest)
     (unless (procedure? verify)             ; boot-time config error, be loud

@@ -92,13 +92,13 @@
     (set-box! account (- (unbox account) amt))       ; provisional hold
     (guard (e (#t (set-box! account (+ (unbox account) amt))
                   (raise e)))                        ; roll the hold back
-      (let ((req2 (suspend! (list (cons 'step "confirm")
-                                  (cons 'amount amt)))))
+      (let ((req2 (suspend! (list (cons "step" "confirm")
+                                  (cons "amount" amt)))))
         (when crash-on-confirm? (raise 'step-crashed))
         (if (equal? (utf8->string (req-body req2)) "confirm")
-            (list (cons 'done #t) (cons 'balance (unbox account)))
+            (list (cons "done" #t) (cons "balance" (unbox account)))
             (begin (set-box! account (+ (unbox account) amt))
-                   (list (cons 'done #f))))))))
+                   (list (cons "done" #f))))))))
 
 (define app (create-app))
 
@@ -117,8 +117,8 @@
                                          ;; body -- and the body is all that
                                          ;; gets retained
                                          req-body)))
-        (send-json! res (cons (cons 'conv id)
-                              (cons (cons 'token token) reply)))))))
+        (send-json! res (cons (cons "conv" id)
+                              (cons (cons "token" token) reply)))))))
 
 (app-post app "/t/:id"
   (lambda (req res)
@@ -129,23 +129,23 @@
         (cond
           ((conversation-gone? status)
            (set-status! res 410)
-           (send-json! res (list (cons 'fault "gone"))))
+           (send-json! res (list (cons "fault" "gone"))))
           ;; NOT 410. 410 says the transaction rolled back, and this
           ;; answer cannot support that: the conversation is not here and
           ;; this node no longer has a record either way. The one thing a
           ;; client must not do with it is resubmit.
           ((conversation-unknown? status)
            (set-status! res 409)
-           (send-json! res (list (cons 'fault "unknown"))))
+           (send-json! res (list (cons "fault" "unknown"))))
           ((conversation-stale? status)
            (set-status! res 409)
-           (send-json! res (list (cons 'fault "stale"))))
+           (send-json! res (list (cons "fault" "stale"))))
           ((conversation-done? status) (send-json! res r))
-          (else (send-json! res (cons (cons 'token status) r))))))))
+          (else (send-json! res (cons (cons "token" status) r))))))))
 
 (app-get app "/balance"
   (lambda (req res)
-    (send-json! res (list (cons 'balance (unbox account))))))
+    (send-json! res (list (cons "balance" (unbox account))))))
 
 ;; the URL a client builds from what the previous reply handed it
 (define (step-url id token)

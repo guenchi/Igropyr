@@ -193,7 +193,9 @@
 
   (define (now-sec) (time-second (current-time)))
 
-  ;; claims: an alist with symbol or string keys, matching jwt-sign. With
+  ;; claims: an alist WITH STRING KEYS, matching jwt-sign and the objects
+  ;; this library produces. A symbol key is refused by the writer with a
+  ;; message naming the fix, and is not translated here. With
   ;; '((expires-in . N)) it stamps iat = now and exp = now + N unless the
   ;; caller already supplied them; registered claims are otherwise the
   ;; caller's business -- this signs what it is given.
@@ -207,13 +209,13 @@
     (let* ((o (if (pair? rest) (car rest) '()))
            (expires-in (opt o 'expires-in #f))
            (now (now-sec))
-           (has? (lambda (name)
-                   (or (assq (string->symbol name) claims)
-                       (assoc name claims))))
+           (has? (lambda (name) (assoc name claims)))
            (full (append
-                   (if (and expires-in (not (has? "iat"))) `((iat . ,now)) '())
+                   (if (and expires-in (not (has? "iat")))
+                       `(("iat" . ,now))
+                       '())
                    (if (and expires-in (not (has? "exp")))
-                       `((exp . ,(+ now expires-in)))
+                       `(("exp" . ,(+ now expires-in)))
                        '())
                    claims))
            (header (json->string

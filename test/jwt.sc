@@ -40,11 +40,19 @@
 
 ;; ---- round trips -----------------------------------------------------
 
-(define tok (jwt-sign '(("sub" . "42") (role . "admin")) key))
+(define tok (jwt-sign '(("sub" . "42") ("role" . "admin")) key))
 (define claims (jwt-verify tok key))
 (check "round-trip" (and claims
                          (equal? (json-ref claims "sub") "42")
                          (equal? (json-ref claims "role") "admin")))
+;; claims keys are strings now; a symbol key refuses at serialization,
+;; with the object-key message -- pinned whole, repair included
+(check "symbol-key-claims-refused"
+  (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'json-error))
+             (equal? (vector-ref e 1)
+                     "an object key must be a string, not role: an object member is (\"k\" . v), a nested array is #(#(...))")))
+    (jwt-sign '((role . "admin")) key)
+    #f))
 (check "empty-claims-round-trip" (equal? (jwt-verify (jwt-sign '() key) key) '()))
 (check "bytevector-key"
   (let ((k (string->utf8 key)))
@@ -234,7 +242,7 @@
 (app-use app (auth (jwt-verifier key)))
 (app-get app "/me"
   (lambda (req res)
-    (send-json! res (list (cons 'sub (json-ref (req-claims req) "sub"))))))
+    (send-json! res (list (cons "sub" (json-ref (req-claims req) "sub"))))))
 
 (define port2 18087)
 (define app2 (create-app))
@@ -242,7 +250,7 @@
 (app-get app2 "/who"
   (lambda (req res)
     (let ((c (req-claims req)))
-      (send-json! res (list (cons 'sub (if c (json-ref c "sub") "anon")))))))
+      (send-json! res (list (cons "sub" (if c (json-ref c "sub") "anon")))))))
 
 (define (get2 path . headers) (get-on port2 path headers))
 

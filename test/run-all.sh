@@ -133,6 +133,11 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script test/checked-off.sc
 # black-box suite stays green whether they are right, wrong or deleted
 # -- measured, not assumed. That is why (igropyr json-internal) exists
 "$scheme_bin" --script test/json-number-syntax.sc
+# the six verbs, both layers: reads answer #f for "nothing there", writes
+# answer #f for "nothing happened" and leave the tree untouched, selectors
+# belong to the sweeping verbs, the trailing thunk belongs to json-ref
+# only. Each cell owns one ruling from the export comment
+"$scheme_bin" --script test/json-ops.sc
 # every byte in must come back out, checked against the system gzip(1)
 # tool in a separate process. Also the regression for zlib coexistence:
 # with the runtime's embedded zlib and a dlopened libz sharing one

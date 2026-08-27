@@ -97,9 +97,12 @@
     (finish! r "text/plain; charset=utf-8" (as-utf8 s)))
   (define-checked (send-html! (r res?) (s body-data?))
     (finish! r "text/html; charset=utf-8" (as-utf8 s)))
-  ;; serialization comes from (igropyr json): alist -> object,
-  ;; vector or list -> array, 'null -> null. A bytevector is passed
-  ;; through as pre-serialized JSON (define it once at startup).
+  ;; serialization comes from (igropyr json): alist with string keys ->
+  ;; object, vector -> array, 'null -> null. A LIST IS NOT AN ARRAY and a
+  ;; symbol is not a string; both are refused, so a handler that used to
+  ;; hand over either now raises instead of emitting a document. A
+  ;; bytevector is passed through as pre-serialized JSON (define it once
+  ;; at startup).
   (define-checked (send-json! (r res?) obj)
     (finish! r "application/json; charset=utf-8"
              (if (bytevector? obj)
@@ -504,10 +507,10 @@
           (let ((p (assq k info))) (if p (cdr p) d)))
         (set-status! res status)
         (send-json! res
-          (list (cons 'fault (symbol->string (ref 'kind 'crash)))
-                (cons 'attempts (ref 'attempts 1))
-                (cons 'elapsed-ms (ref 'elapsed-ms 0))
-                (cons 'retryable #t))))))
+          (list (cons "fault" (symbol->string (ref 'kind 'crash)))
+                (cons "attempts" (ref 'attempts 1))
+                (cons "elapsed-ms" (ref 'elapsed-ms 0))
+                (cons "retryable" #t))))))
 
   ;; ---- static files -----------------------------------------------------------
 
