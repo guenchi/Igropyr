@@ -1257,7 +1257,7 @@ fully-addressable mesh caps out at a few hundred nodes by nature.
 
 > **Security:** the dist port is full control of the node — anyone on it
 > can message any registered process, including supervisors. The
-> handshake is a mutual HMAC-SHA1 challenge/response on the shared
+> handshake is a mutual HMAC-SHA256 challenge/response on the shared
 > secret, but there is no TLS and the port binds `127.0.0.1` by default.
 > Across machines, keep it on a private network (WireGuard, VPC). For a
 > cluster-wide singleton or leader election, use a system that already
