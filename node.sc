@@ -1765,28 +1765,20 @@
   ;; faster than the retry it replaced counts as the failure it is.
   ;;
   ;; THE BAR IS THE INTERVAL THE PREVIOUS ROUND WAS SET TO WAIT, carried
-  ;; forward as `waited`, rather than a delay recomputed from an attempt
-  ;; number. Recomputing draws fresh jitter: the bar and the wait would be
-  ;; two independent samples of +/-25%, so a link could outlast the
-  ;; interval this node actually waited and still be judged short, by as
-  ;; much as a factor of 1.67 at the extremes. Carrying the number
-  ;; forward removes that particular gap between the two.
+  ;; forward as `waited`.
   ;;
   ;; IT IS A NOMINAL INTERVAL AND NOT A MEASUREMENT, and it is off in
-  ;; BOTH directions -- an earlier version of this paragraph claimed the
-  ;; error was one-sided, and it is not:
-  ;;   - too lax: scheduling and straggler draining can make the real gap
-  ;;     longer than the nominal one, and the comparison still uses the
-  ;;     shorter nominal number, so a link that did not really outlast
-  ;;     the wait can clear the bar;
-  ;;   - too harsh: an inbound link that survives most of the interval
-  ;;     and drops near its end leaves the dial replacing very little
-  ;;     downtime, while the bar is still the whole nominal interval.
-  ;; Both are bounded by the same quantity the backoff is built out of,
-  ;; and neither changes what the bar is for. Measuring the real gap
-  ;; instead would need a second clock reading whose only use is this
-  ;; comparison; that is the trade, stated rather than hidden behind a
-  ;; claim that the number is exact.
+  ;; BOTH directions:
+  ;;   - too harsh, by at most one nominal interval: an inbound link that
+  ;;     survives most of the interval and drops near its end leaves the
+  ;;     dial replacing very little downtime, while the bar is still the
+  ;;     whole of it;
+  ;;   - too lax, WITHOUT BOUND: the deadline stops a straggler from
+  ;;     restarting the wait, but nothing bounds how long after it this
+  ;;     process is next scheduled. Stalled ten minutes past a nominal
+  ;;     six seconds, the next link clears the bar by living six.
+  ;; The lax direction is the one with no ceiling, and it is not bounded
+  ;; by anything the backoff is built out of.
   ;;
   ;; The bar rises with the backoff: each failure lengthens the next wait,
   ;; and that wait is what the peer must then outlast to earn a short
