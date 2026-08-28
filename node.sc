@@ -569,9 +569,13 @@
       (sexpr->string-extended datum)
       (void)))
 
-  ;; SERIALIZING AND SUBMITTING ARE SEPARATE BECAUSE ONLY ONE OF THEM CAN
-  ;; FAIL. frame-segments raises -- the writer refuses the datum, or the
-  ;; frame is over the limit -- and write-body! reports instead. A caller
+  ;; SERIALIZING AND SUBMITTING ARE SEPARATE BECAUSE THEY FAIL
+  ;; DIFFERENTLY. frame-segments raises -- the writer refuses the datum,
+  ;; or the frame is over the limit -- while write-body! reports its
+  ;; submission by returning. (It is not exception-free: two allocating
+  ;; steps sit outside its guard, and it says so where it is defined.
+  ;; What matters here is that the failures a CALLER can act on are the
+  ;; ones this split moves in front of the publication point.) A caller
   ;; that has to
   ;; publish something before it writes (rcall's pending entry,
   ;; monitor-remote's rmonitors entry, both of which must exist before the
@@ -626,12 +630,15 @@
   ;;
   ;; THE FAILURE DOMAIN AFTER A CALLER'S PUBLICATION POINT, written to the
   ;; shape it actually has. frame-segments has already built every byte,
-  ;; so the submission itself can only fail in the OOM domain -- the
+  ;; so nothing is left to serialize; what remains is the submission, and
+  ;; it fails in two quite ordinary ways as well as in the OOM domain --
+  ;; the connection is no longer open by the time the submitting region
+  ;; observes it, or uv_write refuses it outright with a negative errno.
+  ;; Those two report by returning #f already. The OOM cases -- the
   ;; queued path's allocation, and the table entry that publishes its
-  ;; completion. Those are caught below and reported as #f, the same
-  ;; answer a write to a closed connection gives, because a caller that
-  ;; has published state can act on a returned #f and cannot act on an
-  ;; exception.
+  ;; completion -- are caught below and reported the same way, because a
+  ;; caller that has published state can act on a returned #f and cannot
+  ;; act on an exception.
   ;;
   ;; THAT GUARD IS NOT THE WHOLE PROCEDURE, and two things sit outside it:
   ;;   - outbound-charge! runs BEFORE it and allocates (a table entry, and
@@ -639,13 +646,17 @@
   ;;   - close-for-backpressure! runs AFTER it and both allocates
   ;;     (conn-link-pid walks the peers table) and sends.
   ;; An OOM in either still leaves this procedure by raising. The second
-  ;; is the worse of the two and is stated rather than smoothed over: by
-  ;; then the frame HAS been handed to libuv, so the peer may act on it
-  ;; and reply, while this caller sees an exception and its pending entry
-  ;; stays behind -- a reply that arrives later has nothing left to match
-  ;; and remains in the mailbox. All of it is the OOM domain, named here
-  ;; and not mechanised; catching it would mean answering #f for a frame
-  ;; that is already on its way.
+  ;; is the worse of the two and is stated rather than smoothed over:
+  ;; when it is reached after a SUCCESSFUL submission -- which is the
+  ;; usual way to reach it -- the frame is already with libuv, so the
+  ;; peer may act on it and reply, while this caller sees an exception
+  ;; and its pending entry stays behind; a reply arriving later has
+  ;; nothing left to match and remains in the mailbox. (It is also
+  ;; reached after a FAILED submission, when the charge that was refunded
+  ;; still leaves the connection over its ceiling. Nothing was handed to
+  ;; libuv on that path.) Both are named here and not mechanised;
+  ;; catching them would mean answering #f for a frame that may already
+  ;; be on its way.
   ;;
   ;; REFUNDING ONCE IS CORRECT, and the reason lives in libuv.sc rather
   ;; than here, so it is named to be checked: in enqueue-write!
@@ -1215,19 +1226,25 @@
   ;; target side: one process per remote watch. It locally monitors the
   ;; registered process and reports its death back over the link. A
   ;; missing name is an immediate 'noproc. The reason is shipped as-is
-  ;; when wire-safe, else degraded to 'exit -- a monitor must always
-  ;; deliver a DOWN, never wedge on a non-serializable reason.
+  ;; when wire-safe, else degraded to 'exit: a reason that will not
+  ;; serialize must not be allowed to swallow the DOWN, which is what
+  ;; this degradation is for. (It is not a promise that a DOWN always
+  ;; arrives -- see the submission note below for the case where the
+  ;; frame carrying it never goes out.)
   ;; key is (peer . mref); dispatch registered us under it before we ran.
   ;; watcher is that same peer -- the authenticated far end -- and is the
   ;; only node we ever report this DOWN back to.
   ;;
-  ;; IF THE mdown FRAME IS NEVER SUBMITTED -- the OOM domain, see
-  ;; write-body! -- THIS AGENT HAS ALREADY DROPPED ITS STATE AND EXITS,
-  ;; AND THE WATCHER WAITS FOREVER. There is no timeout on that side: a
-  ;; remote monitor ends when its target's node says something or when
-  ;; the link drops, and neither happens here. The same is true of the
-  ;; demon frame in remove-target-watch!, which leaves this side's agent
-  ;; parked until the target dies or the link goes. Both are named as OOM
+  ;; IF THE mdown FRAME IS NEVER SUBMITTED -- see write-body! -- THIS
+  ;; AGENT HAS ALREADY DROPPED ITS STATE AND EXITS, AND NOTHING REPLACES
+  ;; THE DOWN IT WAS CARRYING. The watcher has no timeout of its own, so
+  ;; it waits without bound -- not forever: the wait ends if the link
+  ;; later drops (fail-monitors-for! synthesizes noconnection), if the
+  ;; watching process demonitors, or if it dies. What is gone is the
+  ;; answer this particular death was supposed to produce. The same is
+  ;; true of the demon frame in remove-target-watch!, which leaves this
+  ;; side's agent parked until the target dies or the link goes. Both are
+  ;; named as OOM
   ;; residues rather than mechanised: a retry would need its own queue
   ;; and its own failure domain, on a path that only runs when the
   ;; process is already out of memory.
@@ -2041,20 +2058,46 @@
          (and p (begin (send p msg) #t))))
       ((live-entry node)
        => (lambda (e)
-            ;; #t WHENEVER THERE WAS A LIVE LINK, whether or not the frame
-            ;; reached the socket -- and that is not the lie it looks
-            ;; like. This call is fire-and-forget by contract: delivery is
-            ;; never confirmed, so every caller already has to tolerate
-            ;; "#t and the message was lost". A packet dropped in the
-            ;; network, or a peer that receives and dies before acting,
-            ;; are indistinguishable from a frame that never left this
-            ;; process. Reporting a refused submission as #f would be
-            ;; narrowly more accurate and would break something real:
-            ;; #f means NO LINK, and callers depend on that -- one of
-            ;; them treats it as evidence the node is gone and removes it
-            ;; from its scheduling set, which no node-up will undo while
-            ;; the link is still up. A truer #t is worth less than a
-            ;; theorem the callers rely on.
+            ;; #t WHENEVER THERE WAS A LIVE LINK, whether or not the
+            ;; frame reached the socket -- and the reason is not that the
+            ;; difference does not matter.
+            ;;
+            ;; #f MEANS NO LINK, and callers depend on exactly that. One
+            ;; of them treats #f as evidence the node is gone and drops
+            ;; it from its scheduling set, which no node-up will undo
+            ;; while the link is still up. Overloading #f with "the link
+            ;; is fine but this one frame was refused" breaks that
+            ;; theorem, and a node disappears from a pool over a
+            ;; transient.
+            ;;
+            ;; SO THE INFORMATION IS REAL AND HAS NOWHERE SAFE TO GO. It
+            ;; is worth being precise about which part of the usual
+            ;; argument holds: a caller of a fire-and-forget send must
+            ;; already tolerate a lost message, and cannot distinguish
+            ;; one lost in the network from one lost here. But a message
+            ;; lost in the network is eventually retransmitted or shows
+            ;; up as a failed link, while a submission refused here can
+            ;; leave the link healthy and the frame gone for good. That
+            ;; difference is not visible through this return value.
+            ;;
+            ;; WHICH FAILURES STILL REACH THE CALLER, precisely, because
+            ;; the two are easy to collapse into one: a payload this
+            ;; library cannot serialize still RAISES out of this call
+            ;; (frame-segments refuses it), so a caller that guards
+            ;; rsend still catches that one and can fail the work it
+            ;; belongs to. What has no channel is narrower -- a frame
+            ;; that serialized and was then refused at submission. A
+            ;; caller's guard around rsend is therefore still doing its
+            ;; job for the case it was written for, and silently doing
+            ;; nothing for this one.
+            ;;
+            ;; THIS IS A STATEMENT ABOUT TODAY, NOT AN IMPOSSIBILITY
+            ;; PROOF. The shape a repair takes is a second channel that
+            ;; does not overload #f -- an out-of-band answer to the
+            ;; caller, or a submission result the caller can ask for --
+            ;; so that a refused frame can be reported without claiming
+            ;; the link is down. See the gap ledger for what depends on
+            ;; this.
             (write-frame! (vector-ref e 0) (list 'send reg-name msg))
             #t))
       (else #f)))
