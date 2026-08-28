@@ -1075,6 +1075,92 @@ are masked as RFC 6455 requires).
 
 `wss` is refused — reach TLS-only endpoints through a proxy.
 
+## Design model
+
+Four commitments shape the concurrency and distribution layers. They are
+deliberate: a review comparing this library to Erlang/OTP or Swish will
+find several OTP mechanisms missing, and each absence traces to one of
+these.
+
+1. **Crash-only, with the real supervisor outside the process.** Inside
+   the process: let-it-crash workers, resource reclamation through owner
+   monitors, task-level retry that knows its side effects. At the process
+   level: die loudly and let the service manager (rc.d, `daemon -r`,
+   systemd) restart the whole image. Recovery means rebuilding from
+   durable state, not surgically restarting a subtree in place — so there
+   is no in-process supervision tree, and its absence is a decision, not
+   a gap.
+
+2. **A single scheduler means an in-process supervision tree could not
+   help with the hardest failures anyway.** A supervisor process shares
+   the scheduler with everything it supervises: when the scheduler itself
+   stalls — a foreign call that never returns — the tree stalls with it.
+   The only supervisor that survives that failure class lives outside the
+   process, and it is already there.
+
+3. **The node mesh is a control plane: names, small messages,
+   fail-closed, slow-is-dead.** Registered names cross the wire, pids do
+   not. A protocol confusion closes the connection rather than guessing.
+   A peer that cannot keep up is treated as dead — close and reconnect —
+   never paused: pausing a control link delays heartbeats and monitor
+   traffic, and turns one slow peer into cascading false failures. Bulk
+   data never rides the control link; it gets its own connection.
+
+4. **The mesh is small and fully trusted, and that is a feature.** A
+   shared secret, a full mesh, and a modest node ceiling assume a cluster
+   administered as one unit and upgraded in lockstep. Scaling is
+   processes times machines under that assumption, not a thousand-node
+   substrate.
+
+### Lineage: ChezErlang
+
+Igropyr's actor runtime descends from ChezErlang, a Swish fork, rewritten
+from scratch after the fork collapsed under high-concurrency load. The
+divergence from Swish's design is therefore half philosophy and half scar
+tissue. Four pitfalls were diagnosed and verified on the fork before the
+rewrite:
+
+1. **`receive`'s `after` clause only took effect in first position** — placed
+   after other clauses it silently became a pattern that never matches: a
+   semantic trap with no signal at all.
+2. **The listener was held only weakly** — an accept loop that did not keep it
+   alive by hand was silently collected, and the server died faster the
+   busier it got: the root cause of the high-concurrency collapse.
+3. **A blocking TCP read stalled the calling process** — parsing had to live in
+   a per-connection reader process, or one slow-dripping client wedged the
+   whole server.
+4. **An fd had to be closed exactly once** — including connections that reached
+   EOF without ever carrying data — or fds leaked one-to-one with
+   connections.
+
+Each shaped a rule here, and the rules were checked against the code rather
+than remembered:
+
+1. `after` is **structural, not a pattern**. Its clause is recognised at
+   expansion, and the clause that handles a plain pattern list carries a
+   fender rejecting any list containing `after`. So `after` in a later
+   position matches neither clause and is a compile error — *invalid
+   syntax*, at expansion, not a pattern that quietly never fires.
+2. Listener handles are kept in a strong table whose stated job includes
+   rooting them for the collector. Nothing is required of the accept loop,
+   and the only thing that removes a listener is stopping it on purpose.
+3. Bytes arrive as messages to the connection's owner process, which parks
+   in `receive` — so a read never blocks the caller, and the pitfall is
+   gone. It does **not** follow that a slow peer costs nothing but its own
+   process: delivery *can* be stopped, which closes the kernel's receive
+   window and slows the sender, but stopping it is a call an owner has to
+   make, and the node link does not make it. An owner that consumes more
+   slowly than its peer sends accumulates an unbounded mailbox. The
+   mechanism exists; it is not automatically in force.
+4. Closing is idempotent by construction: the close guard tests the
+   connection's own state and the handle's closing flag, so every path that
+   can reach a close — EOF, error, owner death, explicit close — may call
+   it without closing twice. That is **at most once**, which is the half
+   the guard can prove. Not at least once: EOF and error only deliver a
+   message, and an owner that ignores it leaves the connection open. The
+   node link's own paths do close, so exactly-once holds there; it is not a
+   property of the underlying layer.
+
 ## Fault tolerance semantics
 
 These apply to pooled routes (the default); nothing to configure:

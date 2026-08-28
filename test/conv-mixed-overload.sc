@@ -1,4 +1,11 @@
 #!chezscheme
+;;; RETIRED 2026-08-28 (B1, the wire protocol version) -- out of
+;;; run-all.sh, for the same reason as test/conv-mixed.sc: the pre-v2
+;;; asker this suite runs can no longer join a mesh at all. Kept, not
+;;; deleted; the revival condition is the one in conv-mixed.sc's header
+;;; (the first conversation-protocol change on top of the v2 baseline --
+;;; re-pin old-rev to the last v2 commit before it).
+;;;
 ;;; Mixed-version overload: what a PRE-REFUSAL asker experiences against
 ;;; an owner that refuses -- run against the real old code, not re-derived
 ;;; from reading it.

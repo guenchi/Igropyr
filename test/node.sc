@@ -8,7 +8,8 @@
 ;;;   - rsend to a disconnected node returns #f; to self delivers locally
 
 (import (chezscheme) (igropyr actor) (igropyr libuv)
-        (igropyr node) (igropyr pubsub))
+        (igropyr node) (igropyr pubsub)
+        (only (igropyr crypto) hmac-sha256 bytevector->hex))
 
 ;; The run may be using `chez` or $SCHEME_BIN rather than `scheme`, and a
 ;; child started with the wrong name simply never appears -- which this
@@ -30,6 +31,84 @@
   (system (string-append
             scheme-bin " --script igropyr/test/node-child.sc "
             name " " (number->string port) " " secret " &")))
+
+;; ---- raw handshake probe helpers ---------------------------------------
+;; The adversarial cells below speak the wire by hand, and they encode
+;; only what must FAIL. The one acceptance path -- two current nodes --
+;; is the real child handshake later in this suite, so the current proof
+;; formula is deliberately NOT duplicated here: probe proofs use the
+;; PRE-VERSIONING formula (nonce:name), exactly what a current peer has
+;; to refuse.
+
+(define (frame-bytes datum)
+  (let ((o (open-output-string)))
+    (write datum o)
+    (let ((body (get-output-string o)))
+      ;; handshake datums are ASCII: string length = byte length
+      (string->utf8 (string-append (number->string (string-length body))
+                                   "\n" body)))))
+
+(define (pre-versioning-proof nonce name)
+  (bytevector->hex
+    (hmac-sha256 (string->utf8 secret)
+      (string->utf8 (string-append nonce ":" (symbol->string name))))))
+
+;; accumulate tcp-data on the CURRENT process until one whole frame
+;; parses; fail on timeout. A close is reported as 'closed only when NO
+;; bytes preceded it -- a refusal that dribbles partial output before
+;; closing is not the silent close the spec asks for, and collapsing the
+;; two would let it pass.
+(define (read-frame-or-closed label)
+  (let loop ((acc ""))
+    (let* ((n (string-length acc))
+           (nl (let scan ((k 0))
+                 (cond ((= k n) #f)
+                       ((char=? (string-ref acc k) #\newline) k)
+                       (else (scan (+ k 1))))))
+           (len (and nl (string->number (substring acc 0 nl)))))
+      (if (and len (>= n (+ nl 1 len)))
+          (read (open-input-string (substring acc (+ nl 1) (+ nl 1 len))))
+          (receive (after 4000 (fail! label 'frame-timeout acc))
+            (`#(tcp-data ,bv) (loop (string-append acc (utf8->string bv))))
+            (`#(tcp-eof)
+              (if (zero? (string-length acc)) 'closed 'closed-with-bytes))
+            (`#(tcp-error ,_)
+              (if (zero? (string-length acc)) 'closed 'closed-with-bytes)))))))
+
+;; the CURRENT proof formula, and its anchor. The digest below is a
+;; literal computed by an INDEPENDENT implementation (python hmac) over
+;; the exact bytes "0123456789abcdef0123456789abcdef:a:2" with the key
+;; "test-mesh-secret". Without it, every proof cell would only show that
+;; the library agrees with itself (or with this helper) -- both sides of
+;; such a comparison can drift together. If THIS check fails, the test
+;; helper diverged, not the library.
+(define (versioned-proof nonce name v)
+  (bytevector->hex
+    (hmac-sha256 (string->utf8 secret)
+      (string->utf8 (string-append nonce ":" (symbol->string name)
+                                   ":" (number->string v))))))
+;; A nonce carrying the separator: 32 characters, correct alphabet, ONE
+;; colon, so a refusal can only be about injectivity, not length. Purity
+;; by construction, not by ordering: the arity and version gates happen
+;; to run before the nonce gate today, which keeps the other cells
+;; discriminating -- but only until someone reorders the checks, and the
+;; day that happens nothing goes red, the cells just quietly start
+;; refusing for the new reason. (Counted, not eyeballed: 16 + 1 + 15. An
+;; earlier spelling was 31 characters, which let the length gate refuse
+;; it -- a pass for a build with no colon check at all.)
+(define colon-nonce "0123456789abcdef:123456789abcdef")
+(define kat-nonce "0123456789abcdef0123456789abcdef")
+(define kat-hello-proof
+  "6dce4923ad94cc2b347c9872217cd026328c9733e924a29506ada60f46621b99")
+(unless (equal? (versioned-proof kat-nonce 'a 2) kat-hello-proof)
+  (fail! "versioned-proof-helper-diverged-from-known-answer"))
+
+(define (has-substr? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i m) n) #f)
+            ((string=? (substring s i (+ i m)) sub) #t)
+            (else (loop (+ i 1)))))))
 
 (start-scheduler
   (lambda ()
@@ -119,6 +198,389 @@
     ;; back to a ceiling that cannot interfere with the real handshakes below
     (node-set-limits! #f #f 256)
     (display "pre-auth connection ceiling ok\n")
+
+    ;; ---- dead watchers on a quiet name ----------------------------------
+    ;; notify! sweeps dead watcher pids when an event for that name fires;
+    ;; a name that never has an event never runs that sweep, so a watcher
+    ;; that died under a quiet name was retained forever. Registration is
+    ;; the other moment the list is in hand: monitor-node must sweep it
+    ;; there. 'ghost never connects, so nothing here is cleaned by events.
+    (let ((watcher-count
+            (lambda ()
+              (let ((e (assq 'watchers (node-monitor-stats))))
+                (unless e (fail! "node-monitor-stats-lacks-watchers"))
+                (cdr e))))
+          (me self))
+      (define (expect! n label)
+        (let ((w (watcher-count)))
+          (unless (= w n) (fail! label n w))))
+      (let* ((w0 (watcher-count))
+             (p (spawn (lambda ()
+                         (monitor-node 'ghost)
+                         (send me (vector 'ghost-armed))
+                         (receive (after 10000 'done))))))
+        (receive (after 2000 (fail! "ghost-watcher-arm-timeout"))
+          (`#(ghost-armed) 'ok))
+        (expect! (+ w0 1) "ghost-watcher-not-counted")
+        (kill p 'gone)
+        (sleep-ms 50)
+        ;; the dead pid is STILL stored and still counted: the statistic
+        ;; reports stored watchers, not live ones. This reading is also
+        ;; the documented residual itself -- death alone, on a quiet
+        ;; name, cleans nothing.
+        (expect! (+ w0 1) "watcher-stats-filters-dead-pids")
+        ;; the registration-time sweep: adding a live watcher for the same
+        ;; quiet name must drop the dead one in the same motion
+        (monitor-node 'ghost)
+        (expect! (+ w0 1) "dead-watcher-retained-on-quiet-name")
+        ;; a SECOND live watcher on the same name must raise the count:
+        ;; a statistic that counts names instead of stored pids stays
+        ;; flat here, and every earlier delta in this cell happened to
+        ;; move name-count and pid-count together
+        (let ((q (spawn (lambda ()
+                          (monitor-node 'ghost)
+                          (send me (vector 'q-armed))
+                          (receive (`#(q-done)
+                                     (demonitor-node 'ghost)
+                                     (send me (vector 'q-cleared))))))))
+          (receive (after 2000 (fail! "second-watcher-arm-timeout"))
+            (`#(q-armed) 'ok))
+          (expect! (+ w0 2) "watcher-stats-counts-names-not-pids")
+          (send q (vector 'q-done))
+          (receive (after 2000 (fail! "second-watcher-clear-timeout"))
+            (`#(q-cleared) 'ok))
+          (expect! (+ w0 1) "demonitor-removed-wrong-entry")
+          (demonitor-node 'ghost)
+          (expect! w0 "main-demonitor-not-accounted")))
+      ;; The bound is PER NAME, and saying so is the point. A sweep runs
+      ;; only for the name being registered, so N quiet names that each
+      ;; saw one dead watcher retain N entries -- never more than one per
+      ;; name, and no name reachable by events retains any. This cell
+      ;; pins the real shape so the prose beside the table cannot drift
+      ;; back into claiming a global bound.
+      (let ((w0 (watcher-count)) (me self))
+        (do ((i 0 (+ i 1))) ((= i 5))
+          (let ((nm (string->symbol
+                      (string-append "quiet-" (number->string i)))))
+            (let ((p (spawn (lambda ()
+                              (monitor-node nm)
+                              (send me (vector 'armed))
+                              (receive (after 10000 'done))))))
+              (receive (after 2000 (fail! "quiet-name-arm-timeout" i))
+                (`#(armed) 'ok))
+              (kill p 'gone))))
+        (sleep-ms 100)
+        (let ((w (watcher-count)))
+          (unless (= w (+ w0 5))
+            (fail! "per-name-retention-shape" (+ w0 5) w)))))
+    (display "dead watcher swept at registration; bound is per name ok\n")
+
+    ;; ---- protocol version in the handshake ------------------------------
+    ;; The wire carries a protocol version in challenge and hello. It is
+    ;; checked before the proof, so a refusal can name the real cause,
+    ;; and it is bound INTO the proof, so the explicit field cannot be
+    ;; tampered with independently. Four refusal cells; acceptance is the
+    ;; real child handshake later in this file.
+
+    ;; accept side. A 4-element hello with a correct PRE-VERSIONING proof
+    ;; must be refused without a welcome (red before the change: it
+    ;; authenticated). A 5-element hello whose proof was computed WITHOUT
+    ;; the version owns the proof BINDING: a build that only checks the
+    ;; explicit field answers it with welcome.
+    (let ((probe-hello!
+            (lambda (label hello-of-nonce)
+              (let ((me self) (ref (gensym)))
+                (spawn
+                  (lambda ()
+                    (tcp-connect! "127.0.0.1" port self)
+                    (receive (after 3000 (send me (vector ref 'no-connect)))
+                      (`#(tcp-connected ,c)
+                        (tcp-read-start! c)
+                        (let ((d (read-frame-or-closed label)))
+                          (if (or (not (pair? d))
+                                  (null? (cdr d)) (not (string? (cadr d))))
+                              (send me (vector ref 'bad-challenge))
+                              (begin
+                                (tcp-write! c (frame-bytes
+                                                (hello-of-nonce (cadr d))) #f)
+                                (let ((d2 (read-frame-or-closed label)))
+                                  (send me (vector ref
+                                             (if (symbol? d2) d2 'welcomed)))))))
+                        (tcp-close! c))
+                      (`#(tcp-connect-failed ,e)
+                        (send me (vector ref 'no-connect))))))
+                (receive (after 8000 (fail! label 'probe-timeout))
+                  (`#(,@ref ,what)
+                    (unless (eq? what 'closed) (fail! label what)))))))
+          ;; nonce-b spelled at the length real nodes use, so a refusal
+          ;; can only be ABOUT the property under test -- an accidental
+          ;; nonce-length requirement would otherwise refuse these for
+          ;; the wrong reason and read as a pass
+          (nb32 "cafecafecafecafecafecafecafecafe"))
+      (probe-hello! "acceptor-answers-unversioned-hello"
+        (lambda (nonce)
+          (list 'hello 'relic (pre-versioning-proof nonce 'relic) nb32)))
+      (probe-hello! "acceptor-accepts-proof-not-binding-version"
+        (lambda (nonce)
+          (list 'hello 'relic2 (pre-versioning-proof nonce 'relic2)
+                nb32 2)))
+      ;; version slot 999 with a proof that IS valid for version 2: an
+      ;; acceptor that skips the explicit hello-version check but does
+      ;; verify the bound proof would welcome this one
+      (probe-hello! "acceptor-ignores-hello-version"
+        (lambda (nonce)
+          (list 'hello 'relic3 (versioned-proof nonce 'relic3 2)
+                nb32 999)))
+      ;; the acceptor's end of the injectivity rule, both halves.
+      ;; A nonce-b carrying the separator is what the attacker WOULD
+      ;; sign next; a name carrying it is what the attacker CLAIMS.
+      ;; Note the second one's proof is genuinely correct for the
+      ;; string it hashes -- refusing it cannot come from the proof
+      ;; check, only from the name.
+      (probe-hello! "acceptor-signs-structured-nonce-b"
+        (lambda (nonce)
+          (list 'hello 'relic4 (versioned-proof nonce 'relic4 2)
+                colon-nonce 2)))
+      (probe-hello! "acceptor-admits-colon-in-claimed-name"
+        (lambda (nonce)
+          (list 'hello (string->symbol "evil:a")
+                (versioned-proof nonce (string->symbol "evil:a") 2)
+                nb32 2))))
+    (display "acceptor refuses unversioned/unbound/mislabeled hello ok\n")
+
+    ;; ---- the positive path, spoken by hand ------------------------------
+    ;; A fake dialer that implements the SPECIFIED dialect (anchored to
+    ;; the known-answer digest above) must be accepted, and the welcome
+    ;; must be the exact three-element frame whose proof binds the
+    ;; version. The real-child handshake later in this suite only shows
+    ;; that two copies of the implementation agree with each other; this
+    ;; cell is what ties the shared dialect to the specified one.
+    (let ((me self) (ref (gensym))
+          (nb32 "beefbeefbeefbeefbeefbeefbeefbeef"))
+      (spawn
+        (lambda ()
+          (tcp-connect! "127.0.0.1" port self)
+          (receive (after 3000 (send me (vector ref 'no-connect)))
+            (`#(tcp-connected ,c)
+              (tcp-read-start! c)
+              (let ((d (read-frame-or-closed "wirepeer-challenge")))
+                (cond
+                  ((not (and (list? d) (= (length d) 3)))
+                   (send me (vector ref 'challenge-shape)))
+                  ((not (eq? (car d) 'challenge))
+                   (send me (vector ref 'challenge-tag)))
+                  ((not (string? (cadr d)))
+                   (send me (vector ref 'challenge-nonce-not-string)))
+                  ((not (eqv? (caddr d) 2))
+                   (send me (vector ref 'challenge-version)))
+                  (else
+                   (tcp-write! c (frame-bytes
+                                   (list 'hello 'wirepeer
+                                         (versioned-proof (cadr d) 'wirepeer 2)
+                                         nb32 2))
+                               #f)
+                   (let ((w (read-frame-or-closed "wirepeer-welcome")))
+                     (send me (vector ref
+                       (cond ((symbol? w) w)   ; closed / closed-with-bytes
+                             ((not (and (list? w) (= (length w) 3)))
+                              'welcome-shape)
+                             ((not (eq? (car w) 'welcome)) 'welcome-tag)
+                             ((not (eq? (cadr w) 'a)) 'welcome-name)
+                             ((not (equal? (caddr w)
+                                           (versioned-proof nb32 'a 2)))
+                              'welcome-proof-not-bound)
+                             (else 'good))))))))
+              (tcp-close! c))
+            (`#(tcp-connect-failed ,e) (send me (vector ref 'no-connect))))))
+      (receive (after 8000 (fail! "wirepeer-interop" 'probe-timeout))
+        (`#(,@ref ,what)
+          (unless (eq? what 'good) (fail! "wirepeer-interop" what)))))
+    (display "specified dialect accepted end to end ok\n")
+
+    ;; dial side. A challenge with no version slot must be refused
+    ;; WITHOUT answering (red before the change: the dialer sent hello).
+    ;; A mismatched version must also be a close -- green before the
+    ;; change too (the old arity check refused it); it exists to stay
+    ;; red-capable AFTER the arity moves to 3, when version equality is
+    ;; the only thing left refusing it.
+    (let ((round (box #f)) (me self))
+      (define fake-port 18085)
+      (define l
+        (tcp-listen! "127.0.0.1" fake-port 16
+          (lambda (c)
+            (let ((pid (spawn
+                         (lambda ()
+                           (let ((tag (unbox round)))
+                             (define (await-close!)
+                               (receive (after 4000
+                                          (send me (vector 'fake tag 'timeout)))
+                                 (`#(tcp-data ,_)
+                                   (send me (vector 'fake tag 'answered)))
+                                 (`#(tcp-eof) (send me (vector 'fake tag 'closed)))
+                                 (`#(tcp-error ,_)
+                                   (send me (vector 'fake tag 'closed)))))
+                             (case tag
+                               ((legacy v999 v1 badnonce colon-nonce upper-nonce)
+                                (tcp-write! c (frame-bytes
+                                                (case tag
+                                                  ((legacy) (list 'challenge "aaaabbbb"))
+                                                  ((v999) (list 'challenge "aaaabbbb" 999))
+                                                  ((v1) (list 'challenge "aaaabbbb" 1))
+                                                  ((colon-nonce)
+                                                   (list 'challenge colon-nonce 2))
+                                                  ((upper-nonce)
+                                                   ;; 32 hex digits, but UPPERCASE.
+                                                   ;; Injectivity does not require
+                                                   ;; refusing it -- uppercase has no
+                                                   ;; colon, so it makes no HMAC
+                                                   ;; alias. This refusal is a
+                                                   ;; DELIBERATE narrowing, and it is
+                                                   ;; legitimate only because "32
+                                                   ;; lowercase hex" is NORMATIVE
+                                                   ;; wire syntax, not an accident of
+                                                   ;; what we emit: under lockstep,
+                                                   ;; exact-match wire (version,
+                                                   ;; shape, and now nonce alphabet),
+                                                   ;; there is no third-party sender
+                                                   ;; to lock out -- a peer that
+                                                   ;; sent uppercase would be a
+                                                   ;; different protocol, refused the
+                                                   ;; way a wrong version is. The
+                                                   ;; normative spelling is pinned in
+                                                   ;; the wire doc, not just here;
+                                                   ;; this cell is what turns red if
+                                                   ;; someone widens the gate to "any
+                                                   ;; colon-free string" with nothing
+                                                   ;; else to say the margin shrank.
+                                                   (list 'challenge
+                                                         "0123456789ABCDEF0123456789ABCDEF"
+                                                         2))
+                                                  (else (list 'challenge 123 2))))
+                                            #f)
+                                (await-close!))
+                               ((kat)
+                                ;; the dialer's OWN hello, held against the
+                                ;; known answer: the proof must be the
+                                ;; literal digest, the name its node name,
+                                ;; the frame exactly five long, version 2
+                                (tcp-write! c (frame-bytes
+                                                (list 'challenge kat-nonce 2))
+                                            #f)
+                                (let ((d (read-frame-or-closed "kat-hello")))
+                                  (send me (vector 'fake tag
+                                    (cond ((symbol? d) d)
+                                          ((not (and (list? d) (= (length d) 5)))
+                                           'hello-shape)
+                                          ((not (eq? (car d) 'hello)) 'hello-tag)
+                                          ((not (eq? (cadr d) 'a)) 'hello-name)
+                                          ((not (equal? (caddr d) kat-hello-proof))
+                                           'hello-proof-off-spec)
+                                          ((not (string? (cadddr d)))
+                                           'hello-nonce-b)
+                                          ((not (eqv? (car (cddddr d)) 2))
+                                           'hello-version)
+                                          (else 'good))))))
+                               ((unbound-welcome)
+                                ;; speak the CURRENT protocol right up to the
+                                ;; last frame, then bind nothing: the welcome
+                                ;; proof uses the pre-versioning formula. The
+                                ;; dialer must refuse it -- a build whose
+                                ;; welcome check does not bind the version
+                                ;; accepts and keeps the link open (timeout
+                                ;; here), which is the red this cell owns.
+                                ;; a compliant nonce: this fixture tests
+                                ;; the welcome-proof binding, so the dialer
+                                ;; must get PAST the nonce gate and send a
+                                ;; hello. A short nonce here would be
+                                ;; refused before that and the cell would
+                                ;; never reach what it exists to check.
+                                (tcp-write! c (frame-bytes
+                                                (list 'challenge kat-nonce 2))
+                                            #f)
+                                (let ((d (read-frame-or-closed
+                                           "unbound-welcome-hello")))
+                                  (if (or (eq? d 'closed) (not (pair? d))
+                                          (< (length d) 4))
+                                      (send me (vector 'fake tag 'no-hello))
+                                      (begin
+                                        (tcp-write! c
+                                          (frame-bytes
+                                            (list 'welcome 'z3
+                                              (pre-versioning-proof
+                                                (cadddr d) 'z3)))
+                                          #f)
+                                        (await-close!))))))
+                             (tcp-close! c))))))
+              (conn-set-owner! c pid)
+              (tcp-read-start! c)))))
+      (define (expect-round! tag peer label wanted)
+        (set-box! round tag)
+        (node-connect! peer "127.0.0.1" fake-port)
+        (let wait ()
+          (receive (after 8000 (fail! label 'no-outcome))
+            (`#(fake ,t ,what)
+              (if (eq? t tag)
+                  (unless (eq? what wanted) (fail! label what))
+                  (wait)))))               ; straggler from another round
+        (node-disconnect! peer))
+      ;; The two version refusals must SPEAK. A dialer retries a
+      ;; configured peer forever, so a refusal it never mentions is an
+      ;; outage with no author: capture stderr across both rounds -- the
+      ;; legacy line must name the pre-versioning peer, the mismatch
+      ;; line both versions. Swapping the global error port is safe
+      ;; here; nothing else in this window writes to it.
+      (define errbuf (open-output-string))
+      (let ((old (current-error-port)))
+        (current-error-port errbuf)
+        (expect-round! 'legacy 'z "dialer-answers-unversioned-challenge" 'closed)
+        (expect-round! 'v999 'z2 "dialer-accepts-alien-version" 'closed)
+        (sleep-ms 100)
+        (current-error-port old))
+      (let ((txt (get-output-string errbuf)))
+        (unless (has-substr? txt "pre-2")
+          (fail! "dial-refusal-silent-on-legacy-peer" txt))
+        (unless (and (has-substr? txt "z2") (has-substr? txt "999"))
+          (fail! "dial-refusal-silent-on-version-mismatch" txt)))
+      ;; ---- the proof concatenation must be injective ------------------
+      ;; hmac input is nonce:name:version. If a RECEIVED nonce may carry
+      ;; a colon, the field boundary is ambiguous and the digest of an
+      ;; honest node can be replayed under another name: feeding node a
+      ;; the nonce "X:evil" yields HMAC(secret, "X:evil:a:2"), which is
+      ;; byte-identical to what an attacker calling itself evil:a owes
+      ;; for the real nonce "X". Measured, not argued -- both sides are
+      ;; f987cbdb... for secret "test-mesh-secret".
+      ;;
+      ;; The load-bearing fix is at the RECEIVING end of each nonce: a
+      ;; nonce that is not exactly 32 lowercase hex digits is refused
+      ;; before it can be signed. This cell owns the dialer's end -- a
+      ;; dialer that signs a structured nonce hands the attacker the
+      ;; oracle, so the refusal must happen BEFORE any hello goes out.
+      (expect-round! 'colon-nonce 'z8 "dialer-signs-structured-nonce" 'closed)
+      (expect-round! 'upper-nonce 'z9 "dialer-accepts-uppercase-hex-nonce" 'closed)
+      (expect-round! 'v1 'z4 "dialer-accepts-version-1" 'closed)
+      (expect-round! 'badnonce 'z5 "dialer-accepts-nonstring-nonce" 'closed)
+      (expect-round! 'unbound-welcome 'z3
+                     "dialer-accepts-unbound-welcome-proof" 'closed)
+      (expect-round! 'kat 'z6 "dialer-hello-off-spec" 'good)
+      ;; A diagnostic that raises must not take the CLOSE with it. The
+      ;; report runs on the way past a guard whose next clause swallows
+      ;; everything so the connector can retry -- so a raise inside it
+      ;; is invisible AND skips the tcp-close! that follows, leaking one
+      ;; connection per retry, forever. Judged from the far end: the
+      ;; fake acceptor sees EOF if the close happened, and times out if
+      ;; it did not. (The port is unusable for the width of this round;
+      ;; anything else printing here would raise too. The window is
+      ;; narrow and nothing else in this suite prints.)
+      (let ((old (current-error-port)))
+        (current-error-port
+          (make-custom-textual-output-port "exploding"
+            (lambda (str start count) (raise 'diagnostic-exploded))
+            #f #f (lambda () (void))))
+        (guard (e (#t (current-error-port old) (raise e)))
+          (expect-round! 'v999 'z7 "close-lost-when-diagnostic-raises" 'closed))
+        (current-error-port old))
+      (tcp-stop-listen! l))
+    (display "dialer wire dialect pinned ok\n")
 
     ;; rsend to an unknown node: #f, no crash
     (unless (eq? #f (rsend 'nowhere 'svc 'x))

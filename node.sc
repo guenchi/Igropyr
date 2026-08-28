@@ -30,14 +30,67 @@
 ;;; Handshake (before anything else): mutual HMAC-SHA256 challenge/response
 ;;; on a shared secret. The secret itself never crosses the wire and a
 ;;; recorded proof cannot be replayed against a fresh nonce:
-;;;   acceptor -> (challenge <nonce-a>)
-;;;   dialer   -> (hello <name> <hmac(secret, nonce-a:name)> <nonce-b>)
-;;;   acceptor -> (welcome <name> <hmac(secret, nonce-b:name)>)
+;;;   acceptor -> (challenge <nonce-a> <version>)
+;;;   dialer   -> (hello <name> <hmac(secret, nonce-a:name:version)>
+;;;                      <nonce-b> <version>)
+;;;   acceptor -> (welcome <name> <hmac(secret, nonce-b:name:version)>)
+;;;
+;;; A NONCE IS EXACTLY 32 LOWERCASE HEXADECIMAL DIGITS. That is wire
+;;; syntax, not a description of what this implementation happens to mint:
+;;; a peer sending 32 uppercase digits is refused, in both nonce
+;;; positions. The narrowing is only legitimate BECAUSE it is written here
+;;; -- a rule that lived solely in the code would be an accident from the
+;;; outside -- and it is affordable because this wire has no third-party
+;;; senders: the mesh is exact-match and upgrades in lockstep, so a peer
+;;; spelling nonces differently is another protocol, refused the way a
+;;; different version is. A name is a symbol the writer can serialise,
+;;; containing no colon.
+;;;
+;;; The version is STATED in those first two frames -- not negotiated, and
+;;; there is no fallback: both ends require strict equality with one
+;;; compiled constant. It is bound into
+;;; both proofs, so the field cannot be edited on its own; welcome needs no
+;;; version slot because by then both ends have stated and agreed one. THIS
+;;; IS A BREAKING WIRE CHANGE: the pre-versioning handshake (challenge of
+;;; 2, hello of 4) is refused in both directions. It was made while this
+;;; layer carried no production traffic, and from here every wire evolution
+;;; goes through the version rather than through a shape that older nodes
+;;; can only read as garbage. Mismatches are refused with a reason on the
+;;; dial side, silently on the accept side -- see protocol-version.
 ;;;
 ;;; SECURITY: the dist port is FULL CONTROL of the node -- anyone on it
 ;;; can message any registered process, including supervisors. The
 ;;; listener binds 127.0.0.1 unless told otherwise, and there is no TLS:
 ;;; across machines, keep it on a private network (WireGuard, VPC).
+;;;
+;;; ---- Design model ----------------------------------------------------
+;;;
+;;; Four commitments shape the concurrency and distribution layers. They
+;;; are deliberate: a review comparing this library to Erlang/OTP or Swish
+;;; will find several OTP mechanisms missing, and each absence traces to
+;;; one of these. Two of them are this file's own, and are given in full;
+;;; the other two live in (igropyr otp) and are summarised here.
+;;;
+;;; 3. THE NODE MESH IS A CONTROL PLANE: names, small messages,
+;;;    fail-closed, slow-is-dead. Registered names cross the wire, pids do
+;;;    not. A protocol confusion closes the connection rather than guessing.
+;;;    A peer that cannot keep up is treated as dead -- close and reconnect
+;;;    -- never paused: pausing a control link delays heartbeats and
+;;;    monitor traffic, and turns one slow peer into cascading false
+;;;    failures. Bulk data never rides the control link; it gets its own
+;;;    connection.
+;;;
+;;; 4. THE MESH IS SMALL AND FULLY TRUSTED, AND THAT IS A FEATURE. A shared
+;;;    secret, a full mesh, and a modest node ceiling assume a cluster
+;;;    administered as one unit and upgraded in lockstep. Scaling is
+;;;    processes times machines under that assumption, not a thousand-node
+;;;    substrate.
+;;;
+;;; 1 and 2, in one line each: the failure model is crash-only and the real
+;;; supervisor is the service manager outside the process; and a single
+;;; scheduler means an in-process supervision tree could not survive the
+;;; hardest failure class anyway, since it shares the scheduler with
+;;; everything it supervises. See (igropyr otp) for both in full.
 ;;;
 ;;; Duplicate connections (both sides dialing at once) are resolved
 ;;; deterministically: the connection whose DIALER has the smaller node
@@ -55,13 +108,31 @@
 
   (define max-frame 8388608)        ; 8 MiB per datum, once authenticated
   ;; Pre-auth, an unauthenticated peer may only send this many bytes per
-  ;; frame. The handshake datums -- (challenge n), (hello name proof n),
+  ;; frame. The handshake datums -- (challenge n v), (hello name proof n v),
   ;; (welcome name proof) -- are a few hundred bytes; 4 KiB is generous.
   ;; This is the hard cap on how much attacker-chosen input reaches the
   ;; parser before the HMAC is verified, so a stranger cannot make the
   ;; node parse (allocate lists for, intern symbols from, build
   ;; bytevectors out of) a multi-megabyte datum.
   (define handshake-max-frame 4096)
+
+  ;; THE WIRE PROTOCOL VERSION. Everything on this link is fail-closed by
+  ;; design -- an unknown frame shape drops the connection -- which means a
+  ;; peer running older code cannot be told anything, it can only be
+  ;; confused. So the version is STATED in the first two frames, before
+  ;; there is anything to be confused about, and a mismatch is refused with
+  ;; a reason instead of read as a malformed frame. Stated, not negotiated:
+  ;; there is no selection and no fallback, only strict equality against
+  ;; this one constant. Two nodes either share it or do not connect.
+  ;;
+  ;; THIS IS A BREAKING WIRE CHANGE. A node speaking the pre-versioning
+  ;; handshake (challenge of 2, hello of 4) cannot talk to this one, in
+  ;; either direction. It was made while the distributed layer carried no
+  ;; production traffic, which is the only moment such a change is free;
+  ;; from here on every wire evolution goes through this number, and the
+  ;; unversioned wire is version 1 by convention only -- it never carried
+  ;; the field, so nothing can be negotiated with it.
+  (define protocol-version 2)
   (define handshake-timeout-ms 5000)
   (define tick-ms 15000)            ; heartbeat interval
   (define dead-ms 60000)            ; silence longer than this = dead link
@@ -189,15 +260,57 @@
       (list (cons 'rmonitors (hashtable-size rmonitors))
             (cons 'caller-agents (hashtable-size caller-agents))
             (cons 'owner-agents (hashtable-size owner-agents))
-            (cons 'callee-agents (hashtable-size callee-agents)))))
+            (cons 'callee-agents (hashtable-size callee-agents))
+            ;; watcher PIDS, not names: the leak this exists to make
+            ;; visible is pids piling up under one name, which a count of
+            ;; names cannot show.
+            (cons 'watchers
+                  (let ((total 0))
+                    (vector-for-each
+                      (lambda (l) (set! total (+ total (length l))))
+                      (hashtable-values watchers))
+                    total)))))
 
   ;; ---- node up/down notification --------------------------------------
 
+  ;; REGISTRATION IS THE SECOND MOMENT THE LIST IS IN HAND. notify! already
+  ;; drops dead pids, but only for a name that has an event; a watcher that
+  ;; died under a name which never goes up or down was never swept at all.
+  ;; Sweeping here closes that, and closes it in the same atomic section
+  ;; that does the memq, so no pid is judged alive in one step and inserted
+  ;; in another.
+  ;;
+  ;; WHAT REMAINS, and the shape of it is PER NAME. A dead watcher under a
+  ;; name that has no event and no further registration stays in the
+  ;; table. Sweeping happens at two moments -- an event for that name, a
+  ;; registration for that name -- and both are scoped to one name, so
+  ;; nothing here reclaims a name that is never touched again.
+  ;;
+  ;; AN EARLIER VERSION OF THIS PARAGRAPH SAID THE TABLE IS BOUNDED BY ITS
+  ;; OWN HISTORICAL PEAK. That is false, and measurably so in two
+  ;; different directions:
+  ;;   - across names: registering and killing one watcher under each of
+  ;;     five distinct quiet names leaves five stored pids, while at most
+  ;;     one was ever alive;
+  ;;   - within one name: twenty processes may each monitor the same quiet
+  ;;     name and all die, and twenty pids are retained. The per-name
+  ;;     residue is the largest watcher population that name has held
+  ;;     since its last sweep, not one.
+  ;; The reasoning that produced the false claim was that growth requires
+  ;; a registration and a registration sweeps -- true, and it sweeps only
+  ;; the name being registered, which is the half that was not written
+  ;; down.
+  ;;
+  ;; This is left as an accepted residue rather than repaired, because a
+  ;; global sweep would put a whole-table scan on the registration path.
+  ;; It is a residue and NOT a bound: nothing here caps the table. Names
+  ;; come from the application, so an application with a finite set of
+  ;; node names has a finite table, and one that mints names has not.
   (define (monitor-node name)
     (atomically
-      (let ((l (hashtable-ref watchers name '())))
-        (unless (memq self l)
-          (hashtable-set! watchers name (cons self l)))))
+      (let ((l (filter process-alive? (hashtable-ref watchers name '()))))
+        (hashtable-set! watchers name
+          (if (memq self l) l (cons self l)))))
     (void))
 
   (define (demonitor-node name)
@@ -291,6 +404,76 @@
   ;; ---- HMAC-SHA256 handshake proofs --------------------------------------
   ;; hmac-sha256 and bytevector->hex come from (igropyr crypto).
 
+  ;; A RECEIVED NONCE MUST BE EXACTLY WHAT WE WOULD HAVE SENT: 32 lowercase
+  ;; hex characters. This is load-bearing, not hygiene. The proof is
+  ;; HMAC over nonce ":" name ":" version, and that encoding needs ONE of
+  ;; its variable fields to be separator-free: a colon-free nonce lets the
+  ;; tuple be split from the left, a colon-free name lets it be split from
+  ;; the right, and either alone is enough. Both are enforced, because they
+  ;; guard different fields and neither costs anything. We generate hex,
+  ;; so the sent nonce never can -- but a RECEIVED nonce arrives from the
+  ;; other end, and checking it with string? alone accepted "X:evil".
+  ;;
+  ;; What that bought an attacker, before this check existed: get an honest
+  ;; node named `a` to dial you, answer with the nonce "X:evil" where X is a
+  ;; nonce you were just given by the node you want to enter, and it returns
+  ;; HMAC(secret, "X:evil:a:2"). Send that to the target as
+  ;; (hello evil:a <proof> ... 2) and the target computes HMAC over
+  ;; "X" ":" "evil:a" ":" "2" -- the same bytes. It authenticates a peer
+  ;; that never had the secret. The two digests were measured equal; the
+  ;; value is not quoted here because reproducing it needs the key and the
+  ;; nonce, which live in the cell that owns this, not in this comment.
+  ;;
+  ;; THE PROPERTY BELONGS TO THE PATH, NOT TO THE NAME. An earlier comment
+  ;; argued injectivity from "nonce is hex" -- true of the nonce we mint,
+  ;; and not of the one we are handed. The same identifier names two
+  ;; different quantities on the two sides, and the guarantee only exists
+  ;; on the side that produces it. The same care applies to the name: what
+  ;; the proof needs of it is not "it is a symbol" but "it contains no
+  ;; colon", and what the node needs of it is wider still -- that the
+  ;; writer can serialise it. See wire-name?.
+  (define (hex-nonce? s)
+    (and (string? s)
+         (fx= (string-length s) 32)
+         (let loop ((i 0))
+           (or (fx= i 32)
+               (and (let ((c (string-ref s i)))
+                      (or (and (char>=? c #\0) (char<=? c #\9))
+                          (and (char>=? c #\a) (char<=? c #\f))))
+                    (loop (fx+ i 1)))))))
+
+  ;; TWO SEPARATE REQUIREMENTS, and they are not the same one.
+  ;;
+  ;; NO COLON, because a colon is the proof's separator. This is a real
+  ;; repair and not only depth: with colon-free names the encoding is
+  ;; injective even for a nonce that contains colons, since the tuple can
+  ;; be split from the right. hex-nonce? is the other repair, and either
+  ;; alone would close the collision -- both are enforced because they
+  ;; guard different fields and each is cheap. What a colon check CANNOT
+  ;; do is act on the two public entry points alone: the name an attacker
+  ;; CLAIMS arrives in a hello frame, so it has to be checked there, and
+  ;; it is.
+  ;;
+  ;; WRITABLE BY THE SEXPR WRITER, which is a wider requirement than
+  ;; having no colon and is asked here with the authoritative writer
+  ;; rather than a second grammar. A symbol this library cannot serialise
+  ;; makes a node that starts, accepts configuration, and then fails every
+  ;; handshake at the point of writing hello -- late, repeatedly, and with
+  ;; nothing pointing back at the name. `a b` was such a name: it passed a
+  ;; hand-written colon check and the writer refuses it. Start and connect
+  ;; happen once per peer, so the cost of asking the real writer is not
+  ;; worth a second, drifting copy of its grammar.
+  (define (wire-name? x)
+    (and (symbol? x)
+         (let* ((t (symbol->string x)) (n (string-length t)))
+           (let loop ((i 0))
+             (or (fx= i n)
+                 (and (not (char=? (string-ref t i) #\:))
+                      (loop (fx+ i 1))))))
+         (guard (e (#t #f))
+           (sexpr->string-extended (list x))
+           #t)))
+
   (define (random-hex nbytes)
     (call-with-port (open-file-input-port "/dev/urandom")
       (lambda (p)
@@ -299,10 +482,48 @@
             (raise 'entropy))                   ; short read: fail closed
           (bytevector->hex bv)))))
 
+  ;; THE VERSION IS BOUND INTO THE PROOF, not merely carried beside it. The
+  ;; explicit field is what lets a refusal name its cause; binding is what
+  ;; stops that field from being edited on its own. Without it a peer could
+  ;; send a proof computed for one version and claim another, and both ends
+  ;; would agree on a number neither had authenticated.
+  ;;
+  ;; The version goes LAST and is a plain decimal, so no separator question
+  ;; arises: nonce is hex, name is a symbol, and only the version can end
+  ;; the string. Both directions use this formula -- the welcome proof too,
+  ;; so the dialer is checking a version-bound proof as well.
   (define (proof nonce name)
     (bytevector->hex
       (hmac-sha256 self-secret
-        (string->utf8 (string-append nonce ":" (symbol->string name))))))
+        (string->utf8
+          (string-append nonce ":" (symbol->string name) ":"
+                         (number->string protocol-version))))))
+
+  ;; The nth element, or #f when the datum is too short. Used to look at a
+  ;; version slot before the shape as a whole has been accepted: the point
+  ;; of the ordering below is that a future peer is told its version is
+  ;; wrong rather than that its frame is malformed.
+  (define (slot d n)
+    (let loop ((l d) (i n))
+      (cond ((not (pair? l)) #f)
+            ((fx= i 0) (car l))
+            (else (loop (cdr l) (fx- i 1))))))
+
+  ;; What the other end claimed, for a diagnostic. A peer's datum is
+  ;; untrusted input and may be a cycle or a megabyte, so this is bounded
+  ;; by construction rather than by hoping the value is small: print-graph
+  ;; removes the cycle warning (which is a raised condition, not merely a
+  ;; printed line), print-length and print-level bound the traversal, and
+  ;; the substring bounds a single enormous atom.
+  (define (claimed-version-text v)
+    (if (eq? v #f)
+        "pre-2 (no version field)"
+        (let ((t (parameterize ((print-length 4) (print-level 2)
+                                (print-graph #t))
+                   (format "~s" v))))
+          (if (fx> (string-length t) 32)
+              (string-append (substring t 0 32) "...")
+              t))))
 
   ;; constant-time compare: an attacker probing digests byte by byte
   ;; learns nothing from response timing
@@ -667,18 +888,51 @@
     (let ((freed #f))
       (define (free!)
         (unless freed (set! freed #t) (preauth-slot-free!)))
+      ;; A FAILED HANDSHAKE CLOSES WITHOUT A WORD, and that is deliberate
+      ;; here even for a version mismatch. This side faces strangers: a
+      ;; scanner that has learned the frame format can reach it, and
+      ;; nothing it sends proves it knows the secret, so anything printed
+      ;; here is printed at an attacker's request. The dial side is the
+      ;; opposite case and does speak -- see report-version-mismatch!.
+      ;; The raised value still distinguishes the causes, for a future
+      ;; diagnostic that has somewhere safe to put them.
       (guard (e (#t (free!) (tcp-close! c)))    ; failed handshake: just close
         (let ((nonce (random-hex 16))
               (buf (make-inbuf)))
-          (write-frame! c (list 'challenge nonce))
+          (write-frame! c (list 'challenge nonce protocol-version))
           (let ((d (read-frame c buf handshake-timeout-ms
                                handshake-max-frame)))
-            (unless (and (pair? d) (eq? (car d) 'hello)
-                         (= (length d) 4)
-                         (symbol? (cadr d))
+            ;; ORDER MATTERS, and it is the same on both sides: tag, then
+            ;; the pre-versioning arity, then version, then the rest. Checking the shape first would report
+            ;; a future peer's longer hello as malformed, which is true and
+            ;; useless; checking the version first lets the refusal name
+            ;; what is actually wrong. A hello of exactly 4 is the
+            ;; pre-versioning shape and gets its own answer rather than
+            ;; being folded into "wrong version".
+            ;; THE NONCE GRAMMAR IS THIS VERSION'S, SO IT IS APPLIED ONLY
+            ;; AFTER THE VERSION MATCHES. Tag, then the pre-versioning
+            ;; arity, then the stated version, and only then anything that
+            ;; v2 in particular requires of the fields. A v3 that mints
+            ;; base64 nonces, or carries an extra element, has to be
+            ;; answered "your version differs" rather than refused for
+            ;; breaking a rule that was never its rule -- hoisting a
+            ;; field-grammar check above the version comparison would
+            ;; misclassify exactly the peers this ordering exists for.
+            ;;
+            ;; A consequence to state rather than leave to be discovered:
+            ;; a frame that is malformed AND mismatched is reported as
+            ;; mismatched. (challenge "x" 999) answers 999, not "bad
+            ;; nonce". That is the policy, not an oversight.
+            (unless (and (pair? d) (eq? (car d) 'hello)) (raise 'auth))
+            (when (= (length d) 4) (raise (list 'bad-version #f protocol-version)))
+            (let ((theirs (slot d 4)))
+              (unless (equal? theirs protocol-version)
+                (raise (list 'bad-version theirs protocol-version))))
+            (unless (and (= (length d) 5)
+                         (wire-name? (cadr d))
                          (not (eq? (cadr d) self-name))
-                         (proof=? (caddr d) (proof nonce (cadr d)))
-                         (string? (cadddr d)))
+                         (hex-nonce? (cadddr d))
+                         (proof=? (caddr d) (proof nonce (cadr d))))
               (raise 'auth))
             (let ((peer (cadr d)) (nonce-b (cadddr d)))
               (write-frame! c (list 'welcome self-name (proof nonce-b self-name)))
@@ -689,6 +943,32 @@
 
   ;; ---- dial side --------------------------------------------------------------
 
+  (define (bad-version? e)
+    (and (pair? e) (eq? (car e) 'bad-version)))
+
+  ;; THE DIAL SIDE HAS TO SPEAK. Its peer is one an operator configured, so
+  ;; the trade-off that keeps the acceptor silent is reversed: nothing here
+  ;; was reached at a stranger's invitation. And the failure is one that
+  ;; has no voice of its own -- connector retries every few seconds
+  ;; forever, so a version mismatch presents as a link that simply never
+  ;; comes up, with nothing in any log saying why. That is the shape a
+  ;; maintainer cannot debug: not an error, an absence.
+  ;;
+  ;; It prints on EVERY attempt rather than once. A line every reconnect
+  ;; interval is noisy, and the noise is the point: it stops when someone
+  ;; upgrades a node, which is exactly the action being asked for.
+  ;; THE PORT IS FETCHED AT PRINT TIME, not captured when this library is
+  ;; loaded. current-error-port is a parameter: a caller that rebinds it --
+  ;; to collect diagnostics, to route them into a log -- must see this line
+  ;; go where it points now. Caching it at load time would send every one
+  ;; of these to whatever the port happened to be at import.
+  (define (report-version-mismatch! peer e)
+    (let ((p (current-error-port)))
+      (fprintf p
+        "igropyr node: cannot dial ~a -- protocol version mismatch (peer ~a, this node ~a). Upgrade the older node; the versions must match.\n"
+        peer (claimed-version-text (cadr e)) (caddr e))
+      (flush-output-port p)))
+
   ;; one connect attempt; returns when the link is gone. Raises only 'stop.
   (define (dial! peer host port)
     (guard (e ((eq? e 'stop) (raise 'stop))
@@ -697,19 +977,71 @@
       (receive (after handshake-timeout-ms (raise 'timeout))
         (`#(tcp-connected ,c)
           (guard (e ((eq? e 'stop) (tcp-close! c) (raise 'stop))
+                    ;; CLOSE FIRST, THEN SPEAK. The outer guard turns every
+                    ;; failure into (void) so the connector can retry, so
+                    ;; this line has to be said on the way past -- but if
+                    ;; the report raises (an error port that is closed, or
+                    ;; one a caller installed that refuses writes) then in
+                    ;; the other order the close never runs, and every
+                    ;; retry leaks a connection. Ordering is the fix rather
+                    ;; than wrapping the report in a guard of its own: a
+                    ;; guard is another thing that has to be written
+                    ;; correctly, while an ordering cannot be half right.
+                    ;; This bounds ONE failure mode -- the connection is
+                    ;; closed whatever the report then does. A port that
+                    ;; blocks still blocks the only scheduler, after the
+                    ;; close; that is not fixed here, and not claimed to be.
+                    ((bad-version? e) (tcp-close! c)
+                                      (report-version-mismatch! peer e))
                     (#t (tcp-close! c)))
             (tcp-read-start! c)
             (let* ((buf (make-inbuf))
                    (d (read-frame c buf handshake-timeout-ms
                                   handshake-max-frame)))
-              (unless (and (pair? d) (eq? (car d) 'challenge)
-                           (= (length d) 2) (string? (cadr d)))
+              ;; same order as the acceptor: tag, version, then shape
+              ;; THE NONCE GRAMMAR IS THIS VERSION'S, SO IT IS APPLIED ONLY
+              ;; AFTER THE VERSION MATCHES. Tag, then the pre-versioning
+              ;; arity, then the stated version, and only then anything that
+              ;; v2 in particular requires of the fields. A v3 that mints
+              ;; base64 nonces, or carries an extra element, has to be
+              ;; answered "your version differs" rather than refused for
+              ;; breaking a rule that was never its rule -- hoisting a
+              ;; field-grammar check above the version comparison would
+              ;; misclassify exactly the peers this ordering exists for.
+              ;;
+              ;; A consequence to state rather than leave to be discovered:
+              ;; a frame that is malformed AND mismatched is reported as
+              ;; mismatched. (challenge "x" 999) answers 999, not "bad
+              ;; nonce". That is the policy, not an oversight.
+              (unless (and (pair? d) (eq? (car d) 'challenge)) (raise 'auth))
+              (when (= (length d) 2)
+                (raise (list 'bad-version #f protocol-version)))
+              (let ((theirs (slot d 2)))
+                (unless (equal? theirs protocol-version)
+                  (raise (list 'bad-version theirs protocol-version))))
+              ;; CHECKED BEFORE THE PROOF IS COMPUTED. What must not happen
+              ;; is SENDING a proof over an attacker-shaped nonce: a digest
+              ;; computed and then discarded is harmless, and it is
+              ;; transmission, not computation, that hands over a usable
+              ;; token. Checking first, rather than merely checking before
+              ;; the write, is the cheaper and the more obviously correct
+              ;; arrangement -- there is then no window in which such a
+              ;; token exists in this process at all, and no later edit can
+              ;; move a write above the check by accident.
+              (unless (and (= (length d) 3) (hex-nonce? (cadr d)))
                 (raise 'auth))
               (let ((nonce-b (random-hex 16)))
                 (write-frame! c
-                  (list 'hello self-name (proof (cadr d) self-name) nonce-b))
+                  (list 'hello self-name (proof (cadr d) self-name)
+                        nonce-b protocol-version))
                 (let ((d2 (read-frame c buf handshake-timeout-ms
                                       handshake-max-frame)))
+                  ;; welcome keeps its three-element shape: by now both
+                  ;; ends have stated and agreed a version, so there is
+                  ;; nothing left to state. Its proof still moves with
+                  ;; the formula, so a peer that agreed to the version in
+                  ;; words but computed the proof without it is refused
+                  ;; here -- the binding is checked in both directions.
                   (unless (and (pair? d2) (eq? (car d2) 'welcome)
                                (= (length d2) 3)
                                (eq? (cadr d2) peer)   ; it must BE who we dialed
@@ -750,6 +1082,16 @@
     ;; process doing the asking. Nothing about that failure points here,
     ;; and it appears hours later at the first resume rather than at the
     ;; call that caused it.
+    ;; `:` IS THE SAME RULE ON A DIFFERENT SEPARATOR, and it was missing
+    ;; until a colon in a name turned out to break the handshake proof's
+    ;; encoding. NOTE WHAT THIS DOES NOT DO: the name an attacker CLAIMS
+    ;; arrives in a hello frame and never passes through here, so this is
+    ;; depth, not the repair. The repair is hex-nonce?, which fixes the
+    ;; field that actually has to be separator-free.
+    (unless (wire-name? name)
+      (assertion-violation 'node-start!
+        "`:` separates the fields of the handshake proof; a name containing it makes that encoding ambiguous"
+        name))
     (when (let loop ((i 0))
             (cond ((= i (string-length (symbol->string name))) #f)
                   ((char=? (string-ref (symbol->string name) i) #\~) #t)
@@ -787,6 +1129,17 @@
   (define (node-connect! peer host port)
     (unless self-name
       (assertion-violation 'node-connect! "call node-start! first" peer))
+    ;; A PEER NAME IS A SYMBOL, and it is worth refusing here rather than
+    ;; where the damage appears: this value becomes a hashtable key, is the
+    ;; name the welcome proof is verified against, and is printed in
+    ;; diagnostics. (It does not itself go on the wire -- hello carries
+    ;; self-name -- so what is at stake here is the colon half of
+    ;; wire-name?, not the writability half.) The
+    ;; same argument already refuses a bad name at node-start!; this is the
+    ;; other end of the same rule, and it was missing.
+    (unless (wire-name? peer)
+      (assertion-violation 'node-connect!
+        "peer must be a symbol without `:`" peer))
     (when (eq? peer self-name)
       (assertion-violation 'node-connect! "cannot connect to self" peer))
     ;; Keyed by NAME, but the endpoint has to be part of the decision. A

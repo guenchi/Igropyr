@@ -1,4 +1,19 @@
 #!chezscheme
+;;; RETIRED 2026-08-28 (B1, the wire protocol version) -- out of
+;;; run-all.sh. This suite builds a mixed-WIRE-version mesh, and that
+;;; scenario no longer exists: the version is exact-match and the mesh
+;;; upgrades in lockstep, so a pre-v2 node cannot join one. The suite is
+;;; kept, not deleted, because the scenario it covers at the APPLICATION
+;;; layer is still real -- two nodes both speaking wire version 2 may
+;;; run different code revisions.
+;;;
+;;; REVIVAL, and the condition is mechanical: the first
+;;; conversation-protocol change that lands on top of the v2 baseline.
+;;; Re-pin old-rev to the last v2 commit before that change and put this
+;;; file back in run-all.sh. Until such a commit exists, re-pinning
+;;; would produce a run that passes without testing anything, which is
+;;; worse than a named absence.
+;;;
 ;;; Mixed-version mesh: the rolling-upgrade claim, tested against a REAL
 ;;; old node instead of re-derived from the source.
 ;;;

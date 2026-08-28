@@ -19,6 +19,40 @@
 ;;;   ticker -> supervisor: #(check-stuck-workers)   (every 5s)
 ;;;   crashes arrive as #(DOWN ,pid ,reason) via monitor
 ;;; Task shape (built by the http layer): #(task ,task-id ,conn ,request)
+;;;
+;;; ---- Design model ----------------------------------------------------
+;;;
+;;; Four commitments shape the concurrency and distribution layers. They
+;;; are deliberate: a review comparing this library to Erlang/OTP or Swish
+;;; will find several OTP mechanisms missing -- a supervision tree above
+;;; all -- and each absence traces to one of these. Two of them are this
+;;; file's own, and are given in full; the other two live in (igropyr node)
+;;; and are summarised here.
+;;;
+;;; 1. CRASH-ONLY, WITH THE REAL SUPERVISOR OUTSIDE THE PROCESS. Inside the
+;;;    process: let-it-crash workers, resource reclamation through owner
+;;;    monitors, task-level retry that knows its side effects -- all three
+;;;    are above. At the process level: die loudly and let the service
+;;;    manager (rc.d, daemon -r, systemd) restart the whole image. Recovery
+;;;    means rebuilding from durable state, not surgically restarting a
+;;;    subtree in place -- so there is no in-process supervision tree, and
+;;;    its absence is a decision, not a gap.
+;;;
+;;; 2. A SINGLE SCHEDULER MEANS AN IN-PROCESS SUPERVISION TREE COULD NOT
+;;;    HELP WITH THE HARDEST FAILURES ANYWAY. A supervisor process shares
+;;;    the scheduler with everything it supervises: when the scheduler
+;;;    itself stalls -- a foreign call that never returns -- the tree
+;;;    stalls with it. The only supervisor that survives that failure class
+;;;    lives outside the process, and it is already there. Note what this
+;;;    does NOT say: the pool supervisor above is worth having, because the
+;;;    failures it handles are worker crashes and stuck tasks, which do not
+;;;    stop the scheduler. The claim is about what a TREE would add.
+;;;
+;;; 3 and 4, in one line each: the node mesh is a control plane -- names
+;;; not pids, small messages, fail-closed on confusion, slow-is-dead rather
+;;; than paused; and that mesh is small and fully trusted by design, a
+;;; cluster administered as one unit and upgraded in lockstep. See
+;;; (igropyr node) for both in full.
 
 (library (igropyr otp)
   (export start-worker-pool pool-stats)

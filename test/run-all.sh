@@ -262,21 +262,17 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script test/checked-off.sc
 "$scheme_bin" --script test/fault-hook.sc
 "$scheme_bin" --script test/conversation.sc
 "$scheme_bin" --script test/conv-cluster.sc
-# rolling-upgrade, against a REAL old node: a worktree of the pre-wide
-# protocol revision runs node b from source while node a runs this tree.
-# Covers the narrow-reply branch a positive ref lands in -- a branch no
-# all-new mesh ever takes. Skips (and says so) without full git history
-"$scheme_bin" --script test/conv-mixed.sc
+# RETIRED 2026-08-28: test/conv-mixed.sc -- it built a mixed-WIRE-version
+# mesh, a scenario the handshake protocol version (exact-match, lockstep)
+# abolished. The file stays, with its revival condition in its header.
 # admission is judged by the PAIR (what came back, how fast): a refusal
 # that takes as long as the silence it replaces refuses nothing. Also the
 # only rig that can kill the router with live workers in flight, which is
 # what proved the slot accounting survives the router that took the slots
 "$scheme_bin" --script test/conv-admission.sc
-# what a PRE-refusal asker experiences against a refusing owner, run
-# against the real pinned old code: full ttl then 'unreachable (its own
-# vocabulary), and the token untouched. Skips (and says so) without
-# full git history
-"$scheme_bin" --script test/conv-mixed-overload.sc
+# RETIRED 2026-08-28: test/conv-mixed-overload.sc -- same as conv-mixed
+# above: its pre-v2 asker can no longer join a mesh. Header has the
+# revival condition.
 # census/quiesce spends its assertions on what must KEEP WORKING under
 # quiesce -- a node that refuses in-flight work can never finish draining
 "$scheme_bin" --script test/conv-census.sc
