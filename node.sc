@@ -335,8 +335,8 @@
   ;; TCP's own flow control stops the KERNEL buffer from growing; it does
   ;; nothing about ours behind it. NOR DOES dead-ms: that clock measures
   ;; silence FROM the peer, and a peer that keeps sending while never
-  ;; reading is not silent -- it can hold the link open indefinitely while
-  ;; the queue grows.
+  ;; reading is not silent, so that clock never fires: it can hold the
+  ;; link open for as long as it keeps sending, while the queue grows.
   ;;
   ;; PER CONNECTION, NOT PER PEER, and the difference is the point. A
   ;; per-peer quota has to be keyed on a node name, and a node name is a
@@ -624,19 +624,28 @@
   ;; Submit an already-materialized frame. -> #t if it was handed to
   ;; libuv, #f if it was not.
   ;;
-  ;; THE FAILURE DOMAIN AFTER A CALLER'S PUBLICATION POINT IS THIS
-  ;; PROCEDURE'S SUBMISSION, AND NOTHING ELSE. frame-segments has already
-  ;; built every byte, so what remains that can fail is the queued path's
-  ;; allocation and the table entry that publishes its completion -- the
-  ;; OOM domain. Those are reported as #f, the same answer a write to a
-  ;; closed connection gives, because a caller that has published state
-  ;; can act on a returned #f and cannot act on an exception.
+  ;; THE FAILURE DOMAIN AFTER A CALLER'S PUBLICATION POINT, written to the
+  ;; shape it actually has. frame-segments has already built every byte,
+  ;; so the submission itself can only fail in the OOM domain -- the
+  ;; queued path's allocation, and the table entry that publishes its
+  ;; completion. Those are caught below and reported as #f, the same
+  ;; answer a write to a closed connection gives, because a caller that
+  ;; has published state can act on a returned #f and cannot act on an
+  ;; exception.
   ;;
-  ;; ONE RESIDUE INSIDE THAT DOMAIN: outbound-charge! runs before the
-  ;; guard below and allocates (a table entry, and on a first write a
-  ;; close hook), so an OOM there still escapes as an exception. It is
-  ;; named rather than caught: catching it would mean reporting #f for a
-  ;; frame whose charge may or may not have landed.
+  ;; THAT GUARD IS NOT THE WHOLE PROCEDURE, and two things sit outside it:
+  ;;   - outbound-charge! runs BEFORE it and allocates (a table entry, and
+  ;;     on a first write a close hook);
+  ;;   - close-for-backpressure! runs AFTER it and both allocates
+  ;;     (conn-link-pid walks the peers table) and sends.
+  ;; An OOM in either still leaves this procedure by raising. The second
+  ;; is the worse of the two and is stated rather than smoothed over: by
+  ;; then the frame HAS been handed to libuv, so the peer may act on it
+  ;; and reply, while this caller sees an exception and its pending entry
+  ;; stays behind -- a reply that arrives later has nothing left to match
+  ;; and remains in the mailbox. All of it is the OOM domain, named here
+  ;; and not mechanised; catching it would mean answering #f for a frame
+  ;; that is already on its way.
   ;;
   ;; REFUNDING ONCE IS CORRECT, and the reason lives in libuv.sc rather
   ;; than here, so it is named to be checked: in enqueue-write!
@@ -701,9 +710,12 @@
       ;; it crosses the ceiling again and closes it. THE TICK PING IS NOT
       ;; A BACKSTOP FOR THIS, though it looks like one: link-loop restarts
       ;; its receive on every inbound frame, so a peer that sends anything
-      ;; at all more often than tick-ms holds the ping off indefinitely --
-      ;; and a peer that is not reading its socket while still sending is
-      ;; exactly the peer this ceiling is about.
+      ;; at all more often than tick-ms holds the ping off for as long as
+      ;; it keeps sending -- and a peer that is not reading its socket
+      ;; while still sending is exactly the peer this ceiling is about.
+      ;; WHAT DOES COVER IT is the check at the top of link-loop's drain,
+      ;; which runs on every wake-up: the traffic that suppresses the
+      ;; timer is the same traffic that supplies the check.
       (let ((over? #f))
         (let ((r (atomically
                    (set! over? (outbound-charge! c total))
@@ -1176,23 +1188,27 @@
         'unavailable))
 
   ;; Write one datum to a peer by name, if the link is live.
-  ;; -> #t only if it was handed to libuv.
+  ;; -> #t if there was a live link to write to.
   ;;
-  ;; WHO READS THIS ANSWER, and why the others do not. rcall and
-  ;; monitor-remote read it, because each has published state that a
-  ;; refused frame would strand. The rest do not, and each has a reason
-  ;; that is not "nobody thought about it":
-  ;;   - ping/pong and the handshake frames are covered by a timeout at
-  ;;     the far end -- a frame that does not go out presents as silence,
-  ;;     which those paths already treat as a dead link;
-  ;;   - an rcall reply, an overload shed, an mdown: the peer waiting for
-  ;;     them has its own timeout, and there is no second thing this node
-  ;;     could usefully do with the knowledge;
-  ;;   - rsend is fire-and-forget by contract, and now returns this
-  ;;     answer rather than an unconditional #t.
+  ;; ITS THREE CALLERS, ENUMERATED FROM THE FILE AND NOT FROM MEMORY --
+  ;; serve-rcall!'s fallback reply, mon-agent's noproc and mdown, and
+  ;; remove-target-watch!'s demon -- AND NONE OF THEM READS THE ANSWER.
+  ;; (An earlier version of this comment said rcall and monitor-remote
+  ;; read it. They do not call this procedure at all. A claim about which
+  ;; call sites exist is refutable by one grep, and must be written from
+  ;; one.)
+  ;;
+  ;; What the callers can and cannot fall back on differs, and it is not
+  ;; uniform the way that earlier comment implied:
+  ;;   - serve-rcall!'s reply: the rcall waiting for it has its own
+  ;;     timeout, so a lost frame costs that caller a timeout, not a hang;
+  ;;   - mon-agent's mdown and remove-target-watch!'s demon: THERE IS NO
+  ;;     TIMEOUT ON THE OTHER SIDE. A remote monitor waits until its
+  ;;     target's node says something or the link drops. See mon-agent
+  ;;     for what that means when a submission fails.
   (define (link-write peer datum)
     (let ((e (live-entry peer)))
-      (and e (write-frame! (vector-ref e 0) datum))))
+      (and e (begin (write-frame! (vector-ref e 0) datum) #t))))
 
   ;; ---- cross-node process monitor ----------------------------------------
 
@@ -1204,6 +1220,17 @@
   ;; key is (peer . mref); dispatch registered us under it before we ran.
   ;; watcher is that same peer -- the authenticated far end -- and is the
   ;; only node we ever report this DOWN back to.
+  ;;
+  ;; IF THE mdown FRAME IS NEVER SUBMITTED -- the OOM domain, see
+  ;; write-body! -- THIS AGENT HAS ALREADY DROPPED ITS STATE AND EXITS,
+  ;; AND THE WATCHER WAITS FOREVER. There is no timeout on that side: a
+  ;; remote monitor ends when its target's node says something or when
+  ;; the link drops, and neither happens here. The same is true of the
+  ;; demon frame in remove-target-watch!, which leaves this side's agent
+  ;; parked until the target dies or the link goes. Both are named as OOM
+  ;; residues rather than mechanised: a retry would need its own queue
+  ;; and its own failure domain, on a path that only runs when the
+  ;; process is already out of memory.
   (define (mon-agent watcher key name)
     (let ((mref (cdr key))
           (p (whereis name)))
@@ -1341,11 +1368,12 @@
       ;;
       ;; THE TICK PING IS NOT THAT CHECK, and neither is a complete frame.
       ;; This loop's receive restarts on every inbound BYTE, so a peer
-      ;; that dribbles holds the ping off indefinitely -- and it need
-      ;; never complete a frame to do it: a valid length header followed
+      ;; that dribbles holds the ping off for as long as it keeps
+      ;; dribbling -- and it need never complete a frame to do it: a
+      ;; valid length header followed
       ;; by one body byte every few seconds keeps parse-frame answering
-      ;; `incomplete` for as long as max-frame allows -- a bounded but
-      ;; absurd span, years at one byte per tick -- so a check placed
+      ;; `incomplete` for years -- max-frame bounds it, and the bound is
+      ;; that long at one byte per tick -- so a check placed
       ;; after dispatch! is never reached. The check belongs where the
       ;; loop is entered, which is every wake-up: arriving bytes are what
       ;; suppresses the timer, and now they are also what supplies the
@@ -2003,9 +2031,8 @@
 
   ;; Send msg to the process registered as reg-name on node. #t = handed
   ;; to a live link (delivery still unconfirmed, as within a node); #f =
-  ;; no link, or the frame was refused before it reached the socket.
-  ;; Own node name = plain local send. Raises if msg contains data
-  ;; outside the extended wire whitelist.
+  ;; no link. Own node name = plain local send. Raises if msg contains
+  ;; data outside the extended wire whitelist.
   (define (rsend node reg-name msg)
     (cond
       ((eq? node self-name)
@@ -2022,11 +2049,22 @@
          (and p (begin (send p msg) #t))))
       ((live-entry node)
        => (lambda (e)
-            ;; #t meant "there was a live link" and was returned whether
-            ;; or not the frame reached libuv. It now means the frame was
-            ;; handed over, which is the most this call can honestly
-            ;; report -- delivery is still unconfirmed either way.
-            (write-frame! (vector-ref e 0) (list 'send reg-name msg))))
+            ;; #t WHENEVER THERE WAS A LIVE LINK, whether or not the frame
+            ;; reached the socket -- and that is not the lie it looks
+            ;; like. This call is fire-and-forget by contract: delivery is
+            ;; never confirmed, so every caller already has to tolerate
+            ;; "#t and the message was lost". A packet dropped in the
+            ;; network, or a peer that receives and dies before acting,
+            ;; are indistinguishable from a frame that never left this
+            ;; process. Reporting a refused submission as #f would be
+            ;; narrowly more accurate and would break something real:
+            ;; #f means NO LINK, and callers depend on that -- one of
+            ;; them treats it as evidence the node is gone and removes it
+            ;; from its scheduling set, which no node-up will undo while
+            ;; the link is still up. A truer #t is worth less than a
+            ;; theorem the callers rely on.
+            (write-frame! (vector-ref e 0) (list 'send reg-name msg))
+            #t))
       (else #f)))
 
   ;; Synchronous cross-node call to the GEN-SERVER registered as
@@ -2043,6 +2081,13 @@
   ;; reply), or 'overload when the target is already serving its maximum
   ;; concurrent rcalls (see node-set-limits!). Both msg and the reply
   ;; must be extended-wire-safe.
+  ;; <target> is the registered name, with one exception: 'noconnection
+  ;; names the NODE. That reason is a statement about the link, not about
+  ;; anything registered on the far side, and it is raised from three
+  ;; places -- no link at all, a link that dropped while the call was
+  ;; outstanding, and a frame that was never submitted. All three carry
+  ;; the node, so the same reason never arrives carrying two different
+  ;; kinds of thing.
   (define (rcall node reg-name msg . rest)
     (let ((timeout (if (pair? rest) (car rest) 5000)))
       ;; REFUSED HERE BECAUSE IT GOES ON THE WIRE. The far end drops the
@@ -2093,8 +2138,13 @@
                 ;; own rcall-reply. Raising then would leave that message
                 ;; in this mailbox with no receive left to match it --
                 ;; the orphan this ordering was rebuilt to prevent. If
-                ;; the entry is already gone, someone else answered:
-                ;; fall through and let the receive collect it.
+                ;; the entry is already gone, someone else has TAKEN ON
+                ;; answering -- taken the entry atomically, and sends
+                ;; after -- so fall through and let the receive collect
+                ;; it. Taken on, not done: if that path then fails, no
+                ;; answer arrives from either side and this call waits
+                ;; out its timeout, which is the outcome it has anyway
+                ;; when a reply is lost.
                 (unless (write-body! (vector-ref e 0) segs)
                   (when (atomically
                           (let ((v (hashtable-ref pending ref #f)))
@@ -2112,7 +2162,17 @@
                       ((and (pair? result) (eq? (car result) 'ok) (pair? (cdr result)))
                        (cadr result))
                       ((and (pair? result) (eq? (car result) 'error) (pair? (cdr result)))
-                       (raise (vector 'rcall-error (cadr result) reg-name)))
+                       ;; 'noconnection is a statement about the NODE, and
+                       ;; carries the node in every other place it is
+                       ;; raised. It reaches here when the link dropped
+                       ;; while this call was outstanding; reporting the
+                       ;; registered name there made the same reason carry
+                       ;; two different things depending on which path
+                       ;; produced it.
+                       (raise (vector 'rcall-error (cadr result)
+                                      (if (eq? (cadr result) 'noconnection)
+                                          node
+                                          reg-name))))
                       (else
                        (raise (vector 'rcall-error 'bad-reply reg-name)))))))))
         (else (raise (vector 'rcall-error 'noconnection node))))))
@@ -2163,9 +2223,12 @@
               ;; deliver the DOWN this caller is owed.
               ;;
               ;; ONLY IF THIS PROCESS STILL OWNS THE ENTRY -- if the link
-              ;; dropped in between, fail-monitors-for! has already
-              ;; removed it and delivered a noconnection of its own, and a
-              ;; second one would be a DOWN for a watch that ended.
+              ;; dropped in between, fail-monitors-for! has taken the
+              ;; entry and is on its way to delivering a noconnection of
+              ;; its own, and a second one would be a DOWN for a watch
+              ;; that has already ended. Taken, not necessarily
+              ;; delivered: the atomic step transfers who answers, not
+              ;; the answer itself.
               (let ((segs (frame-segments (list 'mon name mref))))
                 (arm-rmonitor! mref node name)
                 (unless (write-body! (vector-ref e 0) segs)
