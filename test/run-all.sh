@@ -381,6 +381,62 @@ if [ "$boot_status" -ne 70 ] || [ "$boot_panic" -eq 0 ] || [ "$boot_msg" -eq 0 ]
 fi
 echo "BOOT FAILURE PROPAGATION PASSED"
 
+# A critical component that exits for ANY reason -- 'normal included --
+# must panic the process (exit 70, panic naming the component). To stop
+# one on purpose you clear the mark first with uncritical!, and an exit
+# after that must NOT panic. Same expected-nonzero shape as boot above:
+# the assertion is a process exit.
+set +e
+crit_output=$("$scheme_bin" --script test/smoke-critical-failure.sc 2>&1)
+crit_status=$?
+set -e
+case "$crit_output" in
+  *"PANIC: test-critical"*) crit_panic=1 ;;
+  *)                        crit_panic=0 ;;
+esac
+# the uncritical! half must have been passed, not skipped: if clearing the
+# mark had failed, the panic would name 'stoppable and STILL ALIVE would
+# be absent for a different reason. Assert the process got past it.
+case "$crit_output" in
+  *"STILL ALIVE"*) crit_alive=1 ;;
+  *)               crit_alive=0 ;;
+esac
+if [ "$crit_status" -ne 70 ] || [ "$crit_panic" -eq 0 ] || [ "$crit_alive" -eq 1 ]; then
+  printf '%s\n' "$crit_output"
+  echo "critical-component failure propagation test failed" >&2
+  exit 1
+fi
+echo "CRITICAL FAILURE PROPAGATION PASSED"
+
+# The mark on the HTTP pool supervisor, and specifically the LINE THAT
+# APPLIES IT. The two suites above own critical! and the sentinel's rule;
+# neither reaches the one call in http-listen that connects them, and both
+# stay green when it is deleted (measured). This starts a real server,
+# kills its pool supervisor, and requires the process to die naming the
+# pool -- so deleting that call turns this red and nothing else.
+set +e
+httpcrit_output=$("$scheme_bin" --script test/smoke-http-critical.sc 2>&1)
+httpcrit_status=$?
+set -e
+# the name carries the port, because a process may run several listeners --
+# and that the port is IN the name is the thing under test, so the whole
+# name is asserted, not just the prefix. 18099 is the port the fixture
+# opens; if the fixture's port changes, this one string changes with it.
+case "$httpcrit_output" in
+  *"PANIC: http-worker-pool:18099"*) httpcrit_panic=1 ;;
+  *)                                 httpcrit_panic=0 ;;
+esac
+case "$httpcrit_output" in
+  *"STILL ALIVE"*) httpcrit_alive=1 ;;
+  *)               httpcrit_alive=0 ;;
+esac
+if [ "$httpcrit_status" -ne 70 ] || [ "$httpcrit_panic" -eq 0 ] || [ "$httpcrit_alive" -eq 1 ]; then
+  printf '%s\n' "$httpcrit_output"
+  echo "http pool-supervisor critical wiring test failed" >&2
+  exit 1
+fi
+echo "HTTP CRITICAL WIRING PASSED"
+
 # reached only when every suite above ran and passed
 echo "=== WHOLE SUITE RUN: every suite was reached ==="
 

@@ -48,6 +48,25 @@
 ;;;    failures it handles are worker crashes and stuck tasks, which do not
 ;;;    stop the scheduler. The claim is about what a TREE would add.
 ;;;
+;;;    AND WHAT HAPPENS WHEN THE SUPERVISOR ITSELF DIES, which the sentence
+;;;    above does not answer and used to leave to be guessed. Nothing here
+;;;    restarts it: a replacement could not reattach the workers the dead
+;;;    one owned, nor the tasks it was tracking. So the parts arrange
+;;;    themselves around its absence instead. Each worker and the ticker
+;;;    monitor it and stop, dropping what is still queued rather than doing
+;;;    orphan work. NOT everything: a worker already inside run-task cannot
+;;;    be interrupted, and neither can one that passed its liveness check in
+;;;    the instant before -- so up to one task per worker runs on. The
+;;;    worker comment gives the exact window. A pool the image cannot serve
+;;;    without is marked with
+;;;    critical! ((igropyr actor)), which turns its death into a panic and
+;;;    exits 70 and leaves what happens next to whatever started the image.
+;;;    Those committed tasks are the exception: they never reach the
+;;;    receive, so only the exit clears them -- and not even that if one has
+;;;    entered a foreign call that never returns, since then the sentinel
+;;;    does not run either. That is why the marking and the monitors are two
+;;;    mechanisms rather than one.
+;;;
 ;;; 3 and 4, in one line each: the node mesh is a control plane -- names
 ;;; not pids, small messages, fail-closed on confusion, slow-is-dead rather
 ;;; than paused; and that mesh is small and fully trusted by design, a
@@ -115,19 +134,93 @@
         (spawn (lambda () (ticker sup check-ms)))
         sup)))
 
+  ;; THE TICKER OUTLIVING ITS SUPERVISOR IS AN ORPHAN THAT KEEPS TICKING,
+  ;; so it watches the supervisor and stops when it goes. It monitors ONCE,
+  ;; before the loop, rather than per iteration.
+  ;;
+  ;; The wait is a receive with a timeout rather than sleep-ms, and the
+  ;; gain is not a saved tick: sleep-ms is (receive (after n 'ok)) with NO
+  ;; message clauses, so the old ticker never matched a DOWN at all. It
+  ;; left it unread in the mailbox and went on ticking at a supervisor that
+  ;; no longer existed, forever. The change is from never stopping to
+  ;; stopping -- when the DOWN is processed, which is the next time this
+  ;; process is scheduled, rather than at the end of an interval.
+  ;;
+  ;; The clause names the supervisor's pid. It is true today that the
+  ;; ticker holds only one monitor, but that is a fact about the current
+  ;; private call graph rather than a property of the code, and a clause
+  ;; that matches ANY down message would also match one an application
+  ;; contrived to send -- DOWN is an ordinary vector, not a privileged one.
   (define (ticker sup interval-ms)
-    (sleep-ms interval-ms)
-    (send sup (vector 'check-stuck-workers))
-    (ticker sup interval-ms))
+    (monitor sup)
+    (let loop ()
+      (receive (after interval-ms
+                 (begin (send sup (vector 'check-stuck-workers)) (loop)))
+        (`#(DOWN ,@sup ,_) (void)))))
 
+  ;; A WORKER WITHOUT ITS SUPERVISOR HAS NOTHING TO DO AND NOTHING TO
+  ;; ANSWER, so it watches the supervisor and exits when it goes.
+  ;;
+  ;; A QUEUED TASK IS DROPPED RATHER THAN RUN, and the check that does it is
+  ;; on the task, not in the clause order. Clause order cannot do this:
+  ;; $receive iterates the MAILBOX in arrival order and tries every clause
+  ;; against each message, so the earliest message that matches anything
+  ;; wins no matter which clause matched it. A task queued before the
+  ;; supervisor died is ahead of the DOWN and is selected first however the
+  ;; clauses are arranged. What decides is asking, at the moment of
+  ;; dispatch, whether there is still a supervisor to answer -- rearranging
+  ;; the clauses does not, and will not.
+  ;;
+  ;; Running it anyway would be orphan work: nothing collects its
+  ;; completion, nothing retries it, nothing answers the client it belonged
+  ;; to, and if it enters a foreign call that never returns it also stops
+  ;; the sentinel from ever handling the supervisor's own DOWN. So the pool
+  ;; disappears as a unit -- eventually, and with the running-task exception
+  ;; below; what goes at once is everything still queued.
+  ;;
+  ;; The clause names the supervisor's pid rather than matching any DOWN.
+  ;; run-task is APPLICATION code running in this process, and it can
+  ;; monitor something of its own; a blanket pattern would retire the worker
+  ;; on that unrelated death. Naming the pid rejects those. It does NOT
+  ;; authenticate anything: DOWN is an ordinary vector, so application code
+  ;; holding the supervisor's pid can still send this process a forgery and
+  ;; retire its own worker. In a single trusted image that is acceptable --
+  ;; but it is a narrower guarantee than the pattern looks like it makes.
+  ;;
+  ;; WHAT THE CHECK ACTUALLY GUARANTEES, stated as narrowly as it holds: no
+  ;; task is STARTED after this worker has observed the supervisor gone.
+  ;; That is not the same as "after the supervisor dies". The check and the
+  ;; call are two expressions with interrupts enabled between them, and the
+  ;; timer handler yields, so a worker can pass the check, be preempted,
+  ;; and enter run-task once the supervisor is already dead. The window is
+  ;; one preemption wide and no assertion here closes it. A check reports an
+  ;; observation and does not hold anything still: calling this residue
+  ;; "only a task already inside run-task" would be reading a check as a
+  ;; lock.
+  ;;
+  ;; So the residue is: a task inside run-task, or one that passed the
+  ;; check moments before. PER WORKER, not one for the pool -- an n-worker
+  ;; pool can have n of them committed at the instant the supervisor dies.
+  ;; Either way that worker is no longer in this receive and cannot be
+  ;; interrupted, so it runs to completion, or forever.
+  ;;
+  ;; A pool marked critical! usually clears them, since the supervisor's
+  ;; death ends the image; that is not a guarantee, because an orphan which
+  ;; enters a foreign call that never returns can stop the sentinel from
+  ;; running at all, and then nothing ends anything. An unmarked pool
+  ;; simply accepts the orphan. What the check buys is not atomicity: it is
+  ;; that a mailbox full of queued work is not drained into the void.
   (define (worker sup run-task)
     (lambda ()
+      (monitor sup)
       (let loop ()
         (receive
+          (`#(DOWN ,@sup ,_) (void))
           (`#(process-task ,task)
-            (run-task task)
-            (send sup (vector 'task-completed (task-id-of task) self))
-            (loop))))))
+            (when (process-alive? sup)
+              (run-task task)
+              (send sup (vector 'task-completed (task-id-of task) self))
+              (loop)))))))
 
   (define (supervisor n run-task fail-task max-retries stuck-ms retryable?)
     (define idle '())

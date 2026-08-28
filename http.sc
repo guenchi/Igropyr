@@ -30,6 +30,32 @@
   (export http-listen http-swap! http-set-ws!
           http-stats http-stats-json http-shutdown! http-write-timeout!
           http-request-deadline!
+          ;; A CONTROL CAPABILITY, and named as one here rather than
+          ;; described as introspection, which is what an earlier version of
+          ;; this comment called it. A live pid is authority, not a
+          ;; reading, and this library re-exports send and kill below, so
+          ;; whoever holds this can:
+          ;;   (kill (http-server-sup srv) 'anything)  -- ends the image,
+          ;;       because the pool supervisor is marked critical
+          ;;   (send (http-server-sup srv) <datum>)    -- speaks the pool's
+          ;;       private protocol directly, around the HTTP layer
+          ;; and the pid stops addressing anything once that process dies:
+          ;; nothing here mints a replacement. Do not hold it across a
+          ;; restart of anything.
+          ;;
+          ;; THE ARGUMENT THAT IT WAS ALREADY READABLE WAS WRONG. http-stats
+          ;; reads the same value internally, and an internal dependency is
+          ;; not public access -- reaching the process is a different thing
+          ;; from reading a number derived from it.
+          ;;
+          ;; What it is honestly for: tests and operational checks that must
+          ;; act on the supervisor -- the suite that owns the critical
+          ;; marking kills it -- and any future deliberate use of the pool's
+          ;; lifecycle. NOT for health checking. Something that only wants
+          ;; to know whether the pool is still alive should use
+          ;; http-server-pool-alive?, which answers without handing over
+          ;; the means to end the process.
+          http-server-sup http-server-pool-alive?
           ;; record predicates, exported for boundary contracts
           ;; ((igropyr checked) in the framework layers) and any
           ;; user code that wants to type-test req/res values
@@ -1825,6 +1851,25 @@
   (define (http-set-ws! srv resolver)
     (set-box! (http-server-wsbox srv) resolver))
 
+  ;; IS THIS SERVER'S POOL SUPERVISOR STILL ALIVE -- that, and only that.
+  ;; The name says pool on purpose. An earlier version of this was called
+  ;; http-server-alive? and documented as "can this server still serve",
+  ;; which it cannot answer: http-shutdown! stops the listener and leaves
+  ;; the supervisor running, so the predicate stays true for a server that
+  ;; will never accept another request (measured).
+  ;;
+  ;; What it IS good for: the pool supervisor is where requests go, so its
+  ;; death means this server cannot serve -- a false answer is conclusive.
+  ;; A true answer is not: readiness would also need the listener, and this
+  ;; does not look at it. It says nothing about load either; a pool with
+  ;; every worker busy and a long queue is alive, and http-stats is where
+  ;; that is answered.
+  ;;
+  ;; It exists so that something which only wants to observe does not have
+  ;; to take http-server-sup, which hands over the means to end the image.
+  (define (http-server-pool-alive? srv)
+    (process-alive? (http-server-sup srv)))
+
   ;; runtime snapshot: open connections, total requests, uptime, and the
   ;; worker pool's idle/busy/pending counters
   (define (http-stats srv)
@@ -1946,6 +1991,24 @@
       (unless (and (string? host) (> (string-length host) 0))
         (assertion-violation 'http-listen "host must be a non-empty string" host))
       (set-box! supbox sup)
+      ;; LOSING THE POOL SUPERVISOR LEAVES A LISTENER THAT CANNOT SERVE.
+      ;; Every request is submitted to it, so once it is gone requests are
+      ;; submitted to nothing and time out -- while the process is still
+      ;; running and still accepting connections. Marking it critical turns
+      ;; that into an exit 70 instead. Nothing here could restart it and
+      ;; reattach the workers and tasks it owned, which is why the answer is
+      ;; to end the image rather than to grow a supervision tree.
+      ;;
+      ;; THE NAME CARRIES THE PORT, because a process may run several
+      ;; listeners -- an application port and an admin or metrics port are
+      ;; the usual pair -- and a panic saying only "http-worker-pool" would
+      ;; not say which. ASSUMED HERE, and queued rather than built: that
+      ;; every listener in the process is one the image cannot serve
+      ;; without. A genuinely optional listener has no way to opt out of
+      ;; this, and taking one down will end the process.
+      (critical! sup (string->symbol
+                       (string-append "http-worker-pool:"
+                                      (number->string port))))
       (http-server-listener-set! srv
         (tcp-listen! host port 511
           (lambda (c)

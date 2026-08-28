@@ -20,7 +20,8 @@
           link monitor demonitor process-trap-exit kill
           register unregister whereis
           sleep-ms process-alive? process-id process-count
-          start-scheduler)
+          process-monitor-count
+          critical! uncritical! start-scheduler)
   (import (chezscheme) (igropyr libuv))
 
   (define process-default-ticks 100000)
@@ -98,6 +99,32 @@
   (define (alive? p) (and (pcb-inbox p) #t))
   (define process-alive? alive?)
   (define (process-id p) (pcb-id p))
+
+  ;; HOW MANY ENTRIES ARE IN THIS PROCESS'S MONITOR LIST -- entries, not
+  ;; relationships, and the difference is observable. A watch puts the SAME
+  ;; record into the watcher's list and the watched process's list, so it
+  ;; contributes one entry here whichever end this process is. When both
+  ;; ends are this process, (monitor self), it contributes TWO: measured,
+  ;; the count went from 2 to 4 for one such call.
+  ;;
+  ;; SO THE NUMBER IS FOR COMPARING WITH ITSELF, not for reading absolutely.
+  ;; A value of 5 does not say five watches, or in which direction. Take a
+  ;; baseline, perform the operation, compare -- which is what it is for:
+  ;;
+  ;; A LEAKED MONITOR IS NEARLY INVISIBLE. It occupies memory, adds to the
+  ;; work done when either process dies, and can produce a DOWN that some
+  ;; handler then ignores -- none of which any assertion is watching. So a
+  ;; test that removes the demonitor from a mark-and-replace path stays
+  ;; green, which is how the leak this exists to catch was written. Counting
+  ;; is what makes that visible; it is not the only trace, only the one a
+  ;; cell can hold on to.
+  ;;
+  ;; It is a length, so it walks the list. Fine for introspection, not for a
+  ;; hot path.
+  (define (process-monitor-count p)
+    (unless (pcb? p)
+      (assertion-violation 'process-monitor-count "not a process" p))
+    (length (pcb-monitors p)))
 
   ;; ---- global scheduler state ------------------------------------------
 
@@ -748,6 +775,81 @@
   ;; Boot the world: the calling (OS-level) continuation becomes process
   ;; #1 and parks forever; libuv and the preemption timer are set up; the
   ;; event-loop process and the boot process are spawned. Never returns.
+  ;; ---- critical components -----------------------------------------------
+  ;;
+  ;; THE SENTINEL IS ALREADY DOING THIS FOR ONE PROCESS. Process #1 watches
+  ;; boot and panics unless it exits 'normal, so a boot failure cannot leave
+  ;; a healthy event loop running with no application. A component the image
+  ;; depends on afterwards -- the worker pool's supervisor is the first --
+  ;; needs the same treatment, and this generalises the watch from that one
+  ;; process to a set -- with a different rule, not the same one: see below,
+  ;; boot may finish normally and a marked component may not. It is not a
+  ;; supervision tree: nothing is restarted in
+  ;; place. The image exits 70 and whatever started it decides what happens
+  ;; next; whether that is a restart is that supervisor's configuration, not
+  ;; something this code can promise.
+  ;;
+  ;; ANY EXIT PANICS, INCLUDING 'normal, and that is the difference from
+  ;; boot. Boot returning normally is what success looks like. A pool
+  ;; supervisor returning normally is not a stop, it is a component that was
+  ;; supposed to run forever and fell off the end of its loop -- a missing
+  ;; recursion, an unexpected branch -- and 'normal cannot tell that apart
+  ;; from a deliberate one. Treating them alike would leave the image
+  ;; running without the component, answering liveness checks and serving
+  ;; nothing, which is the exact state critical! exists to prevent.
+  ;;
+  ;; SO A DELIBERATE STOP SAYS SO, with uncritical!, before stopping. That
+  ;; makes the intent a call rather than an exit reason: the two are then
+  ;; distinguishable, and the ambiguous case defaults to fatal.
+  (define sentinel-pid #f)
+
+  ;; Both validate in the CALLER. A bad argument discovered later would be
+  ;; raised inside process #1 -- the process responsible for propagating
+  ;; fatal failure -- which is the worst place in the image to put an
+  ;; unexpected exception. The name is required to be a symbol because it is
+  ;; the part of the panic that says WHICH component (the exit reason is
+  ;; printed beside it), and because a #f name once made an earlier version
+  ;; of the sentinel treat the entry as absent.
+  ;; The shared half is only what both callers actually share. The name is
+  ;; checked in critical! itself: uncritical! has no name, and folding that
+  ;; difference into the helper with a "when there is a name" made #f a
+  ;; legal name for the caller that has to refuse it.
+  (define (critical-check who p)
+    (unless sentinel-pid
+      (assertion-violation who "call inside start-scheduler" p))
+    (unless (pcb? p)
+      (assertion-violation who "not a process" p)))
+
+  (define (critical! p name)
+    (critical-check 'critical! p)
+    (unless (symbol? name)
+      (assertion-violation 'critical! "name must be a symbol" name))
+    (send sentinel-pid (vector 'critical p name))
+    (void))
+
+  ;; Registration and removal are asynchronous -- both return once the
+  ;; request is queued, not once the sentinel has acted -- and THAT IS
+  ;; ENOUGH, because the queue is where the order is decided. Enqueueing is
+  ;; the linearisation point: a stop issued after uncritical! cannot put a
+  ;; DOWN ahead of the removal already sitting in the sentinel's mailbox.
+  ;; So this is safe, with no yield in between:
+  ;;
+  ;;   (uncritical! p) (kill p 'whatever)      ;; and (uncritical! self)
+  ;;                                           ;; immediately before returning
+  ;;
+  ;; Measured, with a control: the first sequence does not panic, while the
+  ;; same kill without the uncritical! does. Do not add a warning here
+  ;; telling callers to yield first -- there is no hazard to warn about, and
+  ;; a warning about one would make a correct sequence look dangerous.
+  ;;
+  ;; A death that was ALREADY queued still wins, which is the right way
+  ;; round: unmarking cannot retroactively excuse a component that has
+  ;; already gone.
+  (define (uncritical! p)
+    (critical-check 'uncritical! p)
+    (send sentinel-pid (vector 'uncritical p))
+    (void))
+
   (define (start-scheduler boot-thunk)
     (uv-init!)
     (uv-set-deliver! send)
@@ -761,10 +863,48 @@
       ;; must not leave a healthy event loop running with no application.
       ;; Normal boot completion is expected after setup and is ignored.
       (monitor boot-pid)
-      (let forever ()
-        (receive (after 3600000 (forever))
-          (`#(DOWN ,@boot-pid ,reason)
-            (if (eq? reason 'normal)
-                (forever)
-                (panic 'boot reason)))))))
+      (set! sentinel-pid self)
+      ;; The DOWN pattern is general now and the pid is dispatched on in the
+      ;; body: boot keeps its own reading -- normal completion is success
+      ;; there -- while a marked component panics on ANY reason, under the
+      ;; symbol its critical! call supplied, which is a diagnostic label and
+      ;; not a lookup in the process registry. A DOWN from anything else --
+      ;; a monitor this process took for some other purpose -- is ignored
+      ;; rather than read as a critical failure.
+      ;; pid -> (name . monitor). The monitor is kept so uncritical! can
+      ;; take the watch back off; the pair also keeps presence and value
+      ;; apart, since hashtable-contains? decides membership and the stored
+      ;; value is only read once membership is known.
+      (let ((crit (make-eq-hashtable)))
+        (let forever ()
+          (receive (after 3600000 (forever))
+            ;; A REPEATED MARK REPLACES, it does not accumulate. Marking
+            ;; the same pid twice used to install a second monitor and
+            ;; overwrite the only reference to the first, so uncritical!
+            ;; could remove only the newer one and the older stayed in both
+            ;; processes' monitor lists until one of them died. Mark and
+            ;; unmark a long-lived process in a loop and that list grows
+            ;; without bound.
+            (`#(critical ,p ,name)
+              (when (hashtable-contains? crit p)
+                (demonitor (cdr (hashtable-ref crit p #f))))
+              (hashtable-set! crit p (cons name (monitor p)))
+              (forever))
+            (`#(uncritical ,p)
+              (let ((e (and (hashtable-contains? crit p)
+                            (hashtable-ref crit p #f))))
+                (when e (demonitor (cdr e)) (hashtable-delete! crit p)))
+              (forever))
+            ;; The DOWN pattern is general and the pid is dispatched on
+            ;; here: boot keeps its own reading, a marked component panics
+            ;; on ANY reason, and a DOWN from anything else -- a monitor
+            ;; this process took for some other purpose -- is ignored
+            ;; rather than read as a critical failure.
+            (`#(DOWN ,p ,reason)
+              (cond
+                ((eq? p boot-pid)
+                 (if (eq? reason 'normal) (forever) (panic 'boot reason)))
+                ((hashtable-contains? crit p)
+                 (panic (car (hashtable-ref crit p #f)) reason))
+                (else (forever)))))))))
 )
