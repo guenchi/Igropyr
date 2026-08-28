@@ -1736,19 +1736,29 @@
   ;; interval the last outage had grown to -- while a link that dies
   ;; faster than the retry it replaced counts as the failure it is.
   ;;
-  ;; THE BAR IS THE INTERVAL THIS LINK REPLACED -- the delay the previous
-  ;; round was set to wait, carried forward as `waited`, and not a delay
-  ;; recomputed from an attempt number. It is that nominal interval and
-  ;; not a measurement: draining stragglers and ordinary scheduling can
-  ;; make the real gap longer, and an inbound link that survives most of
-  ;; the interval and drops near its end leaves the dial replacing far
-  ;; less downtime than the bar it is judged against. Both make the bar
-  ;; slightly harsh, never lax. Recomputing instead draws fresh jitter:
-  ;; the bar and the wait would be two independent samples of +/-25%, so a
-  ;; link could outlast the interval this node actually waited and still
-  ;; be judged short, by as much as a factor of 1.67 at the extremes.
-  ;; Comparing against the number that WAS waited is exact, and needs no
-  ;; argument about how far apart two samples can be.
+  ;; THE BAR IS THE INTERVAL THE PREVIOUS ROUND WAS SET TO WAIT, carried
+  ;; forward as `waited`, rather than a delay recomputed from an attempt
+  ;; number. Recomputing draws fresh jitter: the bar and the wait would be
+  ;; two independent samples of +/-25%, so a link could outlast the
+  ;; interval this node actually waited and still be judged short, by as
+  ;; much as a factor of 1.67 at the extremes. Carrying the number
+  ;; forward removes that particular gap between the two.
+  ;;
+  ;; IT IS A NOMINAL INTERVAL AND NOT A MEASUREMENT, and it is off in
+  ;; BOTH directions -- an earlier version of this paragraph claimed the
+  ;; error was one-sided, and it is not:
+  ;;   - too lax: scheduling and straggler draining can make the real gap
+  ;;     longer than the nominal one, and the comparison still uses the
+  ;;     shorter nominal number, so a link that did not really outlast
+  ;;     the wait can clear the bar;
+  ;;   - too harsh: an inbound link that survives most of the interval
+  ;;     and drops near its end leaves the dial replacing very little
+  ;;     downtime, while the bar is still the whole nominal interval.
+  ;; Both are bounded by the same quantity the backoff is built out of,
+  ;; and neither changes what the bar is for. Measuring the real gap
+  ;; instead would need a second clock reading whose only use is this
+  ;; comparison; that is the trade, stated rather than hidden behind a
+  ;; claim that the number is exact.
   ;;
   ;; The bar rises with the backoff: each failure lengthens the next wait,
   ;; and that wait is what the peer must then outlast to earn a short
@@ -1782,12 +1792,21 @@
   ;; against a fixed deadline keeps the wait the wait.
   (define (connector peer host port)
     (guard (e (#t (void)))                      ; 'stop lands here too
-      ;; The first round has no interval behind it, so the bar starts at
-      ;; the shortest one this node would ever wait. Seeding it at zero
-      ;; instead lets the first authenticated link -- however briefly it
-      ;; lived, including a tie-break loser that never ran -- clear a bar
-      ;; of nothing and count as a link worth having.
-      (let loop ((attempt 0) (waited reconnect-base-ms))
+      ;; The first round waited nothing -- the connector dials as soon as
+      ;; it starts -- so there is no interval behind it to carry forward.
+      ;; The bar is instead the delay THIS PAIR would wait at attempt 0:
+      ;; a floor rather than a replaced interval, and deliberately the
+      ;; jittered value reconnect-delay gives for attempt 0, not the
+      ;; un-jittered constant it is drawn from. Those two differ by up to
+      ;; a quarter in EITHER direction, so seeding with the constant
+      ;; misjudges the first link both ways -- one that outlasted this
+      ;; pair's real shortest delay recorded as a failure, or one that
+      ;; never reached it recorded as a success.
+      ;;
+      ;; Seeding it at zero, which is what this was, is worse than either:
+      ;; any authenticated link clears a bar of nothing, including a
+      ;; tie-break loser that never ran.
+      (let loop ((attempt 0) (waited (reconnect-delay self-name peer 0)))
         (let* ((next (if (live-entry peer)      ; a surviving inbound counts
                          attempt
                          (let ((up (dial! peer host port)))
