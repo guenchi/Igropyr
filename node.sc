@@ -570,8 +570,9 @@
       (void)))
 
   ;; SERIALIZING AND SUBMITTING ARE SEPARATE BECAUSE ONLY ONE OF THEM CAN
-  ;; FAIL. frame-body raises -- the writer refuses the datum, or the frame
-  ;; is over the limit -- and write-body! does not. A caller that has to
+  ;; FAIL. frame-segments raises -- the writer refuses the datum, or the
+  ;; frame is over the limit -- and write-body! reports instead. A caller
+  ;; that has to
   ;; publish something before it writes (rcall's pending entry,
   ;; monitor-remote's rmonitors entry, both of which must exist before the
   ;; write because the write is a safe point and the answer can arrive
@@ -587,7 +588,7 @@
   ;; remote-down carries no mref, so a drain pattern would just as happily
   ;; eat a different monitor's DOWN. Raising before publishing is the only
   ;; version with nothing left over.
-  (define (frame-body datum)
+  (define (frame-segments datum)
     (let ((body (string->utf8 (sexpr->string-extended datum))))
       ;; NEVER SEND A FRAME THIS IMPLEMENTATION WOULD ITSELF REFUSE. The
       ;; reader drops the connection on an oversized frame -- correctly, it
@@ -607,37 +608,45 @@
         (assertion-violation 'write-frame!
           "message is larger than the wire frame limit"
           (list 'bytes (bytevector-length body) 'limit max-frame)))
-      body))
+      ;; THE WHOLE FRAME IS MATERIALIZED HERE, header included, so that a
+      ;; caller which must publish state before writing has nothing left
+      ;; that can fail on it except the submission itself. Building the
+      ;; header in the submitting procedure would put an allocation after
+      ;; the publication point, which is the shape this split exists to
+      ;; remove.
+      (list (string->utf8
+              (string-append (number->string (bytevector-length body)) "\n"))
+            body)))
 
   (define (write-frame! c datum)
-    (write-body! c (frame-body datum)))
+    (write-body! c (frame-segments datum)))
 
-  ;; Submit an already-serialized body.
+  ;; Submit an already-materialized frame. -> #t if it was handed to
+  ;; libuv, #f if it was not.
   ;;
-  ;; DOES NOT RAISE, and that is enforced here rather than asserted. The
-  ;; submission can fail in the OOM domain -- foreign-alloc for the queued
-  ;; block, or the table entry that publishes its completion -- and an
-  ;; exception escaping this procedure would land in callers that have
-  ;; already published state they can no longer take back (see
-  ;; frame-body). Failure is reported the way a write to a closed
-  ;; connection is: the charge is refunded and the answer is #f.
+  ;; THE FAILURE DOMAIN AFTER A CALLER'S PUBLICATION POINT IS THIS
+  ;; PROCEDURE'S SUBMISSION, AND NOTHING ELSE. frame-segments has already
+  ;; built every byte, so what remains that can fail is the queued path's
+  ;; allocation and the table entry that publishes its completion -- the
+  ;; OOM domain. Those are reported as #f, the same answer a write to a
+  ;; closed connection gives, because a caller that has published state
+  ;; can act on a returned #f and cannot act on an exception.
   ;;
-  ;; REFUNDING ONCE IS CORRECT, and the reason is in libuv.sc rather than
-  ;; here, so it is named to be checked: in enqueue-write! everything that
-  ;; can raise -- the allocation, the fill, the table insert -- happens
-  ;; BEFORE the completion is registered, and every path after the
-  ;; registration reports failure by returning rather than raising. So an
-  ;; exception arriving here means no completion exists to refund a second
-  ;; time. If that ever stops being true, this refund becomes a double
-  ;; refund, which drives the count negative and raises the effective
-  ;; ceiling instead of enforcing it.
+  ;; ONE RESIDUE INSIDE THAT DOMAIN: outbound-charge! runs before the
+  ;; guard below and allocates (a table entry, and on a first write a
+  ;; close hook), so an OOM there still escapes as an exception. It is
+  ;; named rather than caught: catching it would mean reporting #f for a
+  ;; frame whose charge may or may not have landed.
   ;;
-  ;; WHAT THE CALLERS GET IN THAT DOMAIN, stated because #f is easy to
-  ;; ignore: rsend never promised delivery anyway; an rcall's pending
-  ;; entry is reclaimed by its own timeout; monitor-remote leaves a watch
-  ;; armed here whose mon frame never reached the target, so it reports
-  ;; nothing until the link drops. That last one is a real residue of the
-  ;; OOM path, not a clean failure.
+  ;; REFUNDING ONCE IS CORRECT, and the reason lives in libuv.sc rather
+  ;; than here, so it is named to be checked: in enqueue-write!
+  ;; everything that can raise -- the allocation, the fill, the table
+  ;; insert -- happens BEFORE the completion is registered, and every
+  ;; path after the registration reports failure by returning rather than
+  ;; raising. An exception arriving here therefore means no completion
+  ;; exists to refund a second time. If that ever stops being true, this
+  ;; refund becomes a double refund, which drives the count negative and
+  ;; raises the effective ceiling instead of enforcing it.
   ;;
   ;; THE ONLY OUTBOUND PATH ON A NODE LINK. Every frame this library
   ;; sends -- handshake, heartbeat, send, call, reply, monitor traffic --
@@ -660,11 +669,9 @@
   ;; stopped being queued either way -- and a failed write is NOT a
   ;; backpressure close: it leaves the link to end the way write failures
   ;; already end it, with the peer no longer readable.
-  (define (write-body! c body)
-    (let* ((head (string->utf8
-                   (string-append (number->string (bytevector-length body))
-                                  "\n")))
-           (total (+ (bytevector-length head) (bytevector-length body))))
+  (define (write-body! c segs)
+    (let ((total (fold-left (lambda (a b) (+ a (bytevector-length b)))
+                            0 segs)))
       ;; THE CHARGE AND THE SUBMISSION ARE ONE UNINTERRUPTIBLE STEP. A
       ;; kill between them leaves bytes charged that no completion will
       ;; ever refund, because the write was never submitted and a killed
@@ -701,14 +708,19 @@
         (let ((r (atomically
                    (set! over? (outbound-charge! c total))
                    (guard (e (#t (outbound-discharge! c total)
-                                 ;; the bytes are not queued, so the
-                                 ;; verdict they produced goes back too:
-                                 ;; closing for a charge that has been
-                                 ;; refunded would kill a connection over
-                                 ;; traffic that never left this process
-                                 (set! over? #f)
+                                 ;; RE-READ, do not clear. These bytes
+                                 ;; never queued, so the verdict must not
+                                 ;; rest on them -- but the verdict was
+                                 ;; about the connection's whole balance,
+                                 ;; and the rest of it can be over the
+                                 ;; ceiling on somebody else's in-flight
+                                 ;; writes. Clearing outright drops a
+                                 ;; close that was due; asking again after
+                                 ;; the refund answers about what is
+                                 ;; actually still queued.
+                                 (set! over? (outbound-over? c))
                                  #f))
-                     (tcp-writev! c (list head body)
+                     (tcp-writev! c segs
                        (lambda (status) (outbound-discharge! c total)))))))
           (when over? (close-for-backpressure! c))
           r))))
@@ -1163,10 +1175,24 @@
         (vector-ref e 1)                        ; e.g. gen-server-error tag
         'unavailable))
 
-  ;; write one datum to a peer by name, if the link is live
+  ;; Write one datum to a peer by name, if the link is live.
+  ;; -> #t only if it was handed to libuv.
+  ;;
+  ;; WHO READS THIS ANSWER, and why the others do not. rcall and
+  ;; monitor-remote read it, because each has published state that a
+  ;; refused frame would strand. The rest do not, and each has a reason
+  ;; that is not "nobody thought about it":
+  ;;   - ping/pong and the handshake frames are covered by a timeout at
+  ;;     the far end -- a frame that does not go out presents as silence,
+  ;;     which those paths already treat as a dead link;
+  ;;   - an rcall reply, an overload shed, an mdown: the peer waiting for
+  ;;     them has its own timeout, and there is no second thing this node
+  ;;     could usefully do with the knowledge;
+  ;;   - rsend is fire-and-forget by contract, and now returns this
+  ;;     answer rather than an unconditional #t.
   (define (link-write peer datum)
     (let ((e (live-entry peer)))
-      (and e (begin (write-frame! (vector-ref e 0) datum) #t))))
+      (and e (write-frame! (vector-ref e 0) datum))))
 
   ;; ---- cross-node process monitor ----------------------------------------
 
@@ -1318,7 +1344,8 @@
       ;; that dribbles holds the ping off indefinitely -- and it need
       ;; never complete a frame to do it: a valid length header followed
       ;; by one body byte every few seconds keeps parse-frame answering
-      ;; `incomplete` for as long as the peer likes, so a check placed
+      ;; `incomplete` for as long as max-frame allows -- a bounded but
+      ;; absurd span, years at one byte per tick -- so a check placed
       ;; after dispatch! is never reached. The check belongs where the
       ;; loop is entered, which is every wake-up: arriving bytes are what
       ;; suppresses the timer, and now they are also what supplies the
@@ -1359,9 +1386,15 @@
               (`#(node-stop) (raise 'stop)))
             (begin (dispatch! c peer d) (drain))))))
 
-  ;; Run the link until it drops, then clean up. Never raises.
+  ;; Run the link until it drops, then clean up.
   ;; -> the moment the link STOPPED CARRYING TRAFFIC, read before the
   ;; teardown rather than after it.
+  ;;
+  ;; The guard catches every way link-loop ends -- 'closed, 'protocol,
+  ;; 'stop, 'outbound-backpressure -- so no link failure reaches the
+  ;; caller. What is left is the teardown's own failure domain: it sends
+  ;; messages and touches tables, so an allocation failure there does
+  ;; propagate. Stated rather than promised away.
   ;;
   ;; The distinction matters because dial! subtracts this to get the
   ;; link's lifetime, and the backoff decides on that number. The teardown
@@ -1951,8 +1984,9 @@
 
   ;; Send msg to the process registered as reg-name on node. #t = handed
   ;; to a live link (delivery still unconfirmed, as within a node); #f =
-  ;; no link. Own node name = plain local send. Raises if msg contains
-  ;; data outside the extended wire whitelist.
+  ;; no link, or the frame was refused before it reached the socket.
+  ;; Own node name = plain local send. Raises if msg contains data
+  ;; outside the extended wire whitelist.
   (define (rsend node reg-name msg)
     (cond
       ((eq? node self-name)
@@ -1969,8 +2003,11 @@
          (and p (begin (send p msg) #t))))
       ((live-entry node)
        => (lambda (e)
-            (write-frame! (vector-ref e 0) (list 'send reg-name msg))
-            #t))
+            ;; #t meant "there was a live link" and was returned whether
+            ;; or not the frame reached libuv. It now means the frame was
+            ;; handed over, which is the most this call can honestly
+            ;; report -- delivery is still unconfirmed either way.
+            (write-frame! (vector-ref e 0) (list 'send reg-name msg))))
       (else #f)))
 
   ;; Synchronous cross-node call to the GEN-SERVER registered as
@@ -2016,15 +2053,35 @@
               ;; published before the write, because the write is a safe
               ;; point and the reply can be routed by the link process
               ;; before this one runs again -- it would find nothing. So
-              ;; everything that can fail happens first: frame-body
+              ;; everything that can fail happens first: frame-segments
               ;; refuses an oversized or unwritable payload here, where
               ;; nothing has been published and there is nothing to undo.
-              ;; write-body! does not raise. (Undoing afterwards would not
-              ;; be enough anyway -- see frame-body.)
+              ;; (Undoing afterwards would not be enough anyway -- see
+              ;; frame-segments.)
               (let* ((ref (next-rcall-ref!))
-                     (body (frame-body (list 'call reg-name ref msg timeout))))
+                     (segs (frame-segments
+                             (list 'call reg-name ref msg timeout))))
                 (atomically (hashtable-set! pending ref (vector self node)))
-                (write-body! (vector-ref e 0) body)
+                ;; A REFUSED SUBMISSION IS ANSWERED AS NO LINK. Nothing
+                ;; went out, so nothing will ever reply; waiting out the
+                ;; caller's whole timeout for an answer that cannot come
+                ;; is the hang this layer exists to avoid, and the reason
+                ;; is the one the no-link branch below already uses.
+                ;;
+                ;; ONLY IF THIS PROCESS STILL OWNS THE ENTRY. Between
+                ;; publishing and here, the link can drop and
+                ;; fail-pending-for! can remove the entry and deliver its
+                ;; own rcall-reply. Raising then would leave that message
+                ;; in this mailbox with no receive left to match it --
+                ;; the orphan this ordering was rebuilt to prevent. If
+                ;; the entry is already gone, someone else answered:
+                ;; fall through and let the receive collect it.
+                (unless (write-body! (vector-ref e 0) segs)
+                  (when (atomically
+                          (let ((v (hashtable-ref pending ref #f)))
+                            (when v (hashtable-delete! pending ref))
+                            (and v #t)))
+                    (raise (vector 'rcall-error 'noconnection node))))
                 (receive (after timeout
                             (atomically (hashtable-delete! pending ref))
                             (raise (vector 'rcall-error 'timeout reg-name)))
@@ -2074,13 +2131,33 @@
               ;; no origin field: the target derives the watcher from the
               ;; authenticated far end of this very link (see dispatch!)
               ;;
-              ;; Serialized before the watch is armed, for the reason
-              ;; frame-body gives: arming must precede the write, so the
-              ;; only way a refused frame leaves nothing behind is for the
-              ;; refusal to come first.
-              (let ((body (frame-body (list 'mon name mref))))
+              ;; Materialized before the watch is armed, for the reason
+              ;; frame-segments gives: arming must precede the write, so
+              ;; the only way a refused frame leaves nothing behind is for
+              ;; the refusal to come first.
+              ;;
+              ;; A REFUSED SUBMISSION IS ANSWERED AS NO LINK, exactly as
+              ;; the branch below does for a peer with no link at all: the
+              ;; target never heard of this mref, so it will never report
+              ;; anything, and a watch that reports nothing is the one
+              ;; outcome this API promises cannot happen. Disarm, then
+              ;; deliver the DOWN this caller is owed.
+              ;;
+              ;; ONLY IF THIS PROCESS STILL OWNS THE ENTRY -- if the link
+              ;; dropped in between, fail-monitors-for! has already
+              ;; removed it and delivered a noconnection of its own, and a
+              ;; second one would be a DOWN for a watch that ended.
+              (let ((segs (frame-segments (list 'mon name mref))))
                 (arm-rmonitor! mref node name)
-                (write-body! (vector-ref e 0) body))))
+                (unless (write-body! (vector-ref e 0) segs)
+                  (let ((entry (atomically
+                                 (let ((x (hashtable-ref rmonitors mref #f)))
+                                   (when x (hashtable-delete! rmonitors mref))
+                                   x))))
+                    (when entry
+                      (stop-owner-agent! mref)
+                      (send self (vector 'remote-down node name
+                                         'noconnection))))))))
         (else
          ;; no link at all: report immediately, nothing to install
          (send self (vector 'remote-down node name 'noconnection))))
