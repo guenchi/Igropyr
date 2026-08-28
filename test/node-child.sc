@@ -8,7 +8,7 @@
 ;;;     #(boom) -> raises (so the caller sees an rcall-error)
 ;;;   - starts pubsub, subscribes to 'room, relays #(pub room ,m) to
 ;;;     node a's 'main as #(heard ,m)
-;;; Exits by itself after 30s as a safety net.
+;;; Exits by itself after 60s as a safety net.
 
 (import (chezscheme) (igropyr actor) (igropyr node)
         (igropyr gen-server) (igropyr pubsub))
@@ -36,6 +36,20 @@
           (else (values 'bad state))))
       (lambda (msg state) state))
 
+    ;; A SEPARATE server for the slow-handler cells: 'calc is a corpse
+    ;; after the suite's boom call kills it, so anything after that
+    ;; ordering point would see no-such-server instead of what it came
+    ;; to measure. This one sleeps past the old 5s server-side default,
+    ;; inside a 10s caller timeout: only a timeout carried in the call
+    ;; frame lets the caller see 'slept (see test/node.sc).
+    (gen-server-start-named 'slowcalc
+      (lambda () 0)
+      (lambda (msg from state)
+        (case (vector-ref msg 0)
+          ((slow) (sleep-ms 6500) (values 'slept state))
+          (else (values 'bad state))))
+      (lambda (msg state) state))
+
     ;; relay room traffic back to node a so the test can observe fan-out
     (spawn (lambda ()
              (subscribe 'room)
@@ -50,7 +64,9 @@
                (let loop ()
                  (receive (`#(mon-die ,reason) (kill self reason)))))))
 
-    (spawn (lambda () (sleep-ms 30000) (exit 1)))   ; safety net
+    ;; safety net: generous enough to cover the slow-handler cells the
+    ;; suite runs against this child (two 'slow calls plus the rest)
+    (spawn (lambda () (sleep-ms 60000) (exit 1)))
     (let loop ()
       (receive
         (`#(add1 ,x ,payload)
@@ -58,5 +74,11 @@
           (loop))
         (`#(kill-watched ,reason)
           (let ((p (whereis 'watched))) (when p (kill p reason)))
+          (loop))
+        ;; the serve-side timeout cap is THIS node's setting, not the
+        ;; caller's; the suite lowers it through here to watch the cap
+        ;; arm of the min() without a sixty-second handler
+        (`#(set-serve-cap ,n)
+          (node-set-limits! #f #f #f #f n)
           (loop))
         (`#(quit) (exit 0))))))

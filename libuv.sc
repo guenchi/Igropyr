@@ -413,7 +413,9 @@
   ;; live listeners: handle address -> accept hook, one entry per
   ;; tcp-listen!. Keyed dispatch (not a single global) so several
   ;; servers can listen on different ports in one process; the table
-  ;; also roots the listener handles for the GC.
+  ;; also roots each listener's accept hook, which nothing else holds
+  ;; (the handles themselves are foreign-alloc'd and are not the GC's
+  ;; business).
   (define listener-table (make-eqv-hashtable))
 
   ;; global libuv state, allocated in uv-init!
@@ -1461,11 +1463,33 @@
   ;; socket is gone). This is the ONLY caller-visible identity a remote
   ;; client cannot forge -- unlike any header it sends -- so it is what
   ;; per-client policy (rate limiting, banning) must key on.
+  ;; THE STATE TEST AND THE HANDLE USE ARE ONE UNINTERRUPTIBLE STEP, here
+  ;; and at every other FFI call that passes conn-handle. This is the
+  ;; invariant, stated once for all of them:
+  ;;
+  ;;   a conn's handle may be passed to libuv only inside a region where
+  ;;   its state has been observed 'open WITHOUT an intervening safe point
+  ;;
+  ;; It is not hygiene. close_cb -- the only place handle memory is freed
+  ;; (see on-close-code) -- runs in the event-loop process, so it can only
+  ;; interleave where this process can be preempted. Testing the state,
+  ;; yielding, and then using the handle is a use-after-free: another
+  ;; process closes, the loop runs the close callback, foreign-free
+  ;; returns the memory, and the FFI call that follows hands libuv a dead
+  ;; pointer. Inside a with-interrupts-disabled region there is no
+  ;; preemption, the event loop cannot run, and the observation still
+  ;; holds when the call is made.
+  ;;
+  ;; The test is for 'open specifically, not for "not closed": a handle
+  ;; that has been submitted to uv_close is 'closing, and no FFI call
+  ;; should touch it again even though its memory is still there.
   (define (conn-peer-ip c)
-    (and (eq? (conn-state c) 'open)
-         (with-interrupts-disabled          ; shared peername buffers
-           (foreign-set! 'int peername-len 0 128)
-           (and (>= (uv-tcp-getpeername (conn-handle c) peername-buf peername-len) 0)
+    (with-interrupts-disabled          ; shared peername buffers
+      (and (eq? (conn-state c) 'open)
+           (begin
+             (foreign-set! 'int peername-len 0 128)
+             (and (>= (uv-tcp-getpeername (conn-handle c)
+                                          peername-buf peername-len) 0)
                 ;; sockaddr_in: sin_family differs in layout across
                 ;; platforms, but sin_addr is always at offset 4
                 (let ((fam (case platform-os
@@ -1476,13 +1500,14 @@
                          (number->string (foreign-ref 'unsigned-8 peername-buf 4)) "."
                          (number->string (foreign-ref 'unsigned-8 peername-buf 5)) "."
                          (number->string (foreign-ref 'unsigned-8 peername-buf 6)) "."
-                         (number->string (foreign-ref 'unsigned-8 peername-buf 7)))))))))
+                         (number->string (foreign-ref 'unsigned-8 peername-buf 7))))))))))
 
   ;; Start delivering #(tcp-data ...) messages to the conn's owner.
   ;; Call after conn-set-owner!.
   (define (tcp-read-start! c)
-    (when (eq? (conn-state c) 'open)
-      (uv-read-start (conn-handle c) on-alloc-entry on-read-entry)))
+    (with-interrupts-disabled          ; test and use: see conn-peer-ip
+      (when (eq? (conn-state c) 'open)
+        (uv-read-start (conn-handle c) on-alloc-entry on-read-entry))))
 
   ;; Stop delivering #(tcp-data ...), so the kernel's receive window closes
   ;; and the PEER is slowed down.
@@ -1496,8 +1521,9 @@
   ;;
   ;; Safe to call when reads are already stopped, and on a closed conn.
   (define (tcp-read-stop! c)
-    (when (eq? (conn-state c) 'open)
-      (uv-read-stop (conn-handle c)))
+    (with-interrupts-disabled          ; test and use: see conn-peer-ip
+      (when (eq? (conn-state c) 'open)
+        (uv-read-stop (conn-handle c))))
     (void))
 
   ;; Queue `len` bytes for an async write. fill-data! copies them into
@@ -1523,17 +1549,30 @@
       ;; completion is uv-write failing, and that path removes the entry
       ;; again. The whole publish/submit pair is interrupt-free so the
       ;; callback cannot observe a half-built state.
+      ;; The caller tested the state, but that was before this block was
+      ;; allocated and filled -- both safe points. Re-testing HERE, inside
+      ;; the region that submits, is what satisfies the invariant stated
+      ;; at conn-peer-ip; the earlier test is an early-out, not a
+      ;; guarantee. A connection closed in between takes the same exit as
+      ;; a rejected uv-write: the block is freed and on-done reports the
+      ;; failure, so the caller's accounting balances either way.
       (with-interrupts-disabled
-        (hashtable-set! write-table block
-          (or on-done (lambda (status) (void))))
-        (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
-          (if (< r 0)
-              (begin
-                (hashtable-delete! write-table block)
-                (foreign-free block)
-                (when on-done (on-done r))
-                #f)
-              #t)))))
+        (if (not (eq? (conn-state c) 'open))
+            (begin
+              (foreign-free block)
+              (when on-done (on-done -1))
+              #f)
+            (begin
+              (hashtable-set! write-table block
+                (or on-done (lambda (status) (void))))
+              (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
+                (if (< r 0)
+                    (begin
+                      (hashtable-delete! write-table block)
+                      (foreign-free block)
+                      (when on-done (on-done r))
+                      #f)
+                    #t)))))))
 
   ;; Write a sequence of bytevectors as one response. Small writes take
   ;; the uv_try_write fast path: the segments are packed into the shared
@@ -1561,26 +1600,34 @@
              ;; socket. with-interrupts-disabled is exit-safe; nothing in
              ;; here yields.
              (with-interrupts-disabled
-             ;; pack segments into scratch, then try to write in one shot
-             (let loop ((ss segs) (off 0))
-               (unless (null? ss)
-                 (let ((n (bytevector-length (car ss))))
-                   (memcpy-to-c (+ write-scratch off) (car ss) n)
-                   (loop (cdr ss) (+ off n)))))
-             (foreign-set! 'void* scratch-buf 0 write-scratch)
-             (foreign-set! 'unsigned-64 scratch-buf 8 total)
-             (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))
-               (cond
-                 ((= n total)                       ; fully written now
-                  (when on-done (on-done 0)) #t)
-                 ((and (> n 0) (< n total))         ; partial: queue the rest
-                  (enqueue-write! c (- total n)
-                    (lambda (dest) (memcpy-cc dest (+ write-scratch n) (- total n)))
-                    on-done))
-                 (else                              ; EAGAIN/0: queue all
-                  (enqueue-write! c total
-                    (lambda (dest) (memcpy-cc dest write-scratch total))
-                    on-done))))))
+             ;; The state test at the top of this procedure is an
+             ;; early-out; the fold above it is a safe point, so the
+             ;; observation that matters is this one, made in the same
+             ;; region as the call. See conn-peer-ip for the invariant.
+             (if (not (eq? (conn-state c) 'open))
+                 (begin (when on-done (on-done -1)) #f)
+                 (begin
+                   ;; pack segments into scratch, then write in one shot
+                   (let loop ((ss segs) (off 0))
+                     (unless (null? ss)
+                       (let ((n (bytevector-length (car ss))))
+                         (memcpy-to-c (+ write-scratch off) (car ss) n)
+                         (loop (cdr ss) (+ off n)))))
+                   (foreign-set! 'void* scratch-buf 0 write-scratch)
+                   (foreign-set! 'unsigned-64 scratch-buf 8 total)
+                   (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))
+                     (cond
+                       ((= n total)                 ; fully written now
+                        (when on-done (on-done 0)) #t)
+                       ((and (> n 0) (< n total))   ; partial: queue the rest
+                        (enqueue-write! c (- total n)
+                          (lambda (dest)
+                            (memcpy-cc dest (+ write-scratch n) (- total n)))
+                          on-done))
+                       (else                        ; EAGAIN/0: queue all
+                        (enqueue-write! c total
+                          (lambda (dest) (memcpy-cc dest write-scratch total))
+                          on-done))))))))
             (else                                    ; too big for scratch
              (enqueue-write! c total
                (lambda (dest)
@@ -1604,20 +1651,23 @@
     (if (not (eq? (conn-state c) 'open))
         (begin (when on-done (on-done -1)) #f)
         (with-interrupts-disabled          ; shared scratch-buf: see tcp-writev!
-          (foreign-set! 'void* scratch-buf 0 ptr)
-          (foreign-set! 'unsigned-64 scratch-buf 8 len)
-          (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))
-            (cond
-              ((= n len)                          ; fully written now
-               (when on-done (on-done 0)) #t)
-              ((and (> n 0) (< n len))            ; partial: queue the rest
-               (enqueue-write! c (- len n)
-                 (lambda (dest) (memcpy-cc dest (+ ptr n) (- len n)))
-                 on-done))
-              (else                               ; EAGAIN/0: queue all
-               (enqueue-write! c len
-                 (lambda (dest) (memcpy-cc dest ptr len))
-                 on-done)))))))
+          (if (not (eq? (conn-state c) 'open))   ; see conn-peer-ip
+              (begin (when on-done (on-done -1)) #f)
+              (begin
+                (foreign-set! 'void* scratch-buf 0 ptr)
+                (foreign-set! 'unsigned-64 scratch-buf 8 len)
+                (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))
+                  (cond
+                    ((= n len)                    ; fully written now
+                     (when on-done (on-done 0)) #t)
+                    ((and (> n 0) (< n len))      ; partial: queue the rest
+                     (enqueue-write! c (- len n)
+                       (lambda (dest) (memcpy-cc dest (+ ptr n) (- len n)))
+                       on-done))
+                    (else                         ; EAGAIN/0: queue all
+                     (enqueue-write! c len
+                       (lambda (dest) (memcpy-cc dest ptr len))
+                       on-done)))))))))
 
   ;; Idempotent close; memory is freed only in close_cb, so there is no
   ;; double-close and no fd leak.
@@ -1644,9 +1694,22 @@
                   (begin (conn-set-cleanup! c thunk) #f)))))
       (when run-now? (thunk))))
 
+  ;; THE TEST AND THE CLOSE ARE ONE STEP, and that is what makes this
+  ;; idempotent rather than merely usually-idempotent. The state test and
+  ;; uv-close are separated by a safe point, so two closers -- and this
+  ;; connection has them, since a writer over its outbound ceiling closes
+  ;; from its own process while the reader's error path closes from
+  ;; another -- can both read 'open, both set 'closing, and both call
+  ;; uv_close on the same handle. libuv answers a second uv_close on a
+  ;; closing handle with an assert, which is not an exception this process
+  ;; can catch. Disabling interrupts across the pair is the precondition
+  ;; for the guarantee this procedure advertises, NOT an optimisation, and
+  ;; it costs nothing: uv_close only files the handle for its close
+  ;; callback and does not block.
   (define (tcp-close! c)
-    (when (and (eq? (conn-state c) 'open)
-               (= 0 (uv-is-closing (conn-handle c))))
-      (conn-set-state! c 'closing)
-      (uv-close (conn-handle c) on-close-entry)))
+    (with-interrupts-disabled
+      (when (and (eq? (conn-state c) 'open)
+                 (= 0 (uv-is-closing (conn-handle c))))
+        (conn-set-state! c 'closing)
+        (uv-close (conn-handle c) on-close-entry))))
 )

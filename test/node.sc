@@ -6,6 +6,11 @@
 ;;;   - node-down when the peer exits
 ;;;   - a peer with the WRONG secret never becomes a node
 ;;;   - rsend to a disconnected node returns #f; to self delivers locally
+;;;   - v3 call frames carry the caller's timeout; the stale 4-element
+;;;     arity and a malformed timeout slot drop the link
+;;;   - per-connection outbound backpressure: a slow reader is closed
+;;;     promptly, paced traffic is not, the accounting dies with the conn
+;;;   - reconnect delay: bounded, deterministic, dispersed across names
 
 (import (chezscheme) (igropyr actor) (igropyr libuv)
         (igropyr node) (igropyr pubsub)
@@ -77,7 +82,7 @@
 
 ;; the CURRENT proof formula, and its anchor. The digest below is a
 ;; literal computed by an INDEPENDENT implementation (python hmac) over
-;; the exact bytes "0123456789abcdef0123456789abcdef:a:2" with the key
+;; the exact bytes "0123456789abcdef0123456789abcdef:a:3" with the key
 ;; "test-mesh-secret". Without it, every proof cell would only show that
 ;; the library agrees with itself (or with this helper) -- both sides of
 ;; such a comparison can drift together. If THIS check fails, the test
@@ -99,8 +104,8 @@
 (define colon-nonce "0123456789abcdef:123456789abcdef")
 (define kat-nonce "0123456789abcdef0123456789abcdef")
 (define kat-hello-proof
-  "6dce4923ad94cc2b347c9872217cd026328c9733e924a29506ada60f46621b99")
-(unless (equal? (versioned-proof kat-nonce 'a 2) kat-hello-proof)
+  "2f8cc2827c8770ca1b3d5d61682cdbf066fbce46c22b68b62d04bba4e2f53c75")
+(unless (equal? (versioned-proof kat-nonce 'a 3) kat-hello-proof)
   (fail! "versioned-proof-helper-diverged-from-known-answer"))
 
 (define (has-substr? s sub)
@@ -110,6 +115,32 @@
             ((string=? (substring s i (+ i m)) sub) #t)
             (else (loop (+ i 1)))))))
 
+;; Dial node a and complete a CURRENT-version handshake by hand, as
+;; `name`; returns the open conn. Runs in the calling process, which
+;; owns the socket. This is the doorway to the post-auth cells below:
+;; what they probe only exists on an authenticated link, so each one
+;; must first BE a peer. Any surprise here is a fail!, not a report --
+;; the handshake itself already has its own cells.
+(define (handshake-as! name label)
+  (tcp-connect! "127.0.0.1" port self)
+  (receive (after 3000 (fail! label 'no-connect))
+    (`#(tcp-connected ,c)
+      (tcp-read-start! c)
+      (let ((d (read-frame-or-closed label)))
+        (unless (and (pair? d) (eq? (car d) 'challenge)
+                     (string? (cadr d)) (eqv? (caddr d) 3))
+          (fail! label 'challenge-shape d))
+        (tcp-write! c (frame-bytes
+                        (list 'hello name
+                              (versioned-proof (cadr d) name 3)
+                              "feedfeedfeedfeedfeedfeedfeedfeed" 3))
+                    #f)
+        (let ((w (read-frame-or-closed label)))
+          (unless (and (pair? w) (eq? (car w) 'welcome))
+            (fail! label 'no-welcome w))))
+      c)
+    (`#(tcp-connect-failed ,e) (fail! label 'no-connect e))))
+
 (start-scheduler
   (lambda ()
     (node-start! 'a secret port)
@@ -117,6 +148,73 @@
     (start-pubsub!)
     (register 'main self)
     (monitor-node 'b)
+
+    ;; ---- reconnect delay: bounds, determinism, dispersion ---------------
+    ;; The schedule is a pure exported function precisely so this can be
+    ;; measured: the property that matters -- a herd of nodes that lost
+    ;; the same peer at the same moment must not knock again in unison --
+    ;; lives in the spread across (self, peer) pairs, which no single
+    ;; reconnect timing could show without a flaky multi-process clock.
+    (let ()
+      (define (base a) (min (* 3000 (expt 2 a)) 60000))
+      ;; bounds: inside +/-25% of the capped exponential base at every
+      ;; attempt, so backoff neither collapses toward zero nor overshoots
+      ;; the cap (exact arithmetic: 0.75b <= d <= 1.25b as 3b <= 4d <= 5b)
+      (do ((a 0 (+ a 1))) ((> a 20))
+        (let ((d (reconnect-delay 'a 'b a)) (b (base a)))
+          (unless (and (integer? d) (exact? d)
+                       (>= (* 4 d) (* 3 b))
+                       (<= (* 4 d) (* 5 b)))
+            (fail! "reconnect-delay-bounds" a b d))))
+      ;; deterministic: jitter comes from the names, not from clocks or
+      ;; random state -- a retrying node can be reasoned about, and the
+      ;; entropy-starved failure mode of a random source (a raise the
+      ;; connector's guard would silently turn into "never dial again")
+      ;; has no place on the reconnect path
+      (unless (= (reconnect-delay 'a 'b 3) (reconnect-delay 'a 'b 3))
+        (fail! "reconnect-delay-not-deterministic"))
+      ;; ...including across a real clock tick: two adjacent calls can
+      ;; land inside one millisecond, where a clock-seeded jitter still
+      ;; reads as deterministic
+      (let ((d1 (reconnect-delay 'a 'b 3)))
+        (sleep-ms 50)
+        (unless (= d1 (reconnect-delay 'a 'b 3))
+          (fail! "reconnect-delay-clock-seeded")))
+      ;; dispersion, in both directions the mesh actually has: one node
+      ;; dialing many peers, and many nodes dialing one hub. 16 names
+      ;; into a 12000ms-wide band; a working hash gives nearly 16
+      ;; distinct delays, a name-blind jitter gives exactly 1. The
+      ;; threshold 8 is lenient to collisions while unreachable by any
+      ;; implementation that ignores the varying name.
+      (let ()
+        (define (distinct-count l)
+          (let loop ((l l) (seen '()) (n 0))
+            (cond ((null? l) n)
+                  ((member (car l) seen) (loop (cdr l) seen n))
+                  (else (loop (cdr l) (cons (car l) seen) (+ n 1))))))
+        (define (nm k) (string->symbol (string-append "n" (number->string k))))
+        (define (sweep f)
+          (let loop ((k 0) (acc '()))
+            (if (= k 16) acc (loop (+ k 1) (cons (f (nm k)) acc)))))
+        (let ((across-peers (sweep (lambda (p) (reconnect-delay 'a p 3))))
+              (across-selves (sweep (lambda (s) (reconnect-delay s 'hub 3)))))
+          (when (< (distinct-count across-peers) 8)
+            (fail! "reconnect-delay-peer-dispersion" across-peers))
+          (when (< (distinct-count across-selves) 8)
+            (fail! "reconnect-delay-self-dispersion" across-selves))
+          ;; ...and with ATTEMPT: normalize the exponential base away
+          ;; and the residual phase must still walk as attempt climbs
+          ;; with both names fixed. A jitter that hashes only the names
+          ;; gives one ratio for every attempt.
+          (let ((ratios
+                  (let loop ((a 0) (acc '()))
+                    (if (= a 16) acc
+                        (loop (+ a 1)
+                              (cons (/ (reconnect-delay 'a 'b a) (base a))
+                                    acc))))))
+            (when (< (distinct-count ratios) 8)
+              (fail! "reconnect-delay-attempt-dispersion" ratios))))))
+    (display "reconnect delay bounded, deterministic, dispersed ok\n")
 
     ;; The pre-auth handshake has one absolute deadline. Dripping a byte
     ;; before each idle timeout must not hold an unauthenticated fd forever.
@@ -323,13 +421,13 @@
       (probe-hello! "acceptor-accepts-proof-not-binding-version"
         (lambda (nonce)
           (list 'hello 'relic2 (pre-versioning-proof nonce 'relic2)
-                nb32 2)))
-      ;; version slot 999 with a proof that IS valid for version 2: an
+                nb32 3)))
+      ;; version slot 999 with a proof that IS valid for version 3: an
       ;; acceptor that skips the explicit hello-version check but does
       ;; verify the bound proof would welcome this one
       (probe-hello! "acceptor-ignores-hello-version"
         (lambda (nonce)
-          (list 'hello 'relic3 (versioned-proof nonce 'relic3 2)
+          (list 'hello 'relic3 (versioned-proof nonce 'relic3 3)
                 nb32 999)))
       ;; the acceptor's end of the injectivity rule, both halves.
       ;; A nonce-b carrying the separator is what the attacker WOULD
@@ -339,13 +437,24 @@
       ;; check, only from the name.
       (probe-hello! "acceptor-signs-structured-nonce-b"
         (lambda (nonce)
-          (list 'hello 'relic4 (versioned-proof nonce 'relic4 2)
-                colon-nonce 2)))
+          (list 'hello 'relic4 (versioned-proof nonce 'relic4 3)
+                colon-nonce 3)))
       (probe-hello! "acceptor-admits-colon-in-claimed-name"
         (lambda (nonce)
           (list 'hello (string->symbol "evil:a")
-                (versioned-proof nonce (string->symbol "evil:a") 2)
-                nb32 2))))
+                (versioned-proof nonce (string->symbol "evil:a") 3)
+                nb32 3)))
+      ;; the name-length bound is WIRE SYNTAX, not a local construction
+      ;; limit: without this check on the accept side, a name this node
+      ;; could never be configured to dial can still connect in -- an
+      ;; asymmetry that surfaces as an unroutable peer. The proof is
+      ;; genuinely valid for the long name, so a refusal can only come
+      ;; from the length rule.
+      (probe-hello! "acceptor-admits-overlong-name"
+        (lambda (nonce)
+          (let ((long-name (string->symbol (make-string 300 #\n))))
+            (list 'hello long-name (versioned-proof nonce long-name 3)
+                  nb32 3)))))
     (display "acceptor refuses unversioned/unbound/mislabeled hello ok\n")
 
     ;; ---- the positive path, spoken by hand ------------------------------
@@ -371,13 +480,13 @@
                    (send me (vector ref 'challenge-tag)))
                   ((not (string? (cadr d)))
                    (send me (vector ref 'challenge-nonce-not-string)))
-                  ((not (eqv? (caddr d) 2))
+                  ((not (eqv? (caddr d) 3))
                    (send me (vector ref 'challenge-version)))
                   (else
                    (tcp-write! c (frame-bytes
                                    (list 'hello 'wirepeer
-                                         (versioned-proof (cadr d) 'wirepeer 2)
-                                         nb32 2))
+                                         (versioned-proof (cadr d) 'wirepeer 3)
+                                         nb32 3))
                                #f)
                    (let ((w (read-frame-or-closed "wirepeer-welcome")))
                      (send me (vector ref
@@ -387,7 +496,7 @@
                              ((not (eq? (car w) 'welcome)) 'welcome-tag)
                              ((not (eq? (cadr w) 'a)) 'welcome-name)
                              ((not (equal? (caddr w)
-                                           (versioned-proof nb32 'a 2)))
+                                           (versioned-proof nb32 'a 3)))
                               'welcome-proof-not-bound)
                              (else 'good))))))))
               (tcp-close! c))
@@ -427,7 +536,7 @@
                                                   ((v999) (list 'challenge "aaaabbbb" 999))
                                                   ((v1) (list 'challenge "aaaabbbb" 1))
                                                   ((colon-nonce)
-                                                   (list 'challenge colon-nonce 2))
+                                                   (list 'challenge colon-nonce 3))
                                                   ((upper-nonce)
                                                    ;; 32 hex digits, but UPPERCASE.
                                                    ;; Injectivity does not require
@@ -454,17 +563,17 @@
                                                    ;; else to say the margin shrank.
                                                    (list 'challenge
                                                          "0123456789ABCDEF0123456789ABCDEF"
-                                                         2))
-                                                  (else (list 'challenge 123 2))))
+                                                         3))
+                                                  (else (list 'challenge 123 3))))
                                             #f)
                                 (await-close!))
                                ((kat)
                                 ;; the dialer's OWN hello, held against the
                                 ;; known answer: the proof must be the
                                 ;; literal digest, the name its node name,
-                                ;; the frame exactly five long, version 2
+                                ;; the frame exactly five long, version 3
                                 (tcp-write! c (frame-bytes
-                                                (list 'challenge kat-nonce 2))
+                                                (list 'challenge kat-nonce 3))
                                             #f)
                                 (let ((d (read-frame-or-closed "kat-hello")))
                                   (send me (vector 'fake tag
@@ -477,7 +586,7 @@
                                            'hello-proof-off-spec)
                                           ((not (string? (cadddr d)))
                                            'hello-nonce-b)
-                                          ((not (eqv? (car (cddddr d)) 2))
+                                          ((not (eqv? (car (cddddr d)) 3))
                                            'hello-version)
                                           (else 'good))))))
                                ((unbound-welcome)
@@ -495,7 +604,7 @@
                                 ;; refused before that and the cell would
                                 ;; never reach what it exists to check.
                                 (tcp-write! c (frame-bytes
-                                                (list 'challenge kat-nonce 2))
+                                                (list 'challenge kat-nonce 3))
                                             #f)
                                 (let ((d (read-frame-or-closed
                                            "unbound-welcome-hello")))
@@ -582,10 +691,335 @@
       (tcp-stop-listen! l))
     (display "dialer wire dialect pinned ok\n")
 
+    ;; ---- post-auth wire shapes that must drop the link -------------------
+    ;; Spoken from an AUTHENTICATED fake peer: these frames only reach
+    ;; dispatch on a live link. Both cells expect the fail-closed answer
+    ;; -- a close, not a reply.
+    (let ((drop-probe!
+            (lambda (label peer-name frame)
+              (let ((me self) (ref (gensym)))
+                (spawn
+                  (lambda ()
+                    (let ((c (handshake-as! peer-name label)))
+                      (tcp-write! c (frame-bytes frame) #f)
+                      (let ((d (read-frame-or-closed label)))
+                        (send me (vector ref d))
+                        (tcp-close! c)))))
+                (receive (after 8000 (fail! label 'probe-timeout))
+                  (`#(,@ref ,what)
+                    (unless (eq? what 'closed) (fail! label what))))))))
+      ;; The OLD 4-element call, from a peer that authenticated as v3.
+      ;; The fail-closed rule owns it now: an unknown shape drops the
+      ;; link. A build whose dispatch still accepts the pre-v3 arity
+      ;; ANSWERS -- a reply frame comes back and this cell reads it
+      ;; instead of the close.
+      (drop-probe! "v3-refuses-4-element-call" 'stale-caller
+                   (list 'call 'nonesuch 1 'x))
+      ;; ...and the arity is pinned from BOTH sides: a six-element call
+      ;; must drop too, or "refuses four" is just "requires at least
+      ;; five" wearing a stricter label.
+      (drop-probe! "v3-admits-6-element-call" 'stale-caller6
+                   (list 'call 'nonesuch 3 'x 5000 'extra))
+      ;; The timeout slot is validated at dispatch, BEFORE the serving
+      ;; process is spawned. Validated inside the server instead, the
+      ;; raise kills that process quietly and the link stays up -- this
+      ;; cell then times out rather than reading the close, which is
+      ;; exactly its red. One probe per input kind: the wrong TYPE, a
+      ;; zero, a negative, and the inexact integer 2.0 -- the last is
+      ;; what a validator that spells "integer?" but forgets "exact?"
+      ;; admits, and (min 2.0 cap) then quietly contaminates arithmetic
+      ;; downstream.
+      (drop-probe! "call-timeout-slot-not-validated" 'stale-caller2
+                   (list 'call 'nonesuch 2 'x "soon"))
+      (drop-probe! "call-timeout-zero" 'stale-caller3
+                   (list 'call 'nonesuch 4 'x 0))
+      (drop-probe! "call-timeout-negative" 'stale-caller4
+                   (list 'call 'nonesuch 5 'x -5))
+      (drop-probe! "call-timeout-inexact" 'stale-caller5
+                   (list 'call 'nonesuch 6 'x 2.0)))
+    (display "stale call arities and malformed timeouts drop the link ok\n")
+
+    ;; ---- the outgoing call frame, held against the wire ------------------
+    ;; Everything above spoke TO this node; this cell reads what the node
+    ;; itself EMITS for an rcall. Without it, "the timeout crosses the
+    ;; wire" is only ever shown by two copies of this implementation
+    ;; agreeing with each other -- a fixed slot of the right magnitude
+    ;; would pass every behavioral cell. The frame must be exactly
+    ;; (call <reg> <ref> <msg> <the caller's own timeout>), and the
+    ;; reply routed back by ref must reach the caller as the value.
+    (let* ((me self) (ref (gensym))
+           ;; the acceptor INSTALLS the peer after writing welcome, so
+           ;; the fake peer being ready does not mean this node can
+           ;; address it yet -- the watch is armed before the spawn and
+           ;; the call gated on node-up below, or the rcall races
+           ;; install-peer! to a noconnection
+           (armed (monitor-node 'callee))
+           (callee-pid
+        (spawn
+          (lambda ()
+            (let ((c (handshake-as! 'callee "outgoing-call-frame")))
+            (let ((d (read-frame-or-closed "outgoing-call-frame")))
+              (cond
+                ((symbol? d) (send me (vector ref d)))
+                ((not (and (list? d) (= (length d) 5)))
+                 (send me (vector ref 'call-arity d)))
+                ((not (eq? (car d) 'call))
+                 (send me (vector ref 'call-tag d)))
+                ((not (eq? (cadr d) 'echo))
+                 (send me (vector ref 'call-reg d)))
+                ((not (and (integer? (caddr d)) (exact? (caddr d))))
+                 (send me (vector ref 'call-ref d)))
+                ((not (equal? (cadddr d) (vector 'q)))
+                 (send me (vector ref 'call-msg d)))
+                ((not (eqv? (car (cddddr d)) 7321))
+                 (send me (vector ref 'call-timeout-slot d)))
+                (else
+                 (tcp-write! c (frame-bytes
+                                 (list 'reply (caddr d) (list 'ok 42)))
+                             #f)
+                 (send me (vector ref 'frame-good)))))
+              ;; hold the link open until the caller has its answer; an
+              ;; early close would fail the call for the wrong reason
+              (receive (after 6000 'done) (`#(callee-done) 'ok))
+              (tcp-close! c))))))
+      (receive (after 8000 (fail! "outgoing-call-frame" 'no-node-up))
+        (`#(node-up callee) 'ok))
+      (demonitor-node 'callee)
+      (spawn (lambda ()
+               (send me (vector ref 'rcall
+                 (guard (e (#t (list 'raised e)))
+                   (rcall 'callee 'echo (vector 'q) 7321))))))
+      (let wait ((frame? #f) (value? #f))
+        (if (and frame? value?)
+            (send callee-pid (vector 'callee-done))
+            (receive (after 8000 (fail! "outgoing-call-frame" 'timeout
+                                        frame? value?))
+              (`#(,@ref frame-good) (wait #t value?))
+              (`#(,@ref rcall ,v)
+                (unless (equal? v 42) (fail! "outgoing-call-reply" v))
+                (wait frame? #t))
+              (`#(,@ref ,bad ,d) (fail! "outgoing-call-frame" bad d))))))
+    (display "outgoing call frame carries the caller's timeout ok\n")
+
+    ;; ---- outbound backpressure is per connection -------------------------
+    ;; A peer that stops reading makes every frame to it queue in this
+    ;; process; without a ceiling the queue grows as fast as senders can
+    ;; call rsend -- unbounded memory on a control link -- and the only
+    ;; exit was the 60s silence deadline. The ceiling is on IN-FLIGHT
+    ;; BYTES PER CONNECTION, and crossing it must behave like a link
+    ;; failure PROMPTLY: node-down within 8s, far below both the 15s
+    ;; heartbeat and the 60s deadline, so neither of the old clocks can
+    ;; be what passes this cell.
+    (let ((me self) (ref (gensym))
+          (zero-stats '((conns . 0) (bytes . 0))))
+      ;; The baseline must be QUIESCENT, and quiescent here is the
+      ;; literal zero alist -- which also pins the export's shape (a
+      ;; stub answering '() or #f would fail this equality, not pass
+      ;; vacuously). Earlier cells' connections are still tearing down
+      ;; when this one starts, so a snapshot baseline made both deltas
+      ;; below unreadable; and cleanup that never converges to zero is
+      ;; itself the leak the final assertion owns, so waiting loses no
+      ;; discrimination.
+      ;;
+      ;; The wait must OUTLAST A HANDSHAKE DEADLINE, not just a close
+      ;; callback: the ceiling cell's challenged connections hold their
+      ;; sockets and are only closed by the acceptor's 5s handshake
+      ;; timeout, and everything between that cell and this one runs in
+      ;; well under a second -- so up to ~5s of those entries are still
+      ;; due here on a healthy build. (Measured, not assumed: the four
+      ;; entries clear within 100ms of the deadline, and an earlier 2s
+      ;; bound here read that tail as a leak.)
+      (let poll ((n 0))
+        (let ((s (node-outbound-stats)))
+          (unless (equal? s zero-stats)
+            (if (= n 200)
+                (fail! "outbound-entries-linger-at-baseline" s)
+                (begin (sleep-ms 50) (poll (+ n 1)))))))
+      ;; armed BEFORE the peer exists: node-up is the gate that says
+      ;; this node can address it (the acceptor installs the peer after
+      ;; writing welcome, so the holder's 'ready alone races that)
+      (monitor-node 'slowpeer)
+      (let ((holder
+              (spawn
+                (lambda ()
+                  (let ((c (handshake-as! 'slowpeer "backpressure-slow-reader")))
+                    ;; stop reading at the KERNEL level: read-stop parks
+                    ;; the fd, so the socket buffers fill and stay full.
+                    ;; Merely never receiving would let libuv keep
+                    ;; draining them into this process's mailbox.
+                    (tcp-read-stop! c)
+                    (send me (vector ref 'ready))
+                    ;; hold the socket open across the flood: the far
+                    ;; end closing is the event under test
+                    (receive (after 20000 'give-up)
+                      (`#(release) 'ok))
+                    (tcp-close! c))))))
+        (receive (after 8000 (fail! "backpressure-slow-reader" 'no-handshake))
+          (`#(,@ref ready) 'ok))
+        (receive (after 8000 (fail! "backpressure-slow-reader" 'no-node-up))
+          (`#(node-up slowpeer) 'ok))
+        ;; entry on first write, observably: the handshake made this
+        ;; node WRITE on that conn (challenge, welcome), so its entry
+        ;; exists before any flood -- exactly one conn above the
+        ;; quiescent zero
+        (let ((s (node-outbound-stats)))
+          (unless (= (cdr (assq 'conns s)) 1)
+            (fail! "outbound-entry-not-created-on-write" s)))
+        ;; a pending rcall and a live remote monitor ride this link; the
+        ;; backpressure close must fail BOTH over exactly as a link drop
+        ;; would. Armed before the flood, judged after the node-down.
+        (spawn (lambda ()
+                 (send me (vector 'bp-rcall
+                   (guard (e ((and (vector? e)
+                                   (eq? (vector-ref e 0) 'rcall-error))
+                              (vector-ref e 1)))
+                     (rcall 'slowpeer 'svc 'x 30000)
+                     'no-raise)))))
+        (monitor-remote 'slowpeer 'never-there)
+        (node-set-limits! #f #f #f 65536)
+        ;; ~16 KiB serialized per frame, 600 frames ~ 10 MiB attempted:
+        ;; far past any plausible kernel buffering plus the 64 KiB
+        ;; ceiling (the margin is the portability argument -- loopback
+        ;; buffers autotune, but not to ten megabytes). The loop stops
+        ;; at the first refused send (the link died under it); sending
+        ;; everything with the link still open means the count was
+        ;; never kept.
+        (let ((bv (make-bytevector 8192 7)))
+          (let loop ((k 0))
+            (cond
+              ((= k 600) (fail! "backpressure-never-tripped"))
+              ((rsend 'slowpeer 'sink bv) (loop (+ k 1)))
+              (else 'tripped))))
+        (receive (after 8000 (fail! "backpressure-no-node-down"))
+          (`#(node-down slowpeer) 'ok))
+        (receive (after 4000 (fail! "backpressure-pending-rcall-kept"))
+          (`#(bp-rcall ,r)
+            (unless (eq? r 'noconnection)
+              (fail! "backpressure-pending-rcall-reason" r))))
+        (receive (after 4000 (fail! "backpressure-monitor-kept"))
+          (`#(remote-down slowpeer never-there ,r)
+            (unless (eq? r 'noconnection)
+              (fail! "backpressure-monitor-reason" r))))
+        (demonitor-node 'slowpeer)
+        (send holder (vector 'release))
+        (node-set-limits! #f #f #f 16777216)
+        ;; the accounting died with the connection: entries and in-flight
+        ;; bytes return exactly to the quiescent zero (canceled writes
+        ;; subtracted, the conn's entry dropped). Polled, not slept:
+        ;; close-callback timing is the OS's, not this cell's.
+        (let poll ((n 0))
+          (let ((s (node-outbound-stats)))
+            (unless (equal? s zero-stats)
+              (if (= n 40)
+                  (fail! "backpressure-accounting-residue" s)
+                  (begin (sleep-ms 50) (poll (+ n 1)))))))))
+    (display "outbound backpressure closes a slow reader, accounting clean ok\n")
+
+    ;; ---- the ceiling has a trigger that inbound traffic cannot mute ------
+    ;; The charge-side check fires only when this node WRITES. A
+    ;; connection can sit over the ceiling with no further outbound
+    ;; traffic -- and a peer that keeps SENDING resets the link's tick
+    ;; timer, so even the ping that would recharge and trip never runs.
+    ;; The inbound path must therefore check too: the very traffic that
+    ;; mutes the tick becomes the trigger. Armed here without any kill:
+    ;; flood under a high limit (charge never trips), then LOWER the
+    ;; limit -- the connection is now over a ceiling nobody has checked
+    ;; -- and let the peer send one frame that provokes no reply. Only
+    ;; an inbound-side check can be what closes it.
+    (let ((me self) (ref (gensym)))
+      (monitor-node 'slowpeer2)
+      (let ((holder
+              (spawn
+                (lambda ()
+                  (let ((c (handshake-as! 'slowpeer2 "inbound-trigger")))
+                    (tcp-read-stop! c)
+                    (send me (vector ref 'ready))
+                    (let wait ()
+                      (receive (after 30000 'give-up)
+                        (`#(poke)
+                          ;; NOT a whole frame: a length header with no
+                          ;; body. A complete frame would also trigger
+                          ;; the check, but a fragment is the stronger
+                          ;; probe -- bytes that never finish a datum
+                          ;; still restart the link's tick timer, so a
+                          ;; check that runs only after a parsed frame
+                          ;; can be muted by exactly this dribble. The
+                          ;; check must fire on ARRIVAL, not on parse.
+                          (tcp-write! c (string->utf8 "64\n") #f)
+                          (wait))
+                        (`#(release) 'ok)))
+                    (tcp-close! c))))))
+        (receive (after 8000 (fail! "inbound-trigger" 'no-handshake))
+          (`#(,@ref ready) 'ok))
+        (receive (after 8000 (fail! "inbound-trigger" 'no-node-up))
+          (`#(node-up slowpeer2) 'ok))
+        ;; ~2 MB in flight against the default 16 MiB ceiling: every send
+        ;; must be accepted and the link must stay up
+        (let ((bv (make-bytevector 8192 5)))
+          (do ((k 0 (+ k 1))) ((= k 130))
+            (unless (rsend 'slowpeer2 'sink bv)
+              (fail! "inbound-trigger-flood-refused" k))))
+        ;; now the ceiling drops below what is already in flight
+        (node-set-limits! #f #f #f 65536)
+        (send holder (vector 'poke))
+        (receive (after 8000 (fail! "inbound-trigger-no-close"))
+          (`#(node-down slowpeer2) 'ok))
+        (demonitor-node 'slowpeer2)
+        (send holder (vector 'release))
+        (node-set-limits! #f #f #f 16777216)
+        (let poll ((n 0))
+          (let ((s (node-outbound-stats)))
+            (unless (equal? s '((conns . 0) (bytes . 0)))
+              (if (= n 200)
+                  (fail! "inbound-trigger-accounting-residue" s)
+                  (begin (sleep-ms 50) (poll (+ n 1)))))))))
+    (display "inbound traffic triggers the outbound ceiling ok\n")
+
+    ;; ACCEPTED RESIDUE of the backpressure and backoff cells, named so
+    ;; absence reads as decision, not oversight. Internal program points
+    ;; never reach the wire or an export and are pinned by review and by
+    ;; the change contract, not here: the increment landing strictly
+    ;; before the write call, the limit checked on the increment side,
+    ;; the completion closing over its own total, the single-outbound-
+    ;; path architecture, connection-keyed (not name-keyed) accounting,
+    ;; the 'outbound-backpressure close reason, and which hook removes
+    ;; the entry. Likewise the connector's USE of reconnect-delay --
+    ;; attempt counting and its reset after an authenticated link -- a
+    ;; wall-clock observation of reconnect spacing would be flaky where
+    ;; this suite is deterministic. The 16 MiB limit and 60000 serve cap
+    ;; are exercised only as explicitly set values, never as defaults.
+    ;;
+    ;; Later review rounds added more of the same family, each pinned by
+    ;; review and by the mechanism comment beside it: the charge, the
+    ;; write, and its completion registration running under one
+    ;; interrupt-disable (a kill between them is not injectable from out
+    ;; here); the link-stop message carrying its connection so a late
+    ;; one cannot kill the connector's NEXT link (nothing external can
+    ;; forge or time that message); the backoff wait surviving a
+    ;; straggler dial completion (a timing observation); the reset
+    ;; threshold -- an authenticated link must outlive the delay the
+    ;; connector was about to wait -- measured only as a reconnect
+    ;; cadence (and measured, not assumed: reverting an earlier, weaker
+    ;; threshold to plain authentication turned no cell red); and the
+    ;; state-recheck inside each interrupt-disabled region before a
+    ;; handle is used (the close-vs-use interleave is not reachable from
+    ;; a test that cannot place a kill).
+
     ;; rsend to an unknown node: #f, no crash
     (unless (eq? #f (rsend 'nowhere 'svc 'x))
       (fail! "rsend-unknown"))
     (display "rsend to unknown node ok\n")
+
+    ;; Handshake frames carry names inside the 4 KiB pre-auth frame
+    ;; ceiling, so a name's length is wire-normative: refused at
+    ;; configuration time, not at the first hello that overflows and
+    ;; presents as a peer that mysteriously never comes up.
+    (unless (guard (e ((assertion-violation? e) #t) (#t #f))
+              (node-connect! (string->symbol (make-string 5000 #\n))
+                             "127.0.0.1" 1)
+              #f)
+      (fail! "unbounded-peer-name-accepted"))
+    (display "oversized peer name refused at node-connect! ok\n")
 
     ;; rsend to self is a local send
     (rsend 'a 'main (vector 'loopback 1))
@@ -741,6 +1175,24 @@
           (unless (equal? p payload) (fail! "payload-fidelity" p)))))
     (display "rsend round-trip + payload fidelity ok\n")
 
+    ;; The write side must never EMIT a frame its own read side would
+    ;; refuse: an oversized payload is an error at the call site, not a
+    ;; dead link for every other user of it. ~18 MB serialized against
+    ;; the 8 MiB frame ceiling. Red before the gate existed: the frame
+    ;; went out whole and the peer's length-header check dropped the
+    ;; link -- one caller's mistake, everyone's outage.
+    (let ((huge (make-bytevector 9000000 7)))
+      (unless (guard (e (#t #t))
+                (rsend 'b 'svc (vector 'add1 1 huge))
+                #f)
+        (fail! "oversized-frame-sent"))
+      ;; refused locally: the link is unharmed and still carries traffic
+      (unless (rsend 'b 'svc (vector 'add1 41 (vector)))
+        (fail! "oversized-frame-broke-link"))
+      (receive (after 5000 (fail! "oversized-frame-link-dead"))
+        (`#(ans 42 ,p) 'ok)))
+    (display "oversized frame refused locally, link unharmed ok\n")
+
     ;; ordering: a burst arrives in send order
     (do ((i 0 (+ i 1))) ((= i 100))
       (rsend 'b 'svc (vector 'add1 i (vector))))
@@ -752,10 +1204,44 @@
             (loop (+ expect 1))))))
     (display "in-order burst ok\n")
 
+    ;; The ceiling must NOT act on a healthy link. Replies pace the
+    ;; flow, so true in-flight bytes stay near one frame -- but the
+    ;; cumulative volume crosses the limit many times over. That
+    ;; separates the two accountings: an implementation that forgets to
+    ;; subtract completed writes accumulates phantom in-flight bytes and
+    ;; closes this link mid-loop; the correct one never comes near the
+    ;; ceiling. (~16 KiB serialized per frame each way, 50 rounds ~ 800
+    ;; KiB through a 256 KiB limit.)
+    (node-set-limits! #f #f #f 262144)
+    (let ((payload (make-bytevector 8192 3)))
+      (do ((i 0 (+ i 1))) ((= i 50))
+        (unless (rsend 'b 'svc (vector 'add1 i payload))
+          (fail! "backpressure-false-trip-send" i))
+        (receive (after 5000 (fail! "backpressure-false-trip" i))
+          (`#(ans ,n ,p) 'ok))))
+    (node-set-limits! #f #f #f 16777216)
+    (display "outbound backpressure spares paced traffic ok\n")
+
     ;; rcall: synchronous cross-node call to a gen-server on b
     (unless (= 49 (rcall 'b 'calc (vector 'square 7)))
       (fail! "rcall-value"))
     (display "rcall round-trip ok\n")
+
+    ;; The timeout goes ON THE WIRE, so rcall refuses to send what no
+    ;; peer could use: a non-fixnum timeout is an error at the call
+    ;; site. The write side is deliberately narrower than the read side
+    ;; (which still takes any positive exact integer and caps it) --
+    ;; without this gate the call is refused at the far end by dropping
+    ;; the whole link, and every other caller on it pays for one typo.
+    (let ((got (guard (e ((assertion-violation? e) 'refused)
+                         (#t (list 'wrong-condition e)))
+                 (rcall 'b 'calc (vector 'square 2) (expt 2 62))
+                 'no-raise)))
+      (unless (eq? got 'refused) (fail! "rcall-huge-timeout-sent" got))
+      ;; refused LOCALLY: the link is unharmed and the next call rides it
+      (unless (= 9 (rcall 'b 'calc (vector 'square 3)))
+        (fail! "rcall-huge-timeout-broke-link")))
+    (display "rcall refuses a non-fixnum timeout locally ok\n")
 
     ;; rcall to a gen-server that raises -> rcall-error, not a hang
     (let ((got (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'rcall-error))
@@ -772,6 +1258,77 @@
                  #f)))
       (unless got (fail! "rcall-missing")))
     (display "rcall missing server -> rcall-error ok\n")
+
+    ;; ---- the caller's timeout crosses the wire ---------------------------
+    ;; The v3 call frame carries the caller's timeout and the serving
+    ;; side adopts it (capped) for its own gen-server-call. Before that,
+    ;; the server used its local default: a caller patient beyond 5s was
+    ;; answered (error ...) by a peer that had no idea how long the
+    ;; caller was willing to wait. The slow handler sleeps 6.5s -- past
+    ;; the old default, well inside this call's 10s -- so only a build
+    ;; that ships the timeout in the frame can return the value.
+    (let ((t0 (now-ms)))
+      ;; guarded so the red has this cell's name: on a build that lets
+      ;; the server default win, the rcall RAISES (the server answered
+      ;; (error timeout) at its 5s default) rather than returning a
+      ;; wrong value, and an unguarded raise would exit as a panic
+      ;; instead of a reading
+      (unless (eq? 'slept (guard (e (#t (list 'raised e)))
+                            (rcall 'b 'slowcalc (vector 'slow) 10000)))
+        (fail! "rcall-timeout-not-in-frame"))
+      (let ((dt (- (now-ms) t0)))
+        ;; the value must come from the handler actually finishing:
+        ;; under 6s something answered early, over 9.5s something other
+        ;; than the 6.5s sleep was the clock
+        (when (or (< dt 6000) (> dt 9500))
+          (fail! "rcall-slow-elapsed" dt))))
+    (display "rcall timeout crosses the wire ok\n")
+
+    ;; ...and a SHORT timeout still cuts the caller loose locally: the
+    ;; frame's copy caps the server, it must never extend the caller.
+    ;; let*, not let: the clock must be read BEFORE the call -- plain
+    ;; let leaves the evaluation order unspecified, and this build ran
+    ;; the rcall first, timing a completed call at zero
+    (let* ((t0 (now-ms))
+           (got (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'rcall-error))
+                           (vector-ref e 1)))
+                  (rcall 'b 'slowcalc (vector 'slow) 1500)
+                  'no-raise)))
+      (unless (eq? got 'timeout) (fail! "rcall-short-timeout" got))
+      (let ((dt (- (now-ms) t0)))
+        (when (> dt 3000) (fail! "rcall-short-timeout-elapsed" dt))
+        ;; ...and a LOWER bound: without it, a build that answers with a
+        ;; synthetic immediate timeout reads as a working 1.5s clock
+        (when (< dt 1200) (fail! "rcall-short-timeout-too-early" dt))))
+    (display "rcall caller timeout still local ok\n")
+
+    ;; The serve side's own cap is the other arm of the min(), and the
+    ;; cap is the SERVER's setting -- so it is lowered on b, through the
+    ;; fixture, not here. The same patient 10s call now comes back an
+    ;; error in ~2s: the server adopted min(10000, 2000). A build that
+    ;; takes the frame value alone serves the full sleep and returns
+    ;; 'slept past the caller's 10s -- either the value or the elapsed
+    ;; time turns this red.
+    (rsend 'b 'svc (vector 'set-serve-cap 2000))
+    (sleep-ms 200)
+    (let* ((t0 (now-ms))
+           (got (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'rcall-error))
+                           (vector-ref e 1)))
+                  (rcall 'b 'slowcalc (vector 'slow) 10000)
+                  'no-raise)))
+      (when (eq? got 'no-raise) (fail! "serve-cap-ignored"))
+      (let ((dt (- (now-ms) t0)))
+        ;; 4000 excludes both the old 5s server default and the uncapped
+        ;; 6.5s handler (the previous cell's handler may still be asleep
+        ;; when this call queues; the capped gen-server-call times out in
+        ;; the queue just the same)
+        (when (> dt 4000) (fail! "serve-cap-elapsed" dt))))
+    (rsend 'b 'svc (vector 'set-serve-cap 60000))
+    (sleep-ms 100)
+    ;; b's slowcalc drains its queued sleeps for a while yet; nothing
+    ;; between here and the quit touches 'slowcalc, and the child's
+    ;; safety net was raised to 60s to cover these cells
+    (display "serve-side cap arms the min ok\n")
 
     ;; distributed pubsub: a publish on node a must reach a subscriber
     ;; on node b (b relays it back as #(heard ...))

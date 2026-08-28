@@ -8,6 +8,38 @@
   (display "FAIL: ") (display msg) (newline)
   (exit 1))
 
+;; ---- receive syntax: an after clause is FIRST, or an error -----------
+;; Checked at expansion, so it runs before the scheduler exists. The
+;; pure-pattern arm has a fender refusing 'after among its patterns; the
+;; after-first arm's TRAILING patterns need the same fender, and its
+;; absence was quietly worse than a dead clause: in
+;; (receive (after 1 'a) (after 2 'b)) the second `after` parses as an
+;; IDENTIFIER pattern -- a binding catch-all consuming every message
+;; that reaches it. Both spellings must refuse to expand. The escape
+;; stays open in both arms: a QUASIQUOTED after is a pattern matching
+;; the literal symbol, not a clause keyword.
+(define (expands? form)
+  (call/cc (lambda (k)
+    (with-exception-handler
+      (lambda (c) (k #f))
+      (lambda () (expand form) #t)))))
+(when (expands? '(receive (after 1 'a) (after 2 'b)))
+  (fail "double-after clause expanded"))
+(when (expands? '(receive (`#(x) 'ok) (after 2 'b)))
+  (fail "late-after clause expanded"))
+;; ...and buried among patterns under an after-first clause: the arm
+;; that takes the timeout has its own trailing pattern list, and each
+;; spelling that reaches it must refuse independently
+(when (expands? '(receive (after 1 'a) (`#(x) 'ok) (after 2 'b)))
+  (fail "buried-after clause expanded"))
+(unless (expands? '(receive (after 1 'a) (`#(x) 'ok)))
+  (fail "after-first stopped expanding"))
+(unless (expands? '(receive (`after 'ok)))
+  (fail "quasiquoted after pattern refused (pure arm)"))
+(unless (expands? '(receive (after 1 'a) (`after 'ok)))
+  (fail "quasiquoted after pattern refused (after-first arm)"))
+(display "after clause is first-or-error at expansion ok\n")
+
 (start-scheduler
   (lambda ()
     ;; 1. ping-pong between two processes

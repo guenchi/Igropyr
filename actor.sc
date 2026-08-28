@@ -736,7 +736,18 @@
     (lambda (stx)
       (syntax-case stx ()
         ((_ (after timeout t1 t2 ...) (pattern b1 b2 ...) ...)
-         (and (identifier? #'after) (eq? (syntax->datum #'after) 'after))
+         ;; THE SAME GUARD AS THE PLAIN CASE, and it was missing here.
+         ;; Without the memq, (receive (after 1 'a) (after 2 'b)) expands
+         ;; silently: the first form is taken as the timeout and the
+         ;; SECOND one goes through as an ordinary pattern, where a bare
+         ;; identifier is a binding catch-all -- so a second after clause
+         ;; quietly becomes a clause that matches every message. A
+         ;; duplicated or mistyped timeout has to be a syntax error, not a
+         ;; wildcard. The check looks for a BARE `after, so a quasiquoted
+         ;; pattern matching the literal symbol -- `after inside `#(...) --
+         ;; is unaffected and stays legal, exactly as in the plain case.
+         (and (identifier? #'after) (eq? (syntax->datum #'after) 'after)
+              (not (memq 'after (syntax->datum #'(pattern ...)))))
          #'(receive-after
              (lambda (m) (match-msg m ((pattern b1 b2 ...) ...)))
              timeout
