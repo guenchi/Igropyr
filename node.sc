@@ -307,7 +307,15 @@
   (define rcall-serving 0)
   (define preauth-conns 0)
 
-  ;; take a serve-rcall slot iff one is free; #t if taken
+  ;; Take a serve-rcall slot iff one is free; #t if taken.
+  ;;
+  ;; THE COUNTER ONLY WORKS IF EVERY TAKE IS PAIRED WITH A RELEASE, and
+  ;; the two ways that pairing breaks are worth naming together. A raise
+  ;; out of the server is handled where the slot is taken (see dispatch!);
+  ;; a KILL of that process is not, and cannot be, because a kill runs no
+  ;; handlers. Both leak the same counter in the same direction -- down,
+  ;; permanently -- and a leaked ceiling presents as a node that sheds
+  ;; every remote call as overload while looking healthy.
   (define (rcall-slot-take!)
     (atomically
       (and (fx< rcall-serving max-rcall-serving)
@@ -622,11 +630,45 @@
               (string-append (number->string (bytevector-length body)) "\n"))
             body)))
 
+  ;; The single-valued form, for the paths that cannot act on a failed
+  ;; submission anyway: ping and pong, the three handshake frames, and
+  ;; dispatch!'s overload answers. IT DROPS THE CONDITION ON PURPOSE.
+  ;; Each of those has a reader on the far side with its own timeout, so
+  ;; a frame that never goes out arrives as silence -- which those paths
+  ;; already treat as a dead link -- and there is no second thing this
+  ;; node could do with the knowledge. The paths that CAN act on it call
+  ;; write-body! directly: rsend and link-write raise, rcall and
+  ;; monitor-remote answer their caller.
   (define (write-frame! c datum)
-    (write-body! c (frame-segments datum)))
+    (let-values (((ok failure) (write-body! c (frame-segments datum))))
+      ok))
 
-  ;; Submit an already-materialized frame. -> #t if it was handed to
-  ;; libuv, #f if it was not.
+  ;; The one shape both loud paths raise. It carries the peer the frame
+  ;; was for and the original condition, because a bare "it failed" turns
+  ;; an out-of-memory into an unexplained one.
+  (define (submission-failure peer e)
+    (vector 'rsend-error 'submission-failed peer e))
+
+  ;; Submit an already-materialized frame.
+  ;; -> (values submitted? failure)
+  ;;      #t #f          handed to libuv
+  ;;      #f #f          the connection was not open
+  ;;      #f <condition> the submission itself failed; the condition is
+  ;;                     the one it raised, carried out rather than lost
+  ;;
+  ;; TWO VALUES AND NOT A THREE-WAY SINGLE ONE, because a condition object
+  ;; is TRUE. Every caller written as `(unless (write-body! ...) ...)`
+  ;; would read a failed submission as a success, and the reading would
+  ;; look right. The shape has to make that mistake impossible to write,
+  ;; not merely wrong.
+  ;;
+  ;; WHY THE TWO FAILURES ARE KEPT APART AT ALL: they are the same event
+  ;; to a caller that has published state (rcall, monitor-remote -- both
+  ;; answer noconnection either way) and different events to a caller
+  ;; that reports upward. #f-with-no-condition means the link is gone,
+  ;; which is a thing callers reason about and depend on; a failed
+  ;; submission on a healthy link is not that, and saying it is was the
+  ;; defect this batch exists to repair.
   ;;
   ;; THE FAILURE DOMAIN AFTER A CALLER'S PUBLICATION POINT, written to the
   ;; shape it actually has. frame-segments has already built every byte,
@@ -727,10 +769,11 @@
       ;; WHAT DOES COVER IT is the check at the top of link-loop's drain,
       ;; which runs on every wake-up: the traffic that suppresses the
       ;; timer is the same traffic that supplies the check.
-      (let ((over? #f))
+      (let ((over? #f) (failure #f))
         (let ((r (atomically
                    (set! over? (outbound-charge! c total))
-                   (guard (e (#t (outbound-discharge! c total)
+                   (guard (e (#t (set! failure e)
+                                 (outbound-discharge! c total)
                                  ;; RE-READ, do not clear. These bytes
                                  ;; never queued, so the verdict must not
                                  ;; rest on them -- but the verdict was
@@ -746,7 +789,7 @@
                      (tcp-writev! c segs
                        (lambda (status) (outbound-discharge! c total)))))))
           (when over? (close-for-backpressure! c))
-          r))))
+          (values (and r #t) failure)))))
 
   ;; Over the ceiling: this connection is done.
   ;;
@@ -1111,7 +1154,36 @@
            (raise 'protocol))
          (if (rcall-slot-take!)
              (spawn (lambda ()
-                      (serve-rcall! peer reg ref m timeout)
+                      ;; THE SLOT IS RELEASED WHETHER OR NOT THE SERVER
+                      ;; RETURNS NORMALLY. serve-rcall! can raise -- its
+                      ;; fallback reply goes through link-write, which
+                      ;; reports a failed submission by raising -- and a
+                      ;; raise here would skip the release. A ceiling
+                      ;; meant to bound concurrency would then ratchet
+                      ;; downwards instead, until every remote call was
+                      ;; shed as overload: the failure mode is a node
+                      ;; that answers nothing while looking busy.
+                      ;;
+                      ;; THIS IS AN ESCAPE BRANCH AND IT SWALLOWS
+                      ;; SOMETHING. What it swallows is the failure to
+                      ;; send a reply -- either the reply frame or the
+                      ;; fallback that stands in for it. That is
+                      ;; tolerable here and nowhere near tolerable in
+                      ;; general: the peer waiting for this reply has its
+                      ;; own rcall timeout, so the cost is one call that
+                      ;; times out instead of erroring, which is what
+                      ;; happens today when a reply is lost in the
+                      ;; network. A leaked slot, by contrast, has nothing
+                      ;; that ever gives it back.
+                      ;;
+                      ;; IT IS ONE OF TWO WAYS THIS SLOT CAN BE LOST, and
+                      ;; the other is not repaired: rcall-slot-free! is
+                      ;; still skipped if this process is KILLED, since a
+                      ;; kill runs no handlers. A guard cannot cover that
+                      ;; one -- see the gap ledger, where it is recorded
+                      ;; against the same counter this branch protects.
+                      (guard (e (#t (void)))
+                        (serve-rcall! peer reg ref m timeout))
                       (rcall-slot-free!)))
              (guard (e (#t (void)))
                (write-frame! c (list 'reply ref (list 'error 'overload)))))))
@@ -1217,9 +1289,19 @@
   ;;     TIMEOUT ON THE OTHER SIDE. A remote monitor waits until its
   ;;     target's node says something or the link drops. See mon-agent
   ;;     for what that means when a submission fails.
+  ;; It raises on a failed submission, in the same shape rsend uses: it
+  ;; is the same event, on an internal path. What each caller does with
+  ;; that is not uniform, and the difference is deliberate -- see the
+  ;; three call sites named above.
   (define (link-write peer datum)
     (let ((e (live-entry peer)))
-      (and e (begin (write-frame! (vector-ref e 0) datum) #t))))
+      (and e
+           (let-values (((ok failure)
+                         (write-body! (vector-ref e 0)
+                                      (frame-segments datum))))
+             (cond (ok #t)
+                   (failure (raise (submission-failure peer failure)))
+                   (else #f))))))
 
   ;; ---- cross-node process monitor ----------------------------------------
 
@@ -2058,48 +2140,37 @@
          (and p (begin (send p msg) #t))))
       ((live-entry node)
        => (lambda (e)
-            ;; #t WHENEVER THERE WAS A LIVE LINK, whether or not the
-            ;; frame reached the socket -- and the reason is not that the
-            ;; difference does not matter.
+            ;; THREE OUTCOMES, THREE ANSWERS, AND NO TWO OF THEM SHARE A
+            ;; VALUE. That separation is the whole point of this shape:
+            ;;   #t     the frame is with libuv. Delivery is still not
+            ;;          confirmed -- it never is here -- so a caller must
+            ;;          tolerate #t and a lost message, as it always had
+            ;;          to.
+            ;;   #f     THERE IS NO LINK. Callers depend on exactly this
+            ;;          and act on it: one of them takes #f as evidence
+            ;;          the node is gone and drops it from its scheduling
+            ;;          set. Nothing else may be reported this way.
+            ;;   raise  the link is up and THIS frame did not go. Named,
+            ;;          carrying the node and the original condition.
             ;;
-            ;; #f MEANS NO LINK, and callers depend on exactly that. One
-            ;; of them treats #f as evidence the node is gone and drops
-            ;; it from its scheduling set, which no node-up will undo
-            ;; while the link is still up. Overloading #f with "the link
-            ;; is fine but this one frame was refused" breaks that
-            ;; theorem, and a node disappears from a pool over a
-            ;; transient.
+            ;; The middle one is a theorem, not a convention. Overloading
+            ;; #f with "the link is fine, this frame was refused" removed
+            ;; a node from a pool over a transient, with no node-down to
+            ;; ever undo it; that is what this shape exists to prevent,
+            ;; and it is why the third outcome raises instead of joining
+            ;; #f.
             ;;
-            ;; SO THE INFORMATION IS REAL AND HAS NOWHERE SAFE TO GO. It
-            ;; is worth being precise about which part of the usual
-            ;; argument holds: a caller of a fire-and-forget send must
-            ;; already tolerate a lost message, and cannot distinguish
-            ;; one lost in the network from one lost here. But a message
-            ;; lost in the network is eventually retransmitted or shows
-            ;; up as a failed link, while a submission refused here can
-            ;; leave the link healthy and the frame gone for good. That
-            ;; difference is not visible through this return value.
-            ;;
-            ;; WHICH FAILURES STILL REACH THE CALLER, precisely, because
-            ;; the two are easy to collapse into one: a payload this
-            ;; library cannot serialize still RAISES out of this call
-            ;; (frame-segments refuses it), so a caller that guards
-            ;; rsend still catches that one and can fail the work it
-            ;; belongs to. What has no channel is narrower -- a frame
-            ;; that serialized and was then refused at submission. A
-            ;; caller's guard around rsend is therefore still doing its
-            ;; job for the case it was written for, and silently doing
-            ;; nothing for this one.
-            ;;
-            ;; THIS IS A STATEMENT ABOUT TODAY, NOT AN IMPOSSIBILITY
-            ;; PROOF. The shape a repair takes is a second channel that
-            ;; does not overload #f -- an out-of-band answer to the
-            ;; caller, or a submission result the caller can ask for --
-            ;; so that a refused frame can be reported without claiming
-            ;; the link is down. See the gap ledger for what depends on
-            ;; this.
-            (write-frame! (vector-ref e 0) (list 'send reg-name msg))
-            #t))
+            ;; A serialization failure raises too, out of frame-segments,
+            ;; and always did. So a caller that guards this call catches
+            ;; both kinds of "it did not go", and neither kind quietly
+            ;; reports success.
+            (let-values (((ok failure)
+                          (write-body! (vector-ref e 0)
+                                       (frame-segments
+                                         (list 'send reg-name msg)))))
+              (cond (ok #t)
+                    (failure (raise (submission-failure node failure)))
+                    (else #f)))))
       (else #f)))
 
   ;; Synchronous cross-node call to the GEN-SERVER registered as
@@ -2180,12 +2251,20 @@
                 ;; answer arrives from either side and this call waits
                 ;; out its timeout, which is the outcome it has anyway
                 ;; when a reply is lost.
-                (unless (write-body! (vector-ref e 0) segs)
-                  (when (atomically
-                          (let ((v (hashtable-ref pending ref #f)))
-                            (when v (hashtable-delete! pending ref))
-                            (and v #t)))
-                    (raise (vector 'rcall-error 'noconnection node))))
+                (let-values (((ok failure)
+                              (write-body! (vector-ref e 0) segs)))
+                  ;; BOTH FAILURES ANSWER THE SAME. A caller that has
+                  ;; already published a pending entry needs an answer,
+                  ;; not a diagnosis: no link and a frame that did not go
+                  ;; both mean nothing will reply. The condition is not
+                  ;; discarded for want of a place -- it is discarded
+                  ;; because this caller's answer does not depend on it.
+                  (unless ok
+                    (when (atomically
+                            (let ((v (hashtable-ref pending ref #f)))
+                              (when v (hashtable-delete! pending ref))
+                              (and v #t)))
+                      (raise (vector 'rcall-error 'noconnection node)))))
                 (receive (after timeout
                             (atomically (hashtable-delete! pending ref))
                             (raise (vector 'rcall-error 'timeout reg-name)))
@@ -2266,7 +2345,9 @@
               ;; the answer itself.
               (let ((segs (frame-segments (list 'mon name mref))))
                 (arm-rmonitor! mref node name)
-                (unless (write-body! (vector-ref e 0) segs)
+                (let-values (((ok failure)
+                              (write-body! (vector-ref e 0) segs)))
+                 (unless ok
                   (let ((entry (atomically
                                  (let ((x (hashtable-ref rmonitors mref #f)))
                                    (when x (hashtable-delete! rmonitors mref))
@@ -2274,7 +2355,7 @@
                     (when entry
                       (stop-owner-agent! mref)
                       (send self (vector 'remote-down node name
-                                         'noconnection))))))))
+                                         'noconnection)))))))))
         (else
          ;; no link at all: report immediately, nothing to install
          (send self (vector 'remote-down node name 'noconnection))))

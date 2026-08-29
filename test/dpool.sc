@@ -97,6 +97,29 @@
           (unless (eq? got 'task-error) (fail! "task-error" got))))
       (display "handler crash -> task-error (no retry) ok\n")
 
+      ;; A payload the wire refuses must FAIL the task, not strand it.
+      ;; The coordinator's dispatch wraps its send in a guard whose
+      ;; 'unsendable arm answers the awaiter through the task-error
+      ;; path; this cell pins that arm alive. The red shapes it owns:
+      ;; a coordinator that dies on the raise (every later await hangs
+      ;; on a dead process), and an arm that never fires (this await
+      ;; burns its whole timeout against a task nobody will answer).
+      ;; The prompt bound is the assertion: an ANSWER within the window,
+      ;; not a timeout spent.
+      (let ((t (dpool-submit pool (vector 'x car))))
+        (let ((got (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'dpool-error))
+                              (vector-ref e 1)))
+                     (dpool-await pool t 5000)
+                     'no-raise)))
+          (unless (eq? got 'task-error) (fail! "unsendable-payload" got))))
+      ;; ...and the refusal cost one task, not the pool: the next
+      ;; ordinary submit still completes
+      (let ((t (dpool-submit pool (vector 'square 6))))
+        (let ((r (dpool-await pool t 10000)))
+          (unless (and (vector? r) (= (vector-ref r 2) 36))
+            (fail! "pool-dead-after-unsendable" r))))
+      (display "unsendable payload fails one task, pool survives ok\n")
+
       ;; a non-serializable result must not strand the task: the worker
       ;; turns it into a task-error instead of crashing on the reply
       (let ((t (dpool-submit pool (vector 'unserializable))))
