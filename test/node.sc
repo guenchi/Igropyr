@@ -1005,6 +1005,119 @@
     ;; handle is used (the close-vs-use interleave is not reachable from
     ;; a test that cannot place a kill).
 
+    ;; ---- a replacement is a death and a birth, in that order -------------
+    ;; The generational contract, driven end to end with a DETERMINISTIC
+    ;; replacement: a fake peer dials in as 'genpeer (dialer name
+    ;; 'genpeer), state is parked on that generation, then node a is told
+    ;; to dial a fake listener where an acceptor completes the handshake
+    ;; as the same peer -- a's dial installs with dialer 'a, and
+    ;; 'a < 'genpeer wins the tie-break: a replacement, on demand, with
+    ;; no timing to race. What must follow: the old generation's monitor
+    ;; answers noconnection, its pending rcall fails over, watchers hear
+    ;; node-down then node-up -- and nothing speaks for that generation
+    ;; twice.
+    ;;
+    ;; THE CONSEQUENCES HAVE TWO SUPPLIERS, and this cell is deliberately
+    ;; insensitive to which one delivered: the installer sweeps the old
+    ;; generation at once, and the old link's own teardown sweeps
+    ;; unconditionally by epoch -- removing either alone stays green
+    ;; (measured), because the twin covers it. What this cell pins is
+    ;; the contract; total loss of both is what the pre-generational
+    ;; build showed as four missing consequences.
+    (let ((me self) (ref (gensym)) (fake-port 18084))
+      ;; ORDERING IS THE FIXTURE. a's connector skips dialing while a
+      ;; live entry exists, so a dial that starts after gen1 never
+      ;; happens; instead a dials FIRST (no entry yet), the fake
+      ;; acceptor swallows the hello and holds the welcome, gen1 dials
+      ;; in and parks its state, and only then is the welcome released
+      ;; -- a's install lands on a live gen1 and must win the tie-break.
+      (monitor-node 'genpeer)
+      (let ((acceptor-pid (box #f)))
+        (define l
+          (tcp-listen! "127.0.0.1" fake-port 4
+            (lambda (c)
+              (let ((pid (spawn
+                           (lambda ()
+                             (let ((nb "abcdefabcdefabcdefabcdefabcdefab"))
+                               (tcp-write! c (frame-bytes (list 'challenge nb 3)) #f)
+                               (let ((d (read-frame-or-closed "generation-swap-hello")))
+                                 (if (and (pair? d) (eq? (car d) 'hello))
+                                     (begin
+                                       (set-box! acceptor-pid self)
+                                       (send me (vector ref 'hello-held))
+                                       ;; hold the welcome until told
+                                       (receive (after 4000 'welcome-anyway)
+                                         (`#(speak) 'ok))
+                                       (tcp-write! c
+                                         (frame-bytes
+                                           (list 'welcome 'genpeer
+                                             (versioned-proof (cadddr d) 'genpeer 3)))
+                                         #f)
+                                       (receive (after 30000 'give-up)
+                                         (`#(release) 'ok))
+                                       (tcp-close! c))
+                                     (tcp-close! c))))))))
+                (conn-set-owner! c pid)
+                (tcp-read-start! c)))))
+        (node-connect! 'genpeer "127.0.0.1" fake-port)
+        (receive (after 8000 (fail! "generation-swap" 'no-held-hello))
+          (`#(,@ref hello-held) 'ok))
+        ;; gen1: dial in while a's own dial is parked mid-handshake
+        (let ((holder
+                (spawn
+                  (lambda ()
+                    (let ((c (handshake-as! 'genpeer "generation-swap")))
+                      (send me (vector ref 'gen1-up))
+                      (receive (after 30000 'give-up) (`#(release) 'ok))
+                      (tcp-close! c))))))
+          (receive (after 8000 (fail! "generation-swap" 'no-gen1)) (`#(,@ref gen1-up) 'ok))
+          (receive (after 8000 (fail! "generation-swap" 'no-node-up)) (`#(node-up genpeer) 'ok))
+          ;; park state on gen1: a remote monitor and a pending rcall
+          (monitor-remote 'genpeer 'ghost)
+          (spawn (lambda ()
+                   (send me (vector 'gen-rcall
+                     (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'rcall-error))
+                                (vector-ref e 1)))
+                       (rcall 'genpeer 'svc 'x 30000)
+                       'no-raise)))))
+          (sleep-ms 100)
+          ;; release the welcome: a's dial completes, dialer 'a wins
+          (send (unbox acceptor-pid) (vector 'speak))
+          ;; the four consequences, in whatever order they arrive
+          (let wait ((down #f) (up #f) (mon #f) (rc #f))
+            (if (and down up mon rc)
+                'ok
+                (receive (after 10000 (fail! "generation-swap-missing"
+                                             (list 'down down 'up up 'mon mon 'rc rc)))
+                  (`#(node-down genpeer) (wait #t up mon rc))
+                  (`#(node-up genpeer) (wait down #t mon rc))
+                  (`#(remote-down genpeer ghost ,r)
+                    (unless (eq? r 'noconnection)
+                      (fail! "generation-swap-mon-reason" r))
+                    (wait down up #t rc))
+                  (`#(gen-rcall ,r)
+                    (unless (eq? r 'noconnection)
+                      (fail! "generation-swap-rcall-reason" r))
+                    (wait down up mon #t)))))
+          ;; ...and only once: the swept generation stays swept
+          (receive (after 1000 'quiet)
+            (`#(remote-down genpeer ghost ,r)
+              (fail! "generation-swap-second-report" r)))
+          ;; negative control: an ORDINARY drop of the current generation
+          ;; is a death without a birth -- one node-down, no node-up
+          (node-disconnect! 'genpeer)   ; stop redialing before the close
+          (let ((p (unbox acceptor-pid)))
+            (when p (send p (vector 'release))))
+          (receive (after 8000 (fail! "generation-swap-plain-drop-silent"))
+            (`#(node-down genpeer) 'ok))
+          (receive (after 1200 'quiet)
+            (`#(node-up genpeer)
+              (fail! "generation-swap-plain-drop-reborn")))
+          (demonitor-node 'genpeer)
+          (send holder (vector 'release))
+          (tcp-stop-listen! l))))
+    (display "a replacement is a death and a birth, exactly once ok\n")
+
     ;; rsend to an unknown node: #f, no crash
     (unless (eq? #f (rsend 'nowhere 'svc 'x))
       (fail! "rsend-unknown"))
