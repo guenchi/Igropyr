@@ -1024,6 +1024,14 @@
     ;; (measured), because the twin covers it. What this cell pins is
     ;; the contract; total loss of both is what the pre-generational
     ;; build showed as four missing consequences.
+    ;;
+    ;; AND THE TWO SUPPLIERS ARE NOT REDUNDANT, which bounds what this
+    ;; cell proves: the installer's sweep guarantees PROMPTNESS, the
+    ;; teardown's guarantees EVENTUALLY. This cell proves eventually.
+    ;; A promptness cell would need a bound only the installer can meet,
+    ;; which needs the old link wedged -- no external handle does that,
+    ;; so timeliness is review-pinned and in the ledger, not implied
+    ;; here.
     (let ((me self) (ref (gensym)) (fake-port 18084))
       ;; ORDERING IS THE FIXTURE. a's connector skips dialing while a
       ;; live entry exists, so a dial that starts after gen1 never

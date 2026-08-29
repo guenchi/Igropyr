@@ -30,6 +30,24 @@
 ;;;     with side effects that can't be made idempotent ("charge once").
 ;;;     The caller decides whether to resubmit, with its own context.
 ;;;
+;;;   A CONNECTION REPLACEMENT COUNTS AS A NODE DEATH, and it is worth
+;;;   knowing where that bites. (igropyr node) treats a link that is
+;;;   replaced -- two nodes dialing each other at once resolve to one
+;;;   connection, and the other is replaced -- as the peer going down and
+;;;   coming back up. This pool sees the node-down and acts on it:
+;;;     - at-least-once tasks in flight on that node are RE-RUN. The
+;;;       contract already allows that; what changes is how often it
+;;;       happens.
+;;;     - at-most-once tasks in flight on that node FAIL with
+;;;       #(dpool-error node-down id). The caller already has to handle
+;;;       that error; what changes is that a reconnection can now cause
+;;;       it, not only a node that really went away.
+;;;   TWO NODES DIALING EACH OTHER IS THE ORDINARY WAY A MESH STARTS, so
+;;;   the replacement is not a rare event -- it is close to guaranteed
+;;;   once per pair at startup, when there is usually nothing in flight
+;;;   yet. It is a live-traffic concern only when a node rejoins a
+;;;   working mesh.
+;;;
 ;;;   Exactly-once is not on offer: no message-passing system can give
 ;;;   both "never dropped" and "never duplicated" across a crash -- that
 ;;;   needs downstream cooperation (idempotency keys, a transactional
