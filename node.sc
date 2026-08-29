@@ -891,9 +891,13 @@
   ;; process, and a diagnostic here would turn an error port that refuses
   ;; writes into a failure of the unrelated rsend that happened to be the
   ;; frame over the line.
-  ;; Take a link down from a process that is NOT the link process, which
-  ;; is the only situation needing this: the link process itself just
-  ;; closes and raises. Enforce first, then wake -- the close does not
+  ;; Take a link down. It is written for a process that is NOT the link
+  ;; process -- which is the usual caller, since the link process can
+  ;; close and raise directly -- but nothing restricts it to that, and
+  ;; the link process does reach it: a ping or a reply that crosses the
+  ;; outbound ceiling arrives here through close-for-backpressure!. In
+  ;; that case the wake-up goes to its own mailbox and is matched at its
+  ;; next receive, which is the same outcome by a slightly longer route. Enforce first, then wake -- the close does not
   ;; depend on the other process ever running, and the message is what
   ;; turns a closed socket into a link that has gone down (libuv's close
   ;; completion notifies nobody).
@@ -1422,22 +1426,55 @@
   ;; fail-monitors-for! synthesizes noconnection for every watch that
   ;; crossed the link.
   ;;
-  ;; THE CONNECTION THAT FAILED IS THE ONE TAKEN DOWN. It comes from the
-  ;; entry this call already holds, not from a second lookup by name: see
-  ;; stop-link! for why a name is the wrong handle here.
+  ;; THE CONNECTION THAT FAILED IS THE ONE TAKEN DOWN -- but only if it
+  ;; is still the connection this peer is reached on.
+  ;;
+  ;; A LINK CAN BE REPLACED UNDER THIS CALL. Between taking the entry and
+  ;; finishing the write there are safe points, and a duplicate dial can
+  ;; win the tie-break in that window: install-peer! swaps the table over
+  ;; to the new connection and condemns the old one. If the write then
+  ;; fails on the old connection, taking "the link" down accomplishes
+  ;; nothing -- that connection was already dying, and remove-peer!
+  ;; deliberately skips its monitor cleanup because the table no longer
+  ;; points at it, so the far end is told nothing by anybody. The frame
+  ;; is simply retried on the connection that is now current.
+  ;;
+  ;; IT TERMINATES because a retry is only taken when the current
+  ;; connection is not the one just written to, so each iteration
+  ;; requires another connection to have completed a handshake and won a
+  ;; tie-break. The iteration count is bounded by real reconnections, and
+  ;; a failure on a connection that is still current never retries.
+  ;;
+  ;; The generation check races too, and harmlessly: if the connection is
+  ;; replaced just after it reads "still current", the close lands on a
+  ;; connection that was condemned anyway and the wake-up carries that
+  ;; connection, which link-loop refuses if it has moved on.
   ;;
   ;; A SERIALIZATION FAILURE STILL PROPAGATES. Only a failed submission is
   ;; handled: a datum the writer refuses is a different event with a
   ;; different repair, and mon-agent's degrade-to-'exit path depends on
   ;; still seeing it.
   (define (link-write/critical peer datum why)
-    (let ((e (live-entry peer)))
-      (and e
-           (let ((c (vector-ref e 0)) (link (vector-ref e 1)))
-             (let-values (((ok failure) (write-body! c (frame-segments datum))))
-               (cond (ok #t)
-                     (failure (stop-link! c link why) #f)
-                     (else #f)))))))
+    (let retry ()
+      (let ((e (live-entry peer)))
+        (and e
+             (let ((c (vector-ref e 0)) (link (vector-ref e 1)))
+               (let-values (((ok failure) (write-body! c (frame-segments datum))))
+                 (cond
+                   (ok #t)
+                   ;; BOTH FAILURES TAKE THIS ROUTE. A refused submission
+                   ;; and a connection that was already gone differ to a
+                   ;; caller reporting upward; here they are the same
+                   ;; event -- this frame did not reach the peer -- and
+                   ;; the same two answers apply.
+                   ((eq? c (current-conn peer)) (stop-link! c link why) #f)
+                   (else (retry)))))))))
+
+  ;; The connection this peer is currently reached on, or #f. Used to ask
+  ;; whether a connection in hand is still the current one.
+  (define (current-conn peer)
+    (let ((e (peer-entry peer)))
+      (and e (vector-ref e 0))))
 
   ;; ---- cross-node process monitor ----------------------------------------
 
@@ -1475,10 +1512,24 @@
             (receive
               (`#(DOWN ,@p ,reason)
                 (atomically (hashtable-delete! callee-agents key))
-                ;; The guard is for a REASON THAT WILL NOT SERIALIZE, and
-                ;; only that: link-write/critical does not raise for a
-                ;; failed submission -- it takes the link down and answers
-                ;; #f -- so this handler still means what it always meant.
+                ;; The guard is here for a REASON THAT WILL NOT
+                ;; SERIALIZE, and it catches more than that. It is a bare
+                ;; (#t ...), so it also takes the OOM-domain raises from
+                ;; outside write-body!'s own guard -- outbound-charge!
+                ;; before the submission, close-for-backpressure! after
+                ;; it -- and answers all of them by degrading the reason
+                ;; to 'exit.
+                ;;
+                ;; THAT BREADTH IS DELIBERATE BECAUSE THE ALTERNATIVE IS
+                ;; NOT AVAILABLE. Splitting them would need a predicate
+                ;; that tells a serializer's refusal from an allocation
+                ;; failure, and neither has a shape this file can match
+                ;; on reliably. The degrade direction is the safe one:
+                ;; sending an 'exit that was not strictly warranted costs
+                ;; a watcher a less precise reason, while sending nothing
+                ;; costs it the DOWN entirely. (An earlier version of
+                ;; this comment claimed the guard handled serialization
+                ;; failures "and only that". It never did.)
                 (guard (e (#t (link-write/critical
                                 watcher (list 'mdown mref 'exit)
                                 'mdown-lost)))
