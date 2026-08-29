@@ -2068,7 +2068,11 @@
             ;; cannot be reached right now -- and this layer already has
             ;; a word for it. Letting the condition through instead would
             ;; take an out-of-memory in the transport and surface it from
-            ;; conversation-peek, which promises a status, not a raise.
+            ;; conversation-peek, whose callers expect a status. It is
+            ;; not a promise that nothing can raise from here -- an
+            ;; allocation failure inside monitor-remote or the transport
+            ;; still can -- only that a transport refusal, which is a
+            ;; reachability fact, is answered as one.
             (if (guard (e ((submission-failure? e) #f))
                   (rsend owner router
                          (vector 'conv-peek-fwd (node-self) reply-name ref id)))

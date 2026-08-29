@@ -679,8 +679,13 @@
   ;; one of TWO ways the layer below reports a failed submission. The
   ;; other is a plain #f -- uv_write declining immediately with a
   ;; negative errno, which frees its block, calls the completion, and
-  ;; returns, without raising anything at all. Both happen on healthy
-  ;; connections. Keying on the exception therefore repaired one half and
+  ;; returns, without raising anything at all. Neither of them means the
+  ;; connection is gone -- which is the distinction being drawn -- though
+  ;; neither proves it is healthy either: uv_write can refuse with EPIPE
+  ;; or ENOTCONN on a connection this side still has in 'open. What the
+  ;; state test establishes is only that this side has not yet observed
+  ;; the connection go away, and that is exactly what "#f means no link"
+  ;; needs to promise. Keying on the exception therefore repaired one half and
   ;; left the other reporting "no link" for a link that was up, which is
   ;; exactly the failure being repaired. What actually distinguishes the
   ;; two cases is whether the connection is still open, so that is what
@@ -699,11 +704,15 @@
   ;; caller that has published state can act on a returned #f and cannot
   ;; act on an exception.
   ;;
-  ;; THAT GUARD IS NOT THE WHOLE PROCEDURE, and two things sit outside it:
+  ;; THAT GUARD IS NOT THE WHOLE PROCEDURE, and three things sit outside
+  ;; it:
   ;;   - outbound-charge! runs BEFORE it and allocates (a table entry, and
   ;;     on a first write a close hook);
   ;;   - close-for-backpressure! runs AFTER it and both allocates
-  ;;     (conn-link-pid walks the peers table) and sends.
+  ;;     (conn-link-pid walks the peers table) and sends;
+  ;;   - the wake-up for a connection found closed does the same two
+  ;;     things, and was added to this procedure after this list was
+  ;;     first written -- which is how a list like this goes wrong.
   ;; An OOM in either still leaves this procedure by raising. The second
   ;; is the worse of the two and is stated rather than smoothed over:
   ;; when it is reached after a SUCCESSFUL submission -- which is the
@@ -844,8 +853,24 @@
           ;; the partial-write branches in libuv.sc) arrives here looking
           ;; exactly like any other closed connection, because that is
           ;; all this side can observe.
+          ;; THE TEST IS THE CONNECTION'S STATE, not whether a condition
+          ;; was captured -- the same measure R1 above settled on, applied
+          ;; here too. Keying it on `failure` missed the case where the
+          ;; transport closed the connection AND raised (a partial write
+          ;; whose remainder could not be queued does exactly that): the
+          ;; connection was gone and nobody was woken, because a condition
+          ;; had been captured.
+          ;;
+          ;; READING IT HERE, OUTSIDE THE ATOMIC REGION, IS SOUND IN ONE
+          ;; DIRECTION ONLY, and that is the direction to be in. A
+          ;; connection's state moves open -> closing -> closed and never
+          ;; back, so "not open" read now was not open a moment ago
+          ;; either. The error this can make is the other one: reading
+          ;; 'open just before it closes, and skipping a wake-up that was
+          ;; available. That case is the one every other discovery path
+          ;; already covers.
           (cond (over? (close-for-backpressure! c))
-                ((and (not r) (not failure))
+                ((and (not r) (not (eq? (conn-state c) 'open)))
                  (stop-link! c (conn-link-pid c) 'write-to-closed)))
           (values (and r #t) failure)))))
 
@@ -937,7 +962,12 @@
   ;; owns it (a connection still in its handshake, or one already torn
   ;; down). A scan, because peers is keyed by node name and this asks the
   ;; question from the other end; the mesh is small by design (see the
-  ;; fourth commitment) and this runs once per backpressure close.
+  ;; fourth commitment). It used to run once per backpressure close;
+  ;; since the wake-up above it also runs for every writer that finds a
+  ;; connection already closed, so concurrent writers can each scan once
+  ;; before the link process consumes the first wake-up. They send
+  ;; messages tagged with the same connection, which link-loop accepts
+  ;; once and refuses thereafter.
   (define (conn-link-pid c)
     (atomically
       (let-values (((names entries) (hashtable-entries peers)))
