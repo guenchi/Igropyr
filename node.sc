@@ -20,17 +20,6 @@
 ;;;     TCP connection per pair)
 ;;;   - rsend to the OWN node name is a plain local send (location
 ;;;     transparency)
-;;;   - A CONNECTION IS A GENERATION, AND NOTHING SURVIVES ONE. When the
-;;;     link to a peer is replaced -- two nodes dialing each other at once
-;;;     resolve to one connection, and the loser's is replaced -- the peer
-;;;     is reported DOWN and then UP, every cross-node monitor over it
-;;;     fires 'noconnection, every rcall waiting on it fails, and every
-;;;     monitor hosted for it is dropped. A WATCHER MUST RE-ARM ON
-;;;     node-up; a monitor placed over one generation says nothing about
-;;;     the next. This costs a duplicate-connection event the work in
-;;;     flight over it, and buys the rule that no watch can outlive the
-;;;     connection that carried it and quietly report nothing -- which is
-;;;     what it did before, on a link that looked healthy.
 ;;;
 ;;; Wire protocol: length-prefixed frames -- "<decimal-len>\n<datum>" --
 ;;; carrying one EXTENDED-mode s-expression each (vectors, bytevectors
@@ -214,38 +203,8 @@
   ;; with interrupts disabled so preemption cannot interleave them (the
   ;; same discipline as the actor registry).
 
-  ;; node-name -> #(conn link-pid dialer-name epoch)
-  ;;
-  ;; The epoch identifies the GENERATION of connection: state established
-  ;; over a link records the epoch it was made under, so a sweep for an
-  ;; older generation cannot take a newer one's entries. See
-  ;; peer-epochs for why the counter itself does not live here.
+  ;; node-name -> #(conn link-pid dialer-name)
   (define peers (make-eq-hashtable))
-
-  ;; node-name -> the highest epoch ever issued for that name. NEVER
-  ;; DELETED, and that is the whole reason it is a separate table.
-  ;;
-  ;; THE COUNTER HAS TO OUTLIVE THE THING IT COUNTS. It was first kept
-  ;; inside the peers entry, which fails in the one case it exists for: a
-  ;; peer that fully disconnects has its entry removed, so the next
-  ;; install found nothing and started again at 1 -- while a teardown
-  ;; still in flight for epoch 7 was about to sweep everything at
-  ;; `epoch <= 7`, which now included the whole new generation. A
-  ;; generation counter stored in the record whose disappearance it is
-  ;; meant to survive is not a generation counter.
-  ;;
-  ;; WHAT IT COSTS is one entry per node name ever connected to, never
-  ;; reclaimed -- the same shape, and the same accepted residue, as the
-  ;; watchers table: an application with a finite set of node names has a
-  ;; finite table, and one that mints names has not. It is a small entry
-  ;; (a symbol and an integer) and it is not swept, because a sweep is
-  ;; exactly what would let the counter restart.
-  (define peer-epochs (make-eq-hashtable))
-
-  (define (next-peer-epoch! name)
-    (let ((ep (+ 1 (hashtable-ref peer-epochs name 0))))
-      (hashtable-set! peer-epochs name ep)
-      ep))
   ;; node-name -> #(connector-pid host port). The endpoint is part of the
   ;; value because a node keeps its name across a move: keyed on name
   ;; alone, a connector for the OLD address counts as "already dialing"
@@ -253,31 +212,20 @@
   (define connectors (make-eq-hashtable))
   ;; node-name -> list of watcher pids
   (define watchers (make-eq-hashtable))
-  ;; rcall ref -> #(caller node epoch) (this node is the caller; epoch is
-  ;; the generation the call was issued over, so a sweep for an older
-  ;; generation leaves a newer call alone)
-  ;;
-  ;; THESE SUMMARIES SIT AT THE TOP AND THE CODE THEY DESCRIBE IS A
-  ;; THOUSAND LINES AWAY, which is exactly how they went stale when the
-  ;; epoch was added: the change was made where the shape is used, and
-  ;; nothing at the point of change pointed back here. If a value shape
-  ;; changes, this block is part of the change.
+  ;; rcall ref -> waiting caller pid (this node is the caller)
   (define pending (make-eqv-hashtable))
   (define rcall-counter 0)
   (define (next-rcall-ref!)
     (atomically (set! rcall-counter (+ rcall-counter 1)) rcall-counter))
 
   ;; cross-node process monitors. On the WATCHER node:
-  ;;   rmonitors: mref -> #(caller node name epoch)   (for demonitor +
-  ;;              the noconnection synthesized when the link to node
-  ;;              drops; epoch is the generation the watch was placed
-  ;;              over -- 0 for a local watch, which no peer sweep names)
+  ;;   rmonitors: mref -> #(caller node name)   (for demonitor + the
+  ;;              noconnection synthesized when the link to node drops)
   ;;   caller-agents: mref -> agent pid         (self-watch only)
   ;;   owner-agents: mref -> agent pid          (cleans up when caller dies)
   ;; On the TARGET node:
-  ;;   callee-agents: (peer . mref) -> (agent-pid . epoch)  (one local
-  ;;              monitor per remote watch; killed on demon). Keyed by
-  ;;              (peer . mref)
+  ;;   callee-agents: (peer . mref) -> agent pid  (one local monitor per
+  ;;              remote watch; killed on demon). Keyed by (peer . mref)
   ;;              because mref is chosen by the watcher's own counter, so
   ;;              two watchers collide on it -- the pair namespaces them.
   (define rmonitors (make-eqv-hashtable))
@@ -633,7 +581,7 @@
   ;; SERIALIZING AND SUBMITTING ARE SEPARATE BECAUSE THEY FAIL
   ;; DIFFERENTLY. frame-segments raises -- the writer refuses the datum,
   ;; or the frame is over the limit -- while write-body! reports its
-  ;; submission by returning. (It is not exception-free: three allocating
+  ;; submission by returning. (It is not exception-free: two allocating
   ;; steps sit outside its guard, and it says so where it is defined.
   ;; What matters here is that the failures a CALLER can act on are the
   ;; ones this split moves in front of the publication point.) A caller
@@ -705,20 +653,11 @@
   ;; Submit an already-materialized frame.
   ;; -> (values submitted? failure)
   ;;      #t #f       handed to libuv
-  ;;      #f #f       nothing was submitted and no condition was
-  ;;                  produced: read as "there is no link"
-  ;;      #f <why>    the submission failed and said something about it;
+  ;;      #f #f       the connection was not open -- there is no link
+  ;;      #f <why>    the submission failed on a connection that IS open;
   ;;                  <why> is the condition it raised, or the symbol
   ;;                  'submission-refused when libuv declined without
   ;;                  raising anything to carry
-  ;;
-  ;; <why> DOES NOT IMPLY THE CONNECTION IS STILL OPEN, and an earlier
-  ;; version of this list said it did. A partial write whose remainder
-  ;; cannot be queued closes the connection and then raises, so
-  ;; (#f . condition) arrives with the connection already gone. The
-  ;; connection's state is consulted separately, at the end of this
-  ;; procedure, and what it decides there is whether to wake the link --
-  ;; not which of these two rows applies.
   ;;
   ;; TWO VALUES AND NOT A THREE-WAY SINGLE ONE, because a condition object
   ;; is TRUE. Every caller written as `(unless (write-body! ...) ...)`
@@ -774,9 +713,8 @@
   ;;   - the wake-up for a connection found closed does the same two
   ;;     things, and was added to this procedure after this list was
   ;;     first written -- which is how a list like this goes wrong.
-  ;; An OOM in any of the three still leaves this procedure by raising.
-  ;; The close-for-backpressure! one
-  ;; is the worst of them and is stated rather than smoothed over:
+  ;; An OOM in either still leaves this procedure by raising. The second
+  ;; is the worse of the two and is stated rather than smoothed over:
   ;; when it is reached after a SUCCESSFUL submission -- which is the
   ;; usual way to reach it -- the frame is already with libuv, so the
   ;; peer may act on it and reply, while this caller sees an exception
@@ -926,22 +864,11 @@
           ;; READING IT HERE, OUTSIDE THE ATOMIC REGION, IS SOUND IN ONE
           ;; DIRECTION ONLY, and that is the direction to be in. A
           ;; connection's state moves open -> closing -> closed and never
-          ;; back. What that buys is NOT "not open now means it was
-          ;; already not open when the write failed" -- an earlier version
-          ;; of this comment claimed exactly that, and it is backwards:
-          ;; the write can be refused on a connection that is still open
-          ;; and be closed by someone else a moment later. What
-          ;; monotonicity gives is the forward direction -- once this read
-          ;; says "not open", it will not become open again -- and that is
-          ;; enough, because the action taken is about the connection's
-          ;; state NOW: close it (idempotent) and wake whoever is running
-          ;; it.
-          ;;
-          ;; The error this can make is the other one: reading 'open just
-          ;; before it closes, and skipping a wake-up. Not every other
-          ;; path covers that -- a local close produces no tcp-eof, and if
-          ;; nothing more is written there is no next write either. What
-          ;; covers it is the tick.
+          ;; back, so "not open" read now was not open a moment ago
+          ;; either. The error this can make is the other one: reading
+          ;; 'open just before it closes, and skipping a wake-up that was
+          ;; available. That case is the one every other discovery path
+          ;; already covers.
           (cond (over? (close-for-backpressure! c))
                 ((and (not r) (not (eq? (conn-state c) 'open)))
                  (stop-link! c (conn-link-pid c) 'write-to-closed)))
@@ -1039,11 +966,8 @@
   ;; since the wake-up above it also runs for every writer that finds a
   ;; connection already closed, so concurrent writers can each scan once
   ;; before the link process consumes the first wake-up. They send
-  ;; messages tagged with the same connection. The first one that reaches
-  ;; a link-loop ends it, so the duplicates do not accumulate there; they
-  ;; go one of three other ways -- drained by a long-lived connector's
-  ;; wait, discarded with an acceptor that is exiting anyway, or refused
-  ;; by a LATER link-loop whose connection is not the one in the message.
+  ;; messages tagged with the same connection, which link-loop accepts
+  ;; once and refuses thereafter.
   (define (conn-link-pid c)
     (atomically
       (let-values (((names entries) (hashtable-entries peers)))
@@ -1246,91 +1170,22 @@
     (string<? (symbol->string a) (symbol->string b)))
 
   ;; -> #t if this conn was installed, #f if it lost the tie-break
-  ;; -> the new generation's epoch if this conn was installed, #f if it
-  ;; lost the tie-break.
-  ;;
-  ;; A REPLACEMENT IS A FULL DOWN-THEN-UP. It used to be silent: the table
-  ;; was swapped, the old link was told to stop, and no watcher heard
-  ;; anything -- on the theory that the peer never went away, only the
-  ;; socket did. That theory does not survive contact with what hangs off
-  ;; a connection. Monitors, pending calls and hosted agents all belong to
-  ;; the connection that carried them, and the old link's teardown
-  ;; deliberately skipped their cleanup once the table had moved on, so a
-  ;; replacement left watchers armed on a generation that no longer
-  ;; existed and calls waiting for replies that could not come.
-  ;;
-  ;; Rather than teach the teardown to clean up for a generation it no
-  ;; longer owns, the replacement itself does it and says so: everything
-  ;; of the old generation fails, watchers are told down and then up, and
-  ;; the rule a caller has to know is one sentence -- A MONITOR DOES NOT
-  ;; SURVIVE A GENERATION; RE-ARM ON node-up. (dpool already works this
-  ;; way for its own reasons, which is where the pattern comes from.)
   (define (install-peer! name c dialer)
-    (let ((outcome
+    (let ((won?
            (atomically
-             (let* ((e (hashtable-ref peers name #f))
-                    (old (and e (vector-ref e 3)))
-                    (ep (next-peer-epoch! name)))
-               (cond
-                 ;; a live entry: the tie-break decides, and only the
-                 ;; winner disturbs anything
-                 ((and e (eq? (conn-state (vector-ref e 0)) 'open))
-                  (and (name<? dialer (vector-ref e 2))
-                       (begin
+             (let ((e (hashtable-ref peers name #f)))
+               (if (and e (eq? (conn-state (vector-ref e 0)) 'open))
+                   (if (name<? dialer (vector-ref e 2))
+                       (begin                    ; new conn wins: evict old
                          (send (vector-ref e 1) (vector 'node-stop))
-                         (hashtable-set! peers name (vector c self dialer ep))
-                         (cons ep old))))
-                 ;; an entry whose connection is already gone, or none at
-                 ;; all. Taking over is not a contest; whether it is a
-                 ;; replacement depends on whether anything was there.
-                 (else
-                  (hashtable-set! peers name (vector c self dialer ep))
-                  (cons ep old)))))))
-      (cond
-        ((not outcome) #f)
-        (else
-         (let ((ep (car outcome)) (old (cdr outcome)))
-           ;; the old generation's state, and only it: entries carry the
-           ;; epoch they were made under, so anything the NEW generation
-           ;; has already established is not swept by this
-           (when old (fail-generation! name old))
-           ;; THE PAIR IS GUARDED BY THE GENERATION, AND SENT AS ONE STEP.
-           ;; The sweep above is O(application state) and cannot be inside
-           ;; an atomic region, so by the time these are sent this
-           ;; generation may already have been replaced -- and then a
-           ;; down/up describing a generation two removals ago would land
-           ;; AFTER the newer one's own notifications, leaving watchers
-           ;; with "up" for a peer that is gone. Whoever is current says
-           ;; what happened to it; a generation that has been superseded
-           ;; says nothing, because everything it would have said has been
-           ;; said by its successor.
-           (atomically
-             (when (current-generation? name ep)
-               (when old (notify! name 'node-down))
-               (notify! name 'node-up)))
-           ep)))))
-
-  ;; Is `ep` still the generation this peer is reached on?
-  (define (current-generation? name ep)
-    (let ((e (hashtable-ref peers name #f)))
-      (and e (eqv? (vector-ref e 3) ep))))
-
-  ;; Fail everything this peer's generation `epoch` (or older) established.
-  ;;
-  ;; SCOPED BY EPOCH, WHICH IS WHAT MAKES IT SAFE TO RUN OUTSIDE THE TABLE
-  ;; SWAP. The swap and this sweep cannot be one uninterruptible step --
-  ;; the sweep walks tables whose size is set by the application, so an
-  ;; atomic region around it has no bound. Without the epoch that leaves a
-  ;; window in which a call or a monitor established on the NEW generation
-  ;; is swept as if it belonged to the old one. With it, the window is
-  ;; harmless: new entries carry a newer epoch and are skipped. The
-  ;; ordering problem is removed by construction rather than defended
-  ;; against with a lock, which is also why two sweeps for the same
-  ;; generation are safe -- the second finds nothing.
-  (define (fail-generation! name epoch)
-    (drop-hosted-monitors! name epoch)   ; monitors this peer parked here
-    (fail-monitors-for! name epoch)      ; DOWN(noconnection) for watchers
-    (fail-pending-for! name epoch))      ; nothing will answer these now
+                         (hashtable-set! peers name (vector c self dialer))
+                         'replaced)
+                       #f)                       ; old conn wins
+                   (begin
+                     (hashtable-set! peers name (vector c self dialer))
+                     #t))))))
+      (when (eq? won? #t) (notify! name 'node-up))   ; a replacement is not a new up
+      (and won? #t)))
 
   ;; idempotent: only removes the entry if it still belongs to this conn
   ;; The link to `name` is gone, so every monitor we HOST on its behalf
@@ -1338,71 +1193,24 @@
   ;; local process and frees its callee-agents slot). Without this a peer
   ;; that connects, parks monitors, and drops -- over and over -- would
   ;; leak agents and eventually exhaust max-hosted-monitors.
-  ;; THE ENTRY GOES HERE, NOT WHEN THE AGENT GETS AROUND TO IT. Sending
-  ;; demon-local and leaving the entry in place releases the hosting slot
-  ;; only once that agent is next scheduled, and the notification this
-  ;; sweep precedes says the peer is UP again -- so a watcher that obeys
-  ;; the documented rule and re-arms immediately can be answered
-  ;; 'overload against a ceiling still occupied by the generation that
-  ;; just ended, with no second node-up ever coming to prompt a retry.
-  ;; "Re-arm on node-up" is a complete recovery path only if the room has
-  ;; actually been made by then.
-  ;;
-  ;; The message still goes: the agent has a local monitor to release and
-  ;; a process to end, and only it can do that. What changed is that the
-  ;; accounting no longer waits for it.
-  (define (drop-hosted-monitors! name epoch)
-    (let ((doomed
-            (atomically
-              (let-values (((keys agents) (hashtable-entries callee-agents)))
-                (let ((acc '()))
-                  (vector-for-each
-                    (lambda (k a)
-                      (when (and (eq? (car k) name) (<= (cdr a) epoch))
-                        (hashtable-delete! callee-agents k)
-                        (set! acc (cons (car a) acc))))
-                    keys agents)
-                  acc)))))
-      (for-each (lambda (agent) (send agent (vector 'demon-local))) doomed)))
+  (define (drop-hosted-monitors! name)
+    (let-values (((keys agents) (atomically (hashtable-entries callee-agents))))
+      (vector-for-each
+        (lambda (k agent) (when (eq? (car k) name) (send agent (vector 'demon-local))))
+        keys agents)))
 
-  ;; THE CLEANUP IS UNCONDITIONAL, THE NOTIFICATION IS NOT, and the two
-  ;; used to be gated together on "is this still the current entry".
-  ;; Gating the cleanup was the defect: a link that had been replaced
-  ;; skipped it, and the replacement did not do it either, so the state of
-  ;; a generation nobody owned any more was simply left behind. Now it is
-  ;; scoped by epoch instead, which makes it safe to run whether or not
-  ;; this connection is still current -- if the replacement already swept
-  ;; this generation, there is nothing left to find.
-  ;;
-  ;; The notification stays gated, because it is not idempotent: a
-  ;; replacement has already told watchers down-and-up, and a second down
-  ;; from the connection it replaced would report a peer that is up.
-  (define (remove-peer! name c epoch)
+  (define (remove-peer! name c)
     (let ((mine?
            (atomically
              (let ((e (hashtable-ref peers name #f)))
                (and e (eq? (vector-ref e 0) c)
                     (begin (hashtable-delete! peers name) #t))))))
       (tcp-close! c)
-      (fail-generation! name epoch)
-      ;; ASKED AT THE MOMENT OF SENDING, not at the moment of deleting.
-      ;; `mine?` above is a snapshot: it says this connection was current
-      ;; when its entry was removed, which does not say a newer one has
-      ;; not been installed since -- and a node-down arriving after that
-      ;; successor's node-up reports a live peer as gone, which is the
-      ;; worse of the two errors available here.
-      ;;
-      ;; The test is "is there no entry now": ours was removed, so
-      ;; anything present is necessarily newer. Suppressing in that case
-      ;; costs a watcher the down for this generation -- its successor
-      ;; sends only an up, having found no old entry to report the death
-      ;; of -- and that is the price of never reporting a working peer as
-      ;; down. The state itself was already failed above, so a watcher
-      ;; that missed the down still had every monitor over this
-      ;; generation answered.
-      (atomically
-        (unless (hashtable-ref peers name #f)
-          (notify! name 'node-down)))))
+      (when mine?
+        (drop-hosted-monitors! name)       ; free monitors this peer parked here
+        (fail-monitors-for! name)          ; DOWN(noconnection) for watchers
+        (fail-pending-for! name)           ; nothing will answer these now
+        (notify! name 'node-down))))
 
   ;; Calls waiting on a peer that just went: no reply can arrive for them,
   ;; so the entry would sit here until its caller's own timeout removed it
@@ -1412,15 +1220,14 @@
   ;; timeout for an answer that cannot come; the caller sees the same
   ;; rcall-error it would have seen, only sooner. The message is harmless
   ;; to a caller that has already moved on, whose ref can never match again.
-  (define (fail-pending-for! name epoch)
+  (define (fail-pending-for! name)
     (let ((doomed
             (atomically
               (let ((ks (hashtable-keys pending)) (acc '()))
                 (do ((i 0 (fx+ i 1))) ((fx= i (vector-length ks)) acc)
                   (let* ((ref (vector-ref ks i))
                          (slot (hashtable-ref pending ref #f)))
-                    (when (and slot (eq? (vector-ref slot 1) name)
-                               (<= (vector-ref slot 2) epoch))
+                    (when (and slot (eq? (vector-ref slot 1) name))
                       (hashtable-delete! pending ref)
                       (set! acc (cons (cons ref (vector-ref slot 0)) acc)))))))))
       (for-each
@@ -1432,7 +1239,7 @@
 
   ;; the wire shapes a link may carry (peer is the node at the far end of
   ;; c). Anything else is a confused peer -> drop the link.
-  (define (dispatch! c peer d epoch)
+  (define (dispatch! c peer d)
     (cond
       ;; (send ,reg-name ,msg) -> deliver to that registered process
       ((and (frame? d 'send 3) (symbol? (cadr d)))
@@ -1537,12 +1344,8 @@
          (unless (atomically
                    (and (fx< (hashtable-size callee-agents) max-hosted-monitors)
                         (begin
-                          ;; the agent AND the generation it belongs to:
-                          ;; a sweep for an older generation must not take
-                          ;; a monitor established on this one
                           (hashtable-set! callee-agents key
-                            (cons (spawn (lambda () (mon-agent peer key name)))
-                                  epoch))
+                            (spawn (lambda () (mon-agent peer key name))))
                           #t)))
            ;; At the hosting ceiling: refuse, and tell the watcher at
            ;; once. THIS REFUSAL IS A CONTROL FRAME NOBODY TIMES OUT --
@@ -1573,7 +1376,7 @@
       ((frame? d 'demon 2)
        (let ((agent (atomically
                       (hashtable-ref callee-agents (cons peer (cadr d)) #f))))
-         (when agent (send (car agent) (vector 'demon-local)))))
+         (when agent (send agent (vector 'demon-local)))))
       ((equal? d '(ping)) (write-frame! c '(pong)))
       ((equal? d '(pong)) (void))
       (else (raise 'protocol))))                ; confused peer: drop it
@@ -1813,26 +1616,12 @@
   ;; this one included. The demon frame in remove-target-watch! is the
   ;; same case and takes the same route. See link-write/critical for the
   ;; rule, and for why an rcall reply is deliberately NOT in this class.
-  ;; Remove this agent's own registration, and only its own. The key is
-  ;; (peer . mref), and an mref comes from the watcher's own counter, so a
-  ;; watcher re-arming after a generation change can present a key this
-  ;; agent still holds. An unconditional delete on the way out would then
-  ;; remove the successor's entry and leak a hosting slot that is in use.
-  ;; Deleting only what is still ours makes the exits idempotent and safe
-  ;; in any order, including after drop-hosted-monitors! has already taken
-  ;; the entry.
-  (define (forget-callee-agent! key)
-    (atomically
-      (let ((v (hashtable-ref callee-agents key #f)))
-        (when (and v (eq? (car v) self))
-          (hashtable-delete! callee-agents key)))))
-
   (define (mon-agent watcher key name)
     (let ((mref (cdr key))
           (p (whereis name)))
       (if (not p)
           (begin
-            (forget-callee-agent! key)
+            (atomically (hashtable-delete! callee-agents key))
             ;; Building the frame can fail too -- the allocation, not the
             ;; writer, since this datum always serializes -- and by here
             ;; the agent has dropped its state and is leaving. Same
@@ -1845,7 +1634,7 @@
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
-                (forget-callee-agent! key)
+                (atomically (hashtable-delete! callee-agents key))
                 ;; THE GUARD COVERS BUILDING THE FRAME AND NOTHING ELSE,
                 ;; which is what it was always meant to cover. A reason
                 ;; that will not serialize is degraded to 'exit; the
@@ -1877,7 +1666,7 @@
                     (link-write/critical watcher segs 'mdown-lost))))
               (`#(demon-local)
                 (demonitor m)
-                (forget-callee-agent! key)))))))
+                (atomically (hashtable-delete! callee-agents key))))))))
 
   (define (stop-owner-agent! mref)
     (let ((agent (atomically
@@ -1930,15 +1719,9 @@
   ;; install-owner-agent! disables them again inside; the counter nests.
   ;; Its own rule -- publish the agent's pid before the agent can run --
   ;; still holds, because nothing runs until this region ends.
-  ;; `epoch` is the generation of the link the watch is placed over, and
-  ;; it comes from the SAME entry the frame is written to; a local watch
-  ;; uses 0, which no peer sweep can match. Reading the connection and the
-  ;; epoch from two separate lookups would stamp a fresh generation on a
-  ;; watch placed over the old one -- the exact error this field exists to
-  ;; prevent.
-  (define (arm-rmonitor! mref node name epoch)
+  (define (arm-rmonitor! mref node name)
     (atomically
-      (hashtable-set! rmonitors mref (vector self node name epoch))
+      (hashtable-set! rmonitors mref (vector self node name))
       (install-owner-agent! self mref)))
 
   (define (install-owner-agent! caller mref)
@@ -1991,16 +1774,15 @@
   ;; every rmonitor watching a node whose link just dropped gets a
   ;; synthesized noconnection (the target may be alive or dead -- across
   ;; a broken link they're indistinguishable, as in Erlang)
-  (define (fail-monitors-for! node epoch)
+  (define (fail-monitors-for! node)
     (let-values (((mrefs entries) (atomically (hashtable-entries rmonitors))))
       (vector-for-each
         (lambda (mref e)
-          (when (and (eq? (vector-ref e 1) node)
-                     (<= (vector-ref e 3) epoch))
+          (when (eq? (vector-ref e 1) node)
             (fire-remote-down! mref 'noconnection)))
         mrefs entries)))
 
-  (define (link-loop c peer buf last-seen epoch)
+  (define (link-loop c peer buf last-seen)
     (let drain ()
       ;; EVERY WAKE-UP IS A CHECK ON THE OUTBOUND CEILING, and it is the
       ;; only check that does not depend on this node writing something. A
@@ -2035,10 +1817,10 @@
                         (if (> (- (now-ms) last-seen) dead-ms)
                             (raise 'closed)
                             (begin (write-frame! c '(ping))
-                                   (link-loop c peer buf last-seen epoch))))
+                                   (link-loop c peer buf last-seen))))
               (`#(tcp-data ,bv)
                 (inbuf-append! buf bv)
-                (link-loop c peer buf (now-ms) epoch))
+                (link-loop c peer buf (now-ms)))
               (`#(tcp-eof) (raise 'closed))
               (`#(tcp-error ,e) (raise 'closed))
               ;; a close decided elsewhere -- see close-for-backpressure!.
@@ -2053,9 +1835,9 @@
               (`#(link-stop ,which ,why)
                 (if (eq? which c)
                     (raise why)
-                    (link-loop c peer buf last-seen epoch)))
+                    (link-loop c peer buf last-seen)))
               (`#(node-stop) (raise 'stop)))
-            (begin (dispatch! c peer d epoch) (drain))))))
+            (begin (dispatch! c peer d) (drain))))))
 
   ;; Run the link until it drops, then clean up.
   ;; -> the moment the link STOPPED CARRYING TRAFFIC, read before the
@@ -2076,9 +1858,9 @@
   ;; drops at once be scored as one that stayed up -- on a node whose
   ;; tables have grown, and only on such a node, which is the worst way
   ;; for a measurement to be wrong.
-  (define (run-link c peer buf epoch)
-    (guard (e (#t (let ((ended (now-ms))) (remove-peer! peer c epoch) ended)))
-      (link-loop c peer buf (now-ms) epoch)
+  (define (run-link c peer buf)
+    (guard (e (#t (let ((ended (now-ms))) (remove-peer! peer c) ended)))
+      (link-loop c peer buf (now-ms))
       (now-ms)))                        ; link-loop only ever exits by raising
 
   ;; ---- accept side -----------------------------------------------------------
@@ -2152,10 +1934,9 @@
             (let ((peer (cadr d)) (nonce-b (cadddr d)))
               (write-frame! c (list 'welcome self-name (proof nonce-b self-name)))
               (free!)                           ; authenticated: no longer pre-auth
-              (let ((ep (install-peer! peer c peer)))  ; dialer = remote side
-                (if ep
-                    (run-link c peer buf ep)
-                    (tcp-close! c)))))))))         ; lost the tie-break
+              (if (install-peer! peer c peer)   ; dialer = the remote side
+                  (run-link c peer buf)
+                  (tcp-close! c))))))))         ; lost the tie-break
 
   ;; ---- dial side --------------------------------------------------------------
 
@@ -2319,11 +2100,10 @@
                                (eq? (cadr d2) peer)   ; it must BE who we dialed
                                (proof=? (caddr d2) (proof nonce-b peer)))
                     (raise 'auth))
-                  (let ((ep (install-peer! peer c self-name)))
-                    (if ep
-                        (let ((up (now-ms)))
-                          (- (run-link c peer buf ep) up))
-                        (begin (tcp-close! c) 0))))))))
+                  (if (install-peer! peer c self-name)
+                      (let ((up (now-ms)))
+                        (- (run-link c peer buf) up))
+                      (begin (tcp-close! c) 0)))))))
         (`#(tcp-connect-failed ,e) #f)
         (`#(node-stop) (raise 'stop)))))
 
@@ -2777,13 +2557,7 @@
               (let* ((ref (next-rcall-ref!))
                      (segs (frame-segments
                              (list 'call reg-name ref msg timeout))))
-                ;; The epoch comes from the SAME entry the frame is
-                ;; written to, three lines down. Looking it up separately
-                ;; would stamp whatever generation is current at that
-                ;; moment onto a call issued over the one in hand.
-                (atomically
-                  (hashtable-set! pending ref
-                                  (vector self node (vector-ref e 3))))
+                (atomically (hashtable-set! pending ref (vector self node)))
                 ;; A REFUSED SUBMISSION IS ANSWERED AS NO LINK. Nothing
                 ;; went out, so nothing will ever reply; waiting out the
                 ;; caller's whole timeout for an answer that cannot come
@@ -2852,11 +2626,7 @@
   ;;                   monitor before the event that can kill it)
   ;;   - 'noconnection if the link to node drops first (the target may
   ;;                   be alive or dead -- indistinguishable across a
-  ;;                   broken link, as in Erlang), OR if that link is
-  ;;                   REPLACED by another connection to the same node:
-  ;;                   a watch belongs to the generation it was placed
-  ;;                   over and does not carry across one. Re-arm when
-  ;;                   monitor-node reports the peer up again.
+  ;;                   broken link, as in Erlang)
   ;;   - 'overload     if node is already hosting its maximum number of
   ;;                   remote monitors and refuses another (node-set-limits!)
   ;; Returns a monitor ref for demonitor-remote. The own node name is a
@@ -2873,9 +2643,7 @@
          ;; agent rooted after the monitor has already completed. It must
          ;; also exist before this process can be killed -- see
          ;; arm-rmonitor!, which is why the two are one step.
-         ;; a local watch belongs to no generation; 0 is below every
-         ;; epoch a peer sweep can name
-         (arm-rmonitor! mref node name 0)
+         (arm-rmonitor! mref node name)
          (install-self-agent! self mref name))
         ((live-entry node)
          => (lambda (e)
@@ -2902,7 +2670,7 @@
               ;; delivered: the atomic step transfers who answers, not
               ;; the answer itself.
               (let ((segs (frame-segments (list 'mon name mref))))
-                (arm-rmonitor! mref node name (vector-ref e 3))
+                (arm-rmonitor! mref node name)
                 (let-values (((ok failure)
                               (write-body! (vector-ref e 0) segs)))
                  (unless ok
