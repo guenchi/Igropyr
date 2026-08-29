@@ -581,7 +581,7 @@
   ;; SERIALIZING AND SUBMITTING ARE SEPARATE BECAUSE THEY FAIL
   ;; DIFFERENTLY. frame-segments raises -- the writer refuses the datum,
   ;; or the frame is over the limit -- while write-body! reports its
-  ;; submission by returning. (It is not exception-free: two allocating
+  ;; submission by returning. (It is not exception-free: three allocating
   ;; steps sit outside its guard, and it says so where it is defined.
   ;; What matters here is that the failures a CALLER can act on are the
   ;; ones this split moves in front of the publication point.) A caller
@@ -653,11 +653,20 @@
   ;; Submit an already-materialized frame.
   ;; -> (values submitted? failure)
   ;;      #t #f       handed to libuv
-  ;;      #f #f       the connection was not open -- there is no link
-  ;;      #f <why>    the submission failed on a connection that IS open;
+  ;;      #f #f       nothing was submitted and no condition was
+  ;;                  produced: read as "there is no link"
+  ;;      #f <why>    the submission failed and said something about it;
   ;;                  <why> is the condition it raised, or the symbol
   ;;                  'submission-refused when libuv declined without
   ;;                  raising anything to carry
+  ;;
+  ;; <why> DOES NOT IMPLY THE CONNECTION IS STILL OPEN, and an earlier
+  ;; version of this list said it did. A partial write whose remainder
+  ;; cannot be queued closes the connection and then raises, so
+  ;; (#f . condition) arrives with the connection already gone. The
+  ;; connection's state is consulted separately, at the end of this
+  ;; procedure, and what it decides there is whether to wake the link --
+  ;; not which of these two rows applies.
   ;;
   ;; TWO VALUES AND NOT A THREE-WAY SINGLE ONE, because a condition object
   ;; is TRUE. Every caller written as `(unless (write-body! ...) ...)`
@@ -713,8 +722,9 @@
   ;;   - the wake-up for a connection found closed does the same two
   ;;     things, and was added to this procedure after this list was
   ;;     first written -- which is how a list like this goes wrong.
-  ;; An OOM in either still leaves this procedure by raising. The second
-  ;; is the worse of the two and is stated rather than smoothed over:
+  ;; An OOM in any of the three still leaves this procedure by raising.
+  ;; The close-for-backpressure! one
+  ;; is the worst of them and is stated rather than smoothed over:
   ;; when it is reached after a SUCCESSFUL submission -- which is the
   ;; usual way to reach it -- the frame is already with libuv, so the
   ;; peer may act on it and reply, while this caller sees an exception
@@ -864,11 +874,22 @@
           ;; READING IT HERE, OUTSIDE THE ATOMIC REGION, IS SOUND IN ONE
           ;; DIRECTION ONLY, and that is the direction to be in. A
           ;; connection's state moves open -> closing -> closed and never
-          ;; back, so "not open" read now was not open a moment ago
-          ;; either. The error this can make is the other one: reading
-          ;; 'open just before it closes, and skipping a wake-up that was
-          ;; available. That case is the one every other discovery path
-          ;; already covers.
+          ;; back. What that buys is NOT "not open now means it was
+          ;; already not open when the write failed" -- an earlier version
+          ;; of this comment claimed exactly that, and it is backwards:
+          ;; the write can be refused on a connection that is still open
+          ;; and be closed by someone else a moment later. What
+          ;; monotonicity gives is the forward direction -- once this read
+          ;; says "not open", it will not become open again -- and that is
+          ;; enough, because the action taken is about the connection's
+          ;; state NOW: close it (idempotent) and wake whoever is running
+          ;; it.
+          ;;
+          ;; The error this can make is the other one: reading 'open just
+          ;; before it closes, and skipping a wake-up. Not every other
+          ;; path covers that -- a local close produces no tcp-eof, and if
+          ;; nothing more is written there is no next write either. What
+          ;; covers it is the tick.
           (cond (over? (close-for-backpressure! c))
                 ((and (not r) (not (eq? (conn-state c) 'open)))
                  (stop-link! c (conn-link-pid c) 'write-to-closed)))
@@ -966,8 +987,11 @@
   ;; since the wake-up above it also runs for every writer that finds a
   ;; connection already closed, so concurrent writers can each scan once
   ;; before the link process consumes the first wake-up. They send
-  ;; messages tagged with the same connection, which link-loop accepts
-  ;; once and refuses thereafter.
+  ;; messages tagged with the same connection. The first one that reaches
+  ;; a link-loop ends it, so the duplicates do not accumulate there; they
+  ;; go one of three other ways -- drained by a long-lived connector's
+  ;; wait, discarded with an acceptor that is exiting anyway, or refused
+  ;; by a LATER link-loop whose connection is not the one in the message.
   (define (conn-link-pid c)
     (atomically
       (let-values (((names entries) (hashtable-entries peers)))
