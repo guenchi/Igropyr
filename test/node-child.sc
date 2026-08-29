@@ -64,6 +64,15 @@
                (let loop ()
                  (receive (`#(mon-die ,reason) (kill self reason)))))))
 
+    ;; a second watchable process, for the 'exit-degradation cell: its
+    ;; death reason is built HERE, locally, because a reason carrying a
+    ;; procedure cannot be injected over the wire -- which is exactly
+    ;; the property the cell needs (the wire refusing it is the trigger)
+    (register 'watched2
+      (spawn (lambda ()
+               (receive (`#(raw-die) 'ok))
+               (kill self (vector 'unprintable (lambda () #f))))))
+
     ;; safety net: generous enough to cover the slow-handler cells the
     ;; suite runs against this child (two 'slow calls plus the rest)
     (spawn (lambda () (sleep-ms 60000) (exit 1)))
@@ -74,6 +83,9 @@
           (loop))
         (`#(kill-watched ,reason)
           (let ((p (whereis 'watched))) (when p (kill p reason)))
+          (loop))
+        (`#(kill-watched-raw)
+          (let ((p (whereis 'watched2))) (when p (send p (vector 'raw-die))))
           (loop))
         ;; the serve-side timeout cap is THIS node's setting, not the
         ;; caller's; the suite lowers it through here to watch the cap

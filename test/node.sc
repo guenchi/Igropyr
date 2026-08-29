@@ -1360,6 +1360,23 @@
         (unless (eq? reason 'crash-reason) (fail! "remote-down-reason" reason))))
     (display "monitor-remote -> remote-down with reason ok\n")
 
+    ;; A reason the wire refuses must DEGRADE to 'exit, not take the
+    ;; link with it. The serialization raise happens on the target's
+    ;; first mdown attempt; the critical write path must let that raise
+    ;; reach mon-agent's degradation guard rather than reading it as a
+    ;; submission failure and dropping the link -- a build that swallows
+    ;; both delivers noconnection here instead of 'exit.
+    (monitor-remote 'b 'watched2)
+    (rsend 'b 'svc (vector 'kill-watched-raw))
+    (receive (after 5000 (fail! "exit-degrade-timeout"))
+      (`#(remote-down b watched2 ,reason)
+        (unless (eq? reason 'exit) (fail! "exit-degrade-reason" reason))))
+    ;; ...and the LINK SURVIVED IT, said directly rather than inferred:
+    ;; the proposition is "a refused reason does not take the link", and
+    ;; reason='exit is only its consequence
+    (unless (memq 'b (node-peers)) (fail! "exit-degrade-took-link"))
+    (display "unserializable reason degrades to 'exit, link intact ok\n")
+
     ;; watching a name that isn't registered -> immediate noproc
     (monitor-remote 'b 'watched)                 ; now dead
     (receive (after 5000 (fail! "noproc-timeout"))

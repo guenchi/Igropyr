@@ -833,11 +833,36 @@
   ;; process, and a diagnostic here would turn an error port that refuses
   ;; writes into a failure of the unrelated rsend that happened to be the
   ;; frame over the line.
+  ;; Take a link down from a process that is NOT the link process, which
+  ;; is the only situation needing this: the link process itself just
+  ;; closes and raises. Enforce first, then wake -- the close does not
+  ;; depend on the other process ever running, and the message is what
+  ;; turns a closed socket into a link that has gone down (libuv's close
+  ;; completion notifies nobody).
+  ;;
+  ;; BOTH THE CONNECTION AND ITS PROCESS ARE PASSED IN, never looked up
+  ;; by node name here. A name maps to whatever connection is current,
+  ;; and by the time a failure is being acted on, the name may already
+  ;; have been reconnected onto a healthy one -- taking down the
+  ;; replacement for the sins of its predecessor. Callers know which
+  ;; connection failed and say so; the conn also rides in the message, so
+  ;; link-loop's eq? check refuses one that arrives after its own link
+  ;; has been replaced.
+  (define (stop-link! c link why)
+    (tcp-close! c)                              ; enforce first, then wake
+    (when (and link (process-alive? link))
+      (send link (vector 'link-stop c why))))
+
   (define (close-for-backpressure! c)
-    (let ((link (conn-link-pid c)))
-      (tcp-close! c)                            ; enforce first, then wake
-      (when (and link (process-alive? link))
-        (send link (vector 'link-stop c 'outbound-backpressure)))))
+    (stop-link! c (conn-link-pid c) 'outbound-backpressure))
+
+  ;; Is this the condition rsend and link-write raise when a frame was
+  ;; built but could not be handed to libuv?
+  (define (submission-failure? e)
+    (and (vector? e)
+         (fx>= (vector-length e) 2)
+         (eq? (vector-ref e 0) 'rsend-error)
+         (eq? (vector-ref e 1) 'submission-failed)))
 
   ;; The link process running on connection c, or #f if no installed peer
   ;; owns it (a connection still in its handshake, or one already torn
@@ -1273,26 +1298,26 @@
   ;; Write one datum to a peer by name, if the link is live.
   ;; -> #t if there was a live link to write to.
   ;;
-  ;; ITS THREE CALLERS, ENUMERATED FROM THE FILE AND NOT FROM MEMORY --
-  ;; serve-rcall!'s fallback reply, mon-agent's noproc and mdown, and
-  ;; remove-target-watch!'s demon -- AND NONE OF THEM READS THE ANSWER.
-  ;; (An earlier version of this comment said rcall and monitor-remote
-  ;; read it. They do not call this procedure at all. A claim about which
-  ;; call sites exist is refutable by one grep, and must be written from
-  ;; one.)
+  ;; ONE CALLER, ENUMERATED FROM THE FILE AND NOT FROM MEMORY:
+  ;; serve-rcall!'s fallback reply, and it does not read the answer. (An
+  ;; earlier version of this comment said rcall and monitor-remote read
+  ;; it -- they do not call this procedure at all -- and a later one
+  ;; listed three callers, which was true until the monitor traffic moved
+  ;; to link-write/critical. A claim about which call sites exist is
+  ;; refutable by one grep and has to be written from one, every time it
+  ;; is written.)
   ;;
-  ;; What the callers can and cannot fall back on differs, and it is not
-  ;; uniform the way that earlier comment implied:
-  ;;   - serve-rcall!'s reply: the rcall waiting for it has its own
-  ;;     timeout, so a lost frame costs that caller a timeout, not a hang;
-  ;;   - mon-agent's mdown and remove-target-watch!'s demon: THERE IS NO
-  ;;     TIMEOUT ON THE OTHER SIDE. A remote monitor waits until its
-  ;;     target's node says something or the link drops. See mon-agent
-  ;;     for what that means when a submission fails.
-  ;; It raises on a failed submission, in the same shape rsend uses: it
-  ;; is the same event, on an internal path. What each caller does with
-  ;; that is not uniform, and the difference is deliberate -- see the
-  ;; three call sites named above.
+  ;; THE REMAINING CALLER IS HERE AND NOT IN link-write/critical BECAUSE
+  ;; ITS FRAME'S LOSS IS DETECTABLE BY THE FAR END: an rcall that gets no
+  ;; reply times out. Losing it costs one call an error instead of an
+  ;; answer, which is what losing a reply in the network already costs,
+  ;; and is not grounds for taking a working link away from every other
+  ;; conversation on it.
+  ;;
+  ;; It raises on a failed submission, in the shape rsend uses -- the
+  ;; same event on an internal path. That raise leaves serve-rcall!, and
+  ;; the process running it releases its serving slot regardless: see the
+  ;; guard at the spawn in dispatch!.
   (define (link-write peer datum)
     (let ((e (live-entry peer)))
       (and e
@@ -1302,6 +1327,37 @@
              (cond (ok #t)
                    (failure (raise (submission-failure peer failure)))
                    (else #f))))))
+
+  ;; For a control frame WHOSE LOSS THE FAR END CANNOT DETECT. That is
+  ;; the test, and it is not "is this frame important": an rcall reply
+  ;; matters more than a demon, and its loss costs the peer a timeout it
+  ;; already has. An mdown or a demon that never goes out costs the peer
+  ;; a wait with no end in it, because nothing over there is counting.
+  ;;
+  ;; So a failed submission takes the LINK down instead of being
+  ;; swallowed: slow-is-dead, the same rule the rest of this layer
+  ;; follows. A link that cannot carry its own control traffic is not
+  ;; serving anyone, and dropping it is what turns an unbounded wait into
+  ;; the answer the far end already knows how to produce -- its own
+  ;; fail-monitors-for! synthesizes noconnection for every watch that
+  ;; crossed the link.
+  ;;
+  ;; THE CONNECTION THAT FAILED IS THE ONE TAKEN DOWN. It comes from the
+  ;; entry this call already holds, not from a second lookup by name: see
+  ;; stop-link! for why a name is the wrong handle here.
+  ;;
+  ;; A SERIALIZATION FAILURE STILL PROPAGATES. Only a failed submission is
+  ;; handled: a datum the writer refuses is a different event with a
+  ;; different repair, and mon-agent's degrade-to-'exit path depends on
+  ;; still seeing it.
+  (define (link-write/critical peer datum why)
+    (let ((e (live-entry peer)))
+      (and e
+           (let ((c (vector-ref e 0)) (link (vector-ref e 1)))
+             (let-values (((ok failure) (write-body! c (frame-segments datum))))
+               (cond (ok #t)
+                     (failure (stop-link! c link why) #f)
+                     (else #f)))))))
 
   ;; ---- cross-node process monitor ----------------------------------------
 
@@ -1317,32 +1373,37 @@
   ;; watcher is that same peer -- the authenticated far end -- and is the
   ;; only node we ever report this DOWN back to.
   ;;
-  ;; IF THE mdown FRAME IS NEVER SUBMITTED -- see write-body! -- THIS
-  ;; AGENT HAS ALREADY DROPPED ITS STATE AND EXITS, AND NOTHING REPLACES
-  ;; THE DOWN IT WAS CARRYING. The watcher has no timeout of its own, so
-  ;; it waits without bound -- not forever: the wait ends if the link
-  ;; later drops (fail-monitors-for! synthesizes noconnection), if the
-  ;; watching process demonitors, or if it dies. What is gone is the
-  ;; answer this particular death was supposed to produce. The same is
-  ;; true of the demon frame in remove-target-watch!, which leaves this
-  ;; side's agent parked until the target dies or the link goes. Both are
-  ;; named as OOM
-  ;; residues rather than mechanised: a retry would need its own queue
-  ;; and its own failure domain, on a path that only runs when the
-  ;; process is already out of memory.
+  ;; IF THE mdown FRAME IS NEVER SUBMITTED, THE LINK GOES DOWN. By then
+  ;; this agent has dropped its state and is about to exit, so nothing
+  ;; here can carry the DOWN any further; and the watcher has no timeout
+  ;; of its own, so a lost frame would leave it waiting on an answer that
+  ;; is not coming. Taking the link down instead hands the far end a
+  ;; question it already knows how to answer: its own fail-monitors-for!
+  ;; synthesizes noconnection for every watch that crossed that link,
+  ;; this one included. The demon frame in remove-target-watch! is the
+  ;; same case and takes the same route. See link-write/critical for the
+  ;; rule, and for why an rcall reply is deliberately NOT in this class.
   (define (mon-agent watcher key name)
     (let ((mref (cdr key))
           (p (whereis name)))
       (if (not p)
           (begin
             (atomically (hashtable-delete! callee-agents key))
-            (link-write watcher (list 'mdown mref 'noproc)))
+            (link-write/critical watcher (list 'mdown mref 'noproc)
+                                 'mdown-lost))
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
                 (atomically (hashtable-delete! callee-agents key))
-                (guard (e (#t (link-write watcher (list 'mdown mref 'exit))))
-                  (link-write watcher (list 'mdown mref reason))))
+                ;; The guard is for a REASON THAT WILL NOT SERIALIZE, and
+                ;; only that: link-write/critical does not raise for a
+                ;; failed submission -- it takes the link down and answers
+                ;; #f -- so this handler still means what it always meant.
+                (guard (e (#t (link-write/critical
+                                watcher (list 'mdown mref 'exit)
+                                'mdown-lost)))
+                  (link-write/critical watcher (list 'mdown mref reason)
+                                       'mdown-lost)))
               (`#(demon-local)
                 (demonitor m)
                 (atomically (hashtable-delete! callee-agents key))))))))
@@ -1364,7 +1425,7 @@
                            a))))
             (when (and agent (process-alive? agent))
               (send agent (vector 'demon-local))))
-          (link-write node (list 'demon mref)))))
+          (link-write/critical node (list 'demon mref) 'demon-lost))))
 
   ;; One small local monitor ties the global/remote state to the process
   ;; that requested it. Without this, rmonitors roots a dead pcb and the
