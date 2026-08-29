@@ -2001,14 +2001,34 @@
       ;;
       ;; THE NAME CARRIES THE PORT, because a process may run several
       ;; listeners -- an application port and an admin or metrics port are
-      ;; the usual pair -- and a panic saying only "http-worker-pool" would
-      ;; not say which. ASSUMED HERE, and queued rather than built: that
-      ;; every listener in the process is one the image cannot serve
-      ;; without. A genuinely optional listener has no way to opt out of
-      ;; this, and taking one down will end the process.
-      (critical! sup (string->symbol
-                       (string-append "http-worker-pool:"
-                                      (number->string port))))
+      ;; the usual pair -- and a panic saying only "http-worker-pool"
+      ;; would not say which.
+      ;;
+      ;; NOT EVERY LISTENER IS ONE THE IMAGE CANNOT SERVE WITHOUT, so
+      ;; `critical` can be set to #f. It defaults to #t because that is
+      ;; the safe answer for the listener an application exists to serve,
+      ;; and because it is the behaviour every existing caller already
+      ;; has.
+      ;;
+      ;; WHAT OPTING OUT BUYS IS NOT GRACEFUL DEGRADATION, and a caller
+      ;; should decide with that in front of them. The pool dying does
+      ;; not stop the listener: it goes on accepting connections and
+      ;; submitting requests to something that is gone, so every request
+      ;; on that port times out, with the port still open and the process
+      ;; still healthy by every other measure. `critical` #t converts
+      ;; that into an exit 70. Setting it to #f says the silence is
+      ;; preferable to ending the image -- true for a metrics or admin
+      ;; port, whose absence an operator notices and whose failure should
+      ;; not take the application down with it, and false for anything a
+      ;; client depends on.
+      ;;
+      ;; Nothing restarts the pool either way. There is no supervision
+      ;; tree to reattach its workers and tasks to, which is why the two
+      ;; choices are "end the image" and "this port stops working".
+      (when (opt 'critical #t)
+        (critical! sup (string->symbol
+                         (string-append "http-worker-pool:"
+                                        (number->string port)))))
       (http-server-listener-set! srv
         (tcp-listen! host port 511
           (lambda (c)

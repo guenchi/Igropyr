@@ -121,9 +121,50 @@
                     (put-char p c)
                     (loop (fx+ i 1) #f #t))))))))
 
+  ;; A HEADER NAME IS AN RFC 7230 TOKEN, AND THAT IS CHECKED HERE RATHER
+  ;; THAN ASSUMED. The canonical request joins a name to its value with
+  ;; ":" and joins names to each other with ";", so a name carrying
+  ;; either of those -- or a newline -- produces a string that differs
+  ;; from the one AWS rebuilds out of the headers it received. The
+  ;; signature then fails to match, and the failure is a 403 with no body
+  ;; and no clue, on exactly the requests that carried that header and no
+  ;; others.
+  ;;
+  ;; THE PREMISE THIS REPLACES WAS ALREADY FALSE. The encoding was safe
+  ;; while every header name came from inside this library, and that has
+  ;; not been true: sigv4-sign-headers takes a caller's headers and signs
+  ;; them, which is what it is for. Writing the premise down instead of
+  ;; enforcing it would have recorded something the code contradicts one
+  ;; call away.
+  ;;
+  ;; Names only. A VALUE containing a newline has a related problem and a
+  ;; different owner: values are checked, and split requests prevented,
+  ;; where the request is written -- see the note in the gap ledger.
+  (define (header-name-char? c)
+    (or (and (char>=? c #\a) (char<=? c #\z))
+        (and (char>=? c #\A) (char<=? c #\Z))
+        (and (char>=? c #\0) (char<=? c #\9))
+        (memv c '(#\! #\# #\$ #\% #\& #\' #\* #\+ #\- #\.
+                  #\^ #\_ #\` #\| #\~))))
+
+  (define (header-name? s)
+    (and (string? s)
+         (fx> (string-length s) 0)
+         (let loop ((i 0))
+           (or (fx= i (string-length s))
+               (and (header-name-char? (string-ref s i))
+                    (loop (fx+ i 1)))))))
+
   ;; headers: ((name . value) ...) raw, INCLUDING host.
   ;; -> (values canonical-request signed-headers-string)
   (define (sigv4-canonical-request method path canonical-query headers payload-hash)
+    (for-each
+      (lambda (h)
+        (unless (and (pair? h) (header-name? (car h)))
+          (assertion-violation 'sigv4-canonical-request
+            "header name must be a non-empty RFC 7230 token; a name carrying \":\", \";\" or a newline signs a request AWS cannot reproduce"
+            (and (pair? h) (car h)))))
+      headers)
     (let* ((lowered (map (lambda (h)
                            (cons (string-downcase (car h))
                                  (trim-collapse (cdr h))))

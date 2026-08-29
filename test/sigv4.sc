@@ -133,6 +133,40 @@
             ((string=? (substring canonical i (+ i 12)) "x-test:a b\n\n") #t)
             (else (loop (+ i 1)))))))
 
+;; ---- the header-name gate: RFC 7230 tokens, or a refusal at the call ----
+;; The canonical form joins names with ':' and ';', so a name carrying
+;; either -- or any non-token byte -- signs a string AWS reassembles
+;; differently: a 403 with no body, no clue, and only on the requests
+;; carrying that header. The precondition "names all come from this
+;; library" was already false (sigv4-sign-headers exists to sign caller
+;; headers), so the gate is the only honest option. Both directions are
+;; cells: the refusals, and the token zoo the gate must not eat.
+(define (signs? headers)
+  (call/cc (lambda (k)
+    (with-exception-handler
+      (lambda (c) (k #f))
+      (lambda ()
+        (sigv4-canonical-request "GET" "/" "" headers empty-hash)
+        #t)))))
+(check "header-name-accepts-plain"
+  (signs? '(("host" . "h") ("x-amz-date" . "d"))))
+(check "header-name-accepts-mixed-case"
+  (signs? '(("host" . "h") ("Content-Type" . "t"))))
+(check "header-name-accepts-token-zoo"
+  (signs? '(("host" . "h") ("x-ok!#$%&'*+-.^_`|~" . "v"))))
+(check "header-name-rejects-colon"
+  (not (signs? '(("host" . "h") ("x-a:b" . "v")))))
+(check "header-name-rejects-semicolon"
+  (not (signs? '(("host" . "h") ("x-a;b" . "v")))))
+(check "header-name-rejects-newline"
+  (not (signs? (list (cons "host" "h") (cons "x-a\nb" "v")))))
+(check "header-name-rejects-space"
+  (not (signs? '(("host" . "h") ("x-a b" . "v")))))
+(check "header-name-rejects-empty"
+  (not (signs? '(("host" . "h") ("" . "v")))))
+(check "header-name-rejects-nonstring"
+  (not (signs? '(("host" . "h") (x-sym . "v")))))
+
 (if (zero? failures)
     (begin (display "sigv4: all tests passed") (newline) (exit 0))
     (begin (display failures) (display " failures") (newline) (exit 1)))

@@ -437,6 +437,15 @@ if [ "$httpcrit_status" -ne 70 ] || [ "$httpcrit_panic" -eq 0 ] || [ "$httpcrit_
 fi
 echo "HTTP CRITICAL WIRING PASSED"
 
+# The same option's other direction: a listener that opted out loses its
+# pool and the image survives. The fixture pins the pool's death first
+# (pool-alive? answering #f is conclusive), so its exit 0 cannot be
+# satisfied by a kill that never landed. Ignoring the 'critical option
+# makes this process exit 70 like the default case, which set -e reads
+# as the failure it is.
+"$scheme_bin" --script test/smoke-http-noncritical.sc
+echo "HTTP NONCRITICAL OPT-OUT PASSED"
+
 # reached only when every suite above ran and passed
 echo "=== WHOLE SUITE RUN: every suite was reached ==="
 
