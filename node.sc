@@ -1426,6 +1426,17 @@
   ;; fail-monitors-for! synthesizes noconnection for every watch that
   ;; crossed the link.
   ;;
+  ;; TAKES AN ALREADY-MATERIALIZED FRAME, not a datum. That is what
+  ;; separates the two failures this path must not confuse: building the
+  ;; frame can fail because the writer refuses the datum, and that is the
+  ;; CALLER's business (mon-agent answers it by degrading the reason to
+  ;; 'exit), while submitting it can fail because the link cannot carry
+  ;; it, and that is this procedure's business. Splitting them by WHERE
+  ;; THEY HAPPEN needs no predicate to tell them apart -- an earlier
+  ;; version reasoned that no reliable predicate exists and concluded
+  ;; that the two could not be separated at all, which confused "this
+  ;; particular mechanism does not work" with "the thing cannot be done".
+  ;;
   ;; THE CONNECTION THAT FAILED IS THE ONE TAKEN DOWN -- but only if it
   ;; is still the connection this peer is reached on.
   ;;
@@ -1441,33 +1452,61 @@
   ;;
   ;; IT TERMINATES because a retry is only taken when the current
   ;; connection is not the one just written to, so each iteration
-  ;; requires another connection to have completed a handshake and won a
-  ;; tie-break. The iteration count is bounded by real reconnections, and
-  ;; a failure on a connection that is still current never retries.
-  ;;
-  ;; The generation check races too, and harmlessly: if the connection is
-  ;; replaced just after it reads "still current", the close lands on a
-  ;; connection that was condemned anyway and the wake-up carries that
-  ;; connection, which link-loop refuses if it has moved on.
+  ;; requires another generation to have been INSTALLED AS CURRENT.
+  ;; (Not "to have won a tie-break": install-peer! replaces a connection
+  ;; that is no longer open without comparing anything, so the stronger
+  ;; phrasing an earlier version used named a path that need not be
+  ;; taken.) The iteration count is bounded by real reconnections; a
+  ;; failure on a connection that is still current never retries; and
+  ;; when the peer has no current connection at all, the next round's
+  ;; live-entry ends the loop.
   ;;
   ;; A SERIALIZATION FAILURE STILL PROPAGATES. Only a failed submission is
   ;; handled: a datum the writer refuses is a different event with a
   ;; different repair, and mon-agent's degrade-to-'exit path depends on
   ;; still seeing it.
-  (define (link-write/critical peer datum why)
+  (define (link-write/critical peer segs why)
     (let retry ()
       (let ((e (live-entry peer)))
         (and e
              (let ((c (vector-ref e 0)) (link (vector-ref e 1)))
-               (let-values (((ok failure) (write-body! c (frame-segments datum))))
+               ;; EVERY WAY THIS CAN FAIL MEANS THE SAME THING HERE, so
+               ;; none of them is distinguished. The frame is already
+               ;; built, so what remains is the submission: it can answer
+               ;; #f for a connection that was not open, answer #f for a
+               ;; refusal, or raise from the allocating steps outside
+               ;; write-body!'s own guard. All three are "this frame did
+               ;; not reach the peer", which is the only question this
+               ;; procedure asks. Letting a raise escape instead would
+               ;; break the contract in the worst way available: the
+               ;; caller is an agent that has already dropped its state,
+               ;; so the frame would not go AND the link would not go,
+               ;; which is the outcome this whole path exists to prevent.
+               (let ((ok (guard (e2 (#t #f))
+                           (let-values (((ok failure) (write-body! c segs)))
+                             ok))))
                  (cond
                    (ok #t)
-                   ;; BOTH FAILURES TAKE THIS ROUTE. A refused submission
-                   ;; and a connection that was already gone differ to a
-                   ;; caller reporting upward; here they are the same
-                   ;; event -- this frame did not reach the peer -- and
-                   ;; the same two answers apply.
-                   ((eq? c (current-conn peer)) (stop-link! c link why) #f)
+                   ;; THE GENERATION TEST AND THE CLOSE ARE ONE STEP.
+                   ;; install-peer! does its table swap inside an atomic
+                   ;; region, so holding interrupts across the test and
+                   ;; the close excludes it entirely -- the connection
+                   ;; cannot be replaced between deciding that it is
+                   ;; current and acting on that. Testing and then
+                   ;; closing as two steps only narrows the window: a
+                   ;; replacement landing in between leaves this call
+                   ;; closing a connection that was already condemned and
+                   ;; NOT retrying on the live one, while the old
+                   ;; connection's teardown skips its monitor cleanup
+                   ;; because the table has moved on. Narrowing a window
+                   ;; is not closing it, and a test whose answer can go
+                   ;; stale before it is used is the same mistake as
+                   ;; keying on how a failure was reported instead of on
+                   ;; what state the connection is in.
+                   ((atomically
+                      (and (eq? c (current-conn peer))
+                           (begin (stop-link! c link why) #t)))
+                    #f)
                    (else (retry)))))))))
 
   ;; The connection this peer is currently reached on, or #f. Used to ask
@@ -1506,35 +1545,34 @@
       (if (not p)
           (begin
             (atomically (hashtable-delete! callee-agents key))
-            (link-write/critical watcher (list 'mdown mref 'noproc)
+            (link-write/critical watcher
+                                 (frame-segments (list 'mdown mref 'noproc))
                                  'mdown-lost))
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
                 (atomically (hashtable-delete! callee-agents key))
-                ;; The guard is here for a REASON THAT WILL NOT
-                ;; SERIALIZE, and it catches more than that. It is a bare
-                ;; (#t ...), so it also takes the OOM-domain raises from
-                ;; outside write-body!'s own guard -- outbound-charge!
-                ;; before the submission, close-for-backpressure! after
-                ;; it -- and answers all of them by degrading the reason
-                ;; to 'exit.
+                ;; THE GUARD COVERS BUILDING THE FRAME AND NOTHING ELSE,
+                ;; which is what it was always meant to cover. A reason
+                ;; that will not serialize is degraded to 'exit; the
+                ;; submission that follows is link-write/critical's
+                ;; problem and is not inside this guard at all.
                 ;;
-                ;; THAT BREADTH IS DELIBERATE BECAUSE THE ALTERNATIVE IS
-                ;; NOT AVAILABLE. Splitting them would need a predicate
-                ;; that tells a serializer's refusal from an allocation
-                ;; failure, and neither has a shape this file can match
-                ;; on reliably. The degrade direction is the safe one:
-                ;; sending an 'exit that was not strictly warranted costs
-                ;; a watcher a less precise reason, while sending nothing
-                ;; costs it the DOWN entirely. (An earlier version of
-                ;; this comment claimed the guard handled serialization
-                ;; failures "and only that". It never did.)
-                (guard (e (#t (link-write/critical
-                                watcher (list 'mdown mref 'exit)
-                                'mdown-lost)))
-                  (link-write/critical watcher (list 'mdown mref reason)
-                                       'mdown-lost)))
+                ;; It got here by scope, not by a predicate. Two earlier
+                ;; versions of this comment are worth remembering: one
+                ;; claimed the guard handled serialization failures "and
+                ;; only that" while it was a bare (#t ...) catching
+                ;; everything; the next admitted the breadth and argued
+                ;; it was unavoidable because no predicate can tell a
+                ;; serializer's refusal from an allocation failure. The
+                ;; predicate part was true and the conclusion did not
+                ;; follow -- moving one of the two operations out of the
+                ;; guarded region separates them by WHERE THEY RUN, and
+                ;; needs to recognise nothing.
+                (let ((segs (guard (e (#t (frame-segments
+                                            (list 'mdown mref 'exit))))
+                              (frame-segments (list 'mdown mref reason)))))
+                  (link-write/critical watcher segs 'mdown-lost)))
               (`#(demon-local)
                 (demonitor m)
                 (atomically (hashtable-delete! callee-agents key))))))))
@@ -1556,7 +1594,8 @@
                            a))))
             (when (and agent (process-alive? agent))
               (send agent (vector 'demon-local))))
-          (link-write/critical node (list 'demon mref) 'demon-lost))))
+          (link-write/critical node (frame-segments (list 'demon mref))
+                               'demon-lost))))
 
   ;; One small local monitor ties the global/remote state to the process
   ;; that requested it. Without this, rmonitors roots a dead pcb and the
