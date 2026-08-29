@@ -1412,6 +1412,20 @@
                    (failure (raise (submission-failure peer failure)))
                    (else #f))))))
 
+  ;; THE CONTRACT THIS PATH KEEPS: either the frame goes, or the link
+  ;; goes. Its callers are agents that have already dropped their own
+  ;; state, so "neither" is the one outcome that strands a watcher on a
+  ;; healthy link -- which is what all of this is for.
+  ;;
+  ;; WHERE THE CONTRACT ENDS. It holds on every path the program can act
+  ;; on; its last link -- the failure handling's own allocations -- can
+  ;; still give way in the OOM domain, because any action taken on
+  ;; failure needs resources and some link is always last. Stated once,
+  ;; here, where the contract is made: a reader who has just been told
+  ;; "either the frame goes or the link goes" is exactly the reader who
+  ;; needs its boundary, and three copies at the call sites would rot
+  ;; separately.
+  ;;
   ;; For a control frame WHOSE LOSS THE FAR END CANNOT DETECT. That is
   ;; the test, and it is not "is this frame important": an rcall reply
   ;; matters more than a demon, and its loss costs the peer a timeout it
@@ -1470,18 +1484,30 @@
       (let ((e (live-entry peer)))
         (and e
              (let ((c (vector-ref e 0)) (link (vector-ref e 1)))
-               ;; EVERY WAY THIS CAN FAIL MEANS THE SAME THING HERE, so
-               ;; none of them is distinguished. The frame is already
-               ;; built, so what remains is the submission: it can answer
-               ;; #f for a connection that was not open, answer #f for a
-               ;; refusal, or raise from the allocating steps outside
-               ;; write-body!'s own guard. All three are "this frame did
-               ;; not reach the peer", which is the only question this
-               ;; procedure asks. Letting a raise escape instead would
-               ;; break the contract in the worst way available: the
-               ;; caller is an agent that has already dropped its state,
-               ;; so the frame would not go AND the link would not go,
-               ;; which is the outcome this whole path exists to prevent.
+               ;; EVERY WAY THIS CAN FAIL IS TREATED THE SAME, so none of
+               ;; them is distinguished. The frame is already built, so
+               ;; what remains is the submission: it can answer #f for a
+               ;; connection that was not open, answer #f for a refusal,
+               ;; or raise from the allocating steps outside write-body!'s
+               ;; own guard.
+               ;;
+               ;; WHAT THEY SHARE IS NOT "THE FRAME DID NOT ARRIVE" -- an
+               ;; earlier version of this comment said that and it is
+               ;; false. close-for-backpressure! runs AFTER a successful
+               ;; submission, so a raise from it is caught here with the
+               ;; frame already handed over and possibly delivered. What
+               ;; they share is that SUCCESS CANNOT BE CONFIRMED, and the
+               ;; safe way to converge on that is to treat it as failure:
+               ;; a repeated mdown or demon is harmless (both are keyed by
+               ;; mref and the second finds nothing to act on), and a
+               ;; connection over its outbound ceiling was due to be
+               ;; closed anyway.
+               ;;
+               ;; Letting a raise escape instead would break the contract
+               ;; in the worst way available: the caller is an agent that
+               ;; has already dropped its state, so the frame would not go
+               ;; AND the link would not go, which is the outcome this
+               ;; whole path exists to prevent.
                (let ((ok (guard (e2 (#t #f))
                            (let-values (((ok failure) (write-body! c segs)))
                              ok))))
@@ -1515,6 +1541,27 @@
     (let ((e (peer-entry peer)))
       (and e (vector-ref e 0))))
 
+  ;; Take down whatever connection this peer is currently reached on.
+  ;;
+  ;; BY NAME, WHICH THE REST OF THIS FILE IS CAREFUL NOT TO DO, and the
+  ;; exception is the point rather than a lapse. Everywhere else a link
+  ;; is taken down because a SPECIFIC connection failed, and looking the
+  ;; peer up again could condemn a healthy replacement for its
+  ;; predecessor's failure. Here there is no such connection: the frame
+  ;; was never built, so nothing was written anywhere, and there is
+  ;; nothing to blame a particular generation for.
+  ;;
+  ;; What is left is the intent, and the intent is about the PEER: a
+  ;; monitor this node can no longer report on has to fail over, and the
+  ;; only mechanism that produces that is a link going down so the far
+  ;; end synthesizes noconnection. Closing the current connection
+  ;; achieves it whichever generation that is. The cost of closing one
+  ;; that just replaced the old is a reconnect -- and the failover still
+  ;; happens, which is what was being asked for.
+  (define (drop-link-by-name! peer why)
+    (let ((e (peer-entry peer)))
+      (when e (stop-link! (vector-ref e 0) (vector-ref e 1) why))))
+
   ;; ---- cross-node process monitor ----------------------------------------
 
   ;; target side: one process per remote watch. It locally monitors the
@@ -1545,9 +1592,15 @@
       (if (not p)
           (begin
             (atomically (hashtable-delete! callee-agents key))
-            (link-write/critical watcher
-                                 (frame-segments (list 'mdown mref 'noproc))
-                                 'mdown-lost))
+            ;; Building the frame can fail too -- the allocation, not the
+            ;; writer, since this datum always serializes -- and by here
+            ;; the agent has dropped its state and is leaving. Same
+            ;; contract as the submission: if the frame does not go, the
+            ;; link does.
+            (guard (e (#t (drop-link-by-name! watcher 'mdown-lost)))
+              (link-write/critical watcher
+                                   (frame-segments (list 'mdown mref 'noproc))
+                                   'mdown-lost)))
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
@@ -1569,10 +1622,18 @@
                 ;; follow -- moving one of the two operations out of the
                 ;; guarded region separates them by WHERE THEY RUN, and
                 ;; needs to recognise nothing.
-                (let ((segs (guard (e (#t (frame-segments
-                                            (list 'mdown mref 'exit))))
-                              (frame-segments (list 'mdown mref reason)))))
-                  (link-write/critical watcher segs 'mdown-lost)))
+                ;; TWO GUARDS, TWO QUESTIONS. The inner one asks whether
+                ;; the REASON can be written and degrades it to 'exit if
+                ;; not. The outer one asks nothing: any failure at all --
+                ;; including the fallback materialization raising, which
+                ;; the inner handler is not itself protected against --
+                ;; means this DOWN is not going to be delivered, and the
+                ;; contract for that is the link, not silence.
+                (guard (e2 (#t (drop-link-by-name! watcher 'mdown-lost)))
+                  (let ((segs (guard (e (#t (frame-segments
+                                              (list 'mdown mref 'exit))))
+                                (frame-segments (list 'mdown mref reason)))))
+                    (link-write/critical watcher segs 'mdown-lost))))
               (`#(demon-local)
                 (demonitor m)
                 (atomically (hashtable-delete! callee-agents key))))))))
@@ -1594,8 +1655,12 @@
                            a))))
             (when (and agent (process-alive? agent))
               (send agent (vector 'demon-local))))
-          (link-write/critical node (frame-segments (list 'demon mref))
-                               'demon-lost))))
+          ;; Same contract as the mdown paths: this side has already
+          ;; dropped its rmonitors entry, so a demon that is never built
+          ;; leaves the target's agent parked with nobody to free it.
+          (guard (e (#t (drop-link-by-name! node 'demon-lost)))
+            (link-write/critical node (frame-segments (list 'demon mref))
+                                 'demon-lost)))))
 
   ;; One small local monitor ties the global/remote state to the process
   ;; that requested it. Without this, rmonitors roots a dead pcb and the
