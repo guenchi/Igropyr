@@ -32,6 +32,13 @@
 ;;; returns raw bytes -- hex/encode decisions all happen here.
 
 (library (igropyr sigv4)
+  ;; HEADER NAMES MUST BE RFC 7230 TOKENS. A name carrying ":", ";" or a
+  ;; newline is refused with an assertion-violation rather than signed.
+  ;; This is a narrowing, and it is deliberate: such a name signs a
+  ;; canonical request AWS cannot reproduce from the headers it received,
+  ;; so the request comes back 403 with no body and no diagnostic, on
+  ;; exactly the calls that carried that header. The refusal replaces an
+  ;; unexplainable 403 with an error at the call that caused it.
   (export sigv4-sign-headers
           sigv4-uri-encode sigv4-canonical-query sigv4-canonical-request
           sigv4-signing-key sigv4-string-to-sign sigv4-authorization
