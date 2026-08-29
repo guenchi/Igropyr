@@ -214,8 +214,38 @@
   ;; with interrupts disabled so preemption cannot interleave them (the
   ;; same discipline as the actor registry).
 
-  ;; node-name -> #(conn link-pid dialer-name)
+  ;; node-name -> #(conn link-pid dialer-name epoch)
+  ;;
+  ;; The epoch identifies the GENERATION of connection: state established
+  ;; over a link records the epoch it was made under, so a sweep for an
+  ;; older generation cannot take a newer one's entries. See
+  ;; peer-epochs for why the counter itself does not live here.
   (define peers (make-eq-hashtable))
+
+  ;; node-name -> the highest epoch ever issued for that name. NEVER
+  ;; DELETED, and that is the whole reason it is a separate table.
+  ;;
+  ;; THE COUNTER HAS TO OUTLIVE THE THING IT COUNTS. It was first kept
+  ;; inside the peers entry, which fails in the one case it exists for: a
+  ;; peer that fully disconnects has its entry removed, so the next
+  ;; install found nothing and started again at 1 -- while a teardown
+  ;; still in flight for epoch 7 was about to sweep everything at
+  ;; `epoch <= 7`, which now included the whole new generation. A
+  ;; generation counter stored in the record whose disappearance it is
+  ;; meant to survive is not a generation counter.
+  ;;
+  ;; WHAT IT COSTS is one entry per node name ever connected to, never
+  ;; reclaimed -- the same shape, and the same accepted residue, as the
+  ;; watchers table: an application with a finite set of node names has a
+  ;; finite table, and one that mints names has not. It is a small entry
+  ;; (a symbol and an integer) and it is not swept, because a sweep is
+  ;; exactly what would let the counter restart.
+  (define peer-epochs (make-eq-hashtable))
+
+  (define (next-peer-epoch! name)
+    (let ((ep (+ 1 (hashtable-ref peer-epochs name 0))))
+      (hashtable-set! peer-epochs name ep)
+      ep))
   ;; node-name -> #(connector-pid host port). The endpoint is part of the
   ;; value because a node keeps its name across a move: keyed on name
   ;; alone, a connector for the OLD address counts as "already dialing"
@@ -223,20 +253,31 @@
   (define connectors (make-eq-hashtable))
   ;; node-name -> list of watcher pids
   (define watchers (make-eq-hashtable))
-  ;; rcall ref -> waiting caller pid (this node is the caller)
+  ;; rcall ref -> #(caller node epoch) (this node is the caller; epoch is
+  ;; the generation the call was issued over, so a sweep for an older
+  ;; generation leaves a newer call alone)
+  ;;
+  ;; THESE SUMMARIES SIT AT THE TOP AND THE CODE THEY DESCRIBE IS A
+  ;; THOUSAND LINES AWAY, which is exactly how they went stale when the
+  ;; epoch was added: the change was made where the shape is used, and
+  ;; nothing at the point of change pointed back here. If a value shape
+  ;; changes, this block is part of the change.
   (define pending (make-eqv-hashtable))
   (define rcall-counter 0)
   (define (next-rcall-ref!)
     (atomically (set! rcall-counter (+ rcall-counter 1)) rcall-counter))
 
   ;; cross-node process monitors. On the WATCHER node:
-  ;;   rmonitors: mref -> #(caller node name)   (for demonitor + the
-  ;;              noconnection synthesized when the link to node drops)
+  ;;   rmonitors: mref -> #(caller node name epoch)   (for demonitor +
+  ;;              the noconnection synthesized when the link to node
+  ;;              drops; epoch is the generation the watch was placed
+  ;;              over -- 0 for a local watch, which no peer sweep names)
   ;;   caller-agents: mref -> agent pid         (self-watch only)
   ;;   owner-agents: mref -> agent pid          (cleans up when caller dies)
   ;; On the TARGET node:
-  ;;   callee-agents: (peer . mref) -> agent pid  (one local monitor per
-  ;;              remote watch; killed on demon). Keyed by (peer . mref)
+  ;;   callee-agents: (peer . mref) -> (agent-pid . epoch)  (one local
+  ;;              monitor per remote watch; killed on demon). Keyed by
+  ;;              (peer . mref)
   ;;              because mref is chosen by the watcher's own counter, so
   ;;              two watchers collide on it -- the pair namespaces them.
   (define rmonitors (make-eqv-hashtable))
@@ -1229,7 +1270,7 @@
            (atomically
              (let* ((e (hashtable-ref peers name #f))
                     (old (and e (vector-ref e 3)))
-                    (ep (+ 1 (or old 0))))
+                    (ep (next-peer-epoch! name)))
                (cond
                  ;; a live entry: the tie-break decides, and only the
                  ;; winner disturbs anything
@@ -1249,14 +1290,30 @@
         ((not outcome) #f)
         (else
          (let ((ep (car outcome)) (old (cdr outcome)))
-           (when old
-             ;; the old generation's state, and only it: entries carry the
-             ;; epoch they were made under, so anything the NEW generation
-             ;; has already established is not swept by this
-             (fail-generation! name old)
-             (notify! name 'node-down))
-           (notify! name 'node-up)
+           ;; the old generation's state, and only it: entries carry the
+           ;; epoch they were made under, so anything the NEW generation
+           ;; has already established is not swept by this
+           (when old (fail-generation! name old))
+           ;; THE PAIR IS GUARDED BY THE GENERATION, AND SENT AS ONE STEP.
+           ;; The sweep above is O(application state) and cannot be inside
+           ;; an atomic region, so by the time these are sent this
+           ;; generation may already have been replaced -- and then a
+           ;; down/up describing a generation two removals ago would land
+           ;; AFTER the newer one's own notifications, leaving watchers
+           ;; with "up" for a peer that is gone. Whoever is current says
+           ;; what happened to it; a generation that has been superseded
+           ;; says nothing, because everything it would have said has been
+           ;; said by its successor.
+           (atomically
+             (when (current-generation? name ep)
+               (when old (notify! name 'node-down))
+               (notify! name 'node-up)))
            ep)))))
+
+  ;; Is `ep` still the generation this peer is reached on?
+  (define (current-generation? name ep)
+    (let ((e (hashtable-ref peers name #f)))
+      (and e (eqv? (vector-ref e 3) ep))))
 
   ;; Fail everything this peer's generation `epoch` (or older) established.
   ;;
@@ -1281,13 +1338,32 @@
   ;; local process and frees its callee-agents slot). Without this a peer
   ;; that connects, parks monitors, and drops -- over and over -- would
   ;; leak agents and eventually exhaust max-hosted-monitors.
+  ;; THE ENTRY GOES HERE, NOT WHEN THE AGENT GETS AROUND TO IT. Sending
+  ;; demon-local and leaving the entry in place releases the hosting slot
+  ;; only once that agent is next scheduled, and the notification this
+  ;; sweep precedes says the peer is UP again -- so a watcher that obeys
+  ;; the documented rule and re-arms immediately can be answered
+  ;; 'overload against a ceiling still occupied by the generation that
+  ;; just ended, with no second node-up ever coming to prompt a retry.
+  ;; "Re-arm on node-up" is a complete recovery path only if the room has
+  ;; actually been made by then.
+  ;;
+  ;; The message still goes: the agent has a local monitor to release and
+  ;; a process to end, and only it can do that. What changed is that the
+  ;; accounting no longer waits for it.
   (define (drop-hosted-monitors! name epoch)
-    (let-values (((keys agents) (atomically (hashtable-entries callee-agents))))
-      (vector-for-each
-        (lambda (k a)
-          (when (and (eq? (car k) name) (<= (cdr a) epoch))
-            (send (car a) (vector 'demon-local))))
-        keys agents)))
+    (let ((doomed
+            (atomically
+              (let-values (((keys agents) (hashtable-entries callee-agents)))
+                (let ((acc '()))
+                  (vector-for-each
+                    (lambda (k a)
+                      (when (and (eq? (car k) name) (<= (cdr a) epoch))
+                        (hashtable-delete! callee-agents k)
+                        (set! acc (cons (car a) acc))))
+                    keys agents)
+                  acc)))))
+      (for-each (lambda (agent) (send agent (vector 'demon-local))) doomed)))
 
   ;; THE CLEANUP IS UNCONDITIONAL, THE NOTIFICATION IS NOT, and the two
   ;; used to be gated together on "is this still the current entry".
@@ -1309,7 +1385,24 @@
                     (begin (hashtable-delete! peers name) #t))))))
       (tcp-close! c)
       (fail-generation! name epoch)
-      (when mine? (notify! name 'node-down))))
+      ;; ASKED AT THE MOMENT OF SENDING, not at the moment of deleting.
+      ;; `mine?` above is a snapshot: it says this connection was current
+      ;; when its entry was removed, which does not say a newer one has
+      ;; not been installed since -- and a node-down arriving after that
+      ;; successor's node-up reports a live peer as gone, which is the
+      ;; worse of the two errors available here.
+      ;;
+      ;; The test is "is there no entry now": ours was removed, so
+      ;; anything present is necessarily newer. Suppressing in that case
+      ;; costs a watcher the down for this generation -- its successor
+      ;; sends only an up, having found no old entry to report the death
+      ;; of -- and that is the price of never reporting a working peer as
+      ;; down. The state itself was already failed above, so a watcher
+      ;; that missed the down still had every monitor over this
+      ;; generation answered.
+      (atomically
+        (unless (hashtable-ref peers name #f)
+          (notify! name 'node-down)))))
 
   ;; Calls waiting on a peer that just went: no reply can arrive for them,
   ;; so the entry would sit here until its caller's own timeout removed it
@@ -1720,12 +1813,26 @@
   ;; this one included. The demon frame in remove-target-watch! is the
   ;; same case and takes the same route. See link-write/critical for the
   ;; rule, and for why an rcall reply is deliberately NOT in this class.
+  ;; Remove this agent's own registration, and only its own. The key is
+  ;; (peer . mref), and an mref comes from the watcher's own counter, so a
+  ;; watcher re-arming after a generation change can present a key this
+  ;; agent still holds. An unconditional delete on the way out would then
+  ;; remove the successor's entry and leak a hosting slot that is in use.
+  ;; Deleting only what is still ours makes the exits idempotent and safe
+  ;; in any order, including after drop-hosted-monitors! has already taken
+  ;; the entry.
+  (define (forget-callee-agent! key)
+    (atomically
+      (let ((v (hashtable-ref callee-agents key #f)))
+        (when (and v (eq? (car v) self))
+          (hashtable-delete! callee-agents key)))))
+
   (define (mon-agent watcher key name)
     (let ((mref (cdr key))
           (p (whereis name)))
       (if (not p)
           (begin
-            (atomically (hashtable-delete! callee-agents key))
+            (forget-callee-agent! key)
             ;; Building the frame can fail too -- the allocation, not the
             ;; writer, since this datum always serializes -- and by here
             ;; the agent has dropped its state and is leaving. Same
@@ -1738,7 +1845,7 @@
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
-                (atomically (hashtable-delete! callee-agents key))
+                (forget-callee-agent! key)
                 ;; THE GUARD COVERS BUILDING THE FRAME AND NOTHING ELSE,
                 ;; which is what it was always meant to cover. A reason
                 ;; that will not serialize is degraded to 'exit; the
@@ -1770,7 +1877,7 @@
                     (link-write/critical watcher segs 'mdown-lost))))
               (`#(demon-local)
                 (demonitor m)
-                (atomically (hashtable-delete! callee-agents key))))))))
+                (forget-callee-agent! key)))))))
 
   (define (stop-owner-agent! mref)
     (let ((agent (atomically

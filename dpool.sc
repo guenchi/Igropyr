@@ -42,11 +42,14 @@
 ;;;       #(dpool-error node-down id). The caller already has to handle
 ;;;       that error; what changes is that a reconnection can now cause
 ;;;       it, not only a node that really went away.
-;;;   TWO NODES DIALING EACH OTHER IS THE ORDINARY WAY A MESH STARTS, so
-;;;   the replacement is not a rare event -- it is close to guaranteed
-;;;   once per pair at startup, when there is usually nothing in flight
-;;;   yet. It is a live-traffic concern only when a node rejoins a
-;;;   working mesh.
+;;;   HOW OFTEN THIS HAPPENS IS A DEPLOYMENT QUESTION, not a property of
+;;;   the mesh. A configuration where both ends of a pair call
+;;;   node-connect! produces a replacement whenever they dial at once --
+;;;   typically at startup, when there is usually nothing in flight. A
+;;;   configuration where only one end dials each pair (by node-name
+;;;   order, say) produces none at all. Replacements can also arrive
+;;;   later, from a configuration change or a connection that took its
+;;;   time, so "startup only" is not a safe assumption either.
 ;;;
 ;;;   Exactly-once is not on offer: no message-passing system can give
 ;;;   both "never dropped" and "never duplicated" across a crash -- that

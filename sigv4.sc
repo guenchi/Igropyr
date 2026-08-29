@@ -35,10 +35,13 @@
   ;; HEADER NAMES MUST BE RFC 7230 TOKENS. A name carrying ":", ";" or a
   ;; newline is refused with an assertion-violation rather than signed.
   ;; This is a narrowing, and it is deliberate: such a name signs a
-  ;; canonical request AWS cannot reproduce from the headers it received,
-  ;; so the request comes back 403 with no body and no diagnostic, on
-  ;; exactly the calls that carried that header. The refusal replaces an
-  ;; unexplainable 403 with an error at the call that caused it.
+  ;; canonical request the service cannot reproduce from the headers it
+  ;; received, so the request is rejected -- as a signature mismatch, on
+  ;; exactly the calls that carried that header, and with whatever
+  ;; diagnostic that service chooses to give (which for a mismatch is
+  ;; typically little). The refusal moves the failure to the call that
+  ;; caused it. What cannot be promised here is the status code or the
+  ;; body: an HTTP writer may refuse the header before it is ever sent.
   (export sigv4-sign-headers
           sigv4-uri-encode sigv4-canonical-query sigv4-canonical-request
           sigv4-signing-key sigv4-string-to-sign sigv4-authorization
