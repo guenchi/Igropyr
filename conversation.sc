@@ -541,7 +541,8 @@
           (igropyr conv-status)
           (only (igropyr libuv) now-ms)
           (only (igropyr node)
-                node-self rsend node-peers monitor-remote demonitor-remote))
+                node-self rsend node-peers monitor-remote demonitor-remote
+                submission-failure?))
 
   (define default-ttl-ms 300000)      ; 5 minutes
 
@@ -2060,8 +2061,17 @@
         (dynamic-wind
           (lambda () (void))
           (lambda ()
-            (if (rsend owner router
-                       (vector 'conv-peek-fwd (node-self) reply-name ref id))
+            ;; A REFUSED SUBMISSION IS UNREACHABLE, same as no link.
+            ;; rsend answers #f when there is no link and raises when the
+            ;; link is up but this frame could not be handed to libuv.
+            ;; Both mean the same thing in this vocabulary -- the owner
+            ;; cannot be reached right now -- and this layer already has
+            ;; a word for it. Letting the condition through instead would
+            ;; take an out-of-memory in the transport and surface it from
+            ;; conversation-peek, which promises a status, not a raise.
+            (if (guard (e ((submission-failure? e) #f))
+                  (rsend owner router
+                         (vector 'conv-peek-fwd (node-self) reply-name ref id)))
                 (let loop ((deadline (+ (now-ms) ttl-ms)))
                   (let ((left (- deadline (now-ms))))
                     (if (<= left 0)
@@ -2215,9 +2225,11 @@
         (dynamic-wind
           (lambda () (void))
           (lambda ()
-            ;; rsend is #f when the link is already down. That, the link
-            ;; dropping mid-flight, and the forwarding TTL are all the
-            ;; same statement: unreachable. The owner may be dead, or may
+            ;; rsend is #f when there is no link, and RAISES when the
+            ;; link is up but the frame could not be handed to the
+            ;; transport; both are absorbed here as the same statement.
+            ;; That, the link dropping mid-flight, and the forwarding TTL
+            ;; are all the same statement: unreachable. The owner may be dead, or may
             ;; be committing right now -- from here they are
             ;; indistinguishable. The ROUTER going down is not on that
             ;; list: a worker it has already spawned outlives it and
@@ -2225,9 +2237,10 @@
             ;; at the receive below. (A router that dies before dispatching
             ;; leaves no worker and nothing to wait for, and that call does
             ;; run out the TTL.)
-            (if (rsend owner router
-                       (vector 'conv-resume (node-self) reply-name ref
-                               id token req))
+            (if (guard (e ((submission-failure? e) #f))
+                  (rsend owner router
+                         (vector 'conv-resume (node-self) reply-name ref
+                                 id token req)))
                 (let loop ((deadline (+ (now-ms) ttl-ms)))
                   (let ((left (- deadline (now-ms))))
                     (if (<= left 0)

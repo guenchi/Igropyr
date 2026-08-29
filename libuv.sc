@@ -1620,10 +1620,28 @@
                        ((= n total)                 ; fully written now
                         (when on-done (on-done 0)) #t)
                        ((and (> n 0) (< n total))   ; partial: queue the rest
-                        (enqueue-write! c (- total n)
-                          (lambda (dest)
-                            (memcpy-cc dest (+ write-scratch n) (- total n)))
-                          on-done))
+                       ;; A PARTIAL WRITE HAS ALREADY PUT BYTES ON THE
+                       ;; WIRE, so failing to queue the remainder is not
+                       ;; a failure to send -- it is a stream that now
+                       ;; carries a truncated message with no way to
+                       ;; retract it. Whatever is written next would be
+                       ;; read as the missing tail. There is no recovery
+                       ;; from that at this layer or any layer above it,
+                       ;; so the connection is closed: the peer sees a
+                       ;; connection drop, which every protocol on top of
+                       ;; this already knows how to handle, instead of a
+                       ;; framing error it has no vocabulary for.
+                       ;; The close covers both ways queueing can fail --
+                       ;; a returned #f, and a raise on the way there.
+                        (let ((queued
+                                (guard (e (#t (tcp-close! c) (raise e)))
+                                  (enqueue-write! c (- total n)
+                                    (lambda (dest)
+                                      (memcpy-cc dest (+ write-scratch n)
+                                                 (- total n)))
+                                    on-done))))
+                          (unless queued (tcp-close! c))
+                          queued))
                        (else                        ; EAGAIN/0: queue all
                         (enqueue-write! c total
                           (lambda (dest) (memcpy-cc dest write-scratch total))
@@ -1661,9 +1679,17 @@
                     ((= n len)                    ; fully written now
                      (when on-done (on-done 0)) #t)
                     ((and (> n 0) (< n len))      ; partial: queue the rest
-                     (enqueue-write! c (- len n)
-                       (lambda (dest) (memcpy-cc dest (+ ptr n) (- len n)))
-                       on-done))
+                     ;; same as tcp-writev!'s partial branch: a prefix is
+                     ;; already on the wire, so a remainder that cannot be
+                     ;; queued leaves a truncated message behind it
+                     (let ((queued
+                             (guard (e (#t (tcp-close! c) (raise e)))
+                               (enqueue-write! c (- len n)
+                                 (lambda (dest)
+                                   (memcpy-cc dest (+ ptr n) (- len n)))
+                                 on-done))))
+                       (unless queued (tcp-close! c))
+                       queued))
                     (else                         ; EAGAIN/0: queue all
                      (enqueue-write! c len
                        (lambda (dest) (memcpy-cc dest ptr len))

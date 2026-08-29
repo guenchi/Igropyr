@@ -114,7 +114,8 @@
   (export node-start! node-connect! node-disconnect! node-self
           rsend rcall monitor-node demonitor-node node-peers
           monitor-remote demonitor-remote node-set-limits!
-          node-monitor-stats node-outbound-stats reconnect-delay)
+          node-monitor-stats node-outbound-stats reconnect-delay
+          submission-failure?)
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv) (igropyr sexpr)
           (igropyr gen-server)
@@ -651,10 +652,12 @@
 
   ;; Submit an already-materialized frame.
   ;; -> (values submitted? failure)
-  ;;      #t #f          handed to libuv
-  ;;      #f #f          the connection was not open
-  ;;      #f <condition> the submission itself failed; the condition is
-  ;;                     the one it raised, carried out rather than lost
+  ;;      #t #f       handed to libuv
+  ;;      #f #f       the connection was not open -- there is no link
+  ;;      #f <why>    the submission failed on a connection that IS open;
+  ;;                  <why> is the condition it raised, or the symbol
+  ;;                  'submission-refused when libuv declined without
+  ;;                  raising anything to carry
   ;;
   ;; TWO VALUES AND NOT A THREE-WAY SINGLE ONE, because a condition object
   ;; is TRUE. Every caller written as `(unless (write-body! ...) ...)`
@@ -665,10 +668,24 @@
   ;; WHY THE TWO FAILURES ARE KEPT APART AT ALL: they are the same event
   ;; to a caller that has published state (rcall, monitor-remote -- both
   ;; answer noconnection either way) and different events to a caller
-  ;; that reports upward. #f-with-no-condition means the link is gone,
-  ;; which is a thing callers reason about and depend on; a failed
-  ;; submission on a healthy link is not that, and saying it is was the
-  ;; defect this batch exists to repair.
+  ;; that reports upward. #f-with-nothing means the link is gone, which
+  ;; is a thing callers reason about and depend on; a failed submission
+  ;; on a healthy link is not that, and saying it is was the defect this
+  ;; work exists to repair.
+  ;;
+  ;; THE LINE BETWEEN THEM IS THE CONNECTION'S STATE, NOT WHETHER AN
+  ;; EXCEPTION WAS RAISED. An earlier version drew it at the exception,
+  ;; and that was wrong in a way worth leaving written down: raising is
+  ;; one of TWO ways the layer below reports a failed submission. The
+  ;; other is a plain #f -- uv_write declining immediately with a
+  ;; negative errno, which frees its block, calls the completion, and
+  ;; returns, without raising anything at all. Both happen on healthy
+  ;; connections. Keying on the exception therefore repaired one half and
+  ;; left the other reporting "no link" for a link that was up, which is
+  ;; exactly the failure being repaired. What actually distinguishes the
+  ;; two cases is whether the connection is still open, so that is what
+  ;; is asked -- and asked inside the same uninterruptible region as the
+  ;; write, so the answer belongs to the moment of the failure.
   ;;
   ;; THE FAILURE DOMAIN AFTER A CALLER'S PUBLICATION POINT, written to the
   ;; shape it actually has. frame-segments has already built every byte,
@@ -772,6 +789,7 @@
       (let ((over? #f) (failure #f))
         (let ((r (atomically
                    (set! over? (outbound-charge! c total))
+                   (let ((res
                    (guard (e (#t (set! failure e)
                                  (outbound-discharge! c total)
                                  ;; RE-READ, do not clear. These bytes
@@ -787,8 +805,48 @@
                                  (set! over? (outbound-over? c))
                                  #f))
                      (tcp-writev! c segs
-                       (lambda (status) (outbound-discharge! c total)))))))
-          (when over? (close-for-backpressure! c))
+                       (lambda (status) (outbound-discharge! c total))))))
+                     ;; A calm #f on a connection that is STILL OPEN is a
+                     ;; refusal, not a dead link. There is no condition to
+                     ;; carry for it -- libuv reported by returning -- so
+                     ;; one is named here rather than leaving the caller
+                     ;; to infer a link failure that did not happen.
+                     (when (and (not res) (not failure)
+                                (eq? (conn-state c) 'open))
+                       (set! failure 'submission-refused))
+                     res))))
+          ;; A WRITE THAT FINDS THE CONNECTION GONE WAKES WHOEVER IS
+          ;; RUNNING THE LINK. Closing notifies nobody -- libuv's close
+          ;; completion runs the connection's cleanup and frees the
+          ;; handle, and the link process is parked in a receive that
+          ;; knows nothing about it. Left alone, a link whose connection
+          ;; died elsewhere (the transport closed it under a truncated
+          ;; frame, say, or another writer closed it) is discovered by
+          ;; whichever comes first of an EOF that may never arrive, the
+          ;; next tick's ping, or dead-ms a minute later. This is a
+          ;; fourth path and the only one with no delay in it.
+          ;;
+          ;; UNCONDITIONAL, not "only if it looks freshly closed". The
+          ;; other source of this outcome -- a link that died a while ago
+          ;; and this writer is only now finding out -- may equally have
+          ;; a link process that has not seen the EOF yet, so waking it
+          ;; is an improvement there too; and a process that has already
+          ;; gone simply does not receive. tcp-close! is idempotent and
+          ;; the message carries the connection, so a link that has since
+          ;; been replaced refuses it (see stop-link!).
+          ;;
+          ;; When this runs IN the link process -- a ping, a reply -- the
+          ;; message goes to its own mailbox and is matched at its next
+          ;; receive. That is the same answer by a slightly longer route.
+          ;;
+          ;; The reason is 'write-to-closed whatever closed it. A
+          ;; connection the transport dropped for its own reasons (see
+          ;; the partial-write branches in libuv.sc) arrives here looking
+          ;; exactly like any other closed connection, because that is
+          ;; all this side can observe.
+          (cond (over? (close-for-backpressure! c))
+                ((and (not r) (not failure))
+                 (stop-link! c (conn-link-pid c) 'write-to-closed)))
           (values (and r #t) failure)))))
 
   ;; Over the ceiling: this connection is done.
@@ -856,8 +914,15 @@
   (define (close-for-backpressure! c)
     (stop-link! c (conn-link-pid c) 'outbound-backpressure))
 
-  ;; Is this the condition rsend and link-write raise when a frame was
-  ;; built but could not be handed to libuv?
+  ;; Is this the condition rsend raises when a frame was built but could
+  ;; not be handed to libuv?
+  ;;
+  ;; EXPORTED BECAUSE A CALLER CANNOT ACT ON WHAT IT CANNOT NAME. rsend
+  ;; distinguishes three outcomes and two of them are values; the third
+  ;; is this condition, and a caller that wants to treat it the way it
+  ;; treats #f -- which is the right answer wherever "reachable right
+  ;; now" is the question being asked -- needs a predicate for it that is
+  ;; not a shape match written out again at every call site.
   (define (submission-failure? e)
     (and (vector? e)
          (fx>= (vector-length e) 2)
@@ -1248,9 +1313,24 @@
                           (hashtable-set! callee-agents key
                             (spawn (lambda () (mon-agent peer key name))))
                           #t)))
-           ;; at the hosting ceiling: refuse, tell the watcher at once
-           (guard (e (#t (void)))
-             (write-frame! c (list 'mdown mref 'overload))))))
+           ;; At the hosting ceiling: refuse, and tell the watcher at
+           ;; once. THIS REFUSAL IS A CONTROL FRAME NOBODY TIMES OUT --
+           ;; monitor-remote has no clock of its own, so a watcher that
+           ;; never hears the refusal stays armed for a monitor this node
+           ;; declined to host. Same test as link-write/critical: if the
+           ;; frame does not go, the far end never learns anything, so
+           ;; the link goes instead.
+           ;;
+           ;; We ARE the link process here, so the way to take the link
+           ;; down is to raise -- no message to send to ourselves. The
+           ;; old guard swallowed everything; nothing it protected
+           ;; against remains (this frame is (mdown <int> overload),
+           ;; which always serializes).
+           (let-values (((ok failure)
+                         (write-body! c (frame-segments
+                                          (list 'mdown mref 'overload)))))
+             (when (and (not ok) failure)
+               (raise (submission-failure peer failure)))))))
       ;; (mdown ,mref ,reason) -> the watched process/link is gone; only
       ;; honor it from the node the monitor actually targets
       ((frame? d 'mdown 3)
