@@ -255,23 +255,55 @@
   ;; to say plainly where it is minted.
   (define self-boot-id #f)          ; 16 lowercase hex chars
 
-  ;; DIAL GENERATION, ONE COUNTER PER PEER NAME, minted here TEMPORARILY.
+  ;; DIAL GENERATION: ONE PER AUTHORISATION, ISSUED BY THE REGISTRAR.
   ;;
-  ;; ITS FINAL HOME IS THE REGISTRAR, which will issue it at the moment a
-  ;; dial is AUTHORISED rather than at the moment one is attempted. This
-  ;; spelling is staged, not settled, and the distinction is not
-  ;; cosmetic: "monotonic per dial" and "monotonic per authorisation" are
-  ;; different statements, because one authorisation can outlive several
-  ;; attempts. When the counter moves, every property asserted about it
-  ;; has to be re-derived rather than assumed to travel with the name.
+  ;; It moved here from the dial site, and the move changed what the word
+  ;; "monotonic" means rather than merely relocating a counter. Per DIAL
+  ;; it would count attempts; per AUTHORISATION it names the epoch a
+  ;; connection belongs to -- and one authorisation outlives many
+  ;; attempts, because a connector retries under the same permission it
+  ;; was already given.
   ;;
-  ;; Numbering starts at 1 for each peer independently: a generation is
-  ;; only ever compared against another generation for the SAME peer
-  ;; under the same boot id, so two peers both starting at 1 is not a
-  ;; collision. Nothing reads this value on this side yet -- the reader
-  ;; arrives with the registrar -- so what holds it to its contract for
-  ;; now is the wire cell that observes it, not a caller.
+  ;; So retries carry the SAME generation, and that has a consequence
+  ;; worth stating rather than discovering: a second connection minted
+  ;; under one authorisation cannot displace the first, because ordering
+  ;; compares generations and equal is not greater. One authorisation,
+  ;; one installed connection. A NEW generation is issued only when the
+  ;; authorisation itself is replaced -- the endpoint changed, the
+  ;; connector died, the peer was disconnected.
+  ;;
+  ;; Numbering starts at 1 per peer: generations are only ever compared
+  ;; against another generation for the SAME peer under the same boot id,
+  ;; so two peers both starting at 1 is not a collision.
   (define dial-gens (make-eq-hashtable))
+
+  ;; ---- the registrar's authorisation table ---------------------------
+  ;;
+  ;; ONE WRITER, MANY READERS. The registrar is the only process that
+  ;; writes this table; an attempt only reads it, and only ever CONSUMES
+  ;; the one row addressed to itself. That split is what lets the check
+  ;; and the commit share an atomic region without either of them being a
+  ;; message round trip: an attempt that had to ask the registrar
+  ;; "may I still?" would have to `receive`, and `receive` parks -- so the
+  ;; answer could go stale between the reply and the connect, which is
+  ;; the hole this arrangement exists to close.
+  ;;
+  ;; A row is IMMUTABLE and consumed by replacing it whole, after
+  ;; re-reading the table and confirming it is still the same object.
+  ;; Setting a "consumed" bit in place would look equivalent and is not:
+  ;; between reading the row and writing the bit, a revocation could have
+  ;; replaced the row, and the write would then mark the NEW row as
+  ;; consumed -- authorising the old attempt and cancelling the new one
+  ;; in a single step. Whole replacement plus an eq? recheck is a real
+  ;; compare-and-swap; a mutable bit is not one.
+  ;;
+  ;; auth-record = #(endpoint parent child gen consumed?)
+  (define peers-auth (make-eq-hashtable))
+  (define (auth-endpoint r) (vector-ref r 0))
+  (define (auth-parent r)   (vector-ref r 1))
+  (define (auth-child r)    (vector-ref r 2))
+  (define (auth-gen r)      (vector-ref r 3))
+  (define (auth-consumed? r)(vector-ref r 4))
 
   ;; The domain is unsigned 64-bit. Exhausting it locally is a
   ;; fail-stop: there is no correct value left to send, and continuing
@@ -305,6 +337,15 @@
   ;; hand both the same generation, which is the one thing this counter
   ;; exists to prevent.
   (define dial-gen-exhausted (list 'dial-gen-exhausted))
+
+  ;; The current epoch's generation, minting one if this peer has none.
+  ;; Called only by the registrar, so the read-modify-write needs no
+  ;; region of its own -- but it keeps one anyway, because "only the
+  ;; registrar calls it" is a fact about today's callers and the counter
+  ;; would be silently wrong if that stopped being true.
+  (define (peer-gen peer)
+    (or (atomically (hashtable-ref dial-gens peer #f))
+        (next-dial-gen! peer)))
 
   (define (next-dial-gen! peer)
     (let ((n (atomically
@@ -2827,10 +2868,18 @@
   ;; a delay and never a connection, so every test still passes while the
   ;; guarantee above is gone.
   (define (dial! peer host port parent)
+    (define dial-gen #f)
     (guard (e ((eq? e 'stop) (raise 'stop))
               ((eq? e dial-gen-exhausted) (raise e))   ; not a retryable failure
               (#t #f))                          ; any failure: retry later
-      (tcp-connect! host port self)
+      ;; AUTHORISED FIRST, AND THE CONNECT IS PART OF THE AUTHORISATION.
+      ;; The generation is not minted here any more -- it is read out of
+      ;; the row the registrar published, so every retry under one
+      ;; permission carries the same number and a fresh permission
+      ;; carries a new one.
+      (let ((gen (authorised-connect! peer host port parent)))
+        (unless gen (raise 'unauthorised))
+        (set! dial-gen gen))
       (receive (after handshake-timeout-ms (raise 'timeout))
         (`#(tcp-connected ,c)
           (guard (e ((eq? e 'stop) (tcp-close! c) (raise 'stop))
@@ -2899,7 +2948,7 @@
               ;; reads it back yet.
               (let ((nonce-b (random-hex 16))
                     (bootid-a (cadddr d))
-                    (gen (next-dial-gen! peer)))
+                    (gen dial-gen))
                 (write-frame! c
                   (list 'hello (symbol->string self-name)
                         (proof-d (cadr d) (symbol->string self-name)
@@ -3100,6 +3149,81 @@
   ;; argument above depends on that number meaning the life of the
   ;; AUTHENTICATED link, and moving where the code runs must not quietly
   ;; move where the clock starts.
+  ;; ---- the registrar --------------------------------------------------
+  ;;
+  ;; ITS MAILBOX IS THE TOTAL ORDER. Everything that changes who may dial
+  ;; a peer -- a new attempt asking permission, an endpoint change, a
+  ;; disconnect -- arrives here as a message, so those changes are
+  ;; sequenced against each other by construction rather than by each
+  ;; caller remembering to take the same lock.
+  ;;
+  ;; It issues and revokes; it never consumes. Consumption happens in the
+  ;; attempt's own atomic region, on the one row addressed to that
+  ;; attempt. See peers-auth for why the two cannot be swapped.
+  (define registrar #f)
+
+  (define (registrar-loop)
+    (let loop ()
+      (receive
+        (`#(attempt-register ,peer ,endpoint ,parent ,child)
+          ;; ONE LIVE AUTHORISATION PER PEER. An existing row whose child
+          ;; is still alive and has not consumed it means another attempt
+          ;; is already holding permission; a second one would dial the
+          ;; same name in parallel, and both would reach the far end.
+          (let* ((cur (atomically (hashtable-ref peers-auth peer #f)))
+                 (held (and cur
+                            (not (auth-consumed? cur))
+                            (process-alive? (auth-child cur))
+                            (not (eq? (auth-child cur) child)))))
+            (if held
+                (when (process-alive? child) (send child (vector 'no-go)))
+                (begin
+                  ;; The generation belongs to the EPOCH, not to this
+                  ;; attempt: a retry under the same authorisation reads
+                  ;; the same number back.
+                  (atomically
+                    (hashtable-set! peers-auth peer
+                      (vector endpoint parent child (peer-gen peer) #f)))
+                  (when (process-alive? child) (send child (vector 'go))))))
+          (loop))
+        ;; A revocation ends the epoch: the next authorisation for this
+        ;; peer gets a NEW generation, which is what makes "a fresh
+        ;; permission outranks the one it replaced" true.
+        (`#(auth-revoke ,peer)
+          (atomically (hashtable-delete! peers-auth peer))
+          (next-dial-gen! peer)
+          (loop))
+        (`#(node-stop) (void)))))
+
+  ;; -> the generation this attempt is authorised under, or #f. The
+  ;; connect is submitted INSIDE the region that consumes the row: an
+  ;; authorisation checked and then acted on afterwards is an
+  ;; authorisation that could have been revoked in between, and the
+  ;; revocation exists precisely because somebody decided this dial must
+  ;; not happen.
+  (define (authorised-connect! peer host port parent)
+    (send registrar (vector 'attempt-register peer (cons host port) parent self))
+    (receive (after handshake-timeout-ms #f)
+      (`#(no-go) #f)
+      (`#(go)
+        (atomically
+          (let ((r (hashtable-ref peers-auth peer #f)))
+            (and r
+                 (eq? (auth-child r) self)
+                 (not (auth-consumed? r))
+                 (equal? (auth-endpoint r) (cons host port))
+                 (or (not (auth-parent r)) (process-alive? (auth-parent r)))
+                 ;; the compare half of the compare-and-swap: still the
+                 ;; same row we just read, not a replacement published
+                 ;; between the read and here
+                 (eq? (hashtable-ref peers-auth peer #f) r)
+                 (let ((gen (auth-gen r)))
+                   (hashtable-set! peers-auth peer
+                     (vector (auth-endpoint r) (auth-parent r) (auth-child r)
+                             gen #t))
+                   (tcp-connect! host port self)
+                   gen)))))))
+
   (define (attempt! peer host port)
     (let* ((parent self)
            (ref (gensym))
@@ -3232,6 +3356,10 @@
     ;; the proof it then verifies, so a second spelling would make this
     ;; node fail to authenticate a peer that answered it correctly.
     (set! self-boot-id (random-hex 8))
+    ;; The registrar starts with the node, not with the first dial: its
+    ;; mailbox is the order in which permission to dial changes, and an
+    ;; order that only begins once somebody dials is not one.
+    (set! registrar (spawn registrar-loop))
     (when (pair? rest)
       (let ((port (car rest))
             (host (if (pair? (cdr rest)) (cadr rest) "127.0.0.1")))
@@ -3289,7 +3417,13 @@
                    ;; or two of them dial the same name in parallel
                    (and e (process-alive? (vector-ref e 0))
                         (vector-ref e 0))))))))
-      (when stale (kill stale 'endpoint-changed)))
+      (when stale
+        ;; The old permission dies with the connector that held it, and
+        ;; the next one gets a new generation -- that is what makes a
+        ;; connection dialled to the NEW endpoint outrank one still being
+        ;; established to the old.
+        (when registrar (send registrar (vector 'auth-revoke peer)))
+        (kill stale 'endpoint-changed)))
     (void))
 
   ;; Stop dialing and drop the live link, if any.
@@ -3299,6 +3433,7 @@
                  (hashtable-delete! connectors peer)
                  (and e (vector-ref e 0))))))
       (when (and p (process-alive? p)) (send p (vector 'node-stop))))
+    (when registrar (send registrar (vector 'auth-revoke peer)))
     (let ((e (peer-entry peer)))
       (when e (send (entry-link e) (vector 'node-stop))))
     (void))
