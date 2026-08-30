@@ -840,6 +840,56 @@
         (unless (zero? (node-orphan-count))
           (fail! "s2-orphan-empty-at-rest" 'leaked-after-churn
                  (node-orphan-count)))))
+
+    ;; ---- CV: what conversation depends on ------------------------------
+    ;; conversation deliberately does NOT trust the reason on a
+    ;; remote-down; it asks node-peers instead, because a reason can be
+    ;; forwarded verbatim, can arrive with no link behind it, and carries
+    ;; no ref (conversation.sc's own note). That makes node-peers a
+    ;; load-bearing observable for at-most-once: a false 'unreachable
+    ;; sends a resume to reconcile a step that already ran. These cells
+    ;; are the node-side half of that contract.
+    ;;
+    ;; CV-1a: an entry must not outlive its link. If it did, a retry
+    ;; would arrive under the SAME generation, hit I8a's <= and be
+    ;; refused for ever -- the failure is silent and permanent, and
+    ;; nothing else in the suite would notice it.
+    (let ((cv-port 18088))
+      (let ((lc (tcp-listen! "127.0.0.1" cv-port 16
+                  (lambda (c)
+                    (let ((pid (spawn
+                                 (lambda ()
+                                   (tcp-read-start! c)
+                                   (tcp-write! c (frame-bytes
+                                                   (list 'challenge kat-nonce 4
+                                                         probe-boot-id))
+                                               #f)
+                                   (read-frame-or-closed "cv-probe")
+                                   (tcp-close! c)))))
+                      (conn-set-owner! c pid))))))
+        (node-connect! 'cvpeer "127.0.0.1" cv-port)
+        (sleep-ms 1200)
+        ;; the fake acceptor never welcomes, so no entry should exist;
+        ;; what must hold either way is that node-peers never names a
+        ;; peer whose link is gone
+        (tcp-stop-listen! lc)
+        (node-disconnect! 'cvpeer)
+        (sleep-ms 1200)
+        ;; SCOPE, measured rather than assumed: this assertion holds both
+        ;; when the entry was correctly removed AND when none was ever
+        ;; installed (the fake acceptor never welcomes). The mutation
+        ;; that makes remove-peer! keep its entry is caught earlier, by
+        ;; backpressure-no-node-down -- so the discriminating power for
+        ;; "an entry outlived its link" lives in THAT cell, not this one.
+        ;; What this one owns is the pair, taken after a real
+        ;; connect/disconnect cycle rather than at rest: the peer is not
+        ;; listed AND nothing was left behind on the orphan chain.
+        (when (memq 'cvpeer (node-peers))
+          (fail! "cv-1a-entry-outlives-link" 'still-listed (node-peers)))
+        (unless (zero? (node-orphan-count))
+          (fail! "cv-1a-entry-outlives-link" 'orphan-leak
+                 (node-orphan-count)))))
+    (display "CV cells passed\n")
     (display "S2 registrar/container cells passed\n")
     ;; ==== end S2 ========================================================
 
