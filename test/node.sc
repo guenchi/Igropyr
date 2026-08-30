@@ -1043,6 +1043,21 @@
         (let ((loser (same-name-as! "s2-rep-stale" 6)))
           (unless (eq? loser 'closed)
             (fail! "s2-stale-gen-must-not-be-welcomed" loser)))
+        ;; THE OLD CONNECTION MUST ACTUALLY BE CLOSED by the replacement,
+        ;; and only the peer sitting on it can say so. (R1) closes it by
+        ;; calling tcp-close! inside the region rather than by writing a
+        ;; state word -- a marker would leave the handle open for ever,
+        ;; and the difference is invisible from our own tables. The held
+        ;; session parks until EOF, so if the close were neutralised it
+        ;; would still be alive here.
+        (let ((h2 (hold-open-as! "s2-rep-gen10" 10)))
+          (unless (eq? (car h2) 'welcomed)
+            (fail! "s2-replacement" 'gen10-not-welcomed (car h2)))
+          (sleep-ms 800)
+          (when (process-alive? (cdr held))
+            (fail! "s2-old-conn-not-closed-by-replacement" 'still-parked))
+          (kill (cdr h2) 'done)
+          (sleep-ms 300))
         ;; leave nothing parked: the held session would otherwise still
         ;; own a connection when the later baseline cells count them
         (kill (cdr held) 'done)
