@@ -151,7 +151,7 @@
           rsend rcall monitor-node demonitor-node node-peers
           monitor-remote demonitor-remote node-set-limits!
           node-monitor-stats node-outbound-stats reconnect-delay
-          submission-failure? node-install-rule-order)
+          submission-failure? node-install-rule-order node-orphan-count)
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv) (igropyr sexpr)
           (igropyr gen-server)
@@ -612,6 +612,115 @@
   (define (entry-boot-id e) (vector-ref e 3))   ; the peer's boot id, or #f
   (define (entry-gen e)     (vector-ref e 4))   ; its dial generation, or #f
   (define (entry-head e)    (vector-ref e 5))   ; topology queue head slot
+
+  ;; ---- the per-peer topology queue ------------------------------------
+  ;;
+  ;; ONE QUEUE PER PEER, AND IT LIVES ON THE PEER'S ENTRY. Every producer
+  ;; of a topology event -- a replacement, a real death, a first install
+  ;; -- appends at its own linearisation point, so the order a consumer
+  ;; sees inside one peer is the order the transitions happened in. The
+  ;; ordering promise is per peer; nothing here claims one across peers.
+  ;;
+  ;; THE HEAD IS BUILT WITH THE ENTRY, never on first use. A head created
+  ;; lazily means the enqueue that finds none has to CREATE one, and
+  ;; creating one inside the swap region is a container growth: it can
+  ;; allocate, it can rehash, and it can raise -- inside a region that
+  ;; does not roll back. Building it with the entry, outside, turns every
+  ;; later enqueue into two pointer writes.
+  ;;
+  ;; THE HEAD IS NOT AN EVENT IDENTITY. It is a long-lived container that
+  ;; outlives the entries it hangs on -- it survives replacement, it
+  ;; survives the peer's death while events are still undelivered, and it
+  ;; is adopted again if the peer comes back. Anything that has to say
+  ;; "this exact event completed" needs its own per-event object; reusing
+  ;; the head for that would make a completion match a later event that
+  ;; merely shares the container. Same argument as the fair-ring node,
+  ;; and they are separate roles for the same reason.
+  (define-record-type qnode
+    (fields event (mutable next)))
+
+  ;; `onext` is the head's OWN link into the global orphan chain. A
+  ;; separate chain cell would have to be allocated at the moment of
+  ;; handover -- and that handover happens inside the atomic region that
+  ;; removes the peer, where an allocation that raises would leave the
+  ;; entry gone and the queue unreachable, with the peer's own death
+  ;; notice still in it. Carrying the link in the head removes the
+  ;; allocation rather than pre-arranging one, so the failure it guards
+  ;; against cannot occur.
+  (define-record-type qhead
+    (fields (mutable first) (mutable last) (mutable onext) (mutable oname)))
+
+  (define (new-qhead) (make-qhead #f #f #f #f))
+
+  ;; Splice a PRE-BUILT node. Two writes, no allocation, no growth: safe
+  ;; to call from inside an atomic region.
+  (define (qhead-push! h n)
+    (if (qhead-last h)
+        (qnode-next-set! (qhead-last h) n)
+        (qhead-first-set! h n))
+    (qhead-last-set! h n))
+
+  (define (qhead-pop! h)
+    (let ((n (qhead-first h)))
+      (and n
+           (begin
+             (qhead-first-set! h (qnode-next n))
+             (unless (qhead-first h) (qhead-last-set! h #f))
+             (qnode-next-set! n #f)
+             (qnode-event n)))))
+
+  (define (qhead-empty? h) (not (qhead-first h)))
+
+  ;; THE ORPHAN CHAIN EXISTS ONLY WHILE SOMETHING IS ON IT. It is a bare
+  ;; pointer, not a table keyed by peer name: a table would be the
+  ;; O(number of names ever seen) structure this design already refused,
+  ;; and it would need somebody to clean it. A chain is empty when the
+  ;; last head leaves it, with nothing to sweep. The cost is that finding
+  ;; one peer's head is a walk -- bounded by the number of peers that are
+  ;; dead AND still undrained at the same instant, which is the smallest
+  ;; set any of these arrangements could be walked over.
+  (define orphans #f)                     ; qhead | #f
+
+  (define (orphan-attach! h name)         ; region-safe: pointer writes only
+    (qhead-oname-set! h name)
+    (qhead-onext-set! h orphans)
+    (set! orphans h))
+
+  ;; Unlink and return this peer's orphaned head, or #f. Used by the
+  ;; install path to adopt it back, and by the drain to drop a head that
+  ;; has emptied -- "only while non-empty" is enforced by actually
+  ;; removing it, not by a flag saying it is gone.
+  ;; Read-only: is this peer's head on the chain? Separated from the
+  ;; unlink so the install path can decide WHICH head the new entry will
+  ;; carry before it changes anything -- see the ordering note there.
+  (define (orphan-find name)
+    (let loop ((h orphans))
+      (cond ((not h) #f)
+            ((eq? (qhead-oname h) name) h)
+            (else (loop (qhead-onext h))))))
+
+  (define (orphan-detach! name)
+    (let loop ((prev #f) (h orphans))
+      (cond
+        ((not h) #f)
+        ((eq? (qhead-oname h) name)
+         (if prev (qhead-onext-set! prev (qhead-onext h))
+                  (set! orphans (qhead-onext h)))
+         (qhead-onext-set! h #f)
+         (qhead-oname-set! h #f)
+         h)
+        (else (loop h (qhead-onext h))))))
+
+  ;; EXPORTED, because "the orphan chain is empty again" is a claim that
+  ;; has to be checkable from outside. The chain exists only while some
+  ;; dead peer still has undelivered events; a build that leaked heads
+  ;; onto it would behave correctly in every other respect and grow
+  ;; without bound, which is precisely the failure nothing else would
+  ;; report. Reading it is O(chain), and the chain is empty on an idle
+  ;; system.
+  (define (node-orphan-count)
+    (atomically
+      (let loop ((h orphans) (n 0)) (if h (loop (qhead-onext h) (fx+ n 1)) n))))
 
   (define (peer-entry name)
     (atomically (hashtable-ref peers name #f)))
@@ -1637,7 +1746,19 @@
   (define (install-peer! name c dialer boot-id gen parent)
     (let ((r (make-ireq name c dialer boot-id gen parent)))
       (let judge ((fuel 2))
-        (let* ((cut #f)
+        ;; (R0) EVERYTHING THAT CAN ALLOCATE IS BUILT HERE, outside. The
+        ;; region below may take a head, two event nodes, or none of
+        ;; them; building all three unconditionally costs three small
+        ;; objects on a path that runs once per connection, and buys the
+        ;; property that the region contains no allocation at all. A
+        ;; region that allocates can raise, and `atomically` does not
+        ;; roll back -- a half-finished handover there is unreachable
+        ;; state, not a retryable failure.
+        (let* ((spare (list (new-qhead)
+                            (make-qnode (vector 'node-down name) #f)
+                            (make-qnode (vector 'node-up name) #f)))
+               (cut #f)
+               (drain #f)
                (old #f)
                (decision
                  (atomically
@@ -1649,9 +1770,46 @@
                           (d (and rule ((irule-act rule) e r))))
                      (case d
                        ((install)
+                        ;; ADOPT AN ORPHANED QUEUE IF THIS PEER LEFT ONE.
+                        ;; A peer that died with events still undelivered
+                        ;; put its head on the orphan chain; coming back
+                        ;; under a new entry must take it back rather
+                        ;; than start an empty one beside it. Two heads
+                        ;; for one peer would let this install's `up` be
+                        ;; delivered before the previous `down` that is
+                        ;; still sitting in the older queue.
+                        ;; ORDER INSIDE THE REGION IS THE ARGUMENT, and
+                        ;; it is worth spelling out because `atomically`
+                        ;; does not roll back: whatever raises here
+                        ;; leaves behind exactly what ran before it.
+                        ;;   1. make-entry -- the ONE allocation in this
+                        ;;      region, placed first, where a failure has
+                        ;;      changed nothing at all;
+                        ;;   2. the push -- pointer writes on a head that
+                        ;;      is still reachable either way (it is
+                        ;;      still on the orphan chain, or it is the
+                        ;;      spare nobody else can see);
+                        ;;   3. hashtable-set! -- a NEW key, so this one
+                        ;;      can grow the table and can raise. If it
+                        ;;      does, the entry is simply unpublished and
+                        ;;      the queued event is still reachable
+                        ;;      through the orphan chain;
+                        ;;   4. the unlink -- pointer writes only, so by
+                        ;;      the time the head leaves the chain there
+                        ;;      is nothing left that can fail.
+                        ;; Detaching first would invert that: a failure
+                        ;; at step 3 would leave the head off the chain
+                        ;; and out of the table, with the peer's earlier
+                        ;; undelivered events on it and no way to reach
+                        ;; them.
                         (set! cut (hashtable-ref watchers name '()))
-                        (hashtable-set! peers name
-                          (make-entry c self dialer boot-id gen #f))
+                        (let* ((oh (orphan-find name))
+                               (h (or oh (car spare)))
+                               (ne (make-entry c self dialer boot-id gen h)))
+                          (qhead-push! h (caddr spare))   ; an install is an `up`
+                          (hashtable-set! peers name ne)
+                          (when oh (orphan-detach! name))
+                          (set! drain h))
                         'installed)
                        ((replace)
                         ;; (R1). THREE THINGS, ONE REGION.
@@ -1682,10 +1840,28 @@
                         ;; the swap lets a watcher that finishes
                         ;; registering in between miss the pair for good.
                         ;; The list is immutable, so this is a pointer.
+                        ;; THE QUEUE MOVES TO THE NEW ENTRY, and it has
+                        ;; to: the head hangs on the entry, and replacing
+                        ;; an entry is otherwise an implicit destruction
+                        ;; of everything hanging on it -- including
+                        ;; events already queued and not yet delivered.
+                        ;; One pointer, carried across. This event is
+                        ;; appended AFTER them, so the peer's own order
+                        ;; survives the handover.
+                        ;; Same ordering rule as the install branch, and
+                        ;; here it closes completely: make-entry first,
+                        ;; and the hashtable-set! that follows replaces an
+                        ;; EXISTING key, so it cannot grow the table and
+                        ;; cannot raise. Everything after the allocation
+                        ;; is a pointer write.
                         (set! old e)
                         (set! cut (hashtable-ref watchers name '()))
-                        (hashtable-set! peers name
-                          (make-entry c self dialer boot-id gen (entry-head e)))
+                        (let* ((h (entry-head e))
+                               (ne (make-entry c self dialer boot-id gen h)))
+                          (qhead-push! h (cadr spare))
+                          (qhead-push! h (caddr spare))
+                          (hashtable-set! peers name ne)
+                          (set! drain h))
                         (tcp-close! (entry-conn e))
                         'replaced)
                        (else d)))))) 
@@ -1700,6 +1876,17 @@
                (when (and e (same-conn? e r)) (remove-peer! name c)))
              (if (> fuel 0) (judge (- fuel 1)) 'refused))
             ((replaced)
+             ;; (R2)(R3)(R4). The queue is drained OUTSIDE the region:
+             ;; the cut was taken inside, at the same instant as the
+             ;; swap, and only the fan-out is out here. Moving the cut
+             ;; out with it would let a watcher that finishes registering
+             ;; between the read and the swap miss the pair for good --
+             ;; late is recoverable, missing is not.
+             ;;
+             ;; The drain runs in this process for now. A supervised
+             ;; serial dispatcher is the eventual owner; what is settled
+             ;; here is the container and the handovers, not who turns
+             ;; the crank.
              ;; (R2) wake the old link process, (R3) settle what the old
              ;; generation left behind, (R4) fan out down then up to the
              ;; snapshot cut above.
@@ -1718,13 +1905,29 @@
              (stop-link! (entry-conn old) (entry-link old) 'replaced)
              (drop-hosted-monitors! name)
              (fail-pending-for! name)
-             (notify-list! cut name 'node-down)
-             (notify-list! cut name 'node-up)
+             (drain-queue! drain cut)
              'replaced)
-            ((installed) (notify-list! cut name 'node-up) 'installed)
+            ((installed) (drain-queue! drain cut) 'installed)
             ((idempotent) 'idempotent)
             ((protocol-error) (tcp-close! c) 'protocol-error)
             (else (tcp-close! c) 'refused))))))
+
+  ;; Take events until the queue is empty and fan each out to the cut
+  ;; taken when it was queued. Draining to empty rather than one at a
+  ;; time is what makes the "only while non-empty" rule about the orphan
+  ;; chain checkable: a head that empties here is unlinked in the same
+  ;; call, so an idle system has an empty chain rather than a chain of
+  ;; empty heads nobody will ever look at again.
+  (define (drain-queue! h cut)
+    (when h
+      (let loop ()
+        (let ((ev (atomically (qhead-pop! h))))
+          (when ev
+            (notify-list! cut (vector-ref ev 1) (vector-ref ev 0))
+            (loop))))
+      (atomically
+        (when (and (qhead-empty? h) (qhead-oname h))
+          (orphan-detach! (qhead-oname h))))))
 
   ;; Did the install succeed, in the sense the caller cares about: is
   ;; this connection now the one in the table?
@@ -1756,18 +1959,33 @@
         (lambda (k agent) (when (eq? (car k) name) (send agent (vector 'demon-local))))
         keys agents)))
 
+  ;; A REAL DEATH, and the queue has to outlive the entry it hangs on.
+  ;; The entry goes in the same region that queues this peer's own
+  ;; `node-down`, so deleting the entry would delete the notice about the
+  ;; deletion -- the notification destroyed by the very thing it is
+  ;; about. The head therefore moves to the orphan chain, where the same
+  ;; drain finds it, and leaves the chain when it empties.
   (define (remove-peer! name c)
-    (let ((mine?
-           (atomically
-             (let ((e (hashtable-ref peers name #f)))
-               (and e (eq? (entry-conn e) c)
-                    (begin (hashtable-delete! peers name) #t))))))
+    (let* ((node (make-qnode (vector 'node-down name) #f))  ; (R0): outside
+           (cut #f)
+           (drain #f)
+           (mine?
+             (atomically
+               (let ((e (hashtable-ref peers name #f)))
+                 (and e (eq? (entry-conn e) c)
+                      (let ((h (entry-head e)))
+                        (set! cut (hashtable-ref watchers name '()))
+                        (qhead-push! h node)
+                        (hashtable-delete! peers name)
+                        (orphan-attach! h name)
+                        (set! drain h)
+                        #t))))))
       (tcp-close! c)
       (when mine?
         (drop-hosted-monitors! name)       ; free monitors this peer parked here
         (fail-monitors-for! name)          ; DOWN(noconnection) for watchers
         (fail-pending-for! name)           ; nothing will answer these now
-        (notify! name 'node-down))))
+        (drain-queue! drain cut))))
 
   ;; Calls waiting on a peer that just went: no reply can arrive for them,
   ;; so the entry would sit here until its caller's own timeout removed it
