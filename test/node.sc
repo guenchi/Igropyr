@@ -890,6 +890,53 @@
           (fail! "cv-1a-entry-outlives-link" 'orphan-leak
                  (node-orphan-count)))))
 
+    ;; two long-lived processes for the S3 probe to watch
+    (register 'monitor-victim
+      (spawn (lambda () (receive (after 60000 (void)) (`#(stop) (void))))))
+    (register 'monitor-victim-2
+      (spawn (lambda () (receive (after 60000 (void)) (`#(stop) (void))))))
+    ;; ---- S3: hosted-monitor admission ---------------------------------
+    ;; The ceiling that bounds hosted monitors used to count table
+    ;; entries, and arming used to overwrite its key. Both are visible
+    ;; from a peer's chair: repeating the SAME (mref, target) must cost
+    ;; nothing, and reusing an mref for a DIFFERENT target must cost the
+    ;; link -- otherwise one authenticated peer holds an unbounded number
+    ;; of agents behind a table of size one.
+    ;;
+    ;; Run in its own process: the frames belong to whoever owns the
+    ;; socket, and the surrounding cells have their own conversations on
+    ;; this scheduler.
+    (let ((me self) (ref (gensym)))
+      (spawn
+        (lambda ()
+          (let ((c (handshake-as! "monrepeat" "s3-mon-repeat")))
+            (define (mon! mref name)
+              (tcp-write! c (frame-bytes (list 'mon name mref)) #f))
+            (define (quiet? ms)
+              (receive (after ms #t)
+                (`#(tcp-eof) #f)
+                (`#(tcp-error ,_) #f)
+                (`#(tcp-data ,_) #t)))
+            ;; the target must actually exist and stay alive: an agent
+            ;; watching a missing name answers noproc and retires at
+            ;; once, and then the second frame is a fresh arm rather than
+            ;; the repeat this cell is about
+            (mon! 4001 'monitor-victim)
+            (sleep-ms 200)
+            (mon! 4001 'monitor-victim)
+            (mon! 4001 'monitor-victim)
+            (let ((survived (quiet? 700)))
+              (mon! 4001 'monitor-victim-2)
+              (let ((closed (not (quiet? 1500))))
+                (tcp-close! c)
+                (send me (vector ref survived closed)))))))
+      (receive (after 15000 (fail! "s3-admission" 'timeout))
+        (`#(,@ref ,survived ,closed)
+          (unless survived
+            (fail! "s3-mon-repeat-must-be-idempotent" 'link-closed))
+          (unless closed
+            (fail! "s3-mref-reuse-must-close-the-link" 'link-still-open))))
+      (display "S3 admission cells passed\n"))
     ;; ---- S2: replacement, seen from the side that LOSES ---------------
     ;; Everything above asserts our own tables. A rule that says "refuse,
     ;; close, notify nobody" has a second half that only the peer can
@@ -1074,6 +1121,8 @@
         (kill (cdr held) 'done)
         (sleep-ms 400))
       (display "S2 replacement cells passed\n"))
+
+
     (display "CV cells passed\n")
     (display "S2 registrar/container cells passed\n")
     ;; ==== end S2 ========================================================
