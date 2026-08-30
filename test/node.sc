@@ -750,20 +750,44 @@
             (let* ((first (list-ref (reverse acc) 0))
                    (second (list-ref (reverse acc) 1)))
               (node-disconnect! 'gpeer)
-              (tcp-stop-listen! l)
               (when (or (pair? (car first)) (pair? (car second)))
                 (fail! "s1-dialgen-generator" 'hello-shape first second))
               ;; per-peer numbering starts at 1 -- a global counter shared
               ;; across peers would show up here as a first value > 1
               (unless (eqv? (car first) 1)
                 (fail! "s1-dialgen-generator" 'first-not-1 (car first)))
-              (unless (eqv? (car second) 2)
-                (fail! "s1-dialgen-generator" 'not-monotonic-by-one
+              ;; SAME AUTHORISATION, SAME NUMBER. The generator moved from
+              ;; the dial site to the registrar's issuance point (design
+              ;; §10.9.20.2), and that move changed the proposition: what
+              ;; is monotone is the AUTHORISATION, not the attempt. One
+              ;; authorisation spans however many dials the backoff makes,
+              ;; so two attempts under it must carry the same generation --
+              ;; an increment here would mean the number had gone back to
+              ;; counting attempts. The revocation half is below.
+              (unless (eqv? (car second) (car first))
+                (fail! "s1-dialgen-generator" 'retry-changed-generation
                        (car first) (car second)))
               ;; the boot-id is the node's, not the connection's
               (unless (equal? (cdr first) (cdr second))
                 (fail! "s1-dialgen-generator" 'bootid-varies-per-dial
-                       (cdr first) (cdr second))))
+                       (cdr first) (cdr second)))
+              ;; THE OTHER HALF, and without it the cell above is passed
+              ;; by a generator that always answers 1. Revoking the
+              ;; authorisation (node-disconnect!) must make the next one
+              ;; carry a HIGHER number: that is what stops a stale attempt
+              ;; from arriving under a live authorisation's colours.
+              (node-disconnect! 'gpeer)
+              (sleep-ms 300)
+              (node-connect! 'gpeer "127.0.0.1" gen-port)
+              (receive (after 20000 (fail! "s1-dialgen-revocation" 'timeout))
+                (`#(,@ref ,v3)
+                  (when (pair? (car v3))
+                    (fail! "s1-dialgen-revocation" 'hello-shape v3))
+                  (unless (> (car v3) (car second))
+                    (fail! "s1-dialgen-revocation" 'reissue-did-not-advance
+                           (car second) (car v3)))))
+              (node-disconnect! 'gpeer)
+              (tcp-stop-listen! l))
             (receive (after 20000 (fail! "s1-dialgen-generator" 'timeout acc))
               (`#(,@ref ,v) (collect (+ n 1) (cons v acc)))))))
     (display "S1 wire-v4 cells passed\n"))
