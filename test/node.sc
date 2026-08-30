@@ -968,6 +968,45 @@
                 (`#(tcp-connect-failed ,e) (send me (vector ref 'no-connect))))))
           (receive (after 9000 (fail! label 'probe-timeout))
             (`#(,@ref ,what) what))))
+      (define (hold-open-as! label gen)
+        ;; welcomes, then PARKS holding the connection, so the entry
+        ;; stays installed. Returns (cons result session-pid).
+        (let ((me self) (ref (gensym)))
+          (let ((pid (spawn
+                       (lambda ()
+                         (tcp-connect! "127.0.0.1" port self)
+                         (receive (after 3000 (send me (vector ref 'no-connect)))
+                           (`#(tcp-connected ,c)
+                             (tcp-read-start! c)
+                             (let ((d (read-frame-or-closed label)))
+                               (if (not (and (list? d) (= (length d) 4)))
+                                   (send me (vector ref (list 'challenge-shape d)))
+                                   (let ((nonce-a (cadr d)) (bootid-a (cadddr d)))
+                                     (tcp-write! c (frame-bytes
+                                                     (list 'hello "repeat"
+                                                           (v4-proof-d nonce-a "repeat"
+                                                                       probe-boot-id
+                                                                       (number->string gen)
+                                                                       wire-name-of-this-node
+                                                                       bootid-a)
+                                                           "beadbeadbeadbeadbeadbeadbeadbead"
+                                                           4 probe-boot-id gen))
+                                                 #f)
+                                     (let ((w (read-frame-or-closed label)))
+                                       (send me (vector ref
+                                         (if (symbol? w) w
+                                             (if (and (list? w) (eq? (car w) 'welcome))
+                                                 'welcomed 'other))))
+                                       ;; hold: only EOF (the replacement
+                                       ;; closing us) ends this session
+                                       (receive (after 20000 (void))
+                                         (`#(tcp-eof) (void))
+                                         (`#(tcp-error ,_) (void)))
+                                       (tcp-close! c))))))
+                           (`#(tcp-connect-failed ,e)
+                             (send me (vector ref 'no-connect))))))))
+            (receive (after 9000 (fail! label 'probe-timeout))
+              (`#(,@ref ,what) (cons what pid))))))
       ;; the three names differ, so each handshake is a separate peer and
       ;; the generation is the only thing under test here
       (let ((first (inbound-as! "s2-rep-first" 7)))
@@ -976,10 +1015,24 @@
       ;; SAME NAME, so these two are a real (R1) replacement rather than
       ;; two unrelated peers. A higher generation takes over; a LOWER one
       ;; is the refusal whose second half only the loser can see.
-      (unless (eq? (same-name-as! "s2-rep-gen8" 8) 'welcomed)
-        (fail! "s2-replacement" 'higher-gen-not-welcomed))
-      (unless (eq? (same-name-as! "s2-rep-gen9" 9) 'welcomed)
-        (fail! "s2-replacement" 'replacement-not-welcomed))
+      ;; THE WINNER MUST STAY OPEN while the stale attempt is made.
+      ;; Closing it first tears the entry down, and then the stale
+      ;; generation lands on I5 -- "no entry, no current value, accept
+      ;; any generation", which is a DIFFERENT rule with the same
+      ;; observable. An earlier spelling of this cell closed each probe
+      ;; as soon as it read the reply and was red for that reason, both
+      ;; before and after the defect it was supposed to be watching: it
+      ;; named I8a and exercised I5.
+      (let ((held (hold-open-as! "s2-rep-gen8" 8)))
+        (unless (eq? (car held) 'welcomed)
+          (fail! "s2-replacement" 'higher-gen-not-welcomed (car held)))
+        ;; THE DISCRIMINATOR. Without this the cell cannot tell "I8a
+        ;; refused" from "I5 accepted": both answers look the same on the
+        ;; wire, and only the presence of a live entry says which rule
+        ;; the stale attempt is about to meet.
+        (unless (memq 'repeat (node-peers))
+          (fail! "s2-replacement" 'no-entry-so-the-next-probe-tests-I5
+                 (node-peers)))
       ;; THE REFUSAL, ASSERTED FROM THE LOSER'S CHAIR. Design I8a says
       ;; "refuse, close, notify nobody"; the second half is a claim about
       ;; what the peer observes, so it can only be checked here. A
@@ -987,9 +1040,13 @@
       ;; install, announce node-up, and then read the close as node-down
       ;; -- a pair of events out of nothing, on a link that was never
       ;; accepted.
-      (let ((loser (same-name-as! "s2-rep-stale" 6)))
-        (unless (eq? loser 'closed)
-          (fail! "s2-stale-gen-must-not-be-welcomed" loser)))
+        (let ((loser (same-name-as! "s2-rep-stale" 6)))
+          (unless (eq? loser 'closed)
+            (fail! "s2-stale-gen-must-not-be-welcomed" loser)))
+        ;; leave nothing parked: the held session would otherwise still
+        ;; own a connection when the later baseline cells count them
+        (kill (cdr held) 'done)
+        (sleep-ms 400))
       (display "S2 replacement cells passed\n"))
     (display "CV cells passed\n")
     (display "S2 registrar/container cells passed\n")
