@@ -399,6 +399,56 @@
             (fail! "per-name-retention-shape" (+ w0 5) w)))))
     (display "dead watcher swept at registration; bound is per name ok\n")
 
+    ;; ---- the two variants share a table, and each unsubscribe owns a
+    ;; ---- part of it ------------------------------------------------------
+    ;; The token variant was added to the SAME watchers table, so every
+    ;; operation on that table now meets two shapes. This cell is about
+    ;; the one operation whose scope is easy to get wrong in the direction
+    ;; that says nothing: the old demonitor-node.
+    ;;
+    ;; BOTH HALVES ARE ASSERTED, and that is the whole point. A
+    ;; demonitor-node that removes nothing passes a cell which only checks
+    ;; "the token subscription survived"; a demonitor-node that removes
+    ;; everything owned by this pid passes a cell which only checks "the
+    ;; legacy one is gone". Each half is green under the other's defect,
+    ;; so neither alone is a judge.
+    ;;
+    ;; The over-removing direction is the one with no voice: the holder
+    ;; still has its token, the call returned normally, and nothing is
+    ;; reported -- the subscription simply never delivers again. It is
+    ;; also the direction the design ruled out by name, which is why the
+    ;; scope belongs in a cell rather than in a sentence.
+    (let ((watcher-count
+            (lambda ()
+              (let ((e (assq 'watchers (node-monitor-stats))))
+                (unless e (fail! "node-monitor-stats-lacks-watchers"))
+                (cdr e)))))
+      (let ((w0 (watcher-count)))
+        (monitor-node 'mixed)
+        (let ((tok (monitor-node/token 'mixed)))
+          ;; the arming anchor: without it, a cell that failed to register
+          ;; anything would go on to observe the right numbers for the
+          ;; wrong reason -- zero minus zero is also zero.
+          (unless tok (fail! "s4-mixed-token-not-issued"))
+          (unless (= (watcher-count) (+ w0 2))
+            (fail! "s4-mixed-both-not-stored" (+ w0 2) (watcher-count)))
+          ;; the legacy unsubscribe: exactly one entry leaves, and it is
+          ;; the legacy one.
+          (demonitor-node 'mixed)
+          (let ((w (watcher-count)))
+            (when (= w w0)
+              (fail! "s4-legacy-demonitor-took-the-token-subscription"
+                     'expected (+ w0 1) 'got w))
+            (unless (= w (+ w0 1))
+              (fail! "s4-legacy-demonitor-removed-nothing"
+                     'expected (+ w0 1) 'got w)))
+          ;; and the token unsubscribe removes what is left
+          (demonitor-node/token tok)
+          (unless (= (watcher-count) w0)
+            (fail! "s4-token-demonitor-did-not-remove"
+                   'expected w0 'got (watcher-count))))))
+    (display "legacy and token unsubscribes each own their half ok\n")
+
     ;; ---- protocol version in the handshake ------------------------------
     ;; The wire carries a protocol version in challenge and hello. It is
     ;; checked before the proof, so a refusal can name the real cause,
