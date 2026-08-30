@@ -456,6 +456,61 @@
   ;; healthy traffic; tune with node-set-limits!.
   (define max-rcall-serving 256)
   (define max-hosted-monitors 4096)
+
+  ;; ---- what the hosting ceiling counts -------------------------------
+  ;;
+  ;; NOT THE SIZE OF THE TABLE. The table holds the monitors this node is
+  ;; currently hosting; the ceiling has to cover everything that is still
+  ;; holding a physical process, and those two stop agreeing the moment an
+  ;; eviction removes an entry while its agent is still being torn down.
+  ;; Counting entries then reads zero for agents that are alive, and the
+  ;; ceiling lets another full set in beside them.
+  ;;
+  ;; The quantity is ACCOUNTED = ACTIVE + RETIRING:
+  ;;   active   -- has an entry in the table;
+  ;;   retiring -- entry already removed, agent's DOWN not yet seen.
+  ;; and the rule is `accounted <= cap`. The bound is stated apart from
+  ;; the definition on purpose: folding it in makes the quantity and its
+  ;; limit read as two definitions of one thing.
+  ;;
+  ;; ⚠ STAGED: `retiring` has no writer yet -- it arrives with the
+  ;; eviction path, which is what creates the state it names. A counter
+  ;; that is always zero would look like the definition was already
+  ;; honoured, so it is not declared here; `accounted` is written as a
+  ;; procedure so the second term can be added where it becomes real,
+  ;; and every caller already reads the name rather than a table size.
+  (define active-monitors 0)
+
+  ;; The table used to hold a bare pid. It holds a record now because
+  ;; idempotence is a question about the whole request, not about the key:
+  ;; the name being watched and the connection the request arrived on are
+  ;; both part of what the agent was built from, so both have to be
+  ;; comparable when the same reference is offered again.
+  (define (make-agent-rec pid name conn) (vector pid name conn))
+  (define (agent-pid r)  (vector-ref r 0))
+  (define (agent-name r) (vector-ref r 1))
+  (define (agent-conn r) (vector-ref r 2))
+  (define (agent-matches? r conn name)
+    (and (eq? (agent-conn r) conn) (eq? (agent-name r) name)))
+
+  ;; THE ONE PLACE THE COUNT COMES BACK DOWN, and it is one place on
+  ;; purpose: a quantity with several decrement sites is a quantity whose
+  ;; conservation nobody can check by reading.
+  ;;
+  ;; ⚠ STAGED: today the agent calls this on its own way out. The design
+  ;; puts the return on the DOWN the reaper observes instead, because an
+  ;; agent that is killed does not run its exit branch and an agent that
+  ;; hangs never reaches it -- in both cases the credit would never come
+  ;; back. When the reaper lands, what changes is WHO CALLS THIS, not how
+  ;; many places decrement; that is why the three inline deletions were
+  ;; collapsed here first.
+  (define (retire-agent! key)
+    (atomically
+      (when (hashtable-ref callee-agents key #f)
+        (hashtable-delete! callee-agents key)
+        (set! active-monitors (fx- active-monitors 1)))))
+
+  (define (accounted-monitors) active-monitors)
   (define max-preauth-conns 256)
 
   ;; The callee's own ceiling on how long it will serve one remote call.
@@ -2172,12 +2227,37 @@
       ((and (frame? d 'mon 3) (symbol? (cadr d)))
        (let* ((name (cadr d)) (mref (caddr d))
               (key (cons peer mref)))
+         ;; A REPEAT OF THIS EXACT REQUEST IS FREE; A DIFFERENT REQUEST
+         ;; UNDER THE SAME KEY IS A PROTOCOL ERROR.
+         ;;
+         ;; What used to be here was an unconditional set!, and the hole
+         ;; had no floor: the same (peer . mref) sent again spawned
+         ;; another agent and overwrote the pid of the last one. The table
+         ;; stayed at one entry, so the ceiling always passed -- while
+         ;; every overwritten agent stayed alive and became invisible,
+         ;; the only handle on it being the pid just replaced. One key was
+         ;; enough to make unbounded processes.
+         ;;
+         ;; Idempotence is judged on the whole triple -- this connection,
+         ;; the reference, and the name being watched -- because those are
+         ;; what the agent was built from. Matching the key alone would
+         ;; let a peer re-point an existing reference at a different name
+         ;; and be told "already done" for something it never asked for.
+         ;; A mismatch is not a replacement request: one reference cannot
+         ;; mean two things, so the link goes.
          (unless (atomically
-                   (and (fx< (hashtable-size callee-agents) max-hosted-monitors)
-                        (begin
-                          (hashtable-set! callee-agents key
-                            (spawn (lambda () (mon-agent peer key name))))
-                          #t)))
+                   (let ((cur (hashtable-ref callee-agents key #f)))
+                     (cond
+                       ((and cur (agent-matches? cur c name)) #t)
+                       (cur (raise 'protocol))
+                       ((fx< (accounted-monitors) max-hosted-monitors)
+                        (hashtable-set! callee-agents key
+                          (make-agent-rec
+                            (spawn (lambda () (mon-agent peer key name)))
+                            name c))
+                        (set! active-monitors (fx+ active-monitors 1))
+                        #t)
+                       (else #f))))
            ;; At the hosting ceiling: refuse, and tell the watcher at
            ;; once. THIS REFUSAL IS A CONTROL FRAME NOBODY TIMES OUT --
            ;; monitor-remote has no clock of its own, so a watcher that
@@ -2205,9 +2285,9 @@
              (fire-remote-down! mref reason)))))
       ;; (demon ,mref) -> stop a monitor we host for this peer
       ((frame? d 'demon 2)
-       (let ((agent (atomically
-                      (hashtable-ref callee-agents (cons peer (cadr d)) #f))))
-         (when agent (send agent (vector 'demon-local)))))
+       (let ((rec (atomically
+                    (hashtable-ref callee-agents (cons peer (cadr d)) #f))))
+         (when rec (send (agent-pid rec) (vector 'demon-local)))))
       ((equal? d '(ping)) (write-frame! c '(pong)))
       ((equal? d '(pong)) (void))
       (else (raise 'protocol))))                ; confused peer: drop it
@@ -2452,7 +2532,7 @@
           (p (whereis name)))
       (if (not p)
           (begin
-            (atomically (hashtable-delete! callee-agents key))
+            (retire-agent! key)
             ;; Building the frame can fail too -- the allocation, not the
             ;; writer, since this datum always serializes -- and by here
             ;; the agent has dropped its state and is leaving. Same
@@ -2465,7 +2545,7 @@
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
-                (atomically (hashtable-delete! callee-agents key))
+                (retire-agent! key)
                 ;; THE GUARD COVERS BUILDING THE FRAME AND NOTHING ELSE,
                 ;; which is what it was always meant to cover. A reason
                 ;; that will not serialize is degraded to 'exit; the
@@ -2497,7 +2577,7 @@
                     (link-write/critical watcher segs 'mdown-lost))))
               (`#(demon-local)
                 (demonitor m)
-                (atomically (hashtable-delete! callee-agents key))))))))
+                (retire-agent! key)))))))
 
   (define (stop-owner-agent! mref)
     (let ((agent (atomically
