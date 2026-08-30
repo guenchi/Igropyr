@@ -617,7 +617,22 @@
   ;; it produces its DOWN at once and the credit comes back. Without that,
   ;; every death inside a reaper outage would leak a permit forever. That
   ;; is a property of the runtime rather than of this file.
-  (define reaper #f)
+  ;; THE REAPER IS FOUND BY NAME, NEVER BY A CACHED PID. A pid held
+  ;; anywhere outside the warden goes stale the moment the reaper is
+  ;; replaced, and the holder then talks to a corpse without any
+  ;; indication that it is doing so. Looking the name up each time costs a
+  ;; hashtable read on a path that runs once per armed monitor, and it
+  ;; makes "there is no reaper right now" a value the caller can see
+  ;; rather than a silence it cannot.
+  ;;
+  ;; The name is also the only handle anything outside has: a test that
+  ;; wants to prove the warden can rebuild has to be able to kill the
+  ;; reaper, and killing it is the only way to test that claim rather than
+  ;; argue it. That makes this name part of what this file promises, not
+  ;; an accident of the implementation.
+  (define reaper-name 'igropyr-node-reaper)
+  (define (reaper-pid) (whereis reaper-name))
+
   (define reaper-warden #f)
   (define reaper-watched (make-eq-hashtable))   ; reaper-private: pid -> key
   (define reaper-chunk 64)
@@ -654,6 +669,7 @@
           (outer)))))
 
   (define (reaper-loop)
+    (register reaper-name self)
     (reaper-rescan!)
     (let loop ()
       (receive
@@ -684,7 +700,6 @@
   (define (warden-loop)
     (let loop ()
       (let ((r (spawn reaper-loop)))
-        (set! reaper r)
         (monitor r)
         (receive
           (`#(DOWN ,@r ,_) (loop))
@@ -2488,8 +2503,10 @@
                           ;; asynchronous on purpose: arming must not wait
                           ;; on another process, and a watch that arrives
                           ;; late is covered by the rescan
-                          (when reaper
-                            (send reaper (vector 'watch (agent-pid r) key))))
+                          (let ((rp (reaper-pid))
+                                (arec r))
+                            (when rp
+                              (send rp (vector 'watch (agent-pid arec) key)))))
                         #t)
                        (else #f))))
            ;; At the hosting ceiling: refuse, and tell the watcher at
