@@ -486,12 +486,106 @@
   ;; the name being watched and the connection the request arrived on are
   ;; both part of what the agent was built from, so both have to be
   ;; comparable when the same reference is offered again.
-  (define (make-agent-rec pid name conn) (vector pid name conn))
+  ;; THE RECORD IS THE CHAIN NODE. Two chains run through the same
+  ;; objects, and they answer two different questions:
+  ;;
+  ;;   the per-peer chain -- "everything this peer parked here", so that
+  ;;   evicting a peer is one pointer operation rather than a scan;
+  ;;   the global chain -- "everything hosted", so that a reaper coming
+  ;;   back can walk it in bounded chunks and re-establish its watches.
+  ;;
+  ;; They are two JOBS, not two copies. A path that unlinks from one and
+  ;; not the other leaks, and leaks without a symptom -- so unlinking
+  ;; happens in exactly one procedure rather than at each call site.
+  ;;
+  ;; Node identity is never reused: a record is built once, for one
+  ;; monitor, and is not recycled after it retires. That is what removes
+  ;; the ABA question a token would otherwise have to answer.
+  (define (make-agent-rec pid name conn key peer)
+    (vector pid name conn key peer #f #f #f #f))
   (define (agent-pid r)  (vector-ref r 0))
   (define (agent-name r) (vector-ref r 1))
   (define (agent-conn r) (vector-ref r 2))
+  (define (agent-key r)  (vector-ref r 3))
+  (define (agent-peer r) (vector-ref r 4))
+  (define (agent-pnext r) (vector-ref r 5))   ; per-peer chain
+  (define (agent-pprev r) (vector-ref r 6))
+  (define (agent-gnext r) (vector-ref r 7))   ; global chain
+  (define (agent-gprev r) (vector-ref r 8))
+  (define (agent-pnext-set! r v) (vector-set! r 5 v))
+  (define (agent-pprev-set! r v) (vector-set! r 6 v))
+  (define (agent-gnext-set! r v) (vector-set! r 7 v))
+  (define (agent-gprev-set! r v) (vector-set! r 8 v))
   (define (agent-matches? r conn name)
     (and (eq? (agent-conn r) conn) (eq? (agent-name r) name)))
+
+  ;; The per-peer heads. Present only while that peer has something
+  ;; parked -- the same rule the orphan chain follows, and for the same
+  ;; reason: a table that keeps a row per name ever seen is the structure
+  ;; this design already refused, and it needs somebody to clean it.
+  ;;
+  ;; NOT ON THE PEERS ENTRY, deliberately. Living there would be cheaper,
+  ;; but an entry is replaced whole, and replacing it is an implicit
+  ;; destruction of whatever hangs on it. A hosted monitor retires by its
+  ;; key, through retire-agent!, and does not travel with the entry -- so
+  ;; its chain must not either.
+  (define mon-heads (make-eq-hashtable))
+  (define mon-chain #f)                        ; global chain head
+
+  ;; Region-safe: pointer writes only, no allocation, no table growth
+  ;; except the per-peer head row -- which is why arming takes the ceiling
+  ;; decision first and this second.
+  (define (mon-link! r)
+    (let ((ph (hashtable-ref mon-heads (agent-peer r) #f)))
+      (agent-pnext-set! r ph)
+      (when ph (agent-pprev-set! ph r))
+      (hashtable-set! mon-heads (agent-peer r) r))
+    (agent-gnext-set! r mon-chain)
+    (when mon-chain (agent-gprev-set! mon-chain r))
+    (set! mon-chain r))
+
+  ;; THE ONLY PLACE A NODE LEAVES A CHAIN. Both chains, always, in one
+  ;; call: "unlink from both" is then a property of the structure rather
+  ;; than something every caller has to remember.
+  ;;
+  ;; The two halves are separable on purpose -- eviction takes a whole
+  ;; per-peer chain out in one operation and then walks it -- so each half
+  ;; is idempotent and safe to call on a node already out of that chain.
+  ;;
+  ;; ⭐ SECOND TIME IN THIS FILE that a property is bought by collapsing
+  ;; call sites rather than by asking each of them to behave: retire-agent!
+  ;; did it for "the count comes down in one place". Said once so the
+  ;; pattern reads as a decision rather than a coincidence -- when a rule
+  ;; has to hold at every call site, the cheapest way to make it hold is
+  ;; to leave one call site.
+  (define (mon-unlink-peer! r)
+    (let ((n (agent-pnext r)) (p (agent-pprev r)))
+      (if p (agent-pnext-set! p n)
+            (when (eq? (hashtable-ref mon-heads (agent-peer r) #f) r)
+              (if n
+                  (hashtable-set! mon-heads (agent-peer r) n)
+                  (hashtable-delete! mon-heads (agent-peer r)))))
+      (when n (agent-pprev-set! n p))
+      (agent-pnext-set! r #f)
+      (agent-pprev-set! r #f)))
+
+  (define (mon-unlink-global! r)
+    (let ((n (agent-gnext r)) (p (agent-gprev r)))
+      (if p (agent-gnext-set! p n) (when (eq? mon-chain r) (set! mon-chain n)))
+      (when n (agent-gprev-set! n p))
+      (agent-gnext-set! r #f)
+      (agent-gprev-set! r #f)))
+
+  (define (mon-unlink! r)
+    (mon-unlink-peer! r)
+    (mon-unlink-global! r))
+
+  ;; For assertions from outside: how many nodes each chain holds.
+  (define (mon-chain-length)
+    (let loop ((r mon-chain) (n 0)) (if r (loop (agent-gnext r) (fx+ n 1)) n)))
+  (define (mon-peer-chain-length peer)
+    (let loop ((r (hashtable-ref mon-heads peer #f)) (n 0))
+      (if r (loop (agent-pnext r) (fx+ n 1)) n)))
 
   ;; THE ONE PLACE THE COUNT COMES BACK DOWN, and it is one place on
   ;; purpose: a quantity with several decrement sites is a quantity whose
@@ -506,9 +600,11 @@
   ;; collapsed here first.
   (define (retire-agent! key)
     (atomically
-      (when (hashtable-ref callee-agents key #f)
-        (hashtable-delete! callee-agents key)
-        (set! active-monitors (fx- active-monitors 1)))))
+      (let ((r (hashtable-ref callee-agents key #f)))
+        (when r
+          (hashtable-delete! callee-agents key)
+          (mon-unlink! r)
+          (set! active-monitors (fx- active-monitors 1))))))
 
   (define (accounted-monitors) active-monitors)
   (define max-preauth-conns 256)
@@ -860,6 +956,23 @@
             (cons 'caller-agents (hashtable-size caller-agents))
             (cons 'owner-agents (hashtable-size owner-agents))
             (cons 'callee-agents (hashtable-size callee-agents))
+            ;; THE TWO CHAINS, SEPARATELY, because the failure this
+            ;; makes visible is asymmetric. A node on the global chain but
+            ;; not its peer's is the DESIGNED middle of an eviction: the
+            ;; reaper still sees it, so its DOWN will arrive. A node on a
+            ;; peer chain but not the global one is the opposite -- the
+            ;; reaper can never see it, its credit never comes back, and
+            ;; nothing else reports it. One number covering both would
+            ;; hide exactly the direction that matters.
+            (cons 'mon-chain (mon-chain-length))
+            (cons 'mon-peer-chains
+                  (let-values (((ks vs) (hashtable-entries mon-heads)))
+                    (let loop ((i 0) (n 0))
+                      (if (fx= i (vector-length ks)) n
+                          (loop (fx+ i 1)
+                                (fx+ n (mon-peer-chain-length
+                                         (vector-ref ks i))))))))
+            (cons 'accounted (accounted-monitors))
             ;; watcher PIDS, not names: the leak this exists to make
             ;; visible is pids piling up under one name, which a count of
             ;; names cannot show.
@@ -2067,7 +2180,8 @@
   (define (drop-hosted-monitors! name)
     (let-values (((keys agents) (atomically (hashtable-entries callee-agents))))
       (vector-for-each
-        (lambda (k agent) (when (eq? (car k) name) (send agent (vector 'demon-local))))
+        (lambda (k r)
+          (when (eq? (car k) name) (send (agent-pid r) (vector 'demon-local))))
         keys agents)))
 
   ;; A REAL DEATH, and the queue has to outlive the entry it hangs on.
@@ -2251,11 +2365,12 @@
                        ((and cur (agent-matches? cur c name)) #t)
                        (cur (raise 'protocol))
                        ((fx< (accounted-monitors) max-hosted-monitors)
-                        (hashtable-set! callee-agents key
-                          (make-agent-rec
-                            (spawn (lambda () (mon-agent peer key name)))
-                            name c))
-                        (set! active-monitors (fx+ active-monitors 1))
+                        (let ((r (make-agent-rec
+                                   (spawn (lambda () (mon-agent peer key name)))
+                                   name c key peer)))
+                          (hashtable-set! callee-agents key r)
+                          (mon-link! r)
+                          (set! active-monitors (fx+ active-monitors 1)))
                         #t)
                        (else #f))))
            ;; At the hosting ceiling: refuse, and tell the watcher at
