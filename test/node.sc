@@ -1043,6 +1043,17 @@
         (let ((loser (same-name-as! "s2-rep-stale" 6)))
           (unless (eq? loser 'closed)
             (fail! "s2-stale-gen-must-not-be-welcomed" loser)))
+        ;; NOT COVERED HERE, and the boundary is worth writing down: the
+        ;; delete-then-insert spelling of the swap is unobservable only
+        ;; in fault-free executions -- the whole sequence runs in one
+        ;; non-preemptible region on a single scheduler thread, so no
+        ;; reader can be running between the two writes. That says
+        ;; nothing about the failure path: `atomically` does not roll
+        ;; back, so a re-insert that raises leaves the entry absent
+        ;; permanently, not for an instant, and CV-1 says entries never
+        ;; go absent. What makes in-place replacement correct is that
+        ;; property, not the width of the window.
+        ;;
         ;; THE OLD CONNECTION MUST ACTUALLY BE CLOSED by the replacement,
         ;; and only the peer sitting on it can say so. (R1) closes it by
         ;; calling tcp-close! inside the region rather than by writing a
