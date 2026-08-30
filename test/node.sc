@@ -449,6 +449,53 @@
                    'expected w0 'got (watcher-count))))))
     (display "legacy and token unsubscribes each own their half ok\n")
 
+    ;; ---- and the same table's other operation: deduplication ------------
+    ;; Registration asks "has this process already subscribed". Once the
+    ;; table holds two shapes that question has two answers, and asking
+    ;; only about the pid picks whichever call happened to come first.
+    ;;
+    ;; THE JUDGE IS THAT BOTH ORDERS AGREE. One order alone cannot tell
+    ;; "both kept" from "one dropped": either rule yields a defensible
+    ;; number in one order. It is the DISAGREEMENT between the orders that
+    ;; says the question was asked about the wrong thing -- two orders
+    ;; giving different totals is not a choice between two semantics, it
+    ;; is neither of them.
+    ;;
+    ;; The failing order is the quiet one: the second call returns the
+    ;; same nothing it always returns, so a caller that took a token and
+    ;; then asked for the older subscription holds one subscription while
+    ;; believing it holds two.
+    (let ((watcher-count
+            (lambda ()
+              (let ((e (assq 'watchers (node-monitor-stats))))
+                (unless e (fail! "node-monitor-stats-lacks-watchers"))
+                (cdr e)))))
+      ;; legacy first, then token
+      (let ((w0 (watcher-count)))
+        (monitor-node 'dedup-a)
+        (let ((tok (monitor-node/token 'dedup-a)))
+          (unless tok (fail! "s4-dedup-a-token-not-issued"))
+          (let ((w (watcher-count)))
+            (unless (= w (+ w0 2))
+              (fail! "s4-dedup-legacy-then-token" 'expected (+ w0 2) 'got w)))
+          (demonitor-node 'dedup-a)
+          (demonitor-node/token tok))
+        (let ((w (watcher-count)))
+          (unless (= w w0) (fail! "s4-dedup-a-residue" 'expected w0 'got w))))
+      ;; token first, then legacy -- the order a pid-only test loses
+      (let ((w0 (watcher-count)))
+        (let ((tok (monitor-node/token 'dedup-b)))
+          (unless tok (fail! "s4-dedup-b-token-not-issued"))
+          (monitor-node 'dedup-b)
+          (let ((w (watcher-count)))
+            (unless (= w (+ w0 2))
+              (fail! "s4-dedup-token-then-legacy" 'expected (+ w0 2) 'got w)))
+          (demonitor-node 'dedup-b)
+          (demonitor-node/token tok))
+        (let ((w (watcher-count)))
+          (unless (= w w0) (fail! "s4-dedup-b-residue" 'expected w0 'got w)))))
+    (display "registration deduplicates within a variant, both orders ok\n")
+
     ;; ---- protocol version in the handshake ------------------------------
     ;; The wire carries a protocol version in challenge and hello. It is
     ;; checked before the proof, so a refusal can name the real cause,
