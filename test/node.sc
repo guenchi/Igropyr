@@ -1005,6 +1005,12 @@
     ;; it comes back. The precondition itself is guarded by construction
     ;; (arming reads liveness inside the same region that installs), not
     ;; by this cell.
+    ;;
+    ;; ⚠️ And the green itself is contingent: the window stays shut only
+    ;; because the reaper currently drains its DOWN faster than a peer
+    ;; can send the next frame. That is a property of today's timing,
+    ;; not a guarantee -- if the sweep grows or the mailbox backs up, the
+    ;; window opens and nothing here is watching it.
     ;; Moving credit return to the reaper moved something else with it:
     ;; the entry now outlives the agent, from the moment the agent dies
     ;; until the reaper has processed its DOWN. Inside that window a
@@ -1063,6 +1069,60 @@
                  (fail! "s3-revive-credit-must-return" (node-monitor-stats)))
                 (else (sleep-ms 250) (loop (- tries 1))))))
       (display "S3 revive cell passed\n"))
+    ;; ---- S3: the warden actually restores the function ----------------
+    ;; ⛔ THIS IS THE ONLY DEVICE COVERING THE POST-RESTART PATH. No probe
+    ;; that does not kill the reaper can reach it -- deleting this cell
+    ;; returns that path to zero coverage. It has already earned that
+    ;; description once: it found a reaper that restarted, registered,
+    ;; swept, and reported normally while establishing no monitors at
+    ;; all, because the pid index it inherited made every record look
+    ;; already-watched. Every observable was healthy; one number stopped
+    ;; moving.
+    ;; The reaper is the only thing that returns hosted-monitor credit,
+    ;; so if it dies and nothing brings it back, the ceiling ratchets
+    ;; shut in silence. Asserting that a NEW pid appeared would not say
+    ;; that much: a reaper that restarts but never sweeps leaves every
+    ;; record from before the restart unwatched, and a crash loop
+    ;; produces new pids forever. So the assertion is the function --
+    ;; kill it, then kill a watched target and require the credit back.
+    (let ((me self) (ref (gensym)))
+      (spawn
+        (lambda ()
+          (let ((c (handshake-as! "wardenpeer" "s3-warden")))
+            (register 'warden-victim
+              (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
+            (tcp-write! c (frame-bytes (list 'mon 'warden-victim 7001)) #f)
+            (sleep-ms 500)
+            ;; take the reaper out from under the armed monitor
+            (let ((r (whereis 'igropyr-node-reaper)))
+              (unless r (fail! "s3-warden" 'no-reaper-registered))
+              (kill r 'probe-kill))
+            (sleep-ms 800)
+            ;; the discriminator that separates "never came back" from
+            ;; "came back but never swept": without it a dead warden
+            ;; leaves this cell waiting instead of failing
+            (unless (whereis 'igropyr-node-reaper)
+              (fail! "s3-warden-must-restart-the-reaper" 'still-absent))
+            (let ((v (whereis 'warden-victim)))
+              (when v (kill v 'after-restart)))
+            (sleep-ms 200)
+            (send me (vector ref 'done))
+            (receive (after 3000 (void)) (`#(tcp-eof) (void)))
+            (tcp-close! c))))
+      (receive (after 15000 (fail! "s3-warden" 'timeout))
+        (`#(,@ref ,_) (void)))
+      ;; the credit for a monitor armed BEFORE the restart must come back
+      ;; after it: that can only happen if the new reaper swept the chain
+      ;; and re-established the watch it inherited
+      (let loop ((tries 40))
+        (let ((acc (assq 'accounted (node-monitor-stats))))
+          (cond ((and acc (zero? (cdr acc))) (void))
+                ((zero? tries)
+                 (fail! "s3-warden-restart-must-restore-the-function"
+                        (node-monitor-stats)))
+                (else (sleep-ms 250) (loop (- tries 1))))))
+      (display "S3 warden cell passed\n"))
+
 
 
     ;; ---- S2: replacement, seen from the side that LOSES ---------------
