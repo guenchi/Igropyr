@@ -473,12 +473,20 @@
   ;; the definition on purpose: folding it in makes the quantity and its
   ;; limit read as two definitions of one thing.
   ;;
-  ;; ⚠ STAGED: `retiring` has no writer yet -- it arrives with the
-  ;; eviction path, which is what creates the state it names. A counter
-  ;; that is always zero would look like the definition was already
-  ;; honoured, so it is not declared here; `accounted` is written as a
-  ;; procedure so the second term can be added where it becomes real,
-  ;; and every caller already reads the name rather than a table size.
+  ;; RETIRING IS DERIVED, NOT COUNTED, and the reason the second term
+  ;; never acquired a writer is worth keeping rather than quietly
+  ;; dropping: it is not a missing addend. A permit is taken when a
+  ;; monitor is armed and returned when its agent's DOWN arrives, and it
+  ;; spans both phases -- active while the node is on its peer's chain,
+  ;; retiring after an eviction has spliced that chain away. Eviction
+  ;; moves nodes between the phases without changing the total, which is
+  ;; why the splice can never fail: it asks for nothing.
+  ;;
+  ;; So this counter is `accounted` outright, and the split into active
+  ;; and retiring is read off the two chains when somebody asks (see
+  ;; mon-phase-counts). Keeping two counters would mean decrementing one
+  ;; and incrementing the other for every node of a spliced chain, inside
+  ;; the region -- the linear cost the chain arrangement exists to avoid.
   (define active-monitors 0)
 
   ;; The table used to hold a bare pid. It holds a record now because
@@ -588,11 +596,21 @@
   ;; is exactly the shape a peer could aim at by parking as many as the
   ;; ceiling allows.
   ;;
-  ;; The nodes stay on the GLOBAL chain, deliberately. That is what makes
-  ;; them still visible to the reaper, so their DOWNs arrive and their
-  ;; permits come back; a node off both chains would be one the reaper can
-  ;; never see. Being on the global chain and not on a peer's is the state
-  ;; this design calls retiring.
+  ;; The nodes stay on the GLOBAL chain, deliberately -- and it is worth
+  ;; being precise about WHEN that matters, because the ordinary path does
+  ;; not depend on it. An evicted agent gets its notice, exits, and the
+  ;; reaper returns its permit from the DOWN; none of that reads the chain,
+  ;; so removing them from it here would leave every ordinary run green.
+  ;;
+  ;; It matters when a reaper is replaced while these nodes are still
+  ;; retiring. The new one rebuilds its watches by walking the global
+  ;; chain, and a node that is on neither chain is one it can never find:
+  ;; its DOWN would go to a process that no longer exists, and its permit
+  ;; would never come back. So the property is real and its only witness
+  ;; is the restart path.
+  ;;
+  ;; Being on the global chain and not on a peer's is the state this design
+  ;; calls retiring.
   ;;
   ;; -> the first node, or #f. Caller walks it via agent-pnext.
   (define (mon-splice-peer! peer)
@@ -632,13 +650,16 @@
   ;; purpose: a quantity with several decrement sites is a quantity whose
   ;; conservation nobody can check by reading.
   ;;
-  ;; ⚠ STAGED: today the agent calls this on its own way out. The design
-  ;; puts the return on the DOWN the reaper observes instead, because an
-  ;; agent that is killed does not run its exit branch and an agent that
-  ;; hangs never reaches it -- in both cases the credit would never come
-  ;; back. When the reaper lands, what changes is WHO CALLS THIS, not how
-  ;; many places decrement; that is why the three inline deletions were
-  ;; collapsed here first.
+  ;; THE CALLER IS THE REAPER, on the DOWN it observes -- not the agent on
+  ;; its own way out. An agent that is killed does not run its exit branch
+  ;; and one that hangs never reaches it; in both cases the permit would
+  ;; never come back.
+  ;;
+  ;; It reached that shape in two steps, and the order was deliberate: the
+  ;; three inline deletions were collapsed here BEFORE the reaper existed,
+  ;; so that "the count comes down in one place" was true from that moment
+  ;; rather than becoming true later. What the reaper changed was who
+  ;; calls this, not how many places decrement.
   ;; ---- the reaper, and the one process that keeps it alive ----------
   ;;
   ;; THE CREDIT COMES BACK ON A DOWN, NOT ON AN EXIT BRANCH. An agent that
