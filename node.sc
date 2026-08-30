@@ -166,7 +166,8 @@
           rsend rcall monitor-node demonitor-node node-peers
           monitor-remote demonitor-remote node-set-limits!
           node-monitor-stats node-outbound-stats reconnect-delay
-          submission-failure? node-install-rule-order node-orphan-count)
+          submission-failure? node-install-rule-order node-orphan-count
+          monitor-node/token demonitor-node/token)
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv) (igropyr sexpr)
           (igropyr gen-server)
@@ -1119,6 +1120,8 @@
   ;; confirmation means the next deliverer sends the same event again.
   ;; That is the trade this design took deliberately -- a repeat can be
   ;; absorbed by the consumer, a loss cannot be reconstructed by anyone.
+  (define (stamp-qnode! n) (stamp-event! (qnode-event n)) n)
+
   (define (qhead-peek h) (qhead-first h))
 
   (define (qhead-done! h n)
@@ -1286,6 +1289,45 @@
               (cons (make-legacy-watcher self) l)))))
     (void))
 
+  ;; THE TOKEN VARIANT, added beside the old call rather than replacing
+  ;; it. A caller that never asks for a token sees nothing change: same
+  ;; procedure, same return value, same message. A caller that does gets
+  ;; back an object it must keep, and every message for that subscription
+  ;; carries it.
+  ;;
+  ;; SUBSCRIBING AGAIN STARTS A NEW GENERATION -- it does not hand back the
+  ;; token you already had. The point of the token is to tell this
+  ;; subscription's messages from a previous one's, and returning the old
+  ;; object would make those two indistinguishable, which is the single
+  ;; thing it exists to prevent.
+  (define (monitor-node/token name)
+    (let ((tok (new-sub-token)))
+      (atomically
+        (let ((l (filter (lambda (w) (process-alive? (w-pid w)))
+                         (hashtable-ref watchers name (list)))))
+          (hashtable-set! watchers name
+            (cons (make-token-watcher self tok)
+                  ;; a previous generation of THIS process's token
+                  ;; subscription is replaced, not accumulated
+                  (filter (lambda (w)
+                            (not (and (eq? (w-pid w) self) (w-token w))))
+                          l)))))
+      tok))
+
+  ;; Removes exactly the subscription that token names, and nothing else:
+  ;; a process may hold several, and may also hold a legacy one alongside.
+  (define (demonitor-node/token tok)
+    (atomically
+      (let-values (((names lists) (hashtable-entries watchers)))
+        (let loop ((i 0))
+          (when (fx< i (vector-length names))
+            (let ((l (vector-ref lists i)))
+              (when (find (lambda (w) (eq? (w-token w) tok)) l)
+                (hashtable-set! watchers (vector-ref names i)
+                  (filter (lambda (w) (not (eq? (w-token w) tok))) l))))
+            (loop (fx+ i 1))))))
+    (void))
+
   (define (demonitor-node name)
     (atomically
       (hashtable-set! watchers name
@@ -1313,18 +1355,26 @@
   ;; decrement, one unlink, one number, one removal, one message shape.
   ;; Same family each time -- remove the second supplier instead of
   ;; strengthening the assertion.
-  (define (notify-one! w name what)
+  (define (notify-one! w name what seq)
     (let ((p (w-pid w)))
       (if (process-alive? p)
-          (send p (vector what name))
+          (send p (if (w-token w)
+                      ;; The wider message exists so a holder can tell a
+                      ;; message meant for THIS subscription from one left
+                      ;; over by a previous one, and an old delivery from a
+                      ;; current one. Both questions are asked by the
+                      ;; receiver, so both answers travel with the message.
+                      (vector what name (w-token w) seq)
+                      ;; Unchanged, and it has to stay unchanged: an older
+                      ;; subscriber is entitled to exactly what it has
+                      ;; always received. This is the half worth guarding
+                      ;; -- a new shape that is wrong gets noticed, an old
+                      ;; shape that quietly grew a field does not.
+                      (vector what name)))
           (drop-watcher! name w))))
 
-  (define (notify-list! l name what)
-    (for-each (lambda (w) (notify-one! w name what)) l))
-
-  (define (notify! name what)               ; what: node-up | node-down
-    (notify-list! (atomically (hashtable-ref watchers name (list)))
-                  name what))
+  (define (notify-list! l name what seq)
+    (for-each (lambda (w) (notify-one! w name what seq)) l))
 
   ;; ---- watcher entries ------------------------------------------------
   ;;
@@ -1335,13 +1385,49 @@
   ;; as "the same record with #f in the token slot" would leave every
   ;; reader to carry the distinction itself, which is where two kinds of
   ;; thing quietly become one.
-  ;; ⚠ This commit has ONE kind. The tag is here because the second kind
-  ;; arrives next and the readers below should not have to change again
-  ;; when it does -- but nothing selects on it yet, and no token exists in
-  ;; this tree. Said rather than left to be inferred from a lone variant.
-  (define (make-legacy-watcher p) (vector 'watcher 'legacy p))
+  ;; A SUBSCRIPTION TOKEN IS AN OBJECT WITH NO NAME, and that is the whole
+  ;; requirement. It has to be unrepeatable across the entire span in which
+  ;; a late message might still exist -- not merely across the life of the
+  ;; subscription, which is the narrower claim that was rejected. A symbol
+  ;; would carry a name, and anything with a name can be written down and
+  ;; read back; a fresh pair cannot be reconstructed by any reader, so the
+  ;; only way to hold one is to have been given it. Comparison is by
+  ;; identity, never by contents.
+  (define (new-sub-token) (list 'node-subscription))
+
+  ;; ONE COUNTER FOR THE WHOLE NODE, and it is handed out INSIDE the region
+  ;; that publishes the event it numbers. A replacement publishes two
+  ;; events, and their numbers have to bracket that transition with nothing
+  ;; of the same peer's slipping between them -- which they do here for a
+  ;; structural reason rather than a remembered one: both nodes were built
+  ;; outside and are enqueued in the same region, so their numbers are
+  ;; taken in the same uninterruptible turn.
+  ;;
+  ;; A redelivery reuses the node it was queued in, and the number lives in
+  ;; that node, so a replay cannot mint a fresh one. Consumers compare per
+  ;; peer, which a globally monotonic sequence satisfies with room to
+  ;; spare; the sequence is not a count of anything and no reader may treat
+  ;; it as one.
+  (define event-seq-counter 0)
+
+  (define (next-event-seq!)                   ; caller holds the region
+    (set! event-seq-counter (+ event-seq-counter 1))
+    event-seq-counter)
+
+  (define (event-kind e) (vector-ref e 0))
+  (define (event-name e) (vector-ref e 1))
+  (define (event-seq e)  (vector-ref e 2))
+  (define (make-event kind name) (vector kind name #f))
+  (define (stamp-event! e)                    ; caller holds the region
+    (when (not (vector-ref e 2))
+      (vector-set! e 2 (next-event-seq!)))
+    e)
+
+  (define (make-legacy-watcher p) (vector 'watcher 'legacy p #f))
+  (define (make-token-watcher p tok) (vector 'watcher 'token p tok))
   (define (w-kind w)  (vector-ref w 1))
   (define (w-pid w)   (vector-ref w 2))
+  (define (w-token w) (vector-ref w 3))       ; #f on a legacy entry
 
   (define (drop-watcher! name w)
     (atomically
@@ -2275,8 +2361,8 @@
         ;; roll back -- a half-finished handover there is unreachable
         ;; state, not a retryable failure.
         (let* ((spare (list (new-qhead)
-                            (make-qnode (vector 'node-down name) #f)
-                            (make-qnode (vector 'node-up name) #f)))
+                            (make-qnode (make-event 'node-down name) #f)
+                            (make-qnode (make-event 'node-up name) #f)))
                (cut #f)
                (drain #f)
                (old #f)
@@ -2326,7 +2412,7 @@
                         (let* ((oh (orphan-find name))
                                (h (or oh (car spare)))
                                (ne (make-entry c self dialer boot-id gen h)))
-                          (qhead-push! h (caddr spare))   ; an install is an `up`
+                          (qhead-push! h (stamp-qnode! (caddr spare)))  ; an install is an `up`
                           (hashtable-set! peers name ne)
                           (when oh (orphan-detach! name))
                           (set! drain h))
@@ -2378,8 +2464,9 @@
                         (set! cut (hashtable-ref watchers name '()))
                         (let* ((h (entry-head e))
                                (ne (make-entry c self dialer boot-id gen h)))
-                          (qhead-push! h (cadr spare))
-                          (qhead-push! h (caddr spare))
+                          ;; two numbers, one turn -- see next-event-seq!
+                          (qhead-push! h (stamp-qnode! (cadr spare)))
+                          (qhead-push! h (stamp-qnode! (caddr spare)))
                           (hashtable-set! peers name ne)
                           (set! drain h))
                         (tcp-close! (entry-conn e))
@@ -2463,7 +2550,7 @@
         (let ((n (atomically (qhead-peek h))))
           (when n
             (let ((ev (qnode-event n)))
-              (notify-list! cut (vector-ref ev 1) (vector-ref ev 0)))
+              (notify-list! cut (event-name ev) (event-kind ev) (event-seq ev)))
             ;; delivered, and only now is it gone. A death anywhere above
             ;; this line leaves the event where it was, for whoever drains
             ;; next.
@@ -2517,7 +2604,7 @@
   ;; about. The head therefore moves to the orphan chain, where the same
   ;; drain finds it, and leaves the chain when it empties.
   (define (remove-peer! name c)
-    (let* ((node (make-qnode (vector 'node-down name) #f))  ; (R0): outside
+    (let* ((node (make-qnode (make-event 'node-down name) #f))  ; (R0): outside
            (cut #f)
            (drain #f)
            (mine?
@@ -2526,7 +2613,7 @@
                  (and e (eq? (entry-conn e) c)
                       (let ((h (entry-head e)))
                         (set! cut (hashtable-ref watchers name '()))
-                        (qhead-push! h node)
+                        (qhead-push! h (stamp-qnode! node))
                         (hashtable-delete! peers name)
                         (orphan-attach! h name)
                         (set! drain h)
