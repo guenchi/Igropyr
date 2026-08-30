@@ -992,6 +992,78 @@
               (else (sleep-ms 250) (loop (- tries 1)))))
       (chains-agree? "s3-chains-at-rest-after")
       (display "S3 chain cells passed\n"))
+    ;; ---- S3: a dead agent's entry must not answer for a live one ------
+    ;; ⚠️ SCOPE, measured: this cell does NOT discriminate the liveness
+    ;; precondition on its own. Removing that check from the arming path
+    ;; leaves the cell green, because the reaper usually processes the
+    ;; agent's DOWN and drops the entry before the re-arm arrives -- so
+    ;; the re-arm takes the fresh-install branch either way, and the
+    ;; window the check exists for is one this cell cannot reliably open.
+    ;; What it does own is the end-to-end property: after a target dies
+    ;; and a new one takes its name, arming the same triple again yields
+    ;; a monitor that really follows the new target, and the credit for
+    ;; it comes back. The precondition itself is guarded by construction
+    ;; (arming reads liveness inside the same region that installs), not
+    ;; by this cell.
+    ;; Moving credit return to the reaper moved something else with it:
+    ;; the entry now outlives the agent, from the moment the agent dies
+    ;; until the reaper has processed its DOWN. Inside that window a
+    ;; repeat of the same triple used to find an entry and report
+    ;; idempotent success -- telling the peer its monitor is armed while
+    ;; the agent behind it is gone. Arming has to check that the agent is
+    ;; alive, and re-arm when it is not.
+    (let ((me self) (ref (gensym)))
+      (spawn
+        (lambda ()
+          (let ((c (handshake-as! "revivepeer" "s3-revive")))
+            (tcp-write! c (frame-bytes (list 'mon 'monitor-victim 6001)) #f)
+            (sleep-ms 500)
+            ;; kill what the agent is watching: the agent reports and
+            ;; dies, and for a moment its entry is still in the table
+            (let ((v (whereis 'monitor-victim)))
+              (when v (kill v 'for-the-cell)))
+            (sleep-ms 150)
+            ;; re-register a target under the same name, then re-arm the
+            ;; SAME triple. This must install a new agent, not answer
+            ;; "already done" on behalf of the dead one.
+            (register 'monitor-victim
+              (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
+            (tcp-write! c (frame-bytes (list 'mon 'monitor-victim 6001)) #f)
+            (sleep-ms 700)
+            ;; THE DISCRIMINATOR is the second kill, not the count. A
+            ;; stale entry that answered "already armed" leaves the new
+            ;; victim unwatched: killing it then returns nothing, and
+            ;; accounted stays where it was. A real re-arm follows the
+            ;; new victim and the credit comes back.
+            (let ((v2 (whereis 'monitor-victim)))
+              (when v2 (kill v2 'second-kill)))
+            (sleep-ms 800)
+            (send me (vector ref (assq 'accounted (node-monitor-stats))))
+            (receive (after 3000 (void)) (`#(tcp-eof) (void)))
+            (tcp-close! c))))
+      (receive (after 15000 (fail! "s3-revive" 'timeout))
+        (`#(,@ref ,acc)
+          ;; the re-arm must have produced a live monitor again: a stale
+          ;; entry answering "idempotent" leaves nothing armed and the
+          ;; count sits at zero
+          ;; after the second kill the credit must be back: a live
+          ;; monitor followed that victim and its death was reported.
+          ;; With a stale entry answering as armed, nothing watched the
+          ;; new victim and the count never returns.
+          (when (or (not acc) (not (zero? (cdr acc))))
+            (fail! "s3-stale-entry-must-not-answer-as-armed" acc))))
+      ;; leave the counters where they were found: this cell arms a
+      ;; monitor and kills a target, and the later baseline cells count
+      ;; both. Waiting for the reaper to drain is part of the cell, not
+      ;; cleanup after it -- an assertion that the credit comes back.
+      (let loop ((tries 40))
+        (let ((acc (assq 'accounted (node-monitor-stats))))
+          (cond ((and acc (zero? (cdr acc))) (void))
+                ((zero? tries)
+                 (fail! "s3-revive-credit-must-return" (node-monitor-stats)))
+                (else (sleep-ms 250) (loop (- tries 1))))))
+      (display "S3 revive cell passed\n"))
+
 
     ;; ---- S2: replacement, seen from the side that LOSES ---------------
     ;; Everything above asserts our own tables. A rule that says "refuse,
