@@ -10,6 +10,23 @@
 ;;;   (rsend 'b 'worker-pool #(job 42))         ; -> (whereis 'worker-pool) on b
 ;;;   (monitor-node 'b)                         ; -> #(node-up b) / #(node-down b)
 ;;;
+;;; TOPOLOGY NOTICES ARE AT LEAST ONCE. One supervised process delivers
+;;; them, and an event leaves its queue only once it has been handed to
+;;; every subscriber -- so a delivery that dies half way through is
+;;; started again by the next dispatcher rather than lost. A subscriber
+;;; can therefore see the same notice twice. The token form exists to
+;;; make that absorbable:
+;;;
+;;;   (define t (monitor-node/token 'b))        ; -> #(node-up b t seq)
+;;;
+;;; It carries the subscription token and a sequence number that rises
+;;; across all notices, which is what a receiver deduplicates with:
+;;; ignore anything whose token is not yours, then ignore a sequence
+;;; number you have already passed. The two-element form above carries
+;;; neither and cannot tell a repeat from a new event. It is kept exactly
+;;; as it is for code written before the token form existed; that is the
+;;; trade, and it is stated rather than papered over.
+;;;
 ;;; NODE-CONNECT! AND NODE-DISCONNECT! RETURN WHEN THE REQUEST IS
 ;;; ACCEPTED, NOT WHEN IT HAS TAKEN EFFECT. Both hand the change to the
 ;;; registrar, whose mailbox is the order such changes happen in, and
@@ -1166,8 +1183,16 @@
   ;; the head for that would make a completion match a later event that
   ;; merely shares the container. Same argument as the fair-ring node,
   ;; and they are separate roles for the same reason.
+  ;; THE CUT TRAVELS WITH THE EVENT. It used to be an argument to the
+  ;; drain, which was possible only because the process that queued the
+  ;; event was also the one that delivered it. A dispatcher that finds
+  ;; the event later was not there when the watcher list was read, and
+  ;; re-reading it at delivery time would be a different list: watchers
+  ;; that subscribed after the event happened would receive it. The
+  ;; snapshot has to be part of the event or the rule "you are told
+  ;; about what happened while you were watching" has no owner.
   (define-record-type qnode
-    (fields event (mutable next)))
+    (fields event (mutable next) (mutable cut)))
 
   ;; `onext` is the head's OWN link into the global orphan chain. A
   ;; separate chain cell would have to be allocated at the moment of
@@ -1177,10 +1202,19 @@
   ;; notice still in it. Carrying the link in the head removes the
   ;; allocation rather than pre-arranging one, so the failure it guards
   ;; against cannot occur.
+  ;; `rnext` is the head's own link into the ready chain, for the same
+  ;; reason `onext` is its link into the orphan chain: the moment a head
+  ;; becomes ready is inside a region that must not allocate. The two
+  ;; chains are separate because a head can be on both at once and they
+  ;; answer different questions -- the orphan chain says "the entry that
+  ;; held this is gone", the ready chain says "there is undelivered work
+  ;; in here". `ronq` is the membership flag; without it, pushing a
+  ;; second event would link the head to itself.
   (define-record-type qhead
-    (fields (mutable first) (mutable last) (mutable onext) (mutable oname)))
+    (fields (mutable first) (mutable last) (mutable onext) (mutable oname)
+            (mutable rnext) (mutable ronq)))
 
-  (define (new-qhead) (make-qhead #f #f #f #f))
+  (define (new-qhead) (make-qhead #f #f #f #f #f #f))
 
   ;; Splice a PRE-BUILT node. Two writes, no allocation, no growth: safe
   ;; to call from inside an atomic region.
@@ -1209,7 +1243,10 @@
   ;; confirmation means the next deliverer sends the same event again.
   ;; That is the trade this design took deliberately -- a repeat can be
   ;; absorbed by the consumer, a loss cannot be reconstructed by anyone.
-  (define (stamp-qnode! n) (stamp-event! (qnode-event n)) n)
+  ;; Stamp and load in one motion, because the two have to happen in the
+  ;; same region as the push and there is no valid state where a node is
+  ;; queued carrying one and not the other.
+  (define (stamp-qnode! n cut) (stamp-event! (qnode-event n)) (qnode-cut-set! n cut) n)
 
   (define (qhead-peek h) (qhead-first h))
 
@@ -1221,6 +1258,46 @@
       #t))
 
   (define (qhead-empty? h) (not (qhead-first h)))
+
+  ;; ---- the ready chain ---------------------------------------------------
+  ;;
+  ;; THE LIST OF HEADS THAT HOLD UNDELIVERED WORK. It exists so that the
+  ;; question "is there anything to deliver" has an answer that outlives
+  ;; the process asking it. A dispatcher's mailbox cannot be that answer:
+  ;; a mailbox dies with its process, and the events it was told about
+  ;; would then be sitting in heads nobody knows to look at.
+  ;;
+  ;; Same shape as the orphan chain and for the same reason -- the link
+  ;; is a field of the head, so joining costs two pointer writes and no
+  ;; allocation, which is what lets it happen inside the region that
+  ;; queued the event.
+  (define ready #f)                       ; qhead | #f
+
+  (define (ready-attach! h)
+    (unless (qhead-ronq h)
+      (qhead-rnext-set! h ready)
+      (qhead-ronq-set! h #t)
+      (set! ready h)))
+
+  (define (ready-detach! h)
+    (let loop ((prev #f) (x ready))
+      (cond
+        ((not x) #f)
+        ((eq? x h)
+         (if prev (qhead-rnext-set! prev (qhead-rnext x)) (set! ready (qhead-rnext x)))
+         (qhead-rnext-set! x #f)
+         (qhead-ronq-set! x #f)
+         #t)
+        (else (loop x (qhead-rnext x))))))
+
+  ;; PUSHING AND BECOMING READY ARE ONE ACT. As two calls they could be
+  ;; separated by a later edit, and a head holding an event while off the
+  ;; ready chain is precisely the failure this arrangement exists to
+  ;; remove: the container is there and nobody will ever look inside it.
+  ;; There is no caller that wants one without the other.
+  (define (qhead-enqueue! h n cut)
+    (qhead-push! h (stamp-qnode! n cut))
+    (ready-attach! h))
 
   ;; THE ORPHAN CHAIN EXISTS ONLY WHILE SOMETHING IS ON IT. It is a bare
   ;; pointer, not a table keyed by peer name: a table would be the
@@ -1238,8 +1315,8 @@
     (set! orphans h))
 
   ;; Unlink and return this peer's orphaned head, or #f. Used by the
-  ;; install path to adopt it back, and by the drain to drop a head that
-  ;; has emptied -- "only while non-empty" is enforced by actually
+  ;; install path to adopt it back, and by the dispatcher to drop a head
+  ;; that has emptied -- "only while non-empty" is enforced by actually
   ;; removing it, not by a flag saying it is gone.
   ;; Read-only: is this peer's head on the chain? Separated from the
   ;; unlink so the install path can decide WHICH head the new entry will
@@ -2508,10 +2585,9 @@
         ;; roll back -- a half-finished handover there is unreachable
         ;; state, not a retryable failure.
         (let* ((spare (list (new-qhead)
-                            (make-qnode (make-event 'node-down name) #f)
-                            (make-qnode (make-event 'node-up name) #f)))
+                            (make-qnode (make-event 'node-down name) #f '())
+                            (make-qnode (make-event 'node-up name) #f '())))
                (cut #f)
-               (drain #f)
                (old #f)
                (decision
                  (atomically
@@ -2559,10 +2635,9 @@
                         (let* ((oh (orphan-find name))
                                (h (or oh (car spare)))
                                (ne (make-entry c self dialer boot-id gen h)))
-                          (qhead-push! h (stamp-qnode! (caddr spare)))  ; an install is an `up`
+                          (qhead-enqueue! h (caddr spare) cut)   ; an install is an `up`
                           (hashtable-set! peers name ne)
-                          (when oh (orphan-detach! name))
-                          (set! drain h))
+                          (when oh (orphan-detach! name)))
                         'installed)
                        ((replace)
                         ;; (R1). THREE THINGS, ONE REGION.
@@ -2612,10 +2687,9 @@
                         (let* ((h (entry-head e))
                                (ne (make-entry c self dialer boot-id gen h)))
                           ;; two numbers, one turn -- see next-event-seq!
-                          (qhead-push! h (stamp-qnode! (cadr spare)))
-                          (qhead-push! h (stamp-qnode! (caddr spare)))
-                          (hashtable-set! peers name ne)
-                          (set! drain h))
+                          (qhead-enqueue! h (cadr spare) cut)
+                          (qhead-enqueue! h (caddr spare) cut)
+                          (hashtable-set! peers name ne))
                         (tcp-close! (entry-conn e))
                         'replaced)
                        (else d)))))) 
@@ -2637,13 +2711,13 @@
              ;; between the read and the swap miss the pair for good --
              ;; late is recoverable, missing is not.
              ;;
-             ;; The drain runs in this process for now. A supervised
-             ;; serial dispatcher is the eventual owner; what is settled
-             ;; here is the container and the handovers, not who turns
-             ;; the crank.
              ;; (R2) wake the old link process, (R3) settle what the old
-             ;; generation left behind, (R4) fan out down then up to the
-             ;; snapshot cut above.
+             ;; generation left behind, (R4) hand the head to the
+             ;; dispatcher, which fans out down then up to the snapshot
+             ;; cut taken inside. R4 is now a wake-up rather than a
+             ;; fan-out: this process asks for the work to be done and
+             ;; does not do it, so its own death no longer takes the
+             ;; events with it.
              ;;
              ;; R3 IS THE CONSERVATIVE READING and is flagged as such:
              ;; the design says "the old generation's pending calls and
@@ -2659,53 +2733,109 @@
              (stop-link! (entry-conn old) (entry-link old) 'replaced)
              (drop-hosted-monitors! name)
              (fail-pending-for! name)
-             (drain-queue! drain cut)
+             (dispatch-wake!)
              'replaced)
-            ((installed) (drain-queue! drain cut) 'installed)
+            ((installed) (dispatch-wake!) 'installed)
             ((idempotent) 'idempotent)
             ((protocol-error) (tcp-close! c) 'protocol-error)
             (else (tcp-close! c) 'refused))))))
 
-  ;; Take events until the queue is empty and fan each out to the cut
-  ;; taken when it was queued. Draining to empty rather than one at a
-  ;; time is what makes the "only while non-empty" rule about the orphan
-  ;; chain checkable: a head that empties here is unlinked in the same
-  ;; call, so an idle system has an empty chain rather than a chain of
-  ;; empty heads nobody will ever look at again.
-  ;; ⚠ WHAT done(head) BUYS, STATED NARROWLY. It turns a loss into a
-  ;; retention: an event whose delivery died before it was confirmed stays
-  ;; in the queue. It does NOT by itself guarantee the event is delivered
-  ;; -- that needs somebody to drain the head afterwards, and today the
-  ;; only drainers are the three call sites below, each running in the
-  ;; link or attempt process whose death opened the window in the first
-  ;; place. Whether a later drain happens is currently a matter of whether
-  ;; the peer reconnects. The design's own name for this shape is "the
-  ;; container is still there and the way in is gone"; the supervised
-  ;; dispatcher is what closes it.
+  ;; ---- the dispatcher ----------------------------------------------------
   ;;
-  ;; ⛔ AND IT HAS NO REGRESSION PROTECTION. Reverting it leaves the whole
-  ;; suite green: nothing in test/ can produce a death between taking an
-  ;; event and delivering it without editing this file, so no cell fails
-  ;; when it goes away. The evidence for it is a one-shot shadow-tree
-  ;; injection, which is an observation and not a reproducible leg. Until
-  ;; the dispatcher exists and gives a killable pid to build that cell on,
-  ;; this must be listed at every decision point as: landed, and guarded
-  ;; by nothing.
-  (define (drain-queue! h cut)
-    (when h
-      (let loop ()
-        (let ((n (atomically (qhead-peek h))))
-          (when n
-            (let ((ev (qnode-event n)))
-              (notify-list! cut (event-name ev) (event-kind ev) (event-seq ev)))
-            ;; delivered, and only now is it gone. A death anywhere above
-            ;; this line leaves the event where it was, for whoever drains
-            ;; next.
-            (atomically (qhead-done! h n))
-            (loop))))
-      (atomically
-        (when (and (qhead-empty? h) (qhead-oname h))
-          (orphan-detach! (qhead-oname h))))))
+  ;; ONE PROCESS DELIVERS EVERY TOPOLOGY EVENT. Until now delivery ran in
+  ;; whichever process had queued the event -- a link process or a dial
+  ;; attempt -- which put the delivery inside the death it was reporting.
+  ;; done(head) made that death a retention rather than a loss, but a
+  ;; retained event still needs somebody to come back for it, and there
+  ;; was nobody: the container was there and the way in was gone. This is
+  ;; the way in.
+  ;;
+  ;; ⭐ WHAT A SUCCESSOR INHERITS IS THE WHOLE DESIGN. The ready chain is
+  ;; module state, not this process's mailbox. A replacement walks the
+  ;; same chain and finds the same heads, including the one it was in the
+  ;; middle of when its predecessor died, and including heads queued
+  ;; while no dispatcher existed at all. The `work` message is a wake-up
+  ;; hint and nothing more -- losing one costs latency, never an event.
+  ;; That is the only reason the receive has a timeout: it is the
+  ;; backstop for a hint sent to a pid that had already died, and if it
+  ;; ever becomes the thing that makes delivery work, something above is
+  ;; broken.
+  ;;
+  ;; ⚠ THE PRICE IS A DUPLICATE, and it is not evenly paid. Dying after
+  ;; the delivery and before the confirmation leaves the node at the
+  ;; front, so the successor sends it again. A token subscriber has the
+  ;; token and the sequence number in the message and can drop the
+  ;; repeat; a legacy two-element message carries neither, so an older
+  ;; subscriber sees it. That is declared, not absorbed -- see the shape
+  ;; promise at notify-one!.
+  ;;
+  ;; FAIRNESS IS ONE EVENT PER HEAD PER ROUND, not draining a head to
+  ;; empty. A peer flapping fast enough to keep its own queue non-empty
+  ;; would otherwise hold the only deliverer for as long as it kept
+  ;; flapping, and every other peer's notices would wait behind it.
+  (define dispatcher-name 'igropyr-node-dispatcher)
+  (define dispatch-idle-ms 1000)
+
+  (define (dispatch-wake!)
+    (let ((d (whereis dispatcher-name)))
+      (when d (send d (vector 'work)))))
+
+  ;; At most one event from this head. The answer is also the signal that
+  ;; another round is worth running.
+  (define (dispatch-one! h)
+    (let ((n (atomically (qhead-peek h))))
+      (and n
+           (let ((ev (qnode-event n)))
+             (notify-list! (qnode-cut n) (event-name ev) (event-kind ev) (event-seq ev))
+             ;; delivered, and only now is it gone. A death anywhere above
+             ;; this line leaves the event where it was, for the successor.
+             (atomically (qhead-done! h n))
+             #t))))
+
+  ;; A head leaves the chains only when it is empty, and emptiness is
+  ;; re-tested inside the region: something may have been queued on it
+  ;; between the delivery above and this test, and a head dropped while
+  ;; holding an event is unreachable work.
+  (define (dispatch-retire! h)
+    (atomically
+      (when (qhead-empty? h)
+        (ready-detach! h)
+        (when (qhead-oname h) (orphan-detach! (qhead-oname h))))))
+
+  (define (dispatch-round!)
+    (let loop ((h (atomically ready)) (any #f))
+      (if (not h)
+          any
+          ;; next FIRST: retiring this head clears its own link, and
+          ;; reading it afterwards walks into a node that is nowhere.
+          (let ((next (atomically (qhead-rnext h))))
+            (let ((did (dispatch-one! h)))
+              (dispatch-retire! h)
+              (loop next (or any did)))))))
+
+  (define (dispatcher-loop)
+    (register dispatcher-name self)
+    ;; A ROUND BEFORE THE FIRST RECEIVE. This is what makes a restart
+    ;; recover rather than merely resume: whatever was queued while the
+    ;; previous dispatcher was dying is on the chain now, and no hint
+    ;; about it survived.
+    (let loop ()
+      (if (dispatch-round!)
+          (loop)
+          (let ((m (receive
+                     (after dispatch-idle-ms 'idle)
+                     (`#(work) 'work)
+                     (`#(node-stop) 'stop)
+                     ;; MUST STAY LAST -- bare identifier, catch-all.
+                     ;; Said out loud rather than dropped: nothing else
+                     ;; should be sending here, so a message that arrives
+                     ;; is a mistake somewhere, and a silent branch would
+                     ;; make it a mistake nobody can find.
+                     (other
+                       (display "igropyr node: dispatcher discarded an unrecognised message\n"
+                                (current-error-port))
+                       'other))))
+            (unless (eq? m 'stop) (loop))))))
 
   ;; Did the install succeed, in the sense the caller cares about: is
   ;; this connection now the one in the table?
@@ -2748,29 +2878,28 @@
   ;; The entry goes in the same region that queues this peer's own
   ;; `node-down`, so deleting the entry would delete the notice about the
   ;; deletion -- the notification destroyed by the very thing it is
-  ;; about. The head therefore moves to the orphan chain, where the same
-  ;; drain finds it, and leaves the chain when it empties.
+  ;; about. The head therefore moves to the orphan chain, and onto the
+  ;; ready chain in the same region, so the dispatcher finds it with no
+  ;; entry to reach it through; it leaves both chains when it empties.
   (define (remove-peer! name c)
-    (let* ((node (make-qnode (make-event 'node-down name) #f))  ; (R0): outside
+    (let* ((node (make-qnode (make-event 'node-down name) #f '()))  ; (R0): outside
            (cut #f)
-           (drain #f)
            (mine?
              (atomically
                (let ((e (hashtable-ref peers name #f)))
                  (and e (eq? (entry-conn e) c)
                       (let ((h (entry-head e)))
                         (set! cut (hashtable-ref watchers name '()))
-                        (qhead-push! h (stamp-qnode! node))
+                        (qhead-enqueue! h node cut)
                         (hashtable-delete! peers name)
                         (orphan-attach! h name)
-                        (set! drain h)
                         #t))))))
       (tcp-close! c)
       (when mine?
         (drop-hosted-monitors! name)       ; free monitors this peer parked here
         (fail-monitors-for! name)          ; DOWN(noconnection) for watchers
         (fail-pending-for! name)           ; nothing will answer these now
-        (drain-queue! drain cut))))
+        (dispatch-wake!))))
 
   ;; Calls waiting on a peer that just went: no reply can arrive for them,
   ;; so the entry would sit here until its caller's own timeout removed it
@@ -4256,7 +4385,9 @@
       (spawn (lambda ()
                (warden-loop
                  (list (vector 'reaper reaper-loop
-                              "hosted-monitor credit is no longer being returned"))))))
+                               "hosted-monitor credit is no longer being returned")
+                       (vector 'dispatcher dispatcher-loop
+                               "topology notifications are no longer being delivered"))))))
     (critical! reaper-warden 'node-warden)
     (when (pair? rest)
       (let ((port (car rest))

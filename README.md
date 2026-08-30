@@ -1270,6 +1270,7 @@ mirror Erlang distribution.
 (rsend 'b 'worker (vector 'job 42))       ; fire-and-forget -> #t / #f
 (rcall 'b 'calc  (vector 'square 7))      ; synchronous gen-server call -> 49
 (monitor-node 'b)                         ; -> #(node-up b) / #(node-down b)
+(monitor-node/token 'b)                   ; -> #(node-up b token seq)
 (monitor-remote 'b 'worker)               ; -> #(remote-down b worker reason)
 ```
 
@@ -1285,6 +1286,23 @@ for the call to return.
 > caller that dialled and then immediately inspected node state may now
 > observe it a moment earlier than the connector exists; nothing that
 > waited for `node-up` is affected.
+
+**Topology notices are delivered at least once.** A single supervised
+process delivers them, and an event leaves its queue only once it has
+been handed to every subscriber — a delivery interrupted half way
+through is started again rather than dropped. A subscriber can therefore
+see the same notice twice.
+
+`monitor-node/token` is the form that lets you tell. It returns a
+subscription token, and its notices are `#(node-up peer token seq)`,
+where `seq` rises across all notices: ignore anything whose token is not
+the one you hold, then ignore a sequence number you have already passed.
+`demonitor-node/token` cancels that subscription and nothing else.
+
+The two-element form is unchanged and stays unchanged, which is the
+point of it — but it carries neither a token nor a sequence number, so a
+receiver using it cannot distinguish a repeat from a new event. If that
+matters, use the token form; if it does not, nothing needs to change.
 
 **Node names are wire syntax, not a local label.** A node name is
 non-empty, at most 255 characters, and drawn from `[0-9a-z-]` — lowercase
