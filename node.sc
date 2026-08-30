@@ -2400,6 +2400,25 @@
   ;; chain checkable: a head that empties here is unlinked in the same
   ;; call, so an idle system has an empty chain rather than a chain of
   ;; empty heads nobody will ever look at again.
+  ;; ⚠ WHAT done(head) BUYS, STATED NARROWLY. It turns a loss into a
+  ;; retention: an event whose delivery died before it was confirmed stays
+  ;; in the queue. It does NOT by itself guarantee the event is delivered
+  ;; -- that needs somebody to drain the head afterwards, and today the
+  ;; only drainers are the three call sites below, each running in the
+  ;; link or attempt process whose death opened the window in the first
+  ;; place. Whether a later drain happens is currently a matter of whether
+  ;; the peer reconnects. The design's own name for this shape is "the
+  ;; container is still there and the way in is gone"; the supervised
+  ;; dispatcher is what closes it.
+  ;;
+  ;; ⛔ AND IT HAS NO REGRESSION PROTECTION. Reverting it leaves the whole
+  ;; suite green: nothing in test/ can produce a death between taking an
+  ;; event and delivering it without editing this file, so no cell fails
+  ;; when it goes away. The evidence for it is a one-shot shadow-tree
+  ;; injection, which is an observation and not a reproducible leg. Until
+  ;; the dispatcher exists and gives a killable pid to build that cell on,
+  ;; this must be listed at every decision point as: landed, and guarded
+  ;; by nothing.
   (define (drain-queue! h cut)
     (when h
       (let loop ()
