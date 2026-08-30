@@ -121,23 +121,49 @@
 ;; what they probe only exists on an authenticated link, so each one
 ;; must first BE a peer. Any surprise here is a fail!, not a report --
 ;; the handshake itself already has its own cells.
+;; v4: the proof binds the TARGET as well, and the target's boot-id
+;; arrives in the challenge -- so this cannot be precomputed, it has to
+;; read slot 4 first. `name` is a string on the wire (v4 §8 item 3b);
+;; the node's own name here is 'a, spelled out because the proof binds
+;; who we think we are talking to.
+(define wire-name-of-this-node "a")
+(define probe-boot-id "feedfacefeedface")
+(define (v4-hmac msg)
+  (bytevector->hex (hmac-sha256 (string->utf8 secret) (string->utf8 msg))))
+(define (v4-proof-d nonce-a name-d bootid-d dialgen name-a bootid-a)
+  (v4-hmac (string-append nonce-a ":" name-d ":4:" bootid-d ":"
+                          dialgen ":" name-a ":" bootid-a)))
+(define (v4-proof-a nonce-b name-a bootid-a)
+  (v4-hmac (string-append nonce-b ":" name-a ":4:" bootid-a)))
+(define (hex16? s)
+  (and (string? s) (= (string-length s) 16)
+       (let ok ((i 0))
+         (or (= i 16)
+             (and (let ((ch (string-ref s i)))
+                    (or (char<=? #\0 ch #\9) (char<=? #\a ch #\f)))
+                  (ok (+ i 1)))))))
 (define (handshake-as! name label)
   (tcp-connect! "127.0.0.1" port self)
   (receive (after 3000 (fail! label 'no-connect))
     (`#(tcp-connected ,c)
       (tcp-read-start! c)
       (let ((d (read-frame-or-closed label)))
-        (unless (and (pair? d) (eq? (car d) 'challenge)
-                     (string? (cadr d)) (eqv? (caddr d) 3))
+        (unless (and (pair? d) (= (length d) 4) (eq? (car d) 'challenge)
+                     (string? (cadr d)) (eqv? (caddr d) 4)
+                     (string? (cadddr d)))
           (fail! label 'challenge-shape d))
-        (tcp-write! c (frame-bytes
-                        (list 'hello name
-                              (versioned-proof (cadr d) name 3)
-                              "feedfeedfeedfeedfeedfeedfeedfeed" 3))
-                    #f)
-        (let ((w (read-frame-or-closed label)))
-          (unless (and (pair? w) (eq? (car w) 'welcome))
-            (fail! label 'no-welcome w))))
+        (let* ((nonce-a (cadr d)) (bootid-a (cadddr d))
+               (name-s (if (symbol? name) (symbol->string name) name)))
+          (tcp-write! c (frame-bytes
+                          (list 'hello name-s
+                                (v4-proof-d nonce-a name-s probe-boot-id "1"
+                                            wire-name-of-this-node bootid-a)
+                                "feedfeedfeedfeedfeedfeedfeedfeed" 4
+                                probe-boot-id 1))
+                      #f)
+          (let ((w (read-frame-or-closed label)))
+            (unless (and (pair? w) (eq? (car w) 'welcome))
+              (fail! label 'no-welcome w)))))
       c)
     (`#(tcp-connect-failed ,e) (fail! label 'no-connect e))))
 
@@ -457,6 +483,38 @@
                   nb32 3)))))
     (display "acceptor refuses unversioned/unbound/mislabeled hello ok\n")
 
+    ;; ⑤ boot-id is a NODE identity, not a connection id: two dials to
+    ;;    the same acceptor must see the SAME bootid-A in the challenge.
+    ;;    Red spelling of the failure: "boot-id got generated per
+    ;;    connection" -- easy to write, and it never announces itself.
+    (let ((me self) (ref (gensym)))
+      (define (dial-read-bootid! tag)
+        (spawn
+          (lambda ()
+            (tcp-connect! "127.0.0.1" port self)
+            (receive (after 3000 (send me (vector ref tag 'no-connect)))
+              (`#(tcp-connected ,c)
+                (tcp-read-start! c)
+                (let ((d (read-frame-or-closed "s1-bootid-stable")))
+                  (send me (vector ref tag
+                             (if (and (list? d) (= (length d) 4)
+                                      (eq? (car d) 'challenge))
+                                 (cadddr d) (list 'shape d)))))
+                (tcp-close! c))
+              (`#(tcp-connect-failed ,e) (send me (vector ref tag 'no-connect)))))))
+      (dial-read-bootid! 'one)
+      (dial-read-bootid! 'two)
+      (let ((got '()))
+        (let collect ((n 0))
+          (when (< n 2)
+            (receive (after 8000 (fail! "s1-bootid-stable" 'timeout))
+              (`#(,@ref ,tag ,val) (set! got (cons (cons tag val) got))
+                (collect (+ n 1))))))
+        (let ((b1 (cdr (assq 'one got))) (b2 (cdr (assq 'two got))))
+          (unless (and (hex16? b1) (hex16? b2))
+            (fail! "s1-bootid-stable" 'not-hex16 b1 b2))
+          (unless (string=? b1 b2)
+            (fail! "s1-bootid-stable" 'per-connection-bootid b1 b2)))))
     ;; ---- the positive path, spoken by hand ------------------------------
     ;; A fake dialer that implements the SPECIFIED dialect (anchored to
     ;; the known-answer digest above) must be accepted, and the welcome
@@ -474,19 +532,24 @@
               (tcp-read-start! c)
               (let ((d (read-frame-or-closed "wirepeer-challenge")))
                 (cond
-                  ((not (and (list? d) (= (length d) 3)))
+                  ((not (and (list? d) (= (length d) 4)))
                    (send me (vector ref 'challenge-shape)))
                   ((not (eq? (car d) 'challenge))
                    (send me (vector ref 'challenge-tag)))
                   ((not (string? (cadr d)))
                    (send me (vector ref 'challenge-nonce-not-string)))
-                  ((not (eqv? (caddr d) 3))
+                  ((not (eqv? (caddr d) 4))
                    (send me (vector ref 'challenge-version)))
+                  ((not (string? (cadddr d)))
+                   (send me (vector ref 'challenge-bootid-not-string)))
                   (else
                    (tcp-write! c (frame-bytes
-                                   (list 'hello 'wirepeer
-                                         (versioned-proof (cadr d) 'wirepeer 3)
-                                         nb32 3))
+                                   (list 'hello "wirepeer"
+                                         (v4-proof-d (cadr d) "wirepeer"
+                                                     probe-boot-id "1"
+                                                     wire-name-of-this-node
+                                                     (cadddr d))
+                                         nb32 4 probe-boot-id 1))
                                #f)
                    (let ((w (read-frame-or-closed "wirepeer-welcome")))
                      (send me (vector ref
@@ -494,9 +557,16 @@
                              ((not (and (list? w) (= (length w) 3)))
                               'welcome-shape)
                              ((not (eq? (car w) 'welcome)) 'welcome-tag)
-                             ((not (eq? (cadr w) 'a)) 'welcome-name)
+                             ;; v4: names are STRINGS on the wire
+                             ((not (equal? (cadr w) wire-name-of-this-node))
+                              'welcome-name)
+                             ;; the welcome proof binds nonce-b, the
+                             ;; acceptor's own name and ITS boot-id --
+                             ;; the one it just sent in the challenge
                              ((not (equal? (caddr w)
-                                           (versioned-proof nb32 'a 3)))
+                                           (v4-proof-a nb32
+                                                       wire-name-of-this-node
+                                                       (cadddr d))))
                               'welcome-proof-not-bound)
                              (else 'good))))))))
               (tcp-close! c))
@@ -527,13 +597,6 @@
                      ":" name-a ":" bootid-a))
     (define (msg-a nonce-b name-a bootid-a)
       (string-append nonce-b ":" name-a ":4:" bootid-a))
-    (define (hex16? s)
-      (and (string? s) (= (string-length s) 16)
-           (let ok ((i 0))
-             (or (= i 16)
-                 (and (let ((ch (string-ref s i)))
-                        (or (char<=? #\0 ch #\9) (char<=? #\a ch #\f)))
-                      (ok (+ i 1)))))))
     ;; one v4 probe = dial, read challenge, answer with a caller-built
     ;; hello (possibly tampered), report what came back. `expect` is
     ;; 'good for a welcome with a CORRECT proof-A, 'closed for refusal.
@@ -650,38 +713,59 @@
       (good-v4-hello "wire4d" "18446744073709551616"))
     (v4-probe! "s1-node-survives-bad-dialgen" 'good
       (good-v4-hello "wire4e" "9"))
-    ;; ⑤ boot-id is a NODE identity, not a connection id: two dials to
-    ;;    the same acceptor must see the SAME bootid-A in the challenge.
-    ;;    Red spelling of the failure: "boot-id got generated per
-    ;;    connection" -- easy to write, and it never announces itself.
-    (let ((me self) (ref (gensym)))
-      (define (dial-read-bootid! tag)
-        (spawn
-          (lambda ()
-            (tcp-connect! "127.0.0.1" port self)
-            (receive (after 3000 (send me (vector ref tag 'no-connect)))
-              (`#(tcp-connected ,c)
-                (tcp-read-start! c)
-                (let ((d (read-frame-or-closed "s1-bootid-stable")))
-                  (send me (vector ref tag
-                             (if (and (list? d) (= (length d) 4)
-                                      (eq? (car d) 'challenge))
-                                 (cadddr d) (list 'shape d)))))
-                (tcp-close! c))
-              (`#(tcp-connect-failed ,e) (send me (vector ref tag 'no-connect)))))))
-      (dial-read-bootid! 'one)
-      (dial-read-bootid! 'two)
-      (let ((got '()))
-        (let collect ((n 0))
-          (when (< n 2)
-            (receive (after 8000 (fail! "s1-bootid-stable" 'timeout))
-              (`#(,@ref ,tag ,val) (set! got (cons (cons tag val) got))
-                (collect (+ n 1))))))
-        (let ((b1 (cdr (assq 'one got))) (b2 (cdr (assq 'two got))))
-          (unless (and (hex16? b1) (hex16? b2))
-            (fail! "s1-bootid-stable" 'not-hex16 b1 b2))
-          (unless (string=? b1 b2)
-            (fail! "s1-bootid-stable" 'per-connection-bootid b1 b2)))))
+    ;; ⑥ THE GENERATOR, not just the consumer. Cells ①–⑤ all check what
+    ;;    this node does with a dial-gen it RECEIVES; nothing above says
+    ;;    anything about the one it EMITS -- and a field with no reader
+    ;;    is the shape of a decoration. Until S2 moves issuance to the
+    ;;    registrar (§10.9.20.2), this cell is that reader: a fake
+    ;;    acceptor lets the node dial twice and asserts the sequence is
+    ;;    per-peer, starts at 1, and advances by one, with the dialer's
+    ;;    boot-id constant across the two dials.
+    (let ((me self) (ref (gensym)) (gen-port 18086))
+      (define seen (box '()))
+      (define l
+        (tcp-listen! "127.0.0.1" gen-port 16
+          (lambda (c)
+            (let ((pid (spawn
+                         (lambda ()
+                           ;; read-start inside the owner: the parent
+                           ;; callback must not touch the conn after
+                           ;; handing it over (C12 in the design, and
+                           ;; the same shape the other fixtures use)
+                           (tcp-read-start! c)
+                           (tcp-write! c (frame-bytes
+                                           (list 'challenge kat-nonce 4
+                                                 probe-boot-id))
+                                       #f)
+                           (let ((d (read-frame-or-closed "s1-gen")))
+                             (send me (vector ref
+                               (if (and (list? d) (= (length d) 7))
+                                   (cons (list-ref d 6) (list-ref d 5))
+                                   (list 'shape d))))
+                             (tcp-close! c))))))
+              (conn-set-owner! c pid)))))
+      (node-connect! 'gpeer "127.0.0.1" gen-port)
+      (let collect ((n 0) (acc '()))
+        (if (= n 2)
+            (let* ((first (list-ref (reverse acc) 0))
+                   (second (list-ref (reverse acc) 1)))
+              (node-disconnect! 'gpeer)
+              (tcp-stop-listen! l)
+              (when (or (pair? (car first)) (pair? (car second)))
+                (fail! "s1-dialgen-generator" 'hello-shape first second))
+              ;; per-peer numbering starts at 1 -- a global counter shared
+              ;; across peers would show up here as a first value > 1
+              (unless (eqv? (car first) 1)
+                (fail! "s1-dialgen-generator" 'first-not-1 (car first)))
+              (unless (eqv? (car second) 2)
+                (fail! "s1-dialgen-generator" 'not-monotonic-by-one
+                       (car first) (car second)))
+              ;; the boot-id is the node's, not the connection's
+              (unless (equal? (cdr first) (cdr second))
+                (fail! "s1-dialgen-generator" 'bootid-varies-per-dial
+                       (cdr first) (cdr second))))
+            (receive (after 20000 (fail! "s1-dialgen-generator" 'timeout acc))
+              (`#(,@ref ,v) (collect (+ n 1) (cons v acc)))))))
     (display "S1 wire-v4 cells passed\n"))
     ;; ==== end S1 ========================================================
 
@@ -715,7 +799,11 @@
                                                   ((v999) (list 'challenge "aaaabbbb" 999))
                                                   ((v1) (list 'challenge "aaaabbbb" 1))
                                                   ((colon-nonce)
-                                                   (list 'challenge colon-nonce 3))
+                                                   ;; v4 shape, so the version gate
+                                                   ;; cannot refuse it first: what is
+                                                   ;; on trial is the nonce alphabet
+                                                   (list 'challenge colon-nonce 4
+                                                         probe-boot-id))
                                                   ((upper-nonce)
                                                    ;; 32 hex digits, but UPPERCASE.
                                                    ;; Injectivity does not require
@@ -742,30 +830,47 @@
                                                    ;; else to say the margin shrank.
                                                    (list 'challenge
                                                          "0123456789ABCDEF0123456789ABCDEF"
-                                                         3))
-                                                  (else (list 'challenge 123 3))))
+                                                         4 probe-boot-id))
+                                                  (else (list 'challenge 123 4
+                                                              probe-boot-id))))
                                             #f)
                                 (await-close!))
                                ((kat)
                                 ;; the dialer's OWN hello, held against the
-                                ;; known answer: the proof must be the
-                                ;; literal digest, the name its node name,
-                                ;; the frame exactly five long, version 3
+                                ;; v4 spec: arity 7, name as a STRING, the
+                                ;; proof recomputed here from the specified
+                                ;; formula (it binds our boot-id, which this
+                                ;; fixture chose, so it cannot be a literal
+                                ;; digest any more -- the KAT literal above
+                                ;; still anchors the formula itself), and a
+                                ;; dial-gen that is a non-negative integer.
                                 (tcp-write! c (frame-bytes
-                                                (list 'challenge kat-nonce 3))
+                                                (list 'challenge kat-nonce 4
+                                                      probe-boot-id))
                                             #f)
                                 (let ((d (read-frame-or-closed "kat-hello")))
                                   (send me (vector 'fake tag
                                     (cond ((symbol? d) d)
-                                          ((not (and (list? d) (= (length d) 5)))
+                                          ((not (and (list? d) (= (length d) 7)))
                                            'hello-shape)
                                           ((not (eq? (car d) 'hello)) 'hello-tag)
-                                          ((not (eq? (cadr d) 'a)) 'hello-name)
-                                          ((not (equal? (caddr d) kat-hello-proof))
+                                          ((not (equal? (cadr d) "a")) 'hello-name)
+                                          ((not (string? (list-ref d 5)))
+                                           'hello-bootid)
+                                          ((not (and (integer? (list-ref d 6))
+                                                     (>= (list-ref d 6) 0)))
+                                           'hello-dialgen)
+                                          ((not (equal? (caddr d)
+                                                        (v4-proof-d
+                                                          kat-nonce "a"
+                                                          (list-ref d 5)
+                                                          (number->string
+                                                            (list-ref d 6))
+                                                          "z6" probe-boot-id)))
                                            'hello-proof-off-spec)
                                           ((not (string? (cadddr d)))
                                            'hello-nonce-b)
-                                          ((not (eqv? (car (cddddr d)) 3))
+                                          ((not (eqv? (car (cddddr d)) 4))
                                            'hello-version)
                                           (else 'good))))))
                                ((unbound-welcome)
@@ -783,7 +888,8 @@
                                 ;; refused before that and the cell would
                                 ;; never reach what it exists to check.
                                 (tcp-write! c (frame-bytes
-                                                (list 'challenge kat-nonce 3))
+                                                (list 'challenge kat-nonce 4
+                                                      probe-boot-id))
                                             #f)
                                 (let ((d (read-frame-or-closed
                                            "unbound-welcome-hello")))

@@ -1273,6 +1273,23 @@ mirror Erlang distribution.
 (monitor-remote 'b 'worker)               ; -> #(remote-down b worker reason)
 ```
 
+**Node names are wire syntax, not a local label.** A node name is
+non-empty, at most 255 characters, and drawn from `[0-9a-z-]` — lowercase
+letters, digits and the hyphen, which is legal in any position including
+first and last. The rule is enforced at `node-start!` and `node-connect!`
+as well as against the name a peer claims, so a name this node would
+accept is always one it can also dial. Anything outside that set is
+refused at startup with an `assertion-violation`, not later as a link
+that mysteriously never comes up.
+
+> **Upgrading from a wire version 3 node:** this narrowed in wire
+> version 4. Names carrying uppercase, `_` or `.` used to start and now
+> fail in `node-start!` immediately. A mesh must be upgraded as a
+> whole in any case: a version 4 node refuses a version 3 one, saying why
+> on the side that dialled it and closing without a word on the side that
+> was dialled — a stranger reaching the listener is told nothing on
+> purpose. Rename while planning that upgrade.
+
 Addressing is by registered name (pids are memory objects; names survive
 restarts). `rsend` is fire-and-forget with per-pair ordering; `rcall` is
 its synchronous counterpart. Payloads cross in the extended s-expression

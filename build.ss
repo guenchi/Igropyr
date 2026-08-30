@@ -32,6 +32,13 @@
     ;; anything compiled against it reloads silently. Same reason the
     ;; sexpr note below gives.
     ("igropyr/durable-async.sc" . 2)
+    ;; json-internal BEFORE json, and for the reason the note above
+    ;; gives: json.so imports it, so leaving it source-only makes it take
+    ;; a fresh UID per process and every dependent .so reload silently --
+    ;; or, once json.so exists, refuse to load at all ("a different
+    ;; compilation instance"). It was added as a file without being added
+    ;; here, which is the same omission this list already documents.
+    ("igropyr/json-internal.sc" . 2)
     ("igropyr/json.sc" . 2)
     ("igropyr/gzip.sc" . 2)
     ;; sexpr must be compiled too: a source-only library gets a fresh
