@@ -1278,15 +1278,19 @@
   ;; node names has a finite table, and one that mints names has not.
   (define (monitor-node name)
     (atomically
-      (let ((l (filter process-alive? (hashtable-ref watchers name '()))))
+      (let ((l (filter (lambda (w) (process-alive? (w-pid w)))
+                       (hashtable-ref watchers name (list)))))
         (hashtable-set! watchers name
-          (if (memq self l) l (cons self l)))))
+          (if (find (lambda (w) (eq? (w-pid w) self)) l)
+              l
+              (cons (make-legacy-watcher self) l)))))
     (void))
 
   (define (demonitor-node name)
     (atomically
       (hashtable-set! watchers name
-        (remq self (hashtable-ref watchers name '()))))
+        (filter (lambda (w) (not (eq? (w-pid w) self)))
+                (hashtable-ref watchers name (list)))))
     (void))
 
   ;; Fan out to a snapshot taken by the caller. The replacement sequence
@@ -1294,27 +1298,61 @@
   ;; swaps the entry, or a watcher that finishes registering between the
   ;; read and the swap misses the pair permanently -- not late, missing.
   ;; Reading the list here instead would be exactly that read.
+  ;; ---- what a subscriber gets ----------------------------------------
+  ;;
+  ;; ONE PLACE DECIDES THE SHAPE OF A NOTIFICATION, and that is why this
+  ;; is a procedure rather than two sends in two branches. The older
+  ;; subscription has to keep receiving exactly what it always received --
+  ;; a two-element vector -- while the newer one receives a wider message.
+  ;; Two code paths would each be correct on the day they were written and
+  ;; would drift on the day one of them was edited; one dispatch point
+  ;; cannot drift against itself.
+  ;;
+  ;; Fifth time in this file that a property is bought by leaving exactly
+  ;; one call site rather than asking every call site to behave: one
+  ;; decrement, one unlink, one number, one removal, one message shape.
+  ;; Same family each time -- remove the second supplier instead of
+  ;; strengthening the assertion.
+  (define (notify-one! w name what)
+    (let ((p (w-pid w)))
+      (if (process-alive? p)
+          (send p (vector what name))
+          (drop-watcher! name w))))
+
   (define (notify-list! l name what)
-    (for-each
-      (lambda (p)
-        (if (process-alive? p)
-            (send p (vector what name))
-            (demonitor-dead! name p)))
-      l))
+    (for-each (lambda (w) (notify-one! w name what)) l))
 
   (define (notify! name what)               ; what: node-up | node-down
-    (let ((l (atomically (hashtable-ref watchers name '()))))
-      (for-each
-        (lambda (p)
-          (if (process-alive? p)
-              (send p (vector what name))
-              (demonitor-dead! name p)))
-        l)))
+    (notify-list! (atomically (hashtable-ref watchers name (list)))
+                  name what))
+
+  ;; ---- watcher entries ------------------------------------------------
+  ;;
+  ;; A TAGGED SUM, because there are now two kinds of subscription and they
+  ;; are not one shape with a field left empty. The older kind has no token
+  ;; and never will; the newer kind has one, and that token is what makes a
+  ;; stale subscription's messages recognisable to its holder. Writing it
+  ;; as "the same record with #f in the token slot" would leave every
+  ;; reader to carry the distinction itself, which is where two kinds of
+  ;; thing quietly become one.
+  ;; ⚠ This commit has ONE kind. The tag is here because the second kind
+  ;; arrives next and the readers below should not have to change again
+  ;; when it does -- but nothing selects on it yet, and no token exists in
+  ;; this tree. Said rather than left to be inferred from a lone variant.
+  (define (make-legacy-watcher p) (vector 'watcher 'legacy p))
+  (define (w-kind w)  (vector-ref w 1))
+  (define (w-pid w)   (vector-ref w 2))
+
+  (define (drop-watcher! name w)
+    (atomically
+      (hashtable-set! watchers name
+        (remq w (hashtable-ref watchers name (list))))))
 
   (define (demonitor-dead! name p)
     (atomically
       (hashtable-set! watchers name
-        (remq p (hashtable-ref watchers name '())))))
+        (filter (lambda (w) (not (eq? (w-pid w) p)))
+                (hashtable-ref watchers name (list))))))
 
   ;; ---- framing ----------------------------------------------------------
 
