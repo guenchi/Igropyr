@@ -634,7 +634,6 @@
   (define (reaper-pid) (whereis reaper-name))
 
   (define reaper-warden #f)
-  (define reaper-watched (make-eq-hashtable))   ; reaper-private: pid -> key
   (define reaper-chunk 64)
 
   ;; Re-establish watches from the global chain, in bounded pieces.
@@ -647,14 +646,14 @@
   ;; unlinking; this runs only when a reaper restarts, so the cheaper
   ;; version would buy speed on a path that almost never executes at the
   ;; cost of a correctness question on the path that matters.
-  (define (reaper-rescan!)
+  (define (reaper-rescan! watched)
     (let outer ()
       (let ((fresh
              (let scan ((r (atomically mon-chain)) (n 0) (acc (list)))
                (cond
                  ((not r) (reverse acc))
                  ((fx= n reaper-chunk) (reverse acc))
-                 ((hashtable-ref reaper-watched (agent-pid r) #f)
+                 ((hashtable-ref watched (agent-pid r) #f)
                   (scan (atomically (agent-gnext r)) n acc))
                  (else
                   (scan (atomically (agent-gnext r)) (fx+ n 1)
@@ -663,27 +662,44 @@
           (for-each (lambda (pk)
                       ;; index first: monitor may deliver the DOWN before it
                       ;; returns, and that DOWN has to find the key
-                      (hashtable-set! reaper-watched (car pk) (cdr pk))
+                      (hashtable-set! watched (car pk) (cdr pk))
                       (monitor (car pk)))
                     fresh)
           (outer)))))
 
   (define (reaper-loop)
-    (register reaper-name self)
-    (reaper-rescan!)
-    (let loop ()
-      (receive
-        (`#(watch ,pid ,key)
-          (hashtable-set! reaper-watched pid key)
-          (monitor pid)
-          (loop))
-        (`#(DOWN ,pid ,reason)
-          (let ((key (hashtable-ref reaper-watched pid #f)))
-            (when key
-              (hashtable-delete! reaper-watched pid)
-              (retire-agent! key)))
-          (loop))
-        (`#(node-stop) (void)))))
+    ;; THE INDEX BELONGS TO THIS INCARNATION, so it is created here rather
+    ;; than beside the other module state.
+    ;;
+    ;; It used to live at module scope with a comment calling it private,
+    ;; and the comment was the only thing making it so. A replacement
+    ;; reaper inherited the table its predecessor had filled in -- while
+    ;; the monitors that table described had died with the process that
+    ;; held them. The rescan then found every pid already indexed, skipped
+    ;; every one of them, and established no watches at all: the reaper
+    ;; was running, its index looked complete, and no DOWN would ever
+    ;; arrive again. Nothing reported it except credit that stopped
+    ;; coming back.
+    ;;
+    ;; Clearing the table on entry would have fixed that instance. Scoping
+    ;; it to the process fixes the class: a new reaper cannot see the old
+    ;; one's index, because there is no longer anywhere for it to persist.
+    (let ((watched (make-eq-hashtable)))
+      (register reaper-name self)
+      (reaper-rescan! watched)
+      (let loop ()
+        (receive
+          (`#(watch ,pid ,key)
+            (hashtable-set! watched pid key)
+            (monitor pid)
+            (loop))
+          (`#(DOWN ,pid ,reason)
+            (let ((key (hashtable-ref watched pid #f)))
+              (when key
+                (hashtable-delete! watched pid)
+                (retire-agent! key)))
+            (loop))
+          (`#(node-stop) (void))))))
 
   ;; THE WARDEN DOES THREE THINGS AND MAY NEVER DO A FOURTH: monitor the
   ;; reaper, spawn a replacement, and let the replacement rescan. Anything
