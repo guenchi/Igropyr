@@ -143,5 +143,61 @@
           (unless (eq? got 'node-down) (fail! "at-most-once" got))))
       (display "at-most-once fail on node-down ok\n"))
 
+    ;; ---- a member that joins AFTER the pool starts -----------------------
+    ;; Every pool above was handed nodes that were already connected, so
+    ;; its live set came straight out of node-peers at startup and the
+    ;; node-up notice never mattered. Two things follow from that, and
+    ;; both of them are gaps rather than passing cells: the four-element
+    ;; up message was never actually received by a pool, and no node ever
+    ;; got a SECOND notice, so the watermark comparison never ran -- every
+    ;; notice that reached a coordinator was that node's first and took
+    ;; the "no entry yet, let it through" branch.
+    ;;
+    ;; One fixture closes both. The member is named before it exists, so
+    ;; the pool has to learn it is alive from the notice; then it dies, and
+    ;; that second notice is the first one in this suite that meets an
+    ;; existing watermark.
+    ;;
+    ;; The two gate counters are asserted, not the downstream symptom. A
+    ;; dropped notice looks exactly like a notice that never arrived, so
+    ;; "the pool still thinks it is live" is a reading both defects and
+    ;; correctness can produce; the counters say which gate did it.
+    (let ((late (dpool-start '(d) 'render)))
+      (define (pstat k)
+        (let ((e (assq k (dpool-stats late))))
+          (unless e (fail! "s4-late-stats-lacks-key" k))
+          (cdr e)))
+      ;; A wait that times out says WHICH GATE ate the notice, not just
+      ;; that the pool never heard about it. The two readings are the only
+      ;; thing that separates "the notice was correctly ignored" from
+      ;; "the notice was wrongly ignored" -- from outside, both are
+      ;; silence, and a failure that reports only the silence sends the
+      ;; reader to look at delivery when the answer is in a comparison.
+      (define (await-stat! k want label)
+        (let wait ((i 0))
+          (let ((v (pstat k)))
+            (cond ((equal? v want) 'ok)
+                  ((> i 400)
+                   (fail! label 'expected want 'got v
+                          'token-miss (pstat 'token-miss)
+                          'seq-stale (pstat 'seq-stale)))
+                  (else (sleep-ms 25) (wait (+ i 1)))))))
+      ;; the anchor: the member is NOT live yet, so what follows is about
+      ;; a notice and not about the startup scan
+      (unless (= (pstat 'live) 0)
+        (fail! "s4-late-member-was-already-live" (pstat 'live)))
+      (spawn-child! "d")
+      (await-stat! 'live 1 "s4-late-join-up-never-arrived")
+      ;; and now the second notice for the same node -- the first one in
+      ;; this suite that meets a watermark entry
+      (rsend 'd 'render (vector 'dtask -1 'a 'ignore (vector 'die) 0))
+      (await-stat! 'live 0 "s4-late-join-down-never-arrived")
+      ;; neither gate may have eaten a legitimate notice on the way
+      (unless (= (pstat 'token-miss) 0)
+        (fail! "s4-late-join-token-gate-ate-a-notice" (pstat 'token-miss)))
+      (unless (= (pstat 'seq-stale) 0)
+        (fail! "s4-late-join-seq-gate-ate-a-notice" (pstat 'seq-stale))))
+    (display "a member that joins after the pool learns it from a notice ok\n")
+
     (display "ALL DPOOL TESTS PASSED\n")
     (exit 0)))
