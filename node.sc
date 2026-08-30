@@ -1284,7 +1284,15 @@
       (let ((l (filter (lambda (w) (process-alive? (w-pid w)))
                        (hashtable-ref watchers name (list)))))
         (hashtable-set! watchers name
-          (if (find (lambda (w) (eq? (w-pid w) self)) l)
+          ;; DEDUPLICATION IS WITHIN THE VARIANT, NOT ACROSS IT. Asking
+          ;; only "has this process subscribed" makes the answer depend on
+          ;; which call came first: a process that took a token and then
+          ;; asked for the older subscription was told it already had one,
+          ;; got void back, and had nothing. The same two calls in the
+          ;; other order produced both. Two orders disagreeing is not a
+          ;; choice of semantics -- it is neither of them.
+          (if (find (lambda (w) (and (eq? (w-pid w) self) (not (w-token w))))
+                    l)
               l
               (cons (make-legacy-watcher self) l)))))
     (void))
