@@ -1100,14 +1100,33 @@
         (qhead-first-set! h n))
     (qhead-last-set! h n))
 
-  (define (qhead-pop! h)
-    (let ((n (qhead-first h)))
-      (and n
-           (begin
-             (qhead-first-set! h (qnode-next n))
-             (unless (qhead-first h) (qhead-last-set! h #f))
-             (qnode-next-set! n #f)
-             (qnode-event n)))))
+  ;; TAKING AND FINISHING ARE TWO STEPS, and keeping them apart is the
+  ;; whole point. A single pop hands the event over and forgets it in one
+  ;; motion, so a delivery that dies after the pop and before the send
+  ;; takes the event with it -- silently, because nothing is left to say
+  ;; anything was ever queued. Peeking leaves the event in place; it is
+  ;; removed only once a delivery has been made and says so.
+  ;;
+  ;; The confirmation is CONDITIONAL: the node just delivered is removed
+  ;; only if it is still at the front. Two deliverers can otherwise
+  ;; overlap -- one resumes after another has already finished the same
+  ;; head and moved on -- and an unconditional pop would then discard the
+  ;; NEXT event, which nobody delivered. Comparing the object rather than
+  ;; a position is what makes that check exact, and it is why a node is
+  ;; never reused for a second event.
+  ;;
+  ;; The cost is duplicates: dying between the delivery and the
+  ;; confirmation means the next deliverer sends the same event again.
+  ;; That is the trade this design took deliberately -- a repeat can be
+  ;; absorbed by the consumer, a loss cannot be reconstructed by anyone.
+  (define (qhead-peek h) (qhead-first h))
+
+  (define (qhead-done! h n)
+    (when (eq? (qhead-first h) n)
+      (qhead-first-set! h (qnode-next n))
+      (unless (qhead-first h) (qhead-last-set! h #f))
+      (qnode-next-set! n #f)
+      #t))
 
   (define (qhead-empty? h) (not (qhead-first h)))
 
@@ -2384,9 +2403,14 @@
   (define (drain-queue! h cut)
     (when h
       (let loop ()
-        (let ((ev (atomically (qhead-pop! h))))
-          (when ev
-            (notify-list! cut (vector-ref ev 1) (vector-ref ev 0))
+        (let ((n (atomically (qhead-peek h))))
+          (when n
+            (let ((ev (qnode-event n)))
+              (notify-list! cut (vector-ref ev 1) (vector-ref ev 0)))
+            ;; delivered, and only now is it gone. A death anywhere above
+            ;; this line leaves the event where it was, for whoever drains
+            ;; next.
+            (atomically (qhead-done! h n))
             (loop))))
       (atomically
         (when (and (qhead-empty? h) (qhead-oname h))
