@@ -937,6 +937,62 @@
           (unless closed
             (fail! "s3-mref-reuse-must-close-the-link" 'link-still-open))))
       (display "S3 admission cells passed\n"))
+    ;; ---- S3: the two chains carry the same records --------------------
+    ;; The global chain serves the reaper's restart sweep; the per-peer
+    ;; chains serve eviction, which splices a whole chain out in one
+    ;; step. A record sits on both, and the two are NOT symmetric:
+    ;;
+    ;;   only on the global chain  = the retiring state itself -- spliced
+    ;;       out, DOWN not yet in, credit still held. Legitimate.
+    ;;   only on a per-peer chain  = the reaper can never see it, so its
+    ;;       DOWN is never awaited and the credit never comes back. A
+    ;;       leak, and one with no symptom: nothing else in the system
+    ;;       reads that chain.
+    ;;
+    ;; At rest the three readings must agree; the equality is the cell.
+    (let ()
+      (define (stat k)
+        (let ((e (assq k (node-monitor-stats)))) (and e (cdr e))))
+      (define (chains-agree? label)
+        (let ((g (stat 'mon-chain)) (p (stat 'mon-peer-chains))
+              (a (stat 'accounted)))
+          (unless (and g p a)
+            (fail! label 'stats-missing (node-monitor-stats)))
+          (unless (= g p a)
+            (fail! label 'chains-disagree (list 'global g 'per-peer p
+                                                'accounted a)))
+          g))
+      (chains-agree? "s3-chains-at-rest-before")
+      (let ((me self) (ref (gensym)))
+        (spawn
+          (lambda ()
+            (let ((c (handshake-as! "chainpeer" "s3-chain-peer")))
+              (tcp-write! c (frame-bytes (list 'mon 'monitor-victim 5001)) #f)
+              (tcp-write! c (frame-bytes (list 'mon 'monitor-victim-2 5002)) #f)
+              (sleep-ms 600)
+              (send me (vector ref 'armed))
+              ;; hold, then drop the link so every record retires
+              (receive (after 4000 (void)) (`#(tcp-eof) (void)))
+              (tcp-close! c))))
+        (receive (after 12000 (fail! "s3-chains" 'arm-timeout))
+          (`#(,@ref ,_)
+            ;; armed: both chains must have grown, and still agree
+            (let ((n (chains-agree? "s3-chains-while-armed")))
+              (when (zero? n)
+                (fail! "s3-chains" 'nothing-armed))))))
+      ;; after the link is gone everything must come back -- the reading
+      ;; that would stay high if a record were left on a per-peer chain
+      ;; alone, or if credit were returned by an exit branch that a
+      ;; killed agent never runs
+      (let loop ((tries 40))
+        (cond ((zero? (stat 'accounted)) (void))
+              ((zero? tries)
+               (fail! "s3-chains-return-to-baseline"
+                      (node-monitor-stats)))
+              (else (sleep-ms 250) (loop (- tries 1)))))
+      (chains-agree? "s3-chains-at-rest-after")
+      (display "S3 chain cells passed\n"))
+
     ;; ---- S2: replacement, seen from the side that LOSES ---------------
     ;; Everything above asserts our own tables. A rule that says "refuse,
     ;; close, notify nobody" has a second half that only the peer can
