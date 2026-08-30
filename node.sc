@@ -598,13 +598,107 @@
   ;; back. When the reaper lands, what changes is WHO CALLS THIS, not how
   ;; many places decrement; that is why the three inline deletions were
   ;; collapsed here first.
+  ;; ---- the reaper, and the one process that keeps it alive ----------
+  ;;
+  ;; THE CREDIT COMES BACK ON A DOWN, NOT ON AN EXIT BRANCH. An agent that
+  ;; is killed never runs its own cleanup and one that hangs never reaches
+  ;; it; in both cases the count would stay up for a process that is gone
+  ;; or going. A watcher outside the agent sees both, so the return lives
+  ;; there.
+  ;;
+  ;; The reaper holds its own pid -> key index because a DOWN carries only
+  ;; a pid. That index is PRIVATE and rebuildable: a restarted reaper walks
+  ;; the global chain and re-establishes every watch.
+  ;;
+  ;; THE REBUILD IS SELF-HEALING, and it is worth saying why, because it
+  ;; removes a failure that would otherwise be permanent. `monitor`
+  ;; delivers DOWN immediately for a process that is already dead, so an
+  ;; agent that died while no reaper was running is not lost: re-watching
+  ;; it produces its DOWN at once and the credit comes back. Without that,
+  ;; every death inside a reaper outage would leak a permit forever. That
+  ;; is a property of the runtime rather than of this file.
+  (define reaper #f)
+  (define reaper-warden #f)
+  (define reaper-watched (make-eq-hashtable))   ; reaper-private: pid -> key
+  (define reaper-chunk 64)
+
+  ;; Re-establish watches from the global chain, in bounded pieces.
+  ;;
+  ;; RESTARTS FROM THE HEAD EACH CHUNK rather than carrying a cursor. A
+  ;; cursor into a chain other processes are unlinking from can be left
+  ;; pointing at a node whose next pointer has been cleared, and the walk
+  ;; would then stop early and silently leave the rest unwatched. Starting
+  ;; over is quadratic in the worst case and correct under concurrent
+  ;; unlinking; this runs only when a reaper restarts, so the cheaper
+  ;; version would buy speed on a path that almost never executes at the
+  ;; cost of a correctness question on the path that matters.
+  (define (reaper-rescan!)
+    (let outer ()
+      (let ((fresh
+             (let scan ((r (atomically mon-chain)) (n 0) (acc (list)))
+               (cond
+                 ((not r) (reverse acc))
+                 ((fx= n reaper-chunk) (reverse acc))
+                 ((hashtable-ref reaper-watched (agent-pid r) #f)
+                  (scan (atomically (agent-gnext r)) n acc))
+                 (else
+                  (scan (atomically (agent-gnext r)) (fx+ n 1)
+                        (cons (cons (agent-pid r) (agent-key r)) acc)))))))
+        (unless (null? fresh)
+          (for-each (lambda (pk)
+                      ;; index first: monitor may deliver the DOWN before it
+                      ;; returns, and that DOWN has to find the key
+                      (hashtable-set! reaper-watched (car pk) (cdr pk))
+                      (monitor (car pk)))
+                    fresh)
+          (outer)))))
+
+  (define (reaper-loop)
+    (reaper-rescan!)
+    (let loop ()
+      (receive
+        (`#(watch ,pid ,key)
+          (hashtable-set! reaper-watched pid key)
+          (monitor pid)
+          (loop))
+        (`#(DOWN ,pid ,reason)
+          (let ((key (hashtable-ref reaper-watched pid #f)))
+            (when key
+              (hashtable-delete! reaper-watched pid)
+              (retire-agent! key)))
+          (loop))
+        (`#(node-stop) (void)))))
+
+  ;; THE WARDEN DOES THREE THINGS AND MAY NEVER DO A FOURTH: monitor the
+  ;; reaper, spawn a replacement, and let the replacement rescan. Anything
+  ;; added here has to pass the critical bar again, because this process is
+  ;; critical and its death stops the node.
+  ;;
+  ;; WHAT IS FAIL-STOP HERE IS THE WARDEN, NOT THE REAPER. The design says
+  ;; a reaper failure must not take the node down, and it still does not --
+  ;; it is restarted. What cannot be recovered from is losing the thing
+  ;; that restarts it, and that is a dozen lines with no business logic in
+  ;; them. This is a trade rather than a removal: the risk moves from a
+  ;; process that runs with the workload to one that runs only when the
+  ;; first one dies. Recorded as a residue, not as a fix.
+  (define (warden-loop)
+    (let loop ()
+      (let ((r (spawn reaper-loop)))
+        (set! reaper r)
+        (monitor r)
+        (receive
+          (`#(DOWN ,@r ,_) (loop))
+          (`#(node-stop) (when (process-alive? r) (send r (vector 'node-stop))))))))
+
+  (define (retire-agent-locked! key)             ; caller already holds the region
+    (let ((r (hashtable-ref callee-agents key #f)))
+      (when r
+        (hashtable-delete! callee-agents key)
+        (mon-unlink! r)
+        (set! active-monitors (fx- active-monitors 1)))))
+
   (define (retire-agent! key)
-    (atomically
-      (let ((r (hashtable-ref callee-agents key #f)))
-        (when r
-          (hashtable-delete! callee-agents key)
-          (mon-unlink! r)
-          (set! active-monitors (fx- active-monitors 1))))))
+    (atomically (retire-agent-locked! key)))
 
   (define (accounted-monitors) active-monitors)
   (define max-preauth-conns 256)
@@ -2360,7 +2454,27 @@
          ;; A mismatch is not a replacement request: one reference cannot
          ;; mean two things, so the link goes.
          (unless (atomically
-                   (let ((cur (hashtable-ref callee-agents key #f)))
+                   (let* ((found (hashtable-ref callee-agents key #f))
+                          ;; A STALE ENTRY MUST NOT ANSWER "already done".
+                          ;; Returning the credit on the DOWN a reaper
+                          ;; observes -- rather than on the agent's own way
+                          ;; out -- also moves WHEN the entry disappears: it
+                          ;; outlives its agent by however long that DOWN
+                          ;; takes to be processed. In that window the same
+                          ;; request arriving again would match the triple
+                          ;; and be told it was already armed, while the
+                          ;; agent behind it is dead and the watch is
+                          ;; silently doing nothing.
+                          ;;
+                          ;; So liveness is part of the match. A dead record
+                          ;; for this exact request is retired here and the
+                          ;; request treated as new; the reaper's DOWN then
+                          ;; finds nothing left to do, which is what
+                          ;; retire-agent! being idempotent is for.
+                          (cur (and found
+                                    (if (process-alive? (agent-pid found))
+                                        found
+                                        (begin (retire-agent-locked! key) #f)))))
                      (cond
                        ((and cur (agent-matches? cur c name)) #t)
                        (cur (raise 'protocol))
@@ -2370,7 +2484,12 @@
                                    name c key peer)))
                           (hashtable-set! callee-agents key r)
                           (mon-link! r)
-                          (set! active-monitors (fx+ active-monitors 1)))
+                          (set! active-monitors (fx+ active-monitors 1))
+                          ;; asynchronous on purpose: arming must not wait
+                          ;; on another process, and a watch that arrives
+                          ;; late is covered by the rescan
+                          (when reaper
+                            (send reaper (vector 'watch (agent-pid r) key))))
                         #t)
                        (else #f))))
            ;; At the hosting ceiling: refuse, and tell the watcher at
@@ -2647,7 +2766,7 @@
           (p (whereis name)))
       (if (not p)
           (begin
-            (retire-agent! key)
+            (void)
             ;; Building the frame can fail too -- the allocation, not the
             ;; writer, since this datum always serializes -- and by here
             ;; the agent has dropped its state and is leaving. Same
@@ -2660,7 +2779,7 @@
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
-                (retire-agent! key)
+                (void)
                 ;; THE GUARD COVERS BUILDING THE FRAME AND NOTHING ELSE,
                 ;; which is what it was always meant to cover. A reason
                 ;; that will not serialize is degraded to 'exit; the
@@ -2692,7 +2811,7 @@
                     (link-write/critical watcher segs 'mdown-lost))))
               (`#(demon-local)
                 (demonitor m)
-                (retire-agent! key)))))))
+                (void)))))))
 
   (define (stop-owner-agent! mref)
     (let ((agent (atomically
@@ -3662,6 +3781,11 @@
     ;; mailbox is the order in which permission to dial changes, and an
     ;; order that only begins once somebody dials is not one.
     (set! registrar (spawn registrar-loop))
+    ;; The warden starts with the node and is marked critical: it is the
+    ;; root the reaper's recoverability hangs from, so its own death is
+    ;; not something to survive quietly.
+    (set! reaper-warden (spawn warden-loop))
+    (critical! reaper-warden 'node-reaper-warden)
     (when (pair? rest)
       (let ((port (car rest))
             (host (if (pair? (cdr rest)) (cadr rest) "127.0.0.1")))
