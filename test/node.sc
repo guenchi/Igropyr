@@ -506,6 +506,185 @@
           (unless (eq? what 'good) (fail! "wirepeer-interop" what)))))
     (display "specified dialect accepted end to end ok\n")
 
+    ;; ==== S1: wire v4 -- RED FIRST ======================================
+    ;; These cells encode the v4 dialect from the signed-off C design
+    ;; (archive/igropyr-C-design/C-design.md §8): challenge grows a
+    ;; boot-id slot (arity 4), hello grows boot-id and dial-gen (arity
+    ;; 7, names as STRINGS on the wire), proof-D binds the dialer's
+    ;; identity AND the target's (name-A, bootid-A from the challenge),
+    ;; proof-A binds nonce-b:name-A:version:bootid-A. They are EXPECTED
+    ;; RED against the v3 tree they thaw: the first assertion fails on
+    ;; today's 3-element challenge. They go green when S1 lands, and
+    ;; nothing in them may be edited to make that happen -- the digests
+    ;; below anchor the formulas to the design's known-answer vectors,
+    ;; recomputed independently three times (doc, this session, codex).
+    (let ()
+    (define (v4-proof key-string msg)
+      (bytevector->hex
+        (hmac-sha256 (string->utf8 key-string) (string->utf8 msg))))
+    (define (msg-d nonce-a name-d bootid-d dialgen name-a bootid-a)
+      (string-append nonce-a ":" name-d ":4:" bootid-d ":" dialgen
+                     ":" name-a ":" bootid-a))
+    (define (msg-a nonce-b name-a bootid-a)
+      (string-append nonce-b ":" name-a ":4:" bootid-a))
+    (define (hex16? s)
+      (and (string? s) (= (string-length s) 16)
+           (let ok ((i 0))
+             (or (= i 16)
+                 (and (let ((ch (string-ref s i)))
+                        (or (char<=? #\0 ch #\9) (char<=? #\a ch #\f)))
+                      (ok (+ i 1)))))))
+    ;; one v4 probe = dial, read challenge, answer with a caller-built
+    ;; hello (possibly tampered), report what came back. `expect` is
+    ;; 'good for a welcome with a CORRECT proof-A, 'closed for refusal.
+    (define (v4-probe! label expect build-hello)
+      (let ((me self) (ref (gensym)))
+        (spawn
+          (lambda ()
+            (tcp-connect! "127.0.0.1" port self)
+            (receive (after 3000 (send me (vector ref 'no-connect)))
+              (`#(tcp-connected ,c)
+                (tcp-read-start! c)
+                (let ((d (read-frame-or-closed label)))
+                  (cond
+                    ((not (and (list? d) (= (length d) 4)))
+                     (send me (vector ref (list 'challenge-arity d))))
+                    ((not (eq? (car d) 'challenge))
+                     (send me (vector ref 'challenge-tag)))
+                    ((not (eqv? (caddr d) 4))
+                     (send me (vector ref (list 'challenge-version (caddr d)))))
+                    ((not (hex16? (cadddr d)))
+                     (send me (vector ref 'challenge-bootid-syntax)))
+                    (else
+                     (let ((nonce-a (cadr d)) (bootid-a (cadddr d)))
+                       (tcp-write! c (frame-bytes
+                                       (build-hello nonce-a bootid-a)) #f)
+                       (let ((w (read-frame-or-closed label)))
+                         (send me (vector ref
+                           (cond ((symbol? w) w) ; closed / closed-with-bytes
+                                 ((not (and (list? w) (= (length w) 3)
+                                            (eq? (car w) 'welcome)))
+                                  'welcome-shape)
+                                 (else 'welcomed)))))))))
+                (tcp-close! c))
+              (`#(tcp-connect-failed ,e) (send me (vector ref 'no-connect))))))
+        (receive (after 8000 (fail! label 'probe-timeout))
+          (`#(,@ref ,what)
+            (unless (eq? what (if (eq? expect 'good) 'welcomed 'closed))
+              (fail! label what))))))
+    (define s1-bootid-d "feedfacefeedface")
+    (define (good-v4-hello name-d dialgen)
+      (lambda (nonce-a bootid-a)
+        (list 'hello name-d
+              (v4-proof secret
+                        (msg-d nonce-a name-d s1-bootid-d dialgen
+                               "a" bootid-a))
+              "beadbeadbeadbeadbeadbeadbeadbead" 4 s1-bootid-d
+              (string->number dialgen))))
+    ;; anchor: the design's known-answer vectors, secret "s". If these
+    ;; fail the HELPER diverged from the spec, not the library.
+    (unless (equal? (v4-proof "s" (msg-d (make-string 32 #\0) "d"
+                                         (make-string 16 #\a) "7"
+                                         "e" (make-string 16 #\b)))
+                    "6323ff0b8e27276dc0ca365135fa51a4c855343d943ffc703e11df0f726cfbf0")
+      (fail! "s1-kat-proof-d-helper-diverged"))
+    (unless (equal? (v4-proof "s" (msg-a (make-string 32 #\1) "e"
+                                         (make-string 16 #\b)))
+                    "0870664de029139ae4ff303314198e4b03b7f5c19874243248b7bf808063fe40")
+      (fail! "s1-kat-proof-a-helper-diverged"))
+    ;; ① the specified v4 dialect is accepted end to end (RED today:
+    ;;    the challenge is still v3's three elements)
+    (v4-probe! "s1-v4-dialect-accepted" 'good (good-v4-hello "wire4" "7"))
+    ;; ② the v3 dialect must now be REFUSED -- version 3 is over the
+    ;;    wire and this node no longer speaks it (RED today: accepted)
+    (let ((me self) (ref (gensym)))
+      (spawn
+        (lambda ()
+          (tcp-connect! "127.0.0.1" port self)
+          (receive (after 3000 (send me (vector ref 'no-connect)))
+            (`#(tcp-connected ,c)
+              (tcp-read-start! c)
+              (let ((d (read-frame-or-closed "s1-v3-refused")))
+                ;; whatever the challenge looks like, answer in v3
+                (let ((nonce (if (and (pair? d) (pair? (cdr d))
+                                      (string? (cadr d)))
+                                 (cadr d) kat-nonce)))
+                  (tcp-write! c (frame-bytes
+                                  (list 'hello 'relicv3
+                                        (versioned-proof nonce 'relicv3 3)
+                                        "feedfeedfeedfeedfeedfeedfeedfeed" 3))
+                              #f)
+                  (let ((w (read-frame-or-closed "s1-v3-refused")))
+                    (send me (vector ref (if (symbol? w) w 'welcomed))))))
+              (tcp-close! c))
+            (`#(tcp-connect-failed ,e) (send me (vector ref 'no-connect))))))
+      (receive (after 8000 (fail! "s1-v3-hello-refused" 'probe-timeout))
+        (`#(,@ref ,what)
+          (unless (eq? what 'closed) (fail! "s1-v3-hello-refused" what)))))
+    ;; ③ tampering contrast, discriminating only TOGETHER with ①:
+    ;;    a proof bound to the WRONG target boot-id must be refused, and
+    ;;    a dial-gen altered after signing must be refused. Each of
+    ;;    these alone would be green today for the wrong reason (arity
+    ;;    refusal); ① is the half that keeps the batch red until the
+    ;;    real gate exists.
+    (v4-probe! "s1-proof-wrong-target-bootid" 'closed
+      (lambda (nonce-a bootid-a)
+        (list 'hello "wire4b"
+              (v4-proof secret
+                        (msg-d nonce-a "wire4b" s1-bootid-d "7"
+                               "a" (make-string 16 #\0))) ; not the real bootid-a
+              "beadbeadbeadbeadbeadbeadbeadbead" 4 s1-bootid-d 7)))
+    (v4-probe! "s1-dialgen-altered-after-signing" 'closed
+      (lambda (nonce-a bootid-a)
+        (list 'hello "wire4c"
+              (v4-proof secret
+                        (msg-d nonce-a "wire4c" s1-bootid-d "7"
+                               "a" bootid-a))
+              "beadbeadbeadbeadbeadbeadbeadbead" 4 s1-bootid-d
+              8)))                       ; signed 7, sent 8
+    ;; ④ dial-gen at 2^64 is a PROTOCOL refusal -- close this link,
+    ;;    never the node (§8 item 3d: untrusted input must not become a
+    ;;    node-level fail-stop). The survival half is the probe that
+    ;;    follows: the same good handshake as ① must still succeed.
+    (v4-probe! "s1-dialgen-out-of-range-refused" 'closed
+      (good-v4-hello "wire4d" "18446744073709551616"))
+    (v4-probe! "s1-node-survives-bad-dialgen" 'good
+      (good-v4-hello "wire4e" "9"))
+    ;; ⑤ boot-id is a NODE identity, not a connection id: two dials to
+    ;;    the same acceptor must see the SAME bootid-A in the challenge.
+    ;;    Red spelling of the failure: "boot-id got generated per
+    ;;    connection" -- easy to write, and it never announces itself.
+    (let ((me self) (ref (gensym)))
+      (define (dial-read-bootid! tag)
+        (spawn
+          (lambda ()
+            (tcp-connect! "127.0.0.1" port self)
+            (receive (after 3000 (send me (vector ref tag 'no-connect)))
+              (`#(tcp-connected ,c)
+                (tcp-read-start! c)
+                (let ((d (read-frame-or-closed "s1-bootid-stable")))
+                  (send me (vector ref tag
+                             (if (and (list? d) (= (length d) 4)
+                                      (eq? (car d) 'challenge))
+                                 (cadddr d) (list 'shape d)))))
+                (tcp-close! c))
+              (`#(tcp-connect-failed ,e) (send me (vector ref tag 'no-connect)))))))
+      (dial-read-bootid! 'one)
+      (dial-read-bootid! 'two)
+      (let ((got '()))
+        (let collect ((n 0))
+          (when (< n 2)
+            (receive (after 8000 (fail! "s1-bootid-stable" 'timeout))
+              (`#(,@ref ,tag ,val) (set! got (cons (cons tag val) got))
+                (collect (+ n 1))))))
+        (let ((b1 (cdr (assq 'one got))) (b2 (cdr (assq 'two got))))
+          (unless (and (hex16? b1) (hex16? b2))
+            (fail! "s1-bootid-stable" 'not-hex16 b1 b2))
+          (unless (string=? b1 b2)
+            (fail! "s1-bootid-stable" 'per-connection-bootid b1 b2)))))
+    (display "S1 wire-v4 cells passed\n"))
+    ;; ==== end S1 ========================================================
+
     ;; dial side. A challenge with no version slot must be refused
     ;; WITHOUT answering (red before the change: the dialer sent hello).
     ;; A mismatched version must also be a close -- green before the
