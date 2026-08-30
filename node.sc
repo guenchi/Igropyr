@@ -2780,22 +2780,50 @@
                                            self-boot-id)))
               (raise 'auth))
             (let ((peer (string->symbol (cadr d))) (nonce-b (cadddr d)))
-              (write-frame! c
-                (list 'welcome (symbol->string self-name)
-                      (proof-a nonce-b (symbol->string self-name)
-                               self-boot-id)))
-              (free!)                           ; authenticated: no longer pre-auth
-              ;; PARENT IS #f UNTIL PER-ATTEMPT PROCESSES LAND. An
-              ;; acceptor has no parent to outlive, and the dial side
-              ;; does not yet run its attempt in a process separate from
-              ;; the connector, so I0 -- the orphan refusal -- has
-              ;; nothing to refuse on either side today. That is stated
-              ;; rather than left to be inferred from a #f, because a
-              ;; rule that is present and never fires reads exactly like
-              ;; a rule that is working.
+              ;; RELEASED HERE, BEFORE THE INSTALL DECISION, and that is
+              ;; deliberate: the slot covers the HANDSHAKE, and the
+              ;; handshake is over. A connection refused below is still an
+              ;; authenticated one; holding a stranger's slot while we
+              ;; decide whether it wins would let refusals count against a
+              ;; ceiling that exists to bound unauthenticated peers.
+              (free!)
+              ;; NO PARENT ON THIS SIDE. An acceptor's connection was not
+              ;; requested by anything of ours, so there is nobody whose
+              ;; death would orphan it -- I0 has nothing to refuse here.
+              ;; (The dial side does have one: its attempt runs in its own
+              ;; process and passes the connector as parent.) Said rather
+              ;; than left to be read off a #f, because a rule that never
+              ;; fires looks exactly like a rule that is working.
+              ;;
+              ;; THE WELCOME COMES AFTER THE DECISION, NOT BEFORE IT.
+              ;; Writing it first was harmless while the only refusal was
+              ;; the tie-break: that comparison is symmetric, both ends
+              ;; compute the same winner, and the loser knows it lost. A
+              ;; generation comparison is NOT symmetric -- this side
+              ;; compares against the generation in ITS table, which the
+              ;; dialer cannot know -- so an early welcome tells a peer it
+              ;; is connected and then drops it. That peer installs, emits
+              ;; a node-up, then reads the close as a node-down: one pair
+              ;; of events for a connection that was never accepted. The
+              ;; rule says refuse, close, and notify nothing, and the last
+              ;; of those three is only half true if the far end has
+              ;; already been welcomed.
+              ;;
+              ;; Installing before writing is safe in the other direction
+              ;; too: a replacement closes the OLD connection, never this
+              ;; one, so the welcome still goes out on a connection that
+              ;; is open. If the write fails, the entry we just published
+              ;; has to go with it -- remove-peer! is guarded on this
+              ;; connection's identity, so it removes ours and nobody
+              ;; else's.
               (if (installed? (install-peer! peer c peer (list-ref d 5)
                                              (list-ref d 6) #f))
-                  (run-link c peer buf)
+                  (if (write-frame! c
+                        (list 'welcome (symbol->string self-name)
+                              (proof-a nonce-b (symbol->string self-name)
+                                       self-boot-id)))
+                      (run-link c peer buf)
+                      (remove-peer! peer c))
                   (tcp-close! c))))))))         ; lost the tie-break
 
   ;; ---- dial side --------------------------------------------------------------
