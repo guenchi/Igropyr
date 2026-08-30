@@ -27,7 +27,8 @@
           tcp-close!
           conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
           conn-on-close!
-          conn-state conn-count uv-strerror)
+          conn-state conn-count uv-owner-index-count uv-live-handle-count
+          uv-strerror)
   (import (chezscheme) (igropyr platform))
 
   ;; Shared objects must be loaded before the foreign-procedure
@@ -281,6 +282,20 @@
   ;; Still a superset, not the truth: a resource handed on to another owner
   ;; leaves its entry behind under the old one, and uv-owner-died! re-checks
   ;; every candidate against the real owner before touching it.
+  ;; Total entries across every owner. Exported for the same reason as
+  ;; conn-count and fs-count: a registration that is never paired with a
+  ;; removal has no symptom other than growth, and growth cannot be shown
+  ;; to have stopped without a number to compare. It counts entries, not
+  ;; owners -- one owner with a thousand stale registrations is the shape
+  ;; this is here to catch, and an owner count would read as 1.
+  (define (uv-owner-index-count)
+    (with-interrupts-disabled
+      (let-values (((ks vs) (hashtable-entries owner-index)))
+        (let loop ((i 0) (n 0))
+          (if (fx= i (vector-length vs))
+              n
+              (loop (fx+ i 1) (fx+ n (length (vector-ref vs i)))))))))
+
   (define (unindex-owner! owner kind key)
     (when owner
       (let ((xs (hashtable-ref owner-index owner '())))
@@ -782,6 +797,20 @@
       (lambda (req status)
         (let ((entry (hashtable-ref connect-table req #f)))
           (hashtable-delete! connect-table req)
+          ;; THE OTHER HALF OF index-owner!. Registering the request
+          ;; against its owner and never taking it back left one entry
+          ;; per connect on that owner's list, for the life of the
+          ;; process -- a connector that reconnects on a timer grows it
+          ;; without bound, and teardown walks all of it. There is no
+          ;; symptom before that: the entry names a request that is
+          ;; gone, and the teardown branch for it looks the request up
+          ;; and finds nothing. A missing entry is silent, and so is a
+          ;; surplus one.
+          ;;
+          ;; #f owner means uv-owner-died! already emptied that owner's
+          ;; list, so there is nothing left to remove.
+          (when (and entry (cdr entry))
+            (unindex-owner! (cdr entry) 'connect req))
           (foreign-free req)
           (when entry
             (let ((handle (car entry)) (owner (cdr entry)))
@@ -802,6 +831,19 @@
                      (hashtable-set! conn-table handle c))
                    (deliver owner (vector 'tcp-connected c)))))))))
       (void* int)
+      void))
+
+  ;; walk_cb: counts. uv_walk is the only way to ask libuv how many
+  ;; handles the loop is holding, and that question has no answer
+  ;; anywhere on the Scheme side -- a handle that was initialised and
+  ;; then abandoned is in no table here, so nothing short of asking the
+  ;; loop can see it. Without this, "the handle is not leaked" is a
+  ;; sentence with no measurement behind it.
+  (define walk-tally 0)
+  (define on-walk-code
+    (foreign-callable
+      (lambda (handle arg) (set! walk-tally (fx+ walk-tally 1)))
+      (void* void*)
       void))
 
   ;; timer_cb for the poll wakeup timer: exists only to bound the
@@ -1173,10 +1215,11 @@
       (lock-object on-fs-code)
       (lock-object on-fsw-code)
       (lock-object on-timer-code)
+      (lock-object on-walk-code)
       (vector on-alloc-code on-read-code on-close-code
               on-write-code on-connection-code on-connect-code
               on-getaddrinfo-code on-fs-code on-fsw-code
-              on-timer-code)))
+              on-timer-code on-walk-code)))
 
   (define on-fsw-entry (foreign-callable-entry-point on-fsw-code))
   (define on-alloc-entry (foreign-callable-entry-point on-alloc-code))
@@ -1188,6 +1231,19 @@
   (define on-getaddrinfo-entry (foreign-callable-entry-point on-getaddrinfo-code))
   (define on-fs-entry (foreign-callable-entry-point on-fs-code))
   (define on-timer-entry (foreign-callable-entry-point on-timer-code))
+  (define on-walk-entry (foreign-callable-entry-point on-walk-code))
+
+  (define uv-walk-c
+    (foreign-procedure "uv_walk" (void* void* void*) void))
+
+  ;; Every handle the loop still holds, counted. Includes the internal
+  ;; wakeup timer, so the number is compared against a baseline taken in
+  ;; the same process rather than against zero.
+  (define (uv-live-handle-count)
+    (with-interrupts-disabled
+      (set! walk-tally 0)
+      (uv-walk-c uv-loop on-walk-entry 0)
+      walk-tally))
 
   ;; ---- public API ----------------------------------------------------
 
@@ -1219,13 +1275,29 @@
   (define (tcp-listen! host port backlog on-accept . opts)
     (with-interrupts-disabled          ; shared sockaddr-buf: see tcp-connect!
     (let ((flags (if (pair? opts) (car opts) 0))
-          (l (foreign-alloc tcp-handle-size)))
-      (check 'uv-tcp-init (uv-tcp-init uv-loop l))
-      (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
-      (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf flags))
-      (check 'uv-listen (uv-listen l backlog on-connection-entry))
-      (hashtable-set! listener-table l on-accept)
-      l)))
+          (l (foreign-alloc tcp-handle-size))
+          (inited? #f))
+      ;; EVERY ONE OF THESE FOUR CAN FAIL, and one of them fails as a
+      ;; matter of routine: a bind onto a port somebody else already
+      ;; holds. Without this the handle allocated above is simply
+      ;; abandoned -- and once uv_tcp_init has run it is not just memory,
+      ;; it is a handle registered with the loop that nothing will ever
+      ;; close. A server that retries its bind leaks one per attempt.
+      ;;
+      ;; Which release is right depends on how far we got: before init
+      ;; the block is plain memory and is freed here; after it, the
+      ;; handle belongs to libuv and has to go out through uv_close,
+      ;; whose callback frees the block. Getting that backwards frees
+      ;; memory the loop still holds a pointer to.
+      (guard (e (#t (if inited? (uv-close l on-close-entry) (foreign-free l))
+                    (raise e)))
+        (check 'uv-tcp-init (uv-tcp-init uv-loop l))
+        (set! inited? #t)
+        (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
+        (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf flags))
+        (check 'uv-listen (uv-listen l backlog on-connection-entry))
+        (hashtable-set! listener-table l on-accept)
+        l))))
 
   ;; Stop accepting new connections (graceful shutdown step 1);
   ;; established connections are unaffected. With a listener handle
@@ -1444,15 +1516,39 @@
     (with-interrupts-disabled
     (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
     (let ((h (foreign-alloc tcp-handle-size))
-          (req (foreign-alloc connect-req-size)))
-      (check 'uv-tcp-init (uv-tcp-init uv-loop h))
-      (hashtable-set! connect-table req (cons h owner))
-      (index-owner! owner 'connect req)
-      (let ((r (uv-tcp-connect req h sockaddr-buf on-connect-entry)))
-        (when (< r 0)
+          (inited? #f)
+          (req #f)
+          (indexed? #f))
+      ;; WHAT HAS BEEN TAKEN SO FAR, AND NOTHING ELSE. Each flag is set
+      ;; immediately after the step that makes the resource ours, so the
+      ;; release below never guesses: it undoes exactly what happened.
+      ;; The alternative -- one cleanup that assumes the common case --
+      ;; is what turns a failure in the middle into either a leak or a
+      ;; double free, depending on where it stopped.
+      ;;
+      ;; It runs at most once. The guard re-raises after releasing, and
+      ;; the synchronous-failure path below runs it only after the guard
+      ;; has already been left behind.
+      (define (release!)
+        (when indexed?
+          (unindex-owner! owner 'connect req)
+          (set! indexed? #f))
+        (when req
           (hashtable-delete! connect-table req)
           (foreign-free req)
-          (uv-close h on-close-entry)
+          (set! req #f))
+        (if inited? (uv-close h on-close-entry) (foreign-free h))
+        (set! inited? #f))
+      (let ((r (guard (e (#t (release!) (raise e)))
+                 (check 'uv-tcp-init (uv-tcp-init uv-loop h))
+                 (set! inited? #t)
+                 (set! req (foreign-alloc connect-req-size))
+                 (hashtable-set! connect-table req (cons h owner))
+                 (index-owner! owner 'connect req)
+                 (set! indexed? #t)
+                 (uv-tcp-connect req h sockaddr-buf on-connect-entry))))
+        (when (< r 0)
+          (release!)
           (error 'tcp-connect! (uv-strerror r)))
         #t))))
 
