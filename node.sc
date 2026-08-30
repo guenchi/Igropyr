@@ -3193,6 +3193,70 @@
           (atomically (hashtable-delete! peers-auth peer))
           (next-dial-gen! peer)
           (loop))
+        (`#(disconnect ,peer)
+          (let ((p (atomically
+                     (let ((e (hashtable-ref connectors peer #f)))
+                       (hashtable-delete! connectors peer)
+                       (and e (vector-ref e 0))))))
+            (when (and p (process-alive? p)) (send p (vector 'node-stop))))
+          (atomically (hashtable-delete! peers-auth peer))
+          (next-dial-gen! peer)
+          (let ((e (peer-entry peer)))
+            (when e (send (entry-link e) (vector 'node-stop))))
+          (loop))
+        ;; The endpoint change, in the order the design calls (0)-(4).
+        ;; The steps are numbered there and named here so the two can be
+        ;; read against each other.
+        (`#(set-endpoint ,peer ,host ,port)
+          (let* ((cur (atomically (hashtable-ref connectors peer #f)))
+                 (same? (and cur (process-alive? (vector-ref cur 0))
+                             (string=? (vector-ref cur 1) host)
+                             (equal? (vector-ref cur 2) port))))
+            (if same?
+                ;; The base case, and it has to stay one: asking for the
+                ;; endpoint that is already being dialled must not tear
+                ;; down a working link to rebuild the same thing.
+                (void)
+                (let* ((old-conn (atomically   ; (0) take, then forget
+                                   (let ((e (hashtable-ref connectors peer #f)))
+                                     (hashtable-delete! connectors peer)
+                                     (and e (vector-ref e 0)))))
+                       (ent (peer-entry peer))
+                       ;; (2) HAS A BRANCH. A child holding a connection
+                       ;; THIS node dialled is dialling the old endpoint
+                       ;; and must go. A child holding a connection the
+                       ;; PEER dialled to us is not ours to end: the
+                       ;; endpoint being changed is the one we dial, and
+                       ;; the inbound link is unaffected by it. Killing it
+                       ;; would drop a working link to change an address
+                       ;; nobody was using for it.
+                       (outbound? (and ent (eq? (entry-dialer ent) self-name))))
+                  ;; (1) the old connector, by the pid taken in (0) --
+                  ;; never from a parent's private state, which is what
+                  ;; made this unimplementable when the pid lived there.
+                  (when (and old-conn (process-alive? old-conn))
+                    (kill old-conn 'endpoint-changed))
+                  ;; (3) the teardown consequences, reached the same way
+                  ;; an ordinary death reaches them: stop-link! closes
+                  ;; first and then wakes, and the link's own exit path
+                  ;; runs remove-peer!, which is the one place those five
+                  ;; consequences live. Reimplementing them here would be
+                  ;; a second copy that drifts.
+                  (when outbound?
+                    (stop-link! (entry-conn ent) (entry-link ent)
+                                'endpoint-changed))
+                  ;; the old permission ends with the old endpoint, so the
+                  ;; next one carries a new generation
+                  (atomically (hashtable-delete! peers-auth peer))
+                  (next-dial-gen! peer)
+                  ;; (4) publish the new mapping and the connector that
+                  ;; serves it in one region, so nothing can observe a
+                  ;; mapping with no connector or the reverse.
+                  (atomically
+                    (hashtable-set! connectors peer
+                      (vector (spawn (lambda () (connector peer host port)))
+                              host port))))))
+          (loop))
         (`#(node-stop) (void)))))
 
   ;; -> the generation this attempt is authorised under, or #f. The
@@ -3400,42 +3464,28 @@
     ;; was considered "already dialing" forever, so it went on retrying the
     ;; old host after the new one had been published. The link never came
     ;; back, and nothing said why.
-    (let ((stale
-            (atomically
-              (let ((e (hashtable-ref connectors peer #f)))
-                (cond
-                  ;; already dialing this exact endpoint: leave it alone
-                  ((and e (process-alive? (vector-ref e 0))
-                        (string=? (vector-ref e 1) host)
-                        (equal? (vector-ref e 2) port))
-                   #f)
-                  (else
-                   (hashtable-set! connectors peer
-                     (vector (spawn (lambda () (connector peer host port)))
-                             host port))
-                   ;; a live connector for a DIFFERENT endpoint must stop,
-                   ;; or two of them dial the same name in parallel
-                   (and e (process-alive? (vector-ref e 0))
-                        (vector-ref e 0))))))))
-      (when stale
-        ;; The old permission dies with the connector that held it, and
-        ;; the next one gets a new generation -- that is what makes a
-        ;; connection dialled to the NEW endpoint outrank one still being
-        ;; established to the old.
-        (when registrar (send registrar (vector 'auth-revoke peer)))
-        (kill stale 'endpoint-changed)))
+    ;; THE CHANGE GOES THROUGH THE REGISTRAR, and that is the whole point
+    ;; of it having a mailbox. Two endpoint changes racing here used to be
+    ;; able to interleave -- A kills the old connector and has not spawned
+    ;; yet, B sees none and spawns its own, A resumes and spawns over it
+    ;; -- and the endpoint that survived was not necessarily the one asked
+    ;; for last. A mailbox is a total order for free.
+    (unless registrar
+      (assertion-violation 'node-connect! "call node-start! first" peer))
+    (send registrar (vector 'set-endpoint peer host port))
     (void))
 
   ;; Stop dialing and drop the live link, if any.
+  ;;
+  ;; THROUGH THE REGISTRAR, for the same reason node-connect! is: this
+  ;; changes who may dial the peer, and every such change has to be in
+  ;; one order with the others. Writing the connector table here as well
+  ;; would give it a second writer, and a second writer is exactly the
+  ;; interleaving the mailbox exists to rule out -- a disconnect landing
+  ;; between an endpoint change's take and its publish would be undone by
+  ;; the publish.
   (define (node-disconnect! peer)
-    (let ((p (atomically
-               (let ((e (hashtable-ref connectors peer #f)))
-                 (hashtable-delete! connectors peer)
-                 (and e (vector-ref e 0))))))
-      (when (and p (process-alive? p)) (send p (vector 'node-stop))))
-    (when registrar (send registrar (vector 'auth-revoke peer)))
-    (let ((e (peer-entry peer)))
-      (when e (send (entry-link e) (vector 'node-stop))))
+    (when registrar (send registrar (vector 'disconnect peer)))
     (void))
 
   ;; Tune this node's ceilings, in order: the max serve-rcall processes in
