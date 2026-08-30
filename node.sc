@@ -697,6 +697,11 @@
   (define (reaper-pid) (whereis reaper-name))
 
   (define reaper-warden #f)
+  ;; The warden carries a registered name for the same reason its child
+  ;; does: the two branches below that report a mistake can only be shown
+  ;; to work by a harness that can put a message in front of them, and a
+  ;; guard nobody can reach is a sentence, not a mechanism.
+  (define warden-name 'igropyr-node-warden)
   (define reaper-chunk 64)
 
   ;; Re-establish watches from the global chain, in bounded pieces.
@@ -791,44 +796,128 @@
   ;;     this process is critical, so the node stops loudly;
   ;;   - say every restart out loud, with the count, so a node that is
   ;;     limping is visible before it reaches the limit.
-  (define reaper-restart-window-ms 60000)
-  (define reaper-restart-max 5)
-  (define reaper-restart-cap-ms 1000)
+  (define child-restart-window-ms 60000)
+  (define child-restart-max 5)
+  (define child-restart-cap-ms 1000)
 
-  (define (warden-loop)
-    (let loop ((deaths (list)) (delay 0))
-      (let ((r (spawn reaper-loop)))
-        (monitor r)
+  ;; ---- the warden ------------------------------------------------------
+  ;;
+  ;; IT MONITORS A LIST OF CHILDREN, RESTARTS THEM, AND LETS EACH ONE
+  ;; REBUILD ITSELF. Three verbs, and it may never acquire a fourth: this
+  ;; process is critical, so anything added here has to earn that again.
+  ;; Going from one child to several changed how many things it watches
+  ;; and not what it does with them, which is why the bar it was held to
+  ;; still holds.
+  ;;
+  ;; What is fail-stop here is the warden, never a child. A child failing
+  ;; is recovered from; losing the thing that recovers is not, and that
+  ;; thing is a page with no business logic in it.
+  ;;
+  ;; EACH CHILD IS THROTTLED SEPARATELY. A shared count would let a healthy
+  ;; child's restarts dilute a sick one's, and the give-up rule -- so many
+  ;; deaths inside a window means the problem is not transient -- would
+  ;; then never fire for the child that actually cannot start.
+  ;;
+  ;; A child spec is #(name start-thunk consequence), where consequence is
+  ;; the sentence an operator needs: what stops working while this child
+  ;; is down. It is part of the spec rather than the message so that
+  ;; giving up names the child that gave up -- a precise fail-stop
+  ;; reported under the wrong name is worse than none.
+  (define (child-name c) (vector-ref c 0))
+  (define (child-thunk c) (vector-ref c 1))
+  (define (child-consequence c) (vector-ref c 2))
+
+  (define (warden-loop specs)
+    (let* ((v (list->vector specs))
+           (n (vector-length v))
+           (pids (make-vector n #f))
+           (deaths (make-vector n (list)))
+           (delays (make-vector n 0)))
+      (define (start! i)
+        (let ((p (spawn (child-thunk (vector-ref v i)))))
+          (vector-set! pids i p)
+          (monitor p)))
+      (define (index-of p)
+        (let loop ((i 0))
+          (cond ((fx= i n) #f)
+                ((eq? (vector-ref pids i) p) i)
+                (else (loop (fx+ i 1))))))
+      (register warden-name self)
+      (let init ((i 0)) (when (fx< i n) (start! i) (init (fx+ i 1))))
+      (let loop ()
         (receive
-          (`#(DOWN ,@r ,reason)
-            (let* ((now (now-ms))
-                   (recent (cons now
-                                 (filter (lambda (t)
-                                           (> t (- now reaper-restart-window-ms)))
-                                         deaths)))
-                   (n (length recent)))
-              (display (string-append
-                         "igropyr node: reaper exited ("
-                         (claimed-version-text reason)
-                         "); restart " (number->string n) " of at most "
-                         (number->string reaper-restart-max) " in "
-                         (number->string (quotient reaper-restart-window-ms 1000))
-                         "s\n")
-                       (current-error-port))
-              (when (fx>= n reaper-restart-max)
-                (display (string-append
-                           "igropyr node: the reaper has not stayed up "
-                           (number->string n)
-                           " restarts running; this is not transient and"
-                           " hosted-monitor credit is no longer being"
-                           " returned. Stopping the node.\n")
-                         (current-error-port))
-                (raise (list 'reaper-will-not-start n)))
-              (when (fx> delay 0) (sleep-ms delay))
-              (loop recent
-                    (fxmin reaper-restart-cap-ms
-                           (if (fx= delay 0) 50 (fx* delay 2))))))
-          (`#(node-stop) (when (process-alive? r) (send r (vector 'node-stop))))))))
+          (`#(DOWN ,p ,reason)
+            (let ((i (index-of p)))
+              (if (not i)
+                  ;; A DOWN for something we are not managing. It costs
+                  ;; nothing to handle and it says our dispatch is wrong,
+                  ;; so it gets said out loud: a silent branch here would
+                  ;; turn a bookkeeping bug into a state that never shows
+                  ;; up anywhere -- no error, no loss, just a warden that
+                  ;; has quietly stopped watching something.
+                  (display (string-append
+                             "igropyr node: warden saw a DOWN from a process "
+                             "it does not manage (" (claimed-version-text reason)
+                             "); this means a child was started or replaced "
+                             "outside the warden\n")
+                           (current-error-port))
+                (let* ((spec (vector-ref v i))
+                       (nm (symbol->string (child-name spec)))
+                       (now (now-ms))
+                       (recent (cons now
+                                     (filter (lambda (t)
+                                               (> t (- now child-restart-window-ms)))
+                                             (vector-ref deaths i))))
+                       (k (length recent)))
+                  (vector-set! deaths i recent)
+                  (display (string-append
+                             "igropyr node: " nm " exited ("
+                             (claimed-version-text reason)
+                             "); restart " (number->string k) " of at most "
+                             (number->string child-restart-max) " in "
+                             (number->string (quotient child-restart-window-ms 1000))
+                             "s\n")
+                           (current-error-port))
+                  (when (fx>= k child-restart-max)
+                    (display (string-append
+                               "igropyr node: " nm " has not stayed up "
+                               (number->string k)
+                               " restarts running; this is not transient and "
+                               (child-consequence spec)
+                               ". Stopping the node.\n")
+                             (current-error-port))
+                    (raise (list 'child-will-not-start (child-name spec) k)))
+                  (let ((d (vector-ref delays i)))
+                    (when (fx> d 0) (sleep-ms d))
+                    (vector-set! delays i
+                      (fxmin child-restart-cap-ms
+                             (if (fx= d 0) 50 (fx* d 2)))))
+                  (start! i))))
+            (loop))
+          ;; EVERY CHILD, not the first one. Missing one here produces no
+          ;; symptom at all: a child outlives the node's shutdown and
+          ;; nothing is watching for that.
+          (`#(node-stop)
+            (let stop ((i 0))
+              (when (fx< i n)
+                (let ((p (vector-ref pids i)))
+                  (when (and p (process-alive? p)) (send p (vector 'node-stop))))
+                (stop (fx+ i 1)))))
+          ;; Anything else. THIS CLAUSE MUST STAY LAST: it is a bare
+          ;; identifier, which match-msg treats as a catch-all, so moving
+          ;; it up one line silently swallows every clause below it. The
+          ;; clause list is source order and there is nowhere to hang an
+          ;; assertion on it, so this sentence is the whole guard -- if
+          ;; the warden ever grows a third message, add it above here.
+          ;;
+          ;; Without this clause an unrecognised message is
+          ;; not an error -- it simply stays in the mailbox, and the next
+          ;; one after it, forever. That is a leak whose only symptom is
+          ;; memory, which is to say no symptom at all until it is large.
+          (other
+            (display "igropyr node: warden discarded an unrecognised message\n"
+                     (current-error-port))
+            (loop))))))
 
   (define (retire-agent-locked! key)             ; caller already holds the region
     (let ((r (hashtable-ref callee-agents key #f)))
@@ -1395,11 +1484,31 @@
                       ;; current one. Both questions are asked by the
                       ;; receiver, so both answers travel with the message.
                       (vector what name (w-token w) seq)
-                      ;; Unchanged, and it has to stay unchanged: an older
-                      ;; subscriber is entitled to exactly what it has
-                      ;; always received. This is the half worth guarding
-                      ;; -- a new shape that is wrong gets noticed, an old
-                      ;; shape that quietly grew a field does not.
+                      ;; Unchanged, and it has to stay unchanged: the
+                      ;; SHAPE an older subscriber receives is exactly the
+                      ;; shape it has always received. That is the whole
+                      ;; promise, and it is deliberately smaller than it
+                      ;; reads -- a new shape that is wrong gets noticed,
+                      ;; an old shape that quietly grew a field does not.
+                      ;;
+                      ;; THE COUNT IS NOT PROMISED. Delivery is at least
+                      ;; once: a node is taken off the queue only after it
+                      ;; has been handed to everyone, so a dispatcher that
+                      ;; dies mid-fan-out is succeeded by one that starts
+                      ;; the same node again. A token holder can absorb
+                      ;; that -- the token and the sequence number are in
+                      ;; its message. This branch carries neither, so an
+                      ;; older subscriber has nothing to deduplicate with
+                      ;; and WILL see the repeat.
+                      ;;
+                      ;; The fix is not to widen this vector. Widening it
+                      ;; is the exact change the paragraph above forbids,
+                      ;; and it would break every existing receiver to
+                      ;; spare it a duplicate it can also just tolerate.
+                      ;; It is declared instead, and the declaration is
+                      ;; carried in the breaking-surface list rather than
+                      ;; here, because a consumer decides what to do about
+                      ;; it and consumers do not read this file.
                       (vector what name)))
           (drop-watcher! name w))))
 
@@ -4143,8 +4252,12 @@
     ;; The warden starts with the node and is marked critical: it is the
     ;; root the reaper's recoverability hangs from, so its own death is
     ;; not something to survive quietly.
-    (set! reaper-warden (spawn warden-loop))
-    (critical! reaper-warden 'node-reaper-warden)
+    (set! reaper-warden
+      (spawn (lambda ()
+               (warden-loop
+                 (list (vector 'reaper reaper-loop
+                              "hosted-monitor credit is no longer being returned"))))))
+    (critical! reaper-warden 'node-warden)
     (when (pair? rest)
       (let ((port (car rest))
             (host (if (pair? (cdr rest)) (cadr rest) "127.0.0.1")))
