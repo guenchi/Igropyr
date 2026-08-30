@@ -1122,6 +1122,78 @@
                         (node-monitor-stats)))
                 (else (sleep-ms 250) (loop (- tries 1))))))
       (display "S3 warden cell passed\n"))
+    ;; ---- S3: eviction conserves the credit ----------------------------
+    ;; Admission pays for a record once, and that payment covers it from
+    ;; arming until its DOWN -- across both phases. So eviction, which
+    ;; moves a whole peer's chain from active to retiring in one splice,
+    ;; must not change `accounted` at all: it applies for nothing and can
+    ;; therefore not fail.
+    ;;
+    ;; ⚠️ WHAT THIS CELL DOES NOT WITNESS: retiring > 0. The whole
+    ;; eviction -- splice, the walk that tells each agent to go, their
+    ;; exits, and the reaper's DOWNs -- fits in one scheduling turn, and a
+    ;; sampling loop is another green thread in that same scheduler: its
+    ;; first sleep hands the entire sequence away. The intermediate state
+    ;; is not "brief", it is unreachable from here. Conservation is
+    ;; checked across the eviction instead of inside it, which is the
+    ;; property that matters; the non-zero half is unwitnessed and is
+    ;; recorded as such rather than asserted with a sleep that would pass
+    ;; for the wrong reason.
+    (let ()
+      (define (stat k)
+        (let ((st (node-monitor-stats)))
+          (let ((e (assq k st)))
+            (cond (e (cdr e))
+                  (else (let ((ph (assq 'phases st)))
+                          (and ph (let ((q (assq k (cdr ph)))) (and q (cdr q))))))))))
+      (let ((me self) (ref (gensym)))
+        (spawn
+          (lambda ()
+            (let ((c (handshake-as! "evictpeer" "s3-evict")))
+              (register 'evict-victim
+                (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
+              ;; TWO, not more: this suite runs with the hosting ceiling
+              ;; set to 2 (node-set-limits! 64 2 near the top), so a
+              ;; larger number here would be refused and the cell would
+              ;; be measuring the ceiling instead of the eviction
+              (let arm ((i 0))
+                (when (< i 2)
+                  (tcp-write! c (frame-bytes
+                                  (list 'mon 'evict-victim (+ 8100 i))) #f)
+                  (sleep-ms 60)
+                  (arm (+ i 1))))
+              (sleep-ms 600)
+              (send me (vector ref (stat 'accounted)))
+              ;; dropping the link evicts the whole per-peer chain
+              (tcp-close! c))))
+        (receive (after 15000 (fail! "s3-evict" 'timeout))
+          (`#(,@ref ,armed)
+            (unless (and armed (= armed 2))
+              (fail! "s3-evict" 'arming-count armed (node-monitor-stats))))))
+      ;; ⚠️ MEASURED SCOPE: taking the evicted nodes off the GLOBAL chain
+      ;; as well leaves this cell green. The walk tells each agent to go,
+      ;; the agent exits, and the reaper returns the credit from its
+      ;; DOWN -- none of which reads that chain. What the global chain
+      ;; buys is the restart path: a reaper that comes back walks it to
+      ;; re-establish the watches it inherited, and a node missing from
+      ;; it is one it can never see again. That property belongs to the
+      ;; warden cell above, which does kill the reaper; this cell does
+      ;; not stand behind it.
+      ;;
+      ;; after the eviction has drained, every reading returns to zero.
+      ;; A record left on a per-peer chain, or credit returned by an exit
+      ;; branch a killed agent never runs, shows up here and nowhere else.
+      (let loop ((tries 60))
+        (cond ((and (eqv? (stat 'accounted) 0)
+                    (eqv? (stat 'mon-chain) 0)
+                    (eqv? (stat 'active) 0)
+                    (eqv? (stat 'retiring) 0))
+               (void))
+              ((zero? tries)
+               (fail! "s3-eviction-must-drain" (node-monitor-stats)))
+              (else (sleep-ms 250) (loop (- tries 1)))))
+      (display "S3 eviction cell passed\n"))
+
 
 
 
