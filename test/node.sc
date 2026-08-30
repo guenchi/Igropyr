@@ -2168,6 +2168,54 @@
     (unless (memq 'b (node-peers)) (fail! "peers-missing-b"))
     (display "handshake + node-up ok\n")
 
+    ;; ---- a restart replays what was not finished, and ONLY that ---------
+    ;; The deliverer is a supervised process now, so "it was delivered"
+    ;; and "it is off the queue" are two moments with a gap between them,
+    ;; and a successor picks up whatever sits in that gap. This cell is
+    ;; about the other side of that promise: an event that finished must
+    ;; not come back.
+    ;;
+    ;; The at-least-once half is cheap to satisfy by replaying everything,
+    ;; and a suite that only checks "it arrived" would be perfectly happy
+    ;; with a dispatcher that redelivers the whole queue on every restart
+    ;; -- a legacy subscriber has no token and no number, so for it a
+    ;; second copy is indistinguishable from a second event.
+    ;;
+    ;; The kill lands AFTER delivery completed: node-up for b was received
+    ;; above, so that event is done and gone. Anything arriving now was
+    ;; invented by the restart.
+    ;;
+    ;; ⚠️ NO DEMONSTRATED DISCRIMINATING POWER, and saying so is the
+    ;; point. A completed event is unlinked from its head, so under this
+    ;; implementation there is nothing left for a successor to replay --
+    ;; the failure this cell describes is not reachable by mutating the
+    ;; code as it stands. The one mutation that produces a repeat at all
+    ;; (never marking an event done) is caught several cells earlier, by
+    ;; the orphan chain refusing to empty, so its red never reaches here.
+    ;;
+    ;; It is kept as a guard against the cheap way to satisfy at least
+    ;; once: replaying more than the unfinished head after a restart. A
+    ;; legacy subscriber carries neither token nor number, so for it a
+    ;; second copy and a second event are the same message, and a suite
+    ;; that only ever checks "it arrived" would accept either. That the
+    ;; guard cannot fail today is a fact about today's implementation,
+    ;; not evidence that the property is being enforced.
+    (let ((d (whereis 'igropyr-node-dispatcher)))
+      (unless d (fail! "s4-dispatcher-not-registered"))
+      (kill d 'restart-under-test)
+      ;; the warden has to put a DIFFERENT process under the same name;
+      ;; asserting only that the name resolves would pass while the dead
+      ;; pid is still registered
+      (let wait ((i 0))
+        (let ((d2 (whereis 'igropyr-node-dispatcher)))
+          (cond ((and d2 (not (eq? d2 d))) 'ok)
+                ((> i 400) (fail! "s4-dispatcher-not-restarted"))
+                (else (sleep-ms 25) (wait (+ i 1))))))
+      (receive (after 1500 'ok)
+        (`#(node-up b) (fail! "s4-restart-replayed-a-completed-event"))
+        (`#(node-down b) (fail! "s4-restart-invented-a-down"))))
+    (display "a dispatcher restart replays nothing that finished ok\n")
+
     ;; round-trip: extended payload must cross bit-intact both ways
     (let ((payload (vector 'blob (bytevector 0 127 255) 3.25 1/3 '(a . b))))
       (unless (rsend 'b 'svc (vector 'add1 41 payload))
