@@ -580,6 +580,47 @@
     (mon-unlink-peer! r)
     (mon-unlink-global! r))
 
+  ;; EVICTION IS ONE POINTER OPERATION. The whole of a peer's chain leaves
+  ;; in a single step and the head row goes with it; the nodes are dealt
+  ;; with afterwards, outside, where the scheduler can interrupt. Sending
+  ;; each agent its notice inside the region would put a walk proportional
+  ;; to one peer's parked monitors in a place nothing can interrupt, which
+  ;; is exactly the shape a peer could aim at by parking as many as the
+  ;; ceiling allows.
+  ;;
+  ;; The nodes stay on the GLOBAL chain, deliberately. That is what makes
+  ;; them still visible to the reaper, so their DOWNs arrive and their
+  ;; permits come back; a node off both chains would be one the reaper can
+  ;; never see. Being on the global chain and not on a peer's is the state
+  ;; this design calls retiring.
+  ;;
+  ;; -> the first node, or #f. Caller walks it via agent-pnext.
+  (define (mon-splice-peer! peer)
+    (let ((head (hashtable-ref mon-heads peer #f)))
+      (when head (hashtable-delete! mon-heads peer))
+      head))
+
+  ;; Retiring: on the global chain, off its peer's. Derived rather than
+  ;; counted, because the alternative is decrementing one counter and
+  ;; incrementing another for every node of a spliced chain -- inside the
+  ;; region, which is the O(N) this arrangement exists to avoid.
+  ;; BOTH NUMBERS FROM ONE WALK. Two walks would each be honest and the
+  ;; pair could still be impossible -- a node retiring between them counts
+  ;; in neither, and the sum stops matching the permit count. The claim
+  ;; being checked from outside is that eviction moves nodes between the
+  ;; two phases WITHOUT changing their total, and a pair taken at two
+  ;; instants cannot check that.
+  ;;
+  ;; -> (values active retiring)
+  (define (mon-phase-counts)
+    (let loop ((r mon-chain) (a 0) (t 0))
+      (cond
+        ((not r) (values a t))
+        ((or (agent-pprev r)
+             (eq? (hashtable-ref mon-heads (agent-peer r) #f) r))
+         (loop (agent-gnext r) (fx+ a 1) t))
+        (else (loop (agent-gnext r) a (fx+ t 1))))))
+
   ;; For assertions from outside: how many nodes each chain holds.
   (define (mon-chain-length)
     (let loop ((r mon-chain) (n 0)) (if r (loop (agent-gnext r) (fx+ n 1)) n)))
@@ -1143,6 +1184,12 @@
                           (loop (fx+ i 1)
                                 (fx+ n (mon-peer-chain-length
                                          (vector-ref ks i))))))))
+            ;; active and retiring come from ONE walk, so their sum can be
+            ;; compared against the permit count meaningfully: the property
+            ;; worth checking is that eviction moves nodes between the two
+            ;; without changing the total.
+            (let-values (((a t) (mon-phase-counts)))
+              (cons 'phases (list (cons 'active a) (cons 'retiring t))))
             (cons 'accounted (accounted-monitors))
             ;; watcher PIDS, not names: the leak this exists to make
             ;; visible is pids piling up under one name, which a count of
@@ -2349,11 +2396,17 @@
   ;; that connects, parks monitors, and drops -- over and over -- would
   ;; leak agents and eventually exhaust max-hosted-monitors.
   (define (drop-hosted-monitors! name)
-    (let-values (((keys agents) (atomically (hashtable-entries callee-agents))))
-      (vector-for-each
-        (lambda (k r)
-          (when (eq? (car k) name) (send (agent-pid r) (vector 'demon-local))))
-        keys agents)))
+    (let ((head (atomically (mon-splice-peer! name))))
+      (let walk ((r head))
+        (when r
+          ;; next FIRST: this node's own links are about to be cleared by
+          ;; whoever retires it, and reading them afterwards would walk
+          ;; into a node that is no longer anywhere.
+          (let ((next (agent-pnext r)))
+            (agent-pnext-set! r #f)
+            (agent-pprev-set! r #f)
+            (send (agent-pid r) (vector 'demon-local))
+            (walk next))))))
 
   ;; A REAL DEATH, and the queue has to outlive the entry it hangs on.
   ;; The entry goes in the same region that queues this peer's own
