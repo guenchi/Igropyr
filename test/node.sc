@@ -889,6 +889,108 @@
         (unless (zero? (node-orphan-count))
           (fail! "cv-1a-entry-outlives-link" 'orphan-leak
                  (node-orphan-count)))))
+
+    ;; ---- S2: replacement, seen from the side that LOSES ---------------
+    ;; Everything above asserts our own tables. A rule that says "refuse,
+    ;; close, notify nobody" has a second half that only the peer can
+    ;; see, and no assertion about our state can reach it: the frames we
+    ;; already put on the wire are the peer's evidence, not ours.
+    ;;
+    ;; This drives a real replacement by hand -- two inbound handshakes
+    ;; for one name -- which is also the only path in this suite that
+    ;; executes (R1) at all. A generation BELOW the installed one must be
+    ;; refused, and refusal means the loser never saw a welcome: a
+    ;; welcome makes a real dialer install, announce node-up, and then
+    ;; take the close as node-down, which is a pair of events out of
+    ;; nothing.
+    (let ()
+      (define (inbound-as! label gen)
+        ;; returns 'welcomed or 'closed, from the DIALER's chair
+        (let ((me self) (ref (gensym)))
+          (spawn
+            (lambda ()
+              (tcp-connect! "127.0.0.1" port self)
+              (receive (after 3000 (send me (vector ref 'no-connect)))
+                (`#(tcp-connected ,c)
+                  (tcp-read-start! c)
+                  (let ((d (read-frame-or-closed label)))
+                    (if (not (and (list? d) (= (length d) 4)))
+                        (send me (vector ref (list 'challenge-shape d)))
+                        (let ((nonce-a (cadr d)) (bootid-a (cadddr d))
+                              (nm (string-append "rep" (number->string gen))))
+                          (tcp-write! c (frame-bytes
+                                          (list 'hello nm
+                                                (v4-proof-d nonce-a nm
+                                                            probe-boot-id
+                                                            (number->string gen)
+                                                            wire-name-of-this-node
+                                                            bootid-a)
+                                                "beadbeadbeadbeadbeadbeadbeadbead"
+                                                4 probe-boot-id gen))
+                                      #f)
+                          (let ((w (read-frame-or-closed label)))
+                            (send me (vector ref
+                              (if (symbol? w) w
+                                  (if (and (list? w) (eq? (car w) 'welcome))
+                                      'welcomed 'other))))))))
+                  (tcp-close! c))
+                (`#(tcp-connect-failed ,e) (send me (vector ref 'no-connect))))))
+          (receive (after 9000 (fail! label 'probe-timeout))
+            (`#(,@ref ,what) what))))
+      (define (same-name-as! label gen)
+        (let ((me self) (ref (gensym)))
+          (spawn
+            (lambda ()
+              (tcp-connect! "127.0.0.1" port self)
+              (receive (after 3000 (send me (vector ref 'no-connect)))
+                (`#(tcp-connected ,c)
+                  (tcp-read-start! c)
+                  (let ((d (read-frame-or-closed label)))
+                    (if (not (and (list? d) (= (length d) 4)))
+                        (send me (vector ref (list 'challenge-shape d)))
+                        (let ((nonce-a (cadr d)) (bootid-a (cadddr d)))
+                          (tcp-write! c (frame-bytes
+                                          (list 'hello "repeat"
+                                                (v4-proof-d nonce-a "repeat"
+                                                            probe-boot-id
+                                                            (number->string gen)
+                                                            wire-name-of-this-node
+                                                            bootid-a)
+                                                "beadbeadbeadbeadbeadbeadbeadbead"
+                                                4 probe-boot-id gen))
+                                      #f)
+                          (let ((w (read-frame-or-closed label)))
+                            (send me (vector ref
+                              (if (symbol? w) w
+                                  (if (and (list? w) (eq? (car w) 'welcome))
+                                      'welcomed 'other))))))))
+                  (tcp-close! c))
+                (`#(tcp-connect-failed ,e) (send me (vector ref 'no-connect))))))
+          (receive (after 9000 (fail! label 'probe-timeout))
+            (`#(,@ref ,what) what))))
+      ;; the three names differ, so each handshake is a separate peer and
+      ;; the generation is the only thing under test here
+      (let ((first (inbound-as! "s2-rep-first" 7)))
+        (unless (eq? first 'welcomed)
+          (fail! "s2-replacement" 'first-not-welcomed first)))
+      ;; SAME NAME, so these two are a real (R1) replacement rather than
+      ;; two unrelated peers. A higher generation takes over; a LOWER one
+      ;; is the refusal whose second half only the loser can see.
+      (unless (eq? (same-name-as! "s2-rep-gen8" 8) 'welcomed)
+        (fail! "s2-replacement" 'higher-gen-not-welcomed))
+      (unless (eq? (same-name-as! "s2-rep-gen9" 9) 'welcomed)
+        (fail! "s2-replacement" 'replacement-not-welcomed))
+      ;; THE REFUSAL, ASSERTED FROM THE LOSER'S CHAIR. Design I8a says
+      ;; "refuse, close, notify nobody"; the second half is a claim about
+      ;; what the peer observes, so it can only be checked here. A
+      ;; welcome sent before the install decision makes a real dialer
+      ;; install, announce node-up, and then read the close as node-down
+      ;; -- a pair of events out of nothing, on a link that was never
+      ;; accepted.
+      (let ((loser (same-name-as! "s2-rep-stale" 6)))
+        (unless (eq? loser 'closed)
+          (fail! "s2-stale-gen-must-not-be-welcomed" loser)))
+      (display "S2 replacement cells passed\n"))
     (display "CV cells passed\n")
     (display "S2 registrar/container cells passed\n")
     ;; ==== end S2 ========================================================
