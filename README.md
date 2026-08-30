@@ -1273,6 +1273,19 @@ mirror Erlang distribution.
 (monitor-remote 'b 'worker)               ; -> #(remote-down b worker reason)
 ```
 
+`node-connect!` and `node-disconnect!` **return once the request is
+accepted, not once it has taken effect.** Both hand the change to an
+internal registrar whose mailbox orders such changes against each other,
+and return immediately. The promise has always been "start dialling",
+never "the link is up" — reconnection is a background loop. Wait for
+`#(node-up peer)` from `monitor-node` if you need the link, rather than
+for the call to return.
+
+> **Upgrading:** this narrowed in the same release as wire version 4. A
+> caller that dialled and then immediately inspected node state may now
+> observe it a moment earlier than the connector exists; nothing that
+> waited for `node-up` is affected.
+
 **Node names are wire syntax, not a local label.** A node name is
 non-empty, at most 255 characters, and drawn from `[0-9a-z-]` — lowercase
 letters, digits and the hyphen, which is legal in any position including

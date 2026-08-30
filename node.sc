@@ -10,6 +10,21 @@
 ;;;   (rsend 'b 'worker-pool #(job 42))         ; -> (whereis 'worker-pool) on b
 ;;;   (monitor-node 'b)                         ; -> #(node-up b) / #(node-down b)
 ;;;
+;;; NODE-CONNECT! AND NODE-DISCONNECT! RETURN WHEN THE REQUEST IS
+;;; ACCEPTED, NOT WHEN IT HAS TAKEN EFFECT. Both hand the change to the
+;;; registrar, whose mailbox is the order such changes happen in, and
+;;; return. The promise has always been "start dialling", never "the link
+;;; is up" -- reconnection is a background loop and a first connect could
+;;; never have meant a link existed. What did change is narrower and is
+;;; worth saying plainly: on return, the connector process for that peer
+;;; may not exist yet. Code that dialled and then immediately looked for
+;;; internal state saw it before; it now has to wait for what it actually
+;;; wants, which is #(node-up peer) from monitor-node.
+;;;
+;;; Waiting for the registrar here was considered and refused: it would
+;;; tie a public call's return to the scheduling delay of an internal
+;;; process, for a guarantee the call never made.
+;;;
 ;;; Semantics mirror Erlang distribution deliberately:
 ;;;   - addressing is by registered name, never by raw pid (pids are
 ;;;     memory objects; names survive restarts, pids don't)
@@ -3439,6 +3454,9 @@
     name)
 
   ;; Dial a peer (and keep dialing whenever the link is down).
+  ;;
+  ;; RETURNS ON ACCEPTANCE, NOT ON EFFECT -- see the note at the top of
+  ;; this file. The work is done by the registrar, in its order.
   (define (node-connect! peer host port)
     (unless self-name
       (assertion-violation 'node-connect! "call node-start! first" peer))
