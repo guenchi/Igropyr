@@ -151,7 +151,7 @@
           rsend rcall monitor-node demonitor-node node-peers
           monitor-remote demonitor-remote node-set-limits!
           node-monitor-stats node-outbound-stats reconnect-delay
-          submission-failure?)
+          submission-failure? node-install-rule-order)
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv) (igropyr sexpr)
           (igropyr gen-server)
@@ -590,12 +590,35 @@
         (list (cons 'conns (hashtable-size outbound))
               (cons 'bytes total)))))
 
+  ;; ---- the peers entry ----------------------------------------------
+  ;;
+  ;; SIX FIELDS BEHIND NAMES, and the names are the point. The entry used
+  ;; to be a bare three-slot vector read as `(vector-ref e 0)` all over
+  ;; this file -- and three other tables (rmonitors, connectors, the
+  ;; rsend-error report) are ALSO vectors read the same way, so a
+  ;; mechanical widening of "slot 0" would have edited them too. Naming
+  ;; the accessors makes the peers entry a type the reader can see, and
+  ;; leaves the other vectors visibly untouched.
+  ;;
+  ;; The entry is IMMUTABLE and replaced whole. That is not a style
+  ;; choice: the replacement sequence's atomic region swaps peers[name]
+  ;; in place precisely so the name never goes absent, and a mutable
+  ;; entry would let a reader see a half-updated one instead.
+  (define (make-entry conn link dialer boot-id gen head)
+    (vector conn link dialer boot-id gen head))
+  (define (entry-conn e)    (vector-ref e 0))
+  (define (entry-link e)    (vector-ref e 1))   ; the link process
+  (define (entry-dialer e)  (vector-ref e 2))   ; who dialled, for tie-break
+  (define (entry-boot-id e) (vector-ref e 3))   ; the peer's boot id, or #f
+  (define (entry-gen e)     (vector-ref e 4))   ; its dial generation, or #f
+  (define (entry-head e)    (vector-ref e 5))   ; topology queue head slot
+
   (define (peer-entry name)
     (atomically (hashtable-ref peers name #f)))
 
   (define (live-entry name)
     (let ((e (peer-entry name)))
-      (and e (eq? (conn-state (vector-ref e 0)) 'open) e)))
+      (and e (eq? (conn-state (entry-conn e)) 'open) e)))
 
   (define (node-peers)
     (filter live-entry
@@ -674,6 +697,19 @@
       (hashtable-set! watchers name
         (remq self (hashtable-ref watchers name '()))))
     (void))
+
+  ;; Fan out to a snapshot taken by the caller. The replacement sequence
+  ;; needs this: its cut has to happen inside the atomic region that
+  ;; swaps the entry, or a watcher that finishes registering between the
+  ;; read and the swap misses the pair permanently -- not late, missing.
+  ;; Reading the list here instead would be exactly that read.
+  (define (notify-list! l name what)
+    (for-each
+      (lambda (p)
+        (if (process-alive? p)
+            (send p (vector what name))
+            (demonitor-dead! name p)))
+      l))
 
   (define (notify! name what)               ; what: node-up | node-down
     (let ((l (atomically (hashtable-ref watchers name '()))))
@@ -1124,8 +1160,8 @@
         (let loop ((i 0))
           (cond
             ((fx= i (vector-length entries)) #f)
-            ((eq? (vector-ref (vector-ref entries i) 0) c)
-             (vector-ref (vector-ref entries i) 1))
+            ((eq? (entry-conn (vector-ref entries i)) c)
+             (entry-link (vector-ref entries i)))
             (else (loop (fx+ i 1))))))))
 
   ;; unique incomplete marker: a peer legitimately sending the DATUM
@@ -1448,23 +1484,265 @@
   (define (name<? a b)
     (string<? (symbol->string a) (symbol->string b)))
 
-  ;; -> #t if this conn was installed, #f if it lost the tie-break
-  (define (install-peer! name c dialer)
-    (let ((won?
-           (atomically
-             (let ((e (hashtable-ref peers name #f)))
-               (if (and e (eq? (conn-state (vector-ref e 0)) 'open))
-                   (if (name<? dialer (vector-ref e 2))
-                       (begin                    ; new conn wins: evict old
-                         (send (vector-ref e 1) (vector 'node-stop))
-                         (hashtable-set! peers name (vector c self dialer))
-                         'replaced)
-                       #f)                       ; old conn wins
-                   (begin
-                     (hashtable-set! peers name (vector c self dialer))
-                     #t))))))
-      (when (eq? won? #t) (notify! name 'node-up))   ; a replacement is not a new up
-      (and won? #t)))
+  ;; ---- the install decision tree -------------------------------------
+  ;;
+  ;; ORDERED DATA, NOT A COND, AND THE ORDER IS THE SEMANTICS. The table
+  ;; is first-match-wins, so a rule's position IS its priority -- and a
+  ;; position expressed as source layout is a requirement no test can
+  ;; see. I0 in particular has to be physically first: move it after I1
+  ;; and behaviour differs only when a parent dies inside one window,
+  ;; which is to say every run stays green while the rule is gone. As a
+  ;; list, the order is a value: `(car install-rules)` is I0, and that is
+  ;; an assertion something can make.
+  ;;
+  ;; THE RULES ARE DELIBERATELY NOT MUTUALLY EXCLUSIVE, which is the one
+  ;; arrangement that needs saying out loud. I1 and I2 share their
+  ;; opening condition and split on metadata; I3 hands back to the top so
+  ;; a torn-down current is re-judged from I0. Everywhere else an overlap
+  ;; would be a defect, so the permitted pairs are written down (see
+  ;; install-rule-overlaps) rather than left as "whatever the order does"
+  ;; -- otherwise ordering slides from a decision into a default.
+  (define-record-type irule
+    (fields name applies act))
+
+  ;; The request, as one value: the tree reads nothing else, so a rule
+  ;; cannot quietly depend on ambient state.
+  (define-record-type ireq
+    (fields name conn dialer boot-id gen parent))
+
+  ;; Same connection, same story? The metadata is what the peer told us
+  ;; about itself; a repeat of the identical request is idempotent, a
+  ;; repeat that says something different is a protocol error and gets
+  ;; its own answer rather than being folded into replacement.
+  (define (meta=? e r)
+    (and (eq? (entry-dialer e) (ireq-dialer r))
+         (equal? (entry-boot-id e) (ireq-boot-id r))
+         (equal? (entry-gen e) (ireq-gen r))))
+
+  (define (entry-healthy? e)
+    (and (eq? (conn-state (entry-conn e)) 'open)
+         (let ((l (entry-link e)))
+           (or (not l) (process-alive? l)))))
+
+  (define (same-conn? e r) (eq? (entry-conn e) (ireq-conn r)))
+
+  ;; Decisions the tree can reach. The action returns one of these; the
+  ;; table work for `replace` and `install` has already happened inside
+  ;; the atomic region by the time it is returned.
+  ;;   installed | idempotent | replaced | refused | protocol-error | retry
+  ;; `retry` is I3's: tear the current entry down, then judge again from
+  ;; the top -- the candidate is then not current and unhealthy, so it
+  ;; lands on I4.
+
+  (define (install-rules)
+    (list
+      ;; I0 -- PHYSICALLY FIRST. An install request whose parent is gone
+      ;; is an orphan: whatever asked for it is no longer there to own
+      ;; the result. Placed after I1 it would never fire, because a
+      ;; repeat request from a live child of a dead parent answers
+      ;; "idempotent success" first.
+      (make-irule 'I0
+        (lambda (e r) (and (ireq-parent r)
+                           (not (process-alive? (ireq-parent r)))))
+        (lambda (e r) 'refused))
+      ;; I1 -- the same connection saying the same thing. Idempotent
+      ;; success, and NEVER a close: the caller is the owner of a working
+      ;; link and closing it here would kill what it just proved.
+      (make-irule 'I1
+        (lambda (e r) (and e (same-conn? e r) (entry-healthy? e) (meta=? e r)))
+        (lambda (e r) 'idempotent))
+      ;; I2 -- the same connection saying something else. Not a
+      ;; replacement candidate: one connection cannot have two identities,
+      ;; so this is a protocol error and is answered as one.
+      (make-irule 'I2
+        (lambda (e r) (and e (same-conn? e r) (entry-healthy? e)))
+        (lambda (e r) 'protocol-error))
+      ;; I3 -- the current entry IS this connection but is not healthy.
+      ;; Tear it down and judge again from the top; reporting success
+      ;; here would install nothing and say it had.
+      (make-irule 'I3
+        (lambda (e r) (and e (same-conn? e r)))
+        (lambda (e r) 'retry))
+      ;; I4 -- a candidate that is not current and not healthy. Refuse
+      ;; without touching current: an unhealthy newcomer must never
+      ;; displace a working link.
+      (make-irule 'I4
+        (lambda (e r) (not (conn-open? (ireq-conn r))))
+        (lambda (e r) 'refused))
+      ;; I5 -- no entry. Install, and it is a genuine up.
+      ;;
+      ;; ANY GENERATION IS ACCEPTED HERE, deliberately. A generation is
+      ;; only meaningful against a current value, and with no entry there
+      ;; is no current value to compare against -- the two share a
+      ;; lifetime. The cost is recorded in the design rather than
+      ;; repaired: a stale high generation arriving first is taken as a
+      ;; fresh start.
+      (make-irule 'I5
+        (lambda (e r) (not e))
+        (lambda (e r) 'install))
+      ;; I6 -- a different boot id is a different incarnation of the
+      ;; peer. Nothing about the old one survives it, so no ordering
+      ;; question arises and no tie-break applies.
+      (make-irule 'I6
+        (lambda (e r) (not (equal? (entry-boot-id e) (ireq-boot-id r))))
+        (lambda (e r) 'replace))
+      ;; I7 -- same incarnation, old connection already gone. Same dialer
+      ;; still has to pass the generation gate: without it a late request
+      ;; carrying a SMALLER generation would slip in behind "the old one
+      ;; is not open anyway" and undo the ordering. A different dialer
+      ;; does not take part in ordering at all.
+      (make-irule 'I7
+        (lambda (e r) (not (conn-open? (entry-conn e))))
+        (lambda (e r)
+          (if (eq? (entry-dialer e) (ireq-dialer r))
+              (if (gen>? (ireq-gen r) (entry-gen e)) 'replace 'refused)
+              'replace)))
+      ;; I8a -- same incarnation, old connection open, same dialer:
+      ;; ordering decides, and it decides by replacing, not by "just
+      ;; swapping the table" and not by reporting success and doing
+      ;; nothing.
+      (make-irule 'I8a
+        (lambda (e r) (eq? (entry-dialer e) (ireq-dialer r)))
+        (lambda (e r)
+          (if (gen>? (ireq-gen r) (entry-gen e)) 'replace 'refused)))
+      ;; I8b -- same incarnation, both open, different dialers: the
+      ;; simultaneous-connection tie-break. Both ends see the same dialer
+      ;; for the same physical connection, so both converge on the same
+      ;; survivor.
+      (make-irule 'I8b
+        (lambda (e r) #t)
+        (lambda (e r)
+          (if (name<? (ireq-dialer r) (entry-dialer e)) 'replace 'refused)))))
+
+  ;; The pairs allowed to overlap, each with why. Any other two rules
+  ;; true at once is a defect: the tree would then be deciding by
+  ;; position on a case nobody chose.
+  (define install-rule-overlaps
+    '((I1 I2 . "same opening condition -- they split on metadata, and I1 must win")
+      (I1 I3 . "I3's condition is I1's without the health test")
+      (I2 I3 . "same: I3 is the unhealthy tail of the same shape")
+      (I3 I4 . "after I3 tears down, the re-judged candidate lands on I4")))
+
+  ;; A generation gate that is honest about absence. #f is what an entry
+  ;; installed before generations existed carries, and "unknown" must not
+  ;; read as "smaller than everything".
+  (define (gen>? new old)
+    (and (integer? new) (integer? old) (> new old)))
+
+  (define (conn-open? c) (eq? (conn-state c) 'open))
+
+  ;; -> installed | idempotent | replaced | refused | protocol-error
+  ;;
+  ;; A refusal has already closed the candidate; a success has not.
+  (define (install-peer! name c dialer boot-id gen parent)
+    (let ((r (make-ireq name c dialer boot-id gen parent)))
+      (let judge ((fuel 2))
+        (let* ((cut #f)
+               (old #f)
+               (decision
+                 (atomically
+                   (let* ((e (hashtable-ref peers name #f))
+                          (rule (let loop ((rs (install-rules)))
+                                  (cond ((null? rs) #f)
+                                        (((irule-applies (car rs)) e r) (car rs))
+                                        (else (loop (cdr rs))))))
+                          (d (and rule ((irule-act rule) e r))))
+                     (case d
+                       ((install)
+                        (set! cut (hashtable-ref watchers name '()))
+                        (hashtable-set! peers name
+                          (make-entry c self dialer boot-id gen #f))
+                        'installed)
+                       ((replace)
+                        ;; (R1). THREE THINGS, ONE REGION.
+                        ;;
+                        ;; The swap is IN PLACE: peers[name] never goes
+                        ;; absent, which is what lets a reader elsewhere
+                        ;; keep treating "no entry" as "unreachable"
+                        ;; without that becoming true for an instant
+                        ;; during a handover.
+                        ;;
+                        ;; The old connection is CLOSED HERE, by actually
+                        ;; calling tcp-close!, not by writing a state
+                        ;; flag meaning "will be closed". Between the
+                        ;; swap and a later close, inbound frames on the
+                        ;; old connection still pass the link's gate and
+                        ;; take effect -- the old generation still acting
+                        ;; after the handover is the exact thing this
+                        ;; ordering exists to end. And a flag would be
+                        ;; worse than late: tcp-close! is guarded on the
+                        ;; state it would have written, so the real close
+                        ;; would then be skipped and the handle never
+                        ;; reclaimed. uv_close only files the handle for
+                        ;; its callback and does not block, so doing it
+                        ;; here costs nothing this region cares about.
+                        ;;
+                        ;; The watcher list root is captured HERE, at the
+                        ;; same linearisation point. Reading it before
+                        ;; the swap lets a watcher that finishes
+                        ;; registering in between miss the pair for good.
+                        ;; The list is immutable, so this is a pointer.
+                        (set! old e)
+                        (set! cut (hashtable-ref watchers name '()))
+                        (hashtable-set! peers name
+                          (make-entry c self dialer boot-id gen (entry-head e)))
+                        (tcp-close! (entry-conn e))
+                        'replaced)
+                       (else d)))))) 
+          (case decision
+            ((retry)
+             ;; I3: the current entry is this connection and unhealthy.
+             ;; Tear it down, then judge again -- once. The fuel is not
+             ;; defensive decoration: a tree that could ask for a third
+             ;; pass would be a tree whose teardown did not remove the
+             ;; condition that sent it here.
+             (let ((e (peer-entry name)))
+               (when (and e (same-conn? e r)) (remove-peer! name c)))
+             (if (> fuel 0) (judge (- fuel 1)) 'refused))
+            ((replaced)
+             ;; (R2) wake the old link process, (R3) settle what the old
+             ;; generation left behind, (R4) fan out down then up to the
+             ;; snapshot cut above.
+             ;;
+             ;; R3 IS THE CONSERVATIVE READING and is flagged as such:
+             ;; the design says "the old generation's pending calls and
+             ;; hosted monitors are settled per the channel contract"
+             ;; without spelling that contract out. Pending calls are
+             ;; unambiguous -- no reply can arrive on a closed
+             ;; connection. Hosted monitors are the open question: for a
+             ;; new incarnation (I6) they are certainly dead, and for a
+             ;; new connection of the SAME incarnation the peer may or
+             ;; may not re-register. Dropping them is the reading that
+             ;; cannot lose a resource; keeping them would be the reading
+             ;; that cannot lose a registration.
+             (stop-link! (entry-conn old) (entry-link old) 'replaced)
+             (drop-hosted-monitors! name)
+             (fail-pending-for! name)
+             (notify-list! cut name 'node-down)
+             (notify-list! cut name 'node-up)
+             'replaced)
+            ((installed) (notify-list! cut name 'node-up) 'installed)
+            ((idempotent) 'idempotent)
+            ((protocol-error) (tcp-close! c) 'protocol-error)
+            (else (tcp-close! c) 'refused))))))
+
+  ;; Did the install succeed, in the sense the caller cares about: is
+  ;; this connection now the one in the table?
+  (define (installed? outcome)
+    (memq outcome '(installed idempotent replaced)))
+
+  ;; THE ORDER, AS A VALUE. Exported because the requirement "I0 is
+  ;; first" is otherwise expressed only as source layout, and source
+  ;; layout is the one property a test cannot read. With this, the
+  ;; requirement becomes an equality a cell can assert, and moving a rule
+  ;; is a visible change rather than a silent one.
+  ;;
+  ;; It reports names, not procedures: the point is the sequence, and
+  ;; handing out the predicates would invite a caller to depend on the
+  ;; tree's internals instead of on its decisions.
+  (define (node-install-rule-order)
+    (map irule-name (install-rules)))
+
 
   ;; idempotent: only removes the entry if it still belongs to this conn
   ;; The link to `name` is gone, so every monitor we HOST on its behalf
@@ -1482,7 +1760,7 @@
     (let ((mine?
            (atomically
              (let ((e (hashtable-ref peers name #f)))
-               (and e (eq? (vector-ref e 0) c)
+               (and e (eq? (entry-conn e) c)
                     (begin (hashtable-delete! peers name) #t))))))
       (tcp-close! c)
       (when mine?
@@ -1681,7 +1959,7 @@
         (when e
           (guard (e2 (#t (link-write peer (list 'reply ref
                                                 (list 'error 'not-serializable)))))
-            (write-frame! (vector-ref e 0) (list 'reply ref result)))))))
+            (write-frame! (entry-conn e) (list 'reply ref result)))))))
 
   (define (rcall-reason e)
     (if (and (vector? e) (> (vector-length e) 1) (symbol? (vector-ref e 1)))
@@ -1715,7 +1993,7 @@
     (let ((e (live-entry peer)))
       (and e
            (let-values (((ok failure)
-                         (write-body! (vector-ref e 0)
+                         (write-body! (entry-conn e)
                                       (frame-segments datum))))
              (cond (ok #t)
                    (failure (raise (submission-failure peer failure)))
@@ -1792,7 +2070,7 @@
     (let retry ()
       (let ((e (live-entry peer)))
         (and e
-             (let ((c (vector-ref e 0)) (link (vector-ref e 1)))
+             (let ((c (entry-conn e)) (link (entry-link e)))
                ;; EVERY WAY THIS CAN FAIL IS TREATED THE SAME, so none of
                ;; them is distinguished. The frame is already built, so
                ;; what remains is the submission: it can answer #f for a
@@ -1848,7 +2126,7 @@
   ;; whether a connection in hand is still the current one.
   (define (current-conn peer)
     (let ((e (peer-entry peer)))
-      (and e (vector-ref e 0))))
+      (and e (entry-conn e))))
 
   ;; Take down whatever connection this peer is currently reached on.
   ;;
@@ -1869,7 +2147,7 @@
   ;; happens, which is what was being asked for.
   (define (drop-link-by-name! peer why)
     (let ((e (peer-entry peer)))
-      (when e (stop-link! (vector-ref e 0) (vector-ref e 1) why))))
+      (when e (stop-link! (entry-conn e) (entry-link e) why))))
 
   ;; ---- cross-node process monitor ----------------------------------------
 
@@ -2233,7 +2511,16 @@
                       (proof-a nonce-b (symbol->string self-name)
                                self-boot-id)))
               (free!)                           ; authenticated: no longer pre-auth
-              (if (install-peer! peer c peer)   ; dialer = the remote side
+              ;; PARENT IS #f UNTIL PER-ATTEMPT PROCESSES LAND. An
+              ;; acceptor has no parent to outlive, and the dial side
+              ;; does not yet run its attempt in a process separate from
+              ;; the connector, so I0 -- the orphan refusal -- has
+              ;; nothing to refuse on either side today. That is stated
+              ;; rather than left to be inferred from a #f, because a
+              ;; rule that is present and never fires reads exactly like
+              ;; a rule that is working.
+              (if (installed? (install-peer! peer c peer (list-ref d 5)
+                                             (list-ref d 6) #f))
                   (run-link c peer buf)
                   (tcp-close! c))))))))         ; lost the tie-break
 
@@ -2321,7 +2608,7 @@
   ;; same thing. NOTHING WOULD GO RED for either change: this value moves
   ;; a delay and never a connection, so every test still passes while the
   ;; guarantee above is gone.
-  (define (dial! peer host port)
+  (define (dial! peer host port parent)
     (guard (e ((eq? e 'stop) (raise 'stop))
               ((eq? e dial-gen-exhausted) (raise e))   ; not a retryable failure
               (#t #f))                          ; any failure: retry later
@@ -2427,7 +2714,8 @@
                                         (proof-a nonce-b (symbol->string peer)
                                                  bootid-a)))
                     (raise 'auth))
-                  (if (install-peer! peer c self-name)
+                  (if (installed?
+                        (install-peer! peer c self-name bootid-a gen parent))
                       (let ((up (now-ms)))
                         (- (run-link c peer buf) up))
                       (begin (tcp-close! c) 0)))))))
@@ -2562,6 +2850,71 @@
   ;; being waited out. The backoff would be inert, and nothing about a
   ;; growing counter that is never used shows up as a failure. Draining
   ;; against a fixed deadline keeps the wait the wait.
+  ;; ---- one process per attempt (C16) ---------------------------------
+  ;;
+  ;; THE PROCESS THAT CALLS tcp-connect! IS THE CONNECTION'S OWNER FROM
+  ;; THE FIRST INSTANT, and it is a fresh process for every attempt.
+  ;; Both halves carry weight.
+  ;;
+  ;; Owner from the start means there is no window in which a connection
+  ;; exists and belongs to nobody, and no conn-set-owner! call on this
+  ;; path to get the transfer wrong -- the property is enforced by
+  ;; construction rather than by a later assignment that could be
+  ;; reordered or skipped. (The accept path still assigns an owner: there
+  ;; the socket is handed to us by libuv, so there is no call of ours to
+  ;; move earlier.)
+  ;;
+  ;; A fresh process per attempt means an attempt's identity is not
+  ;; reusable. A late message from an abandoned attempt -- a connect that
+  ;; completes after we gave up on it, a handshake frame that arrives
+  ;; after a newer attempt won -- lands in a mailbox nobody is reading,
+  ;; instead of in the mailbox of the attempt that replaced it. Attributing
+  ;; a stale event to a live attempt is the whole class this removes.
+  ;;
+  ;; The connector stays the PARENT and stays alive across attempts,
+  ;; which is what gives install-peer!'s I0 something real to test: an
+  ;; attempt whose connector has been killed is an orphan, and the
+  ;; install it is about to request has nobody left to own it.
+  ;;
+  ;; -> the same value dial! returned: how long the authenticated link
+  ;; lasted, or #f. The connector's backoff is unchanged by this
+  ;; restructuring, which is deliberate -- the reconnect accounting
+  ;; argument above depends on that number meaning the life of the
+  ;; AUTHENTICATED link, and moving where the code runs must not quietly
+  ;; move where the clock starts.
+  (define (attempt! peer host port)
+    (let* ((parent self)
+           (ref (gensym))
+           (child (spawn (lambda ()
+                           ;; THE EXHAUSTION TOKEN CROSSES THE PROCESS
+                           ;; BOUNDARY. dial! is careful to let it past
+                           ;; three catch-alls whose policy is "retry
+                           ;; later", and putting the call inside a
+                           ;; process adds a fourth. A plain (#t #f) here
+                           ;; would swallow it again and restore exactly
+                           ;; the silent forever-retry that token exists
+                           ;; to end -- so it is reported to the parent
+                           ;; and re-raised there, where the connector's
+                           ;; guard can stop instead of loop.
+                           (let ((outcome
+                                   (guard (e ((eq? e dial-gen-exhausted)
+                                              (cons 'fatal e))
+                                             ((eq? e 'stop) (cons 'up #f))
+                                             (#t (cons 'up #f)))
+                                     (cons 'up (dial! peer host port parent)))))
+                             (when (process-alive? parent)
+                               (send parent (vector ref (car outcome)
+                                                    (cdr outcome))))))))) 
+      (receive
+        (`#(,@ref up ,up) up)
+        (`#(,@ref fatal ,e) (raise e))
+        ;; A node-stop reaching the connector while an attempt is in
+        ;; flight has to reach the attempt too: it owns the socket, and
+        ;; the connector cannot close what it does not hold.
+        (`#(node-stop)
+          (when (process-alive? child) (send child (vector 'node-stop)))
+          (raise 'stop)))))
+
   (define (connector peer host port)
     (guard (e ((eq? e dial-gen-exhausted) (void))  ; reported already; stop
               (#t (void)))                      ; 'stop lands here too
@@ -2582,7 +2935,7 @@
       (let loop ((attempt 0) (waited (reconnect-delay self-name peer 0)))
         (let* ((next (if (live-entry peer)      ; a surviving inbound counts
                          attempt
-                         (let ((up (dial! peer host port)))
+                         (let ((up (attempt! peer host port)))
                            (if (and up (>= up waited)) 0 (+ attempt 1)))))
                (delay (reconnect-delay self-name peer next))
                (deadline (+ (now-ms) delay)))
@@ -2729,7 +3082,7 @@
                  (and e (vector-ref e 0))))))
       (when (and p (process-alive? p)) (send p (vector 'node-stop))))
     (let ((e (peer-entry peer)))
-      (when e (send (vector-ref e 1) (vector 'node-stop))))
+      (when e (send (entry-link e) (vector 'node-stop))))
     (void))
 
   ;; Tune this node's ceilings, in order: the max serve-rcall processes in
@@ -2819,7 +3172,7 @@
             ;; both kinds of "it did not go", and neither kind quietly
             ;; reports success.
             (let-values (((ok failure)
-                          (write-body! (vector-ref e 0)
+                          (write-body! (entry-conn e)
                                        (frame-segments
                                          (list 'send reg-name msg)))))
               (cond (ok #t)
@@ -2906,7 +3259,7 @@
                 ;; out its timeout, which is the outcome it has anyway
                 ;; when a reply is lost.
                 (let-values (((ok failure)
-                              (write-body! (vector-ref e 0) segs)))
+                              (write-body! (entry-conn e) segs)))
                   ;; BOTH FAILURES ANSWER THE SAME. A caller that has
                   ;; already published a pending entry needs an answer,
                   ;; not a diagnosis: no link and a frame that did not go
@@ -3000,7 +3353,7 @@
               (let ((segs (frame-segments (list 'mon name mref))))
                 (arm-rmonitor! mref node name)
                 (let-values (((ok failure)
-                              (write-body! (vector-ref e 0) segs)))
+                              (write-body! (entry-conn e) segs)))
                  (unless ok
                   (let ((entry (atomically
                                  (let ((x (hashtable-ref rmonitors mref #f)))
@@ -3026,4 +3379,19 @@
         (stop-owner-agent! mref)
         (remove-target-watch! mref entry)))
     (void))
+
+  ;; ---- load-time structural checks ------------------------------------
+  ;; Library bodies put every definition before every expression, so this
+  ;; sits at the end rather than beside the tree it guards. What it
+  ;; guards is a requirement source layout expresses and no test can
+  ;; read: first-match-wins makes a rule's POSITION its priority, and I0
+  ;; refuses an install whose parent is already gone. Demoted below I1, a
+  ;; repeat request from a live child of a dead parent answers "idempotent
+  ;; success" first and I0 never sees the orphan -- a change that leaves
+  ;; every run green. A cell can assert the same thing and a cell can
+  ;; also be deleted; this refuses to load.
+  (unless (eq? 'I0 (car (node-install-rule-order)))
+    (assertion-violation 'node
+      "I0 must be the first install rule -- first-match-wins makes position the priority"
+      (node-install-rule-order)))
 )

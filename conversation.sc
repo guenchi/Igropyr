@@ -1261,13 +1261,31 @@
   ;; are orphaned by a rename: a resume carrying one is forwarded to a
   ;; node nobody answers to and comes back 'unreachable.
   ;;
-  ;; A NAME CANNOT CONTAIN `~`, which is the separator above. node-start!
-  ;; accepts any symbol, and one holding a tilde mints ids that this
-  ;; library's own parser reads as belonging to the prefix before it: on
-  ;; node `a~b` every id parses as owned by `a`, so every resume is
-  ;; forwarded off a node that is holding the conversation itself, and
-  ;; answers 'unreachable while the conversation is parked in the same
-  ;; process asking.
+  ;; A NAME CANNOT CONTAIN `~`, which is the separator above. A name
+  ;; holding a tilde mints ids that this library's own parser reads as
+  ;; belonging to the prefix before it: on node `a~b` every id parses as
+  ;; owned by `a`, so every resume is forwarded off a node that is
+  ;; holding the conversation itself, and answers 'unreachable while the
+  ;; conversation is parked in the same process asking.
+  ;;
+  ;; node-start! refuses such a name, and refuses it with THOSE WORDS
+  ;; rather than a character-table complaint, because the words are what
+  ;; send a reader here rather than to an alphabet. Since wire version 4
+  ;; the node name alphabet is [0-9a-z-], which already excludes the
+  ;; tilde -- so that check is redundant for the VERDICT and exists for
+  ;; the MESSAGE. It also survives a future widening of the alphabet,
+  ;; which is the direction worth being redundant in.
+  ;;
+  ;; A REVERSE SENTINEL, AND IT BELONGS HERE RATHER THAN AT node-connect!.
+  ;; A PEER's name is not checked for a tilde, and that is correct only
+  ;; because of the shape minted above: an id carries the name of the
+  ;; node that MINTED it, never a peer's, so a peer whose name held a
+  ;; tilde could not mis-route anything of ours. IF THE ID FORMAT EVER
+  ;; GROWS A PEER NAME, that reasoning is void and the peer name needs
+  ;; the same rule. The dependency is recorded on the side that is
+  ;; depended upon: whoever changes the format above reads this, whereas
+  ;; a note left in node-connect! would only be read by someone already
+  ;; thinking about peer names.
   ;;
   ;; The rename case is a deployment rule rather than a live one: a node
   ;; will not rename itself while running (node-start! refuses a second
