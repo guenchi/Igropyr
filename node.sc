@@ -697,12 +697,58 @@
   ;; them. This is a trade rather than a removal: the risk moves from a
   ;; process that runs with the workload to one that runs only when the
   ;; first one dies. Recorded as a residue, not as a fix.
+  ;; A SUPERVISOR THAT ONLY EVER RESTARTS HAS NO WAY TO SAY "I CANNOT FIX
+  ;; THIS". Recovery hides the difference between a reaper that died once
+  ;; and one that cannot start at all: the second becomes a quiet loop
+  ;; whose only symptom is that credit stops coming back, with no crash
+  ;; visible anywhere. That is the failure mode this whole design treats
+  ;; as the worst one, arrived at by adding the thing meant to prevent
+  ;; failures.
+  ;;
+  ;; So three rules, and none of them is optional:
+  ;;   - back off, so a tight failure cannot spin the scheduler;
+  ;;   - count within a window, and give up when the count says the
+  ;;     problem is not transient -- giving up here means raising, and
+  ;;     this process is critical, so the node stops loudly;
+  ;;   - say every restart out loud, with the count, so a node that is
+  ;;     limping is visible before it reaches the limit.
+  (define reaper-restart-window-ms 60000)
+  (define reaper-restart-max 5)
+  (define reaper-restart-cap-ms 1000)
+
   (define (warden-loop)
-    (let loop ()
+    (let loop ((deaths (list)) (delay 0))
       (let ((r (spawn reaper-loop)))
         (monitor r)
         (receive
-          (`#(DOWN ,@r ,_) (loop))
+          (`#(DOWN ,@r ,reason)
+            (let* ((now (now-ms))
+                   (recent (cons now
+                                 (filter (lambda (t)
+                                           (> t (- now reaper-restart-window-ms)))
+                                         deaths)))
+                   (n (length recent)))
+              (display (string-append
+                         "igropyr node: reaper exited ("
+                         (claimed-version-text reason)
+                         "); restart " (number->string n) " of at most "
+                         (number->string reaper-restart-max) " in "
+                         (number->string (quotient reaper-restart-window-ms 1000))
+                         "s\n")
+                       (current-error-port))
+              (when (fx>= n reaper-restart-max)
+                (display (string-append
+                           "igropyr node: the reaper has not stayed up "
+                           (number->string n)
+                           " restarts running; this is not transient and"
+                           " hosted-monitor credit is no longer being"
+                           " returned. Stopping the node.\n")
+                         (current-error-port))
+                (raise (list 'reaper-will-not-start n)))
+              (when (fx> delay 0) (sleep-ms delay))
+              (loop recent
+                    (fxmin reaper-restart-cap-ms
+                           (if (fx= delay 0) 50 (fx* delay 2))))))
           (`#(node-stop) (when (process-alive? r) (send r (vector 'node-stop))))))))
 
   (define (retire-agent-locked! key)             ; caller already holds the region
