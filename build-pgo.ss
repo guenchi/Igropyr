@@ -16,12 +16,17 @@
 (profile-load-data "app.profile")       ; use the collected profile
 (generate-wpo-files #t)
 
-(define libs
-  '("igropyr/util.sc" "igropyr/blas.sc" "igropyr/checked.sc" "igropyr/buffer.sc" "igropyr/platform.sc" "igropyr/quickjs.sc" "igropyr/libuv.sc" "igropyr/actor.sc" "igropyr/json.sc"
-    "igropyr/gzip.sc" "igropyr/sexpr.sc" "igropyr/otp.sc" "igropyr/websocket.sc" "igropyr/ws-client.sc"
-    "igropyr/gen-server.sc" "igropyr/node.sc" "igropyr/conv-status.sc" "igropyr/conversation.sc" "igropyr/http.sc" "igropyr/pubsub.sc"
-    "igropyr/express.sc" "igropyr/session.sc" "igropyr/ssr.sc" "igropyr/auth.sc" "igropyr/middleware.sc" "igropyr/jwt.sc" "igropyr/metrics.sc" "igropyr/dashboard.sc" "igropyr/http-client.sc" "igropyr/sigv4.sc" "igropyr/s3.sc"
-    "igropyr/redis.sc" "igropyr/mysql.sc"))
+;; THE LIBRARY LIST IS NOT KEPT HERE. This script used to carry its own
+;; copy, and that copy was missing twenty-one libraries -- silently,
+;; because a library left out of a build is not an error, it just stays
+;; source-only. One list, loaded, checked against the directory.
+;;
+;; app.sc is not in it and must not be: it is the PROGRAM, compiled
+;; below with compile-program.
+(load "igropyr/build-units.ss")
+
+(define libs library-units)
+(check-library-list! "build-pgo.ss" libs)
 
 (parameterize ((optimize-level 2)
                (generate-inspector-information #f))

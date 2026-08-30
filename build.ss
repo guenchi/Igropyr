@@ -14,84 +14,14 @@
 
 ;; (source . optimize-level), in dependency order so each library's
 ;; already-compiled dependencies are picked up as .so.
-(define units
-  '(("igropyr/util.sc" . 2)
-    ("igropyr/checked.sc" . 2)
-    ("igropyr/buffer.sc" . 2)
-    ("igropyr/platform.sc" . 2)
-    ("igropyr/durable.sc" . 2)
-    ("igropyr/quickjs.sc" . 2)
-    ("igropyr/crypto.sc" . 2)
-    ("igropyr/blas.sc" . 2)
-    ("igropyr/libuv.sc" . 2)
-    ("igropyr/actor.sc" . 2)
-    ;; after actor and libuv, which it drives, and after durable, whose
-    ;; error predicates and traced step it re-uses. Missing from this
-    ;; list until now, which made it the one source-only library in the
-    ;; set -- and a source-only library takes a fresh UID per process, so
-    ;; anything compiled against it reloads silently. Same reason the
-    ;; sexpr note below gives.
-    ("igropyr/durable-async.sc" . 2)
-    ;; json-internal BEFORE json, and for the reason the note above
-    ;; gives: json.so imports it, so leaving it source-only makes it take
-    ;; a fresh UID per process and every dependent .so reload silently --
-    ;; or, once json.so exists, refuse to load at all ("a different
-    ;; compilation instance"). It was added as a file without being added
-    ;; here, which is the same omission this list already documents.
-    ("igropyr/json-internal.sc" . 2)
-    ("igropyr/json.sc" . 2)
-    ("igropyr/gzip.sc" . 2)
-    ;; sexpr must be compiled too: a source-only library gets a fresh
-    ;; UID per process, which invalidates every dependent .so ("reloading
-    ;; because a dependency has changed") -- node/express/dpool would be
-    ;; silently re-expanded from source on every start
-    ("igropyr/sexpr.sc" . 2)
-    ("igropyr/otp.sc" . 2)
-    ("igropyr/websocket.sc" . 2)
-    ("igropyr/ws-client.sc" . 2)
-    ("igropyr/gen-server.sc" . 2)
-    ("igropyr/node.sc" . 2)
-    ("igropyr/conv-status.sc" . 2)
-    ("igropyr/conversation.sc" . 2)
-    ("igropyr/http.sc" . 2)
-    ("igropyr/pubsub.sc" . 2)
-    ("igropyr/dpool.sc" . 2)
-    ("igropyr/express.sc" . 2)
-    ("igropyr/session.sc" . 2)
-    ("igropyr/auth.sc" . 2)
-    ("igropyr/middleware.sc" . 2)
-    ("igropyr/jwt.sc" . 2)
-    ("igropyr/metrics.sc" . 2)
-    ("igropyr/dashboard.sc" . 2)
-    ("igropyr/http-client.sc" . 2)
-    ("igropyr/sigv4.sc" . 2)
-    ("igropyr/s3.sc" . 2)
-    ("igropyr/aws.sc" . 2)
-    ("igropyr/sts.sc" . 2)
-    ("igropyr/ses.sc" . 2)
-    ("igropyr/sns.sc" . 2)
-    ("igropyr/cloudwatch.sc" . 2)
-    ("igropyr/s3-control.sc" . 2)
-    ("igropyr/tls.sc" . 2)
-    ("igropyr/apple-jws.sc" . 2)
-    ("igropyr/jwks.sc" . 2)
-    ("igropyr/kdf.sc" . 2)
-    ;; rsa and aead import only (igropyr platform) -- the libcrypto loader --
-    ;; so they can sit anywhere after it; they are kept with the other
-    ;; libcrypto-backed libraries above rather than scattered.
-    ("igropyr/rsa.sc" . 2)
-    ("igropyr/aead.sc" . 2)
-    ("igropyr/redis.sc" . 2)
-    ;; connpool is the shared checkout/lease engine: it imports only actor
-    ;; and libuv, and every pooled driver below imports it.
-    ("igropyr/connpool.sc" . 2)
-    ("igropyr/qjspool.sc" . 2)
-    ;; ssr comes after both of its pools' dependencies -- qjspool (the
-    ;; render engine) and redis (a cache backend).
-    ("igropyr/ssr.sc" . 2)
-    ("igropyr/mysql.sc" . 2)
-    ("igropyr/postgresql.sc" . 2)
-    ("igropyr/cluster.sc" . 2)))
+;; The list itself lives in build-units.ss, loaded rather than copied:
+;; it used to be written out here and again in each whole-program build,
+;; and the copies fell behind. Optimize level is this script's business,
+;; the membership is not.
+(load "igropyr/build-units.ss")
+
+(define units (map (lambda (p) (cons p 2)) library-units))
+(check-library-list! "build.ss" library-units)
 
 (define (so-path src)
   (string-append (substring src 0 (- (string-length src) 3)) ".so"))
