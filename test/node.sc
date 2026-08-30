@@ -767,6 +767,58 @@
             (receive (after 20000 (fail! "s1-dialgen-generator" 'timeout acc))
               (`#(,@ref ,v) (collect (+ n 1) (cons v acc)))))))
     (display "S1 wire-v4 cells passed\n"))
+    ;; ==== S2: registrar, decision table, container -- RED FIRST ==========
+    ;; The install rules are DATA now, and two properties of that data are
+    ;; things no behavioural cell can see: I0 must be physically first
+    ;; (reordering it only matters in the window where a parent dies mid
+    ;; handshake -- otherwise everything stays green), and the rule names
+    ;; must be the ones the design signed off. The library also asserts
+    ;; the first of these at load time; this cell is the second reader,
+    ;; and it is the one that says WHICH order was expected.
+    (let ((order (node-install-rule-order)))
+      (unless (pair? order)
+        (fail! "s2-rule-order" 'empty order))
+      (unless (eq? (car order) 'I0)
+        (fail! "s2-rule-order" 'I0-not-first order))
+      (unless (equal? order '(I0 I1 I2 I3 I4 I5 I6 I7 I8a I8b))
+        (fail! "s2-rule-order" 'unexpected-order order)))
+    ;; The orphan chain must be EMPTY whenever nothing is draining -- its
+    ;; whole justification is that it exists only while a dead peer still
+    ;; has undelivered events. A permanent table would be correct, silent,
+    ;; and unbounded in the number of names ever seen (the shape D6
+    ;; refused). Measured from outside because that is the only place the
+    ;; property is visible: the chain has no name of its own.
+    (unless (zero? (node-orphan-count))
+      (fail! "s2-orphan-empty-at-rest" 'nonzero-before (node-orphan-count)))
+    (let ((gen2-port 18087))
+      (let ((l2 (tcp-listen! "127.0.0.1" gen2-port 16
+                  (lambda (c)
+                    (let ((pid (spawn
+                                 (lambda ()
+                                   (tcp-read-start! c)
+                                   (tcp-write! c (frame-bytes
+                                                   (list 'challenge kat-nonce 4
+                                                         probe-boot-id))
+                                               #f)
+                                   (read-frame-or-closed "s2-orphan")
+                                   (tcp-close! c)))))
+                      (conn-set-owner! c pid))))))
+        ;; connect, let it die, and come back under the same name: the
+        ;; second dial exercises the adoption path (orphan -> I5), the
+        ;; first exercises death (peers -> orphan). Both must leave the
+        ;; chain empty once the events have drained.
+        (node-connect! 'opeer "127.0.0.1" gen2-port)
+        (sleep-ms 1500)
+        (node-disconnect! 'opeer)
+        (sleep-ms 1500)
+        (tcp-stop-listen! l2)
+        (sleep-ms 500)
+        (unless (zero? (node-orphan-count))
+          (fail! "s2-orphan-empty-at-rest" 'leaked-after-churn
+                 (node-orphan-count)))))
+    (display "S2 registrar/container cells passed\n")
+    ;; ==== end S2 ========================================================
+
     ;; ==== end S1 ========================================================
 
     ;; dial side. A challenge with no version slot must be refused
