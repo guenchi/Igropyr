@@ -267,6 +267,77 @@
     (define max-queued queue-cap)
     (define next-id 0)
 
+    ;; ---- topology subscriptions ------------------------------------------
+    ;;
+    ;; WHY A TOKEN AND A WATERMARK RATHER THAN THE TWO-ELEMENT NOTICE.
+    ;; Topology notices are delivered at least once: the deliverer takes an
+    ;; event off its queue only after handing it to every subscriber, so a
+    ;; deliverer that dies half way through is succeeded by one that starts
+    ;; the same event again. The two-element form carries nothing a receiver
+    ;; could tell a repeat by. Here a repeat is not harmless -- a second
+    ;; node-down for a node already gone re-runs the reassignment sweep, and
+    ;; a stale node-up would put a dead node back in `live`.
+    ;;
+    ;; The token answers "is this notice for the subscription I hold", which
+    ;; matters because a subscription can be replaced; the sequence number
+    ;; answers "have I already seen this one". Both are needed and neither
+    ;; substitutes for the other.
+    ;;
+    ;; ⭐ THIS DEPENDS ON (igropyr node) STAMPING EACH EVENT EXACTLY ONCE,
+    ;; and it is worth naming what provides that rather than stating the
+    ;; consequence as if it were a fact. `stamp-event!` there numbers an
+    ;; event only if it is not numbered yet, in the same region that queues
+    ;; it; the delivery path only reads the number. So a redelivery of the
+    ;; same event carries the SAME number, compares equal to the watermark
+    ;; and is dropped. That "only if" is a guard, not a structural
+    ;; property: were the number taken at delivery time instead, every
+    ;; repeat would look like a new event and everything below would be
+    ;; decoration that still passes its tests.
+    ;;
+    ;; The numbers are global to the node rather than per peer, so what
+    ;; arrives here for one peer is a subsequence of a rising sequence --
+    ;; still rising, which is all the comparison needs. Gaps are normal and
+    ;; mean nothing was missed; they are other peers' events.
+    (define node-tokens (make-eq-hashtable))   ; node -> subscription token
+    (define watermarks (make-eq-hashtable))    ; node -> highest seq accepted
+
+    ;; TWO GATES, AND THEIR EFFECT IS THE SAME: drop the notice, quietly.
+    ;; That is what makes them dangerous together -- either one written
+    ;; wrongly looks exactly like the other one working, and both look like
+    ;; nothing happening. Each keeps its own count so a harness can say
+    ;; WHICH gate ran. A single "dropped" number would leave that question
+    ;; answerable only by a downstream symptom, and the downstream symptom
+    ;; -- a real notice never acted on -- takes the same value either way.
+    (define token-miss-n 0)
+    (define seq-stale-n 0)
+
+    (define (fresh-notice? node tok seq)
+      (cond
+        ((not (eq? tok (hashtable-ref node-tokens node #f)))
+         (set! token-miss-n (+ token-miss-n 1))
+         #f)
+        ;; ⭐ THE TOKEN TEST IS ABOVE AND THE WATERMARK BELOW, AND SWAPPING
+        ;; THEM IS A REAL BUG rather than a style choice. A notice from a
+        ;; subscription we no longer hold carries a number from somebody
+        ;; else's counting; admitting it below would raise our watermark
+        ;; past events we DO still want, and those would then be thrown
+        ;; away as old. Written the other way round this passes every run
+        ;; in which no stale token ever arrives -- which is every run
+        ;; today -- and starts losing real events the first time one does.
+        (else
+         (let ((w (hashtable-ref watermarks node #f)))
+           ;; #f means nothing has been seen for this node yet, which is
+           ;; not zero and must not be compared as a number: numbering
+           ;; starts at 1, so the first notice has to be accepted by the
+           ;; absence of an entry rather than by beating it.
+           (cond
+             ((and w (<= seq w))
+              (set! seq-stale-n (+ seq-stale-n 1))
+              #f)
+             (else
+              (hashtable-set! watermarks node seq)
+              #t))))))
+
     (define (stash-result! id result)
       (hashtable-set! results id result)
       (set! stash-back (cons id stash-back))
@@ -377,7 +448,22 @@
           ids entries)))
 
     ;; watch every remote member for up/down, then serve forever
-    (for-each (lambda (m) (unless (eq? m self-node) (monitor-node m))) members)
+    ;; THE ONLY WAY TO SUBSCRIBE, and it has to stay the only way. The
+    ;; token is the subscription's identity, and subscribing to a peer
+    ;; again replaces the old subscription -- so a second subscription made
+    ;; anywhere else would leave this table holding a token that is now a
+    ;; stranger, and from that instant every notice for that peer is
+    ;; dropped as a token miss. Silently: the pool does not fail, it stops
+    ;; seeing topology, which surfaces much later as a dead node nobody
+    ;; reassigned away from. Subscribing and remembering are therefore one
+    ;; call, so that they cannot be separated by a later edit.
+    ;;
+    ;; Nothing unsubscribes: the coordinator watches every member for as
+    ;; long as it lives. That is why the table is only ever written here.
+    (define (watch-node! m)
+      (hashtable-set! node-tokens m (monitor-node/token m)))
+
+    (for-each (lambda (m) (unless (eq? m self-node) (watch-node! m))) members)
     (let loop ()
       (receive
         (`#(submit ,payload ,mode ,from ,ref)
@@ -424,17 +510,34 @@
           (let ((e (hashtable-ref inflight id #f)))
             (when (and e (eqv? (vector-ref e 3) token))
               (complete! id result))))
-        (`#(node-up ,node)
-          (unless (memq node live) (set! live (cons node live)))
-          (drain-queue!))
-        (`#(node-down ,node)
-          (node-gone! node))
+        ;; Four elements now, and the shape change is the point of the
+        ;; migration: a receive still matching the two-element form would
+        ;; not fail -- the notice would simply sit in the mailbox forever,
+        ;; unmatched, while the pool went on believing every node was up.
+        (`#(node-up ,node ,tok ,seq)
+          (when (fresh-notice? node tok seq)
+            (unless (memq node live) (set! live (cons node live)))
+            (drain-queue!)))
+        ;; A replacement queues its down and its up together, in that
+        ;; order and with consecutive numbers, so the pair arrives here as
+        ;; down-then-up and the watermark accepts both. Handling only one
+        ;; of them would leave the pool with a node marked live whose
+        ;; in-flight tasks were never reassigned.
+        (`#(node-down ,node ,tok ,seq)
+          (when (fresh-notice? node tok seq)
+            (node-gone! node)))
         (`#(stats ,from ,ref)
           (send from
             (vector 'dpool-stats ref
               (list (cons 'live (length live))
                     (cons 'inflight (hashtable-size inflight))
-                    (cons 'queued (length queue-rev))))))
+                    (cons 'queued (length queue-rev))
+                    ;; The two gates, separately. Reported rather than kept
+                    ;; private because they are the only way to tell a
+                    ;; notice that was correctly ignored from one that was
+                    ;; wrongly ignored -- from outside, both are silence.
+                    (cons 'token-miss token-miss-n)
+                    (cons 'seq-stale seq-stale-n)))))
         (other (void)))                        ; ignore stray messages
       (loop)))
 
@@ -478,7 +581,17 @@
               (vector-ref result 1)
               (raise (vector 'dpool-error (vector-ref result 0) id)))))))
 
-  ;; snapshot: live node count, in-flight tasks, queued tasks
+  ;; A snapshot, as an alist. The keys are `live`, `inflight`, `queued`,
+  ;; and the two gate counters `token-miss` and `seq-stale`; read the
+  ;; clause that builds it for what each one counts, rather than trusting
+  ;; a list here to have kept up. This sentence used to enumerate three
+  ;; keys and went on doing so after there were five, which is the whole
+  ;; argument for pointing at the producer instead of copying it.
+  ;;
+  ;; The two counters are here because both gates do the same thing when
+  ;; they fire -- drop a topology notice, silently -- so from outside,
+  ;; one of them working and the other one being wrong look identical.
+  ;; Counting them apart is what lets anything downstream say which.
   (define (dpool-stats pool)
     (let ((ref (next-ref!)))
       (send (dpool-pid pool) (vector 'stats self ref))
