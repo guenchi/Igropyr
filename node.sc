@@ -1301,7 +1301,7 @@
   ;; object would make those two indistinguishable, which is the single
   ;; thing it exists to prevent.
   (define (monitor-node/token name)
-    (let ((tok (new-sub-token)))
+    (let ((tok (new-sub-token name)))
       (atomically
         (let ((l (filter (lambda (w) (process-alive? (w-pid w)))
                          (hashtable-ref watchers name (list)))))
@@ -1316,22 +1316,44 @@
 
   ;; Removes exactly the subscription that token names, and nothing else:
   ;; a process may hold several, and may also hold a legacy one alongside.
+  ;;
+  ;; ONE ARGUMENT, ON PURPOSE. Taking the name as well would let a caller
+  ;; pass a name that does not match the token, and the call would then do
+  ;; nothing at all with no way to tell -- a new silent failure introduced
+  ;; to save a lookup. The token carries its own name instead, so there is
+  ;; nothing for a caller to get wrong and no table to scan.
+  ;;
+  ;; ⚠ EXPLICIT PREMISE: holding the token IS the authority to end that
+  ;; subscription. Tokens are not meant to be passed around, and nothing
+  ;; here enforces that -- a process given someone else's token can
+  ;; unsubscribe them. Said out loud because it is the kind of assumption
+  ;; that is obvious to whoever wrote it and invisible afterwards.
   (define (demonitor-node/token tok)
-    (atomically
-      (let-values (((names lists) (hashtable-entries watchers)))
-        (let loop ((i 0))
-          (when (fx< i (vector-length names))
-            (let ((l (vector-ref lists i)))
-              (when (find (lambda (w) (eq? (w-token w) tok)) l)
-                (hashtable-set! watchers (vector-ref names i)
-                  (filter (lambda (w) (not (eq? (w-token w) tok))) l))))
-            (loop (fx+ i 1))))))
+    (unless (sub-token? tok)
+      (assertion-violation 'demonitor-node/token
+        "want a token returned by monitor-node/token" tok))
+    (let ((name (sub-token-name tok)))
+      (atomically
+        (hashtable-set! watchers name
+          (filter (lambda (w) (not (eq? (w-token w) tok)))
+                  (hashtable-ref watchers name (list))))))
     (void))
 
+  ;; REMOVES THE LEGACY SUBSCRIPTION AND NOTHING ELSE. Matching on the pid
+  ;; alone took a token subscription of the same process with it --
+  ;; silently, and in the direction hardest to notice: the caller asked for
+  ;; its old subscription to end and it did, so the visible half was
+  ;; exactly right. What went with it was a subscription whose holder still
+  ;; has a token and simply never hears anything again.
+  ;;
+  ;; ⭐ The shape is worth naming: a defect that does MORE than it was
+  ;; asked passes every check that only asks whether the requested thing
+  ;; happened.
   (define (demonitor-node name)
     (atomically
       (hashtable-set! watchers name
-        (filter (lambda (w) (not (eq? (w-pid w) self)))
+        (filter (lambda (w)
+                  (not (and (eq? (w-pid w) self) (not (w-token w)))))
                 (hashtable-ref watchers name (list)))))
     (void))
 
@@ -1393,7 +1415,15 @@
   ;; read back; a fresh pair cannot be reconstructed by any reader, so the
   ;; only way to hold one is to have been given it. Comparison is by
   ;; identity, never by contents.
-  (define (new-sub-token) (list 'node-subscription))
+  ;; The name rides along so an unsubscribe can find the right bucket
+  ;; without a second table and without asking the caller to remember it
+  ;; too. ⚠ It is routing information, never identity: two tokens for the
+  ;; same name are different objects and are never equal, because nothing
+  ;; ever compares their contents.
+  (define (new-sub-token name) (list 'node-subscription name))
+  (define (sub-token? x)
+    (and (pair? x) (eq? (car x) 'node-subscription) (pair? (cdr x))))
+  (define (sub-token-name t) (cadr t))
 
   ;; ONE COUNTER FOR THE WHOLE NODE, and it is handed out INSIDE the region
   ;; that publishes the event it numbers. A replacement publishes two
