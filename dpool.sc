@@ -296,8 +296,15 @@
     ;;
     ;; The numbers are global to the node rather than per peer, so what
     ;; arrives here for one peer is a subsequence of a rising sequence --
-    ;; still rising, which is all the comparison needs. Gaps are normal and
-    ;; mean nothing was missed; they are other peers' events.
+    ;; still rising, which is all the comparison needs.
+    ;;
+    ;; ⚠ NOTHING PROMISES A GAP, and nothing promises there is not one.
+    ;; Consecutive numbers for one peer mean only that no other peer had an
+    ;; event in between, which is a fact about how busy the node happened
+    ;; to be, not a property of anything here. Read this as "a gap is not a
+    ;; loss", never as "there will be gaps": code that leans on a gap
+    ;; existing works on a busy node and fails on a quiet one, and a quiet
+    ;; node is exactly what a test is.
     (define node-tokens (make-eq-hashtable))   ; node -> subscription token
     (define watermarks (make-eq-hashtable))    ; node -> highest seq accepted
 
