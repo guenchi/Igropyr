@@ -584,7 +584,7 @@
   ;; NOT ON THE PEERS ENTRY, deliberately. Living there would be cheaper,
   ;; but an entry is replaced whole, and replacing it is an implicit
   ;; destruction of whatever hangs on it. A hosted monitor retires by its
-  ;; key and by identity, through retire-agent-locked!, and does not
+  ;; key and by identity, through retire-agent-of-rec-locked!, and does not
   ;; travel with the entry -- so
   ;; its chain must not either.
   (define mon-heads (make-eq-hashtable))
@@ -1146,7 +1146,7 @@
     (set! active-monitors (fx- active-monitors 1)))
 
   ;; For a caller holding the record it just examined.
-  (define (retire-agent-locked! key rec)        ; caller already holds the region
+  (define (retire-agent-of-rec-locked! key rec)   ; caller already holds the region
     (let ((r (hashtable-ref callee-agents key #f)))
       (when (and r (eq? r rec)) (retire-rec-locked! key r))))
 
@@ -3622,7 +3622,7 @@
                                              (eq? (agent-conn found)
                                                   (current-conn-locked peer)))
                                         found
-                                        (begin (retire-agent-locked! key found) #f)))))
+                                        (begin (retire-agent-of-rec-locked! key found) #f)))))
                      (cond
                        ((and cur (agent-matches? cur c name)) #t)
                        ;; ⛔ THIS ARM IS REACHABLE, AND A CELL HAS BEEN
