@@ -988,6 +988,38 @@
                      (current-error-port))
             (loop))))))
 
+  ;; Undo a half-finished install. THE CALLER HOLDS THE REGION, and that
+  ;; is the whole reason this is allowed to exist.
+  ;;
+  ;; The design refused "exception-safe undo" once already, and the
+  ;; refusal was right: the objection recorded against it is that a
+  ;; compensating action is hand-written and can fail on its own, leaving
+  ;; a worse state than the one it was cleaning up. THIS ONE ESCAPES THAT
+  ;; OBJECTION, and the escape has to be written down or the next reader
+  ;; will apply the old refusal to it unchanged. Both actions here are
+  ;; allocation-free: hashtable-delete! cannot grow a table, mon-unlink!
+  ;; is pointer writes plus at most an existing-key update or a delete,
+  ;; and kill of a process nothing is watching sends nothing.
+  ;;
+  ;; ⭐ "NOTHING IS WATCHING IT" IS NOT A CLAIM ABOUT TIMING. The whole
+  ;; install runs in one region, and the reaper is told about the new
+  ;; agent only after that region is left. So at the moment this runs,
+  ;; nothing outside has had the opportunity to do anything at all --
+  ;; not because it happens to be early, but because nothing else has
+  ;; run. Move the guard that calls this outside the region and that
+  ;; argument is gone: another link could read the half-installed entry,
+  ;; be told the monitor is armed, and then have it deleted underneath.
+  ;;
+  ;; It never touches the count. The increment is the last step of the
+  ;; install and cannot raise, so reaching it means the install
+  ;; succeeded; nothing that gets here has been counted.
+  (define (undo-install! key p)                  ; caller already holds the region
+    (let ((cur (hashtable-ref callee-agents key #f)))
+      (when (and cur p (eq? (agent-pid cur) p))
+        (hashtable-delete! callee-agents key)
+        (mon-unlink! cur)))
+    (when (and p (process-alive? p)) (kill p 'install-failed)))
+
   (define (retire-agent-locked! key)             ; caller already holds the region
     (let ((r (hashtable-ref callee-agents key #f)))
       (when r
@@ -3299,19 +3331,49 @@
                        ((and cur (agent-matches? cur c name)) #t)
                        (cur (raise 'protocol))
                        ((fx< (accounted-monitors) max-hosted-monitors)
-                        (let ((r (make-agent-rec
-                                   (spawn (lambda () (mon-agent peer key name)))
-                                   name c key peer)))
-                          (hashtable-set! callee-agents key r)
-                          (mon-link! r)
-                          (set! active-monitors (fx+ active-monitors 1))
-                          ;; asynchronous on purpose: arming must not wait
-                          ;; on another process, and a watch that arrives
-                          ;; late is covered by the rescan
-                          (let ((rp (reaper-pid))
-                                (arec r))
+                        ;; THREE STEPS THAT MUST NOT BE LEFT HALF DONE.
+                        ;; Each of them can raise -- the record and the
+                        ;; process are allocations, and the table takes a
+                        ;; NEW key, so it can grow. Stopping in the middle
+                        ;; used to leave one of two states nobody would
+                        ;; ever notice: a process running with no entry
+                        ;; anywhere, or an entry on no chain and in no
+                        ;; count, which the reaper walks past forever
+                        ;; while a later request for the same key reads it
+                        ;; as current.
+                        ;;
+                        ;; ⭐ THE GUARD IS INSIDE THE REGION. It is not a
+                        ;; style choice: outside it, the moment between
+                        ;; the failure and the cleanup is a moment another
+                        ;; link can read the half-installed entry, be told
+                        ;; the monitor is armed, and then watch it be
+                        ;; deleted. Inside, there is no such moment,
+                        ;; because nothing else has run at all -- which is
+                        ;; also what makes the cleanup's own actions
+                        ;; provably harmless. See undo-install!.
+                        (let ((p #f))
+                          (guard (e (#t (undo-install! key p) (raise e)))
+                            (set! p (spawn (lambda () (mon-agent peer key name))))
+                            (let ((r (make-agent-rec p name c key peer)))
+                              (hashtable-set! callee-agents key r)
+                              (mon-link! r)
+                              ;; last, and it cannot raise: reaching it
+                              ;; means there is nothing left to undo
+                              (set! active-monitors (fx+ active-monitors 1))))
+                          ;; ⛔ DELIBERATELY OUTSIDE THE GUARD. By here the
+                          ;; state is complete and consistent, and this
+                          ;; send allocates a mailbox node, so it can
+                          ;; raise. Undoing the install because the
+                          ;; ANNOUNCEMENT failed would delete a monitor
+                          ;; that is correctly armed -- and the rescan
+                          ;; already covers a watch that never arrives,
+                          ;; which is why the send was made asynchronous
+                          ;; in the first place. The scope of the guard is
+                          ;; the documentation: what is inside it is what
+                          ;; is not yet safe to leave behind.
+                          (let ((rp (reaper-pid)))
                             (when rp
-                              (send rp (vector 'watch (agent-pid arec) key)))))
+                              (send rp (vector 'watch p key)))))
                         #t)
                        (else #f))))
            ;; At the hosting ceiling: refuse, and tell the watcher at
