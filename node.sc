@@ -3430,10 +3430,28 @@
                        ;; current connections for one peer. What rules
                        ;; that out is the generation check in the link's
                        ;; frame loop: a superseded connection stops before
-                       ;; it can serve anything. Remove that check and
-                       ;; this arm comes back -- and it comes back with
-                       ;; the wrong meaning, calling a stale generation a
-                       ;; protocol violation. It stays because it is still
+                       ;; it can serve anything.
+                       ;;
+                       ;; ⭐ AND HERE IS THE ROAD THAT USED TO LEAD HERE,
+                       ;; because knowing how it was reached says more
+                       ;; than knowing why it is not. There was exactly
+                       ;; one: a connection that had already been
+                       ;; replaced went on serving buffered frames, and
+                       ;; one of them armed a monitor -- recorded against
+                       ;; that old connection, and installed after the
+                       ;; sweep which clears the previous generation's
+                       ;; monitors had already run, so nothing removed
+                       ;; it. The peer then repeated its request on the
+                       ;; new connection, which this protocol says is
+                       ;; free, and found that record.
+                       ;;
+                       ;; That road matters because it is the one that
+                       ;; reopens. Removing the loop's check does not
+                       ;; merely make this arm reachable again; it makes
+                       ;; it reachable in the only way it ever was, and
+                       ;; the answer it gives there is wrong -- calling a
+                       ;; peer a protocol violator for doing what it was
+                       ;; told it could do. It stays because it is still
                        ;; the only way to say "two live connections are
                        ;; genuinely contending", which is a thing this
                        ;; code should refuse rather than guess about.
