@@ -1479,6 +1479,177 @@
         (sleep-ms 400))
       (display "S2 replacement cells passed\n"))
 
+    ;; ---- a watch across a replacement: two incarnations, opposite answers --
+    ;; A remote monitor has two halves: the watcher's rmonitors entry and
+    ;; the agent the target hosts for it. Nothing on either side reports a
+    ;; difference between them, so a target that quietly stops hosting its
+    ;; half leaves the watcher believing it is watching, and a death that
+    ;; never arrives looks exactly like a process that has not died.
+    ;;
+    ;; THE PEER HERE IS THE WATCHER and this node is the target: the
+    ;; watcher's half is a frame the fixture sends, the target's half is
+    ;; an agent this node hosts, and what the cells read is the mdown
+    ;; FRAME ON THE WIRE -- the target's half and nothing else.
+    ;;
+    ;; ⭐ TWO CELLS, ONE FIXTURE, ONE CONSTANT APART, OPPOSITE VERDICTS.
+    ;; A replacement has two sources and they want opposite things:
+    ;;   - SAME incarnation, new connection: the peer is the same process,
+    ;;     its rmonitors entry is still there, so the hosted half MUST
+    ;;     survive;
+    ;;   - NEW incarnation (different boot id): the old peer is gone, its
+    ;;     parked agents are dead registrations, so they MUST be dropped --
+    ;;     and a stale one that survives does not merely leak: it reports
+    ;;     the death of a local process to the NEW incarnation, whose mref
+    ;;     counter also restarts at 1, so the peer hears that a monitor it
+    ;;     never armed has fired.
+    ;;
+    ;; ⛔ WHICH SOURCE EACH CELL DRIVES IS STRUCTURAL, NOT A COMMENT.
+    ;; The same-incarnation cell keeps the boot id and RAISES the
+    ;; generation (only I8a can replace on that). The new-incarnation cell
+    ;; changes the boot id and KEEPS the generation (I8a refuses an equal
+    ;; generation, so only I6 can replace on that). Change one constant in
+    ;; either and it stops being the case it is named for -- and the other
+    ;; cell, which expects the opposite, is sitting next to it.
+    (let ()
+      (define alt-boot-id "deadbeefdeadbeef")
+      (define (watch-session! label boot gen mref victim-name me ref)
+        ;; Handshake as "wpeer" with `boot`/`gen`. When mref, arm it.
+        ;; Then report the first mdown for it, or 'no-mdown when the read
+        ;; window closes. -> the session's pid.
+        (spawn
+          (lambda ()
+            (tcp-connect! "127.0.0.1" port self)
+            (receive (after 3000 (send me (vector ref 'no-connect)))
+              (`#(tcp-connected ,c)
+                (tcp-read-start! c)
+                (let ((d (read-frame-or-closed label)))
+                  (if (not (and (list? d) (= (length d) 4)))
+                      (send me (vector ref (list 'challenge-shape d)))
+                      (let ((nonce-a (cadr d)) (bootid-a (cadddr d)))
+                        (tcp-write! c (frame-bytes
+                                        (list 'hello "wpeer"
+                                              (v4-proof-d nonce-a "wpeer" boot
+                                                          (number->string gen)
+                                                          wire-name-of-this-node
+                                                          bootid-a)
+                                              "beadbeadbeadbeadbeadbeadbeadbead"
+                                              4 boot gen))
+                                    #f)
+                        (let ((w (read-frame-or-closed label)))
+                          (if (not (and (list? w) (eq? (car w) 'welcome)))
+                              (send me (vector ref (if (symbol? w) w 'other)))
+                              (begin
+                                (when mref
+                                  (tcp-write! c (frame-bytes
+                                                  (list 'mon victim-name mref)) #f))
+                                (send me (vector ref 'welcomed))
+                                ;; READ WITHOUT read-frame-or-closed: that
+                                ;; helper ends the whole run with its own
+                                ;; label on a timeout, and a silence is
+                                ;; exactly what these cells report. The
+                                ;; verdict has to carry THIS cell's name.
+                                (let wait ((acc ""))
+                                  (let* ((n (string-length acc))
+                                         (nl (let scan ((k 0))
+                                               (cond ((= k n) #f)
+                                                     ((char=? (string-ref acc k)
+                                                              #\newline) k)
+                                                     (else (scan (+ k 1))))))
+                                         (len (and nl (string->number
+                                                        (substring acc 0 nl)))))
+                                    (if (and len (>= n (+ nl 1 len)))
+                                        (let ((f (read (open-input-string
+                                                         (substring acc (+ nl 1)
+                                                                    (+ nl 1 len))))))
+                                          (if (and (list? f) (eq? (car f) 'mdown))
+                                              (send me (vector ref (list 'mdown (cadr f))))
+                                              (wait (substring acc (+ nl 1 len) n))))
+                                        (receive (after 5000
+                                                   (send me (vector ref 'no-mdown)))
+                                          (`#(tcp-data ,bv)
+                                            (wait (string-append acc (utf8->string bv))))
+                                          (`#(tcp-eof) (send me (vector ref 'closed)))
+                                          (`#(tcp-error ,_)
+                                            (send me (vector ref 'closed)))))))))))))
+                (tcp-close! c))
+              (`#(tcp-connect-failed ,e) (send me (vector ref 'no-connect)))))))
+      (define (callee-count) (cdr (assq 'callee-agents (node-monitor-stats))))
+      (define (welcomed! ref label)
+        (receive (after 12000 (fail! label 'no-welcome))
+          (`#(,@ref welcomed) 'ok)
+          (`#(,@ref ,other) (fail! label (list 'handshake other)))))
+      (define (armed! base label)
+        ;; OBSERVABLY armed before the replacement: without this a cell
+        ;; passes with nothing to lose.
+        (let poll ((n 0))
+          (unless (> (callee-count) base)
+            (if (= n 60)
+                (fail! label (list 'arm-never-landed (callee-count) base))
+                (begin (sleep-ms 50) (poll (+ n 1)))))))
+
+      ;; ---- same incarnation: the hosted half must survive -----------------
+      (let* ((me self) (r1 (gensym)) (r2 (gensym))
+             (victim (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
+             (base (callee-count)))
+        (register 'watch-victim victim)
+        (let ((p1 (watch-session! "s-watch-old" probe-boot-id 31 9101
+                                  'watch-victim me r1)))
+          (welcomed! r1 "watch-same-incarnation")
+          (armed! base "watch-same-incarnation")
+          (let ((p2 (watch-session! "s-watch-new" probe-boot-id 32 #f
+                                    'watch-victim me r2)))
+            (welcomed! r2 "watch-same-incarnation")
+            (sleep-ms 400)
+            ;; ⭐ THE MIDDLE SAMPLE separates the two ways this can break.
+            ;; A teardown on the replacement path shows up here, as a count
+            ;; that has already fallen; a gate on the reporting side leaves
+            ;; the count alone and shows up below, as a notice that never
+            ;; comes. One reading, three sample points.
+            (unless (> (callee-count) base)
+              (fail! "watch-torn-down-on-same-incarnation" (callee-count)))
+            (kill victim 'for-the-cell)
+            (receive (after 12000 (fail! "watch-same-incarnation" 'verdict-timeout))
+              (`#(,@r2 (mdown ,m)) (unless (eqv? m 9101)
+                                     (fail! "watch-wrong-mref" m)))
+              (`#(,@r2 ,what) (fail! "watch-lost-on-same-incarnation" what)))
+            (kill p1 'done) (kill p2 'done))))
+      (sleep-ms 700)
+      (display "a watch survives a same-incarnation replacement ok\n")
+
+      ;; ---- new incarnation: the hosted half must go, and stay quiet -------
+      (let* ((me self) (r1 (gensym)) (r2 (gensym))
+             (victim (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
+             (base (callee-count)))
+        (register 'watch-victim-2 victim)
+        (let ((p1 (watch-session! "s-inc-old" probe-boot-id 31 9201
+                                  'watch-victim-2 me r1)))
+          (welcomed! r1 "watch-new-incarnation")
+          (armed! base "watch-new-incarnation")
+          ;; SAME generation, DIFFERENT boot id: I8a refuses an equal
+          ;; generation, so the replacement here can only be I6.
+          (let ((p2 (watch-session! "s-inc-new" alt-boot-id 31 #f
+                                    'watch-victim-2 me r2)))
+            (welcomed! r2 "watch-new-incarnation")
+            ;; the old incarnation's registration must be gone
+            (let poll ((n 0))
+              (unless (= (callee-count) base)
+                (if (= n 60)
+                    (fail! "stale-registration-outlives-incarnation"
+                           (list (callee-count) base))
+                    (begin (sleep-ms 50) (poll (+ n 1))))))
+            (kill victim 'for-the-cell)
+            ;; ⭐ AND IT MUST NOT SPEAK. A stale agent reports by peer NAME,
+            ;; so it would write to the new incarnation -- which armed
+            ;; nothing and whose mref counter restarts at 1.
+            (receive (after 9000 'ok)
+              (`#(,@r2 (mdown ,m))
+                (fail! "stale-agent-reported-to-new-incarnation" m))
+              (`#(,@r2 no-mdown) 'ok)
+              (`#(,@r2 ,other) (fail! "watch-new-incarnation" other)))
+            (kill p1 'done) (kill p2 'done))))
+      (sleep-ms 700)
+      (display "a new incarnation drops the old one's hosted watch ok\n"))
+
 
     (display "CV cells passed\n")
     (display "S2 registrar/container cells passed\n")
