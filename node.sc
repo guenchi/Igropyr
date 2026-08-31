@@ -4525,10 +4525,31 @@
                   ;; (4) publish the new mapping and the connector that
                   ;; serves it in one region, so nothing can observe a
                   ;; mapping with no connector or the reverse.
+                  ;; ⚠ AN ALLOCATION IN ARGUMENT POSITION IS NOT FREE OF
+                  ;; CONSEQUENCE HERE. Building the value before the one
+                  ;; write is the shape that keeps a table from being
+                  ;; half-updated, and it does that here too -- but one
+                  ;; of the arguments is a spawn, and a spawn leaves
+                  ;; something behind whether or not the write that was
+                  ;; going to publish it succeeds. The write takes a NEW
+                  ;; key and can grow the table, so it can raise, and
+                  ;; what it left was a connector process dialling a peer
+                  ;; that nothing has a record of -- for as long as the
+                  ;; node runs, and visible in no count this file keeps.
+                  ;;
+                  ;; The compensation is only the kill. Nothing before
+                  ;; the write wrote anything, so there is no entry to
+                  ;; remove, and deleting unconditionally could take out
+                  ;; an entry that was already here. What has to be
+                  ;; undone is exactly what could already have happened.
                   (atomically
-                    (hashtable-set! connectors peer
-                      (vector (spawn (lambda () (connector peer host port)))
-                              host port))))))
+                    (let ((p #f))
+                      (guard (e (#t (when (and p (process-alive? p))
+                                      (kill p 'connector-unpublished))
+                                    (raise e)))
+                        (set! p (spawn (lambda () (connector peer host port))))
+                        (hashtable-set! connectors peer
+                          (vector p host port))))))))
           (loop))
         (`#(node-stop) (void)))))
 
