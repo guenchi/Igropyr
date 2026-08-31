@@ -1297,12 +1297,47 @@
   ;; only user on the connections it owns (TLS uses it on TLS connections,
   ;; which this layer neither creates nor writes to); a second user here
   ;; would silently displace this one.
+  ;; ⚠ THE PARAGRAPH ABOVE IS TRUE AND IT IS NARROWER THAN IT READS.
+  ;; Everything it describes about the phantom balance is right, and the
+  ;; measure it prescribes -- keep interrupts off across both halves --
+  ;; closes exactly one of the two ways to land between them. It closes
+  ;; the kill. It does not close a raise, because this region gives
+  ;; mutual exclusion and not rollback: an exception leaves behind
+  ;; precisely what ran before it, and what ran was the store.
+  ;;
+  ;; That is not a case nobody thought of. It is a complete and correct
+  ;; hazard analysis paired with a measure covering one of its triggers,
+  ;; written in words that read as though they covered both. The store
+  ;; allocates -- a new key can grow the table -- and so does the closure
+  ;; handed to conn-on-close!, which is built before the call it is an
+  ;; argument to. Either raising used to leave the entry with no hook.
+  ;;
+  ;; Measured, not argued: injecting a raise between the two halves
+  ;; leaves conns=1 bytes=70 still standing after the baseline cell has
+  ;; polled for ten seconds. Moving the same raise to just after the hook
+  ;; registration -- one bit of difference, and a larger disturbance,
+  ;; since it fires three times to the other's one -- leaves the suite
+  ;; green. The red is the missing hook and not the interrupted
+  ;; handshake. That an out-of-memory really can land on the closure is
+  ;; an argument rather than a measurement: it escapes into the conn
+  ;; record, so it cannot be stack-allocated.
+  ;;
+  ;; The guard covers both halves, argument evaluation included, since
+  ;; that is where the closure is built. The compensation can never fail
+  ;; because it asks for nothing: restoring a balance writes a key that
+  ;; is already there, and removing one cannot grow a table. It does not
+  ;; touch the order of the two halves -- registering after the store is
+  ;; what makes an already-closed connection come out right, as above.
   (define (outbound-charge! c n)
     (atomically
       (let* ((cur (hashtable-ref outbound c #f))
              (v (+ (or cur 0) n)))
-        (hashtable-set! outbound c v)
-        (unless cur (conn-on-close! c (lambda () (outbound-forget! c))))
+        (guard (e (#t (if cur
+                          (hashtable-set! outbound c cur)
+                          (hashtable-delete! outbound c))
+                      (raise e)))
+          (hashtable-set! outbound c v)
+          (unless cur (conn-on-close! c (lambda () (outbound-forget! c)))))
         (> v max-outbound-bytes))))
 
   ;; Refund n bytes. A missing entry is not an error: the connection
