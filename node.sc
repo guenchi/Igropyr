@@ -553,7 +553,8 @@
   ;; NOT ON THE PEERS ENTRY, deliberately. Living there would be cheaper,
   ;; but an entry is replaced whole, and replacing it is an implicit
   ;; destruction of whatever hangs on it. A hosted monitor retires by its
-  ;; key, through retire-agent!, and does not travel with the entry -- so
+  ;; key and by identity, through retire-agent-locked!, and does not
+  ;; travel with the entry -- so
   ;; its chain must not either.
   (define mon-heads (make-eq-hashtable))
   (define mon-chain #f)                        ; global chain head
@@ -579,8 +580,8 @@
   ;; is idempotent and safe to call on a node already out of that chain.
   ;;
   ;; ⭐ SECOND TIME IN THIS FILE that a property is bought by collapsing
-  ;; call sites rather than by asking each of them to behave: retire-agent!
-  ;; did it for "the count comes down in one place". Said once so the
+  ;; call sites rather than by asking each of them to behave:
+  ;; retire-rec-locked! does it for "the count comes down in one place". Said once so the
   ;; pattern reads as a decision rather than a coincidence -- when a rule
   ;; has to hold at every call site, the cheapest way to make it hold is
   ;; to leave one call site.
@@ -833,7 +834,7 @@
             ;; would give back one resource and quietly keep the other.
             (let ((key (hashtable-ref watched pid #f)))
               (hashtable-delete! watched pid)
-              (when key (retire-agent! key)))
+              (when key (retire-agent-of-pid! key pid)))
             (lease-retire-owner! pid)
             (loop))
           (`#(node-stop) (void))))))
@@ -1057,15 +1058,40 @@
         (mon-unlink! cur)))
     (when (and p (process-alive? p)) (kill p 'install-failed)))
 
-  (define (retire-agent-locked! key)             ; caller already holds the region
-    (let ((r (hashtable-ref callee-agents key #f)))
-      (when r
-        (hashtable-delete! callee-agents key)
-        (mon-unlink! r)
-        (set! active-monitors (fx- active-monitors 1)))))
+  ;; RETIRING IS BY IDENTITY, NOT BY KEY. The key outlives the record
+  ;; filed under it: an entry can be retired here and a new one installed
+  ;; under the same key before the old agent's DOWN is processed, and a
+  ;; retirement that trusted the key alone would then delete the
+  ;; REPLACEMENT -- leaving a live agent in no table, on no chain, in no
+  ;; count, findable by no later demon, and its credit returned twice.
+  ;;
+  ;; ⚠ THE NOTE THAT USED TO STAND FOR THIS SAID retire-agent! WAS
+  ;; IDEMPOTENT. It is, and that is not the property required.
+  ;; Idempotence says deleting twice does not break; it says nothing
+  ;; about deleting the same thing twice. The distinction is the whole
+  ;; defect: the second call was well-formed, harmless-looking, and
+  ;; removed a record that had never been asked about.
+  ;;
+  ;; Same shape as the queue's delivery confirmation, the admission
+  ;; lease's release, and the half-install undo: whoever hands the
+  ;; resource back names WHICH ONE, and the removal happens only if that
+  ;; one is still the one on file.
+  (define (retire-rec-locked! key r)            ; r is known to be current
+    (hashtable-delete! callee-agents key)
+    (mon-unlink! r)
+    (set! active-monitors (fx- active-monitors 1)))
 
-  (define (retire-agent! key)
-    (atomically (retire-agent-locked! key)))
+  ;; For a caller holding the record it just examined.
+  (define (retire-agent-locked! key rec)        ; caller already holds the region
+    (let ((r (hashtable-ref callee-agents key #f)))
+      (when (and r (eq? r rec)) (retire-rec-locked! key r))))
+
+  ;; For the reaper, which knows the pid that died and nothing else. It
+  ;; must not retire whatever happens to be under the key now.
+  (define (retire-agent-of-pid! key pid)
+    (atomically
+      (let ((r (hashtable-ref callee-agents key #f)))
+        (when (and r (eq? (agent-pid r) pid)) (retire-rec-locked! key r)))))
 
   (define (accounted-monitors) active-monitors)
   (define max-preauth-conns 256)
@@ -3406,22 +3432,49 @@
                           ;;
                           ;; So liveness is part of the match. A dead record
                           ;; for this exact request is retired here and the
-                          ;; request treated as new; the reaper's DOWN then
-                          ;; finds nothing left to do, which is what
-                          ;; retire-agent! being idempotent is for.
+                          ;; request treated as new.
+                          ;;
+                          ;; ⚠ WHAT MAKES THAT SAFE IS NOT IDEMPOTENCE.
+                          ;; This note used to say the reaper's DOWN would
+                          ;; then find nothing left to do, because
+                          ;; retiring is idempotent. Retiring is
+                          ;; idempotent, and that is a different claim:
+                          ;; it says a second removal does not break, not
+                          ;; that a second removal takes the same thing.
+                          ;; Between this retirement and that DOWN a new
+                          ;; agent can be filed under the same key, and a
+                          ;; removal trusting the key alone would take
+                          ;; THAT one. Retirement is by identity for
+                          ;; exactly this reason -- see retire-rec-locked!.
                           ;; STALE HAS TWO SHAPES AND ONE ANSWER. A record
                           ;; whose agent has died, and a record left by a
                           ;; connection that is no longer this peer's, are
-                          ;; both entries for a monitor that no longer
-                          ;; exists; each is retired here and the request
-                          ;; treated as new. Only the generation test is
-                          ;; new -- the liveness test was already here for
-                          ;; the same reason.
+                          ;; both entries this peer can no longer be
+                          ;; served through; each is retired here and the
+                          ;; request treated as new. Only the generation
+                          ;; test is new -- the liveness test was already
+                          ;; here for the same reason.
+                          ;;
+                          ;; ⚠ "NO LONGER EXISTS" WOULD BE TOO STRONG for
+                          ;; the second shape, and the difference matters.
+                          ;; A record left by a superseded connection may
+                          ;; still have a LIVING agent: the sweep that
+                          ;; ends the old generation sends it a stop
+                          ;; message, and until it runs, two agents exist
+                          ;; for one key while the count says one. That
+                          ;; window closes by itself, because the stop is
+                          ;; already in that agent's mailbox and its DOWN
+                          ;; will find the key holding somebody else and
+                          ;; leave it alone. It stops closing by itself on
+                          ;; the day some path installs an agent that the
+                          ;; sweep does not reach -- which is what the
+                          ;; frame loop's generation check is there to
+                          ;; prevent.
                           (cur (and found
                                     (if (and (process-alive? (agent-pid found))
                                              (current-conn? peer (agent-conn found)))
                                         found
-                                        (begin (retire-agent-locked! key) #f)))))
+                                        (begin (retire-agent-locked! key found) #f)))))
                      (cond
                        ((and cur (agent-matches? cur c name)) #t)
                        ;; ⚠ THIS ARM IS NOW UNREACHABLE, AND NOT BY ITSELF.
