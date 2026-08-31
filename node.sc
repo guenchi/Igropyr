@@ -920,7 +920,13 @@
   ;; threshold -- so a number here would be a copy of something four
   ;; other lines own, and none of their owners would think to come and
   ;; change it. To find it: add up the delays until the total passes
-  ;; child-min-persist-ms; the restart that crosses it is the last one.
+  ;; child-min-persist-ms; the death that crosses it is the one that
+  ;; raises.
+  ;;
+  ;; ⚠ THAT DEATH IS NOT FOLLOWED BY A RESTART. The give-up raises
+  ;; before start!, so the last restart is the one before the crossing --
+  ;; a sentence here used to say "the restart that crosses it is the last
+  ;; one", which counts one restart that never happens.
   (define child-min-persist-ms 5000)
 
   ;; ---- the warden ------------------------------------------------------
@@ -2863,6 +2869,13 @@
 
   (define (same-conn? e r) (eq? (entry-conn e) (ireq-conn r)))
 
+  ;; Is the request coming from a DIFFERENT run of the peer? I6 uses it to
+  ;; decide that nothing about the old entry survives; the replacement
+  ;; path uses it to decide whether a watch parked here is still owned by
+  ;; anybody. See I6 for why it is one definition and not two.
+  (define (new-incarnation? e r)
+    (not (equal? (entry-boot-id e) (ireq-boot-id r))))
+
   ;; Decisions the tree can reach. The action returns one of these; the
   ;; table work for `replace` and `install` has already happened inside
   ;; the atomic region by the time it is returned.
@@ -2920,9 +2933,14 @@
       ;; I6 -- a different boot id is a different incarnation of the
       ;; peer. Nothing about the old one survives it, so no ordering
       ;; question arises and no tie-break applies.
-      (make-irule 'I6
-        (lambda (e r) (not (equal? (entry-boot-id e) (ireq-boot-id r))))
-        (lambda (e r) 'replace))
+      ;;
+      ;; ⭐ THE PREDICATE IS NAMED BECAUSE TWO PLACES ASK IT. This rule
+      ;; sends a new incarnation down the replacement path, and the
+      ;; replacement path then has to treat it as the one case that is
+      ;; NOT the same peer on a different connection. Spelled out twice
+      ;; the two would drift, and the drift would be silent: each
+      ;; spelling reads as correct on its own.
+      (make-irule 'I6 new-incarnation? (lambda (e r) 'replace))
       ;; I7 -- same incarnation, old connection already gone. Same dialer
       ;; still has to pass the generation gate: without it a late request
       ;; carrying a SMALLER generation would slip in behind "the old one
@@ -3145,38 +3163,87 @@
              ;; does not do it, so its own death no longer takes the
              ;; events with it.
              ;;
-             ;; R3 IS THE CONSERVATIVE READING and is flagged as such:
-             ;; the design says "the old generation's pending calls and
-             ;; hosted monitors are settled per the channel contract"
-             ;; without spelling that contract out. Pending calls are
-             ;; unambiguous -- no reply can arrive on a closed
-             ;; connection. Hosted monitors are the open question: for a
-             ;; new incarnation (I6) they are certainly dead, and for a
-             ;; new connection of the SAME incarnation the peer may or
-             ;; may not re-register. Dropping them is the reading that
-             ;; cannot lose a resource; keeping them would be the reading
-             ;; that cannot lose a registration.
-             ;; ⭐ WHAT IS NOT DONE HERE, AND WHY IT MUST NOT BE. The
-             ;; death path runs a third sweep that this one does not:
-             ;; the one that answers every remote monitor watching this
-             ;; peer with noconnection. Doing it here would tell every
-             ;; watcher that a peer which is reachable right now has
-             ;; become unreachable -- a lie, once per watcher, and one
-             ;; they would act on.
+             ;; ⭐ TWO SWEEPS THE DEATH PATH RUNS AND THIS ONE MUST
+             ;; NOT. A replacement is not a death: it is the same peer on
+             ;; a different connection, and a watch that crossed the old
+             ;; one has to survive. Only state tied to the CONNECTION
+             ;; goes.
              ;;
-             ;; A replacement is not a death. It is the same peer on a
-             ;; different connection, and a watch that crossed the old
-             ;; one has to survive; only the state tied to the
-             ;; CONNECTION goes. That is the whole difference between
-             ;; the two paths, and this is the only place in the file
-             ;; where it is visible.
+             ;;   - fail-monitors-for! would tell every watcher that a
+             ;;     peer which is reachable right now has become
+             ;;     unreachable -- a lie, once per watcher, and one they
+             ;;     would act on.
+             ;;   - drop-hosted-monitors! would tear down the OTHER HALF
+             ;;     of those same watches: the agents this node hosts for
+             ;;     the peer. The watcher keeps its rmonitors entry and
+             ;;     nothing re-arms it, so the watch would go on existing
+             ;;     on one side and being unserviceable on the other.
              ;;
-             ;; ⛔ THE OMISSION IS DELIBERATE. It does not look like one:
-             ;; a diff shows the death path doing three things and this
-             ;; path doing two, and the natural tidy-up is to make them
-             ;; agree. Making them agree breaks this.
+             ;; ⭐ EXCEPT FOR I6, AND IT IS THE WHOLE REASON THE SECOND
+             ;; SWEEP IS CONDITIONAL RATHER THAN GONE. Two rules send
+             ;; work here and they want opposite things. I7/I8 are the
+             ;; same peer on a different connection, and its watches must
+             ;; survive. I6 is a DIFFERENT RUN of the peer: the process
+             ;; that armed those watches no longer exists, so what is
+             ;; parked here is a dead registration that nothing will ever
+             ;; come back for.
+             ;;
+             ;; ⛔ LEAVING I6'S BEHIND IS NOT A LEAK, IT IS A MISREPORT.
+             ;; A stale agent still watches a live local process. When
+             ;; that process dies the agent writes mdown to the PEER
+             ;; NAME, which now resolves to the new incarnation -- whose
+             ;; mref counter has also restarted, so the reference can
+             ;; name one of ITS watches. The far side then hears that a
+             ;; process died which did not, and acts on it.
+             ;;
+             ;; ⭐ AND IT IS NOT EXTRA CAUTION. Without the condition
+             ;; the stale records are still reclaimed -- but only lazily,
+             ;; and only in part: the mon admission path retires a record
+             ;; whose connection is no longer current, so it reaches
+             ;; exactly those keys the new incarnation happens to re-arm.
+             ;; Its mref counter restarts too, so that is a prefix of
+             ;; what the old run held and nothing reaches the rest. With
+             ;; the condition there is no residue at all.
+             ;;
+             ;; ⚠ THE TWO WERE ONE BRANCH ONCE AND THE ARGUMENT FOR
+             ;; REMOVING THE SWEEP WAS CHECKED ON I7/I8 ONLY. It was also
+             ;; called a return to what this path did before generations
+             ;; existed -- and I6 did not exist before generations, so
+             ;; there was no old behaviour for it to return to. A revert
+             ;; only covers the paths the old version had.
+             ;;
+             ;; ⚠ THE SECOND ONE WAS HERE AND HAD TO BE TAKEN OUT. It
+             ;; was argued as the reading that "cannot lose a resource",
+             ;; against a reading that "cannot lose a registration", with
+             ;; the peer's re-registration left open. That symmetry is
+             ;; false: the peer runs this same library, monitor-remote is
+             ;; the only thing that writes rmonitors or sends a mon
+             ;; frame, and nothing calls it again -- so the peer NEVER
+             ;; re-registers, and the cost of that reading is not "may
+             ;; lose a registration" but "loses it, silently, every
+             ;; time".
+             ;;
+             ;; ⭐ AND THE RESOURCE ARGUMENT DOES NOT SURVIVE EITHER.
+             ;; What drop-hosted-monitors! is for is a peer that
+             ;; connects, parks monitors and DROPS, over and over; that
+             ;; path is remove-peer! and still calls it. Here the same
+             ;; fact that makes the loss real -- nothing re-arms -- is
+             ;; what stops the retained agents accumulating, and the
+             ;; admission ceiling bounds them even against a peer that
+             ;; does re-arm.
+             ;;
+             ;; ⛔ THE OMISSION IS DELIBERATE, AND IT LOOKS LIKE AN
+             ;; OVERSIGHT: a diff shows the death path doing three things
+             ;; and this path doing one, and the natural tidy-up is to
+             ;; make them agree. Making them agree is how this broke the
+             ;; first time.
+             ;;
+             ;; ⚠ WHAT IS STILL OPEN is the semantics, not this: whether
+             ;; a hosted watch belongs to the connection it was armed on
+             ;; or to the peer. Until that is decided, this path does
+             ;; what it did before generations existed.
              (stop-link! (entry-conn old) (entry-link old) 'replaced)
-             (drop-hosted-monitors! name)
+             (when (new-incarnation? old r) (drop-hosted-monitors! name))
              (fail-pending-for! name)
              (dispatch-wake!)
              'replaced)
@@ -3300,12 +3367,25 @@
     (map irule-name (install-rules)))
 
 
-  ;; idempotent: only removes the entry if it still belongs to this conn
-  ;; The link to `name` is gone, so every monitor we HOST on its behalf
-  ;; is now unreportable: tear them down (each demon-local demonitors the
-  ;; local process and frees its callee-agents slot). Without this a peer
-  ;; that connects, parks monitors, and drops -- over and over -- would
-  ;; leak agents and eventually exhaust max-hosted-monitors.
+  ;; The peer is GONE -- not replaced, gone -- so every monitor we HOST on
+  ;; its behalf is now unreportable: tear them down (each demon-local
+  ;; demonitors the local process and frees its callee-agents slot).
+  ;; Without this a peer that connects, parks monitors, and drops -- over
+  ;; and over -- would leak agents and eventually exhaust
+  ;; max-hosted-monitors.
+  ;;
+  ;; ⛔ TWO CALLERS, AND THE CONDITION ON THE SECOND IS LOAD-BEARING.
+  ;; The death path calls it unconditionally. The replacement path calls
+  ;; it ONLY for a new incarnation (I6) -- see new-incarnation?. Calling
+  ;; it for a same-incarnation replacement is the defect this condition
+  ;; exists to prevent: the peer is still reachable and still holds the
+  ;; watcher's half of every watch, so tearing this half down leaves the
+  ;; watch alive on one side and unserviceable on the other, with nothing
+  ;; on either side that reports the difference.
+  ;;
+  ;; ⚠ THE LEAK ARGUMENT ABOVE DOES NOT JUSTIFY AN UNCONDITIONAL CALL,
+  ;; though it reads as though it does. The accumulation it describes
+  ;; comes from DROPS, which arrive through the death path.
   (define (drop-hosted-monitors! name)
     (let ((head (atomically (mon-splice-peer! name))))
       (let walk ((r head))
@@ -3678,7 +3758,7 @@
                         ;; provably harmless. See undo-install-of-pid!.
                         (let ((p #f))
                           (guard (e (#t (undo-install-of-pid! key p) (raise e)))
-                            (set! p (spawn (lambda () (mon-agent peer key name c))))
+                            (set! p (spawn (lambda () (mon-agent peer key name))))
                             (let ((r (make-agent-rec p name c key peer)))
                               (hashtable-set! callee-agents key r)
                               (mon-link! r)
@@ -4012,33 +4092,32 @@
   ;; this one included. The demon frame in remove-target-watch! is the
   ;; same case and takes the same route. See link-write/critical for the
   ;; rule, and for why an rcall reply is deliberately NOT in this class.
-  ;; ⭐ IT CARRIES THE CONNECTION IT WAS ARMED ON. Everything else here
-  ;; is named rather than held: the watcher is a peer name, and the write
-  ;; resolves that name when the monitor fires. The gap between those two
-  ;; moments is the whole life of the monitor, and a peer's connection can
-  ;; be replaced inside it -- so an agent belonging to a generation that
-  ;; is gone would send its notice down the link of the generation that
-  ;; replaced it. If that generation has re-armed the same mref for some
-  ;; other target -- which this protocol tells peers is free -- the far
-  ;; side ends the wrong watch, believing the wrong process died. Nothing
-  ;; reports that.
+  ;; ⚠ IT WRITES TO THE PEER, NOT TO A CONNECTION, and that is now a
+  ;; decision rather than an accident. The watcher is a peer name and the
+  ;; write resolves that name when the monitor fires, so a monitor armed
+  ;; before a replacement reports down the connection that replaced it.
   ;;
-  ;; Dropping the notice loses nothing. A link going down makes the
-  ;; watching node fire every remote monitor it held on that node, so the
-  ;; far side has already been told, and told with a reason that is not
-  ;; out of date.
+  ;; ⛔ A GATE HERE WAS TRIED AND REMOVED. It carried the connection the
+  ;; agent was armed on and wrote only while that connection was still
+  ;; current. The argument for dropping the notice otherwise was that the
+  ;; watcher's own fail-monitors-for! had already told the far side --
+  ;; TRUE ON THE DEATH PATH AND FALSE ON THE REPLACEMENT PATH, where that
+  ;; sweep deliberately does not run. On a replacement the gate was
+  ;; therefore not narrow but total: the connection it held could never
+  ;; be current again, so it discarded every notice for the rest of the
+  ;; monitor's life, and the watcher heard nothing.
   ;;
-  ;; ⚠ THIS NARROWS THE WINDOW, IT DOES NOT CLOSE IT. Reading which
-  ;; connection is current and then writing are two steps, and a
-  ;; replacement can land between them; a write cannot be made atomic.
-  ;; What changes is the size -- the exposure was the entire lifetime of
-  ;; a monitor and is now the gap between a comparison and a write. It
-  ;; earns its place here for a reason that did not apply to the gate
-  ;; once tried in the frame loop: this runs once when a monitor fires,
-  ;; not once per frame, so the reduction costs no allocation on a hot
-  ;; path. Said plainly rather than claimed shut -- a guard that claims
-  ;; more than it does is worse than none.
-  (define (mon-agent watcher key name conn)
+  ;; ⭐ THE LESSON IS ABOUT THE MEASUREMENT, not about this gate. It was
+  ;; described, and accepted, as NARROWING a window -- and a narrowing
+  ;; whose remaining width is zero is a closure wearing a compromise's
+  ;; name. Ask what is left after a narrowing, not how much came off.
+  ;;
+  ;; What the gate was aimed at is real and is still open: a stale mref
+  ;; can mean something else on the new generation. Deciding it needs the
+  ;; semantics of a hosted watch across a replacement -- bound to the
+  ;; connection, or to the peer -- and that is a design question, not a
+  ;; guard.
+  (define (mon-agent watcher key name)
     (let ((mref (cdr key))
           (p (whereis name)))
       (if (not p)
@@ -4049,11 +4128,10 @@
             ;; the agent has dropped its state and is leaving. Same
             ;; contract as the submission: if the frame does not go, the
             ;; link does.
-            (when (eq? conn (current-conn watcher))
-              (guard (e (#t (drop-link-by-name! watcher 'mdown-lost)))
-                (link-write/critical watcher
-                                     (frame-segments (list 'mdown mref 'noproc))
-                                     'mdown-lost))))
+            (guard (e (#t (drop-link-by-name! watcher 'mdown-lost)))
+              (link-write/critical watcher
+                                   (frame-segments (list 'mdown mref 'noproc))
+                                   'mdown-lost)))
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
@@ -4082,12 +4160,11 @@
                 ;; the inner handler is not itself protected against --
                 ;; means this DOWN is not going to be delivered, and the
                 ;; contract for that is the link, not silence.
-                (when (eq? conn (current-conn watcher))
                 (guard (e2 (#t (drop-link-by-name! watcher 'mdown-lost)))
                   (let ((segs (guard (e (#t (frame-segments
                                               (list 'mdown mref 'exit))))
                                 (frame-segments (list 'mdown mref reason)))))
-                    (link-write/critical watcher segs 'mdown-lost)))))
+                    (link-write/critical watcher segs 'mdown-lost))))
               (`#(demon-local)
                 (demonitor m)
                 (void)))))))
@@ -5516,20 +5593,35 @@
                (hashtable-set! rmonitors mref (vector caller node name))
                (set! oa (spawn (lambda () (owner-mon-agent caller mref))))
                (hashtable-set! owner-agents mref oa)
-               ;; ⚠ NOTHING SWEEPS caller-agents BUT THESE AGENTS
-               ;; THEMSELVES. Its entries go away on the three exits of
-               ;; self-mon-agent and on an explicit demonitor, and that
-               ;; is the whole list: the reaper walks the monitor chain
-               ;; and the lease chain, not this table. An agent killed
-               ;; outright would leave its row behind for good.
+               ;; ⚠ WHAT REMOVES A caller-agents ROW, and whether
+               ;; the agent has to be alive for it. The agent itself
+               ;; deletes its row on each of self-mon-agent's three
+               ;; exits. remove-target-watch! deletes it by mref --
+               ;; reached from demonitor-remote and from the owner
+               ;; agent's DOWN -- and needs nothing of the agent at all.
+               ;; undo-remote-arm! deletes it when an arming stops part
+               ;; way. The reaper is not on this list: it walks the
+               ;; monitor chain and the lease chain, not this table.
                ;;
-               ;; That is safe today for one reason and one only: these
-               ;; agents have no name outside this library. They are not
-               ;; registered, their pid is returned to no caller, and no
-               ;; path in here kills them -- so nothing can kill one.
+               ;; ⚠ AN EARLIER NOTE SAID A KILLED AGENT WOULD LEAVE ITS
+               ;; ROW BEHIND "FOR GOOD". Too strong -- the two mref-keyed
+               ;; deletions still reach it. What is true is narrower and
+               ;; still worth avoiding: the row then survives until the
+               ;; caller demonitors or dies, and forever if it does
+               ;; neither.
                ;;
-               ;; ⛔ Giving them a name, or adding a path that kills
-               ;; them, is not adding a feature: it is making this table
+               ;; ⭐ THE SAFETY ARGUMENT IS ABOUT THE ONE KILL PATH,
+               ;; NOT ABOUT THERE BEING NONE. The note this replaces said
+               ;; "no path in here kills them -- so nothing can kill
+               ;; one", and undo-remote-arm! kills exactly this agent.
+               ;; The conclusion survived only because that path deletes
+               ;; all three rows BEFORE it kills, so it leaves nothing
+               ;; behind. Safety rests on that ORDER.
+               ;;
+               ;; ⛔ A second kill path that does not delete first
+               ;; breaks this while every sentence above it still reads
+               ;; as true; giving these agents a name reaches the same
+               ;; place by another route. Either way this table would
                ;; need a sweeper it does not have. The row leaks alone --
                ;; no credit is attached to it -- so the accounting that
                ;; catches the other agent table would not notice.
