@@ -779,6 +779,15 @@
       (lambda (req status ai)
         (let ((owner (hashtable-ref getaddrinfo-table req #f)))
           (hashtable-delete! getaddrinfo-table req)
+          ;; THE OTHER HALF OF dns-resolve!'s index-owner!, and this is
+          ;; one of TWO places that owe it -- see the submission for the
+          ;; other. A no-op when owner is #f: uv-owner-died! cleared it
+          ;; and deleted that owner's whole index list in the same step,
+          ;; so there is nothing left to remove. That is not the same
+          ;; question as the getaddrinfo-table entry a few lines up,
+          ;; which is deliberately RETAINED for a dead owner because this
+          ;; callback still has to free the request.
+          (unindex-owner! owner 'dns req)
           (foreign-free req)
           (if (< status 0)
               (when owner (deliver owner (vector 'dns-failed status)))
@@ -1504,6 +1513,17 @@
   ;; Async DNS. The owner process later receives #(dns-resolved ,ip-string)
   ;; or #(dns-failed ,errno). libuv resolves on its thread pool, so the
   ;; scheduler is not blocked.
+  ;; ⚠ TWO EXITS, AND BOTH OWE AN unindex-owner!. A submission that
+  ;; libuv refuses never reaches the callback, so the request is torn
+  ;; down here instead; a submission it accepts is torn down there. The
+  ;; index registration made below is one, and whichever exit runs has to
+  ;; retire it -- neither of them covers the other.
+  ;;
+  ;; ⛔ NEITHER OF THEM DID, AND NOTHING SAID SO. The entry survived every
+  ;; completed resolution for the life of the owning process; only owner
+  ;; death cleared it, by deleting that owner's list wholesale. The
+  ;; symptom was growth alone, which is why unindex-owner! reports a
+  ;; count -- and that count is what a cell reads here.
   (define (dns-resolve! host owner)
     (let ((req (foreign-alloc getaddrinfo-req-size)))
       (hashtable-set! getaddrinfo-table req owner)
@@ -1511,6 +1531,7 @@
       (let ((r (uv-getaddrinfo uv-loop req on-getaddrinfo-entry host 0 0)))
         (when (< r 0)
           (hashtable-delete! getaddrinfo-table req)
+          (unindex-owner! owner 'dns req)
           (foreign-free req)
           (deliver owner (vector 'dns-failed r))))))
 
