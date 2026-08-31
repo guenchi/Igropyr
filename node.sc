@@ -3744,10 +3744,10 @@
   ;; which on a mesh that stays up never happens. That is precisely the
   ;; leak this mechanism exists to prevent, moved one table over.
   ;;
-  ;; Interrupts stay off across both, so no kill can land between them.
-  ;; install-owner-agent! disables them again inside; the counter nests.
-  ;; Its own rule -- publish the agent's pid before the agent can run --
-  ;; still holds, because nothing runs until this region ends.
+  ;; Interrupts stay off across the whole arming, so no kill can land in
+  ;; the middle of it. The rule the two former helpers carried -- publish
+  ;; the agent's pid before the agent can run -- still holds, and holds
+  ;; more simply: nothing runs at all until the region ends.
   ;; Undo an arming that stopped part way. UNCONDITIONAL, and it can be:
   ;; the mref was minted for this call and nothing else can be filed
   ;; under it, so deleting all three keys removes only what this arming
@@ -3773,18 +3773,30 @@
     (when (and oa (process-alive? oa)) (kill oa 'arm-failed))
     (when (and sa (process-alive? sa)) (kill sa 'arm-failed)))
 
+  ;; THE REMOTE PATH'S ARMING, and the same shape as the local one above.
+  ;; The entry and the agent that tears it down go in together or neither
+  ;; goes in.
+  ;;
+  ;; ⚠ THE REASON TO REPAIR THIS IS NOT THE COUNT. If the agent fails to
+  ;; install, the stranded rmonitors entry IS collected: the sweep for a
+  ;; dropped peer walks every entry naming that node and does not consult
+  ;; owner-agents, so the books come back on their own. What does not
+  ;; come back is what the missing agent was for. Its job is to notice
+  ;; the local caller dying and tell the far node to drop the monitor it
+  ;; is holding on our behalf; without it, that registration stays on the
+  ;; OTHER node for as long as it runs.
+  ;;
+  ;; ⭐ So "recoverable" has to be asked about the consequence and not
+  ;; about the bookkeeping. Every reading this node has is local, which
+  ;; means a residue that lands on the peer looks, from here, exactly
+  ;; like nothing happening.
   (define (arm-rmonitor! mref node name)
     (atomically
-      (hashtable-set! rmonitors mref (vector self node name))
-      (install-owner-agent! self mref)))
-
-  (define (install-owner-agent! caller mref)
-    ;; Publish the pid before it can run and observe an already-dead caller;
-    ;; otherwise that fast DOWN path could delete the not-yet-present entry
-    ;; and the installer would then leave a dead agent rooted forever.
-    (atomically
-      (let ((agent (spawn (lambda () (owner-mon-agent caller mref)))))
-        (hashtable-set! owner-agents mref agent))))
+      (let ((caller self) (oa #f))
+        (guard (e (#t (undo-remote-arm! mref oa #f) (raise e)))
+          (hashtable-set! rmonitors mref (vector caller node name))
+          (set! oa (spawn (lambda () (owner-mon-agent caller mref))))
+          (hashtable-set! owner-agents mref oa)))))
 
   ;; watcher side: deliver #(remote-down node name reason) to the caller
   ;; that installed mref, once. Used for both a target-side mdown and a
@@ -3816,14 +3828,6 @@
               (`#(demon-local)
                 (demonitor m)
                 (atomically (hashtable-delete! caller-agents mref))))))))
-
-  (define (install-self-agent! caller mref name)
-    ;; As with owner-agents, publish the pid before it can run. In
-    ;; particular, a missing name takes the immediate noproc path above;
-    ;; publishing afterwards would reinsert that already-dead agent.
-    (atomically
-      (let ((agent (spawn (lambda () (self-mon-agent caller mref name)))))
-        (hashtable-set! caller-agents mref agent))))
 
   ;; every rmonitor watching a node whose link just dropped gets a
   ;; synthesized noconnection (the target may be alive or dead -- across
