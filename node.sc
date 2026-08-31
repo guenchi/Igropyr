@@ -868,6 +868,11 @@
   (define child-restart-window-ms 60000)
   (define child-restart-max 5)
   (define child-restart-cap-ms 1000)
+  ;; How long the failures have to have been going on before giving up is
+  ;; the right answer. A count alone cannot say that: five deaths are
+  ;; five deaths whether they took a third of a second or an hour, and
+  ;; the first of those is the definition of transient.
+  (define child-min-persist-ms 5000)
 
   ;; ---- the warden ------------------------------------------------------
   ;;
@@ -942,25 +947,57 @@
                   (display (string-append
                              "igropyr node: " nm " exited ("
                              (claimed-version-text reason)
-                             "); restart " (number->string k) " of at most "
-                             (number->string child-restart-max) " in "
-                             (number->string (quotient child-restart-window-ms 1000))
-                             "s\n")
+                             "); restart " (number->string k)
+                             ", giving up at " (number->string child-restart-max)
+                             " within " (number->string (quotient child-restart-window-ms 1000))
+                             "s AND " (number->string (quotient child-min-persist-ms 1000))
+                             "s of failing\n")
                            (current-error-port))
-                  (when (fx>= k child-restart-max)
-                    (display (string-append
-                               "igropyr node: " nm " has not stayed up "
-                               (number->string k)
-                               " restarts running; this is not transient and "
-                               (child-consequence spec)
-                               ". Stopping the node.\n")
-                             (current-error-port))
-                    (raise (list 'child-will-not-start (child-name spec) k)))
+                  ;; BACK OFF FIRST, DECIDE AFTER, and the order is the
+                  ;; repair. Deciding first meant the give-up was reached
+                  ;; before any of the waiting happened: the fifth death
+                  ;; raised before its own delay ran, so the four earlier
+                  ;; delays -- nothing, 50, 100, 200 -- were the entire
+                  ;; life of the budget. A child that could not start
+                  ;; took the node down in about a third of a second,
+                  ;; while the message said the problem was not
+                  ;; transient. A third of a second IS transient.
+                  ;;
+                  ;; Two of the three constants were decoration on that
+                  ;; path. The sixty-second window filtered nothing,
+                  ;; since every death fell inside it, and the delay cap
+                  ;; was never reached, since the delay only ever doubled
+                  ;; to 400 before the raise.
                   (let ((d (vector-ref delays i)))
                     (when (fx> d 0) (sleep-ms d))
                     (vector-set! delays i
                       (fxmin child-restart-cap-ms
                              (if (fx= d 0) 50 (fx* d 2)))))
+                  ;; A CONJUNCTION, and both halves are monotone: the
+                  ;; count rises with each death inside the window and
+                  ;; the elapsed time rises with the clock. A child that
+                  ;; genuinely cannot start still stops the node -- it
+                  ;; cannot stay below either half forever -- it just
+                  ;; stops it later. That is the trade, stated: a
+                  ;; mistaken stop is exchanged for a late one, and the
+                  ;; child's work is not being done during the wait.
+                  (let* ((earliest (let loop ((xs recent) (m (car recent)))
+                                     (cond ((null? xs) m)
+                                           ((< (car xs) m) (loop (cdr xs) (car xs)))
+                                           (else (loop (cdr xs) m)))))
+                         (persisted (- (now-ms) earliest)))
+                    (when (and (fx>= k child-restart-max)
+                               (>= persisted child-min-persist-ms))
+                      (display (string-append
+                                 "igropyr node: " nm " has not stayed up "
+                                 (number->string k)
+                                 " restarts over "
+                                 (number->string (quotient persisted 1000))
+                                 "s; this is not transient and "
+                                 (child-consequence spec)
+                                 ". Stopping the node.\n")
+                               (current-error-port))
+                      (raise (list 'child-will-not-start (child-name spec) k))))
                   (start! i))))
             (loop))
           ;; EVERY CHILD, not the first one. Missing one here produces no
