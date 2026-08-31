@@ -750,6 +750,32 @@
                       (hashtable-set! watched (car pk) (cdr pk))
                       (monitor (car pk)))
                     fresh)
+          (outer))))
+    ;; THE SECOND CHAIN. A replacement reaper has to rebuild both, and
+    ;; only one of them used to exist -- so "the reaper was restarted"
+    ;; would have said nothing about the leases it inherited.
+    ;;
+    ;; Monitoring a process that is already dead delivers its DOWN at
+    ;; once, so a holder that died while no reaper was running is
+    ;; collected here rather than being missed: the rescan is what makes
+    ;; the announcement message a shortcut instead of the mechanism.
+    (let outer ()
+      (let ((fresh
+             (let scan ((x (atomically leases)) (n 0) (acc (list)))
+               (cond
+                 ((not x) (reverse acc))
+                 ((fx= n reaper-chunk) (reverse acc))
+                 ((or (not (lease-pid x))
+                      (hashtable-ref watched (lease-pid x) #f))
+                  (scan (atomically (lease-next x)) n acc))
+                 (else
+                  (scan (atomically (lease-next x)) (fx+ n 1)
+                        (cons (lease-pid x) acc)))))))
+        (unless (null? fresh)
+          (for-each (lambda (pid)
+                      (hashtable-set! watched pid #f)   ; #f: leases only
+                      (monitor pid))
+                    fresh)
           (outer)))))
 
   (define (reaper-loop)
@@ -775,14 +801,23 @@
       (let loop ()
         (receive
           (`#(watch ,pid ,key)
-            (hashtable-set! watched pid key)
+            ;; A pid already watched for one reason keeps its key: the
+            ;; DOWN below runs BOTH sweeps regardless of why it was
+            ;; indexed, so arriving twice costs nothing and losing the
+            ;; key would cost an agent.
+            (unless (hashtable-ref watched pid #f)
+              (hashtable-set! watched pid key))
             (monitor pid)
             (loop))
           (`#(DOWN ,pid ,reason)
+            ;; BOTH SWEEPS, ALWAYS. One process can be an agent and hold
+            ;; leases, or hold two leases of different kinds; deciding
+            ;; which sweep to run from how the pid happened to be indexed
+            ;; would give back one resource and quietly keep the other.
             (let ((key (hashtable-ref watched pid #f)))
-              (when key
-                (hashtable-delete! watched pid)
-                (retire-agent! key)))
+              (hashtable-delete! watched pid)
+              (when key (retire-agent! key)))
+            (lease-retire-owner! pid)
             (loop))
           (`#(node-stop) (void))))))
 
@@ -1057,6 +1092,32 @@
 
   (define (lease-free! s) (atomically (lease-detach! s)))
 
+  ;; Give back every lease this process was holding. ONE AT A TIME, and by
+  ;; walking to find them: the alternative -- subtracting however many the
+  ;; owner is thought to have held -- needs a second record of that number
+  ;; and would be wrong the moment the two disagree. Retiring by identity
+  ;; cannot over-return.
+  ;;
+  ;; Only the reaper looks a lease up by owner, and only because the owner
+  ;; is dead: everything it was holding must come back. Every other path
+  ;; releases the record it was given.
+  (define (lease-retire-owner! pid)
+    (atomically
+      (let loop ((x leases) (n 0))
+        (if (not x)
+            n
+            (let ((next (lease-next x)))
+              (if (eq? (lease-pid x) pid)
+                  (begin (lease-detach! x) (loop next (fx+ n 1)))
+                  (loop next n)))))))
+
+  ;; Tell the reaper to watch a new holder. A lost message costs nothing:
+  ;; the lease is on the chain, and a reaper that restarts rescans it.
+  ;; The message is a shortcut, not the mechanism.
+  (define (lease-announce! p)
+    (let ((rp (reaper-pid)))
+      (when rp (send rp (vector 'watch p #f)))))
+
   ;; Admit one holder, or refuse. Returns the new process, or #f.
   ;;
   ;; ⭐ THE SPAWN IS INSIDE THE REGION, AND THAT IS THE WHOLE POINT: while
@@ -1089,6 +1150,13 @@
   ;; a process are occasionally built for a call that is then refused.
   ;; Neither leaks; both are bounded by the race window.
   (define (lease-admit! kind cap body)
+    (let ((p (lease-admit-locked! kind cap body)))
+      ;; Outside the region: it allocates a message, and the region is
+      ;; the one place that must not.
+      (when p (lease-announce! p))
+      p))
+
+  (define (lease-admit-locked! kind cap body)
     (and (fx< (lease-count kind) cap)
          (let ((s (make-lease kind #f #f #f)))   ; (R0) built outside
            (atomically
