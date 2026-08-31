@@ -3125,6 +3125,20 @@
 
   ;; Did the install succeed, in the sense the caller cares about: is
   ;; this connection now the one in the table?
+  ;; Is this connection still the one this peer's entry names?
+  ;;
+  ;; TAKES THE REGION ITSELF rather than asking the caller for it. The
+  ;; table it reads is replaced inside the region that installs a new
+  ;; generation, so a lookup racing that replacement is a bad read, and
+  ;; the caller that needs this most -- the link's frame loop -- has no
+  ;; region of its own. A predicate whose contract says "read this inside
+  ;; a region" and whose only caller has none is a check that guards
+  ;; nothing.
+  (define (current-conn? peer c)
+    (atomically
+      (let ((e (hashtable-ref peers peer #f)))
+        (and e (eq? (entry-conn e) c)))))
+
   (define (installed? outcome)
     (memq outcome '(installed idempotent replaced)))
 
@@ -3358,12 +3372,34 @@
                           ;; request treated as new; the reaper's DOWN then
                           ;; finds nothing left to do, which is what
                           ;; retire-agent! being idempotent is for.
+                          ;; STALE HAS TWO SHAPES AND ONE ANSWER. A record
+                          ;; whose agent has died, and a record left by a
+                          ;; connection that is no longer this peer's, are
+                          ;; both entries for a monitor that no longer
+                          ;; exists; each is retired here and the request
+                          ;; treated as new. Only the generation test is
+                          ;; new -- the liveness test was already here for
+                          ;; the same reason.
                           (cur (and found
-                                    (if (process-alive? (agent-pid found))
+                                    (if (and (process-alive? (agent-pid found))
+                                             (current-conn? peer (agent-conn found)))
                                         found
                                         (begin (retire-agent-locked! key) #f)))))
                      (cond
                        ((and cur (agent-matches? cur c name)) #t)
+                       ;; ⚠ THIS ARM IS NOW UNREACHABLE, AND NOT BY ITSELF.
+                       ;; Reaching it needs a record whose connection is
+                       ;; current and is not this one, which needs two
+                       ;; current connections for one peer. What rules
+                       ;; that out is the generation check in the link's
+                       ;; frame loop: a superseded connection stops before
+                       ;; it can serve anything. Remove that check and
+                       ;; this arm comes back -- and it comes back with
+                       ;; the wrong meaning, calling a stale generation a
+                       ;; protocol violation. It stays because it is still
+                       ;; the only way to say "two live connections are
+                       ;; genuinely contending", which is a thing this
+                       ;; code should refuse rather than guess about.
                        (cur (raise 'protocol))
                        ((fx< (accounted-monitors) max-hosted-monitors)
                         ;; THREE STEPS THAT MUST NOT BE LEFT HALF DONE.
@@ -3930,7 +3966,40 @@
                     (raise why)
                     (link-loop c peer buf last-seen)))
               (`#(node-stop) (raise 'stop)))
-            (begin (dispatch! c peer d) (drain))))))
+            ;; ⭐ WHICH GENERATION IS THIS FRAME FROM. Replacing a peer's
+            ;; connection sends the old link a stop message, and a
+            ;; message is only read where this loop reads its mailbox --
+            ;; which is the branch above, taken only when no whole frame
+            ;; is buffered. With frames still decoded and waiting, the
+            ;; old link went on serving them, for as long as its buffer
+            ;; lasted, after its generation had been superseded. Nothing
+            ;; downstream asked which generation it was speaking for.
+            ;;
+            ;; That produced two things. An arming request served here
+            ;; installed a monitor recorded against the old connection,
+            ;; after the sweep that clears the old generation's monitors
+            ;; had already run, so it was collected by nothing until the
+            ;; next replacement. And when the same request arrived again
+            ;; on the new link -- which this protocol advertises as free
+            ;; -- the entry it found named a connection that was not the
+            ;; new one, and the answer was to call the peer a protocol
+            ;; violator and drop the link. A peer doing exactly what the
+            ;; documentation permits got a link dropped for it.
+            ;;
+            ;; The check is here rather than in the clause that showed
+            ;; the symptoms because the property is about the link and
+            ;; not about one message: a superseded generation should not
+            ;; be serving anything. Guarding the arming clause alone
+            ;; would fix the two symptoms that were noticed and leave
+            ;; every other clause served by a connection that has been
+            ;; replaced.
+            ;;
+            ;; The reason raised is the one stop-link! would have
+            ;; delivered anyway, so this makes an existing ending arrive
+            ;; earlier and introduces no new outcome downstream.
+            (if (current-conn? peer c)
+                (begin (dispatch! c peer d) (drain))
+                (raise 'replaced))))))
 
   ;; Run the link until it drops, then clean up.
   ;; -> the moment the link STOPPED CARRYING TRAFFIC, read before the
