@@ -1239,6 +1239,16 @@
   ;; Every handle the loop still holds, counted. Includes the internal
   ;; wakeup timer, so the number is compared against a baseline taken in
   ;; the same process rather than against zero.
+  ;;
+  ;; ⚠ A CLOSING HANDLE IS STILL A HANDLE. uv_close is asynchronous: the
+  ;; handle leaves the loop when its close callback runs, which needs the
+  ;; loop to turn. Read this number straight after a close and it counts
+  ;; something that is on its way out, which reads exactly like a leak.
+  ;; A caller measuring "was it released" has to let the loop run first
+  ;; -- a sleep long enough to be sure, and that sleep is waiting for the
+  ;; LOOP, not waiting for a fix to take effect. The first measurement
+  ;; written against this counter got that wrong and reported five leaked
+  ;; handles that were all already closing.
   (define (uv-live-handle-count)
     (with-interrupts-disabled
       (set! walk-tally 0)

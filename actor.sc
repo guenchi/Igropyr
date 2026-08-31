@@ -180,7 +180,7 @@
           (hashtable-set! pid->names pid remaining))))
 
   (define (register name pid)
-    (no-interrupts
+    (with-interrupts-disabled
       ;; Rebinding a NAME must also detach it from the displaced process.
       ;; Otherwise that process's later @kill follows a stale reverse entry
       ;; and deletes the replacement registration.
@@ -194,7 +194,7 @@
     pid)
 
   (define (unregister name)
-    (no-interrupts
+    (with-interrupts-disabled
       (let ((p (hashtable-ref name->pid name #f)))
         (hashtable-delete! name->pid name)
         (when p (remove-pid-name! p name)))))
@@ -204,25 +204,48 @@
   ;; under a half-finished lookup, yielding a spurious #f for a name
   ;; that is registered the whole time.
   (define (whereis name)
-    (no-interrupts (hashtable-ref name->pid name #f)))
+    (with-interrupts-disabled (hashtable-ref name->pid name #f)))
 
-  ;; Fast, NON-unwinding interrupt guard: the enable is skipped if body
-  ;; escapes, so `body` must not raise. Every use here is a short
-  ;; sequence of scheduler-state mutations whose arguments are
-  ;; type-checked by the caller BEFORE entering the guard (see send /
-  ;; monitor / link below) precisely so this holds. A raise that is then
-  ;; caught inside the same still-alive process would leave that
-  ;; process's saved interrupt count one too high and permanently
-  ;; disable its preemption; an uncaught one is reconciled at the
-  ;; context switch because the dying process's count is discarded.
-  ;; Use Chez's exit-safe with-interrupts-disabled when the body can
-  ;; raise (panic does).
-  (define-syntax no-interrupts
-    (syntax-rules ()
-      ((_ body ...)
-       (let ((x (begin (disable-interrupts) body ...)))
-         (enable-interrupts)
-         x))))
+  ;; INTERRUPT REGIONS HERE ARE EXIT-SAFE, and that is not free.
+  ;;
+  ;; There used to be a faster macro that skipped the re-enable when its
+  ;; body escaped, on the rule that every body was short enough and
+  ;; pre-validated enough that it could not raise. The rule was written
+  ;; down and it was not kept: twelve sites shared it, and a rule spread
+  ;; over twelve sites is a rule somebody eventually reads as advice.
+  ;;
+  ;; What it cost when broken was out of all proportion to what it
+  ;; bought. A raise that escapes such a region AND IS CAUGHT inside the
+  ;; same still-alive process leaves that process's saved interrupt
+  ;; count one too high, and that process is never preempted again --
+  ;; for the rest of the run, with no error and nothing to see. (An
+  ;; UNCAUGHT one is harmless: the process dies and the context switch
+  ;; discards its count. So the damage needs a guard between the raise
+  ;; and the top, which is exactly what careful code has.)
+  ;;
+  ;; Measured price of exit-safety, ping-pong with no work between
+  ;; messages -- the worst case for it, since the whole loop is send and
+  ;; receive. 200k round-trips, three runs each, on one machine: 245-251
+  ;; ns per round-trip before, 261-263 after. About 5%, and every bit of
+  ;; that 5% is on the two hottest calls in the system. Anything with
+  ;; real work between messages dilutes it. What it buys is the removal
+  ;; of a silent, permanent, whole-process failure, which is not a trade
+  ;; that needed thinking about.
+  ;;
+  ;; The argument type checks stay OUTSIDE these regions anyway (see
+  ;; send and link): failing early is still better than unwinding.
+  ;;
+  ;; PAYING IT UNIFORMLY IS THE POINT, and the next reader will want to
+  ;; stop. Some of these twelve bodies genuinely cannot raise, and it is
+  ;; easy to argue that those ones could keep the fast form and save
+  ;; their share of the 5%. That argument is not new -- it is the rule
+  ;; that used to be written here, and following it site by site is what
+  ;; produced the defect. Twelve places sharing one written rule is one
+  ;; rule read as advice twelve times.
+  ;;
+  ;; So: going back to per-site judgement is allowed, but it starts by
+  ;; explaining why it will not end the same way. "This one obviously
+  ;; cannot raise" is the sentence that was already there.
 
   (define (panic what reason)
     (with-interrupts-disabled
@@ -456,13 +479,13 @@
       p))
 
   (define (spawn thunk)
-    (no-interrupts
+    (with-interrupts-disabled
       (let ((p (@make-process (@thunk->cont thunk))))
         (@run! p)
         p)))
 
   (define (spawn&link thunk)
-    (no-interrupts
+    (with-interrupts-disabled
       (let ((p (@make-process (@thunk->cont thunk))))
         (@link p *self*)
         (@run! p)
@@ -474,7 +497,7 @@
       (pcb-links-set! p2 (cons p1 (pcb-links p2)))))
 
   (define (link p)
-    ;; Validated OUTSIDE no-interrupts, as send already does. An accessor
+    ;; Validated OUTSIDE the interrupt region, as send already does. An accessor
     ;; raising INSIDE the region skips its enable-interrupts, so the process
     ;; carries a permanently disabled preemption timer: it cannot be
     ;; preempted again, and one CPU loop then freezes the whole scheduler.
@@ -483,7 +506,7 @@
     (unless (pcb? p)
       (assertion-violation 'link "not a process" p))
     (unless (eq? p *self*)
-      (no-interrupts
+      (with-interrupts-disabled
         (if (alive? p)
             (@link p *self*)
             ;; linking to a dead process: behave as if it just died
@@ -498,7 +521,7 @@
   (define (monitor p)
     (unless (pcb? p)
       (assertion-violation 'monitor "not a process" p))
-    (no-interrupts
+    (with-interrupts-disabled
       (if (alive? p)
           (let ((m (make-mon *self* p)))
             (pcb-monitors-set! *self* (cons m (pcb-monitors *self*)))
@@ -510,7 +533,7 @@
 
   (define (demonitor m)
     (when (mon? m)
-      (no-interrupts
+      (with-interrupts-disabled
         (pcb-monitors-set! (mon-origin m)
           (remq m (pcb-monitors (mon-origin m))))
         (pcb-monitors-set! (mon-target m)
@@ -530,7 +553,7 @@
           (@kill p reason)
           (yield #f 0))
         (begin
-          (no-interrupts (@kill p reason))
+          (with-interrupts-disabled (@kill p reason))
           ;; @kill cascades along links, and one of those links can be
           ;; US: a non-trapping process that kills a peer it is linked
           ;; to dies in the cascade. Without this check it would return
@@ -608,13 +631,13 @@
 
   ;; ---- send / receive ---------------------------------------------------
 
-  ;; the pcb check is deliberately OUTSIDE no-interrupts: raising inside
+  ;; the pcb check is deliberately OUTSIDE the interrupt region: raising inside
   ;; that guard would skip its enable-interrupts (see the macro's note).
   ;; A whereis miss handing #f here is the common way to reach it.
   (define (send p m)
     (unless (pcb? p)
       (assertion-violation 'send "not a process" p))
-    (no-interrupts (@send p m)))
+    (with-interrupts-disabled (@send p m)))
 
   ;; interrupts disabled
   (define (@send p m)
@@ -660,7 +683,7 @@
              (let ((run (matcher (msg-contents m))))
                (if run
                    (begin
-                     (no-interrupts (remove-msg! m))
+                     (with-interrupts-disabled (remove-msg! m))
                      (run))
                    (begin
                      (disable-interrupts)
@@ -779,7 +802,7 @@
     (disable-interrupts)
     (let loop ()
       (uv-poll! (system-sleep-time))
-      (no-interrupts (@event-check))
+      (with-interrupts-disabled (@event-check))
       (yield 'run 0)
       (loop)))
 
