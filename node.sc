@@ -414,6 +414,19 @@
   (define watchers (make-eq-hashtable))
   ;; rcall ref -> waiting caller pid (this node is the caller)
   (define pending (make-eqv-hashtable))
+  ;; ALSO A COUNTER, and unlike the monitor reference it is safe across a
+  ;; restart -- for a reason worth stating, since the two look alike.
+  ;;
+  ;; This number and the table it keys are both OURS. A ref appears in a
+  ;; reply only because we put it in a call, and if this node restarts,
+  ;; the counter and the table restart together: an old ref coming back
+  ;; finds an empty table and matches nothing. A monitor reference is the
+  ;; opposite -- the peer mints it and we file entries under it, so its
+  ;; counter can restart while our entries have not gone yet.
+  ;;
+  ;; ⇒ "It is a counter" is not by itself an argument for either. What
+  ;; settles it is whether the counter and the table that keys on it live
+  ;; in the same process.
   (define rcall-counter 0)
   (define (next-rcall-ref!)
     (atomically (set! rcall-counter (+ rcall-counter 1)) rcall-counter))
@@ -432,6 +445,24 @@
   (define caller-agents (make-eqv-hashtable))
   (define owner-agents (make-eqv-hashtable))
   (define callee-agents (make-hashtable equal-hash equal?))
+  ;; ⚠ THIS IS A COUNTER, NOT A GENSYM, and code elsewhere depends on the
+  ;; difference. Within one run of this process it does not repeat, so
+  ;; anything filed under an mref can be found again by that mref alone.
+  ;; That is what lets several tables key on it without also recording
+  ;; which connection an entry belongs to.
+  ;;
+  ;; ⛔ ACROSS A RESTART IT REPEATS: it starts at zero again, so a peer
+  ;; that restarts sends mref 1 for something new. What keeps that from
+  ;; colliding is not this counter. It is that both ways a connection
+  ;; ends -- a real drop and a replacement -- run the sweep that tells
+  ;; this peer's hosted monitors to stop, so the entries filed under its
+  ;; old mrefs are on their way out before the new ones arrive. The
+  ;; removal is not instant, and the window where an old entry is still
+  ;; present is covered by the arming clause's staleness test.
+  ;;
+  ;; Anyone replacing this with something that survives a restart, or
+  ;; removing either sweep, is removing that protection and not this
+  ;; counter, which will look untouched.
   (define mref-counter 0)
   (define (next-mref!)
     (atomically (set! mref-counter (+ mref-counter 1)) mref-counter))
@@ -3277,6 +3308,36 @@
 
   ;; the wire shapes a link may carry (peer is the node at the far end of
   ;; c). Anything else is a confused peer -> drop the link.
+  ;; ⭐ IF YOU ARE ADDING A CLAUSE HERE, READ THIS FIRST.
+  ;;
+  ;; A frame arrives on a connection, and a connection is one GENERATION
+  ;; of a peer. The peer's name outlives it: the same name is reachable
+  ;; again the moment a replacement is installed. So a clause that writes
+  ;; something outliving this connection, and later resolves who it
+  ;; belongs to by NAME, commits work begun under one generation against
+  ;; the next one.
+  ;;
+  ;; The question to ask is not "did I remember to check". It is:
+  ;;
+  ;;   ⭐ DOES THE KEY I FILE THIS UNDER CONTAIN AN IDENTITY?
+  ;;
+  ;; A key that is a connection or a process is safe by construction. A
+  ;; key that is a name, or a number scoped to a peer, is not: something
+  ;; has to compare identities explicitly, and it has to do it in the
+  ;; same region that writes the state -- outside one, the answer can go
+  ;; stale between deciding and acting.
+  ;;
+  ;; Four clauses here needed that comparison and did not have it, and a
+  ;; gate placed in the frame loop instead could not supply it, because a
+  ;; check and a dispatch are two steps. See the arming, cancelling and
+  ;; mdown clauses for what the comparison looks like, and
+  ;; retire-rec-locked! for the same idea applied to handing a resource
+  ;; back rather than taking one.
+  ;;
+  ;; Clauses that write nothing durable -- a delivered message, a reply
+  ;; that a fresh key makes unambiguous -- do not need it. Say which of
+  ;; those two your clause is; the answer is short and it is the thing a
+  ;; reader will want.
   (define (dispatch! c peer d)
     (cond
       ;; (send ,reg-name ,msg) -> deliver to that registered process
@@ -3346,6 +3407,15 @@
                       ;; who holds it, so the reaper gives it back on the
                       ;; DOWN it sees. This branch handles the raise; the
                       ;; owner handles the kill.
+                 ;; ⭐ AND THE WORKER OUTLIVES THIS CONNECTION. It resolves
+                 ;; the peer by name when it answers, so a service begun
+                 ;; under one generation can write its reply down the
+                 ;; next one. That is the same shape as the defects fixed
+                 ;; in this batch and it is harmless for the same reason
+                 ;; the reply clause is: the ref it carries is ours and
+                 ;; unrepeated, so the far side either matches it to the
+                 ;; call still waiting -- the answer it wanted -- or
+                 ;; matches nothing.
                  (guard (e (#t (void)))
                    (serve-rcall! peer reg ref m timeout))
                  (lease-free! s)))
@@ -3359,6 +3429,20 @@
       ;; but only if the reply arrives from the node that call targeted
       ;; (a ref is bound to its node, so one peer can't answer a call
       ;; the caller sent to another)
+      ;; ⭐ NO GENERATION TEST HERE, AND THE REASON IS THE KEY. A ref is
+      ;; minted by this node and never repeats within a run, so a reply
+      ;; arriving on a superseded connection carries the ref of its own
+      ;; call and nothing else: either that call is still waiting, in
+      ;; which case this is the answer it asked for and handing it over
+      ;; is right, or the link teardown already failed it and the lookup
+      ;; finds nothing. Late, not wrong.
+      ;;
+      ;; ⚠ What makes the first case correct is the match below, which
+      ;; compares the peer NAME and not the connection. That looks like
+      ;; the omission this file spent a batch fixing elsewhere, and here
+      ;; it is the point: the answer came from the peer this call was
+      ;; sent to, and which of that peer's connections carried it back
+      ;; does not change whose answer it is.
       ((frame? d 'reply 3)
        (let ((ref (cadr d)) (result (caddr d)))
          ;; Delete here, not only in the caller's branches. Both of those --
