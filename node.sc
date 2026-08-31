@@ -3188,20 +3188,6 @@
 
   ;; Did the install succeed, in the sense the caller cares about: is
   ;; this connection now the one in the table?
-  ;; Is this connection still the one this peer's entry names?
-  ;;
-  ;; TAKES THE REGION ITSELF rather than asking the caller for it. The
-  ;; table it reads is replaced inside the region that installs a new
-  ;; generation, so a lookup racing that replacement is a bad read, and
-  ;; the caller that needs this most -- the link's frame loop -- has no
-  ;; region of its own. A predicate whose contract says "read this inside
-  ;; a region" and whose only caller has none is a check that guards
-  ;; nothing.
-  (define (current-conn? peer c)
-    (atomically
-      (let ((e (hashtable-ref peers peer #f)))
-        (and e (eq? (entry-conn e) c)))))
-
   (define (installed? outcome)
     (memq outcome '(installed idempotent replaced)))
 
@@ -3417,7 +3403,21 @@
          ;; and be told "already done" for something it never asked for.
          ;; A mismatch is not a replacement request: one reference cannot
          ;; mean two things, so the link goes.
+         ;; ⭐ WHICH GENERATION ASKED. This is the authoritative test and
+         ;; it is here rather than in the frame loop because here it is
+         ;; atomic: the table that says which connection is current and
+         ;; the table this clause writes are read and written inside one
+         ;; region, so nothing can replace the peer between deciding and
+         ;; installing. A test in the loop cannot say that -- it releases
+         ;; its region before dispatch runs.
+         ;;
+         ;; A request from a connection that is no longer this peer's is
+         ;; not refused, it is dropped: the generation that sent it is
+         ;; gone, its monitors were torn down with it, and there is
+         ;; nobody left to answer. Refusing would write a frame to a
+         ;; closed socket.
          (unless (atomically
+                   (or (not (eq? c (current-conn-locked peer)))
                    (let* ((found (hashtable-ref callee-agents key #f))
                           ;; A STALE ENTRY MUST NOT ANSWER "already done".
                           ;; Returning the credit on the DOWN a reaper
@@ -3472,7 +3472,8 @@
                           ;; prevent.
                           (cur (and found
                                     (if (and (process-alive? (agent-pid found))
-                                             (current-conn? peer (agent-conn found)))
+                                             (eq? (agent-conn found)
+                                                  (current-conn-locked peer)))
                                         found
                                         (begin (retire-agent-locked! key found) #f)))))
                      (cond
@@ -3532,7 +3533,7 @@
                         ;; provably harmless. See undo-install!.
                         (let ((p #f))
                           (guard (e (#t (undo-install! key p) (raise e)))
-                            (set! p (spawn (lambda () (mon-agent peer key name))))
+                            (set! p (spawn (lambda () (mon-agent peer key name c))))
                             (let ((r (make-agent-rec p name c key peer)))
                               (hashtable-set! callee-agents key r)
                               (mon-link! r)
@@ -3554,7 +3555,7 @@
                             (when rp
                               (send rp (vector 'watch p key)))))
                         #t)
-                       (else #f))))
+                       (else #f)))))
            ;; At the hosting ceiling: refuse, and tell the watcher at
            ;; once. THIS REFUSAL IS A CONTROL FRAME NOBODY TIMES OUT --
            ;; monitor-remote has no clock of its own, so a watcher that
@@ -3576,14 +3577,48 @@
       ;; (mdown ,mref ,reason) -> the watched process/link is gone; only
       ;; honor it from the node the monitor actually targets
       ((frame? d 'mdown 3)
+       ;; ⭐ THE MIRROR OF THE TEST IN mon-agent. That one keeps this node
+       ;; from sending a dead generation's notice down a live link; this
+       ;; one keeps a dead generation's notice, arriving on a link that
+       ;; has since been replaced, from ending a watch the new generation
+       ;; set up. The key is an mref and the match compares only the peer
+       ;; NAME, so without this the notice lands on whatever that mref
+       ;; means now.
+       ;;
+       ;; Unlike its mirror, this one IS atomic: the test and the lookup
+       ;; are in one region, and the only thing that happens outside it is
+       ;; acting on a decision already made.
+       ;;
+       ;; Ignoring it costs nothing -- a link that dropped already made
+       ;; this node fire every remote monitor it held on that peer.
        (let ((mref (cadr d)) (reason (caddr d)))
-         (let ((entry (atomically (hashtable-ref rmonitors mref #f))))
+         (let ((entry (atomically
+                        (and (eq? c (current-conn-locked peer))
+                             (hashtable-ref rmonitors mref #f)))))
            (when (and entry (eq? (vector-ref entry 1) peer))
              (fire-remote-down! mref reason)))))
       ;; (demon ,mref) -> stop a monitor we host for this peer
       ((frame? d 'demon 2)
+       ;; ⭐ SAME GENERATION TEST, AND FOR A SHARPER REASON THAN ARMING.
+       ;; The key here is (peer . mref) and carries no connection, so a
+       ;; cancellation buffered on a replaced link would find whatever is
+       ;; filed under that key now -- including a monitor the NEW
+       ;; generation has just armed, because repeating a request is
+       ;; something this protocol tells peers is free. It would be torn
+       ;; down while the peer went on believing it was watching, and
+       ;; nothing reports that.
+       ;;
+       ;; Ignoring a cancellation from a superseded connection is right
+       ;; in both readings. If it meant the old generation's monitor,
+       ;; that monitor was already torn down with the generation. If the
+       ;; peer has re-armed on the new connection, the new one is the one
+       ;; it wants kept.
+       ;;
+       ;; The test is inside the same region as the lookup, which is what
+       ;; makes it a decision rather than a guess.
        (let ((rec (atomically
-                    (hashtable-ref callee-agents (cons peer (cadr d)) #f))))
+                    (and (eq? c (current-conn-locked peer))
+                         (hashtable-ref callee-agents (cons peer (cadr d)) #f)))))
          (when rec (send (agent-pid rec) (vector 'demon-local)))))
       ((equal? d '(ping)) (write-frame! c '(pong)))
       ((equal? d '(pong)) (void))
@@ -3775,9 +3810,17 @@
 
   ;; The connection this peer is currently reached on, or #f. Used to ask
   ;; whether a connection in hand is still the current one.
-  (define (current-conn peer)
-    (let ((e (peer-entry peer)))
+  ;; Which connection is this peer reached on right now. ONE SUPPLIER:
+  ;; the locked form is what callers already inside a region use, and the
+  ;; other is that form with a region around it. A second implementation
+  ;; of the same question was added in this batch and removed again --
+  ;; two of them answer the same thing today and drift apart tomorrow.
+  (define (current-conn-locked peer)            ; caller holds the region
+    (let ((e (hashtable-ref peers peer #f)))
       (and e (entry-conn e))))
+
+  (define (current-conn peer)
+    (atomically (current-conn-locked peer)))
 
   ;; Take down whatever connection this peer is currently reached on.
   ;;
@@ -3824,7 +3867,33 @@
   ;; this one included. The demon frame in remove-target-watch! is the
   ;; same case and takes the same route. See link-write/critical for the
   ;; rule, and for why an rcall reply is deliberately NOT in this class.
-  (define (mon-agent watcher key name)
+  ;; ⭐ IT CARRIES THE CONNECTION IT WAS ARMED ON. Everything else here
+  ;; is named rather than held: the watcher is a peer name, and the write
+  ;; resolves that name when the monitor fires. The gap between those two
+  ;; moments is the whole life of the monitor, and a peer's connection can
+  ;; be replaced inside it -- so an agent belonging to a generation that
+  ;; is gone would send its notice down the link of the generation that
+  ;; replaced it. If that generation has re-armed the same mref for some
+  ;; other target -- which this protocol tells peers is free -- the far
+  ;; side ends the wrong watch, believing the wrong process died. Nothing
+  ;; reports that.
+  ;;
+  ;; Dropping the notice loses nothing. A link going down makes the
+  ;; watching node fire every remote monitor it held on that node, so the
+  ;; far side has already been told, and told with a reason that is not
+  ;; out of date.
+  ;;
+  ;; ⚠ THIS NARROWS THE WINDOW, IT DOES NOT CLOSE IT. Reading which
+  ;; connection is current and then writing are two steps, and a
+  ;; replacement can land between them; a write cannot be made atomic.
+  ;; What changes is the size -- the exposure was the entire lifetime of
+  ;; a monitor and is now the gap between a comparison and a write. It
+  ;; earns its place here for a reason that did not apply to the gate
+  ;; once tried in the frame loop: this runs once when a monitor fires,
+  ;; not once per frame, so the reduction costs no allocation on a hot
+  ;; path. Said plainly rather than claimed shut -- a guard that claims
+  ;; more than it does is worse than none.
+  (define (mon-agent watcher key name conn)
     (let ((mref (cdr key))
           (p (whereis name)))
       (if (not p)
@@ -3835,10 +3904,11 @@
             ;; the agent has dropped its state and is leaving. Same
             ;; contract as the submission: if the frame does not go, the
             ;; link does.
-            (guard (e (#t (drop-link-by-name! watcher 'mdown-lost)))
-              (link-write/critical watcher
-                                   (frame-segments (list 'mdown mref 'noproc))
-                                   'mdown-lost)))
+            (when (eq? conn (current-conn watcher))
+              (guard (e (#t (drop-link-by-name! watcher 'mdown-lost)))
+                (link-write/critical watcher
+                                     (frame-segments (list 'mdown mref 'noproc))
+                                     'mdown-lost))))
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
@@ -3867,11 +3937,12 @@
                 ;; the inner handler is not itself protected against --
                 ;; means this DOWN is not going to be delivered, and the
                 ;; contract for that is the link, not silence.
+                (when (eq? conn (current-conn watcher))
                 (guard (e2 (#t (drop-link-by-name! watcher 'mdown-lost)))
                   (let ((segs (guard (e (#t (frame-segments
                                               (list 'mdown mref 'exit))))
                                 (frame-segments (list 'mdown mref reason)))))
-                    (link-write/critical watcher segs 'mdown-lost))))
+                    (link-write/critical watcher segs 'mdown-lost)))))
               (`#(demon-local)
                 (demonitor m)
                 (void)))))))
@@ -4074,7 +4145,34 @@
                     (raise why)
                     (link-loop c peer buf last-seen)))
               (`#(node-stop) (raise 'stop)))
-            ;; ⭐ WHICH GENERATION IS THIS FRAME FROM. Replacing a peer's
+            ;; ⚠ A SUPERSEDED LINK CAN STILL SERVE WHAT IT HAS BUFFERED.
+            ;; Replacing a peer's connection sends the old link a stop
+            ;; message, and a message is only read where this loop reads
+            ;; its mailbox -- the branch above, taken when no whole frame
+            ;; is buffered. With frames still decoded and waiting, the old
+            ;; link goes on serving them until its buffer runs out.
+            ;;
+            ;; A gate was tried here and removed. It could not give the
+            ;; property it claimed: the check and the dispatch are
+            ;; separate operations with a preemption point between them,
+            ;; so a link could pass the check and be superseded before it
+            ;; dispatched. It also cost an allocation on every frame,
+            ;; which in a change set about what an out-of-memory leaves
+            ;; behind is the wrong direction. The judgement belongs where
+            ;; the state is written, inside the regions that write it --
+            ;; see the arming and cancelling clauses.
+            ;;
+            ;; WHAT THAT LEAVES, STATED: a superseded link still delivers
+            ;; its buffered `send`s and still serves its buffered `call`s.
+            ;; A `send` is a message the peer really did send, arriving
+            ;; late -- so a subscriber can receive a message from a peer
+            ;; AFTER that peer's node-down has been announced. A `call`
+            ;; costs one wasted service and a reply written to a closed
+            ;; connection; its admission lease is released by the serving
+            ;; process itself, so no accounting is lost. Both are bounded
+            ;; by what fits in the buffer.
+            ;;
+            ;; OLD TEXT, KEPT FOR ITS REASONING: Replacing a peer's
             ;; connection sends the old link a stop message, and a
             ;; message is only read where this loop reads its mailbox --
             ;; which is the branch above, taken only when no whole frame
@@ -4105,9 +4203,7 @@
             ;; The reason raised is the one stop-link! would have
             ;; delivered anyway, so this makes an existing ending arrive
             ;; earlier and introduces no new outcome downstream.
-            (if (current-conn? peer c)
-                (begin (dispatch! c peer d) (drain))
-                (raise 'replaced))))))
+            (begin (dispatch! c peer d) (drain))))))
 
   ;; Run the link until it drops, then clean up.
   ;; -> the moment the link STOPPED CARRYING TRAFFIC, read before the
