@@ -249,6 +249,7 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script test/checked-off.sc
 # a file stream whose owner changes must still be reclaimed: the owner
 # INDEX is what teardown consults, and moving only the field leaked the fd
 "$scheme_bin" --script test/fs-owner-transfer.sc
+"$scheme_bin" --script test/dns-owner-index.sc
 "$scheme_bin" --script test/static-stream.sc
 "$scheme_bin" --script test/static-cache-capacity.sc
 # one file must be one cache entry: self-skips on a case-sensitive
