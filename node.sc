@@ -1821,6 +1821,14 @@
   ;; registration for that name -- and both are scoped to one name, so
   ;; nothing here reclaims a name that is never touched again.
   ;;
+  ;; ⛔ THERE IS NO THIRD MOMENT. A sweeper that filtered this table by
+  ;; pid used to sit in this file with no caller: it had been superseded
+  ;; by the two above and left behind. It is deleted, and this sentence
+  ;; replaces it, because a procedure that looks like a cleanup path is
+  ;; read as one -- and someone comparing the two moments listed here
+  ;; against a third one they can see would conclude the list was
+  ;; incomplete rather than that the procedure was dead.
+  ;;
   ;; AN EARLIER VERSION OF THIS PARAGRAPH SAID THE TABLE IS BOUNDED BY ITS
   ;; OWN HISTORICAL PEAK. That is false, and measurably so in two
   ;; different directions:
@@ -2053,12 +2061,6 @@
     (atomically
       (hashtable-set! watchers name
         (remq w (hashtable-ref watchers name (list))))))
-
-  (define (demonitor-dead-of-pid! name p)
-    (atomically
-      (hashtable-set! watchers name
-        (filter (lambda (w) (not (eq? (w-pid w) p)))
-                (hashtable-ref watchers name (list))))))
 
   ;; ---- framing ----------------------------------------------------------
 
