@@ -2805,15 +2805,13 @@
                         ;;   1. make-entry -- the ONE allocation in this
                         ;;      region, placed first, where a failure has
                         ;;      changed nothing at all;
-                        ;;   2. the push -- pointer writes on a head that
-                        ;;      is still reachable either way (it is
-                        ;;      still on the orphan chain, or it is the
-                        ;;      spare nobody else can see);
-                        ;;   3. hashtable-set! -- a NEW key, so this one
-                        ;;      can grow the table and can raise. If it
-                        ;;      does, the entry is simply unpublished and
-                        ;;      the queued event is still reachable
-                        ;;      through the orphan chain;
+                        ;;   2. hashtable-set! -- a NEW key, so this one
+                        ;;      can grow the table and can raise. Nothing
+                        ;;      has been queued yet when it does, so a
+                        ;;      failure here publishes nothing and
+                        ;;      announces nothing;
+                        ;;   3. the enqueue -- pointer writes, and they
+                        ;;      run only once the entry is published;
                         ;;   4. the unlink -- pointer writes only, so by
                         ;;      the time the head leaves the chain there
                         ;;      is nothing left that can fail.
@@ -2823,11 +2821,41 @@
                         ;; undelivered events on it and no way to reach
                         ;; them.
                         (set! cut (hashtable-ref watchers name '()))
+                        ;; ⚠ STEPS 2 AND 3 USED TO BE THE OTHER WAY
+                        ;; ROUND, and the argument for that order was
+                        ;; correct when it was written. It said the push
+                        ;; was safe because the head was reachable either
+                        ;; way -- "still on the orphan chain, or the
+                        ;; spare nobody else can see" -- so a failure at
+                        ;; the table would leave an unpublished entry and
+                        ;; a queue nobody was looking at.
+                        ;;
+                        ;; A later change made that false without
+                        ;; touching this code. Queueing an event now also
+                        ;; puts its head on the dispatcher's ready chain,
+                        ;; deliberately and in the same call, so the head
+                        ;; IS something else can see -- both the fresh
+                        ;; spare and the adopted orphan. A raise at the
+                        ;; table would have left a node-up queued and
+                        ;; announced for a peer that was never installed,
+                        ;; and the dispatcher would have delivered it.
+                        ;;
+                        ;; Publishing first restores the original
+                        ;; argument rather than patching around it:
+                        ;; everything after the table write is a pointer
+                        ;; write and cannot fail, so there is no longer a
+                        ;; step whose failure leaves an announcement
+                        ;; standing. Queueing and announcing stay one
+                        ;; call -- a head holding an event while off the
+                        ;; ready chain is the state that arrangement
+                        ;; exists to prevent, and splitting them here to
+                        ;; fix this would have traded one silent failure
+                        ;; for another.
                         (let* ((oh (orphan-find name))
                                (h (or oh (car spare)))
                                (ne (make-entry c self dialer boot-id gen h)))
-                          (qhead-enqueue! h (caddr spare) cut)   ; an install is an `up`
                           (hashtable-set! peers name ne)
+                          (qhead-enqueue! h (caddr spare) cut)   ; an install is an `up`
                           (when oh (orphan-detach! name)))
                         'installed)
                        ((replace)
