@@ -3748,6 +3748,31 @@
   ;; install-owner-agent! disables them again inside; the counter nests.
   ;; Its own rule -- publish the agent's pid before the agent can run --
   ;; still holds, because nothing runs until this region ends.
+  ;; Undo an arming that stopped part way. UNCONDITIONAL, and it can be:
+  ;; the mref was minted for this call and nothing else can be filed
+  ;; under it, so deleting all three keys removes only what this arming
+  ;; put there, and a key that was never written is a no-op. That is why
+  ;; there are no "did I do this step" flags here -- the freshness of the
+  ;; key does the work bookkeeping would otherwise have to do.
+  ;;
+  ;; ⭐ IT MUST REACH THE RMONITORS ENTRY, not only the agents. Undoing
+  ;; the agents alone would leave a monitor that is armed, has nobody to
+  ;; fire it, AND has consistent-looking books -- turning a residue two
+  ;; exported counts disagree about into one that nothing disagrees
+  ;; about. A repair that makes a defect harder to see is worse than the
+  ;; defect.
+  ;;
+  ;; Caller holds the region. Both actions are allocation-free: deletes
+  ;; cannot grow a table, and killing a process nothing is watching yet
+  ;; sends nothing -- see undo-install! for why that is a structural fact
+  ;; here and not a claim about timing.
+  (define (undo-remote-arm! mref oa sa)          ; caller holds the region
+    (hashtable-delete! rmonitors mref)
+    (hashtable-delete! owner-agents mref)
+    (hashtable-delete! caller-agents mref)
+    (when (and oa (process-alive? oa)) (kill oa 'arm-failed))
+    (when (and sa (process-alive? sa)) (kill sa 'arm-failed)))
+
   (define (arm-rmonitor! mref node name)
     (atomically
       (hashtable-set! rmonitors mref (vector self node name))
@@ -4985,8 +5010,36 @@
          ;; agent rooted after the monitor has already completed. It must
          ;; also exist before this process can be killed -- see
          ;; arm-rmonitor!, which is why the two are one step.
-         (arm-rmonitor! mref node name)
-         (install-self-agent! self mref name))
+         ;; ONE REGION FOR BOTH HALVES, and the guard inside it.
+         ;;
+         ;; These were two regions in a row. If the second raised -- it
+         ;; spawns and it writes a new key, so it can -- the monitor
+         ;; stayed armed with nothing to fire it, and that residue was
+         ;; permanent: the sweep that collects armed monitors fires only
+         ;; for a peer whose link dropped, and this node's own name never
+         ;; drops. The caller simply never heard anything again.
+         ;;
+         ;; It was also not assertable. caller-agents and rmonitors are
+         ;; both reported, but only LOCAL monitors have a caller agent
+         ;; and nothing reports how many monitors are local, so there is
+         ;; no equality between the counts to check. What there is, is a
+         ;; baseline: rmonitors is reported, and after a failed arming it
+         ;; has to be what it was before.
+         ;; ⚠ `caller` IS READ HERE, NOT IN THE AGENTS. `self` is a
+         ;; property of whoever is running, so the same expression means
+         ;; a different process once it is inside a spawned thunk -- it
+         ;; would name the agent instead of the process being watched
+         ;; over, and the agent would then wait for its own death. The
+         ;; two helpers this replaced took the caller as a parameter,
+         ;; which is what kept the reading on this side of the spawn.
+         (atomically
+           (let ((caller self) (oa #f) (sa #f))
+             (guard (e (#t (undo-remote-arm! mref oa sa) (raise e)))
+               (hashtable-set! rmonitors mref (vector caller node name))
+               (set! oa (spawn (lambda () (owner-mon-agent caller mref))))
+               (hashtable-set! owner-agents mref oa)
+               (set! sa (spawn (lambda () (self-mon-agent caller mref name))))
+               (hashtable-set! caller-agents mref sa)))))
         ((live-entry node)
          => (lambda (e)
               ;; no origin field: the target derives the watcher from the
