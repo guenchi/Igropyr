@@ -1304,6 +1304,19 @@ point of it — but it carries neither a token nor a sequence number, so a
 receiver using it cannot distinguish a repeat from a new event. If that
 matters, use the token form; if it does not, nothing needs to change.
 
+> **Upgrading:** delivery of these notices changed, and the message did
+> not, so nothing about a two-element subscription looks different until
+> a notice arrives twice. Previously a delivery interrupted part way
+> through was lost; now it is started again, which is why the same
+> `#(node-up peer)` or `#(node-down peer)` can reach a subscriber more
+> than once. Code that treats a notice as an edge — incrementing a
+> counter, appending to a list, launching one piece of work per event —
+> sees the repeat; code that treats it as a state, setting a flag or
+> re-reading `node-peers`, does not. `monitor-node/token` is the
+> migration if you need to tell the two apart, and switching to it means
+> changing the `receive` pattern as well as the subscription call, since
+> its notices carry two more fields.
+
 **Node names are wire syntax, not a local label.** A node name is
 non-empty, at most 255 characters, and drawn from `[0-9a-z-]` — lowercase
 letters, digits and the hyphen, which is legal in any position including
