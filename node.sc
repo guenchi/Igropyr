@@ -898,12 +898,29 @@
   ;;   - say every restart out loud, with the count, so a node that is
   ;;     limping is visible before it reaches the limit.
   (define child-restart-window-ms 60000)
-  (define child-restart-max 5)
+  (define child-restart-min-count 5)
   (define child-restart-cap-ms 1000)
   ;; How long the failures have to have been going on before giving up is
   ;; the right answer. A count alone cannot say that: five deaths are
   ;; five deaths whether they took a third of a second or an hour, and
   ;; the first of those is the definition of transient.
+  ;;
+  ;; ⚠ THE COUNT IS A FLOOR, NOT A CEILING, and it used to be the other
+  ;; way round. While it was the only test, "max" was its name and its
+  ;; meaning. As one half of a conjunction it is the number of deaths
+  ;; before the elapsed-time test begins to apply, and restarts routinely
+  ;; go past it -- with the delays below, the give-up lands around the
+  ;; tenth. The name changed with the meaning, because someone wanting
+  ;; the node to give up sooner will reach for whatever is called max and
+  ;; find that lowering it changes almost nothing: the time test is the
+  ;; gate, and child-min-persist-ms is the dial.
+  ;;
+  ;; The actual ceiling is not written down here on purpose. It falls out
+  ;; of four constants -- the first delay, the doubling, the cap, and the
+  ;; threshold -- so a number here would be a copy of something four
+  ;; other lines own, and none of their owners would think to come and
+  ;; change it. To find it: add up the delays until the total passes
+  ;; child-min-persist-ms; the restart that crosses it is the last one.
   (define child-min-persist-ms 5000)
 
   ;; ---- the warden ------------------------------------------------------
@@ -979,8 +996,9 @@
                   (display (string-append
                              "igropyr node: " nm " exited ("
                              (claimed-version-text reason)
-                             "); restart " (number->string k)
-                             ", giving up at " (number->string child-restart-max)
+                             "); death " (number->string k)
+                             ", giving up after "
+                             (number->string child-restart-min-count)
                              " within " (number->string (quotient child-restart-window-ms 1000))
                              "s AND " (number->string (quotient child-min-persist-ms 1000))
                              "s of failing\n")
@@ -1005,25 +1023,40 @@
                     (vector-set! delays i
                       (fxmin child-restart-cap-ms
                              (if (fx= d 0) 50 (fx* d 2)))))
-                  ;; A CONJUNCTION, and both halves are monotone: the
-                  ;; count rises with each death inside the window and
-                  ;; the elapsed time rises with the clock. A child that
-                  ;; genuinely cannot start still stops the node -- it
-                  ;; cannot stay below either half forever -- it just
-                  ;; stops it later. That is the trade, stated: a
-                  ;; mistaken stop is exchanged for a late one, and the
-                  ;; child's work is not being done during the wait.
+                  ;; A CONJUNCTION, and ⚠ NEITHER HALF IS MONOTONE. Both
+                  ;; can fall: the count drops as timestamps leave the
+                  ;; window, and the elapsed time shrinks when the oldest
+                  ;; retained death is the one that left. An earlier note
+                  ;; here claimed monotonicity and concluded that a child
+                  ;; which cannot start must eventually stop the node.
+                  ;; That conclusion is true for failures fast enough to
+                  ;; keep the window full, and false otherwise.
+                  ;;
+                  ;; What is guaranteed: a child failing often enough to
+                  ;; hold the required count inside the window will cross
+                  ;; the elapsed-time test, because the backoff runs
+                  ;; before the decision and its cap bounds how slowly
+                  ;; time can accumulate. A child that fails more slowly
+                  ;; than the window -- once every twenty seconds, say --
+                  ;; never reaches the count and is restarted forever.
+                  ;; That is the window's own long-standing meaning, not
+                  ;; something introduced here, and it is written down
+                  ;; because the sentence it replaces said otherwise.
+                  ;;
+                  ;; The trade, stated: a mistaken stop is exchanged for
+                  ;; a late one, and the child's work is not being done
+                  ;; during the wait.
                   (let* ((earliest (let loop ((xs recent) (m (car recent)))
                                      (cond ((null? xs) m)
                                            ((< (car xs) m) (loop (cdr xs) (car xs)))
                                            (else (loop (cdr xs) m)))))
                          (persisted (- (now-ms) earliest)))
-                    (when (and (fx>= k child-restart-max)
+                    (when (and (fx>= k child-restart-min-count)
                                (>= persisted child-min-persist-ms))
                       (display (string-append
-                                 "igropyr node: " nm " has not stayed up "
+                                 "igropyr node: " nm " died "
                                  (number->string k)
-                                 " restarts over "
+                                 " times over "
                                  (number->string (quotient persisted 1000))
                                  "s; this is not transient and "
                                  (child-consequence spec)
@@ -1417,9 +1450,20 @@
   ;; record, so it cannot be stack-allocated.
   ;;
   ;; The guard covers both halves, argument evaluation included, since
-  ;; that is where the closure is built. The compensation can never fail
-  ;; because it asks for nothing: restoring a balance writes a key that
-  ;; is already there, and removing one cannot grow a table. It does not
+  ;; that is where the closure is built. The compensation asks for
+  ;; nothing -- restoring a balance writes a key already present, and
+  ;; removing one cannot grow a table -- so on the implementation this
+  ;; runs on there is nothing in it that allocates, which was measured
+  ;; rather than assumed. ⚠ That is a statement about this Chez and these
+  ;; two operations, not a law: a hashtable whose delete could compact,
+  ;; or a rewrite that made the restore anything but an update in place,
+  ;; would end it. "Cannot fail" is shorthand for that, and shorthand is
+  ;; what the sentence above this one used to be.
+  ;;
+  ;; ⚠ The re-raise is `raise`, so a continuable condition arriving here
+  ;; leaves as non-continuable. Nothing in this file raises one on this
+  ;; path today; it is said because a future one would be silently
+  ;; downgraded rather than refused. It does not
   ;; touch the order of the two halves -- registering after the store is
   ;; what makes an already-closed connection come out right, as above.
   (define (outbound-charge! c n)
@@ -3110,6 +3154,25 @@
              ;; may not re-register. Dropping them is the reading that
              ;; cannot lose a resource; keeping them would be the reading
              ;; that cannot lose a registration.
+             ;; ⭐ WHAT IS NOT DONE HERE, AND WHY IT MUST NOT BE. The
+             ;; death path runs a third sweep that this one does not:
+             ;; the one that answers every remote monitor watching this
+             ;; peer with noconnection. Doing it here would tell every
+             ;; watcher that a peer which is reachable right now has
+             ;; become unreachable -- a lie, once per watcher, and one
+             ;; they would act on.
+             ;;
+             ;; A replacement is not a death. It is the same peer on a
+             ;; different connection, and a watch that crossed the old
+             ;; one has to survive; only the state tied to the
+             ;; CONNECTION goes. That is the whole difference between
+             ;; the two paths, and this is the only place in the file
+             ;; where it is visible.
+             ;;
+             ;; ⛔ THE OMISSION IS DELIBERATE. It does not look like one:
+             ;; a diff shows the death path doing three things and this
+             ;; path doing two, and the natural tidy-up is to make them
+             ;; agree. Making them agree breaks this.
              (stop-link! (entry-conn old) (entry-link old) 'replaced)
              (drop-hosted-monitors! name)
              (fail-pending-for! name)
@@ -3562,37 +3625,33 @@
                                         (begin (retire-agent-locked! key found) #f)))))
                      (cond
                        ((and cur (agent-matches? cur c name)) #t)
-                       ;; ⚠ THIS ARM IS NOW UNREACHABLE, AND NOT BY ITSELF.
-                       ;; Reaching it needs a record whose connection is
-                       ;; current and is not this one, which needs two
-                       ;; current connections for one peer. What rules
-                       ;; that out is the generation check in the link's
-                       ;; frame loop: a superseded connection stops before
-                       ;; it can serve anything.
+                       ;; ⛔ THIS ARM IS REACHABLE, AND A CELL HAS BEEN
+                       ;; PROVING IT EVERY RUN. A note here once said it
+                       ;; was not, on the reasoning that reaching it would
+                       ;; need two current connections for one peer. That
+                       ;; reasoning read one half of the test above: the
+                       ;; match compares the connection AND THE NAME, so
+                       ;; the same connection asking to watch a different
+                       ;; name under a reference it has already used lands
+                       ;; here, with no second connection and no
+                       ;; generations involved at all. test/node.sc does
+                       ;; exactly that and asserts the link closes.
                        ;;
-                       ;; ⭐ AND HERE IS THE ROAD THAT USED TO LEAD HERE,
-                       ;; because knowing how it was reached says more
-                       ;; than knowing why it is not. There was exactly
-                       ;; one: a connection that had already been
-                       ;; replaced went on serving buffered frames, and
-                       ;; one of them armed a monitor -- recorded against
-                       ;; that old connection, and installed after the
-                       ;; sweep which clears the previous generation's
-                       ;; monitors had already run, so nothing removed
-                       ;; it. The peer then repeated its request on the
-                       ;; new connection, which this protocol says is
-                       ;; free, and found that record.
+                       ;; Worth keeping as a lesson about the claim and
+                       ;; not only about the code: a sentence saying
+                       ;; something cannot happen can be checked against
+                       ;; the suite before it is written, and this one
+                       ;; would have been refuted in one grep. A green
+                       ;; suite does not check the comments; it answers
+                       ;; only what it is asked.
                        ;;
-                       ;; That road matters because it is the one that
-                       ;; reopens. Removing the loop's check does not
-                       ;; merely make this arm reachable again; it makes
-                       ;; it reachable in the only way it ever was, and
-                       ;; the answer it gives there is wrong -- calling a
-                       ;; peer a protocol violator for doing what it was
-                       ;; told it could do. It stays because it is still
-                       ;; the only way to say "two live connections are
-                       ;; genuinely contending", which is a thing this
-                       ;; code should refuse rather than guess about.
+                       ;; What the arm means: one reference, two
+                       ;; different requests. That is a peer contradicting
+                       ;; itself, and the link goes rather than this side
+                       ;; guessing which request was meant. A stale
+                       ;; generation is NOT that, which is why the test
+                       ;; above retires such a record instead of arriving
+                       ;; here with it.
                        (cur (raise 'protocol))
                        ((fx< (accounted-monitors) max-hosted-monitors)
                         ;; THREE STEPS THAT MUST NOT BE LEFT HALF DONE.

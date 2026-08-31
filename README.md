@@ -1312,7 +1312,7 @@ matters, use the token form; if it does not, nothing needs to change.
 > than once. Code that treats a notice as an edge — incrementing a
 > counter, appending to a list, launching one piece of work per event —
 > sees the repeat; code that treats it as a state, setting a flag or
-> re-reading `node-peers`, does not. `monitor-node/token` is the
+> re-reading `node-peers`, receives it too but is not affected by it. `monitor-node/token` is the
 > migration if you need to tell the two apart, and switching to it means
 > changing the `receive` pattern as well as the subscription call, since
 > its notices carry two more fields.
