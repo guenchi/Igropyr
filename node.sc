@@ -5514,6 +5514,23 @@
                (hashtable-set! rmonitors mref (vector caller node name))
                (set! oa (spawn (lambda () (owner-mon-agent caller mref))))
                (hashtable-set! owner-agents mref oa)
+               ;; ⚠ NOTHING SWEEPS caller-agents BUT THESE AGENTS
+               ;; THEMSELVES. Its entries go away on the three exits of
+               ;; self-mon-agent and on an explicit demonitor, and that
+               ;; is the whole list: the reaper walks the monitor chain
+               ;; and the lease chain, not this table. An agent killed
+               ;; outright would leave its row behind for good.
+               ;;
+               ;; That is safe today for one reason and one only: these
+               ;; agents have no name outside this library. They are not
+               ;; registered, their pid is returned to no caller, and no
+               ;; path in here kills them -- so nothing can kill one.
+               ;;
+               ;; ⛔ Giving them a name, or adding a path that kills
+               ;; them, is not adding a feature: it is making this table
+               ;; need a sweeper it does not have. The row leaks alone --
+               ;; no credit is attached to it -- so the accounting that
+               ;; catches the other agent table would not notice.
                (set! sa (spawn (lambda () (self-mon-agent caller mref name))))
                (hashtable-set! caller-agents mref sa)))))
         ((live-entry node)
