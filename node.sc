@@ -1487,6 +1487,18 @@
                           (loop (fx+ i 1)
                                 (fx+ n (mon-peer-chain-length
                                          (vector-ref ks i))))))))
+            ;; THE TWO ADMISSION CEILINGS, each reported twice: the cached
+            ;; count and the chain walked. A ceiling with no reading at
+            ;; all is what these were until now -- the counters existed,
+            ;; nothing published them, and the failure they drift into
+            ;; (a node refusing every remote call while healthy) had
+            ;; therefore no observable at all. Reporting the cache beside
+            ;; the walk is what makes a drift between them a fact somebody
+            ;; can assert rather than infer from behaviour.
+            (cons 'serving-slots leases-serving)
+            (cons 'serving-slots-walked (lease-chain-length 'serving))
+            (cons 'preauth-slots leases-preauth)
+            (cons 'preauth-slots-walked (lease-chain-length 'preauth))
             ;; active and retiring come from ONE walk, so their sum can be
             ;; compared against the permit count meaningfully: the property
             ;; worth checking is that eviction moves nodes between the two
