@@ -235,6 +235,27 @@
   ;; The argument type checks stay OUTSIDE these regions anyway (see
   ;; send and link): failing early is still better than unwinding.
   ;;
+  ;; ⭐ WHEN TO USE THIS FORM, AND WHEN A BARE disable-interrupts IS
+  ;; RIGHT. Some of this file does not use the form at all: it disables
+  ;; and enables by hand, sometimes across a yield, sometimes in a place
+  ;; that never enables again. That is not sloppiness left to tidy up
+  ;; later, and the rule for telling the two apart is short:
+  ;;
+  ;;   ⭐ A NEW hand-written disable-interrupts belongs in this form
+  ;;   UNLESS no path out of it ever returns. If there is a path that
+  ;;   comes back, write it lexically.
+  ;;
+  ;; All ten of the hand-paired sites here have been judged one at a
+  ;; time against that rule and none of them qualifies: three sit in
+  ;; front of a yield the process never comes back from, two implement
+  ;; the interrupt save/restore that this form relies on, one spans a
+  ;; park and a rescan loop with two exits at different depths, one is
+  ;; the whole life of the event loop, and one is not a region at all --
+  ;; its disable is an argument, producing a count rather than a scope.
+  ;; The reasoning per site is in the segment archive; what belongs here
+  ;; is the rule, because the person who adds an eleventh will be
+  ;; editing this file and not reading that one.
+  ;;
   ;; PAYING IT UNIFORMLY IS THE POINT, and the next reader will want to
   ;; stop. Some of these twelve bodies genuinely cannot raise, and it is
   ;; easy to argue that those ones could keep the fast form and save
