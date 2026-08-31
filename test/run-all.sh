@@ -250,6 +250,11 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script test/checked-off.sc
 # INDEX is what teardown consults, and moving only the field leaked the fd
 "$scheme_bin" --script test/fs-owner-transfer.sc
 "$scheme_bin" --script test/dns-owner-index.sc
+# every kind registered in libuv's owner index must be retired somewhere:
+# a one-sided tag leaks one entry per operation for the owner's whole
+# life, and the only symptom is growth. rc=2 means the scanner itself
+# broke -- it must never be read as a clean source.
+"$scheme_bin" --script test/owner-index-tags.sc
 "$scheme_bin" --script test/static-stream.sc
 "$scheme_bin" --script test/static-cache-capacity.sc
 # one file must be one cache entry: self-skips on a case-sensitive
