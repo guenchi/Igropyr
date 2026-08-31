@@ -1115,7 +1115,7 @@
   ;; It never touches the count. The increment is the last step of the
   ;; install and cannot raise, so reaching it means the install
   ;; succeeded; nothing that gets here has been counted.
-  (define (undo-install! key p)                  ; caller already holds the region
+  (define (undo-install-of-pid! key p)                  ; caller already holds the region
     (let ((cur (hashtable-ref callee-agents key #f)))
       (when (and cur p (eq? (agent-pid cur) p))
         (hashtable-delete! callee-agents key)
@@ -1983,7 +1983,7 @@
                       ;; here, because a consumer decides what to do about
                       ;; it and consumers do not read this file.
                       (vector what name)))
-          (drop-watcher! name w))))
+          (drop-watcher-of-rec! name w))))
 
   (define (notify-list! l name what seq)
     (for-each (lambda (w) (notify-one! w name what seq)) l))
@@ -2049,12 +2049,12 @@
   (define (w-pid w)   (vector-ref w 2))
   (define (w-token w) (vector-ref w 3))       ; #f on a legacy entry
 
-  (define (drop-watcher! name w)
+  (define (drop-watcher-of-rec! name w)
     (atomically
       (hashtable-set! watchers name
         (remq w (hashtable-ref watchers name (list))))))
 
-  (define (demonitor-dead! name p)
+  (define (demonitor-dead-of-pid! name p)
     (atomically
       (hashtable-set! watchers name
         (filter (lambda (w) (not (eq? (w-pid w) p)))
@@ -3673,9 +3673,9 @@
                         ;; deleted. Inside, there is no such moment,
                         ;; because nothing else has run at all -- which is
                         ;; also what makes the cleanup's own actions
-                        ;; provably harmless. See undo-install!.
+                        ;; provably harmless. See undo-install-of-pid!.
                         (let ((p #f))
-                          (guard (e (#t (undo-install! key p) (raise e)))
+                          (guard (e (#t (undo-install-of-pid! key p) (raise e)))
                             (set! p (spawn (lambda () (mon-agent peer key name c))))
                             (let ((r (make-agent-rec p name c key peer)))
                               (hashtable-set! callee-agents key r)
@@ -4157,7 +4157,7 @@
   ;;
   ;; Caller holds the region. Both actions are allocation-free: deletes
   ;; cannot grow a table, and killing a process nothing is watching yet
-  ;; sends nothing -- see undo-install! for why that is a structural fact
+  ;; sends nothing -- see undo-install-of-pid! for why that is a structural fact
   ;; here and not a claim about timing.
   (define (undo-remote-arm! mref oa sa)          ; caller holds the region
     (hashtable-delete! rmonitors mref)
