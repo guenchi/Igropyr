@@ -640,6 +640,23 @@
   ;; counted, because the alternative is decrementing one counter and
   ;; incrementing another for every node of a spliced chain -- inside the
   ;; region, which is the O(N) this arrangement exists to avoid.
+  ;;
+  ;; ⭐ BEING DERIVED IS ALSO WHY EVICTION CANNOT FAIL, and that is the
+  ;; part worth guarding. There is no retiring table, so there is no
+  ;; insertion into one, so there is nothing on that path that allocates
+  ;; and nothing that can raise for want of memory. Storing the phase
+  ;; instead -- a set of retiring nodes, say -- would put a failable
+  ;; allocation back inside the splice, and a splice that can fail is a
+  ;; cleanup that can fail, which is the shape this design refused.
+  ;;
+  ;; ⚠ THE DESIGN NOTE ON THIS SAYS SOMETHING ELSE, and it would go on
+  ;; saying it. Its argument is that each admitted monitor pre-pays the
+  ;; slot it will need at retirement, so eviction always has room. That
+  ;; is true and it is not what makes eviction infallible here: paying in
+  ;; advance answers "cannot afford it", and having nothing to pay for
+  ;; answers something stronger. Anyone changing this to a stored phase
+  ;; would find the design still vouching for a property their change
+  ;; had just removed.
   ;; BOTH NUMBERS FROM ONE WALK. Two walks would each be honest and the
   ;; pair could still be impossible -- a node retiring between them counts
   ;; in neither, and the sum stops matching the permit count. The claim
