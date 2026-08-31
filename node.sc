@@ -454,7 +454,7 @@
   ;;     REFUSED with (mdown ... overload).
   ;; Those two bound what an AUTHENTICATED member can make this node do.
   ;; A COUNT OF SLOTS IS ONLY HALF OF THAT BOUND, though: concurrency is
-  ;; slots times how long each is held, so the first of them is paired
+  ;; leases times how long each is held, so the first of them is paired
   ;; with a ceiling on the time one call may occupy a slot --
   ;; serve-timeout-cap-ms, just below. Without it the count bounds how
   ;; many calls run at once and nothing bounds how long, which a peer
@@ -970,7 +970,7 @@
   ;; for it -- the caller then gets an error for work that was proceeding,
   ;; which is the worse failure because nothing about it looks like a
   ;; timeout policy. Without the cap the field is a lever: a peer parks
-  ;; one of the max-rcall-serving slots for as long as it likes by
+  ;; one of the max-rcall-serving leases for as long as it likes by
   ;; stating as long a timeout as it likes.
   ;;
   ;; WHAT THIS DOES NOT DO: it bounds how long this node WAITS, not how
@@ -978,32 +978,126 @@
   ;; nobody waiting for it, exactly as it does for a local caller that
   ;; times out. That is gen-server-call's contract, not a gap here.
   (define serve-timeout-cap-ms 60000)
-  (define rcall-serving 0)
-  (define preauth-conns 0)
 
-  ;; Take a serve-rcall slot iff one is free; #t if taken.
+  ;; ---- admission leases -------------------------------------------------
   ;;
-  ;; THE COUNTER ONLY WORKS IF EVERY TAKE IS PAIRED WITH A RELEASE, and
-  ;; the two ways that pairing breaks are worth naming together. A raise
-  ;; out of the server is handled where the slot is taken (see dispatch!);
-  ;; a KILL of that process is not, and cannot be, because a kill runs no
-  ;; handlers. Both leak the same counter in the same direction -- down,
-  ;; permanently -- and a leaked ceiling presents as a node that sheds
-  ;; every remote call as overload while looking healthy.
-  (define (rcall-slot-take!)
-    (atomically
-      (and (fx< rcall-serving max-rcall-serving)
-           (begin (set! rcall-serving (fx+ rcall-serving 1)) #t))))
-  (define (rcall-slot-free!)
-    (atomically (set! rcall-serving (fx- rcall-serving 1))))
+  ;; A SLOT HAS AN OWNER. These two ceilings used to be bare integers:
+  ;; they recorded how many were in use and not who was using them, so
+  ;; nothing could ever reconcile them. A process killed while holding one
+  ;; took it away permanently, and the counter drifts in one direction
+  ;; only -- down -- which presents as a node that sheds every remote call
+  ;; as overload while looking perfectly healthy. Nothing can be built on
+  ;; top of a count with no owner; the reaper below has no one to watch
+  ;; and no way to know how much to give back.
+  ;;
+  ;; The link is a field of the slot record, not an entry in a table.
+  ;; A hashtable insert can rehash, rehashing allocates, and allocation
+  ;; raises -- inside a region, which is exactly the residual already on
+  ;; the ledger for the orphan index. Adding a new instance of a defect
+  ;; while its family is being counted is not a trade worth making. Two
+  ;; pointer writes join a chain and cannot fail.
+  ;; The ceiling counts SLOTS; a LEASE is one process's holding of one.
+  ;; The record is named for the holding rather than the unit because the
+  ;; holding is what has an owner, and having an owner is the entire
+  ;; point of it. (`slot` is also already this file's wire-field
+  ;; accessor, which is how the name collision announced itself.)
+  (define-record-type lease
+    (fields kind (mutable pid) (mutable next) (mutable on?)))
 
-  ;; take a pre-auth handshake slot iff one is free; #t if taken
-  (define (preauth-slot-take!)
-    (atomically
-      (and (fx< preauth-conns max-preauth-conns)
-           (begin (set! preauth-conns (fx+ preauth-conns 1)) #t))))
-  (define (preauth-slot-free!)
-    (atomically (set! preauth-conns (fx- preauth-conns 1))))
+  (define leases #f)                       ; the chain: THE truth
+  (define leases-serving 0)                ; O(1) caches of its length, by kind
+  (define leases-preauth 0)
+
+  ;; The chain is authoritative and the counters are a cache of it -- that
+  ;; is a different thing from two fields checking each other, which has
+  ;; no truth in it. The reaper acts on the chain; if a count disagrees,
+  ;; the count is what is wrong, and node-monitor-stats reports both so
+  ;; that disagreement is visible rather than inferred.
+  (define (lease-bump! kind d)
+    (case kind
+      ((serving) (set! leases-serving (fx+ leases-serving d)))
+      ((preauth) (set! leases-preauth (fx+ leases-preauth d)))))
+
+  (define (lease-count kind)
+    (case kind ((serving) leases-serving) ((preauth) leases-preauth) (else 0)))
+
+  (define (lease-chain-length kind)         ; the truth, walked
+    (let loop ((x leases) (n 0))
+      (cond ((not x) n)
+            ((eq? (lease-kind x) kind) (loop (lease-next x) (fx+ n 1)))
+            (else (loop (lease-next x) n)))))
+
+  (define (lease-attach! s)                 ; caller holds the region
+    (lease-next-set! s leases)
+    (lease-on?-set! s #t)
+    (set! leases s)
+    (lease-bump! (lease-kind s) 1))
+
+  ;; CONDITIONAL, and by the identity of THIS RECORD. Same shape as
+  ;; qhead-done!: the removal happens only if the record is still on the
+  ;; chain, so a second release reports #f instead of taking somebody
+  ;; else's slot away. And it is the record that is removed, never "this
+  ;; pid's record" -- one process can hold a serving slot and a pre-auth
+  ;; slot at the same time, and deleting by owner would take both. That
+  ;; is not a hypothetical: demonitor-node deleted watcher entries by
+  ;; bare pid and removed the token subscriptions sitting beside them.
+  ;; The same mistake, with a different resource's name on it.
+  (define (lease-detach! s)                 ; caller holds the region
+    (and (lease-on? s)
+         (let loop ((prev #f) (x leases))
+           (cond
+             ((not x) #f)
+             ((eq? x s)
+              (if prev (lease-next-set! prev (lease-next x)) (set! leases (lease-next x)))
+              (lease-next-set! s #f)
+              (lease-on?-set! s #f)
+              (lease-bump! (lease-kind s) -1)
+              #t)
+             (else (loop x (lease-next x)))))))
+
+  (define (lease-free! s) (atomically (lease-detach! s)))
+
+  ;; Admit one holder, or refuse. Returns the new process, or #f.
+  ;;
+  ;; ⭐ THE SPAWN IS INSIDE THE REGION, AND THAT IS THE WHOLE POINT: while
+  ;; this process holds interrupts off, the child it just created cannot
+  ;; be scheduled, so there is no instant at which a slot exists with no
+  ;; owner recorded, and none at which a child is serving before it is
+  ;; known to have been admitted. Taking the slot first and spawning
+  ;; afterwards -- which is what this used to do -- is two commits with a
+  ;; gap between them; spawning first and checking the ceiling afterwards
+  ;; is worse still, because the child can start serving before anyone
+  ;; has decided it may.
+  ;;
+  ;; ⚠ THIS IS ONLY SAFE BECAUSE INTERRUPT REGIONS NOW UNWIND. The spawn
+  ;; is the one thing left in here that allocates, and allocation raises.
+  ;; Before that change, a raise in here would have left this process's
+  ;; interrupt count high and its preemption off for good -- silently.
+  ;; Anyone tempted to give this region back the faster non-unwinding
+  ;; form would be turning an out-of-memory into a process that never
+  ;; runs again.
+  ;;
+  ;; The pre-check outside is an optimisation and nothing more: it keeps
+  ;; a flood from allocating a record and a process per refused call.
+  ;; ⛔ THE CHECK INSIDE THE REGION IS THE ONLY AUTHORITY. The one out
+  ;; here can be wrong in both directions, and simplifying it into the
+  ;; only check would move the ceiling out of the one place where it is
+  ;; ordered against everything else.
+  ;;
+  ;; The residual, stated: between the two checks a slot can free up, so
+  ;; a call is occasionally refused that would have fit, and a record and
+  ;; a process are occasionally built for a call that is then refused.
+  ;; Neither leaks; both are bounded by the race window.
+  (define (lease-admit! kind cap body)
+    (and (fx< (lease-count kind) cap)
+         (let ((s (make-lease kind #f #f #f)))   ; (R0) built outside
+           (atomically
+             (and (fx< (lease-count kind) cap)
+                  (let ((p (spawn (lambda () (body s)))))
+                    (lease-pid-set! s p)
+                    (lease-attach! s)
+                    p))))))
+
 
   ;; ---- outbound backpressure -------------------------------------------
   ;; The ceilings above bound what a peer can make this node DO. This one
@@ -2965,8 +3059,8 @@
          ;; leak a serving slot either.
          (unless (and (integer? timeout) (exact? timeout) (> timeout 0))
            (raise 'protocol))
-         (if (rcall-slot-take!)
-             (spawn (lambda ()
+         (if (lease-admit! 'serving max-rcall-serving
+               (lambda (s)
                       ;; THE SLOT IS RELEASED WHETHER OR NOT THE SERVER
                       ;; RETURNS NORMALLY. serve-rcall! can raise -- its
                       ;; fallback reply goes through link-write, which
@@ -2990,14 +3084,20 @@
                       ;; that ever gives it back.
                       ;;
                       ;; IT IS ONE OF TWO WAYS THIS SLOT CAN BE LOST, and
-                      ;; the other is not repaired: rcall-slot-free! is
-                      ;; still skipped if this process is KILLED, since a
-                      ;; kill runs no handlers. A guard cannot cover that
-                      ;; one -- see the gap ledger, where it is recorded
-                      ;; against the same counter this branch protects.
-                      (guard (e (#t (void)))
-                        (serve-rcall! peer reg ref m timeout))
-                      (rcall-slot-free!)))
+                      ;; the other is now repaired elsewhere: the release
+                      ;; below is still skipped if this process is KILLED,
+                      ;; since a kill runs no handlers, and no guard can
+                      ;; cover that. What covers it is that the slot knows
+                      ;; who holds it, so the reaper gives it back on the
+                      ;; DOWN it sees. This branch handles the raise; the
+                      ;; owner handles the kill.
+                 (guard (e (#t (void)))
+                   (serve-rcall! peer reg ref m timeout))
+                 (lease-free! s)))
+             (void)
+             ;; REFUSED. The admission returned #f, which is the only way
+             ;; to get here: an admitted call has a process of its own and
+             ;; nothing more to do on this one.
              (guard (e (#t (void)))
                (write-frame! c (list 'reply ref (list 'error 'overload)))))))
       ;; (reply ,ref ,result) -> route back to the waiting rcall caller,
@@ -3616,10 +3716,13 @@
   ;; double-count. Nothing here is killed abruptly (shutdown is a
   ;; node-stop message, not a kill), so the guard is enough to keep the
   ;; count from drifting.
-  (define (acceptor c)
-    (let ((freed #f))
-      (define (free!)
-        (unless freed (set! freed #t) (preauth-slot-free!)))
+  (define (acceptor c s)
+    (let ()
+      ;; No local "already freed" flag: lease-free! is conditional on the
+      ;; record still being on the chain, so calling it twice is already
+      ;; a no-op the second time. A boolean beside it would be a second
+      ;; supplier of the same fact, and the two could disagree.
+      (define (free!) (lease-free! s))
       ;; A FAILED HANDSHAKE CLOSES WITHOUT A WORD, and that is deliberate
       ;; here even for a version mismatch. This side faces strangers: a
       ;; scanner that has learned the frame format can reach it, and
@@ -4396,11 +4499,11 @@
           (lambda (c)
             ;; libuv callback context: spawn + own + read-start only,
             ;; or -- over the pre-auth ceiling -- close and do none of it
-            (if (preauth-slot-take!)
-                (let ((pid (spawn (lambda () (acceptor c)))))
-                  (conn-set-owner! c pid)
-                  (tcp-read-start! c))
-                (tcp-close! c))))))
+            (let ((pid (lease-admit! 'preauth max-preauth-conns
+                         (lambda (s) (acceptor c s)))))
+              (if pid
+                  (begin (conn-set-owner! c pid) (tcp-read-start! c))
+                  (tcp-close! c)))))))
     name)
 
   ;; Dial a peer (and keep dialing whenever the link is down).
