@@ -113,28 +113,39 @@
    `(section (@ (id "conversations"))
       (div (@ (class "wrap"))
         (div (@ (class "kicker")) "04 · Web programming with continuations")
-        (h2 "Dialogues are processes")
-        (p (@ (class "lead")) "A multi-request dialogue — a wizard, a booking, a "
-           "transfer — runs as " (b "one green process") ". Its local bindings are "
-           "the conversation state, including things a session store can never "
-           "hold: an " (b "open database transaction") ", spanning rounds.")
+        (h2 "Conversations are continuations")
+        (p (@ (class "lead")) "A multi-request workflow—a checkout wizard, a "
+           "booking, a fund transfer—runs as " (b "one single green process")
+           ". Its local lexical bindings are the conversation state. This allows "
+           "it to hold resources that a disconnected session store could never "
+           "serialize: like a " (b "live, open database transaction")
+           " spanning across multiple network roundtrips.")
         (div (@ (class "feature flip"))
           (div (@ (class "txt"))
             (h3 "Control flow is program text")
-            (p "\"The user is at the confirm step\" means the process is parked "
-               (b "at that line") ". A step order the code cannot express cannot "
-               "happen — no state machine to get wrong, no replay to defend "
-               "against.")
-            (p (b "The " (code "gone") " guarantee:") " the transaction commits "
-               "through " (code "commit!") ", so the library knows which side of "
-               "it a death fell on. Before it: dead process = dropped connection "
-               "= the database itself rolled back, and " (code "gone") " "
-               (b "proves") " nothing committed — the one status you may retry "
-               "on. After it, or a kill, or no record at all: " (code "unknown")
-               " — reconcile, never resubmit. Together with the fault codes "
-               "above, the client always knows the definite server state, and "
-               "is told plainly when it cannot be known — a complete remote "
-               "transaction ring."))
+            (p "\"The user is at the confirm step\" literally means the process "
+               "is parked " (b "at that exact line of code") ". A sequence of "
+               "events that the code cannot express simply cannot happen—there "
+               "is no external state machine to get wrong, and no replay attack "
+               "to defend against.")
+            (p (b "The " (code "'gone") " guarantee"))
+            (p "The transaction declares its point of no return through the "
+               (code "commit!") " primitive, giving the framework a razor-sharp "
+               "boundary to judge any death.")
+            (ul
+              (li (b "Before " (code "commit!") ":") " A dead process means a "
+                  "dropped connection, which means the database itself "
+                  "automatically rolled back. The framework answers "
+                  (code "'gone") "—absolute physical proof that nothing "
+                  "committed. This is the one status you may safely retry on.")
+              (li (b "After " (code "commit!")
+                     " (or an unknown kill/missing record):")
+                  " The framework answers " (code "'unknown")
+                  ". It refuses to guess. Reconcile; never resubmit."))
+            (p "Combined with the fault protocols above, the client always knows "
+               "the definite server state. Just as importantly, it is told "
+               "plainly—and honestly—when the state cannot be known. The "
+               "complete remote transaction ring is finally closed."))
           (pre ,(raw conv-code)))))
 
    ;; ---- 5. s-expression rpc ----
