@@ -192,13 +192,13 @@
    `(section (@ (id "cluster"))
       (div (@ (class "wrap"))
         (div (@ (class "kicker")) "06 · From node to hive")
-        (h2 "Self-expanding distributed cluster")
+        (h2 "Write once, run distributed")
         (p (@ (class "lead")) "Nodes discover each other and wire up a full, true "
            "mesh—no central coordinator, and no fragile registry to babysit. "
            "Links self-heal, and work fluidly spreads across every live member.")
         (div (@ (class "feature flip"))
           (div (@ (class "txt"))
-            (h3 "The mesh forms itself")
+            (h3 "Self-expanding distributed cluster")
             (p "Point " (code "cluster-start") " at a discovery strategy, and it "
                "keeps the topology honest: it actively dials any member it isn't "
                "linked to yet, and mercilessly drops anyone that leaves. The "
