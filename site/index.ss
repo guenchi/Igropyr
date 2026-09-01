@@ -61,19 +61,23 @@
       (div (@ (class "wrap"))
         (div (@ (class "kicker")) "02 · Live systems")
         (h2 "Hot code swapping")
-        (p (@ (class "lead")) "Replace the handler — or a single route — on a "
-           "running server. The listener, open connections and the worker pool "
-           "stay up; in-flight requests finish on the old code.")
+        (p (@ (class "lead")) "Swap the entire handler—or just patch a single "
+           "route—on a live server. The TCP listener, open connections, and the "
+           "worker pool remain completely untouched. In-flight requests "
+           "gracefully drain on the old code, while new traffic instantly hits "
+           "the new logic.")
         (div (@ (class "feature flip"))
           (div (@ (class "txt"))
             (h3 "Deploy without a restart")
-            (p "Routes live in a mutable registry behind the pool. Re-registering "
-               "a path " (b "replaces it atomically") " for the next request; "
-               (code "http-swap!") " replaces the whole handler the same way.")
+            (p "Routes live in a mutable registry behind the worker pool. "
+               "Re-registering a path " (b "patches it atomically")
+               " for the very next request; " (code "http-swap!")
+               " replaces the entire top-level handler with the exact same "
+               "guarantee.")
             (p "Combined with graceful shutdown (" (code "http-shutdown!")
-               " drains in-flight work) and " (code "SO_REUSEPORT")
-               " multi-process listening, zero-downtime operation is the "
-               "default, not a project."))
+               " safely drains in-flight work) and " (code "SO_REUSEPORT")
+               " multi-process listening, zero-downtime operation isn't an "
+               "engineering project—it’s the default."))
           (pre ,(raw hotswap-code)))))
 
    ;; ---- 3. failure hook ----
