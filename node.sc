@@ -453,15 +453,22 @@
   ;;
   ;; ⛔ ACROSS A RESTART IT REPEATS: it starts at zero again, so a peer
   ;; that restarts sends mref 1 for something new. What keeps that from
-  ;; colliding is not this counter. It is that both ways a connection
-  ;; ends -- a real drop and a replacement -- run the sweep that tells
-  ;; this peer's hosted monitors to stop, so the entries filed under its
-  ;; old mrefs are on their way out before the new ones arrive. The
-  ;; removal is not instant, and the window where an old entry is still
-  ;; present is covered by the arming clause's staleness test.
+  ;; colliding is not this counter. Two things share the work, and the
+  ;; division matters:
+  ;;   - a real drop, and a replacement BY A NEW RUN, run the sweep that
+  ;;     tells this peer's hosted monitors to stop, so entries filed
+  ;;     under the old run's mrefs are on their way out;
+  ;;   - ⛔ a replacement by the SAME run does not, deliberately: those
+  ;;     watches are still wanted, and their mrefs did not restart.
+  ;; The removal is not instant either way, and the window where an old
+  ;; run's entry is still present is covered by the arming clause's
+  ;; staleness test -- which compares the RUN, so it catches exactly the
+  ;; case this counter creates and leaves the other alone.
   ;;
   ;; Anyone replacing this with something that survives a restart, or
-  ;; removing either sweep, is removing that protection and not this
+  ;; removing either call to drop-hosted-monitors! -- the unconditional
+  ;; one in remove-peer!, or the new-incarnation-only one in the
+  ;; replacement branch -- is removing that protection and not this
   ;; counter, which will look untouched.
   (define mref-counter 0)
   (define (next-mref!)
@@ -540,9 +547,11 @@
 
   ;; The table used to hold a bare pid. It holds a record now because
   ;; idempotence is a question about the whole request, not about the key:
-  ;; the name being watched and the connection the request arrived on are
-  ;; both part of what the agent was built from, so both have to be
-  ;; comparable when the same reference is offered again.
+  ;; the name being watched and the RUN the request came from are both
+  ;; part of what the agent was built from, so both have to be comparable
+  ;; when the same reference is offered again. (The connection used to
+  ;; stand in for the run here, and no longer does -- see the note on the
+  ;; record's third slot.)
   ;; THE RECORD IS THE CHAIN NODE. Two chains run through the same
   ;; objects, and they answer two different questions:
   ;;
@@ -558,11 +567,38 @@
   ;; Node identity is never reused: a record is built once, for one
   ;; monitor, and is not recycled after it retires. That is what removes
   ;; the ABA question a token would otherwise have to answer.
-  (define (make-agent-rec pid name conn key peer)
-    (vector pid name conn key peer #f #f #f #f))
+  ;; ⭐ SLOT 2 IS THE PEER'S BOOT ID, AND IT USED TO BE THE CONNECTION.
+  ;; What this record has to answer is "is the request in front of me the
+  ;; same watch as this one", and a connection is the wrong name for that
+  ;; now that the outbound write is fenced on the run: an agent armed on
+  ;; a connection that has since been replaced still reports correctly
+  ;; TO THE SAME RUN -- against a different run the incarnation fence is
+  ;; supposed to suppress it, which is the other half of this change --
+  ;; so calling it stale was measuring something that had stopped
+  ;; mattering -- and the protocol advertises a repeat of the same
+  ;; request as free, so peers are entitled to send one.
+  ;; ⛔ MERELY DELETING THE COMPARISON WOULD BE WRONG THE OTHER WAY: a
+  ;; NEW run reusing the same mref and name would then be told "already
+  ;; armed" by the previous run's still-exiting agent, because that
+  ;; counter restarts. The run has to be PART of the identity, not
+  ;; absent from it.
+  ;;
+  ;; ⛔ THIS SLOT'S MEANING IS NOT PROTECTED BY THE COMPILER. Renaming
+  ;; the accessor catches every NAMED reader, and that is the whole of
+  ;; what it catches: a positional (vector-ref r 2) elsewhere would go on
+  ;; compiling and would now be reading a boot id where it meant a
+  ;; connection. When this slot changed, the sweep for such readers was
+  ;; done by hand -- every (vector-ref _ 2) in the file was read and
+  ;; judged, and make-agent-rec's single call site was confirmed -- and
+  ;; it came back clean. ⚠ That is an enumeration, not a guarantee, and
+  ;; it expires the moment somebody adds a POSITIONAL reader.
+  ;; ⛔ So do it again before changing this slot, and do not mistake the
+  ;; accessor rename for cover.
+  (define (make-agent-rec pid name boot-id key peer)
+    (vector pid name boot-id key peer #f #f #f #f))
   (define (agent-pid r)  (vector-ref r 0))
   (define (agent-name r) (vector-ref r 1))
-  (define (agent-conn r) (vector-ref r 2))
+  (define (agent-boot-id r) (vector-ref r 2))
   (define (agent-key r)  (vector-ref r 3))
   (define (agent-peer r) (vector-ref r 4))
   (define (agent-pnext r) (vector-ref r 5))   ; per-peer chain
@@ -573,8 +609,9 @@
   (define (agent-pprev-set! r v) (vector-set! r 6 v))
   (define (agent-gnext-set! r v) (vector-set! r 7 v))
   (define (agent-gprev-set! r v) (vector-set! r 8 v))
-  (define (agent-matches? r conn name)
-    (and (eq? (agent-conn r) conn) (eq? (agent-name r) name)))
+  ;; equal?, not eq?: a boot id is a string that arrived off the wire.
+  (define (agent-matches? r boot-id name)
+    (and (equal? (agent-boot-id r) boot-id) (eq? (agent-name r) name)))
 
   ;; The per-peer heads. Present only while that peer has something
   ;; parked -- the same rule the orphan chain follows, and for the same
@@ -3223,6 +3260,14 @@
              ;; lose a registration" but "loses it, silently, every
              ;; time".
              ;;
+             ;; ⛔ THAT FACT NOW CARRIES TWO PROPERTIES, AND A RE-ARMING
+             ;; PATH WOULD BREAK BOTH AT ONCE. It is the reason the sweep
+             ;; can be skipped here, and it is also the only thing
+             ;; keeping the mon admission's stale-record retirement from
+             ;; detaching live agents (see the note beside that
+             ;; retirement). Adding a re-arm is not a local change to
+             ;; whoever adds it.
+             ;;
              ;; ⭐ AND THE RESOURCE ARGUMENT DOES NOT SURVIVE EITHER.
              ;; What drop-hosted-monitors! is for is a peer that
              ;; connects, parks monitors and DROPS, over and over; that
@@ -3483,7 +3528,7 @@
   ;; that a fresh key makes unambiguous -- do not need it. Say which of
   ;; those two your clause is; the answer is short and it is the thing a
   ;; reader will want.
-  (define (dispatch! c peer d)
+  (define (dispatch! c peer boot-id d)
     (cond
       ;; (send ,reg-name ,msg) -> deliver to that registered process
       ((and (frame? d 'send 3) (symbol? (cadr d)))
@@ -3613,7 +3658,16 @@
       ;; alone would race the demon.
       ((and (frame? d 'mon 3) (symbol? (cadr d)))
        (let* ((name (cadr d)) (mref (caddr d))
-              (key (cons peer mref)))
+              (key (cons peer mref))
+              ;; (R0) ALLOCATED OUT HERE, WRITTEN INSIDE, READ AFTER.
+              ;; Set when this key already holds a LIVING agent armed on
+              ;; a connection that is no longer current. Telling that
+              ;; agent to stop allocates a mailbox node, which a
+              ;; no-interrupt region may not do, so the region hands the
+              ;; record out through this box -- a pointer write, which
+              ;; cannot fail -- and the send happens outside, the same
+              ;; division the replacement sequence uses for its queue.
+              (stale-live #f))
          ;; A REPEAT OF THIS EXACT REQUEST IS FREE; A DIFFERENT REQUEST
          ;; UNDER THE SAME KEY IS A PROTOCOL ERROR.
          ;;
@@ -3640,13 +3694,19 @@
          ;; installing. A test in the loop cannot say that -- it releases
          ;; its region before dispatch runs.
          ;;
-         ;; A request from a connection that is no longer this peer's is
-         ;; not refused, it is dropped: the generation that sent it is
-         ;; gone, its monitors were torn down with it, and there is
-         ;; nobody left to answer. Refusing would write a frame to a
-         ;; closed socket.
+         ;; ⭐ THE TEST IS THE INCARNATION, NOT THE CONNECTION. It used
+         ;; to be the connection, and that discarded a request from a
+         ;; SUPERSEDED LINK OF THE SAME RUN -- a peer that is reachable
+         ;; right now, whose request still means what it said, and which
+         ;; the protocol never told it to repeat. Since a replacement of
+         ;; the same run no longer tears its hosted monitors down, there
+         ;; is also nothing left to justify dropping it.
+         ;;
+         ;; A request from a DIFFERENT run is still dropped rather than
+         ;; refused: the process that sent it is gone, and refusing would
+         ;; write a frame to a socket nobody is reading.
          (unless (atomically
-                   (or (not (eq? c (current-conn-locked peer)))
+                   (or (not (current-incarnation-locked? peer boot-id))
                    (let* ((found (hashtable-ref callee-agents key #f))
                           ;; A STALE ENTRY MUST NOT ANSWER "already done".
                           ;; Returning the credit on the DOWN a reaper
@@ -3675,48 +3735,138 @@
                           ;; removal trusting the key alone would take
                           ;; THAT one. Retirement is by identity for
                           ;; exactly this reason -- see retire-rec-locked!.
-                          ;; STALE HAS TWO SHAPES AND ONE ANSWER. A record
-                          ;; whose agent has died, and a record left by a
-                          ;; connection that is no longer this peer's, are
-                          ;; both entries this peer can no longer be
-                          ;; served through; each is retired here and the
-                          ;; request treated as new. Only the generation
-                          ;; test is new -- the liveness test was already
-                          ;; here for the same reason.
+                          ;; STALE HAS TWO SHAPES AND THEY NO LONGER GET
+                          ;; ONE ANSWER. A record whose agent has died is
+                          ;; retired here and the request treated as new.
+                          ;; A record left by a PREVIOUS RUN is a
+                          ;; different thing: its agent may still be
+                          ;; running, so it is stopped and the request is
+                          ;; refused rather than replaced -- see the cond
+                          ;; below.
+                          ;; ⛔ A record from a superseded CONNECTION of
+                          ;; the current run is not made stale by that
+                          ;; supersession alone -- if its agent has died
+                          ;; it is stale by the liveness test below, which
+                          ;; is a different question. It used
+                          ;; to be treated as such, and that cancelled
+                          ;; working watches for peers doing what the
+                          ;; protocol permits.
                           ;;
                           ;; ⚠ "NO LONGER EXISTS" WOULD BE TOO STRONG for
-                          ;; the second shape, and the difference matters.
-                          ;; A record left by a superseded connection may
-                          ;; still have a LIVING agent: the sweep that
-                          ;; ends the old generation sends it a stop
-                          ;; message, and until it runs, two agents exist
-                          ;; for one key while the count says one. That
-                          ;; window closes by itself, because the stop is
-                          ;; already in that agent's mailbox and its DOWN
-                          ;; will find the key holding somebody else and
-                          ;; leave it alone. It stops closing by itself on
-                          ;; the day some path installs an agent that the
-                          ;; sweep does not reach -- which is what the
-                          ;; frame loop's generation check is there to
-                          ;; prevent.
+                          ;; the second shape, and it is the whole reason
+                          ;; this branch now splits. A record left by a
+                          ;; superseded connection may still have a LIVING
+                          ;; agent, and retiring such a record does not
+                          ;; stop it: retirement deletes the row, unlinks
+                          ;; both chains and decrements the count, and
+                          ;; sends nothing. So liveness decides which of
+                          ;; two different things happens -- see the cond
+                          ;; below, where the living case refuses instead
+                          ;; of replacing.
+                          ;;
+                          ;; ⛔ AN EARLIER NOTE HERE SAID THE RESULTING
+                          ;; WINDOW CLOSED BY ITSELF, on two mechanisms.
+                          ;; Neither carried it, and how they failed is
+                          ;; worth more than the conclusion:
+                          ;;   - "the sweep sends it a stop message":
+                          ;;     the sweep is conditional on the peer
+                          ;;     being a NEW RUN, so a same-incarnation
+                          ;;     replacement sends nothing at all;
+                          ;;   - "its DOWN will find the key holding
+                          ;;     somebody else and leave it alone": this
+                          ;;     one is real -- the reaper's
+                          ;;     identity-checked retirement, which runs
+                          ;;     on every agent DOWN the reaper
+                          ;;     processes, whether a
+                          ;;     stop caused it or its own target happened
+                          ;;     to die. What it is not is a CLOSER of the
+                          ;;     window: it collects the orphan if and
+                          ;;     when the orphan dies, and an orphan whose
+                          ;;     target stays alive stays alive with it.
+                          ;;
+                          ;; ⚠ THAT SECOND SENTENCE HAS BEEN WRONG TWICE
+                          ;; IN OPPOSITE DIRECTIONS -- once claiming the
+                          ;; mechanism does not exist, once claiming it is
+                          ;; reachable only through the sweep. Both errors
+                          ;; came from naming a mechanism instead of
+                          ;; naming the path that reaches it. The reaper
+                          ;; watches agent pids; the agent exits for its
+                          ;; own reasons; neither fact is about the sweep.
+                          ;;
+                          ;; ⭐ WHAT HOLDS IT UP IS NO LONGER AN ARGUMENT
+                          ;; ABOUT THE PEER. It used to be: reaching the
+                          ;; living case needs a SECOND mon under a key
+                          ;; that already has an agent, and this library
+                          ;; has no path that sends one -- monitor-remote
+                          ;; mints a fresh mref per call and nothing
+                          ;; re-arms.
+                          ;; ⛔ THAT IS A FACT ABOUT THIS IMPLEMENTATION
+                          ;; AND WAS WRITTEN HERE AS ONE ABOUT CONFORMING
+                          ;; PEERS, which it is not: the protocol makes an
+                          ;; exact repeat free, a restarted peer's counter
+                          ;; starts over, and test/node.sc sends the same
+                          ;; mon three times on purpose. So the support
+                          ;; was never what it claimed, and a ceiling
+                          ;; advertised against a HOSTILE authenticated
+                          ;; peer rested on peers being well behaved.
+                          ;; It now rests
+                          ;; on this branch instead: the living case takes
+                          ;; nothing and gives nothing back, so however
+                          ;; many times it is reached, the permit and the
+                          ;; process stay in step.
                           (cur (and found
                                     (if (and (process-alive? (agent-pid found))
-                                             (eq? (agent-conn found)
-                                                  (current-conn-locked peer)))
+                                             (equal? (agent-boot-id found)
+                                                     boot-id))
                                         found
-                                        (begin (retire-agent-of-rec-locked! key found) #f)))))
+                                        (begin
+                                          (if (process-alive? (agent-pid found))
+                                              (set! stale-live found)
+                                              (retire-agent-of-rec-locked! key found))
+                                          #f)))))
                      (cond
-                       ((and cur (agent-matches? cur c name)) #t)
+                       ;; ⭐ A LIVING AGENT OF ANOTHER RUN DOES NOT MAKE
+                       ;; WAY, AND THE PERMIT IS WHY. The design fixes when a permit
+                       ;; comes back -- "returned when its agent's DOWN
+                       ;; arrives" -- so retiring a record whose process
+                       ;; is still running hands the permit back early and
+                       ;; lets the next request take another. Done in a
+                       ;; loop, that IS the ceiling being bypassed: live
+                       ;; agents grow while the count stands still.
+                       ;;
+                       ;; So this case changes NOTHING. The row stays,
+                       ;; both chains stay, the count stays; the agent is
+                       ;; told to stop outside the region and this request
+                       ;; is refused. The key becomes free when that
+                       ;; agent's DOWN reaches the reaper, which is where
+                       ;; the permit was always meant to come back.
+                       ;;
+                       ;; ⚠ THE DEAD CASE ABOVE IS NOT THE SAME CASE.
+                       ;; There the process is already gone, so no permit
+                       ;; is still in use and there is nothing to stop;
+                       ;; retiring it there is what that branch has always
+                       ;; been for.
+                       ;;
+                       ;; ⭐ AND A REPEAT FROM THE SAME RUN NO LONGER
+                       ;; ARRIVES HERE AT ALL. It matches, so it takes
+                       ;; the idempotent arm below -- which is what the
+                       ;; protocol advertises when it calls an exact
+                       ;; repeat free. Only a record left by a DIFFERENT
+                       ;; run reaches this line, and that run is gone.
+                       (stale-live #f)
+                       ((and cur (agent-matches? cur boot-id name)) #t)
                        ;; ⛔ THIS ARM IS REACHABLE, AND A CELL HAS BEEN
                        ;; PROVING IT EVERY RUN. A note here once said it
                        ;; was not, on the reasoning that reaching it would
                        ;; need two current connections for one peer. That
                        ;; reasoning read one half of the test above: the
-                       ;; match compares the connection AND THE NAME, so
-                       ;; the same connection asking to watch a different
-                       ;; name under a reference it has already used lands
-                       ;; here, with no second connection and no
-                       ;; generations involved at all. test/node.sc does
+                       ;; match compares the RUN AND THE NAME, so a peer
+                       ;; asking to watch a different name under a
+                       ;; reference it has already used lands here, with
+                       ;; one connection and one run involved. (It read
+                       ;; "the connection and the name" while that was
+                       ;; what the match compared; the shape of the
+                       ;; argument is unchanged.) test/node.sc does
                        ;; exactly that and asserts the link closes.
                        ;;
                        ;; Worth keeping as a lesson about the claim and
@@ -3758,8 +3908,8 @@
                         ;; provably harmless. See undo-install-of-pid!.
                         (let ((p #f))
                           (guard (e (#t (undo-install-of-pid! key p) (raise e)))
-                            (set! p (spawn (lambda () (mon-agent peer key name))))
-                            (let ((r (make-agent-rec p name c key peer)))
+                            (set! p (spawn (lambda () (mon-agent peer key name boot-id))))
+                            (let ((r (make-agent-rec p name boot-id key peer)))
                               (hashtable-set! callee-agents key r)
                               (mon-link! r)
                               ;; last, and it cannot raise: reaching it
@@ -3794,55 +3944,130 @@
            ;; old guard swallowed everything; nothing it protected
            ;; against remains (this frame is (mdown <int> overload),
            ;; which always serializes).
+           ;; ⭐ THE STOP GOES FIRST, and that ordering is load-bearing.
+           ;; Both it and the refusal below allocate and can therefore
+           ;; raise; with the stop second, a failed refusal would swallow
+           ;; it. This way the agent is on its way out even when the peer
+           ;; never hears why its request was declined.
+           ;;
+           ;; ⚠ WHAT IS AND IS NOT A NO-OP HERE, stated narrowly because
+           ;; a wider version of this sentence stood here and was false.
+           ;; Nothing above this point touches the monitor accounting --
+           ;; no row, no chain, no count -- so a raise BEFORE the stop
+           ;; leaves that accounting as the frame found it. ⛔ A raise
+           ;; AFTER the stop does not: the agent has the message, so the
+           ;; watch is already leaving, and the next repeat meets a
+           ;; different state from the one this one met.
+           ;; ⭐ WHAT IS BEING STOPPED BELONGS TO A RUN THAT IS OVER.
+           ;; Reaching here means the key holds a living agent whose boot
+           ;; id is not the one now installed -- an agent the peer's
+           ;; previous incarnation armed, whose stop from the replacement
+           ;; sweep has not been processed yet. Ending it loses nothing:
+           ;; the process that asked for that watch no longer exists.
+           ;;
+           ;; ⛔ AN EARLIER VERSION OF THIS BRANCH ALSO CAUGHT SAME-RUN
+           ;; REPEATS, and cancelled a working watch for one. The note
+           ;; here then argued that no conforming CALLER could produce
+           ;; such a repeat, which was true and answered the wrong
+           ;; question: the protocol tells PEERS an exact repeat is free
+           ;; (see the head of this clause), so a conforming peer was
+           ;; entitled to send one and lost its watch for it. This file
+           ;; has made that mistake at this line once before, in the
+           ;; other direction -- see the frame loop's note about calling
+           ;; such a peer a protocol violator.
+           ;; ⛔ The lesson is about which conformance is being claimed:
+           ;; "our caller cannot do this" is not "no correct peer can".
+           (when stale-live
+             (send (agent-pid stale-live) (vector 'demon-local)))
+           ;; ⚠ THE REFUSAL GOES BACK ON THE CONNECTION IT ARRIVED ON,
+           ;; which may be a superseded one and therefore closed. What
+           ;; that costs is now bounded: the watch being refused is one
+           ;; the CURRENT run was trying to arm, so a peer that hears
+           ;; nothing is in the same position as a peer whose arming
+           ;; frame was dropped -- the standing gap that this protocol
+           ;; has no arm-ack for, recorded elsewhere, and not made worse
+           ;; here.
+           ;;
+           ;; ⛔ IT USED TO COST MORE THAN THAT, and the sentence that
+           ;; stood here got it wrong twice over. It said "nothing
+           ;; downstream depends on it hearing: the permit and the
+           ;; process stay in step" -- the second half true, the first
+           ;; not following from it, because accounting staying in step
+           ;; says nothing about whether the watcher still has a watch.
+           ;; ⭐ It answered a narrower question than it appeared to.
+           ;; What actually happened then was a working same-run watch
+           ;; being stopped while its owner was told nothing at all; that
+           ;; path is gone with the identity change above, not with this
+           ;; sentence.
            (let-values (((ok failure)
                          (write-body! c (frame-segments
                                           (list 'mdown mref 'overload)))))
              (when (and (not ok) failure)
-               (raise (submission-failure peer failure)))))))
+               (raise (submission-failure peer failure)))))
+         ))
       ;; (mdown ,mref ,reason) -> the watched process/link is gone; only
       ;; honor it from the node the monitor actually targets
       ((frame? d 'mdown 3)
-       ;; ⭐ THE MIRROR OF THE TEST IN mon-agent. That one keeps this node
-       ;; from sending a dead generation's notice down a live link; this
-       ;; one keeps a dead generation's notice, arriving on a link that
-       ;; has since been replaced, from ending a watch the new generation
-       ;; set up. The key is an mref and the match compares only the peer
-       ;; NAME, so without this the notice lands on whatever that mref
-       ;; means now.
+       ;; ⭐ THE MIRROR OF THE TEST IN mon-agent, and it asks the same
+       ;; question: is this the run we are currently talking to? That one
+       ;; keeps this node from sending a dead RUN's notice; this one keeps
+       ;; a dead run's notice from ending a watch the new run set up. The
+       ;; key is an mref and the match compares only the peer NAME, and a
+       ;; restarted peer's mref counter restarts too, so without this the
+       ;; notice lands on whatever that mref means now.
+       ;;
+       ;; ⚠ WHY THE OLD CONNECTION TEST WAS WRONG HERE. An mdown can be
+       ;; submitted successfully on a link that is replaced before the
+       ;; frame is dispatched, and a superseded link still serves what it
+       ;; has buffered. Keyed on the connection, this dropped a notice
+       ;; from the peer we are still talking to -- and the replacement
+       ;; path deliberately does not run fail-monitors-for!, so nothing
+       ;; else ever reported that death. The watch stayed armed forever.
        ;;
        ;; Unlike its mirror, this one IS atomic: the test and the lookup
        ;; are in one region, and the only thing that happens outside it is
        ;; acting on a decision already made.
-       ;;
-       ;; Ignoring it costs nothing -- a link that dropped already made
-       ;; this node fire every remote monitor it held on that peer.
        (let ((mref (cadr d)) (reason (caddr d)))
          (let ((entry (atomically
-                        (and (eq? c (current-conn-locked peer))
+                        (and (current-incarnation-locked? peer boot-id)
                              (hashtable-ref rmonitors mref #f)))))
            (when (and entry (eq? (vector-ref entry 1) peer))
              (fire-remote-down! mref reason)))))
       ;; (demon ,mref) -> stop a monitor we host for this peer
       ((frame? d 'demon 2)
-       ;; ⭐ SAME GENERATION TEST, AND FOR A SHARPER REASON THAN ARMING.
-       ;; The key here is (peer . mref) and carries no connection, so a
-       ;; cancellation buffered on a replaced link would find whatever is
-       ;; filed under that key now -- including a monitor the NEW
-       ;; generation has just armed, because repeating a request is
-       ;; something this protocol tells peers is free. It would be torn
-       ;; down while the peer went on believing it was watching, and
-       ;; nothing reports that.
+       ;; ⭐ SAME INCARNATION TEST, AND THIS IS THE CLAUSE WHERE THE
+       ;; CHANGE COSTS SOMETHING. The key here is (peer . mref) and
+       ;; carries no connection. Keyed on the connection, a cancellation
+       ;; buffered on a replaced link was dropped; that lost a
+       ;; cancellation the peer had every right to expect, since the
+       ;; peer's run had not ended. Keyed on the incarnation it is
+       ;; honoured, which is correct on its own and admits a case the
+       ;; connection test excluded:
        ;;
-       ;; Ignoring a cancellation from a superseded connection is right
-       ;; in both readings. If it meant the old generation's monitor,
-       ;; that monitor was already torn down with the generation. If the
-       ;; peer has re-armed on the new connection, the new one is the one
-       ;; it wants kept.
+       ;; ⛔ THE mon/demon PAIR CAN NOW ARRIVE OUT OF ORDER. Same peer,
+       ;; same run, two connections, the same mref: nothing orders a
+       ;; frame buffered on the old link against one sent on the new. A
+       ;; demon overtaken by a re-arm cancels a watch that is wanted; a
+       ;; re-arm overtaken by its own demon revives one that was
+       ;; cancelled -- and the second of those breaks the promise
+       ;; demonitor-remote makes below, because the DOWN it would produce
+       ;; is created AFTER the cancellation and so is not covered by that
+       ;; promise's "already in flight" exception.
+       ;;
+       ;; ⚠ THIS IS RECORDED, NOT REPAIRED, AND THE TRADE IS DELIBERATE.
+       ;; Four failure shapes went away and these two appeared; the
+       ;; trigger narrowed from "one late legitimate control frame" to
+       ;; "same mref, same run, across two links, opposite operations,
+       ;; and reordered". That is a count of shapes, not of odds. Closing
+       ;; it needs a per-incarnation epoch admitted before run-link and
+       ;; retired on abnormal death too -- a lifetime-management surface
+       ;; wider than the ordering window it would close.
+       ;; ⛔ So do not read this clause as a complete fix.
        ;;
        ;; The test is inside the same region as the lookup, which is what
        ;; makes it a decision rather than a guess.
        (let ((rec (atomically
-                    (and (eq? c (current-conn-locked peer))
+                    (and (current-incarnation-locked? peer boot-id)
                          (hashtable-ref callee-agents (cons peer (cadr d)) #f)))))
          (when rec (send (agent-pid rec) (vector 'demon-local)))))
       ((equal? d '(ping)) (write-frame! c '(pong)))
@@ -3977,10 +4202,52 @@
   ;; handled: a datum the writer refuses is a different event with a
   ;; different repair, and mon-agent's degrade-to-'exit path depends on
   ;; still seeing it.
-  (define (link-write/critical peer segs why)
+  ;; ⭐ THE OPTIONAL FOURTH ARGUMENT IS AN INCARNATION FENCE, AND IT
+  ;; LIVES HERE BECAUSE THE COMPARISON AND THE CONNECTION MUST COME FROM
+  ;; ONE ENTRY. ⛔ It was called a lock, and that word promised more than
+  ;; it does: it excludes nothing, as the paragraph below says. A caller that only matters to one
+  ;; incarnation of the peer -- a hosted monitor agent, which was armed
+  ;; against a particular run and whose reference means nothing to any
+  ;; other -- can pass the boot id it was armed under. The comparison
+  ;; then happens against the SAME entry the connection is taken from.
+  ;; ⚠ That is not the same as saying no replacement can land in
+  ;; between: it can, and this file says so a few lines up. What it
+  ;; buys is that the decision and the connection describe ONE entry, so
+  ;; a replacement landing afterwards cannot redirect this write onto the
+  ;; new run -- the write goes to the connection that was matched, and a
+  ;; failure on it retries and re-compares.
+  ;; ⛔ Said the other way round because the first phrasing claimed
+  ;; atomicity this does not have, which is the same over-claim the gate
+  ;; it replaced was written with.
+  ;;
+  ;; ⛔ ASKING THE SAME QUESTION BEFORE THE CALL DOES NOT WORK, and that
+  ;; is what this replaced. A predicate that reads the table, returns,
+  ;; and leaves the caller to write is two operations: the entry can be
+  ;; replaced in between, and the write then resolves the peer by NAME
+  ;; and lands on the new run carrying a reference minted by the old one.
+  ;; Moving the comparison in here is not tidier, it is a different
+  ;; property.
+  ;;
+  ;; ⚠ A MISMATCH RETURNS #f AND TAKES NOTHING DOWN. It is the same
+  ;; answer as "this peer has no current entry", and it means the same
+  ;; thing to the caller: the node this frame was for is not reachable
+  ;; any more, and the run it was for is gone. It is NOT a submission
+  ;; failure, so the link must not be dropped for it. No retry either --
+  ;; a retry would re-read the entry that just failed to match.
+  ;;
+  ;; DEFAULT IS #f, MEANING NO COMPARISON. Callers whose frame is
+  ;; addressed to the peer rather than to one of its runs -- the demon in
+  ;; remove-target-watch! is the standing example -- keep the three
+  ;; argument form and keep exactly the behaviour they had.
+  (define link-write/critical
+    (case-lambda
+      ((peer segs why) (link-write/critical peer segs why #f))
+      ((peer segs why want-boot-id)
     (let retry ()
       (let ((e (live-entry peer)))
         (and e
+             (or (not want-boot-id)
+                 (equal? (entry-boot-id e) want-boot-id))
              (let ((c (entry-conn e)) (link (entry-link e)))
                ;; EVERY WAY THIS CAN FAIL IS TREATED THE SAME, so none of
                ;; them is distinguished. The frame is already built, so
@@ -4031,7 +4298,7 @@
                       (and (eq? c (current-conn peer))
                            (begin (stop-link! c link why) #t)))
                     #f)
-                   (else (retry)))))))))
+                   (else (retry)))))))))))
 
   ;; The connection this peer is currently reached on, or #f. Used to ask
   ;; whether a connection in hand is still the current one.
@@ -4046,6 +4313,41 @@
 
   (define (current-conn peer)
     (atomically (current-conn-locked peer)))
+
+  ;; ⭐ IS THIS FRAME'S CONNECTION THE PEER'S CURRENT INCARNATION? The
+  ;; reverse of new-incarnation?, asked from the other side: that one has
+  ;; two entries in hand and asks whether they are different runs; this
+  ;; one has a boot id carried up from a link and asks whether it is
+  ;; still the run currently installed.
+  ;;
+  ;; ⚠ IT DELIBERATELY DOES NOT ASK ABOUT THE CONNECTION. A superseded
+  ;; connection of the SAME run is still that run: its control frames
+  ;; mean what they said, and dropping them was the defect this replaces.
+  ;; Only a different run makes them meaningless, because the process
+  ;; that sent them is gone.
+  ;;
+  ;; ⛔ #f IS NOT AN INCARNATION, and this is the whole reason the test is
+  ;; not a bare equal?. equal? calls two unknowns equal, so an entry with
+  ;; no boot id and a frame with no boot id would be judged the same run
+  ;; of the same node -- the one answer this must never give. Both
+  ;; install points supply one today (the accepted handshake's field, and
+  ;; the dialler's own), so the #f arm cannot be reached from here.
+  ;; ⛔ It is written anyway: "no caller passes #f today" is a property of
+  ;; the callers, not of this predicate, and the callers are what change.
+  (define (current-incarnation-locked? peer boot-id)   ; caller holds the region
+    (let ((e (hashtable-ref peers peer #f)))
+      (and e boot-id (entry-boot-id e)
+           (equal? (entry-boot-id e) boot-id))))
+
+  ;; ⛔ THERE IS NO UNLOCKED FORM OF THIS, AND THERE WAS ONE. It wrapped
+  ;; the locked form in a region and handed the answer back, which is
+  ;; exactly the shape the outbound fence stopped using: outside a
+  ;; region the answer is stale the instant it is returned, and every
+  ;; user of it wanted to ACT on the entry it had just asked about.
+  ;; Callers that need to act take the boot id to the step that reads the
+  ;; entry -- link-write/critical's fourth argument -- instead of asking
+  ;; here first.
+  ;; ⛔ Re-adding the wrapper is how the window comes back.
 
   ;; Take down whatever connection this peer is currently reached on.
   ;;
@@ -4064,9 +4366,30 @@
   ;; achieves it whichever generation that is. The cost of closing one
   ;; that just replaced the old is a reconnect -- and the failover still
   ;; happens, which is what was being asked for.
-  (define (drop-link-by-name! peer why)
-    (let ((e (peer-entry peer)))
-      (when e (stop-link! (entry-conn e) (entry-link e) why))))
+  ;; ⭐ THE OPTIONAL BOOT ID IS THE SAME DEVICE AS link-write/critical'S,
+  ;; and deliberately spelled the same way. A caller that failed to
+  ;; deliver something belonging to ONE run must not take down the link
+  ;; of another: "by name" resolves to whatever incarnation is current,
+  ;; and after a restart that is a healthy link owned by a peer that
+  ;; never saw the frame. Comparison and use come from the same entry, so
+  ;; this is a lock and not a check.
+  ;;
+  ;; ⚠ THE CALLER THAT NEEDS IT IS mon-agent, AND IT NEEDS IT BECAUSE OF
+  ;; A CHANGE MADE NEARBY. It used to skip building its frame once the
+  ;; run was gone, so it never reached its own failure handler; the fence
+  ;; moved into the write, so construction now happens first and a
+  ;; failure to build reaches here with the old run's business.
+  ;;
+  ;; Default #f means no comparison, so callers whose frame is addressed
+  ;; to the peer rather than to one of its runs are unchanged.
+  (define drop-link-by-name!
+    (case-lambda
+      ((peer why) (drop-link-by-name! peer why #f))
+      ((peer why want-boot-id)
+       (let ((e (peer-entry peer)))
+         (when (and e (or (not want-boot-id)
+                          (equal? (entry-boot-id e) want-boot-id)))
+           (stop-link! (entry-conn e) (entry-link e) why))))))
 
   ;; ---- cross-node process monitor ----------------------------------------
 
@@ -4097,27 +4420,59 @@
   ;; write resolves that name when the monitor fires, so a monitor armed
   ;; before a replacement reports down the connection that replaced it.
   ;;
-  ;; ⛔ A GATE HERE WAS TRIED AND REMOVED. It carried the connection the
-  ;; agent was armed on and wrote only while that connection was still
-  ;; current. The argument for dropping the notice otherwise was that the
-  ;; watcher's own fail-monitors-for! had already told the far side --
-  ;; TRUE ON THE DEATH PATH AND FALSE ON THE REPLACEMENT PATH, where that
-  ;; sweep deliberately does not run. On a replacement the gate was
-  ;; therefore not narrow but total: the connection it held could never
-  ;; be current again, so it discarded every notice for the rest of the
-  ;; monitor's life, and the watcher heard nothing.
+  ;; ⛔ A CONNECTION-KEYED GATE WAS TRIED HERE AND REMOVED. It carried
+  ;; the connection the agent was armed on and wrote only while that
+  ;; connection was still current. The argument for dropping the notice
+  ;; otherwise was that the watcher's own fail-monitors-for! had already
+  ;; told the far side -- TRUE ON THE DEATH PATH AND FALSE ON THE
+  ;; REPLACEMENT PATH, where that sweep deliberately does not run. On a
+  ;; replacement the gate was therefore not narrow but total: the
+  ;; connection it held could never be current again, so it discarded
+  ;; every notice for the rest of the monitor's life, and the watcher
+  ;; heard nothing.
   ;;
-  ;; ⭐ THE LESSON IS ABOUT THE MEASUREMENT, not about this gate. It was
+  ;; ⭐ THE LESSON IS ABOUT THE MEASUREMENT, not about that gate. It was
   ;; described, and accepted, as NARROWING a window -- and a narrowing
   ;; whose remaining width is zero is a closure wearing a compromise's
   ;; name. Ask what is left after a narrowing, not how much came off.
   ;;
-  ;; What the gate was aimed at is real and is still open: a stale mref
-  ;; can mean something else on the new generation. Deciding it needs the
-  ;; semantics of a hosted watch across a replacement -- bound to the
-  ;; connection, or to the peer -- and that is a design question, not a
-  ;; guard.
-  (define (mon-agent watcher key name)
+  ;; ⭐ WHAT REPLACES IT IS A FENCE ON THE INCARNATION. The agent records
+  ;; the peer's boot id at arming and writes only while that run is still
+  ;; the one installed. The difference from what was removed is the whole
+  ;; point: a replacement of the SAME run leaves the fence open, because
+  ;; the watcher is still there and still wants the notice; a replacement
+  ;; by a DIFFERENT run closes it, because the process that armed the
+  ;; watch no longer exists and its mref counter has restarted, so
+  ;; delivering the notice would end one of the NEW run's watches and
+  ;; report a death that did not happen.
+  ;;
+  ;; ⭐ AND THE FENCE IS PART OF THE WRITE, NOT A TEST IN FRONT OF IT.
+  ;; The boot id goes to link-write/critical, which compares it against
+  ;; the same entry it takes the connection from. A replacement can still
+  ;; land while that write is in progress; what it cannot do is redirect
+  ;; a write already aimed at the entry that matched. There is no
+  ;; pre-check here to keep in agreement
+  ;; with it, and that is deliberate: a second place asking the same
+  ;; question is a second place that can answer it differently.
+  ;;
+  ;; ⛔ A PRE-CHECK IS WHAT THIS REPLACED, AND IT DID NOT WORK. Reading
+  ;; the table, returning, and then writing is two operations; a new run
+  ;; installed in the gap was written to anyway, carrying a reference the
+  ;; previous run had minted. It was a narrowing described as a closure,
+  ;; which is the same mistake as the connection gate it succeeded.
+  ;;
+  ;; ⚠ NO CELL DISCRIMINATES THIS. Its window is the gap between two
+  ;; statements, and nothing in the suite can open it; the argument for
+  ;; the fix is the structure, not a red run. Recorded so that nobody
+  ;; reads the surrounding green as coverage of it.
+  ;;
+  ;; ⛔ IT IS ALSO NOT A COMPLETE ANSWER TO THE QUESTION IT LOOKS LIKE IT
+  ;; ANSWERS. Whether a hosted watch belongs to the connection it was
+  ;; armed on or to the peer is still open; this fence only settles what
+  ;; happens across a change of RUN. Ordering between two links of the
+  ;; same run is untouched -- see the demon clause in dispatch! for the
+  ;; shape that leaves behind.
+  (define (mon-agent watcher key name boot-id)
     (let ((mref (cdr key))
           (p (whereis name)))
       (if (not p)
@@ -4128,10 +4483,10 @@
             ;; the agent has dropped its state and is leaving. Same
             ;; contract as the submission: if the frame does not go, the
             ;; link does.
-            (guard (e (#t (drop-link-by-name! watcher 'mdown-lost)))
+            (guard (e (#t (drop-link-by-name! watcher 'mdown-lost boot-id)))
               (link-write/critical watcher
                                    (frame-segments (list 'mdown mref 'noproc))
-                                   'mdown-lost)))
+                                   'mdown-lost boot-id)))
           (let ((m (monitor p)))
             (receive
               (`#(DOWN ,@p ,reason)
@@ -4160,11 +4515,11 @@
                 ;; the inner handler is not itself protected against --
                 ;; means this DOWN is not going to be delivered, and the
                 ;; contract for that is the link, not silence.
-                (guard (e2 (#t (drop-link-by-name! watcher 'mdown-lost)))
+                (guard (e2 (#t (drop-link-by-name! watcher 'mdown-lost boot-id)))
                   (let ((segs (guard (e (#t (frame-segments
                                               (list 'mdown mref 'exit))))
                                 (frame-segments (list 'mdown mref reason)))))
-                    (link-write/critical watcher segs 'mdown-lost))))
+                    (link-write/critical watcher segs 'mdown-lost boot-id))))
               (`#(demon-local)
                 (demonitor m)
                 (void)))))))
@@ -4312,7 +4667,7 @@
             (fire-remote-down! mref 'noconnection)))
         mrefs entries)))
 
-  (define (link-loop c peer buf last-seen)
+  (define (link-loop c peer boot-id buf last-seen)
     (let drain ()
       ;; EVERY WAKE-UP IS A CHECK ON THE OUTBOUND CEILING, and it is the
       ;; only check that does not depend on this node writing something. A
@@ -4347,10 +4702,10 @@
                         (if (> (- (now-ms) last-seen) dead-ms)
                             (raise 'closed)
                             (begin (write-frame! c '(ping))
-                                   (link-loop c peer buf last-seen))))
+                                   (link-loop c peer boot-id buf last-seen))))
               (`#(tcp-data ,bv)
                 (inbuf-append! buf bv)
-                (link-loop c peer buf (now-ms)))
+                (link-loop c peer boot-id buf (now-ms)))
               (`#(tcp-eof) (raise 'closed))
               (`#(tcp-error ,e) (raise 'closed))
               ;; a close decided elsewhere -- see close-for-backpressure!.
@@ -4365,7 +4720,7 @@
               (`#(link-stop ,which ,why)
                 (if (eq? which c)
                     (raise why)
-                    (link-loop c peer buf last-seen)))
+                    (link-loop c peer boot-id buf last-seen)))
               (`#(node-stop) (raise 'stop)))
             ;; ⚠ A SUPERSEDED LINK CAN STILL SERVE WHAT IT HAS BUFFERED.
             ;; Replacing a peer's connection sends the old link a stop
@@ -4391,8 +4746,24 @@
             ;; AFTER that peer's node-down has been announced. A `call`
             ;; costs one wasted service and a reply written to a closed
             ;; connection; its admission lease is released by the serving
-            ;; process itself, so no accounting is lost. Both are bounded
-            ;; by what fits in the buffer.
+            ;; process itself, so no accounting is lost.
+            ;;
+            ;; ⛔ THE BOUND IS NOT "WHAT FITS IN THE BUFFER", and an
+            ;; earlier sentence here said it was. This loop reads its
+            ;; mailbox ONLY on the incomplete branch, so while buf still
+            ;; holds a whole frame it neither takes new segments nor sees
+            ;; link-stop. When buf finally runs out it goes to the
+            ;; mailbox -- and what it finds there first is every tcp-data
+            ;; queued AHEAD of link-stop, which it appends, which can
+            ;; complete another frame, and so on. The real bound is buf
+            ;; PLUS everything already sitting in this process's mailbox
+            ;; at the moment of the stop, and that mailbox is unbounded
+            ;; (libuv.sc says so where it delivers into it).
+            ;;
+            ;; ⚠ THE CORRECTION MATTERS BECAUSE OF WHAT THIS SENTENCE IS
+            ;; USED FOR. It is the line anyone reaches for to argue that
+            ;; a superseded link's window is small, and any decision to
+            ;; leave a residue unrepaired rests on that quantity.
             ;;
             ;; OLD TEXT, KEPT FOR ITS REASONING: Replacing a peer's
             ;; connection sends the old link a stop message, and a
@@ -4425,7 +4796,7 @@
             ;; The reason raised is the one stop-link! would have
             ;; delivered anyway, so this makes an existing ending arrive
             ;; earlier and introduces no new outcome downstream.
-            (begin (dispatch! c peer d) (drain))))))
+            (begin (dispatch! c peer boot-id d) (drain))))))
 
   ;; Run the link until it drops, then clean up.
   ;; -> the moment the link STOPPED CARRYING TRAFFIC, read before the
@@ -4446,9 +4817,9 @@
   ;; drops at once be scored as one that stayed up -- on a node whose
   ;; tables have grown, and only on such a node, which is the worst way
   ;; for a measurement to be wrong.
-  (define (run-link c peer buf)
+  (define (run-link c peer boot-id buf)
     (guard (e (#t (let ((ended (now-ms))) (remove-peer! peer c) ended)))
-      (link-loop c peer buf (now-ms))
+      (link-loop c peer boot-id buf (now-ms))
       (now-ms)))                        ; link-loop only ever exits by raising
 
   ;; ---- accept side -----------------------------------------------------------
@@ -4576,15 +4947,21 @@
               ;; has to go with it -- remove-peer! is guarded on this
               ;; connection's identity, so it removes ours and nobody
               ;; else's.
-              (if (installed? (install-peer! peer c peer (list-ref d 5)
-                                             (list-ref d 6) #f))
-                  (if (write-frame! c
-                        (list 'welcome (symbol->string self-name)
-                              (proof-a nonce-b (symbol->string self-name)
-                                       self-boot-id)))
-                      (run-link c peer buf)
-                      (remove-peer! peer c))
-                  (tcp-close! c))))))))         ; lost the tie-break
+              ;; ONE BINDING FOR THE PEER'S BOOT ID. The entry is
+              ;; installed with it and the link is run with it, and the
+              ;; frame gates compare what the link carries against what
+              ;; the entry holds -- so these two must be the same value,
+              ;; not the same expression written twice.
+              (let ((peer-boot-id (list-ref d 5)))
+                (if (installed? (install-peer! peer c peer peer-boot-id
+                                               (list-ref d 6) #f))
+                    (if (write-frame! c
+                          (list 'welcome (symbol->string self-name)
+                                (proof-a nonce-b (symbol->string self-name)
+                                         self-boot-id)))
+                        (run-link c peer peer-boot-id buf)
+                        (remove-peer! peer c))
+                    (tcp-close! c)))))))))        ; lost the tie-break
 
   ;; ---- dial side --------------------------------------------------------------
 
@@ -4787,7 +5164,7 @@
                   (if (installed?
                         (install-peer! peer c self-name bootid-a gen parent))
                       (let ((up (now-ms)))
-                        (- (run-link c peer buf) up))
+                        (- (run-link c peer bootid-a buf) up))
                       (begin (tcp-close! c) 0)))))))
         (`#(tcp-connect-failed ,e) #f)
         (`#(node-stop) (raise 'stop)))))
@@ -5549,8 +5926,12 @@
   ;;   - 'noconnection if the link to node drops first (the target may
   ;;                   be alive or dead -- indistinguishable across a
   ;;                   broken link, as in Erlang)
-  ;;   - 'overload     if node is already hosting its maximum number of
-  ;;                   remote monitors and refuses another (node-set-limits!)
+  ;;   - 'overload     if node will not host this watch right now: either
+  ;;                   it is already at its maximum number of remote
+  ;;                   monitors (node-set-limits!), or this reference's
+  ;;                   previous watch has not finished leaving yet. Both
+  ;;                   are refusals to take a new permit, which is why
+  ;;                   they answer alike; a later attempt can succeed.
   ;; Returns a monitor ref for demonitor-remote. The own node name is a
   ;; local watch (still reported as remote-down, for a uniform API).
   ;; This is process-level; monitor-node is the node-level counterpart.

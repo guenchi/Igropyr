@@ -53,6 +53,24 @@
       (string->utf8 (string-append (number->string (string-length body))
                                    "\n" body)))))
 
+;; One SEGMENT holding many whole frames. The point is the backlog: the
+;; link loop reads its mailbox ONLY in the `incomplete` branch, so while
+;; whole frames remain decoded it keeps dispatching and never looks at
+;; the stop message a replacement sent it. See node.sc's "A SUPERSEDED
+;; LINK CAN STILL SERVE WHAT IT HAS BUFFERED".
+;; The filler is (send <unregistered> 0): dispatch!'s first clause drops
+;; an unregistered name, so a filler frame writes nothing back, touches
+;; no table, and costs only the parse.
+(define (burst-bytes filler-count tail-data)
+  (let ((o (open-output-string)))
+    (define (emit! d)
+      (let ((b (let ((q (open-output-string))) (write d q) (get-output-string q))))
+        (display (string-length b) o) (display "\n" o) (display b o)))
+    (let loop ((i 0))
+      (when (< i filler-count) (emit! (list 'send 'zzz-burst-filler 0)) (loop (+ i 1))))
+    (for-each emit! tail-data)
+    (string->utf8 (get-output-string o))))
+
 (define (pre-versioning-proof nonce name)
   (bytevector->hex
     (hmac-sha256 (string->utf8 secret)
@@ -1512,6 +1530,129 @@
     ;; cell, which expects the opposite, is sitting next to it.
     (let ()
       (define alt-boot-id "deadbeefdeadbeef")
+      (define (mdown-count-session! label boot gen mref victim-name me ref)
+        ;; Like watch-session!, but COUNTS the mdowns for its mref instead
+        ;; of reporting the first one. The first one is all a correct node
+        ;; ever sends; a second is the whole point of the cell, and the
+        ;; helper that stops at the first cannot see it.
+        (spawn
+          (lambda ()
+            (tcp-connect! "127.0.0.1" port self)
+            (receive (after 3000 (send me (vector ref 'no-connect)))
+              (`#(tcp-connected ,c)
+                (tcp-read-start! c)
+                (let ((d (read-frame-or-closed label)))
+                  (if (not (and (list? d) (= (length d) 4)))
+                      (send me (vector ref (list 'challenge-shape d)))
+                      (let ((nonce-a (cadr d)) (bootid-a (cadddr d)))
+                        (tcp-write! c (frame-bytes
+                                        (list 'hello "wpeer"
+                                              (v4-proof-d nonce-a "wpeer" boot
+                                                          (number->string gen)
+                                                          wire-name-of-this-node
+                                                          bootid-a)
+                                              "beadbeadbeadbeadbeadbeadbeadbead"
+                                              4 boot gen))
+                                    #f)
+                        (let ((w (read-frame-or-closed label)))
+                          (if (not (and (list? w) (eq? (car w) 'welcome)))
+                              (send me (vector ref (if (symbol? w) w 'other)))
+                              (begin
+                                (when victim-name
+                                  (tcp-write! c (frame-bytes
+                                                  (list 'mon victim-name mref))
+                                              #f))
+                                (send me (vector ref 'welcomed))
+                                ;; ⛔ TWO KINDS OF (mdown <mref> ...), and
+                                ;; they must not be added together: the
+                                ;; refusal a full node sends carries the
+                                ;; SAME tag and the SAME mref as a real
+                                ;; down (see dispatch!'s overload answer).
+                                ;; A cell that counts frames counts the
+                                ;; refusal as a report.
+                                (let wait ((acc "") (k 0) (ov 0) (idle 0))
+                                  (let* ((n (string-length acc))
+                                         (nl (let scan ((j 0))
+                                               (cond ((= j n) #f)
+                                                     ((char=? (string-ref acc j)
+                                                              #\newline) j)
+                                                     (else (scan (+ j 1))))))
+                                         (len (and nl (string->number
+                                                        (substring acc 0 nl)))))
+                                    (if (and len (>= n (+ nl 1 len)))
+                                        (let* ((f (read (open-input-string
+                                                          (substring acc (+ nl 1)
+                                                                     (+ nl 1 len)))))
+                                               (mine (and (list? f)
+                                                          (eq? (car f) 'mdown)
+                                                          (eqv? (cadr f) mref)))
+                                               (over (and mine (= (length f) 3)
+                                                          (eq? (caddr f) 'overload))))
+                                          (wait (substring acc (+ nl 1 len) n)
+                                                (if (and mine (not over)) (+ k 1) k)
+                                                (if over (+ ov 1) ov)
+                                                0))
+                                        (if (>= idle 10)
+                                            (send me (vector ref 'count k ov))
+                                            (receive (after 600
+                                                       (wait acc k ov (+ idle 1)))
+                                              (`#(tcp-data ,bv)
+                                                (wait (string-append
+                                                        acc (utf8->string bv))
+                                                      k ov 0))
+                                              (`#(tcp-eof)
+                                                (send me (vector ref 'count k ov)))
+                                              (`#(tcp-error ,e)
+                                                (send me (vector ref 'count k ov)))))))))))))))))))
+
+      (define (burst-session! label boot gen me ref arm)
+        ;; Handshake as "wpeer", then WAIT. On #(go victim mref) it writes
+        ;; one segment: filler frames, then the `mon` last. Nothing is
+        ;; read back here -- the mdown is written to the peer NAME, so it
+        ;; arrives on whichever connection is current, which is the point.
+        (spawn
+          (lambda ()
+            (tcp-connect! "127.0.0.1" port self)
+            (receive (after 3000 (send me (vector ref 'no-connect)))
+              (`#(tcp-connected ,c)
+                (tcp-read-start! c)
+                (let ((d (read-frame-or-closed label)))
+                  (if (not (and (list? d) (= (length d) 4)))
+                      (send me (vector ref (list 'challenge-shape d)))
+                      (let ((nonce-a (cadr d)) (bootid-a (cadddr d)))
+                        (tcp-write! c (frame-bytes
+                                        (list 'hello "wpeer"
+                                              (v4-proof-d nonce-a "wpeer" boot
+                                                          (number->string gen)
+                                                          wire-name-of-this-node
+                                                          bootid-a)
+                                              "beadbeadbeadbeadbeadbeadbeadbead"
+                                              4 boot gen))
+                                    #f)
+                        (let ((w (read-frame-or-closed label)))
+                          (if (not (and (list? w) (eq? (car w) 'welcome)))
+                              (send me (vector ref (if (symbol? w) w 'other)))
+                              (begin
+                                ;; arm BEFORE the replacement when asked:
+                                ;; the demon cell needs a watch to cancel.
+                                (when arm
+                                  (tcp-write! c (frame-bytes
+                                                  (list 'mon (car arm) (cdr arm)))
+                                              #f))
+                                (send me (vector ref 'welcomed))
+                                (receive (after 20000 (void))
+                                  ;; The caller supplies the whole tail, in
+                                  ;; order. Its last frame is the one under
+                                  ;; test; the one before it is a marker
+                                  ;; whose effect is observable, so the
+                                  ;; marker's arrival proves this link
+                                  ;; dispatched as far as the frame BEFORE
+                                  ;; the one under test.
+                                  (`#(go ,n ,tail)
+                                    (tcp-write! c (burst-bytes n tail) #f)
+                                    (receive (after 30000 (void))
+                                      (`#(stop) (void))))))))))))))))
+
       (define (watch-session! label boot gen mref victim-name me ref)
         ;; Handshake as "wpeer" with `boot`/`gen`. When mref, arm it.
         ;; Then report the first mdown for it, or 'no-mdown when the read
@@ -1648,7 +1789,309 @@
               (`#(,@r2 ,other) (fail! "watch-new-incarnation" other)))
             (kill p1 'done) (kill p2 'done))))
       (sleep-ms 700)
-      (display "a new incarnation drops the old one's hosted watch ok\n"))
+      (display "a new incarnation drops the old one's hosted watch ok\n")
+
+      ;; ---- a LATE control frame on a superseded same-incarnation link ---
+      ;;
+      ;; ⭐ THE ONLY CELLS THAT SEPARATE THE TWO ADMISSION PREDICATES.
+      ;; The cells above replace the connection and then speak on the NEW
+      ;; one, where "is this the current connection" and "is this the
+      ;; current incarnation" give the same answer -- so they cannot tell
+      ;; the two apart, and mutating the predicate back leaves them green.
+      ;; Here the frame under test is dispatched by the link that has
+      ;; ALREADY been superseded: connection-identity drops it,
+      ;; incarnation admits it.
+      ;;
+      ;; ⛔ THE ANCHOR MEASURES AN ORDER, BECAUSE AN ORDER IS WHAT IS
+      ;; CLAIMED. A first version asked whether an effect had appeared by
+      ;; the time the welcome arrived -- one event, not two -- and a
+      ;; mistimed run fails GREEN here, not red. What is asserted instead
+      ;; is that the WELCOME arrives before the MARKER: the accept side
+      ;; installs the replacement before it writes the welcome, and the
+      ;; marker is the frame immediately before the one under test, so
+      ;; welcome-then-marker means the replacement was in place while the
+      ;; link still had the frame under test to dispatch.
+      ;;
+      ;; ⛔ AND THE VERDICT IS COUNTED PER MREF, NOT READ OFF THE GLOBAL
+      ;; COUNT. Every session here is the same peer name, so one cell's
+      ;; teardown drops the monitors another cell parked: a global count
+      ;; that falls proves nothing about this cell's cancel. Killing the
+      ;; watched process and counting the mdowns for THIS mref does.
+      (let* ((me self) (r1 (gensym)) (r2 (gensym)) (rm (gensym))
+             (victim (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
+             (marker (spawn (lambda ()
+                              (receive (after 30000 (void))
+                                (`(tail ,m) (send me (vector rm 'tail m)))))))
+             (base (callee-count)))
+        (register 'watch-victim-3 victim)
+        (register 'burst-marker marker)
+        (let ((p1 (burst-session! "s-burst-old" probe-boot-id 31 me r1 #f)))
+          (welcomed! r1 "late-mon-on-superseded-link")
+          (let ((p2 (watch-session! "s-burst-new" probe-boot-id 32 #f
+                                    'watch-victim-3 me r2)))
+            (send p1 (vector 'go 4000
+                             (list (list 'send 'burst-marker (list 'tail 9301))
+                                   (list 'mon 'watch-victim-3 9301))))
+            (let ((anchor
+                    (receive (after 25000 'nothing)
+                      (`#(,@r2 welcomed) 'ordered)
+                      (`#(,@r2 ,other)
+                        (fail! "late-mon-on-superseded-link"
+                               (list 'handshake other)))
+                      (`#(,@rm tail ,m) 'marker-first))))
+              (cond
+                ((eq? anchor 'nothing)
+                 (fail! "late-mon-on-superseded-link" 'no-welcome-no-marker))
+                ((eq? anchor 'marker-first)
+                 (display "  💥 INCONCLUSIVE late-mon-on-superseded-link: ")
+                 (display "the burst reached its tail before the replacement ")
+                 (display "was installed; raise the filler count\n")
+                 (kill p1 'done) (kill p2 'done))
+                (else
+                  (receive (after 20000
+                             (fail! "burst-never-reached-tail" 'marker-timeout))
+                    (`#(,@rm tail ,m)
+                      (unless (eqv? m 9301) (fail! "burst-marker-wrong" m))))
+                  (let poll ((n 0))
+                    (unless (> (callee-count) base)
+                      (if (= n 120)
+                          (fail! "late-mon-dropped-on-superseded-link"
+                                 (list (callee-count) base))
+                          (begin (sleep-ms 50) (poll (+ n 1))))))
+                  (kill victim 'for-the-cell)
+                  (receive (after 12000
+                             (fail! "late-mon-no-verdict" 'verdict-timeout))
+                    (`#(,@r2 (mdown ,m))
+                      (unless (eqv? m 9301) (fail! "late-mon-wrong-mref" m)))
+                    (`#(,@r2 ,what)
+                      (fail! "late-mon-not-reported" what)))
+                  (kill p1 'done) (kill p2 'done)
+                  (sleep-ms 700)
+                  (display "a late mon on a superseded link ok\n")))))))
+
+      ;; ---- and the cancel, the other direction of the same predicate ----
+      ;; Armed while the connection is current; the CANCEL arrives on the
+      ;; link that has since been superseded. The verdict is the number of
+      ;; mdowns for this mref after the watched process dies: none if the
+      ;; cancel was honoured, one if it was dropped. The superseded link's
+      ;; own teardown cannot supply that -- remove-peer! only sweeps when
+      ;; the connection it is given is still the peer's current one.
+      (let* ((me self) (r1 (gensym)) (r2 (gensym)) (rm (gensym))
+             (victim (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
+             (marker (spawn (lambda ()
+                              (receive (after 30000 (void))
+                                (`(tail ,m) (send me (vector rm 'tail m)))))))
+             (base (callee-count)))
+        (register 'watch-victim-4 victim)
+        (register 'burst-marker-2 marker)
+        (let ((p1 (burst-session! "s-dem-old" probe-boot-id 41 me r1
+                                  (cons 'watch-victim-4 9401))))
+          (welcomed! r1 "late-demon-on-superseded-link")
+          (armed! base "late-demon-on-superseded-link")
+          ;; p2 does NOT arm: it is here to be the current connection and
+          ;; to read what the target writes to the peer name.
+          (let ((p2 (mdown-count-session! "s-dem-new" probe-boot-id 42 9401
+                                          #f me r2)))
+            (send p1 (vector 'go 4000
+                             (list (list 'send 'burst-marker-2 (list 'tail 9401))
+                                   (list 'demon 9401))))
+            (let ((anchor
+                    (receive (after 25000 'nothing)
+                      (`#(,@r2 welcomed) 'ordered)
+                      (`#(,@r2 ,other)
+                        (fail! "late-demon-on-superseded-link"
+                               (list 'handshake other)))
+                      (`#(,@rm tail ,m) 'marker-first))))
+              (cond
+                ((eq? anchor 'nothing)
+                 (fail! "late-demon-on-superseded-link" 'no-welcome-no-marker))
+                ((eq? anchor 'marker-first)
+                 (display "  💥 INCONCLUSIVE late-demon-on-superseded-link: ")
+                 (display "the burst reached its tail before the replacement ")
+                 (display "was installed; raise the filler count\n")
+                 (kill p1 'done) (kill p2 'done))
+                (else
+                  (receive (after 20000
+                             (fail! "demon-burst-never-reached-tail" 'marker-timeout))
+                    (`#(,@rm tail ,m)
+                      (unless (eqv? m 9401) (fail! "demon-burst-marker-wrong" m))))
+                  (sleep-ms 600)
+                  (kill victim 'for-the-cell)
+                  (receive (after 20000
+                             (fail! "late-demon-on-superseded-link" 'count-timeout))
+                    (`#(,@r2 count ,k ,ov)
+                      (unless (= k 0)
+                        (fail! "late-demon-dropped-on-superseded-link"
+                               (list 'mdowns k 'want 0 'overloads ov))))
+                    (`#(,@r2 ,other)
+                      (fail! "late-demon-on-superseded-link" other)))
+                  (kill p1 'done) (kill p2 'done)
+                  (sleep-ms 700)
+                  (display "a late demon on a superseded link ok\n")))))))
+
+      ;; ---- a retired-but-living agent must not outlive its retirement ----
+      ;;
+      ;; ⛔ RED FIRST. Retiring a stale record deletes the table entry,
+      ;; unlinks it and returns the credit -- and does NOT stop the agent.
+      ;; While the sweep ran on every replacement that did not matter: the
+      ;; stop was already on its way. Since the sweep became conditional on
+      ;; a new incarnation, a same-incarnation replacement leaves the agent
+      ;; running, off every table, off every chain, and out of the count.
+      ;;
+      ;; It is visible from outside because BOTH agents write to the peer
+      ;; NAME, which resolves to whichever connection is current: kill the
+      ;; watched process and the same mref is reported TWICE. The watcher
+      ;; side of a real node would honour only the first -- rmonitors is
+      ;; already gone -- so nothing but a raw reader can see the second.
+      ;;
+      ;; The ceiling is the reason this matters rather than being untidy:
+      ;; the credit was returned, so the admission test passes again, and
+      ;; the loop is unbounded while the count stays where it started.
+      (let* ((me self) (r1 (gensym)) (r2 (gensym))
+             (victim (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
+             (base (callee-count)))
+        (register 'watch-victim-5 victim)
+        (let ((p1 (watch-session! "s-leak-old" probe-boot-id 51 9501
+                                  'watch-victim-5 me r1)))
+          (welcomed! r1 "retired-agent-outlives-retirement")
+          (armed! base "retired-agent-outlives-retirement")
+          ;; same incarnation, higher generation: I8a replaces. The new
+          ;; session arms THE SAME KEY, which is what drives the stale
+          ;; record through the retirement path.
+          (let ((p2 (mdown-count-session! "s-leak-new" probe-boot-id 52 9501
+                                          'watch-victim-5 me r2)))
+            (welcomed! r2 "retired-agent-outlives-retirement")
+            (sleep-ms 600)
+            (kill victim 'for-the-cell)
+            (receive (after 20000
+                       (fail! "retired-agent-outlives-retirement" 'count-timeout))
+              ;; ⭐ TWO DIMENSIONS, because the fix changes BOTH -- and the
+              ;; expected pair was got WRONG the first time, which is why
+              ;; it is spelled out here rather than left to be inferred.
+              ;;
+              ;; Broken: the duplicate installs a second agent beside the
+              ;; living one, nothing is refused, and the death is reported
+              ;; TWICE -- (2 downs, 0 refusals).
+              ;;
+              ;; Fixed: a living stale agent does not make way. It is told
+              ;; to stop -- so it LEAVES -- and the duplicate is refused.
+              ;; Nothing is watching by the time the process dies, so the
+              ;; death is reported NOT AT ALL -- (0 downs, 1 refusal). The
+              ;; peer is not left guessing: the refusal is itself an
+              ;; (mdown <mref> overload), which its own fire-remote-down!
+              ;; turns into a remote-down, and the API says a later
+              ;; attempt can succeed.
+              ;;
+              ;; ⛔ Counting only the downs would call BOTH trees wrong in
+              ;; the same direction, and would also pass a node that
+              ;; silently dropped the duplicate. The refusal is the
+              ;; present-tense witness that it answered.
+              ;; ⛔ THIS PAIR HAS BEEN WRONG TWICE, and the second time is
+              ;; the one worth keeping: it was set to (0 downs, 1 refusal)
+              ;; because that is what the code did once a living stale
+              ;; record stopped making way. ⭐ But that behaviour was itself
+              ;; the product of judging identity by CONNECTION -- an
+              ;; expectation derived from an implementation, which pins a
+              ;; defect down as the specification. With identity judged by
+              ;; run, a repeat from the same run is what the protocol says
+              ;; it is: free. The watch survives, reports once, and
+              ;; nothing is refused.
+              (`#(,@r2 count ,k ,ov)
+                (unless (and (= k 1) (= ov 0))
+                  (fail! "retired-agent-outlives-retirement"
+                         (list 'downs k 'want 1 'refusals ov 'want 0))))
+              (`#(,@r2 ,other)
+                (fail! "retired-agent-outlives-retirement" other)))
+            ;; ⭐ A THIRD PROPERTY, ASSERTED SEPARATELY: the permits come
+            ;; back. Written as "no more than we started with" rather than
+            ;; equality because every session here is the same peer name,
+            ;; so another cell's teardown can push this below base -- and
+            ;; a criterion that fails on someone else's cleanup is not
+            ;; measuring this cell.
+            (let poll ((n 0))
+              (unless (<= (callee-count) base)
+                (if (= n 120)
+                    (fail! "retired-agent-still-counted"
+                           (list (callee-count) base))
+                    (begin (sleep-ms 50) (poll (+ n 1))))))
+            (kill p1 'done) (kill p2 'done))))
+      (sleep-ms 700)
+      (display "a retired agent does not outlive its retirement ok\n")
+
+      ;; ---- a REPEAT on a superseded link must not revoke the watch -----
+      ;;
+      ;; ⛔ RED FIRST, AND THE DEFECT IS SILENT. The protocol says so in
+      ;; as many words a few hundred lines up: "A REPEAT OF THIS EXACT
+      ;; REQUEST IS FREE". A peer may therefore send one, and a peer that
+      ;; sent it just before a replacement has it dispatched by the link
+      ;; that has since been superseded.
+      ;;
+      ;; Admission now judges by INCARNATION, so that repeat is let in --
+      ;; but identity is still judged by CONNECTION, so the record it
+      ;; finds looks stale, and the answer is to stop an agent that was
+      ;; doing its job. The refusal is written back on the connection the
+      ;; frame arrived on, which the replacement already closed, and
+      ;; remove-peer! sweeps only for the connection that is current, so
+      ;; no noconnection is produced either.
+      ;;
+      ;; ⭐ WHAT THE PEER SEES IS NOTHING AT ALL: its rmonitors row is
+      ;; still there, the agent that would have reported is gone, and the
+      ;; process it is watching can die unremarked. That is why the
+      ;; verdict asserts BOTH numbers -- a watch that reports once, and
+      ;; no refusal -- rather than only that something arrived.
+      (let* ((me self) (r1 (gensym)) (r2 (gensym)) (rm (gensym))
+             (victim (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
+             (marker (spawn (lambda ()
+                              (receive (after 30000 (void))
+                                (`(tail ,m) (send me (vector rm 'tail m)))))))
+             (base (callee-count)))
+        (register 'watch-victim-6 victim)
+        (register 'burst-marker-3 marker)
+        (let ((p1 (burst-session! "s-rep-old" probe-boot-id 61 me r1
+                                  (cons 'watch-victim-6 9601))))
+          (welcomed! r1 "repeat-on-superseded-link-revokes-watch")
+          (armed! base "repeat-on-superseded-link-revokes-watch")
+          (let ((p2 (mdown-count-session! "s-rep-new" probe-boot-id 62 9601
+                                          #f me r2)))
+            (send p1 (vector 'go 4000
+                             (list (list 'send 'burst-marker-3 (list 'tail 9601))
+                                   ;; the repeat: the SAME triple it armed
+                                   (list 'mon 'watch-victim-6 9601))))
+            (let ((anchor
+                    (receive (after 25000 'nothing)
+                      (`#(,@r2 welcomed) 'ordered)
+                      (`#(,@r2 ,other)
+                        (fail! "repeat-on-superseded-link-revokes-watch"
+                               (list 'handshake other)))
+                      (`#(,@rm tail ,m) 'marker-first))))
+              (cond
+                ((eq? anchor 'nothing)
+                 (fail! "repeat-on-superseded-link-revokes-watch"
+                        'no-welcome-no-marker))
+                ((eq? anchor 'marker-first)
+                 (display "  💥 INCONCLUSIVE repeat-on-superseded-link: ")
+                 (display "the burst reached its tail before the replacement ")
+                 (display "was installed; raise the filler count\n")
+                 (kill p1 'done) (kill p2 'done))
+                (else
+                  (receive (after 20000
+                             (fail! "repeat-burst-never-reached-tail" 'marker-timeout))
+                    (`#(,@rm tail ,m)
+                      (unless (eqv? m 9601) (fail! "repeat-burst-marker-wrong" m))))
+                  (sleep-ms 600)
+                  (kill victim 'for-the-cell)
+                  (receive (after 20000
+                             (fail! "repeat-on-superseded-link-revokes-watch"
+                                    'count-timeout))
+                    (`#(,@r2 count ,k ,ov)
+                      (unless (and (= k 1) (= ov 0))
+                        (fail! "repeat-on-superseded-link-revokes-watch"
+                               (list 'downs k 'want 1 'refusals ov 'want 0))))
+                    (`#(,@r2 ,other)
+                      (fail! "repeat-on-superseded-link-revokes-watch" other)))
+                  (kill p1 'done) (kill p2 'done)
+                  (sleep-ms 700)
+                  (display "a repeat on a superseded link keeps the watch ok\n"))))))))
 
 
     (display "CV cells passed\n")

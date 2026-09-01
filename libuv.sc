@@ -787,7 +787,21 @@
           ;; question as the getaddrinfo-table entry a few lines up,
           ;; which is deliberately RETAINED for a dead owner because this
           ;; callback still has to free the request.
-          (unindex-owner! owner 'dns req)
+          ;; ⛔ THE FREE BELOW IS MANDATORY AND THIS CALL CAN RAISE.
+          ;; unindex-owner! filters the owner's list with remp, so it
+          ;; allocates. Unguarded it would skip the free -- and, in a
+          ;; foreign callback, unwind into C; the same rule and the same
+          ;; shape as the close callback above. Swallowing is the lesser
+          ;; residue: a stale index entry costs growth, which
+          ;; uv-owner-index-count reports, while the alternatives cost a
+          ;; foreign block that nothing will ever free again.
+          ;;
+          ;; ⚠ IT MUST STAY BEFORE THE FREE, not after. The key IS the
+          ;; freed pointer: once the block is returned, the same address
+          ;; can be handed to the next getaddrinfo request, and a removal
+          ;; running then would delete that request's registration
+          ;; instead of this one's.
+          (guard (e (#t (void))) (unindex-owner! owner 'dns req))
           (foreign-free req)
           (if (< status 0)
               (when owner (deliver owner (vector 'dns-failed status)))
@@ -1531,7 +1545,26 @@
       (let ((r (uv-getaddrinfo uv-loop req on-getaddrinfo-entry host 0 0)))
         (when (< r 0)
           (hashtable-delete! getaddrinfo-table req)
-          (unindex-owner! owner 'dns req)
+          ;; Same ordering and the same reason as the callback's copy,
+          ;; and a different handler: this runs on the caller's own
+          ;; stack, not in a foreign callback, so an allocation failure
+          ;; is reportable and is reported. What must not differ is the
+          ;; free -- nothing else will ever reach this request, because
+          ;; the table row is gone and a refused submission produces no
+          ;; callback.
+          ;;
+          ;; ⛔ ZERO COVERAGE, AND THE REASON IS NAMED. This branch runs
+          ;; only when uv_getaddrinfo refuses SYNCHRONOUSLY. A name that
+          ;; does not resolve is refused by the resolver instead, through
+          ;; the callback with a negative status, so the suite's bad-host
+          ;; case exercises the copy above and not this one: mutating
+          ;; this line leaves test/dns-owner-index.sc green. host is
+          ;; always a string here, so it is not currently known whether
+          ;; any public call can reach it at all.
+          ;; ⛔ Do not manufacture reachability by changing this code to
+          ;; suit a test.
+          (guard (e (#t (foreign-free req) (raise e)))
+            (unindex-owner! owner 'dns req))
           (foreign-free req)
           (deliver owner (vector 'dns-failed r))))))
 
