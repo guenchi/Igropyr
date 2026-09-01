@@ -128,7 +128,7 @@
                "events that the code cannot express simply cannot happen—there "
                "is no external state machine to get wrong, and no replay attack "
                "to defend against.")
-            (p (b "The " (code "'gone") " guarantee"))
+            (p (b "The " (code "gone") " guarantee"))
             (p "The transaction declares its point of no return through the "
                (code "commit!") " primitive, giving the framework a razor-sharp "
                "boundary to judge any death.")
@@ -136,11 +136,11 @@
               (li (b "Before " (code "commit!") ":") " A dead process means a "
                   "dropped connection, which means the database itself "
                   "automatically rolled back. The framework answers "
-                  (code "'gone") "—absolute physical proof that nothing "
+                  (code "gone") "—absolute physical proof that nothing "
                   "committed. This is the one status you may safely retry on.")
               (li (b "After " (code "commit!")
                      " (or an unknown kill/missing record):")
-                  " The framework answers " (code "'unknown")
+                  " The framework answers " (code "unknown")
                   ". It refuses to guess. Reconcile; never resubmit."))
             (p "Combined with the fault protocols above, the client always knows "
                "the definite server state. Just as importantly, it is told "
