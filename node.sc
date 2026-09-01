@@ -3705,6 +3705,22 @@
          ;; A request from a DIFFERENT run is still dropped rather than
          ;; refused: the process that sent it is gone, and refusing would
          ;; write a frame to a socket nobody is reading.
+         ;;
+         ;; ⚠ THAT IS ONE OF TWO WAYS THE TEST ANSWERS NO, and the note
+         ;; used to name only it. current-incarnation-locked? also
+         ;; answers no when this peer has NO CURRENT ENTRY AT ALL -- the
+         ;; window between an entry being removed and a reconnection
+         ;; being installed -- and a frame of the SAME run, buffered on a
+         ;; superseded link and drained inside that window, lands here
+         ;; too.
+         ;;
+         ;; Dropping is right for that one as well, for a different
+         ;; reason: with no current entry there is no link to carry a
+         ;; report, so a monitor armed now could not deliver anything it
+         ;; observed. What it costs is the same thing every unanswered
+         ;; mon costs -- the watcher is not told, because this protocol
+         ;; has no arm-ack. That gap is recorded elsewhere; this is a
+         ;; third way of reaching it, not a new one.
          (unless (atomically
                    (or (not (current-incarnation-locked? peer boot-id))
                    (let* ((found (hashtable-ref callee-agents key #f))
@@ -3920,10 +3936,22 @@
                           ;; send allocates a mailbox node, so it can
                           ;; raise. Undoing the install because the
                           ;; ANNOUNCEMENT failed would delete a monitor
-                          ;; that is correctly armed -- and the rescan
-                          ;; already covers a watch that never arrives,
-                          ;; which is why the send was made asynchronous
-                          ;; in the first place. The scope of the guard is
+                          ;; that is correctly armed.
+                          ;;
+                          ;; ⚠ AND THE RESCAN COVERS A LOST ANNOUNCEMENT
+                          ;; ON THE NEXT REAPER RESTART, NOT BEFORE. An
+                          ;; earlier note said it "already covers" one,
+                          ;; which reads as a standing backstop; the walk
+                          ;; over the global chain runs when a reaper
+                          ;; starts, and a reaper that is not replaced
+                          ;; never runs it again. So if this send raises
+                          ;; -- it allocates a mailbox node, so only
+                          ;; under memory pressure -- the agent is
+                          ;; watched by nobody until then, and its record
+                          ;; and permit stay behind after it dies.
+                          ;; ⛔ Recorded rather than mechanised: the
+                          ;; residue is OOM-only, and the repair for it
+                          ;; is not another announcement. The scope of the guard is
                           ;; the documentation: what is inside it is what
                           ;; is not yet safe to leave behind.
                           (let ((rp (reaper-pid)))
@@ -5928,10 +5956,12 @@
   ;;                   broken link, as in Erlang)
   ;;   - 'overload     if node will not host this watch right now: either
   ;;                   it is already at its maximum number of remote
-  ;;                   monitors (node-set-limits!), or this reference's
-  ;;                   previous watch has not finished leaving yet. Both
-  ;;                   are refusals to take a new permit, which is why
-  ;;                   they answer alike; a later attempt can succeed.
+  ;;                   monitors (node-set-limits!), or a watch under this
+  ;;                   reference from a PREVIOUS RUN OF THIS NODE -- the
+  ;;                   watcher, not the target -- has not finished
+  ;;                   leaving yet. Both are refusals to take a
+  ;;                   new permit, which is why they answer alike; a
+  ;;                   later attempt can succeed.
   ;; Returns a monitor ref for demonitor-remote. The own node name is a
   ;; local watch (still reported as remote-down, for a uniform API).
   ;; This is process-level; monitor-node is the node-level counterpart.
