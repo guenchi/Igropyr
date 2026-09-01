@@ -86,6 +86,9 @@ fi' EXIT
 IGROPYR_CONTRACTS=full "$scheme_bin" --script test/checked-full.sc
 env -u IGROPYR_CONTRACTS "$scheme_bin" --script test/checked-off.sc
 "$scheme_bin" --script test/smoke-actor.sc
+# monitor and demonitor each write both sides of the pair; a record that
+# reaches only one side is a watch that never fires or never clears
+"$scheme_bin" --script test/monitor-symmetry.sc
 "$scheme_bin" --script test/file-read.sc
 # the async write bindings are judged by what runs BESIDE the write: a
 # green process must keep ticking while an 8 MiB write sits on the pool
