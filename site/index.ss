@@ -86,25 +86,27 @@
         (div (@ (class "kicker")) "03 · The remote retry ring")
         (h2 "Faults speak a protocol")
         (p (@ (class "lead")) "When retries are exhausted or a stuck worker is "
-           "killed, Igropyr doesn't just throw a 500 — it can tell the client "
-           "exactly what happened, on a connection that stays open.")
+           "killed, Igropyr doesn't just throw a black-box 500 error—it tells "
+           "the client exactly what happened, on a connection that stays open.")
         (div (@ (class "feature"))
           (div (@ (class "txt"))
             (h3 "Killed first, told after")
-            (p "The " (code "on-failure") " hook answers a structured fault "
-               (b "after") " the stuck worker is dead — so when the client hears "
-               (code "stuck") ", there is " (b "no execution left in flight")
+            (p "The " (code "on-failure") " hook returns a structured JSON fault "
+               "only " (b "after") " the stuck worker is physically dead. When "
+               "the client hears " (code "stuck") ", it comes with an absolute "
+               "guarantee: there is " (b "no execution left in flight")
                ". The state is definite.")
             (ul
-              (li (b "crash") " — retries exhausted; resubmit with changed "
+              (li (b "crash") " — retries exhausted; safely resubmit with changed "
                   "parameters, or compensate.")
-              (li (b "stuck") " — killed mid-flight; resubmit carrying state, "
-                  "or roll back."))
-            (p "Keep-alive survives the fault, so the client resubmits on the "
-               (b "same connection") " and gets a fresh retry round. Shorten "
-               (code "stuck-ms") " and a user who once stared at a spinner for "
-               "30 s now rings through several informed retries in the same "
-               "time — failures become invisible at the UI."))
+              (li (b "stuck") " — killed mid-flight; safely resubmit carrying "
+                  "state, or roll back."))
+            (p "Keep-alive survives the fault. The client resubmits on the "
+               (b "very same connection") " and gets a fresh retry round. Dial "
+               "down the " (code "stuck-ms") " limit, and a user who once stared "
+               "at a spinner for 30 seconds now transparently cycles through "
+               "several informed retries in the exact same time. Failures become "
+               "invisible at the UI."))
           (pre ,(raw faults-code)))))
 
    ;; ---- 4. conversations ----
