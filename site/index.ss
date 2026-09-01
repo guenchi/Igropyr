@@ -18,9 +18,9 @@
       (div (@ (class "wrap"))
         (div (@ (class "lam")) "λ")
         (h1 "Igropyr")
-        (p (@ (class "tag")) "A distributed backend framework where " (b "workers recover from crashes")
-           ", " (b "routes change without restarts") ", " (b "failures get structured replies") ", and "
-           (b "dialogues keep their state") ".")
+        (p (@ (class "tag")) "A distributed backend framework where " (b "crashes self-heal")
+           ", " (b "code hot-swaps") ", " (b "faults speak a protocol") ", and "
+           (b "continuations drive conversations") ".")
         (p (@ (class "sub"))
            "Pure Chez Scheme · Erlang-style actors · libuv event loop · MIT")
         (div (@ (class "cta"))
