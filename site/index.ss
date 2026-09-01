@@ -193,29 +193,33 @@
       (div (@ (class "wrap"))
         (div (@ (class "kicker")) "06 · From node to hive")
         (h2 "Self-expanding distributed cluster")
-        (p (@ (class "lead")) "Nodes discover each other and wire up a full mesh — "
-           "no central coordinator, no registry to babysit. Links reconnect on "
-           "their own, and work spreads across every live member.")
+        (p (@ (class "lead")) "Nodes discover each other and wire up a full, true "
+           "mesh—no central coordinator, and no fragile registry to babysit. "
+           "Links self-heal, and work fluidly spreads across every live member.")
         (div (@ (class "feature flip"))
           (div (@ (class "txt"))
             (h3 "The mesh forms itself")
-            (p "Point " (code "cluster-start") " at a discovery strategy and it "
-               "keeps the mesh honest: it dials any member it isn't linked to yet, "
-               "and drops one that has left. " (code "static") " is a fixed list; "
-               "with " (code "redis") " each node heartbeats itself into a "
-               "per-cluster set and reads the live members back — a node that "
-               "stops beating " (b "falls out on its own") ", with no central "
-               "bookkeeping to keep in sync.")
-            (p "Underneath is plain node-to-node distribution. " (code "rsend")
-               " and " (code "rcall") " reach a registered process on another "
-               "machine by name, " (code "monitor-node") " reports members coming "
-               "and going, and every link " (b "reconnects itself") " through a "
-               "network blip. A mutual " (b "HMAC-SHA256") " handshake gates who "
-               "may join.")
-            (p (code "(igropyr dpool)") " rides on top: submit a task and it lands "
-               "on some live node; if that node dies mid-task, the work "
-               (b "reappears elsewhere") " and still completes — at-least-once, "
-               "across the whole cluster."))
+            (p "Point " (code "cluster-start") " at a discovery strategy, and it "
+               "keeps the topology honest: it actively dials any member it isn't "
+               "linked to yet, and mercilessly drops anyone that leaves. The "
+               (code "static") " strategy uses a fixed list; with " (code "redis")
+               ", nodes heartbeat themselves into a transient set. If a node "
+               "stops beating, it simply " (b "falls out of the mesh")
+               ". There is no central bookkeeping to drift out of sync.")
+            (p (b "Secure, name-based routing"))
+            (p "Underneath lies a pure node-to-node distribution layer. A mutual "
+               (b "HMAC-SHA256") " handshake strictly gates who may join. Once "
+               "inside, " (code "rsend") " and " (code "rcall") " reach registered "
+               "processes on remote machines purely by name. "
+               (code "monitor-node") " watches members come and go, while the "
+               "links themselves stubbornly reconnect through network blips.")
+            (p (b "Distributed execution pools"))
+            (p (code "(igropyr dpool)") " rides on top of this mesh. Submit a "
+               "task, and it lands on an available live node. If that node "
+               "suffers a physical death mid-execution, the mesh notices, and the "
+               "work instantly reappears elsewhere. You get a guaranteed "
+               (b "at-least-once") " execution primitive, seamlessly stretched "
+               "across the entire cluster."))
           (pre ,(raw cluster-code)))))
 
    ;; ---- foundations ----
