@@ -35,21 +35,24 @@
         (div (@ (class "kicker")) "01 · Fault tolerance")
         (h2 "Let It Crash")
         (p (@ (class "lead")) "HTTP requests run in a supervised worker pool. "
-           "Handlers don't defend — they crash, and the system recovers. "
-           "(A WebSocket session runs on its connection's own process, so "
-           "it is the connection that dies, not a pooled worker.)")
+           "Handlers don't defend—they crash, and the system recovers. "
+           "(WebSocket sessions own their own processes, so a crash kills "
+           "only that connection, leaving the pool untouched.)")
         (div (@ (class "feature"))
           (div (@ (class "txt"))
-            (h3 "Crashes heal themselves")
+            (h3 "Crashes self-heal")
             (ul
-              (li "A crashed worker is " (b "replaced instantly") "; the task is "
-                  "retried on a fresh worker, up to 3 times, before the client "
-                  "sees an error.")
-              (li "A worker stuck longer than 30 s — even a CPU-spinning "
-                  "loop — is " (b "killed and replaced") ": preemptive scheduling "
-                  "means nothing can freeze the server.")
-              (li "A half-sent request parks only " (b "its own reader process")
-                  " and is reaped by timeout. Other connections never notice."))
+              (li "A crashed worker is " (b "replaced instantly") ". The task is "
+                  "seamlessly retried on a fresh worker, up to 3 times, before "
+                  "the client ever sees an error.")
+              (li "A worker stuck for over 30s—even in a deadlocked CPU "
+                  "loop—is " (b "ruthlessly killed and replaced") ". Preemptive "
+                  "scheduling guarantees that no single handler can freeze the "
+                  "server.")
+              (li "A half-sent, slow-drip request parks only "
+                  (b "its own reader process")
+                  " and is quietly reaped by a timeout. Other connections "
+                  "never notice."))
             (p "Write the happy path. The supervisor owns the sad one."))
           (pre ,(raw crash-code)))))
 
