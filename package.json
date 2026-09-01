@@ -32,6 +32,7 @@
     "*.sc",
     "*.ss",
     "test/",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ]
 }
