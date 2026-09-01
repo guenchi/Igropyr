@@ -77,7 +77,7 @@
             (p "Combined with graceful shutdown (" (code "http-shutdown!")
                " safely drains in-flight work) and " (code "SO_REUSEPORT")
                " multi-process listening, zero-downtime operation isn't an "
-               "engineering project—it’s the default."))
+               "engineering project—it's the default."))
           (pre ,(raw hotswap-code)))))
 
    ;; ---- 3. failure hook ----
