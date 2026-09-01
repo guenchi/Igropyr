@@ -154,21 +154,28 @@
         (div (@ (class "kicker")) "05 · Scheme talks to Scheme")
         (h2 "Communicate in S-expressions")
         (p (@ (class "lead")) "When the client is Scheme too, requests and replies "
-           "are s-expressions — there is no codec to design. " (code "(igropyr sexpr)")
-           " is the safe parser; " (code "app-rpc") " dispatches one datum per "
-           "message, over HTTP, WebSocket or SSE.")
+           "are pure s-expressions. There is no codec to design, agree upon, or "
+           "debug. " (code "(igropyr sexpr)") " acts as the safe boundary parser, "
+           "while " (code "app-rpc") " dispatches exactly one datum per "
+           "message—seamlessly across HTTP, WebSocket, or SSE.")
         (div (@ (class "feature"))
           (div (@ (class "txt"))
             (h3 "No codec on the wire")
-            (p "Exact ratios and bignums cross the wire intact — no floating-point "
-               "JSON approximation anywhere. " (code "(rpc \"/rpc\" '(add 1 2 1/2))")
-               " comes back " (code "(ok 7/2)") ", the ratio preserved.")
-            (p "The peer is " (a (@ (href "https://goeteia.dev")) "Goeteia") ", a "
-               "Scheme compiler that runs in WebAssembly; its " (code "(web rpc)")
-               " / " (code "(web ws)") " / " (code "(web sse)") " speak the same wire "
-               "format.")
-            (p "This site itself is written in pure Scheme, and compiled to HTML "
-               "and CSS — the honeycomb fire above is compiled in real time by "
+            (p "Exact ratios and bignums cross the network intact. There is no "
+               "lossy JSON floating-point approximation anywhere in the stack. A "
+               "call like " (code "(rpc \"/rpc\" '(add 1 2 1/2))") " comes back "
+               "as " (code "(ok 7/2)") "—the mathematical ratio perfectly "
+               "preserved.")
+            (p (b "The WebAssembly peer"))
+            (p "The natural partner to this backend is "
+               (a (@ (href "https://goeteia.dev")) "Goeteia") ", a Scheme "
+               "compiler running natively in WebAssembly. Its browser-side "
+               (code "(web rpc)") ", " (code "(web ws)") ", and "
+               (code "(web sse)") " modules speak this exact same wire format, "
+               "turning the browser into a first-class Scheme runtime.")
+            (p "This very site is written in pure Scheme and compiled down to "
+               "bare HTML and CSS. That honeycomb fire effect above? It is "
+               "compiled and rendered in real time, directly in your browser, by "
                (a (@ (href "https://goeteia.dev")) "Goeteia") "."))
           (div (@ (class "rpccol"))
             (div (@ (class "rpcwire"))
