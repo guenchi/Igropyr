@@ -56,6 +56,7 @@
           ;; http-server-pool-alive?, which answers without handing over
           ;; the means to end the process.
           http-server-sup http-server-pool-alive?
+          http-server-backlog http-server-backlog-effective
           ;; record predicates, exported for boundary contracts
           ;; ((igropyr checked) in the framework layers) and any
           ;; user code that wants to type-test req/res values
@@ -1843,7 +1844,41 @@
       (immutable started http-server-started)
       ;; this server's listener handle, so shutdown stops only this
       ;; server (several servers may listen in one process)
-      (mutable listener http-server-listener http-server-listener-set!)))
+      (mutable listener http-server-listener http-server-listener-set!)
+      ;; the backlog this server ASKED for. Kept because the kernel does
+      ;; not report what it granted through any path listen() uses, and
+      ;; the request is the only half this process can state on its own.
+      (mutable backlog http-server-backlog http-server-backlog-set!)))
+
+  ;; What the kernel actually kept, or #f where it cannot be read.
+  ;; ⚠ THE TWO READBACKS ARE NOT INTERCHANGEABLE. http-server-backlog is
+  ;; what we asked for and is always available; this one is what the
+  ;; system granted.
+  ;;
+  ;; ⚠ #f MEANS "NO ANSWER", AND IT COVERS THREE CASES: a platform with
+  ;; no such socket option, a failed read (uv_fileno or getsockopt
+  ;; returning an error), and a server already shut down. They are not
+  ;; distinguished, and a caller that needs to tell them apart cannot do
+  ;; it from this value alone. #f is still the right sentinel -- 0 would
+  ;; be a plausible backlog and a symbol would be true in a conditional
+  ;; -- but it says less than it looks like it says. A caller
+  ;; comparing them sees the clamp; a caller reading only the first sees
+  ;; the intention and may be far above what the machine will honour.
+  (define (http-server-backlog-effective srv)
+    (let ((l (http-server-listener srv)))
+      (and l (listener-backlog-effective l))))
+
+  ;; The accept queue the listener asks for. 8192 suits a machine that
+  ;; may see thousands of connections arriving together; the kernel
+  ;; clamps it down to its own maximum, so asking high costs nothing
+  ;; where the maximum is low and helps where it is high.
+  ;;
+  ;; ⚠ 511 WAS THE OLD VALUE AND NOTHING HERE RECORDS WHY. It was a
+  ;; literal carried along, with no measurement behind it in this
+  ;; repository and no note saying where it came from. That is the whole
+  ;; claim: not that it is wrong, but that it was never justified, so it
+  ;; should not be restored on the belief that it was.
+  (define default-backlog 8192)
 
   (define (http-swap! srv handler)
     (set-box! (http-server-hbox srv) handler))
@@ -1909,6 +1944,12 @@
   ;; pool worker (the worker itself counts as busy -- deadlock).
   (define (http-shutdown! srv)
     (tcp-stop-listen! (http-server-listener srv))
+    ;; ⛔ AND DROP THE POINTER, because uv_close's callback frees the
+    ;; handle: the field would otherwise hold freed memory. Nothing read
+    ;; it after shutdown until http-server-backlog-effective was added,
+    ;; which is what turned a dormant stale pointer into a use-after-free
+    ;; -- adding a reader is what made the old lifetime bug reachable.
+    (http-server-listener-set! srv #f)
     (let drain ()
       (let ((s (pool-stats (http-server-sup srv))))
         (if (and (= 0 (cdr (assq 'busy s)))
@@ -1956,6 +1997,23 @@
     (define (opt key default)
       (let ((p (assq key opts)))
         (if p (cdr p) default)))
+    (define backlog (opt 'backlog default-backlog))
+    ;; ⛔ VALIDATED BEFORE ANYTHING IS CREATED, which is why it is here
+    ;; and not beside the host check further down. That check runs after
+    ;; start-worker-pool, so a bad value there raises with a worker pool
+    ;; already running and nothing left holding it -- the caller sees an
+    ;; assertion and the process keeps the threads.
+    ;;
+    ;; The upper bound is uv_listen's parameter type, not a taste. It
+    ;; takes a C int, and a fixnum above 2^31-1 does not fail on the way
+    ;; through: 2147483648 arrives as -2147483648, so the kernel is
+    ;; handed a NEGATIVE backlog by a caller who asked for a large one.
+    ;; Within this range the kernel clamps down to its own maximum and
+    ;; the clamp is visible through http-server-backlog-effective.
+    (unless (and (fixnum? backlog) (fx> backlog 0)
+                 (fx<= backlog 2147483647))
+      (assertion-violation 'http-listen
+        "backlog must be a positive fixnum <= 2147483647" backlog))
     ;; Configurable body-limit (process-global): also unblocks cp0 constant
     ;; inlining so parser reads see the new value. Keep pipeline-limit in
     ;; step. A bad value must crash HERE, at boot -- deferred to request
@@ -1987,7 +2045,7 @@
                   ;; success it will never see corrected.
                   (lambda (task) (not (unbox (vector-ref task 4))))))
            (host (opt 'host "0.0.0.0"))
-           (srv (make-http-server sup hbox wsbox (now-ms) 0)))
+           (srv (make-http-server sup hbox wsbox (now-ms) 0 backlog)))
       (unless (and (string? host) (> (string-length host) 0))
         (assertion-violation 'http-listen "host must be a non-empty string" host))
       (set-box! supbox sup)
@@ -2030,14 +2088,26 @@
                          (string-append "http-worker-pool:"
                                         (number->string port)))))
       (http-server-listener-set! srv
-        (tcp-listen! host port 511
+        (tcp-listen! host port backlog
           (lambda (c)
             ;; libuv callback context: spawn + register only, no yielding
             (let ((pid (spawn (make-reader c srv))))
               (conn-set-owner! c pid)
               (tcp-read-start! c)))
           (if (opt 'reuseport #f) 2 0)))  ; UV_TCP_REUSEPORT
+      ;; The two numbers are printed together because the pair is the
+      ;; whole point: the request is what this process chose, the
+      ;; effective value is what the kernel kept, and only their
+      ;; difference shows a clamp. "unavailable" covers every reason the
+      ;; value is absent, not only an unsupported platform -- and it is
+      ;; printed instead of a zero, and instead of the request repeated
+      ;; as though it had been confirmed.
       (display (string-append "igropyr listening on http://" host ":"
-                              (number->string port) "\n"))
+                              (number->string port)
+                              " backlog " (number->string backlog)
+                              " (effective "
+                              (let ((e (http-server-backlog-effective srv)))
+                                (if e (number->string e) "unavailable"))
+                              ")\n"))
       srv))
 )

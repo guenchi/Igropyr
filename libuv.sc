@@ -22,7 +22,7 @@
           fs-job-count fs-fd-count
           fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc fs-o-excl
           fs-o-directory fs-o-cloexec
-          fs-count dns-count
+          fs-count dns-count listener-backlog-effective
           tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
           conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
@@ -117,6 +117,9 @@
   (define c-open          (foreign-procedure "open" (string int int) int))
   (define c-openat        (foreign-procedure "openat" (int string int int) int))
   (define c-close         (foreign-procedure "close" (int) int))
+  (define uv-fileno       (foreign-procedure "uv_fileno" (void* void*) int))
+  (define c-getsockopt    (foreign-procedure "getsockopt"
+                            (int int int void* void*) int))
 
   (define UV-CONNECT 2)
   (define UV-GETADDRINFO 8)
@@ -1550,6 +1553,53 @@
   ;; superset that a cell can watch return to baseline while this table
   ;; keeps a row nothing will ever reach.
   (define (dns-count) (hashtable-size getaddrinfo-table))
+
+  ;; The accept-queue limit the kernel actually kept for this listener,
+  ;; or #f where it cannot be read. listen() silently clamps the backlog
+  ;; it is given to a system maximum (kern.ipc.soacceptqueue on FreeBSD,
+  ;; somaxconn on Linux), and reports nothing: a server can ask for 8192,
+  ;; be given 128, and overflow under a burst with no local symptom -- the
+  ;; drops are counted in the kernel, not here.
+  ;;
+  ;; ⛔ #f IS AN HONEST ANSWER AND A WRONG NUMBER IS NOT. Both the option
+  ;; and its level come from (igropyr platform) and are #f until read
+  ;; from the target's headers; while either is #f this returns #f rather
+  ;; than calling getsockopt with a guessed constant, which would answer
+  ;; for some other option and hand back a plausible integer.
+  ;; ⛔ ALL THREE BLOCKS ARE ALLOCATED TOGETHER SO ONE HANDLER CAN NAME
+  ;; ALL THREE. The first version allocated val and len INSIDE a guard
+  ;; whose handler knew only about fdbuf, so a raise from getsockopt
+  ;; would have returned one block and leaked two. That raise was not
+  ;; reachable in practice -- the arguments are fixnums and pointers,
+  ;; and the read is from a block allocated three lines above -- which
+  ;; is why the SHAPE is what was wrong, not the symptom. It was the
+  ;; third instance of that shape in one day; the check that catches it
+  ;; is to ask, at every foreign-alloc, which handler knows this name.
+  ;;
+  ;; ⚠ ONE RESIDUAL, STATED RATHER THAN PAPERED OVER: if the second or
+  ;; third foreign-alloc raises, the first is still leaked, because the
+  ;; bindings run before any handler is installed. That is an allocation
+  ;; failure of twelve bytes total, and covering it would need three
+  ;; nested guards for a case where the process is already out of
+  ;; memory. The gap is named here so a reader can weigh it rather than
+  ;; assume it was handled.
+  (define (listener-backlog-effective l)
+    (and so-listenqlimit sol-socket
+         (let ((fdbuf (foreign-alloc 4))
+               (val   (foreign-alloc 4))
+               (len   (foreign-alloc 4)))
+           (define (done! x)
+             (foreign-free fdbuf) (foreign-free val) (foreign-free len)
+             x)
+           (guard (e (#t (done! #f) (raise e)))
+             (foreign-set! 'int len 0 4)
+             (if (< (uv-fileno l fdbuf) 0)
+                 (done! #f)
+                 (let* ((fd (foreign-ref 'int fdbuf 0))
+                        (rc (c-getsockopt fd sol-socket so-listenqlimit
+                                          val len))
+                        (answer (and (>= rc 0) (foreign-ref 'int val 0))))
+                   (done! (and answer (> answer 0) answer))))))))
 
   (define (file-stream-own! op pid)
     (with-interrupts-disabled

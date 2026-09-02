@@ -3,6 +3,7 @@
 
 (library (igropyr platform)
   (export platform-os platform-arch ensure-supported-platform!
+          so-listenqlimit sol-socket
           load-first-shared-object! shared-object-candidates
           addrinfo-address-offset addrinfo-next-offset
           uv-stat-mode-offset uv-stat-size-offset)
@@ -71,6 +72,46 @@
   (define addrinfo-address-offset
     (case platform-os ((macos freebsd) 32) ((linux) 24) (else 0)))
   (define addrinfo-next-offset 40)
+
+  ;; SO_LISTENQLIMIT: the socket option that reports a listening socket's
+  ;; ACTUAL accept-queue limit -- what the kernel kept after clamping the
+  ;; backlog listen() was given to kern.ipc.soacceptqueue. FreeBSD has it;
+  ;; Linux and macOS have no equivalent (checked on macOS: undefined).
+  ;;
+  ;; ⛔ #f MEANS "NOT KNOWN HERE", AND THAT IS DELIBERATELY NOT A GUESS.
+  ;; A wrong option number does not fail loudly: getsockopt would answer
+  ;; for whatever option that number names and hand back a plausible
+  ;; integer, which the caller would report as the effective backlog. The
+  ;; number must come from the target's own headers:
+  ;;
+  ;;   echo '#include <sys/socket.h>
+  ;;   #include <stdio.h>
+  ;;   int main(){printf("%d\n", SO_LISTENQLIMIT);}' > /tmp/q.c \
+  ;;     && cc -o /tmp/q /tmp/q.c && /tmp/q
+  ;;
+  ;; Until that value is filled in, callers get #f, which reports "cannot
+  ;; be read here" -- the honest answer, and one that no reader will
+  ;; mistake for a measurement.
+  (define so-listenqlimit
+    (case platform-os
+      ;; 4113 = 0x1011, printed from <sys/socket.h> on FreeBSD 15.0.
+      ;; SO_LISTENQLEN is 4114 -- adjacent -- and SO_LISTENINCQLEN is
+      ;; 4115, two away. Both report queue DEPTH, not the limit, so an
+      ;; off-by-one here returns a real, plausible, wrong number rather
+      ;; than an error.
+      ((freebsd) 4113)
+      (else #f)))
+
+  ;; SOL_SOCKET, needed as the `level` argument alongside the option
+  ;; above. It is 0xffff on the BSDs and 1 on Linux, but it is left
+  ;; unset for the same reason: this pair is only ever used together,
+  ;; and a level that is wrong in the same silent way as a wrong option
+  ;; number buys nothing. Read it from <sys/socket.h> on the target when
+  ;; so-listenqlimit is filled in, and fill in both at once.
+  (define sol-socket
+    (case platform-os
+      ((freebsd) 65535)                 ; 0xffff, from the same header
+      (else #f)))
 
   ;; libuv's uv_stat_t is a platform-independent struct of uint64_t fields
   ;; before its timestamp fields.
