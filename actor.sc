@@ -22,7 +22,11 @@
           sleep-ms process-alive? process-id process-count
           process-monitor-count
           critical! uncritical! start-scheduler)
-  (import (chezscheme) (igropyr libuv))
+  ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- the
+  ;; off expansion of every primitive refers to no runtime name of it, so
+  ;; this unit's invoke-requirements stay (), which is what
+  ;; test/inject-isolation.ss measures for every unit in library-units.
+  (import (chezscheme) (igropyr libuv) (igropyr inject))
 
   (define process-default-ticks 100000)
 
@@ -514,8 +518,36 @@
 
   (define (@link p1 p2)
     (unless (memq p2 (pcb-links p1))
-      (pcb-links-set! p1 (cons p2 (pcb-links p1)))
-      (pcb-links-set! p2 (cons p1 (pcb-links p2)))))
+      ;; ⛔ BOTH CELLS ARE ALLOCATED BEFORE EITHER IS PUBLISHED. A link is
+      ;; one fact about two processes, and it was written as two steps
+      ;; with an allocation between them: the second cons could fail with
+      ;; p1 already listing p2 and p2 not listing p1. Nothing repairs
+      ;; that -- the raise leaves link's caller, and the half that landed
+      ;; is a live link as far as every reader is concerned, so p1's exit
+      ;; acts on it while p2 never hears. Measured: the proxy received
+      ;; #(EXIT <pcb> for-the-cell) from a link it does not have.
+      ;;
+      ;; With both conses first, the only steps after the first publish
+      ;; are two pointer writes, which is what the R0 rule for this
+      ;; region asks for and is why no guard is needed or wanted here.
+      (let ((l1 (cons p2 (pcb-links p1))))
+        ;; INJECTION POINT 'link-second-half -- OWNING GUARD: none. This
+        ;; body runs inside with-interrupts-disabled at every caller, and
+        ;; a disabled-interrupt region is not a guard: it does not catch,
+        ;; so the raise leaves the region and reaches link's caller.
+        ;;
+        ;; ⚠ THE POINT IS ANCHORED TO THE SECOND ALLOCATION, NOT TO A
+        ;; POSITION BETWEEN THE TWO WRITES. It models the second cons
+        ;; failing, which is the only step here that can fail, and it
+        ;; follows that cons wherever the cons goes. Between the two
+        ;; pcb-links-set! calls below there is now nothing that can fail
+        ;; at all: a point placed there would inject an impossible
+        ;; failure, the cell could never go green, and a correct fix
+        ;; would read as ineffective.
+        (inject-fault! 'link-second-half)
+        (let ((l2 (cons p1 (pcb-links p2))))
+          (pcb-links-set! p1 l1)
+          (pcb-links-set! p2 l2)))))
 
   (define (link p)
     ;; Validated OUTSIDE the interrupt region, as send already does. An accessor
@@ -544,10 +576,34 @@
       (assertion-violation 'monitor "not a process" p))
     (with-interrupts-disabled
       (if (alive? p)
-          (let ((m (make-mon *self* p)))
-            (pcb-monitors-set! *self* (cons m (pcb-monitors *self*)))
-            (pcb-monitors-set! p (cons m (pcb-monitors p)))
-            m)
+          ;; Both cells before either publish, for the reason spelled out
+          ;; at @link. Measured before the change: the watcher's own pcb
+          ;; carried the monitor and the target's did not, so demonitor
+          ;; had something to remove and the target's death had nobody to
+          ;; tell.
+          (let* ((m (make-mon *self* p))
+                 (a (cons m (pcb-monitors *self*))))
+            ;; INJECTION POINT 'monitor-second-half -- OWNING GUARD: none,
+            ;; for the reason given at @link's point, and anchored the same
+            ;; way: to the second cons, which this call sits before in
+            ;; either version of the code.
+            (inject-fault! 'monitor-second-half)
+            ;; ⛔ (monitor self) IS LEGAL AND ALIASES THE TWO LISTS.
+            ;; Unlike link, which refuses a self-target, monitor accepts
+            ;; one, and the header of this file records the measured
+            ;; consequence: such a call adds TWO entries, because the
+            ;; old code's second cons read the list the first write had
+            ;; already updated. Building both cells from the same
+            ;; snapshot loses that -- the second write would overwrite
+            ;; the first and the call would add ONE. Chaining b onto a
+            ;; keeps the published result identical to the old code's
+            ;; while still allocating everything before either write.
+            (let ((b (if (eq? p *self*)
+                         (cons m a)
+                         (cons m (pcb-monitors p)))))
+              (pcb-monitors-set! *self* a)
+              (pcb-monitors-set! p b)
+              m))
           (begin
             (@send *self* (vector 'DOWN p (pcb-exit-reason p)))
             #f))))

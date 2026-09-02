@@ -185,9 +185,11 @@
           node-monitor-stats node-outbound-stats reconnect-delay
           submission-failure? node-install-rule-order node-orphan-count
           monitor-node/token demonitor-node/token)
+  ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
+  ;; the note in libuv.sc; test/inject-isolation.ss is what measures it.
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv) (igropyr sexpr)
-          (igropyr gen-server)
+          (igropyr gen-server) (igropyr inject)
           (only (igropyr crypto) hmac-sha256 bytevector->hex))
 
   (define max-frame 8388608)        ; 8 MiB per datum, once authenticated
@@ -4505,7 +4507,58 @@
                ;; has already dropped its state, so the frame would not go
                ;; AND the link would not go, which is the outcome this
                ;; whole path exists to prevent.
+               ;; INJECTION POINT 'critical-submit -- OWNING GUARD: the
+               ;; guard opened on the next line, and it is the one under
+               ;; test. It converts the raise to ok = #f, which selects
+               ;; the failure branch below: the atomic test that this
+               ;; connection is still the current one, then stop-link!.
+               ;; That branch is the assertion's subject.
+               ;;
+               ;; ⭐ TWO GUARDS STAND BETWEEN THIS POINT AND THE
+               ;; ASSERTION, AND ONLY THE INNER ONE FIRES. The inner one
+               ;; is the guard on the next line, and it is the subject:
+               ;; it turns the raise into ok = #f, which selects the
+               ;; failure branch below.
+               ;;
+               ;; The outer ones are at the call sites. There are
+               ;; THREE, and they are named here by their `why` token
+               ;; rather than by line, because a line number is exactly
+               ;; the thing that goes stale: 'mdown, 'mdown-lost and
+               ;; 'demon, each wrapping this in (guard (e (#t
+               ;; (drop-link-by-name! ...)))). Recover them with
+               ;; `grep -n "(link-write/critical" node.sc`, which is
+               ;; also how this count must be re-checked. None of them sees this
+               ;; raise, because the inner guard has already consumed
+               ;; it. They are there for a DIFFERENT failure --
+               ;; frame-segments allocating -- and are why a frame that
+               ;; cannot even be built still takes the link down.
+               ;;
+               ;; What the call sites share is not that they are agents
+               ;; -- the demon path is the watcher side, which has
+               ;; dropped its rmonitors entry -- but that each has
+               ;; ALREADY discarded the state this frame accounts for.
+               ;; That is why losing the frame silently is not an option
+               ;; and why the raise must not escape.
+               ;;
+               ;; (Written from a grep of the call sites, as the note
+               ;; above this procedure requires. This comment has now
+               ;; been wrong three times: it once said there was no
+               ;; second guard and that every caller was an agent, and
+               ;; the correction to THAT said two call sites when a
+               ;; grep gives three. The count is the part that keeps
+               ;; going stale. The correction after that spelled the
+               ;; sites with LINE NUMBERS to keep them checkable -- and
+               ;; the same edit that added them pushed every one of them
+               ;; down by ten, so they were wrong on arrival. Tokens,
+               ;; not lines.)
+               ;;
+               ;; ⚠ THE COUNT ABOVE IS PRODUCT-SIDE. A test cell adds
+               ;; its own guards outside these; they receive nothing
+               ;; here, because the inner guard consumes the raise, but
+               ;; a point whose cell asserts on a RAISE rather than on
+               ;; state must count those too.
                (let ((ok (guard (e2 (#t #f))
+                           (inject-fault! 'critical-submit)
                            (let-values (((ok failure) (write-body! c segs)))
                              ok))))
                  (cond

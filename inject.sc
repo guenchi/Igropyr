@@ -36,6 +36,40 @@
 ;;; message whose prefix was never sent. Wrap the raw call, never a
 ;;; wrapper that has already acted on the result.
 ;;;
+;;; ⛔ AND A SECOND RULE, GOVERNING SOMETHING ELSE. The one above says
+;;; which VALUE may be injected -- the faked answer must be one the
+;;; skipped call could have given with nothing else done. This one says
+;;; where a point may be PLACED:
+;;;
+;;;   an injection point must sit INSIDE the guard that owns the failure
+;;;   branch you intend to exercise.
+;;;
+;;; ⚠ Outside it, what you measure is the OUTER recovery policy and not
+;;; the inner failure handling -- and an outer policy is usually the
+;;; thing that makes the whole event look like nothing happened. Two
+;;; instances turned up in one day, both silent:
+;;;   - a test fixture whose fail! was changed from exit to raise, which
+;;;     put it in reach of the the catch-all guards in the libraries it drives (about thirty; count them, do not quote this number) in the
+;;;     libraries it drives: a swallowed assertion leaves the cell
+;;;     passing, not failing;
+;;;   - a design draft that placed the mdown/demon point outside the
+;;;     caller's guard, where the raise was caught and dropped and the
+;;;     submission-failure branch never ran at all.
+;;;
+;;; ⚠ AND COUNT THEM OVER THE WHOLE DYNAMIC PATH, NOT THE LEXICAL ONE.
+;;; The line you assert on is in the CELL, so the cell's own guards --
+;;; including whatever the runner wraps every cell in -- are on that
+;;; path and are part of the count. Every point comment in this batch
+;;; was first written with the product-side count only, and every one
+;;; of them therefore undercounted; the review that found it counted
+;;; dynamically, which is what the rule already said to do.
+;;;
+;;; ⭐ THE CHECK IS CHEAPER THAN THE RULE. Count the `guard`s between the
+;;; injection point and the line you mean to assert on. If the answer is
+;;; not zero, say for each of them why it does not catch this first --
+;;; in the design table, where the next round can read it, and not in a
+;;; message.
+;;;
 ;;; ⭐ THE 'on EXPANSION DELIBERATELY REFERENCES A RUNTIME IDENTIFIER OF
 ;;; THIS LIBRARY. That is what makes the invoke-time check below reachable
 ;;; from a compiled artifact: a library is invoked when something refers
@@ -110,7 +144,12 @@
      ;; a validated arm with an unvalidated one. A check placed anywhere
      ;; but at the boundary it protects is a convention.
      ;;
-     ;; ⭐ EVERY FIELD IS CHECKED, not only the injected value. occurrence
+     ;; ⭐ THE FIELDS CHECKED HERE ARE occurrence AND, FOR 'return, THE
+     ;; POINT/VALUE PAIR -- not every field. `point`, `kind` and `ok?`
+     ;; are stored unvalidated, so a bad `ok?` raises at the HIT rather
+     ;; than at the arm -- which is the very thing this procedure exists
+     ;; to prevent. That is a named gap, not a claim of completeness.
+     ;; occurrence
      ;; and the hit counter meet fx= and fx+ inside a write path that is
      ;; dynamically interrupt-disabled; a string or a flonum arriving
      ;; there raises at the hit, in the region, far from the line that
@@ -125,20 +164,48 @@
            ;; uv_write returning >= 0 means libuv accepted the request and
            ;; owns the block; the value also escapes to on-done as a
            ;; purported errno, so it has to be one a C int could hold.
-           ((uv-write-neg)
-            (unless (and (fixnum? value) (fx< value 0) (fx> value -65536))
+           ;; ⭐ THE BOUND IS libuv's OWN ERROR RANGE, NOT A SANITY
+           ;; BOUND. On Unix libuv's codes are -errno, and its own most
+           ;; negative code is UV_EOF = -4095 (uv-errno.h), so [-4095,-1]
+           ;; is what the real API can return. An earlier version here
+           ;; allowed anything above -65536 and called that "C int
+           ;; range", which it is not: it admitted values such as -65535
+           ;; that libuv never produces, and the value is not consumed
+           ;; internally -- it reaches on-done, #(dns-failed r) and
+           ;; uv-strerror unchanged. A cell asserting on it would be
+           ;; asserting on behaviour the real system cannot produce.
+           ((uv-write-neg getaddrinfo-refused tcp-connect-refused)
+            (unless (and (fixnum? value) (fx< value 0) (fx>= value -4095))
               (assertion-violation '$inject-arm!
-                "uv-write-neg needs an exact negative errno in C int range"
+                "this point needs an exact libuv error code in [-4095,-1]"
                 value)))
            ;; a positive count would claim a prefix reached the wire and
            ;; make the caller queue only the suffix.
-           ((try-write-eagain)
-            (unless (and (fixnum? value) (fx<= value 0))
+           ;; 0 is a deliberate stand-in: real uv_try_write does not
+           ;; return it for a non-empty write, but it is what selects
+           ;; the queue-everything branch, which is the branch under
+           ;; test. Negatives are bounded like the errno points above.
+           ((try-write-eagain try-write-foreign-eagain)
+            (unless (and (fixnum? value) (fx<= value 0) (fx>= value -4095))
               (assertion-violation '$inject-arm!
-                "try-write-eagain needs an exact value <= 0" value)))
-           ;; a point nobody has reasoned about yet arrives with its own
-           ;; argument; this table constrains the ones we have.
-           (else (void)))))
+                "this point needs 0 or a libuv error code in [-4095,-1]"
+                value)))
+           ;; ⛔ A WHITELIST, AND THE DEFAULT IS REFUSAL. It read (void)
+           ;; before -- an unlisted return point armed with whatever it
+           ;; was given, so the one kind of mistake this table exists to
+           ;; catch (a value the point's own caller cannot mean) was
+           ;; caught for the points already reasoned about and for no
+           ;; other. That is backwards: the points needing the check are
+           ;; exactly the ones nobody has reasoned about yet.
+           ;;
+           ;; ⚠ Adding a return point therefore means adding a clause
+           ;; here, and that is the intent -- the clause is where you say
+           ;; what the point's caller can possibly read. A fault point
+           ;; carries no value, so nothing here constrains it.
+           (else
+            (assertion-violation '$inject-arm!
+              "unknown return point -- add a clause to check-arm! saying what values its caller can read"
+              point)))))
 
      (define ($inject-arm! point kind value occurrence ok?)
        (check-arm! point kind value occurrence)
@@ -193,8 +260,23 @@
              v))
          #t)))
     (else
-     ;; ---- off: names exist so the export list is one text, and nothing
-     ;; refers to them, so a consumer's invoke-requirements stay empty.
+     ;; ---- off: the names exist so the export list is ONE text, and no
+     ;; PRODUCTION unit refers to them, so a production consumer's
+     ;; invoke-requirements stay empty. That is the property, and it is
+     ;; not kept by hand: test/inject-isolation.ss walks the invoke and
+     ;; import closures of every unit in library-units and fails if the
+     ;; instrument appears anywhere in them. (igropyr inject) is itself a
+     ;; production unit -- libuv imports it -- so it is excluded from the
+     ;; roots and looked for in everything else's closure; the question
+     ;; that gate asks is whether anything ELSE reaches it.
+     ;;
+     ;; ⚠ A TEST FIXTURE MAY REFER TO THEM -- test/inject.sc's mode probe
+     ;; calls $inject-ticket -- and that is OUTSIDE the property, not an
+     ;; exception to it: the gate's denominator is library-units, which
+     ;; no fixture is in. An earlier version of this note said "nothing
+     ;; refers to them", which the probe made false the day it landed;
+     ;; it stated the state instead of the mechanism that keeps it, so a
+     ;; reader finding the probe would have read a violated design.
      (define ($inject-ticket) 0)
      (define ($inject-arm! point kind value occurrence ok?) 0)
      (define ($inject-release! ticket) (void))
@@ -204,6 +286,26 @@
 
   ;; ---- the three primitives ---------------------------------------------
 
+  ;; ⛔ THE OFF EXPANSION IS (void), NOT (begin), AND THE DIFFERENCE IS NOT
+  ;; COSMETIC. (begin) with no forms is valid only in a definition context,
+  ;; where it splices away to nothing. A guard body is NOT such a context
+  ;; in this implementation -- it is a sequence of expressions -- so a
+  ;; point placed inside a guard failed to expand at all, with an error
+  ;; naming this line and not the call site.
+  ;;
+  ;; ⭐ THAT IS EXACTLY WHERE THE RULE AT THE TOP OF THIS FILE SENDS EVERY
+  ;; POINT. Tranche 1 placed all of its points in ordinary bodies, so the
+  ;; off expansion had never once been asked to stand where the placement
+  ;; rule requires -- the rule's first application is what found this.
+  ;; That is not a recollection: had any tranche-1 point sat in a guard
+  ;; body, no ordinary build would have expanded at all, and they did.
+  ;; (void) is an expression everywhere a statement is allowed and expands
+  ;; to the same primitive (begin) does, which is why the isolation gate's
+  ;; "expands to nothing" comparison still holds.
+  ;;
+  ;; ⚠ What (void) does NOT do is splice: it cannot stand before a define
+  ;; in a body the way (begin) could. No point does that today; one that
+  ;; needs to belongs after the definitions anyway.
   (define-syntax inject-fault!
     (lambda (x)
       (syntax-case x ()
@@ -211,7 +313,7 @@
          (if (eq? inject-mode 'on)
              #'(when ($inject-take! point 'fault)
                  (assertion-violation 'inject-fault! "injected failure" point))
-             #'(begin))))))
+             #'(void))))))
 
   (define-syntax inject-return!
     (lambda (x)
@@ -229,4 +331,6 @@
          (if (eq? inject-mode 'on)
              #'(assertion-violation 'inject-barrier!
                  "not implemented in tranche 1" point)
-             #'(begin)))))))
+             ;; (void) for the reason given at inject-fault!; a barrier is
+             ;; if anything MORE likely to be placed inside a guard.
+             #'(void)))))))

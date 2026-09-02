@@ -308,5 +308,31 @@
       (`#(EXIT ,pid ,reason) 'ok))
     (display "link/EXIT ok\n")
 
+    ;; 6. a monitor's two registrations are two, even when both ends are
+    ;;    this process. actor.sc's counter comment records it: (monitor self)
+    ;;    contributes TWO. A repair that built both list cells from one
+    ;;    snapshot published only one -- documented and measured, pinned by
+    ;;    nothing, so it went unnoticed until review. The cross-process case
+    ;;    is checked beside it so the two cannot be traded for each other.
+    (let* ((c0 (process-monitor-count self))
+           (m (monitor self)))
+      (unless (= (process-monitor-count self) (+ c0 2))
+        (fail (string-append "self-monitor must add two registrations, added "
+                             (number->string (- (process-monitor-count self) c0)))))
+      (demonitor m)
+      (unless (= (process-monitor-count self) c0)
+        (fail "self-monitor not fully retired by demonitor")))
+    (let* ((me self)
+           (p (spawn (lambda () (receive (`#(stop) (void))))))
+           (c0 (process-monitor-count me)) (p0 (process-monitor-count p))
+           (m (monitor p)))
+      (unless (and (= (process-monitor-count me) (+ c0 1)) (= (process-monitor-count p) (+ p0 1)))
+        (fail "cross monitor must add one registration on each side"))
+      (demonitor m)
+      (unless (and (= (process-monitor-count me) c0) (= (process-monitor-count p) p0))
+        (fail "cross monitor not fully retired by demonitor"))
+      (kill p 'done))
+    (display "monitor registration counts (self two, cross one each) ok\n")
+
     (display "ALL ACTOR TESTS PASSED\n")
     (exit 0)))

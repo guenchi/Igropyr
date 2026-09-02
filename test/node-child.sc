@@ -8,7 +8,17 @@
 ;;;     #(boom) -> raises (so the caller sees an rcall-error)
 ;;;   - starts pubsub, subscribes to 'room, relays #(pub room ,m) to
 ;;;     node a's 'main as #(heard ,m)
-;;; Exits by itself after 60s as a safety net.
+;;;   - #(watch ,target) -> monitor-remote 'a target, replies #(watched ,mref);
+;;;     a #(remote-down node name reason) for it is RETAINED (the link it
+;;;     reports on is down at that moment) and handed over on #(drain)
+;;;     as #(drained ,list), over whatever link is live then;
+;;;     #(stats) -> replies #(stats ,(node-monitor-stats)). These let a
+;;;     cell make THIS node the watcher and read this node's hosting
+;;;     counts -- injection state is per process, so a cell that needs
+;;;     the hit on the hosting side must host on its own side and watch
+;;;     from here.
+;;; Exits by itself after <lifetime-ms> (4th argument, default 60000) as
+;;; a safety net.
 
 (import (chezscheme) (igropyr actor) (igropyr node)
         (igropyr gen-server) (igropyr pubsub))
@@ -17,6 +27,8 @@
 (define name (string->symbol (car args)))
 (define port (string->number (cadr args)))
 (define secret (caddr args))
+(define pending '())                    ; notices held until a drains them
+(define lifetime-ms (if (> (length args) 3) (string->number (cadddr args)) 60000))
 
 (start-scheduler
   (lambda ()
@@ -75,7 +87,7 @@
 
     ;; safety net: generous enough to cover the slow-handler cells the
     ;; suite runs against this child (two 'slow calls plus the rest)
-    (spawn (lambda () (sleep-ms 60000) (exit 1)))
+    (spawn (lambda () (sleep-ms lifetime-ms) (exit 1)))
     (let loop ()
       (receive
         (`#(add1 ,x ,payload)
@@ -92,5 +104,26 @@
         ;; arm of the min() without a sixty-second handler
         (`#(set-serve-cap ,n)
           (node-set-limits! #f #f #f #f n)
+          (loop))
+        ;; watcher role: arm a watch on a's process and report the mref;
+        ;; the notice for it arrives in this very mailbox and is forwarded
+        (`#(watch ,target)
+          (let ((m (monitor-remote 'a target)))
+            (rsend 'a 'main (vector 'watched m)))
+          (loop))
+        ;; A NOTICE IS RETAINED, NOT FORWARDED. It is #(remote-down node
+        ;; name reason) -- no mref, correlate by name -- and it arrives
+        ;; while the link it reports on is down: an rsend here would
+        ;; return #f and the notice would be gone. It waits for a's
+        ;; #(drain), which can only arrive over the next live link.
+        (`#(remote-down ,n ,nm ,reason)
+          (set! pending (cons (vector 'remote-down n nm reason) pending))
+          (loop))
+        (`#(drain)
+          (rsend 'a 'main (vector 'drained (reverse pending)))
+          (set! pending '())
+          (loop))
+        (`#(stats)
+          (rsend 'a 'main (vector 'stats (node-monitor-stats)))
           (loop))
         (`#(quit) (exit 0))))))

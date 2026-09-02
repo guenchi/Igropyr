@@ -30,7 +30,7 @@
 ;;; list at the end. Setup failures (the child never came up) still abort,
 ;;; since no cell means anything without the link.
 (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr node)
-        (igropyr inject-control))
+        (igropyr inject-control) (igropyr inject))
 
 (define scheme-bin (or (getenv "SCHEME_BIN") "scheme"))
 (define port 18092)                     ; not node.sc's 18091: never collide
@@ -38,6 +38,17 @@
 
 (unless (equal? (getenv "IGROPYR_INJECT") "on")
   (display "inject suite requires IGROPYR_INJECT=on (hooks expand to nothing otherwise)\n")
+  (exit 1))
+;; AND THE EXPANSION HAS TO AGREE. The variable being set says what
+;; this process asked for; whether the libraries it loaded were expanded
+;; that way is a separate fact -- a stale .so compiled with injection off
+;; answers every arm with a silent success and every hit count with #f,
+;; which reads exactly like "armed but never reached". The ticket counter
+;; is 0 in the off expansion and monotone from 1 in the on one, and it
+;; keeps that shape when the barrier primitive becomes real.
+;; takes ticket #1: no cell may assert an absolute ticket value
+(unless (> ($inject-ticket) 0)
+  (display "inject suite process was not expanded with injection on (stale .so?)\n")
   (exit 1))
 
 ;; A CELL FAILURE IS RECORDED BEFORE IT IS RAISED, and the raise is only
@@ -72,7 +83,22 @@
   (for-each (lambda (x) (display " ") (write x)) (cell-failure-info f))
   (newline)
   (set! failures (cons name failures)))
+;; INJECT_SKIP=name,name -- leave those cells out, everything else in the
+;; same order. A bisection aid: "does cell X's arm cause what cell Y sees"
+;; is answered by two runs whose only difference is this variable. A
+;; skipped cell prints SKIP so it cannot be mistaken for one that ran.
+(define skipped
+  (let ((v (getenv "INJECT_SKIP")))
+    (if (not v) '()
+        (let loop ((cs (string->list v)) (cur '()) (acc '()))
+          (cond ((null? cs) (reverse (if (null? cur) acc (cons (list->string (reverse cur)) acc))))
+                ((char=? (car cs) #\,) (loop (cdr cs) '() (if (null? cur) acc (cons (list->string (reverse cur)) acc))))
+                (else (loop (cdr cs) (cons (car cs) cur) acc)))))))
 (define (run-cell name thunk)
+  (if (member name skipped)
+      (begin (display "SKIP ") (display name) (newline))
+      (run-cell* name thunk)))
+(define (run-cell* name thunk)
   (set! recorded #f)
   (let ((came-out
           (guard (e ((cell-failure? e) (report-failure! name e) 'red)
@@ -110,7 +136,7 @@
 (define (spawn-child! name secret)
   (system (string-append
             scheme-bin " --script igropyr/test/node-child.sc "
-            name " " (number->string port) " " secret " &")))
+            name " " (number->string port) " " secret " 180000 &")))
 
 (define (bytes-now) (cdr (assq 'bytes (node-outbound-stats))))
 
@@ -149,6 +175,107 @@
 (define (no-node-down! label)
   (receive (after 700 'ok)
     (`#(node-down b) (fail! label 'link-dropped-on-refusal))))
+
+;; ---- tranche 2 helpers (top level: a body may not define after an expression)
+(define (counts-back! label h0 idx0)
+  (let poll ((n 0))
+    (unless (and (= (uv-live-handle-count) h0) (= (uv-owner-index-count) idx0))
+      (if (= n 40)
+          (fail! label (list 'handles (uv-live-handle-count) h0
+                             'index (uv-owner-index-count) idx0))
+          (begin (sleep-ms 50) (poll (+ n 1)))))))
+(define (local-callee-agents) (cdr (assq 'callee-agents (node-monitor-stats))))
+(define (wait-local-callee! label want)
+  (let poll ((n 0))
+    (unless (= (local-callee-agents) want)
+      (if (= n 100)
+          (fail! label (list 'callee-agents (local-callee-agents) 'want want))
+          (begin (sleep-ms 50) (poll (+ n 1)))))))
+;; the peer's reading, over whatever link is live: it can only be asked
+;; while there is one
+(define (peer-callee-agents! label)
+  (rsend 'b 'svc (vector 'stats))
+  (receive (after 5000 (fail! label 'stats-timeout))
+    (`#(stats ,alist) (cdr (assq 'callee-agents alist)))))
+(define (wait-peer-callee! label want)
+  (let poll ((n 0))
+    (let ((got (peer-callee-agents! label)))
+      (unless (= got want)
+        (if (= n 60)
+            (fail! label (list 'peer-callee-agents got 'want want))
+            (begin (sleep-ms 100) (poll (+ n 1))))))))
+(define drops 0)                         ; link drops this fixture has caused
+(define (expect-node-down! label)
+  (receive (after 10000 (fail! label 'no-node-down-slack-elapsed))
+    (`#(node-down b) (set! drops (+ drops 1)) 'ok)))
+;; THE BUDGET IS DERIVED, NOT GUESSED. The child redials after
+;; reconnect-delay, which doubles per attempt (node.sc: base 3000, cap
+;; 60000, +-25% jitter) and whose jitter is a hash of (self peer attempt)
+;; -- the same number in every process -- so this process can compute
+;; the child's own wait. The attempt counter only resets when a link has
+;; OUTLIVED the previous delay (node.sc's connector, `(if (and up (>= up
+;; waited)) 0 (+ attempt 1))`), which the links these cells drop never do,
+;; so it ratchets: attempt <= drops always, and the delay is monotone in
+;; attempt, so (reconnect-delay 'b 'a drops) is a provable upper bound on
+;; the wait. The +3000 is redundancy, not load-bearing. A fixed 15 s was
+;; here first and sat exactly on the attempt-2 window (9-15 s).
+;; attempt itself is UNOBSERVABLE BY CONSTRUCTION -- it is the connector's
+;; loop variable (node.sc run-connector), in no table, entry or exported
+;; reading -- so the budget takes drops as its bound; attempt <= drops
+;; because each drop advances it by at most one and may reset it. That is
+;; the correct reading, not a stand-in: a precise value would be a new
+;; connector reading, a separate change, never a narrower cell.
+;; AND THE MEASUREMENT IS JUDGED, NOT ONLY PRINTED: an upper bound this
+;; wide would let a reconnect that has slowed pass unnoticed, so a wait
+;; beyond the two-drop bound (15000) is flagged on its own line. The flag
+;; is the substitute for the reading this process cannot take; remove it
+;; and the cell is blind to a ratchet that has run ahead.
+;; EVERY NODE CELL STARTS FROM ATTEMPT 0, BY CONSTRUCTION. The child's
+;; connector resets its attempt counter only when the link that just
+;; ended outlived the delay it last waited (node.sc run-connector: `(if
+;; (and up (>= up waited)) 0 (+ attempt 1))`). Left alone, the link a
+;; cell drops has lived exactly as long as the cells before it took --
+;; the first version of these cells measured a first link of 3323 ms
+;; against a first delay of 3513 ms, and whether it reset was decided by
+;; whether an unrelated earlier cell had run to completion. So before a
+;; cell drops the link it lets it live past the longest delay the counter
+;; could be holding: the SAME bound the budget below uses -- attempt <=
+;; drops, reconnect-delay monotone -- plus a second. A first version keyed
+;; this to attempt 1, which holds only while every earlier settle succeeded:
+;; one miss puts the counter at 2, whose delay that settle never reaches,
+;; and the ratchet is then stuck for good, silently, since the budget
+;; grows with drops too. Keyed to drops it waits longer only when the
+;; counter can actually be higher. Measured, the reconnects land at the
+;; attempt-0 delay every time, and the flag below fires only when
+;; something has actually slowed.
+(define (settle-link!)
+  (sleep-ms (+ (reconnect-delay 'b 'a drops) 1000)))
+(define (expect-node-up! label)
+  (let* ((budget (+ (reconnect-delay 'b 'a drops) 3000))
+         (t0 (let ((t (current-time))) (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000)))))
+    (receive (after budget (fail! label 'no-node-up 'budget budget 'drops drops))
+      (`#(node-up b)
+        (let* ((t (current-time))
+               (ms (- (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000)) t0)))
+          (display "  node-up after ") (display ms) (display " ms (budget ")
+          (display budget) (display ", drops ") (display drops) (display ")")
+          (when (> ms 15000) (display "  ⚠️ SLOWER THAN THE TWO-DROP BOUND"))
+          (newline))))))
+(define (accounted-ok! label)
+  (let ((s (node-monitor-stats)))
+    (unless (= (cdr (assq 'accounted s)) (cdr (assq 'mon-chain s)))
+      (fail! label 'accounted/=mon-chain s))))
+(define (drained-has? l name reason)
+  (and (pair? l)
+       (or (let ((n (car l)))
+             (and (vector? n) (= (vector-length n) 4)
+                  (eq? (vector-ref n 2) name) (eq? (vector-ref n 3) reason)))
+           (drained-has? (cdr l) name reason))))
+(define (drain! label)
+  (rsend 'b 'svc (vector 'drain))
+  (receive (after 5000 (fail! label 'no-drain-reply))
+    (`#(drained ,l) l)))
+
 
 (start-scheduler
   (lambda ()
@@ -234,6 +361,307 @@
             (echo! 201 "c3-after")))
         (display "C3 allocation failure during submission is reported with the raised object ok\n")))
 
+    ;; ==== tranche 2: the three cells that are red before their repair ====
+    ;; See archive/igropyr-C-design/E7-tranche2-design-v4.md §二 rows 2, 5, 6.
+    ;; Each arms a fault point that sits after the first of two steps and
+    ;; before the second, and asserts that NOTHING of the first step
+    ;; survives the failure. On the tree before the repair the first step
+    ;; has already happened: the cell is red for that reason, and the
+    ;; repair is what turns it green.
+
+    ;; ---- T2-2: an allocation failure in fs-start-fd! must close the fd ----
+    ;; file-stream-open-under! opens the raw fd first and only then hands it
+    ;; to fs-start-fd!, which allocates before it publishes. A raise between
+    ;; the two leaves an fd nobody knows about. The reading is the
+    ;; process's own descriptor table: /dev/fd lists it, and the listing's
+    ;; own transient fd is present in both samples alike.
+    (run-cell "T2-2"
+      (lambda ()
+        (let ((fds0 (length (directory-list "/dev/fd"))))
+          (inject-arm-fault! 'fs-oom-fd 1)
+          (let ((raised (guard (e (#t #t))
+                          (file-stream-open-under! "igropyr/test" "node-child.sc" self)
+                          #f)))
+            (unless raised (fail! "t2-2-no-raise"))
+            (unless (eqv? (inject-hits 'fs-oom-fd) 1)
+              (fail! "t2-2-hits" (inject-hits 'fs-oom-fd)))
+            (let ((fds1 (length (directory-list "/dev/fd"))))
+              (unless (= fds1 fds0) (fail! "t2-2-fd-leaked" 'now fds1 'before fds0))
+              ;; and nothing was published either
+              (unless (zero? (fs-count)) (fail! "t2-2-published" (fs-count)))
+              ;; the baseline is printed on success too: "equal" on a shifted
+              ;; baseline is not the same reading as "equal" on the old one
+              (display "T2-2 an allocation failure after open-under closes the fd ok (fds ")
+              (display fds1) (display "/") (display fds0) (display ")\n"))))))
+
+    ;; ---- T2-5: a failed monitor leaves no half registration --------------
+    ;; monitor writes the record on the watcher's pcb, then on the target's,
+    ;; with an allocation between the two. Half a registration is worse
+    ;; than none: the target's exit does not see it, so no DOWN, while
+    ;; the watcher's count stays elevated until the watcher itself dies.
+    (run-cell "T2-5"
+      (lambda ()
+        (let* ((p (spawn (lambda () (receive (`#(stop) (void))))))
+               (m0 (process-monitor-count self))
+               (p0 (process-monitor-count p)))
+          (inject-arm-fault! 'monitor-second-half 1)
+          (let ((raised (guard (e (#t #t)) (monitor p) #f)))
+            (unless raised (fail! "t2-5-no-raise"))
+            (unless (eqv? (inject-hits 'monitor-second-half) 1)
+              (fail! "t2-5-hits" (inject-hits 'monitor-second-half)))
+            ;; NEITHER side may hold half of it
+            (unless (and (= (process-monitor-count self) m0)
+                         (= (process-monitor-count p) p0))
+              (fail! "t2-5-half-registered"
+                     (list 'watcher (process-monitor-count self) m0
+                           'target (process-monitor-count p) p0)))
+            (kill p 'for-the-cell)
+            (receive (after 300 'ok)
+              (`#(DOWN ,@p ,_) (fail! "t2-5-down-from-a-failed-monitor")))))
+        (display "T2-5 a failed monitor leaves no half registration ok\n")))
+
+    ;; ---- T2-6: a failed link leaves no half link ---------------------------
+    ;; @link writes the caller into the TARGET's list first. Half a link is
+    ;; not silent like half a monitor: when the target exits it acts on
+    ;; that entry and sends EXIT to (or kills) a process that never became
+    ;; linked. The proxy forwards WHATEVER reaches it, so a notice of any
+    ;; shape is red -- a cell that named one shape would go green on the
+    ;; others. The arm happens before the proxy exists, so the hit cannot
+    ;; be raced.
+    (run-cell "T2-6"
+      (lambda ()
+        (let* ((me self)
+               (t (spawn (lambda () (receive (`#(stop) (void)))))))
+          (inject-arm-fault! 'link-second-half 1)
+          (let ((proxy (spawn (lambda ()
+                                (process-trap-exit #t)
+                                (let ((raised (guard (e (#t #t)) (link t) #f)))
+                                  (send me (vector 'linked raised)))
+                                (receive (after 1500 (send me (vector 'proxy-quiet)))
+                                  (x (send me (vector 'proxy-got x))))))))
+            (receive (after 3000 (fail! "t2-6-proxy-silent"))
+              (`#(linked ,raised) (unless raised (fail! "t2-6-no-raise"))))
+            (unless (eqv? (inject-hits 'link-second-half) 1)
+              (fail! "t2-6-hits" (inject-hits 'link-second-half)))
+            (kill t 'for-the-cell)
+            (receive (after 3000 (fail! "t2-6-verdict-timeout"))
+              (`#(proxy-got ,x) (fail! "t2-6-half-link-acted-on" x))
+              (`#(proxy-quiet) 'ok))
+            (kill proxy 'done)))
+        (display "T2-6 a failed link leaves no half link ok\n")))
+
+    ;; ==== tranche 2: cells that are green today and owe their red to a mutation
+    ;; (design v4 §二 rows 1, 3, 4). Each pins a cleanup path that the
+    ;; ordinary suite never drives because its trigger is a refusal from
+    ;; inside libuv.
+
+    ;; ---- T2-1: a refused getaddrinfo retires its request on the spot ----
+    ;; uv_getaddrinfo can decline synchronously; the request was already
+    ;; indexed under its owner and filed in the table before the call.
+    (run-cell "T2-1"
+      (lambda ()
+        (let ((idx0 (uv-owner-index-count)) (dns0 (dns-count)))
+          (inject-arm-return! 'getaddrinfo-refused -3 1)   ; EAI_AGAIN-ish, once
+          (dns-resolve! "127.0.0.1" self)
+          (receive (after 3000 (fail! "t2-1-no-failure-delivered"))
+            (`#(dns-failed ,e) (unless (eqv? e -3) (fail! "t2-1-wrong-errno" e)))
+            (`#(dns-resolved ,ip) (fail! "t2-1-resolved-despite-refusal" ip)))
+          (unless (eqv? (inject-hits 'getaddrinfo-refused) 1)
+            (fail! "t2-1-hits" (inject-hits 'getaddrinfo-refused)))
+          (unless (= (uv-owner-index-count) idx0)
+            (fail! "t2-1-owner-index-not-retired" (uv-owner-index-count) idx0))
+          (unless (= (dns-count) dns0)
+            (fail! "t2-1-table-row-not-retired" (dns-count) dns0))
+          ;; the resolver still works afterwards: nothing stale blocks it
+          (inject-disarm!)
+          (dns-resolve! "127.0.0.1" self)
+          (receive (after 5000 (fail! "t2-1-next-resolution-silent"))
+            (`#(dns-resolved ,ip) 'ok)
+            (`#(dns-failed ,e) (fail! "t2-1-next-resolution-failed" e))))
+        (display "T2-1 a refused getaddrinfo retires its request ok\n")))
+
+    ;; ---- T2-3: a refused uv_tcp_connect releases everything it took -----
+    ;; By the time the raw connect is called, the handle is initialised,
+    ;; the request allocated, filed, and indexed under the owner. The
+    ;; refusal must undo all of it; the close is asynchronous, so the
+    ;; handle count is read after the loop has run.
+    (run-cell "T2-3"
+      (lambda ()
+        (sleep-ms 200)                    ; let earlier closes settle first
+        (let ((h0 (uv-live-handle-count)) (idx0 (uv-owner-index-count)))
+          (inject-arm-return! 'tcp-connect-refused -61 1)   ; ECONNREFUSED, once
+          (let ((raised (guard (e (#t #t)) (tcp-connect! "127.0.0.1" port self) #f)))
+            (unless raised (fail! "t2-3-no-raise")))
+          (unless (eqv? (inject-hits 'tcp-connect-refused) 1)
+            (fail! "t2-3-hits" (inject-hits 'tcp-connect-refused)))
+          (counts-back! "t2-3-not-released" h0 idx0)
+          ;; and no stray connected/failed notice arrives for it
+          (receive (after 300 'ok)
+            (`#(tcp-connected ,c) (fail! "t2-3-connected-despite-refusal"))
+            (`#(tcp-connect-failed ,e) (fail! "t2-3-async-failure-for-a-sync-refusal" e))))
+        (display "T2-3 a refused connect releases handle, request and index ok\n")))
+
+    ;; ---- T2-4: an allocation failure mid-connect releases the handle ----
+    ;; The request allocation comes after the handle is initialised: the
+    ;; guard around it must close the handle, and only the handle.
+    (run-cell "T2-4"
+      (lambda ()
+        (sleep-ms 200)
+        (let ((h0 (uv-live-handle-count)) (idx0 (uv-owner-index-count)))
+          (inject-arm-fault! 'connect-oom 1)
+          (let ((raised (guard (e (#t #t)) (tcp-connect! "127.0.0.1" port self) #f)))
+            (unless raised (fail! "t2-4-no-raise")))
+          (unless (eqv? (inject-hits 'connect-oom) 1)
+            (fail! "t2-4-hits" (inject-hits 'connect-oom)))
+          (counts-back! "t2-4-not-released" h0 idx0))
+        (display "T2-4 an allocation failure mid-connect releases the handle ok\n")))
+
+    ;; ---- T2-10: a foreign write that cannot go out at once still arrives -
+    ;; tcp-write-foreign!'s own uv_try_write is the second raw try-write in
+    ;; libuv.sc; tranche 1 left it unwrapped for want of a cell. With the
+    ;; try-write told "nothing written", the bytes must take the queued
+    ;; path -- copied out of the foreign buffer, which is free for reuse
+    ;; the moment the call returns -- and reach the peer intact.
+    (run-cell "T2-10"
+      (lambda ()
+        (let* ((me self) (lport 18093)
+               (payload (string->utf8 "foreign-bytes")))
+          (tcp-listen! "127.0.0.1" lport 16
+            (lambda (c)
+              (conn-set-owner! c
+                (spawn (lambda ()
+                         (tcp-read-start! c)
+                         (receive (after 5000 (send me (vector 'server-silent)))
+                           (`#(tcp-data ,bv) (send me (vector 'server-got bv)))
+                           (`#(tcp-eof) (send me (vector 'server-eof)))
+                           (`#(tcp-error ,e) (send me (vector 'server-error e))))
+                         (tcp-close! c))))))
+          (tcp-connect! "127.0.0.1" lport self)
+          (let ((c (receive (after 5000 (fail! "t2-10-no-connect"))
+                     (`#(tcp-connected ,c) c)
+                     (`#(tcp-connect-failed ,e) (fail! "t2-10-connect-failed" e)))))
+            (inject-arm-return! 'try-write-foreign-eagain 0 1)
+            (let ((ptr (foreign-alloc (bytevector-length payload))))
+              (do ((i 0 (+ i 1))) ((= i (bytevector-length payload)))
+                (foreign-set! 'unsigned-8 ptr i (bytevector-u8-ref payload i)))
+              (tcp-write-foreign! c ptr (bytevector-length payload)
+                (lambda (status) (send me (vector 'written status))))
+              ;; the source buffer may be released as soon as the call returned
+              (foreign-free ptr))
+            (unless (eqv? (inject-hits 'try-write-foreign-eagain) 1)
+              (fail! "t2-10-hits" (inject-hits 'try-write-foreign-eagain)))
+            (receive (after 5000 (fail! "t2-10-no-completion"))
+              (`#(written ,status) (unless (eqv? status 0) (fail! "t2-10-write-status" status))))
+            (receive (after 5000 (fail! "t2-10-verdict-timeout"))
+              (`#(server-got ,bv) (unless (equal? bv payload) (fail! "t2-10-bytes-differ" bv)))
+              (`#(server-silent) (fail! "t2-10-never-arrived"))
+              (`#(server-eof) (fail! "t2-10-eof-before-data"))
+              (`#(server-error ,e) (fail! "t2-10-server-error" e)))
+            (tcp-close! c)))
+        (display "T2-10 a foreign write pushed to the queued path still arrives ok\n")))
+
+    ;; ==== tranche 2: the node cells (design v4 §二 rows 7, 8, 9) ==========
+    ;; All three arm 'critical-submit, the point inside link-write/critical's
+    ;; own guard, and each asserts the failure branch's IMMEDIATE stop-link!:
+    ;; node-down arrives, the hosted agent is reclaimed, accounting stays
+    ;; consistent, and the peer comes back on its own. The wait is slack,
+    ;; not a bound: if this ever waits for dead-ms the cell is red, and that
+    ;; is the finding.
+    ;; The child is the watcher for 7 and 8 (the hosting side is THIS
+    ;; process, where the arm lives: injection state is per process) and
+    ;; the host for 9.
+    ;; ---- T2-7: a DOWN that cannot be submitted costs the link ------------
+    (run-cell "T2-7"
+      (lambda ()
+        ;; a link drop that happened BEFORE this cell would have left its
+        ;; notices waiting here; say so, because the reconnect ratchet
+        ;; would then already be one step ahead
+        (let probe ((n 0))
+          (receive (after 0 (when (> n 0) (display "  stray link notices before T2-7: ") (display n) (newline)))
+            (`#(node-down b) (display "  stray node-down before T2-7\n") (probe (+ n 1)))
+            (`#(node-up b) (display "  stray node-up before T2-7\n") (probe (+ n 1)))))
+        (let* ((base (local-callee-agents))
+               (t (spawn (lambda () (receive (`#(stop) (void)))))))
+          (register 't7 t)
+          (rsend 'b 'svc (vector 'watch 't7))
+          (receive (after 5000 (fail! "t2-7-no-watched")) (`#(watched ,m) 'ok))
+          (wait-local-callee! "t2-7-not-hosted" (+ base 1))
+          (settle-link!)
+          (inject-arm-fault! 'critical-submit 1)
+          (kill t 'for-the-cell)
+          (expect-node-down! "t2-7")
+          (unless (eqv? (inject-hits 'critical-submit) 1)
+            (fail! "t2-7-hits" (inject-hits 'critical-submit)))
+          (inject-disarm!)
+          (wait-local-callee! "t2-7-agent-not-reclaimed" base)
+          (accounted-ok! "t2-7")
+          (expect-node-up! "t2-7")
+          (sleep-ms 300)
+          ;; the watcher was told, by the link's death, that its watch is gone
+          (let ((l (drain! "t2-7")))
+            (unless (drained-has? l 't7 'noconnection)
+              (fail! "t2-7-watcher-not-told" l))))
+        (display "T2-7 a DOWN that cannot be submitted costs the link ok\n")))
+
+    ;; ---- T2-8: the same, on the immediate noproc branch -----------------
+    ;; No pause exists between the mon's arrival and the noproc submission,
+    ;; so the arm comes BEFORE the child is told to watch. The child's
+    ;; #(watched ...) reply may itself be lost to the drop: it is not waited
+    ;; for.
+    (run-cell "T2-8"
+      (lambda ()
+        (let ((base (local-callee-agents)))
+          (settle-link!)
+          (inject-arm-fault! 'critical-submit 1)
+          (rsend 'b 'svc (vector 'watch 'no-such-name-t8))
+          (expect-node-down! "t2-8")
+          (unless (eqv? (inject-hits 'critical-submit) 1)
+            (fail! "t2-8-hits" (inject-hits 'critical-submit)))
+          (inject-disarm!)
+          (wait-local-callee! "t2-8-agent-not-reclaimed" base)
+          (accounted-ok! "t2-8")
+          (expect-node-up! "t2-8")
+          (sleep-ms 300)
+          (let ((l (drain! "t2-8")))
+            (unless (drained-has? l 'no-such-name-t8 'noconnection)
+              (fail! "t2-8-watcher-not-told" l))))
+        (display "T2-8 a noproc DOWN that cannot be submitted costs the link ok\n")))
+
+    ;; ---- T2-9: a demon that cannot be submitted costs the link ----------
+    ;; This process is the watcher; the peer hosts. The local rmonitors
+    ;; entry is gone before the demon is even built, so the local invariant
+    ;; is blind to a hosted agent nobody reclaims: the peer's own count,
+    ;; read over the NEW link, is the assertion.
+    (run-cell "T2-9"
+      (lambda ()
+        (let ((pbase (peer-callee-agents! "t2-9")))
+          (let ((mref (monitor-remote 'b 'svc)))
+            (wait-peer-callee! "t2-9-not-hosted" (+ pbase 1))
+            (settle-link!)
+            (inject-arm-fault! 'critical-submit 1)
+            (demonitor-remote mref)
+            (expect-node-down! "t2-9")
+            (unless (eqv? (inject-hits 'critical-submit) 1)
+              (fail! "t2-9-hits" (inject-hits 'critical-submit)))
+            (inject-disarm!)
+            (expect-node-up! "t2-9")
+            (sleep-ms 300)
+            (wait-peer-callee! "t2-9-peer-agent-not-reclaimed" pbase)
+            (accounted-ok! "t2-9")))
+        (display "T2-9 a demon that cannot be submitted costs the link ok\n")))
+
+    ;; INJECT_EXPECT_UNHIT=point -- the positive control for a skip run:
+    ;; skipping a cell proves the print branch ran, not that nobody else
+    ;; armed its point. If the point was hit anyway, the skip run's
+    ;; conclusion (either of them) is void, and that is reported as broken.
+    (let ((pt (getenv "INJECT_EXPECT_UNHIT")))
+      (when pt
+        (let* ((sym (string->symbol pt)) (h (inject-hits sym)))
+          (if (or (not h) (eqv? h 0))
+              (begin (display "UNHIT ") (display pt) (display " ok (never armed or hit)\n"))
+              (begin (display "💥 BROKEN skip-run: ") (display pt) (display " was hit ")
+                     (display h) (display " times despite the skipped cell\n")
+                     (set! failures (cons "skip-run" failures)))))))
     (rsend 'b 'svc (vector 'quit))
     (sleep-ms 400)
     (cond

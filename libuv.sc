@@ -22,7 +22,7 @@
           fs-job-count fs-fd-count
           fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc fs-o-excl
           fs-o-directory fs-o-cloexec
-          fs-count
+          fs-count dns-count
           tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
           conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
@@ -1365,9 +1365,38 @@
 
  ;; Start the ordinary asynchronous fstat/read pipeline from an fd that
   ;; has already been opened securely with openat.
+  ;; ⛔ THIS FUNCTION TAKES OWNERSHIP OF fd, INCLUDING WHEN IT FAILS. The
+  ;; caller opened fd with openat and has no other handle on it, so a
+  ;; raise that leaves this frame without closing it leaks a descriptor
+  ;; that nothing in the process can name again -- it is not in fs-table,
+  ;; not in the owner index, and not reachable from op, because op is
+  ;; exactly what failed to be built. Measured, not argued: injecting a
+  ;; failure between the allocation and the publish moved the /dev/fd
+  ;; count from 12 to 13 with fs-count still 0.
+  ;;
+  ;; The guard therefore spans allocation up to -- and NOT including --
+  ;; publication. Where it ends is the whole point: once fs-table holds
+  ;; the row, req is rooted and uv-owner-died! can reach it, and the fd
+  ;; belongs to op; closing it from here would then be closing a
+  ;; descriptor somebody else is still using.
   (define (fs-start-fd! fd path owner mode)
-    (let* ((req (foreign-alloc fs-req-size))
-           (op (make-fs-op owner path mode req 'fstat #f #f fd 0 0 '() 0 0)))
+    (let ((req #f) (op #f))
+      (guard (e (#t (c-close fd)
+                    ;; a req that was allocated but never submitted is
+                    ;; plain foreign memory: free it, do NOT run
+                    ;; uv_fs_req_cleanup, which belongs to a request
+                    ;; libuv has actually filled in.
+                    (when req (foreign-free req))
+                    (raise e)))
+        (set! req (foreign-alloc fs-req-size))
+        ;; INJECTION POINT 'fs-oom-fd -- OWNING GUARD: the guard opened
+        ;; above, which exists because of this point and catches it
+        ;; deliberately. There is no second guard between here and the
+        ;; assertion: the re-raise leaves fs-start-fd! and the cell reads
+        ;; the descriptor count, which the handler has already restored.
+        (inject-fault! 'fs-oom-fd)
+        (set! op (make-fs-op owner path mode req 'fstat #f #f fd 0 0 '() 0 0)))
+      ;; ---- published from here; the guard above is out of scope -------
       (with-interrupts-disabled
         (hashtable-set! fs-table req op)
         (index-owner! owner 'fs req))
@@ -1482,6 +1511,14 @@
   (define (file-stream-open-under! root rel owner)
     ;; Keep the raw fd continuously protected: before fs-start-fd! installs
     ;; it in fs-table, actor teardown has no way to discover and close it.
+    ;;
+    ;; ⚠ THE REGION COVERS PREEMPTION AND NOTHING ELSE. It stops actor
+    ;; teardown from running here; it does not unwind, so it never
+    ;; covered fs-start-fd! RAISING with the fd in hand -- that half is
+    ;; fs-start-fd!'s own contract, which is why that function closes fd
+    ;; on any pre-publication failure. Read the two together: this line
+    ;; hands the descriptor over, and the callee owns it from the call,
+    ;; success or failure.
     (with-interrupts-disabled
       (let ((fd (open-under root rel)))
         (and (>= fd 0) (fs-start-fd! fd rel owner 'stream)))))
@@ -1505,6 +1542,14 @@
   ;; report them either -- and a leak that nothing can count is a leak
   ;; nothing can assert about.
   (define (fs-count) (hashtable-size fs-table))
+
+  ;; In-flight getaddrinfo requests. Exported for the reason fs-count and
+  ;; uv-owner-index-count are: the failure this pairs with -- a request
+  ;; row that outlives its resolution -- has no symptom except growth,
+  ;; and the owner index alone cannot show it, because that index is a
+  ;; superset that a cell can watch return to baseline while this table
+  ;; keeps a row nothing will ever reach.
+  (define (dns-count) (hashtable-size getaddrinfo-table))
 
   (define (file-stream-own! op pid)
     (with-interrupts-disabled
@@ -1548,7 +1593,12 @@
     (let ((req (foreign-alloc getaddrinfo-req-size)))
       (hashtable-set! getaddrinfo-table req owner)
       (index-owner! owner 'dns req)
-      (let ((r (uv-getaddrinfo uv-loop req on-getaddrinfo-entry host 0 0)))
+      ;; INJECTION POINT 'getaddrinfo-refused -- OWNING GUARD: none. There
+      ;; is no guard between here and the assertion; a negative return is
+      ;; a value, not a raise, and it is read by the (when (< r 0) ...)
+      ;; immediately below, which is the branch the cell exercises.
+      (let ((r (inject-return! 'getaddrinfo-refused
+                 (uv-getaddrinfo uv-loop req on-getaddrinfo-entry host 0 0))))
         (when (< r 0)
           (hashtable-delete! getaddrinfo-table req)
           ;; Same ordering and the same reason as the callback's copy,
@@ -1612,11 +1662,27 @@
       (let ((r (guard (e (#t (release!) (raise e)))
                  (check 'uv-tcp-init (uv-tcp-init uv-loop h))
                  (set! inited? #t)
+                 ;; INJECTION POINT 'connect-oom -- OWNING GUARD: the guard
+                 ;; opened on the line above, and it is MEANT to catch this.
+                 ;; That is the branch under test: the handle is inited and
+                 ;; nothing else is, so release! must close it and free
+                 ;; nothing else. There is no other guard between here and
+                 ;; the assertion; the re-raise leaves tcp-connect! and the
+                 ;; cell reads the two counts after the loop has run.
+                 (inject-fault! 'connect-oom)
                  (set! req (foreign-alloc connect-req-size))
                  (hashtable-set! connect-table req (cons h owner))
                  (index-owner! owner 'connect req)
                  (set! indexed? #t)
-                 (uv-tcp-connect req h sockaddr-buf on-connect-entry))))
+                 ;; INJECTION POINT 'tcp-connect-refused -- OWNING GUARD:
+                 ;; the same guard lexically, but it does NOT catch this
+                 ;; one and must not: a refused submission is a negative
+                 ;; RETURN, not a raise, so it flows out of the guard to
+                 ;; the (when (< r 0) (release!) ...) below. The two
+                 ;; points share a guard and exercise different branches,
+                 ;; which is why they are separate points and not one.
+                 (inject-return! 'tcp-connect-refused
+                   (uv-tcp-connect req h sockaddr-buf on-connect-entry)))))
         (when (< r 0)
           (release!)
           (error 'tcp-connect! (uv-strerror r)))
@@ -1880,7 +1946,14 @@
               (begin
                 (foreign-set! 'void* scratch-buf 0 ptr)
                 (foreign-set! 'unsigned-64 scratch-buf 8 len)
-                (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))
+                ;; INJECTION POINT 'try-write-foreign-eagain -- OWNING
+                ;; GUARD: none here. The guard further down covers the
+                ;; partial branch's enqueue-write!, not this call, and a
+                ;; 0 return is a value that the cond below reads: it
+                ;; selects the queue-everything branch, which is the one
+                ;; the cell follows to delivery.
+                (let ((n (inject-return! 'try-write-foreign-eagain
+                           (uv-try-write (conn-handle c) scratch-buf 1))))
                   (cond
                     ((= n len)                    ; fully written now
                      (when on-done (on-done 0)) #t)
