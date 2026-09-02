@@ -431,8 +431,8 @@ A performance release.
 
 ## 1.0.0 — 2026-07-12 (68 commits)
 
-The first published release, and a rewrite: an HTTP server on Chez Scheme and libuv
-with Erlang-style green processes.
+The first published rewrite release: an HTTP server on Chez Scheme and libuv with
+Erlang-style green processes.
 
 - HTTP/1.1 core split from an Express-style layer; a let-it-crash worker pool with
   configurable size, retries and stuck threshold; hot code swapping.
