@@ -13,7 +13,12 @@
   (define mono
     "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, Consolas, \"Liberation Mono\", monospace")
 
-  (define (igropyr-styles)
+  ;; WRAP-WIDTH is the page's content max-width in px, and the nav wears
+  ;; it too, so the bar's logo and links line up with the column beneath
+  ;; them. The wide pages (index, agent) take the default; a page whose
+  ;; content is narrower passes its own, the way the markdown pages do.
+  (define (igropyr-styles . opts)
+    (let ((wrap-width (if (pair? opts) (car opts) 1060)))
     `((:root (--bg "#ffffff") (--bg2 "#f6f8fa") (--panel "#f6f8fa")
              (--line "#e2e7ee") (--fg "#1f2430") (--dim "#57606a")
              (--acc "#e8590c") (--acc2 "#0969da") (--warn "#9a6700")
@@ -29,7 +34,7 @@
       ("a.name" (color (var fg)) (text-decoration underline)
                 (text-underline-offset (px 2)) (text-decoration-color (var line)))
       ("a.name:hover" (text-decoration-color (var dim)))
-      (.wrap (max-width (px 1060)) (margin 0 auto) (padding 0 (px 24)))
+      (.wrap (max-width (px ,wrap-width)) (margin 0 auto) (padding 0 (px 24)))
 
       ;; ---- nav ----
       (nav (position sticky) (top 0) (z-index 10)
@@ -228,7 +233,7 @@
                              (border-left (px 3) solid (var line)))
       (".md-body hr" (border none) (border-top (px 1) solid (var line)) (margin "2em 0"))
       (".md-body img" (max-width (pct 100)))
-      (.md-loading (max-width (px 820)) (margin (px 40) auto) (padding 0 (px 24)) (color (var dim)))))
+      (.md-loading (max-width (px 820)) (margin (px 40) auto) (padding 0 (px 24)) (color (var dim))))))
 
   ;; ---- shared nav + footer ----
   (define (nav)
@@ -255,8 +260,10 @@
   ;; ---- assemble a document ----
   ;; head-extra: extra nodes for <head>; body-nodes: the page body;
   ;; scripts: trailing <script> nodes.
+  ;; opts: (scripts [wrap-width]) -- see igropyr-styles for the width.
   (define (render-page title desc body-nodes . opts)
-    (let ((scripts (if (pair? opts) (car opts) '())))
+    (let ((scripts (if (pair? opts) (car opts) '()))
+          (wrap-width (if (and (pair? opts) (pair? (cdr opts))) (cadr opts) 1060)))
       (html->document
        `(html (@ (lang "en"))
           (head
@@ -265,7 +272,7 @@
            (title ,title)
            (meta (@ (name "description") (content ,desc)))
            (link (@ (rel "icon") (href "favicon.svg") (type "image/svg+xml")))
-           (style ,(css->string (igropyr-styles))))
+           (style ,(css->string (igropyr-styles wrap-width))))
           (body ,@body-nodes ,@scripts)))))
 
   ;; ---- build-time file I/O ----

@@ -22,4 +22,6 @@
                   "with the registry.")
    body
    (list `(script (@ (src "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js")))
-         `(script ,(raw (md-loader "docs/changelog.md" "the changelog"))))))
+         `(script ,(raw (md-loader "docs/changelog.md" "the changelog"))))
+   ;; the nav wears the article's width, so the bar lines up with the text
+   820))

@@ -21,4 +21,6 @@
                   "clients, and more.")
    body
    (list `(script (@ (src "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js")))
-         `(script ,(raw (md-loader "docs/manual.md" "the manual"))))))
+         `(script ,(raw (md-loader "docs/manual.md" "the manual"))))
+   ;; the nav wears the article's width, so the bar lines up with the text
+   820))
