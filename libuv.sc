@@ -919,7 +919,9 @@
   ;; filesystem or branches on one.
   (define fsw-table (make-eqv-hashtable))
 
-  ;; fd -> owner, for the death cleanup below. A descriptor opened here
+  ;; fd -> (owner . gen), for the death cleanup below -- the pair, not a
+  ;; bare owner; the generation note further down says why. A descriptor
+  ;; opened here
   ;; belongs to the caller between calls, which is what "one syscall per
   ;; job" means -- and a caller that dies holding one would otherwise
   ;; leak it with no signal at all. That silent shape is the one this
@@ -961,7 +963,7 @@
 
   ;; Hand a descriptor back to the kernel with no owner to tell. Used
   ;; both when an owner dies and when one dies before its open finishes.
-  ;; ITS RESULT IS NOT READ, and the two callers say "closed" on the
+  ;; ITS RESULT IS NOT READ, and its callers say "closed" on the
   ;; strength of that. If this close fails and the OS still holds the
   ;; descriptor, it is now off every book here and nothing will reclaim
   ;; it -- the same unrepairable leak the asynchronous close branch

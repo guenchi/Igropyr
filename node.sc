@@ -48,8 +48,18 @@
 ;;;   - rsend is fire-and-forget: #t means handed to a live link, #f
 ;;;     means no link -- delivery is never confirmed. Use monitor-node
 ;;;     (and application-level replies) for failure handling.
-;;;   - messages between one pair of nodes arrive in send order (one
-;;;     TCP connection per pair)
+;;;   - messages between one pair of nodes arrive in send order WITHIN
+;;;     ONE CONNECTION. Across a replacement the guarantee does not
+;;;     hold: the old and new links coexist while the old one drains
+;;;     its buffer, and it can go on to drain arbitrarily many tcp-data
+;;;     messages queued ahead of link-stop in its mailbox -- unbounded,
+;;;     not a brief window, though an earlier EOF or error can end it
+;;;     sooner -- so
+;;;     two messages sent
+;;;     either side of a replacement can arrive in either order. The
+;;;     mon/demon case is worked through where it bites; grep for
+;;;     "reordered" in this file. One TCP connection per pair is the
+;;;     steady state, and a replacement is the exception to it.
 ;;;   - rsend to the OWN node name is a plain local send (location
 ;;;     transparency)
 ;;;
@@ -127,11 +137,18 @@
 ;;; compiled constant. It is bound into
 ;;; both proofs, so the field cannot be edited on its own; welcome needs no
 ;;; version slot because by then both ends have stated and agreed one. EVERY
-;;; RAISE OF THIS NUMBER IS A BREAK, and two have happened: version 2
-;;; introduced the field itself (the pre-versioning handshake -- challenge
-;;; of 2, hello of 4 -- is refused in both directions), and version 3
-;;; widened the call frame to carry the caller's own timeout. Both were
-;;; made while this
+;;; RAISE OF THIS NUMBER IS A BREAK. The constant is 4, so three have
+;;; happened: version 2 introduced the field itself (the pre-versioning
+;;; handshake -- challenge of 2, hello of 4 -- is refused in both
+;;; directions), version 3 widened the call frame to carry the caller's
+;;; own timeout, and version 4 added boot-id and dial-gen to hello.
+;;;
+;;; ⚠ THIS SENTENCE COUNTS SOMETHING THAT CHANGES, so check it against
+;;; protocol-version rather than trusting it: the count of raises is
+;;; that constant minus one. It said "two" while the constant already
+;;; read 4.
+;;;
+;;; All were made while this
 ;;; layer carried no production traffic, and from here every wire evolution
 ;;; goes through the version rather than through a shape that older nodes
 ;;; can only read as garbage. Mismatches are refused with a reason on the
@@ -159,8 +176,10 @@
 ;;;    failures. That is enforced in both directions: inbound by the
 ;;;    ceilings on what a peer can make this node spawn, outbound by a
 ;;;    ceiling on bytes queued for a peer that has stopped reading (see
-;;;    max-outbound-bytes). Bulk data never rides the control link; it
-;;;    gets its own connection.
+;;;    max-outbound-bytes). Bulk data is not meant to ride the control
+;;;    link and should get its own connection -- ⚠ that is advice, not
+;;;    something this layer enforces: rsend will carry whatever it is
+;;;    given, and the suite sends a 70 000-character message through it.
 ;;;
 ;;; 4. THE MESH IS SMALL AND FULLY TRUSTED, AND THAT IS A FEATURE. A shared
 ;;;    secret, a full mesh, and a modest node ceiling assume a cluster
@@ -203,7 +222,8 @@
   (define handshake-max-frame 4096)
 
   ;; A NODE NAME IS BOUNDED SO THE HANDSHAKE FRAMES ALWAYS ARE. The name
-  ;; is the only variable-length field in hello and welcome, and those two
+  ;; is the longest variable-length field in hello and welcome (dial-gen
+  ;; is variable too, but bounded at 20 digits), and those two
   ;; are read under handshake-max-frame, so an unbounded name is a node
   ;; that starts, dials, and is refused by every peer for a frame it built
   ;; itself -- the failure appearing at the far end, about a value chosen
@@ -219,14 +239,28 @@
   ;; narrowing legitimate rather than an accident of this implementation
   ;; -- the same argument as the nonce grammar.
   ;;
-  ;; The arithmetic, and it holds twice over. Everything else in a hello
-  ;; is fixed: tag, a 64-character proof, a 32-character nonce, a small
-  ;; version, and the punctuation -- 112 bytes, measured. A wire-safe
-  ;; symbol is restricted by the writer to a printable ASCII subset, so
-  ;; today a name is one byte per character and 255 of them make a
-  ;; 367-byte frame. That margin does not depend on the charset staying
-  ;; that way: even if the writer grew full \xNNNNNN; escaping, nine bytes
-  ;; per character, this bound yields 2407 bytes and still fits.
+  ;; The arithmetic, and it holds twice over. Measured on the CURRENT
+  ;; (v4) hello, with this library's own writer -- a 255-character name,
+  ;; a 64-character proof, a 32-character nonce, version 4, a 16-hex
+  ;; boot-id and a dial-gen at its largest issued value (2^64-1, twenty
+  ;; digits): a maximal hello is 409 bytes and a challenge is 67. A
+  ;; wire-safe symbol is restricted by the writer to a printable ASCII
+  ;; subset, so a name is one byte per character today.
+  ;;
+  ;; ⭐ RE-MEASURE RATHER THAN TRUST THESE. They were 112 and 367 for the
+  ;; v3 shape and went stale the day boot-id and dial-gen were added, so
+  ;; the next wire change stales them again:
+  ;;
+  ;;   (import (igropyr sexpr))
+  ;;   (bytevector-length
+  ;;     (string->utf8
+  ;;       (sexpr->string-extended
+  ;;         (list 'hello (make-string 255 #\a) (make-string 64 #\f)
+  ;;               (make-string 32 #\0) 4 (make-string 16 #\a)
+  ;;               (- (expt 2 64) 1))))) That margin does not depend on the charset staying
+  ;; that way: even if the writer grew full \xNNNNNN; escaping, nine
+  ;; bytes per character, the same measurement gives 2449 bytes -- still
+  ;; under handshake-max-frame, which is 4096.
   (define max-name-length 255)
 
   ;; THE WIRE PROTOCOL VERSION. Everything on this link is fail-closed by
@@ -314,9 +348,22 @@
 
   ;; ---- the registrar's authorisation table ---------------------------
   ;;
-  ;; ONE WRITER, MANY READERS. The registrar is the only process that
-  ;; writes this table; an attempt only reads it, and only ever CONSUMES
-  ;; the one row addressed to itself. That split is what lets the check
+  ;; TWO WRITERS, AND THE REGION IS WHAT MAKES THAT SAFE. The registrar
+  ;; writes this table, and so does an attempt: authorised-connect!
+  ;; replaces the row addressed to itself, inside an atomic region, after
+  ;; re-reading it and comparing with eq?.
+  ;;
+  ;; ⭐ THE CORRECTNESS COMES FROM THE REGION, NOT FROM THE RE-READ. The
+  ;; region is uninterruptible under this scheduler, so nothing can land
+  ;; between the read and the replace; that alone is why no update is
+  ;; lost. The eq? comparison is redundant defence, not a synchronisation
+  ;; protocol -- remove the region and it does not hold, so do not read
+  ;; it as a compare-and-swap. (An earlier version of this note said the
+  ;; registrar was the only writer, which a grep of hashtable-set! on
+  ;; this table refutes.)
+  ;;
+  ;; An attempt only ever touches the one row addressed to itself.
+  ;; That split is what lets the check
   ;; and the commit share an atomic region without either of them being a
   ;; message round trip: an attempt that had to ask the registrar
   ;; "may I still?" would have to `receive`, and `receive` parks -- so the
@@ -329,8 +376,11 @@
   ;; between reading the row and writing the bit, a revocation could have
   ;; replaced the row, and the write would then mark the NEW row as
   ;; consumed -- authorising the old attempt and cancelling the new one
-  ;; in a single step. Whole replacement plus an eq? recheck is a real
-  ;; compare-and-swap; a mutable bit is not one.
+  ;; in a single step. Whole replacement plus an eq? recheck has the
+  ;; shape a compare-and-swap has, and a mutable bit does not -- but see
+  ;; the note above: the guarantee comes from the atomic region, not
+  ;; from the recheck, and calling either of these a CAS invites the
+  ;; conclusion that the region is removable.
   ;;
   ;; auth-record = #(endpoint parent child gen consumed?)
   (define peers-auth (make-eq-hashtable))
@@ -355,12 +405,38 @@
   ;; this peer forever without ever sending a valid one. An
   ;; assertion-violation raised here was swallowed exactly like a bad
   ;; proof and the peer simply never came up, with nothing said. So the
-  ;; condition carries a token the handshake guards re-raise, the way
-  ;; 'stop already is, and the connector stops rather than looping.
+  ;; condition carries a token so that a guard which sees it re-raises
+  ;; rather than treating it as a refused proof.
+  ;;
+  ;; ⛔ THAT TOKEN DOES NOT CROSS INTO THE CONNECTOR, AND AN EARLIER
+  ;; VERSION HERE SAID IT DID. Written from a grep: every path to
+  ;; next-dial-gen! runs in registrar-loop -- three direct calls, plus
+  ;; peer-gen, whose only caller is also there. None of them is inside
+  ;; the dynamic extent of dial! or of the process attempt! spawns, so
+  ;; no handshake guard is on this stack and no connector is stopped by
+  ;; it. What actually happens on exhaustion is that the REGISTRAR
+  ;; reports and dies -- and with it every future dial, since it is the
+  ;; process that hands out generations.
+  ;;
+  ;; ⚠ NAMED RESIDUAL: the registrar is spawned bare, with no
+  ;; supervision, so an unexpected raise inside it ends it with nothing
+  ;; restarting it. THIS trigger attempts to print a diagnostic first
+  ;; (see the display below; display can itself raise or block, so even
+  ;; this is not guaranteed) -- but an unexpected raise from
+  ;; anywhere else in the loop would be. Reachability here is the
+  ;; 2^64th advancing call to next-dial-gen! for one peer, after
+  ;; 2^64-1 generations have been issued; those calls are not dials --
+  ;; revoke, disconnect and endpoint change reach it too. That is why
+  ;; this trigger is recorded rather than fixed; the supervision gap is
+  ;; the part worth fixing, and it is its own item.
   ;;
   ;; WHAT THIS IS NOT: the specification calls local exhaustion a NODE
-  ;; fail-stop, and this is a connector-level stop plus a loud report --
-  ;; there is no node-wide stop primitive at this layer to call. The
+  ;; fail-stop, and this is neither that nor the connector-level stop an
+  ;; earlier version of this paragraph claimed -- it is a loud report
+  ;; followed by the death of the registrar, which is the process that
+  ;; issues generations, so no NEW attempt can be authorised for any
+  ;; peer. An attempt already authorised and in flight still completes.
+  ;; There is no node-wide stop primitive at this layer to call. The
   ;; difference is recorded rather than papered over; escalating it is a
   ;; design decision, not an implementation one. What is settled is the
   ;; part that was actually wrong: it is no longer silent, and it no
@@ -405,16 +481,23 @@
   ;; with interrupts disabled so preemption cannot interleave them (the
   ;; same discipline as the actor registry).
 
-  ;; node-name -> #(conn link-pid dialer-name)
+  ;; node-name -> a six-field entry: see make-entry and the entry-*
+  ;; accessors, which are the definition. (This line said
+  ;; #(conn link-pid dialer-name) long after the entry grew; a schema
+  ;; written out here is a copy of something that moves, so it names the
+  ;; constructor instead.)
   (define peers (make-eq-hashtable))
   ;; node-name -> #(connector-pid host port). The endpoint is part of the
   ;; value because a node keeps its name across a move: keyed on name
   ;; alone, a connector for the OLD address counts as "already dialing"
   ;; and retries it forever after the new one is published.
   (define connectors (make-eq-hashtable))
-  ;; node-name -> list of watcher pids
+  ;; node-name -> list of watcher records, not bare pids: see
+  ;; make-legacy-watcher / make-token-watcher for the shape.
   (define watchers (make-eq-hashtable))
-  ;; rcall ref -> waiting caller pid (this node is the caller)
+  ;; rcall ref -> #(caller-pid node) (this node is the caller); the node
+  ;; is in the value so a reply can be matched against where it came
+  ;; from.
   (define pending (make-eqv-hashtable))
   ;; ALSO A COUNTER, and unlike the monitor reference it is safe across a
   ;; restart -- for a reason worth stating, since the two look alike.
@@ -916,18 +999,34 @@
             (loop))
           (`#(node-stop) (void))))))
 
-  ;; THE WARDEN DOES THREE THINGS AND MAY NEVER DO A FOURTH: monitor the
-  ;; reaper, spawn a replacement, and let the replacement rescan. Anything
+  ;; THE WARDEN'S JOB IS TO KEEP ITS CHILDREN RUNNING, and every
+  ;; addition has to earn its place. ⚠ An earlier version of this line
+  ;; said it "does three things and may never do a fourth" -- monitor
+  ;; the reaper, spawn a replacement, let it rescan -- which the body no
+  ;; longer matches: it supervises two children, keeps death windows and
+  ;; counters, backs off, reports, applies a give-up policy and shuts
+  ;; children down. The bar on additions is the point and it stands; the
+  ;; count did not. Anything
   ;; added here has to pass the critical bar again, because this process is
   ;; critical and its death stops the node.
   ;;
   ;; WHAT IS FAIL-STOP HERE IS THE WARDEN, NOT THE REAPER. The design says
   ;; a reaper failure must not take the node down, and it still does not --
   ;; it is restarted. What cannot be recovered from is losing the thing
-  ;; that restarts it, and that is a dozen lines with no business logic in
-  ;; them. This is a trade rather than a removal: the risk moves from a
-  ;; process that runs with the workload to one that runs only when the
-  ;; first one dies. Recorded as a residue, not as a fix.
+  ;; that restarts it. ⚠ That was "a dozen lines with no business logic"
+  ;; when this was written and is no longer: the body now carries death
+  ;; windows, counters, backoff, diagnostics, a persistence rule, the
+  ;; fail-stop policy and child shutdown. The argument does not depend on
+  ;; its size, so the size claim is dropped rather than re-measured.
+  ;;
+  ;; This is a trade rather than a removal: the risk moves from a process
+  ;; that does ordinary per-workload work to one that does none (it is
+  ;; live alongside the workload, it just has no part in it) -- ⚠ not to
+  ;; one
+  ;; that "runs only when the first one dies", which an earlier version
+  ;; of this line said and which is false: the warden starts both
+  ;; children during initialisation, handles node shutdown, and discards
+  ;; unexpected messages. Recorded as a residue, not as a fix.
   ;; A SUPERVISOR THAT ONLY EVER RESTARTS HAS NO WAY TO SAY "I CANNOT FIX
   ;; THIS". Recovery hides the difference between a reaper that died once
   ;; and one that cannot start at all: the second becomes a quiet loop
@@ -978,15 +1077,21 @@
   ;; ---- the warden ------------------------------------------------------
   ;;
   ;; IT MONITORS A LIST OF CHILDREN, RESTARTS THEM, AND LETS EACH ONE
-  ;; REBUILD ITSELF. Three verbs, and it may never acquire a fourth: this
-  ;; process is critical, so anything added here has to earn that again.
+  ;; REBUILD ITSELF -- that is the shape, not a count of what the body
+  ;; does; see the fail-stop paragraph above for what it actually
+  ;; carries. This process is critical, so anything added here has to
+  ;; earn that again.
   ;; Going from one child to several changed how many things it watches
   ;; and not what it does with them, which is why the bar it was held to
   ;; still holds.
   ;;
   ;; What is fail-stop here is the warden, never a child. A child failing
   ;; is recovered from; losing the thing that recovers is not, and that
-  ;; thing is a page with no business logic in it.
+  ;; thing is no longer the "page with no business logic" an earlier
+  ;; version of this line claimed; see the fail-stop paragraph above for
+  ;; what it actually carries. ⚠ No size claim replaces it -- "smaller
+  ;; than the reaper" would be one more unmeasured comparison, and the
+  ;; argument here never needed one.
   ;;
   ;; EACH CHILD IS THROTTLED SEPARATELY. A shared count would let a healthy
   ;; child's restarts dilute a sick one's, and the give-up rule -- so many
@@ -2449,9 +2554,13 @@
   ;; Over the ceiling: this connection is done.
   ;;
   ;; CLOSING IS NOT ENOUGH ON ITS OWN, and that is the whole reason this
-  ;; is a procedure rather than a call to tcp-close!. This runs in the
-  ;; SENDER's process -- whoever called rsend -- while the link process is
-  ;; parked in link-loop's receive. libuv's close completion notifies
+  ;; is a procedure rather than a call to tcp-close!. This runs in
+  ;; WHICHEVER process reached write-body! -- an rsend caller most
+  ;; obviously, but rcall, monitor-remote, dispatch!, link-write and
+  ;; link-write/critical all get here too, and the note further down
+  ;; already says the link process itself can, via a ping or a reply.
+  ;; What matters for the argument is only that it is not necessarily
+  ;; the link process, which may be parked in link-loop's receive. libuv's close completion notifies
   ;; nobody: it runs the connection's cleanup thunk and frees the handle.
   ;; So the link process would sit there until its next tick, write a ping
   ;; into a closed connection (which write-frame! reports by returning #f,
@@ -3038,11 +3147,31 @@
   (define (install-peer! name c dialer boot-id gen parent)
     (let ((r (make-ireq name c dialer boot-id gen parent)))
       (let judge ((fuel 2))
-        ;; (R0) EVERYTHING THAT CAN ALLOCATE IS BUILT HERE, outside. The
-        ;; region below may take a head, two event nodes, or none of
-        ;; them; building all three unconditionally costs three small
-        ;; objects on a path that runs once per connection, and buys the
-        ;; property that the region contains no allocation at all. A
+        ;; (R0) THE CONDITIONAL ALLOCATIONS ARE BUILT HERE, outside. The
+        ;; region below takes, ON A SUCCESSFUL PASS: the spare head and
+        ;; one event for a fresh install, one event when adopting an
+        ;; orphaned head, two events and no head for a replacement, and
+        ;; nothing for a non-mutating outcome. ⚠ A pass that raises part
+        ;; way can consume fewer -- see step 3 -- so this is the
+        ;; successful-path enumeration, not an invariant.
+        ;;
+        ;; `spare` is built unconditionally on each pass through judge --
+        ;; not once per connection: a retry outcome calls judge again for
+        ;; the same connection and rebuilds it. That keeps the spare
+        ;; head, the two queue nodes,
+        ;; their two event vectors and the list spine out of the region.
+        ;; (An earlier version said "three small objects": three is the
+        ;; number of SLOTS, not of allocations, and "small" was never
+        ;; measured.) It does NOT remove every decision-dependent
+        ;; allocation: make-entry runs only on install and replace, the
+        ;; hashtable-set! on a new key can grow the table, and the
+        ;; enqueue's sequence stamp can allocate a bignum (the enqueue
+        ;; itself touches no table).
+        ;;
+        ;; ⚠ It does not make the region allocation-free -- see
+        ;; the note a few lines down, which lists what still allocates
+        ;; inside it. An earlier version of this sentence claimed the
+        ;; stronger property and was contradicted by its own neighbour. A
         ;; region that allocates can raise, and `atomically` does not
         ;; roll back -- a half-finished handover there is unreachable
         ;; state, not a retryable failure.
@@ -3088,16 +3217,36 @@
                         ;; it is worth spelling out because `atomically`
                         ;; does not roll back: whatever raises here
                         ;; leaves behind exactly what ran before it.
-                        ;;   1. make-entry -- the ONE allocation in this
-                        ;;      region, placed first, where a failure has
-                        ;;      changed nothing at all;
+                        ;;   1. make-entry -- the first step in this
+                        ;;      branch that can FAIL, and it runs before
+                        ;;      anything is published; it builds a local
+                        ;;      vector and publishes nothing itself. It
+                        ;;      is neither the only allocation in this
+                        ;;      region nor the first one: install-rules
+                        ;;      allocates before the branch is chosen.
+                        ;;      What the argument needs is the converse
+                        ;;      -- that no PUBLICATION precedes a step
+                        ;;      that can fail -- and step 3 shows that
+                        ;;      is not currently true;
                         ;;   2. hashtable-set! -- a NEW key, so this one
                         ;;      can grow the table and can raise. Nothing
                         ;;      has been queued yet when it does, so a
                         ;;      failure here publishes nothing and
                         ;;      announces nothing;
-                        ;;   3. the enqueue -- pointer writes, and they
-                        ;;      run only once the entry is published;
+                        ;;   3. the enqueue -- pointer writes plus one
+                        ;;      thing that is not: qhead-enqueue! stamps
+                        ;;      a sequence number, and that increment can
+                        ;;      allocate a bignum at fixnum overflow.
+                        ;;      ⚠ SO THIS STEP CAN RAISE AFTER THE ENTRY
+                        ;;      IS PUBLISHED, which the rest of this list
+                        ;;      assumes cannot happen: the install branch
+                        ;;      would then hold peers[name] with no
+                        ;;      node-up queued. Recorded, not fixed --
+                        ;;      reaching it needs a sequence counter past
+                        ;;      the fixnum range, and the fix belongs
+                        ;;      with the ordering argument, not beside
+                        ;;      it. The table growth is not here; it is
+                        ;;      the hashtable-set! in step 2;
                         ;;   4. the unlink -- pointer writes only, so by
                         ;;      the time the head leaves the chain there
                         ;;      is nothing left that can fail.
@@ -3129,7 +3278,11 @@
                         ;; Publishing first restores the original
                         ;; argument rather than patching around it:
                         ;; everything after the table write is a pointer
-                        ;; write and cannot fail, so there is no longer a
+                        ;; write EXCEPT the enqueue's sequence stamp,
+                        ;; which can allocate a bignum and so can raise
+                        ;; (step 3 records this; it is the one hole left
+                        ;; in the argument). Setting that aside there is
+                        ;; no longer a
                         ;; step whose failure leaves an announcement
                         ;; standing. Queueing and announcing stay one
                         ;; call -- a head holding an event while off the
@@ -3182,11 +3335,18 @@
                         ;; appended AFTER them, so the peer's own order
                         ;; survives the handover.
                         ;; Same ordering rule as the install branch, and
-                        ;; here it closes completely: make-entry first,
-                        ;; and the hashtable-set! that follows replaces an
-                        ;; EXISTING key, so it cannot grow the table and
+                        ;; here it closes further than in install --
+                        ;; though not completely, since both enqueues
+                        ;; stamp sequence numbers and a stamp can raise:
+                        ;; make-entry first, and the hashtable-set! that
+                        ;; follows replaces an EXISTING key, so it cannot
+                        ;; grow the table and
                         ;; cannot raise. Everything after the allocation
-                        ;; is a pointer write.
+                        ;; is a pointer write EXCEPT the two sequence
+                        ;; stamps named just above -- the same hole as in
+                        ;; install, and the third place this paragraph
+                        ;; family stated the pointer-write claim without
+                        ;; it.
                         (set! old e)
                         (set! cut (hashtable-ref watchers name '()))
                         (let* ((h (entry-head e))
@@ -5763,9 +5923,16 @@
                  (not (auth-consumed? r))
                  (equal? (auth-endpoint r) (cons host port))
                  (or (not (auth-parent r)) (process-alive? (auth-parent r)))
-                 ;; the compare half of the compare-and-swap: still the
-                 ;; same row we just read, not a replacement published
-                 ;; between the read and here
+                 ;; still the same row we just read, not a replacement
+                 ;; published between the read and here.
+                 ;;
+                 ;; ⚠ NOT A COMPARE-AND-SWAP, though it has that shape,
+                 ;; and this comment used to call it one. The whole
+                 ;; sequence runs in an atomic region that cannot be
+                 ;; interrupted under this scheduler, and THAT is why no
+                 ;; update is lost; this re-read is redundant defence.
+                 ;; Reading it as a lock-free protocol would suggest the
+                 ;; region could be removed, and it cannot.
                  (eq? (hashtable-ref peers-auth peer #f) r)
                  (let ((gen (auth-gen r)))
                    (hashtable-set! peers-auth peer
@@ -5778,15 +5945,22 @@
     (let* ((parent self)
            (ref (gensym))
            (child (spawn (lambda ()
-                           ;; THE EXHAUSTION TOKEN CROSSES THE PROCESS
-                           ;; BOUNDARY. dial! is careful to let it past
-                           ;; three catch-alls whose policy is "retry
-                           ;; later", and putting the call inside a
-                           ;; process adds a fourth. A plain (#t #f) here
-                           ;; would swallow it again and restore exactly
-                           ;; the silent forever-retry that token exists
-                           ;; to end -- so it is reported to the parent
-                           ;; and re-raised there, where the connector's
+                           ;; ⛔ THE EXHAUSTION TOKEN DOES NOT REACH HERE,
+                           ;; and this paragraph used to say it did.
+                           ;; next-dial-gen! is called only from
+                           ;; registrar-loop (three direct calls plus
+                           ;; peer-gen, whose sole caller is there), so
+                           ;; the token never enters this process at all
+                           ;; -- exhaustion kills the registrar instead.
+                           ;;
+                           ;; The passing-through machinery below stays
+                           ;; correct for dial-gen-exhausted if that token
+                           ;; ever does arise in here; the current paths
+                           ;; simply never raise it in this process. A
+                           ;; plain
+                           ;; (#t #f) would swallow whatever does arise,
+                           ;; so it is reported to the parent and
+                           ;; re-raised there, where the connector's
                            ;; guard can stop instead of loop.
                            (let ((outcome
                                    (guard (e ((eq? e dial-gen-exhausted)

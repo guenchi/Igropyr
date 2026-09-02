@@ -261,7 +261,7 @@
   ;; editing this file and not reading that one.
   ;;
   ;; PAYING IT UNIFORMLY IS THE POINT, and the next reader will want to
-  ;; stop. Some of these twelve bodies genuinely cannot raise, and it is
+  ;; stop. Some of these bodies genuinely cannot raise, and it is
   ;; easy to argue that those ones could keep the fast form and save
   ;; their share of the 5%. That argument is not new -- it is the rule
   ;; that used to be written here, and following it site by site is what
