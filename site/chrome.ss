@@ -213,7 +213,7 @@
       (".md-body h1" (font-size (em 2 40)))
       (".md-body h2" (font-size (em 1 60)) (padding-bottom (em 0 25)) (border-bottom (px 1) solid (var line)))
       (".md-body h3" (font-size (em 1 25)))
-      (".md-body h4" (font-size (em 1 5)))
+      (".md-body h4" (font-size (em 1 5 2)))
       (".md-body p, .md-body li" (color "#2b303a"))
       (".md-body a" (color (var acc2)))
       (".md-body ul, .md-body ol" (padding-left (px 26)) (margin "0.6em 0"))
