@@ -1727,6 +1727,76 @@
                                     (receive (after 30000 (void))
                                       (`#(stop) (void))))))))))))))))
 
+      (define (watcher-burst-session! label boot gen me ref)
+        ;; The mirror of burst-session!. There this node HOSTS a watch and
+        ;; the fixture is the watcher; here this node IS the watcher and the
+        ;; fixture is the target that will speak the mdown. After the
+        ;; handshake it READS the mon this node sends and reports the mref
+        ;; it carried -- the test needs it to build the mdown -- then waits
+        ;; for #(go n tail) and writes that one segment.
+        (spawn
+          (lambda ()
+            (tcp-connect! "127.0.0.1" port self)
+            (receive (after 3000 (send me (vector ref 'no-connect)))
+              (`#(tcp-connected ,c)
+                (tcp-read-start! c)
+                (let ((d (read-frame-or-closed label)))
+                  (if (not (and (list? d) (= (length d) 4)))
+                      (send me (vector ref (list 'challenge-shape d)))
+                      (let ((nonce-a (cadr d)) (bootid-a (cadddr d)))
+                        (tcp-write! c (frame-bytes
+                                        (list 'hello "wpeer"
+                                              (v4-proof-d nonce-a "wpeer" boot
+                                                          (number->string gen)
+                                                          wire-name-of-this-node
+                                                          bootid-a)
+                                              "beadbeadbeadbeadbeadbeadbeadbead"
+                                              4 boot gen))
+                                    #f)
+                        (let ((w (read-frame-or-closed label)))
+                          (if (not (and (list? w) (eq? (car w) 'welcome)))
+                              (send me (vector ref (if (symbol? w) w 'other)))
+                              (begin
+                                (send me (vector ref 'welcomed))
+                                ;; -> the mref of this node's mon, or #f
+                                ;; once the silence has been reported
+                                (let ((mref
+                                        (let wait ((acc ""))
+                                          (let* ((n (string-length acc))
+                                                 (nl (let scan ((k 0))
+                                                       (cond ((= k n) #f)
+                                                             ((char=? (string-ref acc k)
+                                                                      #\newline) k)
+                                                             (else (scan (+ k 1))))))
+                                                 (len (and nl (string->number
+                                                                (substring acc 0 nl)))))
+                                            (if (and len (>= n (+ nl 1 len)))
+                                                (let ((f (read (open-input-string
+                                                                 (substring acc (+ nl 1)
+                                                                            (+ nl 1 len))))))
+                                                  (if (and (list? f) (eq? (car f) 'mon)
+                                                           (= (length f) 3))
+                                                      (caddr f)
+                                                      (wait (substring acc (+ nl 1 len) n))))
+                                                (receive (after 8000
+                                                           (begin (send me (vector ref 'no-mon))
+                                                                  #f))
+                                                  (`#(tcp-data ,bv)
+                                                    (wait (string-append acc (utf8->string bv))))
+                                                  (`#(tcp-eof)
+                                                    (send me (vector ref 'closed)) #f)
+                                                  (`#(tcp-error ,_)
+                                                    (send me (vector ref 'closed)) #f)))))))
+                                  (when mref
+                                    (send me (vector ref 'armed mref))
+                                    (receive (after 20000 (void))
+                                      (`#(go ,k ,tail)
+                                        (tcp-write! c (burst-bytes k tail) #f)
+                                        (receive (after 30000 (void))
+                                          (`#(stop) (void)))))))))))))
+                (tcp-close! c))
+              (`#(tcp-connect-failed ,e) (send me (vector ref 'no-connect)))))))
+
       (define (watch-session! label boot gen mref victim-name me ref)
         ;; Handshake as "wpeer" with `boot`/`gen`. When mref, arm it.
         ;; Then report the first mdown for it, or 'no-mdown when the read
@@ -2091,6 +2161,90 @@
             (kill p1 'done) (kill p2 'done))))
       (sleep-ms 700)
       (display "a retired agent does not outlive its retirement ok\n")
+
+      ;; ---- a late mdown on a superseded link, THIS NODE AS WATCHER ------
+      ;;
+      ;; The third inbound predicate, and the one the two cells above
+      ;; cannot reach: they put the frame under test on the TARGET side (a
+      ;; mon or demon hosted here). Here this node is the WATCHER -- it
+      ;; armed a monitor-remote on the peer -- the peer's link is then
+      ;; superseded by a same-run connection, and the mdown arrives on the
+      ;; OLD link. Judged by connection it is dropped and the caller never
+      ;; hears; judged by incarnation it is honoured and the caller gets
+      ;; its remote-down. The peer is a fixture that reads the mon this
+      ;; node sends, so the mdown it speaks names the watch that exists.
+      ;;
+      ;; Same anchor as the cells above: the WELCOME of the replacement
+      ;; must arrive before the MARKER that precedes the frame under test,
+      ;; or the run is inconclusive rather than green.
+      (let* ((me self) (r1 (gensym)) (r2 (gensym)) (rm (gensym))
+             (marker (spawn (lambda ()
+                              (receive (after 30000 (void))
+                                (`(tail ,m) (send me (vector rm 'tail m))))))))
+        (register 'burst-marker-4 marker)
+        (let ((p1 (watcher-burst-session! "s-wmd-old" probe-boot-id 71 me r1)))
+          (welcomed! r1 "late-mdown-on-superseded-link-as-watcher")
+          ;; this node arms the watch; the fixture reads the mon and hands
+          ;; back the mref it carried
+          (let ((mref (monitor-remote 'wpeer 'watched-by-this-node)))
+            (receive (after 10000
+                       (fail! "late-mdown-as-watcher" 'fixture-never-saw-mon))
+              (`#(,@r1 armed ,seen)
+                (unless (eqv? seen mref)
+                  (fail! "late-mdown-as-watcher" (list 'mref seen 'want mref))))
+              (`#(,@r1 ,other) (fail! "late-mdown-as-watcher" other)))
+            ;; same run, higher generation: I8a replaces the link
+            (let ((p2 (watch-session! "s-wmd-new" probe-boot-id 72 #f #f me r2)))
+              (send p1 (vector 'go 4000
+                               (list (list 'send 'burst-marker-4 (list 'tail mref))
+                                     (list 'mdown mref 'noproc))))
+              (let ((anchor
+                      (receive (after 25000 'nothing)
+                        (`#(,@r2 welcomed) 'ordered)
+                        (`#(,@r2 ,other)
+                          (fail! "late-mdown-as-watcher" (list 'handshake other)))
+                        (`#(,@rm tail ,m) 'marker-first))))
+                (cond
+                  ((eq? anchor 'nothing)
+                   (fail! "late-mdown-as-watcher" 'no-welcome-no-marker))
+                  ((eq? anchor 'marker-first)
+                   (display "  💥 INCONCLUSIVE late-mdown-as-watcher: ")
+                   (display "the burst reached its tail before the replacement ")
+                   (display "was installed; raise the filler count\n")
+                   (kill p1 'done) (kill p2 'done))
+                  (else
+                    (receive (after 20000
+                               (fail! "late-mdown-burst-never-reached-tail"
+                                      'marker-timeout))
+                      (`#(,@rm tail ,m)
+                        (unless (eqv? m mref) (fail! "late-mdown-marker-wrong" m))))
+                    ;; THE VERDICT: the caller of monitor-remote -- this
+                    ;; process -- must receive the TARGET'S remote-down,
+                    ;; reason noproc. A node that judged the old link by
+                    ;; connection dropped that mdown and left the row
+                    ;; standing; what the caller then hears is either
+                    ;; nothing (this receive times out) or -- measured on
+                    ;; the mutant tree -- `noconnection`, synthesized when
+                    ;; the replacing session closes a few seconds later.
+                    ;; Both are red, and the reason is printed so the two
+                    ;; are told apart from a load stall: the marker before
+                    ;; the mdown already proved the frame reached the
+                    ;; dispatcher, so a wrong reason here is the gate, not
+                    ;; transit. Reading: mdown gate reverted to connection
+                    ;; identity -> FAIL late-mdown-as-watcher
+                    ;; (reason noconnection); same mutation was green
+                    ;; before this cell existed.
+                    (receive (after 15000
+                               (fail! "late-mdown-dropped-on-superseded-link-as-watcher"
+                                      'no-remote-down))
+                      (`#(remote-down wpeer watched-by-this-node ,reason)
+                        (unless (eq? reason 'noproc)
+                          (fail! "late-mdown-as-watcher" (list 'reason reason))))
+                      (`#(remote-down ,@rest)
+                        (fail! "late-mdown-as-watcher" (cons 'wrong-watch rest))))
+                    (kill p1 'done) (kill p2 'done)
+                    (sleep-ms 700)
+                    (display "a late mdown on a superseded link reaches the watcher ok\n"))))))))
 
       ;; ---- a REPEAT on a superseded link must not revoke the watch -----
       ;;
