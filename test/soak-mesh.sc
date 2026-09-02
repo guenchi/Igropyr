@@ -30,7 +30,7 @@
 ;;; not role letters. node-connect! authenticates the far end against the
 ;;; name it was given; a mismatch is a silent handshake refusal, and the
 ;;; first mesh run formed no links at all for exactly that reason.
-(import (chezscheme) (igropyr actor) (igropyr node) (igropyr gen-server))
+(import (chezscheme) (igropyr actor) (igropyr node) (igropyr gen-server) (igropyr http))
 
 (define args (cdr (command-line)))
 (unless (>= (length args) 9)
@@ -178,6 +178,18 @@
     (node-set-limits! 256 4096)
     (for-each (lambda (p) (node-connect! (peer-name p) (cadr p) (caddr p)) (monitor-node (peer-name p))) peers)
     (log "started; peers" peer-names "boot" (node-self))
+    ;; With SOAK_HTTP_PORT set, ANY role also answers HTTP on the tunnel
+    ;; address: an external load generator on another machine (ab, or
+    ;; test/soak-load.sc) then shares this node's single scheduler with the
+    ;; link churn and the crash-looping peer -- the mix neither loopback nor
+    ;; the mesh alone produces. Two hosts serving and loading each other
+    ;; makes the pressure mutual.
+    (let ((hp (getenv "SOAK_HTTP_PORT")))
+      (when hp
+        (http-listen (string->number hp)
+          (lambda (req res) (res-send! res (string->utf8 "pong")))
+          (list (cons 'host host) (cons 'workers 4)))
+        (log "http listening on" host hp)))
     (case role
       ((b)
        (host-targets!) (serve!)
