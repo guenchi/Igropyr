@@ -1,8 +1,20 @@
-(library (manual-js)
-  (export manual-loader)
+(library (md-js)
+  (export md-loader)
   (import (rnrs))
-  (define manual-loader "
-  var SRC = 'docs/manual.md';
+
+  ;; The client-side renderer shared by every markdown page: fetch the
+  ;; source, run it through marked.js, and give the headings stable ids
+  ;; so a table of contents inside the document can jump to them.
+  ;;
+  ;; SRC is the path fetched; NOUN names the page in the failure message
+  ;; ("the manual", "the changelog"), which is the only sentence a reader
+  ;; sees when the fetch or the render fails. Both are spliced in here
+  ;; rather than read from the DOM, so a page that forgets to say which
+  ;; document it is cannot compile.
+  (define (md-loader src noun)
+    (string-append "
+  var SRC = '" src "';
+  var NOUN = '" noun "';
 
   function slug(s) {
     return s.toLowerCase().trim()
@@ -10,7 +22,7 @@
       .replace(/\\s+/g, '-');
   }
 
-  (function loadManual() {
+  (function loadDoc() {
     var el = document.getElementById('md');
     el.innerHTML = '<p class=\"md-loading\">Loading…</p>';
     fetch(SRC).then(function (r) {
@@ -18,7 +30,6 @@
       return r.text();
     }).then(function (md) {
       el.innerHTML = marked.parse(md, { gfm: true, breaks: false });
-      // give headings stable ids so the in-doc table of contents jumps work
       el.querySelectorAll('h1,h2,h3,h4').forEach(function (h) {
         if (!h.id) h.id = slug(h.textContent);
       });
@@ -27,11 +38,11 @@
         if (t) t.scrollIntoView();
       }
     }).catch(function (e) {
-      el.innerHTML = '<p class=\"md-loading\">Could not render the manual ('
+      el.innerHTML = '<p class=\"md-loading\">Could not render ' + NOUN + ' ('
         + e.message + '). Read it on '
         + '<a href=\"' + SRC + '\">the raw file</a> or on '
         + '<a href=\"https://github.com/guenchi/Igropyr/blob/website/'
         + SRC + '\">GitHub</a>.</p>';
     });
   })();
-"))
+")))

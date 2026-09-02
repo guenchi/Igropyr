@@ -74,6 +74,11 @@
         (.hive (top 0) (right auto) (left (pct 50)) (width "160vw")
                (transform "translateX(-50%)") (height auto)))
       (@media "(prefers-reduced-motion: reduce)" (.hive (display none)))
+      ;; four nav links do not fit a narrow phone at the desktop sizes;
+      ;; the row tightens instead of overflowing the fixed-height bar
+      (@media "(max-width: 700px)"
+        ("nav .wrap" (gap (px 12)))
+        ("nav .links" (gap (px 10)) (font-size (px 12))))
 
       ;; ---- sections ----
       (section (padding (px 72) 0) (border-top (px 1) solid (var line)))
@@ -230,6 +235,7 @@
               (a (@ (href "index.html") (style "color:inherit")) (span "λ") " Igropyr"))
             (div (@ (class "links"))
               (a (@ (href "manual.html")) "Manual")
+              (a (@ (href "changelog.html")) "Changelog")
               (a (@ (href "agent.html")) "Agent")
               (a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub")))))
   ;; links: a list of (a ...) nodes; tagline: the remaining nodes
