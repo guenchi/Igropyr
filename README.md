@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant, high-concurrency backend framework with continuation-based web programming and a remote retry ring, built on [Chez Scheme](https://scheme.com/).
 
-**[igropyr.dev](https://igropyr.dev)** · **[Manual](https://igropyr.dev/manual.html)** · **[Changelog](CHANGELOG.md)**
+**[igropyr.dev](https://igropyr.dev)** · **[Manual](https://igropyr.dev/manual.html)** · **[Changelog](https://igropyr.dev/changelog.html)**
 
 - **Core / framework split, like Node and Express** — the core exposes one
   entry point, `(http-listen port (lambda (req res) ...))`; the bundled
