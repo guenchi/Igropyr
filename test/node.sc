@@ -1107,6 +1107,80 @@
               (else (sleep-ms 250) (loop (- tries 1)))))
       (chains-agree? "s3-chains-at-rest-after")
       (display "S3 chain cells passed\n"))
+
+    ;; ---- the hosted-monitor teardown walk drops EVERY parked monitor --
+    ;;
+    ;; A REGRESSION GUARD for drop-hosted-monitors!'s traversal, NOT a
+    ;; discriminator for the race it was rewritten to close. That race --
+    ;; a reaper retiring a node in the middle of the walk -- is not
+    ;; reachable from this harness: the walk yields only on a tick-budget
+    ;; preemption, which a few thousand monitors do not span, and send
+    ;; does not yield the sender. So no cell turns red on the truncation
+    ;; itself; that is recorded beside the code, not here. ⛔ Do not read
+    ;; this green as coverage of the race.
+    ;;
+    ;; What this DOES own is the ordinary path over a real chain: arm
+    ;; several monitors for one peer, drop the peer, and every one of them
+    ;; must retire. A walk that stops early -- popping only the head,
+    ;; mishandling the sentinel anchor, losing the tail -- leaves
+    ;; accounted above baseline here, on any tree, with no timing needed.
+    ;; Six is more than the two the chain cell above uses, so a
+    ;; middle-of-chain error has somewhere to show.
+    (let ()
+      (define (stat k)
+        (let ((e (assq k (node-monitor-stats)))) (and e (cdr e))))
+      (define (await-accounted! label want tries)
+        (let loop ((n 0))
+          (cond ((eqv? (stat 'accounted) want) 'ok)
+                ((= n tries)
+                 (fail! label (list 'accounted (stat 'accounted) 'want want)))
+                (else (sleep-ms 100) (loop (+ n 1))))))
+      (define (vname i)
+        (string->symbol (string-append "drop6-victim-" (number->string i))))
+      (await-accounted! "drop6-baseline-before" 0 80)
+      ;; the suite runs with a hosting ceiling of 2 (node-set-limits! 64 2
+      ;; near the top), so six monitors would arm two and get overload for
+      ;; the other four. Raise it for this cell -- a longer chain is the
+      ;; point -- and restore it after, since a later cell reads the 2.
+      (node-set-limits! #f 8)
+      (for-each
+        (lambda (i)
+          (register (vname i)
+            (spawn (lambda () (receive (after 60000 (void)) (`#(stop) (void)))))))
+        '(1 2 3 4 5 6))
+      (let ((me self) (ref (gensym)))
+        (spawn
+          (lambda ()
+            (let ((c (handshake-as! "drop6peer" "drop6")))
+              (for-each
+                (lambda (i)
+                  (tcp-write! c (frame-bytes (list 'mon (vname i) (+ 7000 i))) #f))
+                '(1 2 3 4 5 6))
+              (sleep-ms 800)
+              (send me (vector ref 'armed))
+              ;; hold past the main's while-armed read, then drop so the
+              ;; teardown walk runs over the whole chain at once
+              (receive (after 4000 (void)) (`#(tcp-eof) (void)))
+              (tcp-close! c))))
+        (receive (after 15000 (fail! "drop6" 'arm-timeout))
+          (`#(,@ref ,_)
+            ;; all six armed, and the three readings agree
+            (let ((g (stat 'mon-chain)) (p (stat 'mon-peer-chains))
+                  (a (stat 'accounted)))
+              (unless (and (eqv? a 6) (= g p a))
+                (fail! "drop6-arm"
+                       (list 'mon-chain g 'mon-peer-chains p 'accounted a
+                             'want 6)))))))
+      ;; the peer is gone: every parked monitor must retire
+      (await-accounted! "drop6-return-to-baseline" 0 80)
+      (let ((g (stat 'mon-chain)) (p (stat 'mon-peer-chains))
+            (a (stat 'accounted)))
+        (unless (= g p a 0)
+          (fail! "drop6-at-rest-after"
+                 (list 'mon-chain g 'mon-peer-chains p 'accounted a))))
+      (node-set-limits! #f 2)              ; restore the suite's standing ceiling
+      (display "hosted-monitor teardown drops every parked monitor ok\n"))
+
     ;; ---- S3: a dead agent's entry must not answer for a live one ------
     ;; ⚠️ SCOPE, measured: this cell does NOT discriminate the liveness
     ;; precondition on its own. Removing that check from the arming path

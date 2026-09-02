@@ -3431,18 +3431,102 @@
   ;; ⚠ THE LEAK ARGUMENT ABOVE DOES NOT JUSTIFY AN UNCONDITIONAL CALL,
   ;; though it reads as though it does. The accumulation it describes
   ;; comes from DROPS, which arrive through the death path.
+  ;; ⭐ THE WALK HANGS OFF A SENTINEL THAT NOTHING CAN RETIRE, and that
+  ;; is the whole of the arrangement. `root` is a full record built out
+  ;; here, before the region; it is never filed in callee-agents and
+  ;; never joins the global chain, so the reaper has no way to reach it
+  ;; and no reason to retire it. Its only job is to be the pprev of
+  ;; whatever record is currently first.
+  ;;
+  ;; That one job is enough, because of what the reaper does to a
+  ;; predecessor: retiring any record runs (agent-pnext-set! prev next).
+  ;; With root as the predecessor of the first survivor, every
+  ;; retirement re-links root to whatever follows -- so root reaches
+  ;; every record still on the chain, no matter which ones leave while
+  ;; the walk is between steps.
+  ;;
+  ;; ⛔ AN EARLIER VERSION KEPT THE CURSOR IN A LOCAL AND WAS TRUNCATED.
+  ;; It read `next` before sending, on the argument -- written in the
+  ;; comment it carried -- that this node's own links were about to be
+  ;; cleared by whoever retires it. That argument protects the node the
+  ;; walk has FINISHED with. It says nothing about the one it is holding:
+  ;; when the reaper retired THAT node during the send, mon-unlink-peer!
+  ;; set its pnext to #f, the next step read #f, and the walk stopped
+  ;; early -- every record after it kept its agent alive and never heard
+  ;; that it should stop. Such a record is not absent from everything: it
+  ;; stays in callee-agents and stays on the global chain, since the
+  ;; splice removes only the per-peer head. What it has lost is the one
+  ;; thing that would have ended it -- no later sweep of this peer can
+  ;; reach it, because the chain it was on is gone.
+  ;; ⛔ Reading further ahead does not fix it; it moves the exposed node
+  ;; one place along. The cursor has to be a thing that cannot be
+  ;; retired, which is what root is.
+  ;;
+  ;; ⚠ EACH POP IS ITS OWN REGION, and the send is outside it. A record
+  ;; the walk has popped is fully detached before it is used, so a
+  ;; concurrent retirement of it is a no-op: mon-unlink-peer! finds both
+  ;; links already #f, so it touches no neighbour, and its head branch
+  ;; refuses because that branch compares IDENTITY --
+  ;; (eq? (hashtable-ref mon-heads (agent-peer r) #f) r) -- and the head
+  ;; on file is not this record.
+  ;;
+  ;; ⛔ THE REASON IS THE IDENTITY TEST, NOT THE MISSING KEY, and the
+  ;; difference is reachable. A note here said the branch could not fire
+  ;; because the splice had deleted this peer's head; that holds on the
+  ;; death path, where nothing re-creates it, and fails on the
+  ;; replacement path, where a new incarnation arms and mon-heads holds
+  ;; the peer again -- with ITS record, which is why the comparison still
+  ;; says no.
+  ;;
+  ;; (The splice's delete does do the other job it is credited with: a
+  ;; new incarnation's monitors are filed under a fresh head, so they are
+  ;; not in this snapshot.)
+  ;;
+  ;; ⛔ NO CELL DISCRIMINATES THE RACE, and the reason is worth stating
+  ;; rather than leaving the surrounding green to imply otherwise. The
+  ;; window is between a pop and the send that follows it, and reaching
+  ;; it needs this process to yield there:
+  ;;   - `send` does not yield. It links the message into the target's
+  ;;     inbox and marks a parked target runnable; the sender runs on.
+  ;;   - So the walk yields only on timer preemption, and a time slice
+  ;;     is 100000 ticks -- more than a sweep costs at the default cap.
+  ;;   - The retirement that would truncate it is usually several hops
+  ;;     away: the target dies, its agent notices, the agent exits, the
+  ;;     reaper sees THAT death, and only then does it unlink.
+  ;; ⚠ NEITHER OF THOSE IS A BOUND, and an earlier version of this note
+  ;; stated them as though they were. max-hosted-monitors is settable
+  ;; without a ceiling, so a large enough cap makes a sweep outlast a
+  ;; slice; and a DOWN already sitting in the reaper's mailbox when the
+  ;; sweep starts collapses the hop count to one handoff. ⇒ What is
+  ;; true is narrower: nothing in the SUITE constructs the interleaving,
+  ;; and no cell here discriminates it.
+  ;; ⭐ The fix does not rest on either claim -- it rests on the
+  ;; structure above, which is why it survives their being wrong. There is
+  ;; a happy-path cell that sweeps many monitors and checks they are all
+  ;; stopped; it guards this loop against ordinary mistakes and ⛔ is not
+  ;; coverage of the race. Do not read its green as though it were.
   (define (drop-hosted-monitors! name)
-    (let ((head (atomically (mon-splice-peer! name))))
-      (let walk ((r head))
-        (when r
-          ;; next FIRST: this node's own links are about to be cleared by
-          ;; whoever retires it, and reading them afterwards would walk
-          ;; into a node that is no longer anywhere.
-          (let ((next (agent-pnext r)))
-            (agent-pnext-set! r #f)
-            (agent-pprev-set! r #f)
+    ;; (R0): the one allocation, and it is out here where a failure has
+    ;; changed nothing.
+    (let ((root (make-agent-rec #f #f #f #f #f)))
+      (atomically
+        (let ((h (mon-splice-peer! name)))
+          (when h
+            (agent-pnext-set! root h)
+            (agent-pprev-set! h root))))
+      (let loop ()
+        (let ((r #f))
+          (atomically
+            (set! r (agent-pnext root))
+            (when r
+              (let ((n (agent-pnext r)))
+                (agent-pnext-set! root n)
+                (when n (agent-pprev-set! n root))
+                (agent-pnext-set! r #f)
+                (agent-pprev-set! r #f))))
+          (when r
             (send (agent-pid r) (vector 'demon-local))
-            (walk next))))))
+            (loop))))))
 
   ;; A REAL DEATH, and the queue has to outlive the entry it hangs on.
   ;; The entry goes in the same region that queues this peer's own
