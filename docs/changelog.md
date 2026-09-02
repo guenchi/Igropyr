@@ -476,23 +476,3 @@ with Erlang-style green processes.
   messages. Commits before that point have different hashes than they had when the
   corresponding versions were published; their content is unchanged.
 
-## How this file was built
-
-1. The version list and its dates come from `npm view igropyr versions` and
-   `npm view igropyr time` — publish times, in UTC.
-2. Each commit on `master` is attributed to the first release whose publish time is
-   at or after the commit's own timestamp. This is what "N commits" counts.
-3. Where a tag exists, it is a second opinion on the same boundary. For 24 of the 32
-   tagged releases the tag lands exactly on the last commit attributed to it; the
-   other eight differ by one to six commits, except 1.0.0, whose tag sits at the
-   version bump 17 commits before the publish.
-4. The API lines are computed by extracting the `(export ...)` form of every library
-   at each release's last commit and diffing consecutive releases. **This sees names
-   only.** A name that survived while its arguments, return values or behaviour
-   changed does not appear there; those changes are described in prose, taken from
-   the commit that made them. Renamed libraries show up as one module gone and one
-   module added.
-5. Across the whole 1.x series the export surface is otherwise additive: 197 names in
-   20 libraries at 1.0.0, 525 names in 54 libraries at 1.5.1, and the only names ever
-   withdrawn are the two that moved out of `(igropyr websocket)` in 1.1.0 and the two
-   libraries that were renamed.
