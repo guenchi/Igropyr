@@ -455,6 +455,21 @@ echo "HTTP CRITICAL WIRING PASSED"
 "$scheme_bin" --script test/smoke-http-noncritical.sc
 echo "HTTP NONCRITICAL OPT-OUT PASSED"
 
+# ---- E7: the fault-injection shadow pass ----------------------------
+# Two passes, and both have to be here or there is no gate.
+#   1. In THIS environment (IGROPYR_INJECT unset) the injection macros
+#      must have left nothing behind: no runtime state, no branch, no
+#      dependency on the control library. The script proves it by
+#      expanding each primitive and walking the dependency closures.
+"$scheme_bin" --script test/inject-isolation.ss
+#   2. The same sources with the hooks live. FROM SOURCE ONLY: the
+#      library extensions are forced to .sc so a compiled artifact can
+#      never be picked up in preference to the source it is meant to
+#      shadow (build.ss itself lists .so before .sc). Another env var,
+#      not another build -- which is why this costs one suite, not a
+#      compile.
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/inject.sc
+
 # reached only when every suite above ran and passed
 echo "=== WHOLE SUITE RUN: every suite was reached ==="
 

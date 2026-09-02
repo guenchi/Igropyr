@@ -29,7 +29,13 @@
           conn-on-close!
           conn-state conn-count uv-owner-index-count uv-live-handle-count
           uv-strerror)
-  (import (chezscheme) (igropyr platform))
+  ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF.
+  ;; Its three macros expand to the guarded expression or to nothing
+  ;; unless IGROPYR_INJECT was on when this file was compiled, so an
+  ;; ordinary build refers to none of its runtime part and does not
+  ;; invoke it. Measured, not assumed: a consumer of it reports
+  ;; invoke-requirements () when off and ((igropyr inject)) when on.
+  (import (chezscheme) (igropyr platform) (igropyr inject))
 
   ;; Shared objects must be loaded before the foreign-procedure
   ;; definitions below are evaluated (library body runs in order).
@@ -1691,6 +1697,20 @@
   ;; [payload]; write_cb frees it and runs on-done in callback context
   ;; (must not yield). Returns #t if queued, #f on immediate error.
   (define (enqueue-write! c len fill-data! on-done)
+    ;; ⭐ INJECTION POINT (E1, allocation failure). Placed BEFORE the
+    ;; allocation and before anything is published, so an injected raise
+    ;; leaves exactly the state a real out-of-memory would: no block, no
+    ;; write-table entry, nothing for the caller to unwind.
+    ;;
+    ;; ⚠ IT IS NOT OUTSIDE EVERY INTERRUPT REGION, and an earlier note
+    ;; here said it was -- checked lexically, where it does sit before
+    ;; this procedure's own region, and not against the callers.
+    ;; tcp-writev!'s small-write path enters a region and reaches here
+    ;; without leaving it, and node.sc calls tcp-writev! inside
+    ;; `atomically` as well. Raising there is nonetheless right: the
+    ;; allocation this stands in for is in the same place, so the
+    ;; injection reproduces the real failure rather than a tidier one.
+    (inject-fault! 'writev-oom)
     (let* ((block (foreign-alloc (+ write-req-size buf-t-size len)))
            (buf-ptr (+ block write-req-size))
            (data-ptr (+ buf-ptr buf-t-size)))
@@ -1725,7 +1745,14 @@
             (begin
               (hashtable-set! write-table block
                 (or on-done (lambda (status) (void))))
-              (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
+              ;; ⭐ INJECTION POINT (E1, negative errno). It wraps the RAW
+              ;; FFI call and nothing else, which is what inject-return!
+              ;; requires: when armed the call is SKIPPED, so the block is
+              ;; never handed to libuv and the failure path below is free
+              ;; to free it. Wrapping anything that had already acted on
+              ;; the result would fake a failure after the work was done.
+              (let ((r (inject-return! 'uv-write-neg
+                         (uv-write block (conn-handle c) buf-ptr 1 on-write-entry))))
                 (if (< r 0)
                     (begin
                       (hashtable-delete! write-table block)
@@ -1775,7 +1802,26 @@
                          (loop (cdr ss) (+ off n)))))
                    (foreign-set! 'void* scratch-buf 0 write-scratch)
                    (foreign-set! 'unsigned-64 scratch-buf 8 total)
-                   (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))
+                   ;; ⭐ INJECTION POINT (E1, "nothing went out yet").
+                   ;; Frames up to the scratch size finish here and never
+                   ;; reach the queued path, so without this knob the
+                   ;; small control frames -- mon, mdown, demon, a short
+                   ;; rsend -- can never be made to fail. Injecting 0
+                   ;; (EAGAIN) sends the caller down the queue-it-all
+                   ;; branch, where the other two knobs live.
+                   ;;
+                   ;; ⛔ ZERO, NEVER A POSITIVE PARTIAL COUNT. ⚠ 0 is not
+                   ;; something uv_try_write actually returns for a
+                   ;; non-empty buffer -- libuv gives a positive count or
+                   ;; a negative UV_EAGAIN -- so this is a surrogate, and
+                   ;; it is chosen as the smallest value that lands on
+                   ;; the queue-everything branch below without claiming
+                   ;; any byte was written. A positive count would
+                   ;; make the caller queue only the suffix -- the
+                   ;; counter-example inject-return!'s rule is written
+                   ;; against, and unrecoverable at every layer above.
+                   (let ((n (inject-return! 'try-write-eagain
+                              (uv-try-write (conn-handle c) scratch-buf 1))))
                      (cond
                        ((= n total)                 ; fully written now
                         (when on-done (on-done 0)) #t)

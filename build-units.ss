@@ -13,9 +13,37 @@
 ;;; Four copies of a list is four chances to forget. There is now one,
 ;;; and it is compared against the directory rather than trusted.
 
+;; ⛔ NO PRODUCTION BUILD MAY BE MADE WITH FAULT INJECTION ARMED, and
+;; this is the place that can say so once. The switch is read when a
+;; library is expanded, so a .so compiled while IGROPYR_INJECT=on carries
+;; injection code and an invoke-time refusal -- an artifact that is
+;; neither usable in production nor obviously broken until something
+;; loads it.
+;;
+;; ⭐ IT LIVES HERE BECAUSE THE LIST DOES. build.ss is not the only thing
+;; that compiles these units: build-whole.ss, build-profile.ss and
+;; build-pgo.ss load this same file and compile the same names. A refusal
+;; written into one of four consumers is a refusal three builds do not
+;; have -- and the first version of this guard was exactly that.
+;; ⚠ AND ONLY A FIFTH ENTRY POINT THAT LOADS THIS FILE gets it. An
+;; entry point calling compile-library or compile-program directly is
+;; outside this guard entirely -- today there is none, and that is a
+;; fact about the repository rather than a property of this line.
+(let ((v (getenv "IGROPYR_INJECT")))
+  (when (and v (string=? v "on"))
+    (assertion-violation 'build-units
+      "IGROPYR_INJECT=on: refusing to compile igropyr libraries with fault injection armed")))
+
 (define library-units
   '("igropyr/util.sc"
     "igropyr/checked.sc"
+    ;; ⭐ COMPILED EVEN THOUGH IT SHIPS INERT. libuv imports it, so it has
+    ;; to resolve in a compiled build; with IGROPYR_INJECT unset its
+    ;; macros expand to the guarded expression or to nothing and no
+    ;; consumer refers to its runtime part. The refusal at the head of
+    ;; this file stops every build entry point that loads the list, so
+    ;; this line cannot produce an armed .so.
+    "igropyr/inject.sc"
     "igropyr/buffer.sc"
     "igropyr/platform.sc"
     "igropyr/durable.sc"
@@ -100,7 +128,9 @@
   '(("app.sc"
      . "entry-point program, not a library: the whole-program builds compile it with compile-program, and a per-library build must not compile it at all")
     ("qjs-worker.sc"
-     . "standalone script, run as `scheme --script igropyr/qjs-worker.sc`; nothing imports it")))
+     . "standalone script, run as `scheme --script igropyr/qjs-worker.sc`; nothing imports it")
+    ("inject-control.sc"
+     . "test-only: the arming side of fault injection. ⛔ Compiling it into a production build would put the instrument in the product; nothing in the library imports it, and test/inject-isolation.ss checks that mechanically by walking invoke edges")))
 
 ;; Compare the list against the directory it claims to describe.
 ;;

@@ -12,6 +12,11 @@
 
 (import (chezscheme))
 
+;; The refusal to build with fault injection armed is NOT here: it is at
+;; the head of build-units.ss, which every build entry point loads. It
+;; was here first, and three other entry points compiled the same list
+;; without it.
+
 ;; (source . optimize-level), in dependency order so each library's
 ;; already-compiled dependencies are picked up as .so.
 ;; The list itself lives in build-units.ss, loaded rather than copied:
