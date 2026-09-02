@@ -30,13 +30,6 @@
       return r.text();
     }).then(function (md) {
       el.innerHTML = marked.parse(md, { gfm: true, breaks: false });
-      // The page shell already prints the document's title above this
-      // element, so a leading <h1> from the source would be the second
-      // one on the page. It stays in the file -- read raw or on GitHub,
-      // a document wants its own title -- and is dropped here, where the
-      // shell's heading is the one in view.
-      var lead = el.firstElementChild;
-      if (lead && lead.tagName === 'H1') el.removeChild(lead);
       el.querySelectorAll('h1,h2,h3,h4').forEach(function (h) {
         if (!h.id) h.id = slug(h.textContent);
       });

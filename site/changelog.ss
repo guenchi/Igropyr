@@ -6,9 +6,6 @@
 (define body
   (list
    (nav)
-   `(div (@ (class "manualhead"))
-      (div (@ (class "wrap"))
-        (h1 "Changelog")))
    `(main (@ (id "md") (class "md-body"))
       (p (@ (class "md-loading")) "Loading the changelog…"))
    (foot (list `(a (@ (href "index.html")) "Igropyr")

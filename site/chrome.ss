@@ -194,12 +194,14 @@
                         (padding (px 1) (px 5)) (border-radius (px 4)))
       (.backlink (display inline-block) (margin-top (px 8)) (color (var dim)) (font-size (px 14)))
 
-      ;; ---- rendered markdown (manual) ----
-      (.manualhead (padding (px 40) 0 (px 8)))
-      (".manualhead .wrap" (display flex) (align-items center) (gap (px 16)))
-      (".manualhead h1" (font-size (px 34)) (letter-spacing "-.5px") (margin 0))
-      (.md-body (max-width (px 820)) (margin 0 auto) (padding (px 20) (px 24) (px 90))
+      ;; ---- rendered markdown (manual, changelog) ----
+      ;; the document's own leading heading is the page's title: the shell
+      ;; prints none, so the top padding here is the space above it and its
+      ;; heading margin is dropped
+      (.md-body (max-width (px 820)) (margin 0 auto) (padding (px 44) (px 24) (px 90))
                 (color "#2b303a") (font-size (px 16)) (line-height (dec 1 7)))
+      (".md-body > :first-child" (margin-top 0))
+      (".md-body > h1:first-child" (font-size (px 34)) (letter-spacing "-.5px"))
       (".md-body h1, .md-body h2, .md-body h3, .md-body h4"
        (color (var fg)) (letter-spacing "-.3px") (line-height (dec 1 3))
        (margin "1.9em 0 .6em") (scroll-margin-top (px 72)))
