@@ -683,6 +683,13 @@
   ;; is exactly the shape a peer could aim at by parking as many as the
   ;; ceiling allows.
   ;;
+  ;; ⭐ THE CAPTURE IS NOW HELD BY THE CALLER'S TRANSACTION. Both callers
+  ;; run this inside the same atomic region that publishes or removes the
+  ;; peers entry, and hang the returned head under a sentinel they
+  ;; allocated beforehand. This procedure therefore has exactly one job
+  ;; left -- take the chain off mon-heads -- and no opinion about who
+  ;; walks it.
+  ;;
   ;; The nodes stay on the GLOBAL chain, deliberately -- and it is worth
   ;; being precise about WHEN that matters, because the ordinary path does
   ;; not depend on it. An evicted agent gets its notice, exits, and the
@@ -3040,6 +3047,21 @@
         (let* ((spare (list (new-qhead)
                             (make-qnode (make-event 'node-down name) #f '())
                             (make-qnode (make-event 'node-up name) #f '())))
+               ;; (R0) THE SWEEP'S ANCHOR, BUILT OUT HERE WITH EVERYTHING
+               ;; ELSE. The capture in the region below is two pointer
+               ;; writes plus an eq-hashtable delete; building the record
+               ;; there would add an allocation to a step that has none.
+               ;; ⚠ THE REGION AS A WHOLE IS NOT ALLOCATION-FREE, and an
+               ;; earlier version of this note implied it was: the rule
+               ;; list is built inside it, make-entry runs inside it, and
+               ;; qhead-enqueue!'s sequence counter can allocate a bignum
+               ;; at fixnum overflow. That is the pre-existing shape this
+               ;; spare list exists to reduce, not one this line
+               ;; achieves.
+               ;; Unused unless the decision is a new incarnation, which
+               ;; costs one small object on a path that runs once per
+               ;; connection -- the same trade the spares above make.
+               (root (make-agent-rec #f #f #f #f #f))
                (cut #f)
                (old #f)
                (decision
@@ -3172,6 +3194,36 @@
                           (qhead-enqueue! h (caddr spare) cut)
                           (hashtable-set! peers name ne))
                         (tcp-close! (entry-conn e))
+                        ;; ⭐ CAPTURE THE HOSTED CHAIN HERE, IN THE SAME
+                        ;; TRANSACTION THAT PUBLISHED THE NEW ENTRY. It
+                        ;; used to happen later, in a region of its own,
+                        ;; and the gap between the two was a window: a
+                        ;; new incarnation arming in it filed its agent
+                        ;; under the head this sweep was about to take,
+                        ;; and the sweep carried the new run's monitor
+                        ;; away with the old run's.
+                        ;; ⭐ Publishing and capturing being one step is
+                        ;; what closes it -- any arm at all is now either
+                        ;; before the capture (and belongs to the old run)
+                        ;; or after it, under a head this walk cannot
+                        ;; reach. C5 stops being a property the splice
+                        ;; happened to buy and becomes one the transaction
+                        ;; guarantees.
+                        ;;
+                        ;; ⚠ LAST IN THE REGION, and that is not tidiness.
+                        ;; Everything above can still raise; if one of
+                        ;; them did after mon-heads had been cleared, the
+                        ;; chain would be off the table with nobody
+                        ;; holding it. Placed here, a failure earlier
+                        ;; leaves mon-heads untouched.
+                        ;; Pointer writes only -- mon-splice-peer! does an
+                        ;; eq-hashtable lookup and delete, neither of
+                        ;; which can grow a table.
+                        (when (new-incarnation? e r)
+                          (let ((h (mon-splice-peer! name)))
+                            (when h
+                              (agent-pnext-set! root h)
+                              (agent-pprev-set! h root))))
                         'replaced)
                        (else d)))))) 
           (case decision
@@ -3287,8 +3339,33 @@
              ;; a hosted watch belongs to the connection it was armed on
              ;; or to the peer. Until that is decided, this path does
              ;; what it did before generations existed.
+             ;; ⛔ THE WALK GOES FIRST, AND THE ORDER IS LOAD-BEARING.
+             ;; After the region, root is the only thing that can lead a
+             ;; SWEEP to the captured chain: the records are still on the
+             ;; global chain and still in callee-agents -- which is how
+             ;; the reaper collects one whose agent happens to die -- but
+             ;; nothing else will ever send them demon-local. stop-link!
+             ;; sends, and a send allocates: a raise there unwinds past
+             ;; root and leaves those agents running with no path that
+             ;; ends them.
+             ;;
+             ;; ⚠ AND A KILL BETWEEN THE REGION AND HERE DOES THE SAME.
+             ;; Interrupts are back on the moment the region ends, and a
+             ;; killed process's continuation is dropped, so this
+             ;; ordering shortens the exposure and does not remove it.
+             ;; Recorded rather than repaired: making the handoff
+             ;; kill-safe means the captured chain has to live somewhere
+             ;; other than a stack slot, which is a lifetime-management
+             ;; surface wider than the window it would close. The same
+             ;; hazard existed at the exit of the old splice
+             ;; transaction.
+             ;; ⚠ Unconditional: for a same-incarnation replacement the
+             ;; region captured nothing, root is empty, and this is a
+             ;; no-op. The condition that used to be here now lives at
+             ;; the capture, where it belongs -- deciding what to take is
+             ;; the transaction's business, not the walker's.
+             (drop-hosted-monitors! root)
              (stop-link! (entry-conn old) (entry-link old) 'replaced)
-             (when (new-incarnation? old r) (drop-hosted-monitors! name))
              (fail-pending-for! name)
              (dispatch-wake!)
              'replaced)
@@ -3518,28 +3595,31 @@
   ;; a happy-path cell that sweeps many monitors and checks they are all
   ;; stopped; it guards this loop against ordinary mistakes and ⛔ is not
   ;; coverage of the race. Do not read its green as though it were.
-  (define (drop-hosted-monitors! name)
+  (define (drop-hosted-monitors! root)
     ;; (R0): the one allocation, and it is out here where a failure has
     ;; changed nothing.
-    (let ((root (make-agent-rec #f #f #f #f #f)))
-      (atomically
-        (let ((h (mon-splice-peer! name)))
-          (when h
-            (agent-pnext-set! root h)
-            (agent-pprev-set! h root))))
-      (let loop ()
-        (let ((r #f))
-          (atomically
-            (set! r (agent-pnext root))
-            (when r
-              (let ((n (agent-pnext r)))
-                (agent-pnext-set! root n)
-                (when n (agent-pprev-set! n root))
-                (agent-pnext-set! r #f)
-                (agent-pprev-set! r #f))))
+    ;; ⭐ ROOT ARRIVES CAPTURED. The caller took this peer's chain off
+    ;; mon-heads and hung it under root inside its OWN atomic transaction,
+    ;; the same one that published the new entry or removed the old one.
+    ;; ⛔ This function does not read mon-heads and must not: doing the
+    ;; capture here would put it in a second transaction, and between the
+    ;; two a new incarnation could file an arm under a head this walk
+    ;; would then take away.
+    ;; A root with nothing under it is the ordinary case for a
+    ;; same-incarnation replacement; the walk is then a no-op.
+    (let loop ()
+      (let ((r #f))
+        (atomically
+          (set! r (agent-pnext root))
           (when r
-            (send (agent-pid r) (vector 'demon-local))
-            (loop))))))
+            (let ((n (agent-pnext r)))
+              (agent-pnext-set! root n)
+              (when n (agent-pprev-set! n root))
+              (agent-pnext-set! r #f)
+              (agent-pprev-set! r #f))))
+        (when r
+          (send (agent-pid r) (vector 'demon-local))
+          (loop)))))
 
   ;; A REAL DEATH, and the queue has to outlive the entry it hangs on.
   ;; The entry goes in the same region that queues this peer's own
@@ -3550,6 +3630,8 @@
   ;; entry to reach it through; it leaves both chains when it empties.
   (define (remove-peer! name c)
     (let* ((node (make-qnode (make-event 'node-down name) #f '()))  ; (R0): outside
+           ;; (R0) The sweep's anchor, as on the replacement path.
+           (root (make-agent-rec #f #f #f #f #f))
            (cut #f)
            (mine?
              (atomically
@@ -3560,10 +3642,35 @@
                         (qhead-enqueue! h node cut)
                         (hashtable-delete! peers name)
                         (orphan-attach! h name)
+                        ;; ⭐ CAPTURE IN THE SAME TRANSACTION, LAST, and
+                        ;; for the same reasons the replacement path
+                        ;; gives at length: nothing after this point in
+                        ;; the region can fail, so mon-heads is cleared
+                        ;; only once the removal is certain, and a peer
+                        ;; that comes back files its arms under a head
+                        ;; this capture cannot reach.
+                        ;; ⛔ AND THIS PATH HAD THE SAME WINDOW, which an
+                        ;; earlier note here denied on the grounds that
+                        ;; the entry is deleted in this very region.
+                        ;; Deleting it does not prevent a reinstall -- it
+                        ;; ENABLES one: with peers[name] gone, another
+                        ;; process could install a new incarnation, serve
+                        ;; a mon, and have mon-link! build a fresh head,
+                        ;; all before this process reached the separate
+                        ;; splice transaction it used to run. That splice
+                        ;; would then take the NEW peer's chain.
+                        ;; ⭐ Capturing here closes it, exactly as on the
+                        ;; replacement path; the two paths are the same
+                        ;; shape because they had the same defect, not
+                        ;; only for tidiness.
+                        (let ((h (mon-splice-peer! name)))
+                          (when h
+                            (agent-pnext-set! root h)
+                            (agent-pprev-set! h root)))
                         #t))))))
       (tcp-close! c)
       (when mine?
-        (drop-hosted-monitors! name)       ; free monitors this peer parked here
+        (drop-hosted-monitors! root)       ; free monitors this peer parked here
         (fail-monitors-for! name)          ; DOWN(noconnection) for watchers
         (fail-pending-for! name)           ; nothing will answer these now
         (dispatch-wake!))))
