@@ -3,20 +3,24 @@
 // against a real WebGL bridge. No precompiled binary is shipped — the
 // site's fire is literally compiled by Goeteia in your browser.
 // Copyright (c) 2026 guenchi. MIT license; see LICENSE.
-import { makeJsBridge, jsBridgeStubs } from './rt/jsbridge.mjs';
+// The compiler, the loader bridge and the library sources it is fed all
+// come from one versioned CDN prefix, so they cannot drift apart; only
+// this site's own sources (site/*.ss) are fetched from here.
+const CDN = 'https://cdn.goeteia.dev/1.5.8';
+import { makeJsBridge, jsBridgeStubs } from 'https://cdn.goeteia.dev/1.5.8/jsbridge.mjs';
 
 // prelude + the libraries fire.ss imports, then fire.ss itself. The
 // compiler splices each (library ...) and treats (import ...) as a
 // no-op, so imports resolve against these definitions; dependencies
 // come before their dependents (gl needs js).
 const SOURCES = [
-    'src/prelude.ss',
-    'lib/web/js.ss',
-    'lib/web/dom.ss',
-    'lib/gfx/glsl.ss',
-    'lib/gfx/gl.ss',
-    'lib/gfx/mat.ss',
-    'lib/gfx/fx.ss',
+    CDN + '/src/prelude.ss',
+    CDN + '/lib/web/js.ss',
+    CDN + '/lib/web/dom.ss',
+    CDN + '/lib/gfx/glsl.ss',
+    CDN + '/lib/gfx/gl.ss',
+    CDN + '/lib/gfx/mat.ss',
+    CDN + '/lib/gfx/fx.ss',
     'site/hive-data.ss',
     'site/fire.ss',
 ];
@@ -32,7 +36,7 @@ const stubs = {
     let wasmBuf, texts;
     try {
         [wasmBuf, ...texts] = await Promise.all([
-            fetch('goeteia.wasm').then(r => r.arrayBuffer()),
+            fetch(CDN + '/goeteia.wasm').then(r => r.arrayBuffer()),
             ...SOURCES.map(p => fetch(p).then(r => r.text())),
         ]);
     } catch { return; }                              // offline: skip the fire
