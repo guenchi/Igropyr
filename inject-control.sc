@@ -14,7 +14,7 @@
 ;;; perturbs.
 (library (igropyr inject-control)
   (export inject-arm-fault! inject-arm-return! inject-release!
-          inject-disarm! inject-hits inject-armed-points)
+          inject-disarm! inject-hits inject-delivered inject-armed-points)
   (import (chezscheme) (igropyr inject) (igropyr actor))
 
   ;; -> ticket. occurrence: #f = every hit, k = the k-th hit only.
@@ -55,4 +55,9 @@
   (define (inject-release! ticket) ($inject-release! ticket))
   (define (inject-disarm!) ($inject-disarm!))
   (define (inject-hits point) ($inject-hits point))
+
+  ;; How many times an injected value was actually returned at this
+  ;; point. Differs from inject-hits when the wrapped expression raises:
+  ;; the occurrence is spent, nothing is delivered.
+  (define (inject-delivered point) ($inject-delivered-count point))
   (define (inject-armed-points) ($inject-armed-points)))

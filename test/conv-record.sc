@@ -467,15 +467,20 @@
                           (display id2) (newline)
                           (exit 0)))))
                   p)))
+      ;; stdout is the protocol -- two ids, one per line -- and stderr is
+      ;; kept apart from it: merged with 2>&1, any extra line the child
+      ;; prints (a Chez notice, an expansion banner, a future warning)
+      ;; would sit at the head of the file and be read as an id.
       (let* ((out (string-append root "/stage1.out"))
+             (err (string-append root "/stage1.err"))
              (rc (system (string-append
                            "cd " (current-directory) " && "
                            "CHEZSCHEMELIBDIRS=. "
                            "CHEZSCHEMELIBEXTS=\""
                            (or (getenv "CHEZSCHEMELIBEXTS") "") "\" "
-                           scheme-bin " --script " stage1 " > " out " 2>&1"))))
+                           scheme-bin " --script " stage1 " > " out " 2> " err))))
         (unless (zero? rc)
-          (system (string-append "cat " out))
+          (system (string-append "cat " out " " err))
           (fail "stage 1 (the writing process) failed" rc))
         (let* ((lines (call-with-input-file out
                         (lambda (p)

@@ -24,6 +24,7 @@
           fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc fs-o-excl
           fs-o-directory fs-o-cloexec
           fs-count dns-count listener-backlog-effective
+          uv-accept-failure-counts
           tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
           conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
@@ -31,7 +32,7 @@
           conn-state conn-count uv-owner-index-count uv-live-handle-count
           uv-strerror)
   ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF.
-  ;; Its three macros expand to the guarded expression or to nothing
+  ;; Its four macros expand to the guarded expression or to nothing
   ;; unless IGROPYR_INJECT was on when this file was compiled, so an
   ;; ordinary build refers to none of its runtime part and does not
   ;; invoke it. Measured, not assumed: a consumer of it reports
@@ -260,9 +261,11 @@
   (define (uv-set-deliver! proc) (set! deliver proc))
 
   ;; owner pid -> list of resources it may own. This is an INDEX, not the
-  ;; truth: entries are added when ownership is established and never
-  ;; removed on release, so the list is a superset and every candidate is
-  ;; re-checked against the real owner before anything is closed. That
+  ;; truth: entries are added when ownership is established and removed
+  ;; by unindex-owner! when a resource is finished with -- but a resource
+  ;; handed to another owner leaves its entry behind on purpose, so the
+  ;; list is still a superset and every candidate is re-checked against
+  ;; the real owner before anything is closed. That
   ;; asymmetry is deliberate -- a stale entry costs one failed check, while
   ;; a MISSING entry would silently skip a resource that had to be freed,
   ;; and conn-set-owner! is exported, so ownership can move at any time.
@@ -274,10 +277,69 @@
   ;; ended. The two quantities that grow under load were multiplying.
   (define owner-index (make-eq-hashtable))
 
+  ;; ⛔ THE READ AND THE WRITE ARE ONE STEP. Both of these are
+  ;; read-modify-write on a table several green processes touch, and
+  ;; neither was uninterruptible: a preemption between the read and the
+  ;; write dropped whatever the other process had just added. The region
+  ;; is nested wherever a caller already holds one -- that is safe, the
+  ;; disable is counted -- so callers do not have to know.
   (define (index-owner! owner kind key)
     (when owner
-      (hashtable-set! owner-index owner
-        (cons (cons kind key) (hashtable-ref owner-index owner '())))))
+      (with-interrupts-disabled
+        (hashtable-set! owner-index owner
+          (cons (cons kind key) (hashtable-ref owner-index owner '()))))))
+
+  ;; A cell for owner-index-publish!, built where allocation is allowed.
+  ;; Two pairs: the entry itself and the list cell that will carry it.
+  ;; ⚠ Publishing is set-cdr! plus hashtable-set!, and the latter CAN
+  ;; allocate -- it adds a key the first time an owner appears, and may
+  ;; grow. ⚠ Preparing separately no longer shortens the region -- both
+  ;; callers now prepare INSIDE theirs -- it survives because publishing
+  ;; is then a set-cdr! and a store with the key already in hand, not
+  ;; the region allocating nothing; an earlier version of this note
+  ;; claimed the latter.
+  ;; ⚠ THE KEY IS FILLED IN AT PUBLISH TIME, not here, because the key
+  ;; is a foreign address that does not exist yet: the allocation that
+  ;; produces it happens inside the region, so that a kill before the
+  ;; region can lose nothing but Scheme objects the collector reclaims.
+  (define (owner-index-prepare! kind)
+    (cons (cons kind #f) '()))
+
+  ;; Push a prepared cell, filling in the key. Caller holds the region.
+  ;; ⚠ NOT allocation-free: the hashtable-set! can add a key or grow the
+  ;; table, and either allocates. The split survives because publishing
+  ;; is then a set-cdr! and a store with the key already in hand -- ⛔
+  ;; not because it makes the region allocation-free, which an earlier
+  ;; version of this note claimed.
+  (define (owner-index-publish! owner cell key)
+    (when owner
+      (set-cdr! (car cell) key)
+      (set-cdr! cell (hashtable-ref owner-index owner '()))
+      (hashtable-set! owner-index owner cell)))
+
+  ;; Undo owner-index-publish!, and ONLY when the cell is still the head.
+  ;; Caller holds the region.
+  ;;
+  ;; ⭐ IT IS A NO-OP OTHERWISE, ON PURPOSE. Inside one region nothing
+  ;; else can have pushed, so if the cell is the head it was published
+  ;; here and popping it is exact.
+  ;;
+  ;; ⚠ "NOT THE HEAD" DOES NOT MEAN "NEVER PUBLISHED" IN GENERAL -- a
+  ;; synchronous re-entry that called index-owner! after this publish
+  ;; would leave the cell below the new head, and this would silently do
+  ;; nothing. Nothing does that today (the publish is the last expression
+  ;; in every region that uses it), and that is the condition to recheck
+  ;; before adding anything after a publish. Where the cell is not the
+  ;; head, an
+  ;; unindex-owner! sweep here would be a linear search removing an
+  ;; entry that some other operation legitimately owns.
+  (define (owner-index-unpublish-head! owner cell)
+    (when owner
+      (when (eq? (hashtable-ref owner-index owner '()) cell)
+        (let ((rest (cdr cell)))
+          (if (null? rest)
+              (hashtable-delete! owner-index owner)
+              (hashtable-set! owner-index owner rest))))))
 
   ;; Drop an entry when the resource is finished with.
   ;;
@@ -287,7 +349,10 @@
   ;; accumulated one entry per operation it ever performed, held for the
   ;; life of that process, and then walked every one of them inside a
   ;; no-interrupts region when it finally died. Removal keeps the cost
-  ;; proportional to what is OPEN rather than to what has ever happened.
+  ;; proportional to what removal has reached rather than to what has
+  ;; ever happened. ⚠ It is still a superset of what the owner holds: a
+  ;; resource handed to another owner leaves its entry behind on purpose
+  ;; (see conn-set-owner!).
   ;;
   ;; Still a superset, not the truth: a resource handed on to another owner
   ;; leaves its entry behind under the old one, and uv-owner-died! re-checks
@@ -306,8 +371,19 @@
               n
               (loop (fx+ i 1) (fx+ n (length (vector-ref vs i)))))))))
 
+  ;; ⚠ THE SEARCH RUNS INSIDE THE REGION, AND THAT COST IS REAL. remp is
+  ;; O(n) and allocates, and n is the number of resources this owner has
+  ;; OPEN -- so a long-lived owner holding many open resources makes the
+  ;; region correspondingly long. That is the price of the read-modify-
+  ;; write being atomic, and it is named here rather than hidden: the
+  ;; bound is the length of that owner's index list. ⚠ That list is a
+  ;; SUPERSET of what the owner still holds -- a resource handed to
+  ;; another owner leaves its entry behind on purpose, see the note at
+  ;; conn-set-owner! -- so it is not exactly "open resources", only
+  ;; bounded by what removal has not yet reached.
   (define (unindex-owner! owner kind key)
     (when owner
+      (with-interrupts-disabled
       (let ((xs (hashtable-ref owner-index owner '())))
         (unless (null? xs)
           (let ((rest (remp (lambda (e)
@@ -315,7 +391,7 @@
                             xs)))
             (if (null? rest)
                 (hashtable-delete! owner-index owner)
-                (hashtable-set! owner-index owner rest)))))))
+                (hashtable-set! owner-index owner rest))))))))
 
   ;; Ownership is public and mutable -- an application hands a conn to the
   ;; process that will read it, and may hand it on again. The index has to
@@ -523,14 +599,92 @@
 
   ;; connection_cb: accept, register, hand the conn to the upper layer.
   ;; Accept errors are swallowed; the listener must stay alive.
+  ;; Accept failures, counted rather than logged. Two of them, because
+  ;; they mean different things: `error` is the listener callback being
+  ;; handed a negative status by libuv; `refused` is uv_accept declining
+  ;; a connection that was already announced.
+  ;;
+  ;; ⭐ COUNTED BECAUSE THE ALTERNATIVE WAS NOTHING AT ALL. Both branches
+  ;; discard silently -- correctly, since the listener has to stay alive
+  ;; -- so a server dropping every arrival looked exactly like a server
+  ;; nobody was calling. The kernel counts what it refuses itself; this
+  ;; is the half that happens after the kernel handed the connection up.
+  ;;
+  ;; ⚠ SATURATING, NOT WRAPPING. A wrapped counter reports a small number
+  ;; after a large failure, and small numbers are the ones that get
+  ;; ignored; at the ceiling this one stops moving instead, which is
+  ;; "at least this many".
+  ;;
+  ;; ⛔ THAT IS STILL A LOSS, AND IN A MISLEADING DIRECTION: an observer
+  ;; watching deltas sees a saturated counter stop changing and can read
+  ;; that as recovery. Saturation is chosen because the alternative is
+  ;; worse, not because it is safe.
+  (define accept-error-count 0)
+  (define accept-refused-count 0)
+  (define (bump-saturating n)
+    (if (fx< n (greatest-fixnum)) (fx+ n 1) n))
+  ;; ⚠ BOTH VALUES ARE READ IN ONE REGION, then the list is built
+  ;; outside it. Reading them across the allocations of the list would
+  ;; let a bump land in between, so the pair returned could pair an old
+  ;; error count with a new refused count -- a combination that never
+  ;; existed. Individual fixnums are never torn; it is the PAIR that
+  ;; needs the region, and callers comparing deltas are exactly who
+  ;; would be misled.
+  (define (uv-accept-failure-counts)
+    (let-values (((e r) (with-interrupts-disabled
+                          (values accept-error-count
+                                  accept-refused-count))))
+      (list (cons 'error e) (cons 'refused r))))
+
   (define on-connection-code
     (foreign-callable
       (lambda (server status)
-        (when (>= status 0)
-          (let ((client (foreign-alloc tcp-handle-size)))
-            (uv-tcp-init uv-loop client)
-            (if (< (uv-accept server client) 0)
-                (uv-close client on-close-entry)
+        (if (< status 0)
+            ;; ⚠ NO CELL COVERS THIS BRANCH. Making libuv hand a negative
+            ;; status to a listener callback needs a condition this suite
+            ;; cannot create; the counter is here so it is visible if it
+            ;; happens in the field, and it is recorded as uncovered
+            ;; rather than counted as tested.
+            ;;
+            ;; It is not the same event as a refusal: this is the accept
+            ;; itself having failed, possibly before the kernel had a
+            ;; connection to hand up at all, which is why the two are
+            ;; counted separately.
+            (set! accept-error-count (bump-saturating accept-error-count))
+            (let ((client (foreign-alloc tcp-handle-size)))
+              (uv-tcp-init uv-loop client)
+              ;; INJECTION POINT 'accept-refused -- OWNING GUARD: none in
+              ;; this callback, and none may be added: it runs in foreign
+              ;; callback context, where an escaping raise unwinds into C.
+              ;; The injected value is a return rather than a raise, so it
+              ;; takes the refusal branch as a real failure would.
+              ;;
+              ;; ⛔ OVERRIDE, NOT RETURN, AND THE DIFFERENCE IS THE WHOLE
+              ;; POINT HERE. uv_accept must actually RUN. libuv's
+              ;; uv__server_io accept()s into server->accepted_fd before
+              ;; calling this callback, and if the callback returns
+              ;; without consuming it, uv__io_stop removes the listener
+              ;; from the poll set -- permanently. A real uv_accept
+              ;; failure closes that fd and calls uv__io_start, so the
+              ;; listener survives one refusal. Skipping the call
+              ;; therefore does not simulate a refusal; it simulates a
+              ;; dead listener, which is a different defect wearing the
+              ;; same errno. Measured: with inject-return! here, the cell
+              ;; saw the second connection never accepted.
+              ;;
+              ;; What override leaves behind was checked and is clean: the
+              ;; real accepted socket is closed by uv-close, its block is
+              ;; freed by the close callback, no conn is built, and
+              ;; neither conn-table nor owner-index gains an entry. ⚠ The
+              ;; timing differs from a real failure -- which closes the
+              ;; descriptor inside uv_accept rather than attaching it to a
+              ;; handle first -- but nothing persistent is left.
+              (if (< (inject-override! 'accept-refused
+                                       (uv-accept server client)) 0)
+                  (begin
+                    (set! accept-refused-count
+                          (bump-saturating accept-refused-count))
+                    (uv-close client on-close-entry))
                 (let ((c (make-conn client #f 'open #f))
                       ;; #(token on-accept) -- see tcp-listen!
                       (v (hashtable-ref listener-table server #f)))
@@ -582,7 +736,12 @@
       (mutable owner fs-op-owner fs-op-owner-set!)   ; delivery target pid
       (immutable path fs-op-path)
       (immutable mode fs-op-mode)                    ; whole | stream
-      (immutable req fs-op-req)                      ; uv_fs_t address
+      ;; ⚠ MUTABLE ONLY SO IT CAN BE FILLED IN AFTER THE ALLOCATION. The
+      ;; record is built with req = #f and the foreign-alloc happens a
+      ;; few lines later -- both inside the region now; see fs-start!.
+      ;; Nothing else ever writes it, and it is set exactly once, before
+      ;; the op is published anywhere.
+      (mutable req fs-op-req fs-op-req-set!)         ; uv_fs_t address
       (mutable phase fs-op-phase fs-op-phase-set!)   ; open|fstat|idle|read|close
       (mutable aborted? fs-op-aborted? fs-op-aborted?-set!)
       (mutable raw? fs-op-raw? fs-op-raw?-set!)      ; deliver lengths, not bvs
@@ -1453,16 +1612,150 @@
          (when (listener-open? (car rest) (cadr rest))
            (stop! (car rest)))))))
 
+  ;; ⛔ NOTHING THAT NEEDS RETURNING EXISTS OUTSIDE THE REGION. The
+  ;; foreign allocation and both publications happen inside it -- the
+  ;; state vector is built outside, but it is a Scheme object the
+  ;; collector reclaims -- so a kill before the region can discard
+  ;; nothing that has to be handed back. That
+  ;; closes a window this function used to have: req allocated, then a
+  ;; preemption during the Scheme allocations that followed, then a kill
+  ;; -- which discards the continuation without running any guard,
+  ;; leaving a malloc'd request in no table, where uv-owner-died! cannot
+  ;; find it either. There is no cell for that window (a kill cannot be
+  ;; aimed into it with what the suite has); it is closed by
+  ;; construction, and recorded as such.
+  ;;
+  ;; Allocation inside the region is allowed: a collect request is
+  ;; deferred until the region is left, and the only failure shape is a
+  ;; raise, which the handler catches. ⚠ The prepare/publish split is
+  ;; NOT about the region being allocation-free: hashtable-set! may
+  ;; allocate when it adds a key or grows, and both callers now prepare
+  ;; inside their region anyway.
+  ;; ⭐ SHAPED LIKE fs-start-fd!: the submission is INSIDE the region.
+  ;; Publishing and submitting have to be one step, because the state
+  ;; between them is one nothing can reclaim -- a published op whose
+  ;; phase is 'open has no callback coming, and uv-owner-died! reaches it
+  ;; only to call file-stream-close!, which does real work solely for
+  ;; phase 'idle. So it sets the aborted flag and returns, and the row
+  ;; and the request stay for the life of the process.
+  ;;
+  ;; ⚠ An earlier version of this comment said pulling the submission in
+  ;; "would buy nothing". It buys exactly that window. The cost is an
+  ;; uninterruptible foreign call, and it is the right trade here because
+  ;; uv_fs_open with a callback is an enqueue, not the I/O itself.
+  ;; Roll back a partly-started fs operation. TOP LEVEL, and taking its
+  ;; state as a vector, for two reasons that both bit earlier versions:
+  ;;
+  ;; ⭐ A LOCAL PROCEDURE WOULD ALLOCATE A CLOSURE BEFORE THE GUARD that
+  ;; is supposed to protect it. fs-start-fd! owns the caller's descriptor
+  ;; from its first instruction, so an allocation failure there escaped
+  ;; with the fd still open.
+  ;;
+  ;; ⭐ ONE COPY, TWO CALL SITES. The handler and the refused-submission
+  ;; branch both need exactly this, and when they were written separately
+  ;; they drifted -- see the cleanup-safe? note below for what that cost.
+  ;;
+  ;; State vector: #(cell req cleanup-safe? fd fd-open?).
+  ;;
+  ;; ⚠ AT MOST ONCE, NOT EXACTLY ONCE. Each slot is cleared BEFORE the
+  ;; operation it guards, so a raise part way cannot make a second call
+  ;; repeat a free or a close. The price is the other direction: a raise
+  ;; BEFORE the operation takes effect loses that one resource. No flag
+  ;; order gives exactly-once for an operation that may raise on either
+  ;; side of its effect; leaking one block beats freeing one twice.
+  ;; ⛔ This is exactly-once only under the premise that these calls do
+  ;; not raise, which is where they stand today.
+  (define (fs-undo! st owner)
+    (let ((cell (vector-ref st 0)) (req (vector-ref st 1)))
+      ;; ⭐ THE BOUNDARY IS DRAWN PER OPERATION, not uniformly. An
+      ;; idempotent step keeps its slot live across itself, so a retry
+      ;; after a raise can complete it; a step that must not run twice
+      ;; has its slot cleared first, at the price of leaking on a raise
+      ;; before the effect. unpublish-head! and hashtable-delete! are
+      ;; retry-safe (a completed one makes the next a no-op); free and
+      ;; close are not.
+      (when cell
+        (owner-index-unpublish-head! owner cell)
+        (vector-set! st 0 #f))
+      (when req
+        (hashtable-delete! fs-table req)
+        (vector-set! st 1 #f)
+        ;; ⚠ ONLY A REQUEST libuv HAS INITIALISED MAY BE CLEANED UP. Before
+        ;; the submission this is raw foreign-alloc memory and
+        ;; uv_fs_req_cleanup would be reading fields nothing wrote. The
+        ;; separate pre-submission and post-submission paths had this
+        ;; right; merging them into one rollback is what lost it.
+        ;;
+        ;; ⭐ cleanup-safe? (slot 2) IS SET AFTER THE CALL RETURNS,
+        ;; WHATEVER IT RETURNED, and that is safe because libuv
+        ;; initialises the request before anything that can fail.
+        ;; Verified by reading
+        ;; src/unix/fs.c of libuv 1.50.0, 1.51.0, 1.52.0 and 1.52.1 --
+        ;; every version this runs on today: INIT(subtype) is the first
+        ;; statement of both uv_fs_open and uv_fs_fstat, the only earlier
+        ;; failure is req == NULL, and a later PATH/uv__strdup failure
+        ;; returns UV_ENOMEM with INIT already done and the very fields
+        ;; uv_fs_req_cleanup reads left NULL.
+        ;;
+        ;; ⚠ RE-READ THIS AGAINST A NEWER libuv BEFORE TRUSTING IT. The
+        ;; property is whether INIT still precedes every failing path in
+        ;; those two functions. Nothing here breaks loudly if it stops
+        ;; being true -- cleanup on a request libuv never saw is
+        ;; undefined, and undefined has been observed to mean SIGABRT
+        ;; (measured, with a deliberately poisoned request).
+        (when (vector-ref st 2) (uv-fs-req-cleanup req))
+        (foreign-free req))
+      (when (vector-ref st 4)
+        (vector-set! st 4 #f)
+        (c-close (vector-ref st 3)))))
+
   (define (fs-start! path owner mode)
-    (let* ((req (foreign-alloc fs-req-size))
-           (op (make-fs-op owner path mode req 'open #f #f -1 0 0 '() 0 0)))
+    ;; ⚠ THE STATE VECTOR AND THE GUARD'S OWN CONTINUATION ARE ALLOCATED
+    ;; BEFORE ANY HANDLER EXISTS. That is true of every guard in this
+    ;; file and is not repaired here: a Chez allocation failure is an
+    ;; unrecoverable out-of-memory condition, not something a handler
+    ;; could act on. Recorded as a residual rather than papered over.
+    ;; This path holds nothing but Scheme objects at that moment anyway.
+    (let ((st (vector #f #f #f -1 #f)) (op #f) (rc 0))
       (with-interrupts-disabled
-        (hashtable-set! fs-table req op)
-        (index-owner! owner 'fs req))
-      (let ((r (uv-fs-open uv-loop req path O-RDONLY 0 on-fs-entry)))
-        (when (< r 0)
-          (uv-fs-req-cleanup req)
-          (fs-fail! op req r)))
+        (guard (e (#t (fs-undo! st owner) (raise e)))
+          (set! op (make-fs-op owner path mode #f 'open #f #f -1 0 0 '() 0 0))
+          (vector-set! st 0 (owner-index-prepare! 'fs))
+          (vector-set! st 1 (foreign-alloc fs-req-size))
+          (fs-op-req-set! op (vector-ref st 1))
+          (hashtable-set! fs-table (vector-ref st 1) op)
+          ;; INJECTION POINT 'fs-publish-second-half-open -- OWNING
+          ;; GUARD: the guard above.
+          (inject-fault! 'fs-publish-second-half-open)
+          (owner-index-publish! owner (vector-ref st 0) (vector-ref st 1))
+          ;; INJECTION POINT 'fs-submit-gap-open -- OWNING GUARD: the
+          ;; same one. It stands for ANY raise between publishing and
+          ;; submitting, the state nothing reclaims: file-stream-close!
+          ;; acts only on phase 'idle, so a published, unsubmitted op is
+          ;; merely flagged and its row and request stay forever.
+          (inject-fault! 'fs-submit-gap-open)
+          (set! rc (uv-fs-open uv-loop (vector-ref st 1) path
+                               O-RDONLY 0 on-fs-entry))
+          ;; ⭐ THE SLOT MEANS "cleanup is defined on this request", NOT
+          ;; "it was submitted" -- an earlier name said submitted? and
+          ;; was false: uv_fs_open can return UV_ENOMEM having submitted
+          ;; nothing, and the request is still initialised and safe to
+          ;; clean. Set here because this is the earliest point at which
+          ;; that holds; the reading that establishes it, and the one
+          ;; case it depends on not happening (req == NULL, which
+          ;; foreign-alloc makes impossible by raising instead of
+          ;; returning null), are with the consumer in fs-undo!.
+          (vector-set! st 2 #t)
+          (when (< rc 0)
+            (fs-undo! st owner)
+            ;; ⚠ REPORTED INSIDE THE REGION, and that is deliberate.
+            ;; owner is an explicit parameter of the exported API and
+            ;; need not be the process that called: A may submit on
+            ;; behalf of B. Telling the owner outside the region let a
+            ;; kill in between leave B with neither an error nor any
+            ;; callback to come, and for a whole-file read B holds no
+            ;; handle to ask with -- it would wait forever.
+            (deliver owner (vector 'file-error rc)))))
       op))
 
  ;; Start the ordinary asynchronous fstat/read pipeline from an fd that
@@ -1476,33 +1769,78 @@
   ;; failure between the allocation and the publish moved the /dev/fd
   ;; count from 12 to 13 with fs-count still 0.
   ;;
-  ;; The guard therefore spans allocation up to -- and NOT including --
-  ;; publication. Where it ends is the whole point: once fs-table holds
-  ;; the row, req is rooted and uv-owner-died! can reach it, and the fd
-  ;; belongs to op; closing it from here would then be closing a
-  ;; descriptor somebody else is still using.
+  ;; ⭐ THE GUARD SPANS EVERYTHING, PUBLICATION AND SUBMISSION INCLUDED.
+  ;; Earlier versions of this note said it stopped before publication and
+  ;; that an fs-table row alone made the request reachable to
+  ;; uv-owner-died!. Both were wrong: teardown walks the OWNER INDEX
+  ;; first and needs both entries, and stopping the guard before the
+  ;; publish left the state that has no reclaimer at all -- published,
+  ;; unsubmitted, phase not 'idle, so file-stream-close! only flags it.
+  ;;
+  ;; ⚠ ONE ALLOCATION STILL PRECEDES THE REGION: the state vector. If
+  ;; Chez fails to allocate it, this frame is already holding the fd and
+  ;; nothing closes it. ⛔ SO THIS PATH IS NOT YET INDEPENDENT OF ITS
+  ;; CALLER, and file-stream-open-under!'s enclosing region is what
+  ;; covers that instant today. Three versions of this comment have now
+  ;; claimed independence: the first while op and cell were built in the
+  ;; let initialisers, the second while a local undo! allocated a closure
+  ;; there, and the third while this vector did. Each time the claim was
+  ;; written before the last allocation had actually moved.
+  ;;
+  ;; What is left is irreducible without changing the interface -- a Chez
+  ;; allocation failure is unrecoverable and no handler could act on it,
+  ;; and the alternative is preparing the vector before the caller opens
+  ;; the descriptor. Recorded as a residual; the honest statement is that
+  ;; this window exists and is covered only by the caller.
+  ;;
+  ;; Past that, a raise anywhere inside reaches the handler and a kill
+  ;; cannot land inside at all. (The guard's setup is itself inside the
+  ;; disabled region -- Chez expands guard within the dynamic-wind body
+  ;; -- so only the vector above is outside.) Scheme allocation inside the region
+  ;; is allowed: a collect request is deferred until the region is left,
+  ;; and the only failure shape is a raise, which this handler catches.
+  ;;
+  ;; This function OWNS fd from the call, success or failure. Its caller
+  ;; opened it with openat and holds no other handle on it.
+  ;; ⛔ THIS FUNCTION OWNS fd FROM ITS FIRST INSTRUCTION, success or
+  ;; failure. Its caller opened it with openat and holds no other handle
+  ;; on it, so every exit has to close it.
+  ;;
+  ;; ⚠ Same residual as fs-start!: the state vector and the guard's own
+  ;; continuation are allocated before any handler exists. Unlike that
+  ;; path, this one already holds the descriptor at that moment -- so if
+  ;; Chez fails to allocate there, the fd leaks. It is left as a declared
+  ;; residual because an allocation failure in Chez is an unrecoverable
+  ;; out-of-memory condition; the honest statement is that this window
+  ;; exists and is not covered, not that nothing precedes the guard.
   (define (fs-start-fd! fd path owner mode)
-    (let ((req #f) (op #f))
-      (guard (e (#t (c-close fd)
-                    ;; a req that was allocated but never submitted is
-                    ;; plain foreign memory: free it, do NOT run
-                    ;; uv_fs_req_cleanup, which belongs to a request
-                    ;; libuv has actually filled in.
-                    (when req (foreign-free req))
-                    (raise e)))
-        (set! req (foreign-alloc fs-req-size))
-        ;; INJECTION POINT 'fs-oom-fd -- OWNING GUARD: the guard opened
-        ;; above, which exists because of this point and catches it
-        ;; deliberately. There is no second guard between here and the
-        ;; assertion: the re-raise leaves fs-start-fd! and the cell reads
-        ;; the descriptor count, which the handler has already restored.
-        (inject-fault! 'fs-oom-fd)
-        (set! op (make-fs-op owner path mode req 'fstat #f #f fd 0 0 '() 0 0)))
-      ;; ---- published from here; the guard above is out of scope -------
+    (let ((st (vector #f #f #f fd #t)) (op #f) (rc 0))
       (with-interrupts-disabled
-        (hashtable-set! fs-table req op)
-        (index-owner! owner 'fs req))
-      (start-fs-fstat! op req)
+        (guard (e (#t (fs-undo! st owner) (raise e)))
+          (set! op (make-fs-op owner path mode #f 'fstat #f #f fd 0 0 '() 0 0))
+          (vector-set! st 0 (owner-index-prepare! 'fs))
+          ;; INJECTION POINT 'fs-oom-fd -- OWNING GUARD: the guard above,
+          ;; the only one on this path. It stands for the allocation
+          ;; below failing; either Scheme allocation reaches it too.
+          (inject-fault! 'fs-oom-fd)
+          (vector-set! st 1 (foreign-alloc fs-req-size))
+          (fs-op-req-set! op (vector-ref st 1))
+          (hashtable-set! fs-table (vector-ref st 1) op)
+          ;; INJECTION POINT 'fs-publish-second-half -- OWNING GUARD: the
+          ;; same one. A failure between the two publications.
+          (inject-fault! 'fs-publish-second-half)
+          (owner-index-publish! owner (vector-ref st 0) (vector-ref st 1))
+          ;; INJECTION POINT 'fs-submit-gap-fd -- OWNING GUARD: the same
+          ;; one. See fs-start! for what this window costs if it is left
+          ;; outside the guard.
+          (inject-fault! 'fs-submit-gap-fd)
+          (fs-op-phase-set! op 'fstat)
+          (set! rc (uv-fs-fstat uv-loop (vector-ref st 1)
+                                (fs-op-fd op) on-fs-entry))
+          (vector-set! st 2 #t)
+          (when (< rc 0)
+            (fs-undo! st owner)
+            (deliver owner (vector 'file-error rc)))))
       op))
 
   (define (relative-parts rel)

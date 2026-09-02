@@ -102,7 +102,11 @@
   (set! recorded #f)
   (let ((came-out
           (guard (e ((cell-failure? e) (report-failure! name e) 'red)
-                    (#t (display "FAIL ") (display name) (display " raised ") (write e) (newline)
+                    (#t (display "FAIL ") (display name) (display " raised ")
+                        ;; a bare #<compound condition> names nothing: print
+                        ;; what a reader needs to find the raise site
+                        (if (condition? e) (display-condition e) (write e))
+                        (newline)
                         (set! failures (cons name failures)) 'red))
             (thunk)
             'returned)))
@@ -139,7 +143,33 @@
             name " " (number->string port) " " secret " 180000 &")))
 
 (define (bytes-now) (cdr (assq 'bytes (node-outbound-stats))))
+;; Two equal consecutive readings of the live handle count, 50 ms apart;
+;; 100 rounds without one is a failure of the reading, not of the cell.
+(define (handles-stable! label)
+  (let poll ((prev (uv-live-handle-count)) (n 0))
+    (sleep-ms 50)
+    (let ((now (uv-live-handle-count)))
+      (cond ((= now prev) now)
+            ((>= n 100) (fail! label 'handles-never-settled prev now))
+            (else (poll now (+ n 1)))))))
 
+(define (submit-gap-cell! name point thunk)
+  (run-cell name
+    (lambda ()
+      (let ((fds0 (length (directory-list "/dev/fd")))
+            (idx0 (uv-owner-index-count)))
+        (inject-arm-fault! point 1)
+        (let ((raised (guard (e (#t #t)) (thunk) #f)))
+          (unless raised (fail! (string-append name "-no-raise")))
+          (unless (eqv? (inject-hits point) 1)
+            (fail! (string-append name "-hits") (inject-hits point)))
+          (unless (zero? (fs-count)) (fail! (string-append name "-fs-table-row-left") (fs-count)))
+          (unless (= (uv-owner-index-count) idx0)
+            (fail! (string-append name "-owner-index-left") (uv-owner-index-count) idx0))
+          (let ((fds1 (length (directory-list "/dev/fd"))))
+            (unless (= fds1 fds0) (fail! (string-append name "-fd-leaked") 'now fds1 'before fds0)))))
+      (display name)
+      (display " a raise after publication and before submission leaves nothing behind ok\n"))))
 ;; THE CONTRACT IS A SHAPE, AND IT IS SPELLED OUT HERE ON PURPOSE. node.sc
 ;; exports submission-failure? for it, but that predicate is part of the
 ;; fix under test: on the trees the per-commit matrix runs against it does
@@ -371,10 +401,16 @@
 
     ;; ---- T2-2: an allocation failure in fs-start-fd! must close the fd ----
     ;; file-stream-open-under! opens the raw fd first and only then hands it
-    ;; to fs-start-fd!, which allocates before it publishes. A raise between
-    ;; the two leaves an fd nobody knows about. The reading is the
-    ;; process's own descriptor table: /dev/fd lists it, and the listing's
-    ;; own transient fd is present in both samples alike.
+    ;; to fs-start-fd!, which now does all of its work -- the record, the
+    ;; index cell, the foreign request block, the two publications --
+    ;; inside one interrupt-disabled region under one guard whose handler
+    ;; closes the fd. The point sits just before the foreign allocation, so
+    ;; what it stands in for is that allocation failing; a Scheme
+    ;; allocation failing earlier in the region lands in the same handler.
+    ;; A raise anywhere in there that did not close the fd would leave a
+    ;; descriptor nobody knows about. The reading is the process's own
+    ;; descriptor table: /dev/fd lists it, and the listing's own transient
+    ;; fd is present in both samples alike.
     (run-cell "T2-2"
       (lambda ()
         (let ((fds0 (length (directory-list "/dev/fd"))))
@@ -649,6 +685,148 @@
             (wait-peer-callee! "t2-9-peer-agent-not-reclaimed" pbase)
             (accounted-ok! "t2-9")))
         (display "T2-9 a demon that cannot be submitted costs the link ok\n")))
+
+    ;; ==== batch A ==========================================================
+    ;; A1: publication of a file stream is two writes (fs-table, then the
+    ;; owner index) and the second can fail. Half a publication is worse
+    ;; than none: uv-owner-died! starts from the owner index, so a row that
+    ;; is only in fs-table is unreachable, and the fd and request it pins
+    ;; are never returned. See batch-A-design-v2.
+    (run-cell "A1"
+      (lambda ()
+        (let ((fds0 (length (directory-list "/dev/fd")))
+              (idx0 (uv-owner-index-count)))
+          (inject-arm-fault! 'fs-publish-second-half 1)
+          (let ((raised (guard (e (#t #t))
+                          (file-stream-open-under! "igropyr/test" "node-child.sc" self)
+                          #f)))
+            (unless raised (fail! "a1-no-raise"))
+            (unless (eqv? (inject-hits 'fs-publish-second-half) 1)
+              (fail! "a1-hits" (inject-hits 'fs-publish-second-half)))
+            ;; nothing half-published: no fs-table row, index back, fd back
+            (unless (zero? (fs-count)) (fail! "a1-fs-table-row-left" (fs-count)))
+            (unless (= (uv-owner-index-count) idx0)
+              (fail! "a1-owner-index-left" (uv-owner-index-count) idx0))
+            (let ((fds1 (length (directory-list "/dev/fd"))))
+              (unless (= fds1 fds0) (fail! "a1-fd-leaked" 'now fds1 'before fds0)))))
+        (display "A1 a failed second publication write leaves no half-published stream ok\n")))
+
+    ;; A1b: the same failure on the open-by-path route (fs-start!), whose
+    ;; request is published before libuv has opened anything, so the only
+    ;; things that can be left behind are the fs-table row and the index
+    ;; entry; the fd baseline is kept to say so, not because one is expected.
+    (run-cell "A1b"
+      (lambda ()
+        (let ((fds0 (length (directory-list "/dev/fd")))
+              (idx0 (uv-owner-index-count)))
+          (inject-arm-fault! 'fs-publish-second-half-open 1)
+          (let ((raised (guard (e (#t #t))
+                          (file-stream-open! "igropyr/test/node-child.sc" self)
+                          #f)))
+            (unless raised (fail! "a1b-no-raise"))
+            (unless (eqv? (inject-hits 'fs-publish-second-half-open) 1)
+              (fail! "a1b-hits" (inject-hits 'fs-publish-second-half-open)))
+            (unless (zero? (fs-count)) (fail! "a1b-fs-table-row-left" (fs-count)))
+            (unless (= (uv-owner-index-count) idx0)
+              (fail! "a1b-owner-index-left" (uv-owner-index-count) idx0))
+            (let ((fds1 (length (directory-list "/dev/fd"))))
+              (unless (= fds1 fds0) (fail! "a1b-fd-leaked" 'now fds1 'before fds0)))))
+        (display "A1b a failed second publication write on the path route leaves nothing behind ok\n")))
+
+    ;; A1c / A1d: a raise between the two publications and the submission.
+    ;; Once the request is in both tables and not yet handed to libuv, no
+    ;; callback will ever come for it; if the region and its guard end
+    ;; before the submission, a raise there leaves a row that
+    ;; uv-owner-died! later reaches through file-stream-close! -- which
+    ;; only cleans an op in phase 'idle -- and so never releases. The
+    ;; point stands for any raise in that gap; today nothing there raises,
+    ;; and the cell pins that the guard reaches as far as the submission.
+    (submit-gap-cell! "A1c" 'fs-submit-gap-open
+      (lambda () (file-stream-open! "igropyr/test/node-child.sc" self)))
+    (submit-gap-cell! "A1d" 'fs-submit-gap-fd
+      (lambda () (file-stream-open-under! "igropyr/test" "node-child.sc" self)))
+
+    ;; A2: a refused accept is counted, closes what it initialised, and
+    ;; leaves the listener serving. uv_accept's negative return used to be
+    ;; swallowed: no log line, no counter, the listener silently one
+    ;; connection short.
+    (run-cell "A2"
+      (lambda ()
+        (let* ((me self) (lport 18094)
+               (accepted 0))
+          ;; THE ACCEPT CALLBACK CLOSES WHAT IT ACCEPTS, AT ONCE. The injected
+          ;; refusal is an override: uv_accept really runs, the callback
+          ;; then takes the refusal branch and closes the client handle it
+          ;; initialised, and the peer sees a close. Recording an accepted
+          ;; connection and closing it later would leave a handle alive at
+          ;; the next baseline; counting and closing here keeps every
+          ;; baseline deterministic, and the count is the proof that the
+          ;; listener still serves.
+          (tcp-listen! "127.0.0.1" lport 16
+            (lambda (c) (set! accepted (+ accepted 1)) (tcp-close! c)))
+          (let* ((h0 (handles-stable! "a2-baseline"))   ; listener up, nothing else
+                 (c0 (uv-accept-failure-counts))
+                 (refused0 (cdr (assq 'refused c0)))
+                 (error0 (cdr (assq 'error c0))))
+            (inject-arm-return! 'accept-refused -53 1)   ; ECONNABORTED, once
+            (tcp-connect! "127.0.0.1" lport self)
+            (let ((c1 (receive (after 5000 (fail! "a2-first-connect-silent"))
+                        (`#(tcp-connected ,c) c)
+                        (`#(tcp-connect-failed ,e) 'failed))))
+              (unless (eqv? (inject-hits 'accept-refused) 1)
+                (fail! "a2-hits" (inject-hits 'accept-refused)))
+              ;; hits says the point consumed its arm; delivered says the
+              ;; point took the substitute branch for it. A wrapped call
+              ;; that raises consumes the arm without delivering, and the
+              ;; state assertions below would then be saved by the raise,
+              ;; not by the override -- this line is what tells those apart.
+              (unless (eqv? (inject-delivered 'accept-refused) 1)
+                (fail! "a2-delivered" (inject-delivered 'accept-refused)))
+              (let ((c1n (uv-accept-failure-counts)))
+                (unless (= (cdr (assq 'refused c1n)) (+ refused0 1))
+                  (fail! "a2-refused-not-counted" (cdr (assq 'refused c1n)) refused0))
+                (unless (= (cdr (assq 'error c1n)) error0)
+                  (fail! "a2-error-counter-moved" (cdr (assq 'error c1n)) error0)))
+              (when (conn? c1) (tcp-close! c1))
+              (inject-disarm!)
+              ;; ROUND TWO, for the counter's reset. delivered lives with the
+              ;; arm and starts from zero at every arming; a count that
+              ;; survived re-arming would let one old delivery satisfy the
+              ;; assertion above for a later override that never delivers.
+              ;; So: arm again, read zero BEFORE anything can hit the point,
+              ;; then refuse once more and read one.
+              (inject-arm-return! 'accept-refused -53 1)
+              ;; delivered answers 0 both for "no arming" and for "armed,
+              ;; not delivered"; hits answers #f for the first and 0 for
+              ;; the second. Read hits first so the zero below is known to
+              ;; come from a fresh arming, not from the absence of one.
+              (unless (eqv? (inject-hits 'accept-refused) 0)
+                (fail! "a2-delivered-read-without-arming" (inject-hits 'accept-refused)))
+              (unless (eqv? (inject-delivered 'accept-refused) 0)
+                (fail! "a2-delivered-not-reset-by-arm" (inject-delivered 'accept-refused)))
+              (tcp-connect! "127.0.0.1" lport self)
+              (let ((c1b (receive (after 5000 (fail! "a2-second-refusal-silent"))
+                           (`#(tcp-connected ,c) c)
+                           (`#(tcp-connect-failed ,e) 'failed))))
+                (unless (eqv? (inject-delivered 'accept-refused) 1)
+                  (fail! "a2-delivered-round-two" (inject-delivered 'accept-refused)))
+                (let ((c2n (uv-accept-failure-counts)))
+                  (unless (= (cdr (assq 'refused c2n)) (+ refused0 2))
+                    (fail! "a2-second-refusal-not-counted" (cdr (assq 'refused c2n)) refused0)))
+                (when (conn? c1b) (tcp-close! c1b))
+                (inject-disarm!))
+              ;; the listener still serves: a further connection is accepted
+              (tcp-connect! "127.0.0.1" lport self)
+              (let ((c2 (receive (after 5000 (fail! "a2-listener-dead-after-refusal"))
+                          (`#(tcp-connected ,c) c)
+                          (`#(tcp-connect-failed ,e) (fail! "a2-second-connect-failed" e)))))
+                (sleep-ms 100)
+                (unless (>= accepted 1) (fail! "a2-second-connection-not-accepted" accepted))
+                (tcp-close! c2)
+                ;; every handle the refusal or the second connection made is gone
+                (let ((h1 (handles-stable! "a2-final")))
+                  (unless (= h1 h0) (fail! "a2-handles-leaked" h1 h0)))))))
+        (display "A2 a refused accept is counted and the listener keeps serving ok\n")))
 
     ;; INJECT_EXPECT_UNHIT=point -- the positive control for a skip run:
     ;; skipping a cell proves the print branch ran, not that nobody else

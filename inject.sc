@@ -6,7 +6,7 @@
 ;;; so a build made with IGROPYR_INJECT unset contains no injection code
 ;;; at all -- not a disabled branch, not a flag test, nothing.
 ;;;
-;;; Three primitives, and each is placed under a rule:
+;;; Four primitives, and each is placed under a rule:
 ;;;
 ;;;   (inject-fault! 'point)         -- raises when armed. Region-safe:
 ;;;                                     it allocates nothing and may sit
@@ -56,6 +56,29 @@
 ;;;     caller's guard, where the raise was caught and dropped and the
 ;;;     submission-failure branch never ran at all.
 ;;;
+;;; ⛔ AND A THIRD RULE, ABOUT WHICH PRIMITIVE TO USE. inject-return!
+;;; SKIPS the call it wraps and answers in its place; inject-override!
+;;; RUNS it and then replaces the answer. They are not interchangeable:
+;;;
+;;;   skipping a call is the same as that call failing ONLY IF the call
+;;;   has no side effect the code after it depends on
+;;;
+;;; ⚠ Measured, not reasoned: 'accept-refused was written with
+;;; inject-return! and produced a state no real failure produces. In
+;;; libuv's unix stream.c, uv__server_io accept()s into
+;;; server->accepted_fd BEFORE calling the connection callback, and when
+;;; the callback returns without consuming it, uv__io_stop takes the
+;;; listener out of the poll set. A real uv_accept failure closes that fd
+;;; and calls uv__io_start, so the listener survives; skipping the call
+;;; left accepted_fd set and froze the listener for good. Same errno to
+;;; the caller, two different states underneath -- and the cell saw it as
+;;; "the second connection was never accepted".
+;;;
+;;; ⭐ So: use inject-return! for a submission that can genuinely be
+;;; refused without running (uv_write, uv_getaddrinfo, uv_tcp_connect),
+;;; and inject-override! wherever the call itself moves state the caller
+;;; depends on.
+;;;
 ;;; ⚠ AND COUNT THEM OVER THE WHOLE DYNAMIC PATH, NOT THE LEXICAL ONE.
 ;;; The line you assert on is in the CELL, so the cell's own guards --
 ;;; including whatever the runner wraps every cell in -- are on that
@@ -79,9 +102,9 @@
 ;;; consumer reports invoke-requirements () when off and ((igropyr
 ;;; checked)) when on, at optimize-level 2.
 (library (igropyr inject)
-  (export inject-fault! inject-return! inject-barrier!
+  (export inject-fault! inject-return! inject-override! inject-barrier!
           $inject-arm! $inject-release! $inject-disarm! $inject-hits
-          $inject-ticket $inject-armed-points)
+          $inject-ticket $inject-armed-points $inject-delivered-count)
   (import (chezscheme))
 
   ;; ---- the switch, read once at expansion time --------------------------
@@ -125,7 +148,15 @@
      ;; hit. A hit does fx+ on an existing fixnum and set! on an existing
      ;; slot, so a point may sit inside a no-interrupt region without
      ;; putting an allocation there.
-     ;; Slot layout: #(point kind value occurrence hits ticket ok?)
+     ;; Slot layout: #(point kind value occurrence hits ticket ok? delivered)
+     ;;
+     ;; ⭐ delivered LIVES IN THE ARMING, NOT BESIDE IT. It was a separate
+     ;; process-lifetime table, which neither release nor disarm cleared:
+     ;; re-arming a point reset hits and kept deliveries, so one old
+     ;; delivery could satisfy "delivered = 1" for a later run that never
+     ;; delivered at all -- the counter added to restore discriminating
+     ;; power could have it taken back. In the vector it is reset by
+     ;; every arm, for free.
      (define $inject-table (make-eq-hashtable))
      (define $inject-next-ticket 0)
 
@@ -174,7 +205,11 @@
            ;; internally -- it reaches on-done, #(dns-failed r) and
            ;; uv-strerror unchanged. A cell asserting on it would be
            ;; asserting on behaviour the real system cannot produce.
-           ((uv-write-neg getaddrinfo-refused tcp-connect-refused)
+           ;; uv_accept declining an announced connection joins them:
+           ;; same errno domain, and its caller reads only "negative
+           ;; means refused".
+           ((uv-write-neg getaddrinfo-refused tcp-connect-refused
+             accept-refused)
             (unless (and (fixnum? value) (fx< value 0) (fx>= value -4095))
               (assertion-violation '$inject-arm!
                 "this point needs an exact libuv error code in [-4095,-1]"
@@ -211,7 +246,7 @@
        (check-arm! point kind value occurrence)
        (let ((t ($inject-ticket)))
          (hashtable-set! $inject-table point
-                         (vector point kind value occurrence 0 t ok?))
+                         (vector point kind value occurrence 0 t ok? 0))
          t))
 
      (define ($inject-release! ticket)
@@ -226,6 +261,21 @@
      (define ($inject-hits point)
        (let ((v (hashtable-ref $inject-table point #f)))
          (and v (vector-ref v 4))))
+
+     ;; How many times a substitute value was returned for the CURRENT
+     ;; arming. ⭐ NOT the same as hits: an occurrence is spent when the
+     ;; point is entered, so a wrapped expression that raises spends one
+     ;; and delivers nothing. A cell asserting only on hits proves that
+     ;; an eligible call reached the point, not that the injected value
+     ;; was ever seen.
+     ;;
+     ;; ⚠ It answers 0 both for "never armed" and for "armed and never
+     ;; delivered"; those are not distinguished.
+     (define (inject-note-delivered! v)          ; v is the arming vector
+       (vector-set! v 7 (fx+ (vector-ref v 7) 1)))
+     (define ($inject-delivered-count point)
+       (let ((v (hashtable-ref $inject-table point #f)))
+         (if v (vector-ref v 7) 0)))
 
      (define ($inject-armed-points)
        (vector->list (hashtable-keys $inject-table)))
@@ -282,9 +332,10 @@
      (define ($inject-release! ticket) (void))
      (define ($inject-disarm!) (void))
      (define ($inject-hits point) #f)
+     (define ($inject-delivered-count point) 0)
      (define ($inject-armed-points) '())))
 
-  ;; ---- the three primitives ---------------------------------------------
+  ;; ---- the four primitives ----------------------------------------------
 
   ;; ⛔ THE OFF EXPANSION IS (void), NOT (begin), AND THE DIFFERENCE IS NOT
   ;; COSMETIC. (begin) with no forms is valid only in a definition context,
@@ -321,7 +372,36 @@
         ((_ point expr)
          (if (eq? inject-mode 'on)
              #'(let ((slot ($inject-take! point 'return)))
-                 (if slot (vector-ref slot 2) expr))
+                 (if slot
+                     (begin (inject-note-delivered! slot)
+                            (vector-ref slot 2))
+                     expr))
+             #'expr)))))
+
+  ;; Run the call, then answer with the armed value instead of its
+  ;; result. Same table, same kind, same hit accounting as
+  ;; inject-return!; the difference is that the wrapped expression is
+  ;; EVALUATED.
+  ;;
+  ;; ⚠ ONE OCCURRENCE IS SPENT BEFORE THE EXPRESSION RUNS -- the arm
+  ;; itself is not removed, only that occurrence is consumed -- so
+  ;; that "a hit" means the same thing for both primitives: this point
+  ;; consumed one arming. An earlier version evaluated first, which meant
+  ;; an expression that RAISED left the arm unconsumed -- inject-return!
+  ;; would have counted it, and the two would have disagreed about what
+  ;; the hit count measures. The cost is that a raising expression still
+  ;; spends the arm; that is the intended reading.
+  (define-syntax inject-override!
+    (lambda (x)
+      (syntax-case x ()
+        ((_ point expr)
+         (if (eq? inject-mode 'on)
+             #'(let ((slot ($inject-take! point 'return)))
+                 (let ((actual expr))
+                   (if slot
+                       (begin (inject-note-delivered! slot)
+                              (vector-ref slot 2))
+                       actual)))
              #'expr)))))
 
   (define-syntax inject-barrier!
