@@ -2225,23 +2225,41 @@
                     ;; standing; what the caller then hears is either
                     ;; nothing (this receive times out) or -- measured on
                     ;; the mutant tree -- `noconnection`, synthesized when
-                    ;; the replacing session closes a few seconds later.
-                    ;; Both are red, and the reason is printed so the two
-                    ;; are told apart from a load stall: the marker before
-                    ;; the mdown already proved the frame reached the
-                    ;; dispatcher, so a wrong reason here is the gate, not
-                    ;; transit. Reading: mdown gate reverted to connection
-                    ;; identity -> FAIL late-mdown-as-watcher
-                    ;; (reason noconnection); same mutation was green
-                    ;; before this cell existed.
-                    (receive (after 15000
-                               (fail! "late-mdown-dropped-on-superseded-link-as-watcher"
-                                      'no-remote-down))
-                      (`#(remote-down wpeer watched-by-this-node ,reason)
-                        (unless (eq? reason 'noproc)
-                          (fail! "late-mdown-as-watcher" (list 'reason reason))))
-                      (`#(remote-down ,@rest)
-                        (fail! "late-mdown-as-watcher" (cons 'wrong-watch rest))))
+                    ;; the replacing session closes ~5s after its handshake.
+                    ;;
+                    ;; ⚠ THAT SECOND SHAPE IS DEADLINE-TYPE. It comes from
+                    ;; watch-session!'s 5s no-mdown close, so on a CORRECT
+                    ;; tree a sufficiently slow mdown takes the same road
+                    ;; and reads as this red. Load can therefore make a
+                    ;; false red here, never a false green -- the safe
+                    ;; direction, and stated so a noconnection under load
+                    ;; is not read as the gate having regressed.
+                    ;;
+                    ;; The red prints its MARGIN: ms from the marker's
+                    ;; arrival to the verdict. The marker is the frame
+                    ;; right before the mdown in the same segment, so it
+                    ;; proves the mdown reached the dispatcher -- but not
+                    ;; that it was not merely late. Far below 5000 means
+                    ;; the gate dropped it; near 5000 means the deadline
+                    ;; was hit, rerun. Reading on the mutant: FAIL
+                    ;; late-mdown-as-watcher (reason noconnection); the
+                    ;; same mutation was green before this cell existed.
+                    ;; (This paragraph was first written as a prediction
+                    ;; -- "this receive times out" -- and was falsified on
+                    ;; the first real red; it now records what was seen.)
+                    (let ((t-marker (now-ms)))
+                      (receive (after 15000
+                                 (fail! "late-mdown-dropped-on-superseded-link-as-watcher"
+                                        (list 'no-remote-down
+                                              'ms-since-marker (- (now-ms) t-marker))))
+                        (`#(remote-down wpeer watched-by-this-node ,reason)
+                          (unless (eq? reason 'noproc)
+                            (fail! "late-mdown-as-watcher"
+                                   (list 'reason reason
+                                         'ms-since-marker (- (now-ms) t-marker)))))
+                        (`#(remote-down ,@rest)
+                          (fail! "late-mdown-as-watcher"
+                                 (cons 'wrong-watch rest)))))
                     (kill p1 'done) (kill p2 'done)
                     (sleep-ms 700)
                     (display "a late mdown on a superseded link reaches the watcher ok\n"))))))))
