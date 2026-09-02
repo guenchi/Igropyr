@@ -69,13 +69,31 @@
     (unless (= a g) (anomaly! label 'accounted/=global a g))
     (unless (<= p g) (anomaly! label 'peer-chains>global p g))
     (unless (>= rm oa) (anomaly! label 'owner-agents>rmonitors rm oa))))
+;; AT REST IS A STATE THE NODE HAS TO REACH, NOT AN INSTANT. A node spliced
+;; off its peer's chain is "retiring" until its agent has run demon-local,
+;; exited, and been reaped -- three scheduling turns on a scheduler that
+;; may be serving thousands of HTTP handlers. A fixed 700 ms was enough on
+;; an idle node and not under load: the first 24-hour run under full
+;; pressure reported chains-disagree-at-rest twenty-six times, every one of
+;; them with the shortfall on the peer chains (the retiring shape), and
+;; exited the node each time. So the check now waits for the counts to
+;; agree, up to rest-settle-ms, and reports how long that took -- a
+;; settle time is data, a disagreement that outlasts the wait is the
+;; anomaly.
+(define rest-settle-ms 10000)
 (define (rest-check! label)
   (always-check! label)
-  (let ((g (stat 'mon-chain)) (p (stat 'mon-peer-chains)) (a (stat 'accounted))
-        (rm (stat 'rmonitors)) (oa (stat 'owner-agents)))
-    (unless (= g p a) (anomaly! label 'chains-disagree-at-rest g p a))
-    (unless (= rm oa) (anomaly! label 'rmonitors/=owner-agents-at-rest rm oa))
-    (unless (zero? (node-orphan-count)) (anomaly! label 'orphans (node-orphan-count)))))
+  (let settle ((waited 0))
+    (let ((g (stat 'mon-chain)) (p (stat 'mon-peer-chains)) (a (stat 'accounted))
+          (rm (stat 'rmonitors)) (oa (stat 'owner-agents)) (orph (node-orphan-count)))
+      (cond
+        ((and (= g p a) (= rm oa) (zero? orph))
+         (when (> waited 0) (log "rest settled after" waited "ms" g p a)))
+        ((< waited rest-settle-ms) (sleep-ms 250) (settle (+ waited 250)))
+        (else
+         (unless (= g p a) (anomaly! label 'chains-disagree-at-rest g p a))
+         (unless (= rm oa) (anomaly! label 'rmonitors/=owner-agents-at-rest rm oa))
+         (unless (zero? orph) (anomaly! label 'orphans orph)))))))
 
 (define (rand n) (random n))
 (define target-names (map (lambda (i) (string->symbol (string-append "t" (number->string i)))) '(0 1 2 3 4 5 6 7)))
