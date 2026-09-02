@@ -3486,8 +3486,14 @@
   ;; rather than leaving the surrounding green to imply otherwise. The
   ;; window is between a pop and the send that follows it, and reaching
   ;; it needs this process to yield there:
-  ;;   - `send` does not yield. It links the message into the target's
-  ;;     inbox and marks a parked target runnable; the sender runs on.
+  ;;   - `send` does not CALL yield: it links the message into the
+  ;;     target's inbox and wakes a parked target, inside a
+  ;;     with-interrupts-disabled region.
+  ;;     ⚠ But LEAVING that region re-enables interrupts, and a timer
+  ;;     that expired inside it is delivered right there -- so a walk CAN
+  ;;     be preempted at a send's exit. What that does not change is the
+  ;;     conclusion: the delivery still waits on the tick budget expiring
+  ;;     first, and a short chain finishes inside one slice.
   ;;   - So the walk yields only on timer preemption, and a time slice
   ;;     is 100000 ticks -- more than a sweep costs at the default cap.
   ;;   - The retirement that would truncate it is usually several hops
@@ -3500,8 +3506,15 @@
   ;; sweep starts collapses the hop count to one handoff. ⇒ What is
   ;; true is narrower: nothing in the SUITE constructs the interleaving,
   ;; and no cell here discriminates it.
-  ;; ⭐ The fix does not rest on either claim -- it rests on the
-  ;; structure above, which is why it survives their being wrong. There is
+  ;; ⭐ THIS PARAGRAPH HAS BEEN NARROWED THREE TIMES -- "the cap bounds
+  ;; the sweep and the reaper is several hops away", then "the suite does
+  ;; not construct it", then the send bullet above -- and each time the
+  ;; correction was the same one: something stated as impossible was only
+  ;; something we had not built. ⛔ So do not cite it as an impossibility
+  ;; proof; it is a statement about this suite.
+  ;; ⭐ The structure never moved through any of that. The fix does not
+  ;; rest on any timing claim -- it rests on the sentinel above, which is
+  ;; why it survived all three. There is
   ;; a happy-path cell that sweeps many monitors and checks they are all
   ;; stopped; it guards this loop against ordinary mistakes and ⛔ is not
   ;; coverage of the race. Do not read its green as though it were.
