@@ -1,22 +1,8 @@
 # Changelog
 
-Every released version of Igropyr, reconstructed from the published packages and
-the git history. **npm is the authority for version numbers**: where the registry
-and this repository disagree, the registry wins, and the disagreements are listed
-under [Numbering](#numbering) below.
-
-Releases are newest first. The commit count after each date is the number of
-commits that landed between that release and the one before it. "API" lists the
-public names a release added or removed; it is derived mechanically from each
-library's `(export ...)` form, so it sees names, not signatures — a name that
-stayed while its arguments or behaviour changed appears under Breaking or Changed
-instead. The method, and its known limits, are in [How this file was built](#how-this-file-was-built).
-
 ---
 
 ## Unreleased
-
-`package.json` says `1.5.2`; nothing above 1.5.1 has been published. 77 commits so far.
 
 - **node**: wire protocol v4 — boot ids, dial generations, target-bound proofs.
   Dial decisions are installed as an ordered rule table and carried out one
