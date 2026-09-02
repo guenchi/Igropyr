@@ -12,7 +12,8 @@
 
 (library (igropyr libuv)
   (export uv-init! uv-poll! now-ms now-ns uv-set-deliver! uv-owner-died!
-          tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
+          tcp-listen! tcp-stop-listen! listener-open? listener-token
+          tcp-connect! dns-resolve!
           file-read-async! file-realpath
           file-stream-open! file-stream-open-under!
           file-stream-read! file-stream-close!
@@ -434,7 +435,7 @@
                 (else (void)))))
           owned))))
 
-  ;; live listeners: handle address -> accept hook, one entry per
+  ;; live listeners: handle address -> #(token on-accept), one entry per
   ;; tcp-listen!. Keyed dispatch (not a single global) so several
   ;; servers can listen on different ports in one process; the table
   ;; also roots each listener's accept hook, which nothing else holds
@@ -531,11 +532,12 @@
             (if (< (uv-accept server client) 0)
                 (uv-close client on-close-entry)
                 (let ((c (make-conn client #f 'open #f))
-                      (p (hashtable-ref listener-table server #f)))
+                      ;; #(token on-accept) -- see tcp-listen!
+                      (v (hashtable-ref listener-table server #f)))
                   (uv-tcp-nodelay client 1)
                   (hashtable-set! conn-table client c)
-                  (if p
-                      (p c)
+                  (if v
+                      ((vector-ref v 1) c)
                       ;; listener already stopped: refuse the straggler
                       (tcp-close! c)))))))
       (void* int)
@@ -1340,21 +1342,116 @@
         (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
         (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf flags))
         (check 'uv-listen (uv-listen l backlog on-connection-entry))
-        (hashtable-set! listener-table l on-accept)
+        ;; #(token on-accept). The token is a fresh Scheme object per
+        ;; LISTENER INCARNATION, and it is what makes an address safe to
+        ;; use as an identity. Addresses alone are not: uv_handle_size
+        ;; for a TCP handle was 264 bytes on the build this was measured
+        ;; on (uv_handle_size is queried at run time and is not a
+        ;; cross-platform constant; the argument does not depend on the
+        ;; number, only on same-size reuse), and a foreign-alloc of that
+        ;; size right after the close callback frees one returns the SAME
+        ;; address -- measured, not feared. Without the token, a stopped
+        ;; server's handle value would match a later listener's, so the
+        ;; old server would report itself live and its shutdown would
+        ;; stop somebody else's listener.
+        (hashtable-set! listener-table l (vector (list 'listener) on-accept))
         l))))
 
   ;; Stop accepting new connections (graceful shutdown step 1);
   ;; established connections are unaffected. With a listener handle
-  ;; (tcp-listen!'s return value) stops that server only; with no
+  ;; (tcp-listen!'s return value) stops the listener at that address --
+  ;; pass the token too if this caller may be stale, see the note there;
+  ;; with no
   ;; argument stops every listener in the process.
+  ;; Is this handle registered here under THIS incarnation? A lookup in
+  ;; a table this library maintains -- not a question put to libuv, and
+  ;; not an observation of the socket. What it is good for is that it
+  ;; never DEREFERENCES the handle: once tcp-stop-listen! has run and the
+  ;; close callback has freed the block, anything that reads through the
+  ;; pointer -- uv_fileno included -- is a use-after-free, while using it
+  ;; as a key is not.
+  ;;
+  ;; ⛔ THE ADDRESS ALONE IS NOT AN IDENTITY, WHICH IS WHY THE TOKEN IS
+  ;; REQUIRED. A freed address does not stay unmatched: a uv_tcp handle
+  ;; was 264 bytes on the measured build -- the size is read at run time,
+  ;; so treat the number as an illustration and the reuse as the point --
+  ;; and a foreign-alloc of that size immediately after the
+  ;; free returned the same address, so a later listener can be
+  ;; registered under a stopped one's address. Membership alone would
+  ;; then answer #t for a dead listener, and a stale owner's
+  ;; tcp-stop-listen! would stop the new one.
+  ;;
+  ;; ⚠ IT CAN ANSWER #f WHILE THE HANDLE IS STILL OPEN. The row is
+  ;; removed when the stop is REQUESTED and the handle lives until the
+  ;; close callback runs, which is a later turn of the loop -- so the
+  ;; conservative interval is that whole asynchronous close, not the gap
+  ;; to the next line. Early "not listening" is the safe direction; the
+  ;; reverse is what the token prevents.
+  ;; The token currently registered for this handle, or #f. Take it
+  ;; immediately after tcp-listen! and keep it beside the handle; the
+  ;; pair is the identity, neither half alone is.
+  (define (listener-token h)
+    (let ((v (and h (hashtable-ref listener-table h #f))))
+      (and v (vector-ref v 0))))
+
+  (define (listener-open? h token)
+    (let ((v (and h (hashtable-ref listener-table h #f))))
+      (and v (eq? token (vector-ref v 0)))))
+
+  ;; (tcp-stop-listen!)            -- every listener in this process
+  ;; (tcp-stop-listen! h)          -- that handle, whatever incarnation
+  ;; (tcp-stop-listen! h token)    -- that handle ONLY if it is still the
+  ;;                                  incarnation the token came from
+  ;;
+  ;; ⚠ THE TWO-ARGUMENT FORM IS THE ONE TO USE FROM A LONG-LIVED OWNER.
+  ;; A handle address can be reused by a later listener (see tcp-listen!),
+  ;; so a stale owner calling the one-argument form stops whoever holds
+  ;; that address now. The token form makes that a no-op instead.
+  ;;
+  ;; ⛔ HOLDING THE HANDLE DOES NOT MAKE A CALLER SAFE, and an earlier
+  ;; version of this note said it did ("a caller that created a listener
+  ;; and stops it without ever releasing it cannot be stale"). Keeping
+  ;; the number keeps nothing: the no-argument form, called by anyone,
+  ;; stops and frees that listener, after which the address may belong
+  ;; to someone else. The one-argument form is kept for compatibility --
+  ;; every caller of it in this repository is a test that creates a
+  ;; listener and stops it within one flow, checked by grep -- and new
+  ;; code should pass the token.
   (define (tcp-stop-listen! . rest)
-    (define (stop! l)
+    ;; ⛔ THE TEST AND THE CLOSE ARE ONE UNINTERRUPTIBLE STEP, for the
+    ;; reason stated once for every call that passes a handle to libuv.
+    ;; Two failures follow from splitting them, and both were reachable
+    ;; before this region existed:
+    ;;   - preempted after the TOKEN check, this call resumes and closes
+    ;;     whatever now holds that address, because stop! re-tests only
+    ;;     membership -- the stale-owner close the token exists to stop;
+    ;;   - preempted after stop!'s own membership test, two callers each
+    ;;     pass the same handle to uv_close.
+    ;; The membership test inside stop! is therefore not redundant with
+    ;; the token test outside it: it is what makes the no-argument sweep
+    ;; safe over a snapshot that may already be stale.
+    (define (stop! l)                        ; caller holds the region
       (when (hashtable-ref listener-table l #f)
         (hashtable-delete! listener-table l)
         (uv-close l on-close-entry)))
-    (if (pair? rest)
-        (stop! (car rest))
-        (vector-for-each stop! (hashtable-keys listener-table))))
+    (cond
+      ((null? rest)
+       ;; The key vector is built OUTSIDE any region -- hashtable-keys
+       ;; allocates -- and each stop is atomic on its own. A key that
+       ;; goes away between the snapshot and its turn is handled by
+       ;; stop!'s test; a listener created after the snapshot is simply
+       ;; not in this sweep, which is what "every listener at the moment
+       ;; of the call" means.
+       (let ((ks (hashtable-keys listener-table)))
+         (vector-for-each
+           (lambda (l) (with-interrupts-disabled (stop! l)))
+           ks)))
+      ((null? (cdr rest))
+       (with-interrupts-disabled (stop! (car rest))))
+      (else
+       (with-interrupts-disabled
+         (when (listener-open? (car rest) (cadr rest))
+           (stop! (car rest)))))))
 
   (define (fs-start! path owner mode)
     (let* ((req (foreign-alloc fs-req-size))
@@ -1585,7 +1682,20 @@
   ;; nested guards for a case where the process is already out of
   ;; memory. The gap is named here so a reader can weigh it rather than
   ;; assume it was handled.
-  (define (listener-backlog-effective l)
+  ;; ⛔ THE CHECK AND THE FOREIGN USE ARE ONE UNINTERRUPTIBLE STEP, which
+  ;; is the rule this file already states for every call that passes a
+  ;; handle to libuv. A membership test on its own does NOT make this
+  ;; safe: between the test and uv_fileno the process can be preempted,
+  ;; another can stop the listener, and the loop can free the handle --
+  ;; so the region has to span the test AND both foreign calls. The three
+  ;; buffers are therefore allocated OUTSIDE it; the region does pointer
+  ;; work, two FFI calls and the three foreign-frees done! performs --
+  ;; no allocation.
+  ;;
+  ;; The token is checked, not just membership: a later listener can hold
+  ;; this very address (see tcp-listen!), and answering for it would
+  ;; report somebody else's backlog as this server's.
+  (define (listener-backlog-effective l token)
     (and so-listenqlimit sol-socket
          (let ((fdbuf (foreign-alloc 4))
                (val   (foreign-alloc 4))
@@ -1595,13 +1705,17 @@
              x)
            (guard (e (#t (done! #f) (raise e)))
              (foreign-set! 'int len 0 4)
-             (if (< (uv-fileno l fdbuf) 0)
-                 (done! #f)
-                 (let* ((fd (foreign-ref 'int fdbuf 0))
-                        (rc (c-getsockopt fd sol-socket so-listenqlimit
-                                          val len))
-                        (answer (and (>= rc 0) (foreign-ref 'int val 0))))
-                   (done! (and answer (> answer 0) answer))))))))
+             (with-interrupts-disabled
+               (if (not (listener-open? l token))
+                   (done! #f)
+                   (if (< (uv-fileno l fdbuf) 0)
+                       (done! #f)
+                       (let* ((fd (foreign-ref 'int fdbuf 0))
+                              (rc (c-getsockopt fd sol-socket so-listenqlimit
+                                                val len))
+                              (answer (and (>= rc 0)
+                                           (foreign-ref 'int val 0))))
+                         (done! (and answer (> answer 0) answer))))))))))
 
   (define (file-stream-own! op pid)
     (with-interrupts-disabled
@@ -1748,7 +1862,10 @@
   ;; client cannot forge -- unlike any header it sends -- so it is what
   ;; per-client policy (rate limiting, banning) must key on.
   ;; THE STATE TEST AND THE HANDLE USE ARE ONE UNINTERRUPTIBLE STEP, here
-  ;; and at every other FFI call that passes conn-handle. This is the
+  ;; and at every other FFI call that passes conn-handle -- ⚠ a rule
+  ;; this file has not always followed: tcp-stop-listen! split its test
+  ;; from its uv-close until the incarnation work put them back
+  ;; together, and listener-backlog-effective did the same. This is the
   ;; invariant, stated once for all of them:
   ;;
   ;;   a conn's handle may be passed to libuv only inside a region where

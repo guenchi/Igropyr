@@ -455,6 +455,7 @@ echo "HTTP CRITICAL WIRING PASSED"
 "$scheme_bin" --script test/smoke-http-noncritical.sc
 echo "HTTP NONCRITICAL OPT-OUT PASSED"
 "$scheme_bin" --script test/http-backlog.sc
+"$scheme_bin" --script test/http-ready.sc
 
 # ---- E7: the fault-injection shadow pass ----------------------------
 # Two passes, and both have to be here or there is no gate.

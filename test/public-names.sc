@@ -149,7 +149,9 @@
               http-listen http-swap! http-set-ws! http-stats
               http-stats-json http-shutdown! http-write-timeout!
               http-request-deadline! http-server-sup
-              http-server-pool-alive? request? res? req-method
+              http-server-pool-alive? http-server-ready?
+              http-server-backlog http-server-backlog-effective
+              request? res? req-method
               req-path req-query req-headers req-header req-body
               req-keep-alive? req-version req-peer req-params
               req-params-set! req-local req-set-local!
@@ -191,6 +193,7 @@
         (only (igropyr libuv)
               uv-init! uv-poll! now-ms now-ns uv-set-deliver!
               uv-owner-died! tcp-listen! tcp-stop-listen!
+              listener-open? listener-token
               tcp-connect! dns-resolve! file-read-async!
               file-realpath file-stream-open!
               file-stream-open-under! file-stream-read!

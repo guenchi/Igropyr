@@ -54,9 +54,13 @@
           ;; lifecycle. NOT for health checking. Something that only wants
           ;; to know whether the pool is still alive should use
           ;; http-server-pool-alive?, which answers without handing over
-          ;; the means to end the process.
+          ;; the means to end the process -- and anything asking "is this
+          ;; server's machinery still in place" wants http-server-ready?,
+          ;; which checks the listener as well. ⚠ Neither answers "would
+          ;; a request be served"; both report lifecycle state.
           http-server-sup http-server-pool-alive?
           http-server-backlog http-server-backlog-effective
+          http-server-ready?
           ;; record predicates, exported for boundary contracts
           ;; ((igropyr checked) in the framework layers) and any
           ;; user code that wants to type-test req/res values
@@ -1848,16 +1852,54 @@
       ;; the backlog this server ASKED for. Kept because the kernel does
       ;; not report what it granted through any path listen() uses, and
       ;; the request is the only half this process can state on its own.
-      (mutable backlog http-server-backlog http-server-backlog-set!)))
+      (mutable backlog http-server-backlog http-server-backlog-set!)
+      ;; The listener's incarnation token, taken right after tcp-listen!.
+      ;; The handle ADDRESS is not an identity: a later listener can be
+      ;; allocated at the same one. Every use of the handle carries this
+      ;; alongside it.
+      (mutable ltoken http-server-ltoken http-server-ltoken-set!)))
+
+  ;; IS THIS SERVER'S MACHINERY STILL IN PLACE? Both halves have to
+  ;; hold: the listener must still be registered under this server's
+  ;; incarnation token, and the pool that runs the handlers must still
+  ;; be alive. ⚠ That is not the same question as "would a request be
+  ;; served" -- see below.
+  ;;
+  ;; ⚠ BOTH HALVES ARE BOOKKEEPING, AND NEITHER ASKS libuv ANYTHING.
+  ;; listener-open? consults a Scheme table this library maintains, and
+  ;; pool-alive? asks whether a pid exists. An earlier version of this
+  ;; comment called the listener half "a measurement, not bookkeeping,"
+  ;; which confused two unrelated properties: it never DEREFERENCES the
+  ;; handle (true, and why it is safe), and it is an independent
+  ;; observation of the socket (false).
+  ;;
+  ;; ⛔ SO THIS IS LIFECYCLE STATE, NOT READINESS. #t means the table
+  ;; still holds this listener under this incarnation token and the
+  ;; supervisor pid still exists. It does NOT establish that a request
+  ;; would be served: the event loop's progress, the workers' progress
+  ;; and the handler's callability are all unobserved here. #f is the
+  ;; answer that settles something.
+  ;;
+  ;; It can be #f before the listener is really gone -- the table row is
+  ;; removed when the stop is REQUESTED and the close completes on a
+  ;; later turn of the loop, so the interval is as long as the loop takes
+  ;; to get there and is not bounded here -- and that direction is the
+  ;; safe one.
+  (define (http-server-ready? srv)
+    (let ((l (http-server-listener srv)))
+      (and l (listener-open? l (http-server-ltoken srv))
+           (http-server-pool-alive? srv) #t)))
 
   ;; What the kernel actually kept, or #f where it cannot be read.
   ;; ⚠ THE TWO READBACKS ARE NOT INTERCHANGEABLE. http-server-backlog is
   ;; what we asked for and is always available; this one is what the
   ;; system granted.
   ;;
-  ;; ⚠ #f MEANS "NO ANSWER", AND IT COVERS THREE CASES: a platform with
-  ;; no such socket option, a failed read (uv_fileno or getsockopt
-  ;; returning an error), and a server already shut down. They are not
+  ;; ⚠ #f MEANS "NO ANSWER", AND SEVERAL THINGS PRODUCE IT: a platform
+  ;; with no such socket option, a failed read (uv_fileno or getsockopt
+  ;; returning an error), a server already shut down, a handle whose
+  ;; incarnation token no longer matches, and a successful read that
+  ;; returned a non-positive value. They are not
   ;; distinguished, and a caller that needs to tell them apart cannot do
   ;; it from this value alone. #f is still the right sentinel -- 0 would
   ;; be a plausible backlog and a symbol would be true in a conditional
@@ -1866,12 +1908,14 @@
   ;; the intention and may be far above what the machine will honour.
   (define (http-server-backlog-effective srv)
     (let ((l (http-server-listener srv)))
-      (and l (listener-backlog-effective l))))
+      (and l (listener-backlog-effective l (http-server-ltoken srv)))))
 
   ;; The accept queue the listener asks for. 8192 suits a machine that
   ;; may see thousands of connections arriving together; the kernel
-  ;; clamps it down to its own maximum, so asking high costs nothing
-  ;; where the maximum is low and helps where it is high.
+  ;; clamps it down to its own maximum, so asking high has no effect
+  ;; where the maximum is low and helps where it is high. (What the
+  ;; kernel spends on a deeper queue where it IS honoured is not
+  ;; measured here.)
   ;;
   ;; ⚠ 511 WAS THE OLD VALUE AND NOTHING HERE RECORDS WHY. It was a
   ;; literal carried along, with no measurement behind it in this
@@ -1896,7 +1940,10 @@
   ;; What it IS good for: the pool supervisor is where requests go, so its
   ;; death means this server cannot serve -- a false answer is conclusive.
   ;; A true answer is not: readiness would also need the listener, and this
-  ;; does not look at it. It says nothing about load either; a pool with
+  ;; does not look at it -- http-server-ready? is the predicate that looks
+  ;; at both. ⚠ Neither one establishes that a request would be served;
+  ;; both report lifecycle state, and it is their #f that settles
+  ;; something. A #t here does say the pid existed when it was asked. It says nothing about load either; a pool with
   ;; every worker busy and a long queue is alive, and http-stats is where
   ;; that is answered.
   ;;
@@ -1937,25 +1984,71 @@
     (map (lambda (kv) (cons (symbol->string (car kv)) (cdr kv)))
          (http-stats srv)))
 
-  ;; Graceful shutdown: stop accepting, then wait until every accepted
-  ;; request has been answered (busy = pending = 0). Established
-  ;; keep-alive connections stay open but receive no new dispatches;
-  ;; their readers idle out. Call from a detached process, never from a
+  ;; Graceful shutdown: stop accepting, then wait until the pool reports
+  ;; busy = pending = 0. ⚠ TWO LIMITS ON THAT PROMISE, both real:
+  ;; established keep-alive connections stay open and their readers can
+  ;; still dispatch further requests -- nothing sets a shutdown flag on
+  ;; them -- so "every accepted request" means every one counted at the
+  ;; moments the pool was asked; and if the pool is already dead there is
+  ;; nothing to drain and this returns without waiting for anything. Call from a detached process, never from a
   ;; pool worker (the worker itself counts as busy -- deadlock).
   (define (http-shutdown! srv)
-    (tcp-stop-listen! (http-server-listener srv))
-    ;; ⛔ AND DROP THE POINTER, because uv_close's callback frees the
-    ;; handle: the field would otherwise hold freed memory. Nothing read
-    ;; it after shutdown until http-server-backlog-effective was added,
-    ;; which is what turned a dormant stale pointer into a use-after-free
-    ;; -- adding a reader is what made the old lifetime bug reachable.
+    (tcp-stop-listen! (http-server-listener srv) (http-server-ltoken srv))
+    ;; ⛔ AND DROP THE POINTER. uv_close's callback frees the handle, so
+    ;; the field would otherwise hold freed memory that two readers take.
+    ;;
+    ;; ⚠ THIS IS OWNERSHIP HYGIENE, NOT THE THING THAT MAKES ready?
+    ;; CORRECT, and an earlier version of this comment claimed otherwise
+    ;; -- it said deleting the clear would leave ready? answering #t
+    ;; forever. It would not: tcp-stop-listen! has already removed the
+    ;; table row by this point, so listener-open? answers #f and the
+    ;; backlog reader short-circuits, with or without this line. What
+    ;; keeps a stale pointer from being handed to libuv is the token
+    ;; check inside the region, not this assignment. Clearing is still
+    ;; right -- holding a freed address invites the next reader to
+    ;; dereference it -- but the named test does not guard this line.
     (http-server-listener-set! srv #f)
-    (let drain ()
-      (let ((s (pool-stats (http-server-sup srv))))
-        (if (and (= 0 (cdr (assq 'busy s)))
-                 (= 0 (cdr (assq 'pending s))))
+    (http-server-ltoken-set! srv #f)
+    ;; ⛔ DRAINING NEEDS A LIVE POOL, AND SHUTDOWN MUST NOT NEED ONE.
+    ;; pool-stats asks the supervisor and waits for its reply; against a
+    ;; dead supervisor that wait ends in a pool-stats-timeout raise, and
+    ;; http-shutdown! has no caller that expects to catch anything -- the
+    ;; measured result was PANIC: boot pool-stats-timeout, taking the
+    ;; image down.
+    ;;
+    ;; ⚠ AND A DEAD POOL IS ONE OF THE TIMES SHUTDOWN GETS CALLED (the
+    ;; ordinary one is a graceful stop with the pool alive): something
+    ;; noticed the server was not serving and is now cleaning up. The
+    ;; cleanup step must not be the thing that kills the process. With no
+    ;; pool there is also nothing to drain -- the listener is already
+    ;; stopped and the field already cleared -- so skipping the loop
+    ;; loses nothing.
+    ;;
+    ;; test/http-ready.sc's second cell is the guard: it kills the
+    ;; supervisor and then calls http-shutdown!, which must return.
+    (when (http-server-pool-alive? srv)
+      (let drain ()
+        ;; Re-checked each turn: the pool can die DURING the drain, and
+        ;; the next pool-stats would raise exactly as above.
+        ;;
+        ;; ⚠ THE LIVENESS TEST NARROWS THIS WINDOW AND DOES NOT CLOSE IT.
+        ;; The pool can die between the test and the call below, and then
+        ;; pool-stats raises anyway. So the raise is also caught -- and
+        ;; caught BY NAME: otp's pool-stats raises the symbol
+        ;; 'pool-stats-timeout, and only that one ends the drain. A
+        ;; catch-all here would swallow a real fault in the stats path
+        ;; and report a clean shutdown, which is the shape this file
+        ;; keeps removing.
+        (if (not (http-server-pool-alive? srv))
             'done
-            (begin (sleep-ms 100) (drain))))))
+            (let ((s (guard (e ((eq? e 'pool-stats-timeout) #f))
+                       (pool-stats (http-server-sup srv)))))
+              (cond
+                ((not s) 'done)          ; pool died mid-drain
+                ((and (= 0 (cdr (assq 'busy s)))
+                      (= 0 (cdr (assq 'pending s))))
+                 'done)
+                (else (sleep-ms 100) (drain))))))))
 
   ;; Start the worker pool and the TCP listener; handler is
   ;; (lambda (req res) ...), run inside a pool worker for every request.
@@ -2045,7 +2138,7 @@
                   ;; success it will never see corrected.
                   (lambda (task) (not (unbox (vector-ref task 4))))))
            (host (opt 'host "0.0.0.0"))
-           (srv (make-http-server sup hbox wsbox (now-ms) 0 backlog)))
+           (srv (make-http-server sup hbox wsbox (now-ms) 0 backlog #f)))
       (unless (and (string? host) (> (string-length host) 0))
         (assertion-violation 'http-listen "host must be a non-empty string" host))
       (set-box! supbox sup)
@@ -2095,6 +2188,14 @@
               (conn-set-owner! c pid)
               (tcp-read-start! c)))
           (if (opt 'reuseport #f) 2 0)))  ; UV_TCP_REUSEPORT
+      ;; Taken immediately after tcp-listen! returns. ⚠ Not inside one
+      ;; uninterruptible step with it: another process could in principle
+      ;; stop this listener in between, in which case listener-token
+      ;; answers #f and every later check fails closed -- the server
+      ;; reads as not-in-place rather than reading as somebody else's.
+      ;; Every later use pairs handle and token; the address alone would
+      ;; match a future listener's.
+      (http-server-ltoken-set! srv (listener-token (http-server-listener srv)))
       ;; The two numbers are printed together because the pair is the
       ;; whole point: the request is what this process chose, the
       ;; effective value is what the kernel kept, and only their
