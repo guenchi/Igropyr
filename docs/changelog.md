@@ -63,7 +63,6 @@
 - **json**: a digit is required on both sides of the decimal point.
 - The JSON reader's acceptance surface is pinned row by row, each row carrying the
   RFC text that decides it, with the should-be-green half enumerated across the grammar.
-- README: Chez is a requirement, not a preference.
 
 ## 1.3.2 — 2026-08-21 (73 commits)
 
@@ -455,24 +454,4 @@ with Erlang-style green processes.
   header-injection guards, static prefix boundaries, WebSocket frame validation and
   message-size caps, MySQL `caching_sha2` full-auth hardening, and protocol hardening
   ported from contributed patches.
-
----
-
-## Numbering
-
-- **npm is authoritative.** Published versions run 1.0.0 through 1.5.1, 37 of them.
-- **In git but never published**: version bumps to `1.1.21` and `1.2.0` (both
-  2026-07-23). Their content shipped in 1.2.1.
-- **Published but never tagged**: 1.1.19, 1.1.20, 1.5.1.
-- **Republished without changes**: 1.1.12 and 1.1.13 followed 1.1.11 within four
-  minutes, with no commits in between.
-- **Numbers that never existed anywhere**: 1.0.4, 1.1.4, 1.1.14, 1.2.4, and the whole
-  1.4 series — 1.3.3 is followed by 1.5.0.
-- **Before 1.0.0**: eight tags from 0.1.0 to 0.2.10 (2018-03-01 to 2018-04-20) belong
-  to an earlier codebase of the same name. They are not ancestors of the current
-  `master`, whose root commit is the 2026-07-10 rewrite, and none of them was ever
-  published to npm. They are outside this changelog.
-- On 2026-08-07 the history was rewritten to strip tool trailers from commit
-  messages. Commits before that point have different hashes than they had when the
-  corresponding versions were published; their content is unchanged.
 
