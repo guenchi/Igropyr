@@ -492,6 +492,9 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/f
 # item 12: stat / unlink / scandir on the thread pool; the ticker keeps ticking
 # during a 20k-entry scandir, and the synchronous call is the positive control
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/fs-async-ops.sc
+# item 6: the registrar is a warden child and its commands live in a queue, so a
+# death loses nothing; four deaths, four restarts, every command completed
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/registrar-supervision.sc
 #   3. The poison-event suite lives in the same instrumented pass: its
 #      failure is injected at notify-list!'s entry, so it needs the
 #      hooks live and the sources, and it must not share a process with

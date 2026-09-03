@@ -206,7 +206,9 @@
           node-redeliver-dead-letter!
           quarantine-reason? quarantine-reason-kind quarantine-reason-payload
           submission-failure? node-install-rule-order node-orphan-count
-          monitor-node/token demonitor-node/token)
+          monitor-node/token demonitor-node/token
+          $registrar-seed-gen! $registrar-pid $registrar-queue-length
+          $registrar-peer-gen)
   ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
   ;; the note in libuv.sc; test/inject-isolation.ss is what measures it.
   (import (chezscheme) (igropyr buffer)
@@ -473,26 +475,93 @@
   ;; region of its own -- but it keeps one anyway, because "only the
   ;; registrar calls it" is a fact about today's callers and the counter
   ;; would be silently wrong if that stopped being true.
+  ;; ⛔ GENERATION 0 IS NEVER ISSUED, and a stored 0 means ABSENT. It is
+  ;; the explicit spelling of "this peer has no generation yet", written
+  ;; into the table so that the registrar's tails can advance the counter
+  ;; with a replace-in-place instead of an insert -- an insert can grow
+  ;; the table, and these tails advance inside a region where nothing may
+  ;; allocate.
+  ;;
+  ;; ⚠ THE READ HAS TO KNOW THAT, which is the whole cost of the trick: a
+  ;; bare hashtable-ref would hand back 0 as though it were a generation,
+  ;; because 0 is a true value in Scheme. Numbering starts at 1 and the
+  ;; wire proof is built from it, so a 0 reaching an authorisation is a
+  ;; peer dialling under a generation no epoch ever had.
+  ;;
+  ;; ⭐ THIS IS ALSO WHAT MAKES A RAISE IN PHASE (a) HARMLESS. If a tail
+  ;; dies after pre-placing 0 and before advancing, what it leaves is a
+  ;; peer that reads as having no generation -- exactly its state before
+  ;; the command arrived.
   (define (peer-gen peer)
-    (or (atomically (hashtable-ref dial-gens peer #f))
-        (next-dial-gen! peer)))
+    (let ((g (atomically (hashtable-ref dial-gens peer #f))))
+      (if (and g (> g 0)) g (next-dial-gen! peer))))
 
+  ;; Pre-place the counter so the tail's advance replaces rather than
+  ;; inserts. Phase (a) only: it may allocate, so it runs before the
+  ;; tail's region. Never overwrites a real generation.
+  (define (pretouch-dial-gen! peer)
+    (atomically
+      (unless (hashtable-contains? dial-gens peer)
+        (hashtable-set! dial-gens peer 0))))
+
+  ;; ---- test seam ------------------------------------------------------
+  ;; ⛔ R6-8' NEEDS A PEER ONE GENERATION FROM EXHAUSTION, and there is no
+  ;; way to get one by using the library: reaching 2^64-1 honestly would
+  ;; take longer than the universe has had. So the counter is settable,
+  ;; and only when this artifact was expanded with injection on.
+  ;;
+  ;; ⚠ THIS READS IGROPYR_INJECT A SECOND TIME. (igropyr inject) has its
+  ;; own copy of this switch and this is deliberately not shared: the
+  ;; alternative is exporting the mode from there, which would make a
+  ;; production artifact's expansion depend on it. Both are computed from
+  ;; the same variable in the same process at expansion time, so they
+  ;; cannot disagree within one build -- and if a future change makes
+  ;; them able to, the seam is the one that must fail closed.
+  (meta define registrar-seam-mode
+    (let ((v (getenv "IGROPYR_INJECT")))
+      (if (and v (string=? v "on")) 'on 'off)))
+
+  ;; ⭐ THE OFF FORM REFUSES RATHER THAN DOING NOTHING. A silent no-op
+  ;; would let a cell that forgot IGROPYR_INJECT=on run green while
+  ;; seeding nothing -- the counter would stay at 0, no exhaustion would
+  ;; happen, and the cell would be asserting about a peer it never
+  ;; prepared.
+  (meta-cond
+    ((eq? registrar-seam-mode 'on)
+     (define ($registrar-seed-gen! peer n)
+       (atomically (hashtable-set! dial-gens peer n))))
+    (else
+     (define ($registrar-seed-gen! peer n)
+       (assertion-violation '$registrar-seed-gen!
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"
+         peer))))
+
+  ;; ⚠ THE DEFAULT OF 0 IS LOAD-BEARING TWICE OVER: for a peer with no
+  ;; row at all, and for one whose row was pre-placed at 0 by
+  ;; pretouch-dial-gen!. Both mean "none yet", and both make this produce
+  ;; 1 as the first generation -- which is the numbering the wire proof
+  ;; and node-peers both assume.
   (define (next-dial-gen! peer)
     (let ((n (atomically
                (let ((n (+ 1 (hashtable-ref dial-gens peer 0))))
                  (if (>= n dial-gen-limit)
                      #f
                      (begin (hashtable-set! dial-gens peer n) n))))))
-      (unless n
-        (display (string-append
-                   "igropyr node: dial generations for peer "
-                   (symbol->string peer)
-                   " are exhausted; this node cannot dial it again without"
-                   " reusing one. The registrar stops here, so no new"
-                   " attempt can be authorised for any peer; an attempt"
-                   " already authorised is not stopped merely by this.\n")
-                 (current-error-port))
-        (raise dial-gen-exhausted))
+      ;; ⛔ THIS RAISES SILENTLY, and the silence is the point. The
+      ;; registrar calls this from inside an interrupt-disabled region,
+      ;; and `display` there would put an I/O call -- which can block and
+      ;; can itself raise -- inside a region whose whole purpose is that
+      ;; nothing in it does either. So the diagnostic moved to the
+      ;; caller, which is outside the region and knows which command it
+      ;; was running.
+      ;;
+      ;; ⚠ PRINTING IS THE CALLER'S JOB FROM HERE ON. Every caller today
+      ;; is inside the registrar, which does it in one place, so the
+      ;; obligation is discharged exactly once. A future caller from
+      ;; anywhere else inherits it: raise reaches it with no message
+      ;; attached, and an exhaustion that reaches an operator as a bare
+      ;; token is the silence this whole path was written to avoid.
+      (unless n (raise dial-gen-exhausted))
       n))
 
   (define (node-self) self-name)
@@ -4024,6 +4093,13 @@
   (define dispatcher-name 'igropyr-node-dispatcher)
   (define dispatch-idle-ms 1000)
 
+  ;; The registrar's wake is a ping, not the delivery: the work is in the
+  ;; queue before the ping is sent, so a lost ping costs latency and
+  ;; nothing else. This is the bound on that latency, and it is the
+  ;; dispatcher's number for the same reason -- both are "how long until
+  ;; someone notices queued work with no prompting".
+  (define registrar-idle-ms 1000)
+
   (define (dispatch-wake!)
     (let ((d (whereis dispatcher-name)))
       (when d (send d (vector 'work)))))
@@ -6814,123 +6890,364 @@
   ;; attempt. See peers-auth for why the two cannot be swapped.
   (define registrar #f)
 
-  (define (registrar-loop)
+  ;; ---- the command queue (C2) -----------------------------------------
+  ;; ⭐ THE WORK IS DURABLE, THE WAKE IS NOT. Commands used to live in the
+  ;; registrar's mailbox, which died with it: a registrar that was killed
+  ;; mid-command took every queued command with it, and nothing could tell
+  ;; that anything had been lost. The queue is module state, so it
+  ;; outlives any one registrar incarnation; the restarted one finds the
+  ;; head still there and runs it again.
+  ;;
+  ;; ⭐ EVERY WRITE HERE IS A POINTER WRITE. Senders allocate their cell
+  ;; OUTSIDE the region and hand it in already built, so appending is a
+  ;; set-cdr! and two set!s -- nothing in the region can raise for want of
+  ;; memory. That is the property that lets a sender append from any
+  ;; process without a lock.
+  ;;
+  ;; ⚠ NEVER CLEARED ON START. A restart is not a reason to drop work; the
+  ;; command at the head is precisely the one whose effects may be half
+  ;; applied, and re-running it is the recovery.
+  (define registrar-q-head '())
+  (define registrar-q-tail '())
+
+  ;; cell is (cons command '()), allocated by the caller before the region.
+  (define (registrar-enqueue! cell)
+    (atomically
+      (if (null? registrar-q-head)
+          (begin (set! registrar-q-head cell) (set! registrar-q-tail cell))
+          (begin (set-cdr! registrar-q-tail cell) (set! registrar-q-tail cell)))))
+
+  (define (registrar-peek) (atomically registrar-q-head))
+
+  ;; ⭐ BY IDENTITY, NOT BY POSITION. The executor dequeues the cell it
+  ;; actually ran; if anything has changed the head since -- it cannot
+  ;; today, but a second consumer would -- this removes nothing rather
+  ;; than removing someone else's work.
+  (define (registrar-dequeue! cell)
+    (atomically
+      (when (eq? registrar-q-head cell)
+        (set! registrar-q-head (cdr cell))
+        (when (null? registrar-q-head) (set! registrar-q-tail '())))))
+
+  ;; The ping. Best-effort by construction: the command is already queued
+  ;; when this runs, and send to a dead or absent registrar must not
+  ;; propagate into the caller of a public API.
+  (define (registrar-poke!)
+    (guard (e (#t (void)))
+      (when registrar (send registrar (vector 'work)))))
+
+  ;; ---- test seams (see $registrar-seed-gen! for why they are gated) ----
+  ;; ⭐ THE REGISTRAR HAS NO REGISTERED NAME, deliberately: `whereis` is
+  ;; how a peer's own processes find each other, and nothing outside this
+  ;; file has business addressing the registrar. That leaves a cell that
+  ;; wants to kill it with no way to name it, so this hands the pid over
+  ;; -- read-only, and only in an artifact expanded for injection.
+  ;;
+  ;; ⚠ The pid is #f between incarnations. A cell reading #f has caught
+  ;; the window between a death and the warden's restart; that is a real
+  ;; state, not an error.
+  ;;
+  ;; The queue length is what lets a cell say "the command outlived the
+  ;; registrar that was going to run it" -- the property the whole item
+  ;; exists for, and one with no other observable.
+  (meta-cond
+    ((eq? registrar-seam-mode 'on)
+     (define ($registrar-pid) registrar)
+     (define ($registrar-queue-length)
+       (atomically
+         (let loop ((c registrar-q-head) (n 0))
+           (if (pair? c) (loop (cdr c) (fx+ n 1)) n))))
+     ;; ⛔ THE RAW STORED VALUE, AND IT MUST NOT GO THROUGH peer-gen. Two
+     ;; reasons, and both are the point of the seam rather than details of
+     ;; it: peer-gen MINTS when it finds nothing, so reading through it
+     ;; would change the state a cell is trying to observe; and peer-gen
+     ;; is exactly the procedure that turns a stored 0 into a fresh 1, so
+     ;; reading through it could never see the 0. A cell whose mutation is
+     ;; "peer-gen hands 0 back as a generation" needs an observer that
+     ;; peer-gen cannot launder.
+     ;;
+     ;; -> #f when the peer has no counter, 0 when one was pre-placed and
+     ;; not yet advanced, otherwise the generation. Those three are
+     ;; different states and this reports them as three different values.
+     (define ($registrar-peer-gen peer)
+       (atomically (hashtable-ref dial-gens peer #f))))
+    (else
+     (define ($registrar-pid)
+       (assertion-violation '$registrar-pid
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"))
+     (define ($registrar-queue-length)
+       (assertion-violation '$registrar-queue-length
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"))
+     (define ($registrar-peer-gen peer)
+       (assertion-violation '$registrar-peer-gen
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"
+         peer))))
+
+  ;; ---- the executor (C3) ----------------------------------------------
+  ;; ⭐ THE REGISTRAR IS A WARDEN CHILD NOW, and this is the shape that
+  ;; makes that worth anything. Supervision alone would restart a process
+  ;; whose work had died with it; the queue outlives the incarnation, so a
+  ;; restart resumes rather than forgets.
+  ;;
+  ;; ⚠ THE COMMAND IS DEQUEUED ONLY WHEN ITS HANDLER SAYS SO, and each
+  ;; handler puts the dequeue after the writes it must not be separated
+  ;; from. A death between a command's effects and its dequeue therefore
+  ;; re-runs the command -- which is why every handler is written so that
+  ;; re-running it is harmless. R-d below is exactly that property.
+  ;;
+  ;; ⛔ THERE ARE THREE COMMANDS AND THAT IS ALL. A fourth arm,
+  ;; #(auth-revoke ,peer), stood here for a long time and NOTHING EVER
+  ;; SENT IT -- what the design notes call "auth-revoke" is the step
+  ;; inside set-endpoint that deletes the auth row and advances the
+  ;; generation, not a message. It went with the move to the queue rather
+  ;; than acquiring a phase-(a)/(b) handler no cell could ever reach.
+  ;;
+  ;; R-d: The harmlessness of re-running the pre-region stops is a property
+  ;; of those sends: node-stop to a dead or stopping process is dropped.
+  ;; R6-2 and R6-3 check this under injected kills.
+  (define (registrar-start)
+    (set! registrar self)
+    ;; C7. Hygiene, not correctness. A row whose child is dead is already
+    ;; treated as absent by the `held` test; this removes it so the table
+    ;; does not accumulate the dead. Commands are durable in the queue, so
+    ;; no revocation is lost with a dead registrar -- the earlier reading
+    ;; of this sweep as a repair for lost revokes no longer applies. It
+    ;; must not touch generation counters.
+    ;;
+    ;; It cannot race a live consumer: consuming happens in one region and
+    ;; requires the row's child to be self, and a dead child can never
+    ;; consume again.
+    (atomically
+      (let-values (((ks vs) (hashtable-entries peers-auth)))
+        (vector-for-each
+          (lambda (k v)
+            (unless (process-alive? (auth-child v))
+              (hashtable-delete! peers-auth k)))
+          ks vs)))
+    ;; A round before the first receive, for the dispatcher's reason: the
+    ;; work queued while the previous incarnation was dying is here now,
+    ;; and no ping is coming to announce it.
     (let loop ()
+      (registrar-round!)
       (receive
-        (`#(attempt-register ,peer ,endpoint ,parent ,child)
-          ;; ONE LIVE AUTHORISATION PER PEER. An existing row whose child
-          ;; is still alive and has not consumed it means another attempt
-          ;; is already holding permission; a second one would dial the
-          ;; same name in parallel, and both would reach the far end.
-          (let* ((cur (atomically (hashtable-ref peers-auth peer #f)))
-                 (held (and cur
-                            (not (auth-consumed? cur))
-                            (process-alive? (auth-child cur))
-                            (not (eq? (auth-child cur) child)))))
-            (if held
-                (when (process-alive? child) (send child (vector 'no-go)))
-                (begin
-                  ;; The generation belongs to the EPOCH, not to this
-                  ;; attempt: a retry under the same authorisation reads
-                  ;; the same number back.
-                  (atomically
+        (after registrar-idle-ms 'idle)
+        (`#(work) 'work)
+        (`#(node-stop) (raise 'stop)))
+      (loop)))
+
+  ;; Drain the queue. Each command is executed and then dequeued by its
+  ;; own handler; this stops when the head stops moving, which happens
+  ;; when the queue is empty.
+  (define (registrar-round!)
+    (let loop ()
+      (let ((cell (registrar-peek)))
+        (when (pair? cell)
+          (registrar-execute! cell)
+          (when (eq? (registrar-peek) cell)
+            ;; The handler declined to dequeue and nothing else will move
+            ;; it; stopping here rather than spinning on the same head.
+            (raise (list 'registrar-command-stuck (car cell))))
+          (loop)))))
+
+  ;; ⭐ THE DIAGNOSTIC LIVES HERE, not in next-dial-gen!. That procedure
+  ;; runs inside a region where display would be an I/O call that can
+  ;; block and can raise; here we are outside every region and we hold the
+  ;; command, so the message can name the peer and what was being done.
+  ;; A5: a command that raises deterministically stays at the head, the
+  ;; warden restarts us, it raises again, and the give-up rule fires --
+  ;; node fail-stop, with this line already printed.
+  (define (registrar-execute! cell)
+    (let ((cmd (car cell)))
+      (guard (e ((eq? e dial-gen-exhausted)
+                 (display
+                   (string-append
+                     "igropyr node: dial generations for peer "
+                     (symbol->string (vector-ref cmd 1))
+                     " are exhausted while running "
+                     (symbol->string (vector-ref cmd 0))
+                     "; this node cannot dial it again without reusing"
+                     " one. The registrar stops here, so no new attempt"
+                     " can be authorised for any peer; an attempt already"
+                     " authorised is not stopped merely by this.\n")
+                   (current-error-port))
+                 (raise e)))
+        (case (vector-ref cmd 0)
+          ((attempt-register) (registrar-attempt! cell cmd))
+          ((disconnect)       (registrar-disconnect! cell cmd))
+          ((set-endpoint)     (registrar-set-endpoint! cell cmd))
+          ;; A5 again: an unknown command is this node's own bug, not a
+          ;; peer's input, so it is not swallowed.
+          (else (raise (list 'registrar-unknown-command cmd)))))))
+
+  ;; ONE LIVE AUTHORISATION PER PEER. An existing row whose child is still
+  ;; alive and has not consumed it means another attempt already holds
+  ;; permission; a second one would dial the same name in parallel and
+  ;; both would reach the far end.
+  ;;
+  ;; ⚠ THE SEND IS AFTER THE REGION AND THE DEQUEUE IS AFTER THE SEND.
+  ;; Sending inside the region would put an allocation there; dequeuing
+  ;; before the send would let a death between them lose the go, with the
+  ;; command gone and the child waiting for a reply that will never come.
+  ;; In this order a death re-runs the command and the child is told
+  ;; again -- which is why the same-child cases below are written to be
+  ;; re-runnable.
+  (define (registrar-attempt! cell cmd)
+    (let ((peer (vector-ref cmd 1)) (endpoint (vector-ref cmd 2))
+          (parent (vector-ref cmd 3)) (child (vector-ref cmd 4)))
+      (let ((reply
+             (atomically
+               (let ((cur (hashtable-ref peers-auth peer #f)))
+                 (cond
+                   ;; same child, already consumed: it has its answer and
+                   ;; is past needing one. Saying it again would be a
+                   ;; second go for one permission.
+                   ((and cur (eq? (auth-child cur) child) (auth-consumed? cur))
+                    #f)
+                   ;; same child, not consumed: this is a re-run of a
+                   ;; command whose send may have been lost. Say it again.
+                   ((and cur (eq? (auth-child cur) child))
+                    'go)
+                   ;; a different child still holds it
+                   ((and cur (not (auth-consumed? cur))
+                         (process-alive? (auth-child cur)))
+                    'no-go)
+                   (else
+                    ;; The generation belongs to the EPOCH, not to this
+                    ;; attempt: a retry under the same authorisation reads
+                    ;; the same number back.
                     (hashtable-set! peers-auth peer
-                      (vector endpoint parent child (peer-gen peer) #f)))
-                  (when (process-alive? child) (send child (vector 'go))))))
-          (loop))
-        ;; A revocation ends the epoch: the next authorisation for this
-        ;; peer gets a NEW generation, which is what makes "a fresh
-        ;; permission outranks the one it replaced" true.
-        (`#(auth-revoke ,peer)
-          (atomically (hashtable-delete! peers-auth peer))
+                      (vector endpoint parent child (peer-gen peer) #f))
+                    'go))))))
+        ;; INJECTION POINT 'registrar-attempt-after-region -- OWNING
+        ;; GUARD: none here; the raise reaches registrar-execute!'s guard,
+        ;; which re-raises everything but exhaustion, so the warden sees
+        ;; it. The command is still queued at this point: the cell asserts
+        ;; that the restarted registrar re-runs it and the child ends up
+        ;; told exactly once.
+        (inject-fault! 'registrar-attempt-after-region)
+        (when (and reply (process-alive? child))
+          (send child (vector reply)))
+        ;; INJECTION POINT 'registrar-attempt-after-send -- OWNING GUARD:
+        ;; none, as above. A death here re-runs the command; the
+        ;; same-child branches above are what make that harmless.
+        (inject-fault! 'registrar-attempt-after-send)
+        (registrar-dequeue! cell))))
+
+  ;; Stop dialling a peer and drop its link.
+  ;;
+  ;; ⚠ THE STOPS HAPPEN BEFORE THE REGION AND THE ROW IS NOT DELETED YET.
+  ;; Deleting first and stopping after leaves, if the registrar dies
+  ;; between them, a connector nothing has a record of -- alive, dialling,
+  ;; and invisible to every count this file keeps. Stopping first costs
+  ;; only that a re-run stops an already-stopped process, which is R-d.
+  (define (registrar-disconnect! cell cmd)
+    (let ((peer (vector-ref cmd 1)))
+      (let ((p (atomically
+                 (let ((e (hashtable-ref connectors peer #f)))
+                   (and e (vector-ref e 0))))))
+        ;; INJECTION POINT 'registrar-disconnect-after-take -- OWNING
+        ;; GUARD: none; see the attempt points above. Placed after the row
+        ;; read and before the stop, which is the window where the row
+        ;; still names a connector this command is about to end.
+        (inject-fault! 'registrar-disconnect-after-take)
+        (when (and p (process-alive? p)) (send p (vector 'node-stop)))
+        (let ((e (peer-entry peer)))
+          (when e (send (entry-link e) (vector 'node-stop))))
+        ;; phase (a): may allocate, so it is outside the region.
+        ;;
+        ;; R-e (restated for the pre-placement): a raise in phase (a) of a
+        ;; tail leaves the command queued; the only mutation phase (a) can
+        ;; have made is pre-placing 0 for a peer that had no counter, and
+        ;; 0 reads as absent (see peer-gen) -- so the peer is left exactly
+        ;; as it was. The spawned-but-unpublished process, if any, is
+        ;; killed by the compensation guard. The executor re-runs the
+        ;; command.
+        ;;
+        ;; ⛔ AN EARLIER VERSION PRE-MINTED 1 HERE, and it was wrong in a
+        ;; way ten rounds of design review did not see: the advance below
+        ;; then took it to 2, so the first generation a fresh peer was
+        ;; ever authorised under was 2, not 1. test/node.sc's
+        ;; s1-dialgen-generator says so in one line. Pre-placing 0 keeps
+        ;; the replace-in-place and leaves the numbering alone.
+        (pretouch-dial-gen! peer)
+        (atomically
+          (hashtable-delete! connectors peer)
+          (hashtable-delete! peers-auth peer)
           (next-dial-gen! peer)
-          (loop))
-        (`#(disconnect ,peer)
-          (let ((p (atomically
-                     (let ((e (hashtable-ref connectors peer #f)))
-                       (hashtable-delete! connectors peer)
-                       (and e (vector-ref e 0))))))
-            (when (and p (process-alive? p)) (send p (vector 'node-stop))))
-          (atomically (hashtable-delete! peers-auth peer))
-          (next-dial-gen! peer)
-          (let ((e (peer-entry peer)))
-            (when e (send (entry-link e) (vector 'node-stop))))
-          (loop))
-        ;; The endpoint change, in the order the design calls (0)-(4).
-        ;; The steps are numbered there and named here so the two can be
-        ;; read against each other.
-        (`#(set-endpoint ,peer ,host ,port)
-          (let* ((cur (atomically (hashtable-ref connectors peer #f)))
-                 (same? (and cur (process-alive? (vector-ref cur 0))
-                             (string=? (vector-ref cur 1) host)
-                             (equal? (vector-ref cur 2) port))))
-            (if same?
-                ;; The base case, and it has to stay one: asking for the
-                ;; endpoint that is already being dialled must not tear
-                ;; down a working link to rebuild the same thing.
-                (void)
-                (let* ((old-conn (atomically   ; (0) take, then forget
-                                   (let ((e (hashtable-ref connectors peer #f)))
-                                     (hashtable-delete! connectors peer)
-                                     (and e (vector-ref e 0)))))
-                       (ent (peer-entry peer))
-                       ;; (2) HAS A BRANCH. A child holding a connection
-                       ;; THIS node dialled is dialling the old endpoint
-                       ;; and must go. A child holding a connection the
-                       ;; PEER dialled to us is not ours to end: the
-                       ;; endpoint being changed is the one we dial, and
-                       ;; the inbound link is unaffected by it. Killing it
-                       ;; would drop a working link to change an address
-                       ;; nobody was using for it.
-                       (outbound? (and ent (eq? (entry-dialer ent) self-name))))
-                  ;; (1) the old connector, by the pid taken in (0) --
-                  ;; never from a parent's private state, which is what
-                  ;; made this unimplementable when the pid lived there.
-                  (when (and old-conn (process-alive? old-conn))
-                    (kill old-conn 'endpoint-changed))
-                  ;; (3) the teardown consequences, reached the same way
-                  ;; an ordinary death reaches them: stop-link! closes
-                  ;; first and then wakes, and the link's own exit path
-                  ;; runs remove-peer!, which is the one place those five
-                  ;; consequences live. Reimplementing them here would be
-                  ;; a second copy that drifts.
-                  (when outbound?
-                    (stop-link! (entry-conn ent) (entry-link ent)
-                                'endpoint-changed))
-                  ;; the old permission ends with the old endpoint, so the
-                  ;; next one carries a new generation
-                  (atomically (hashtable-delete! peers-auth peer))
-                  (next-dial-gen! peer)
-                  ;; (4) publish the new mapping and the connector that
-                  ;; serves it in one region, so nothing can observe a
-                  ;; mapping with no connector or the reverse.
-                  ;; ⚠ AN ALLOCATION IN ARGUMENT POSITION IS NOT FREE OF
-                  ;; CONSEQUENCE HERE. Building the value before the one
-                  ;; write is the shape that keeps a table from being
-                  ;; half-updated, and it does that here too -- but one
-                  ;; of the arguments is a spawn, and a spawn leaves
-                  ;; something behind whether or not the write that was
-                  ;; going to publish it succeeds. The write takes a NEW
-                  ;; key and can grow the table, so it can raise, and
-                  ;; what it left was a connector process dialling a peer
-                  ;; that nothing has a record of -- for as long as the
-                  ;; node runs, and visible in no count this file keeps.
-                  ;;
-                  ;; The compensation is only the kill. Nothing before
-                  ;; the write wrote anything, so there is no entry to
-                  ;; remove, and deleting unconditionally could take out
-                  ;; an entry that was already here. What has to be
-                  ;; undone is exactly what could already have happened.
-                  (atomically
-                    (let ((p #f))
-                      (guard (e (#t (when (and p (process-alive? p))
-                                      (kill p 'connector-unpublished))
-                                    (raise e)))
-                        (set! p (spawn (lambda () (connector peer host port))))
-                        (hashtable-set! connectors peer
-                          (vector p host port))))))))
-          (loop))
-        (`#(node-stop) (void)))))
+          (registrar-dequeue! cell)))))
+
+  ;; The endpoint change, in the order the design calls (0)-(4).
+  ;;
+  ;; ⭐ THE ADVANCE COMES BEFORE THE PUBLISH. The publish is the only
+  ;; state write here that may allocate -- a new connector key can grow
+  ;; the table -- so it is placed last among them. A raise there leaves
+  ;; the old rows gone, the generation advanced and nothing published,
+  ;; which the re-run completes; a publish before the advance would leave
+  ;; a new connector dialling under the OLD generation, which nothing
+  ;; downstream can detect.
+  ;;
+  ;; The set-endpoint publish may allocate when the connector key is new. It
+  ;; is ordered after the generation advance and is the last state write
+  ;; before dequeue. A raise leaves rows and auth deleted, the generation
+  ;; advanced, and nothing published; the command is replayable, and the
+  ;; compensation guard kills the unpublished process. Each re-run after a
+  ;; publish raise consumes one extra generation.
+  (define (registrar-set-endpoint! cell cmd)
+    (let ((peer (vector-ref cmd 1)) (host (vector-ref cmd 2))
+          (port (vector-ref cmd 3)))
+      (let* ((cur (atomically (hashtable-ref connectors peer #f)))
+             (same? (and cur (process-alive? (vector-ref cur 0))
+                         (string=? (vector-ref cur 1) host)
+                         (equal? (vector-ref cur 2) port))))
+        (if same?
+            ;; The base case, and it has to stay one: asking for the
+            ;; endpoint that is already being dialled must not tear down a
+            ;; working link to rebuild the same thing.
+            (registrar-dequeue! cell)
+            (let* ((old-conn (and cur (vector-ref cur 0)))
+                   (ent (peer-entry peer))
+                   ;; (2) HAS A BRANCH. A child holding a connection THIS
+                   ;; node dialled is dialling the old endpoint and must
+                   ;; go. A child holding a connection the PEER dialled to
+                   ;; us is not ours to end: the endpoint being changed is
+                   ;; the one we dial, and the inbound link is unaffected
+                   ;; by it.
+                   (outbound? (and ent (eq? (entry-dialer ent) self-name))))
+              ;; INJECTION POINT 'registrar-endpoint-after-take -- OWNING
+              ;; GUARD: none; see the attempt points. After the row read,
+              ;; before the stop.
+              (inject-fault! 'registrar-endpoint-after-take)
+              ;; (1) the old connector, by the pid read above -- never
+              ;; from a parent's private state.
+              (when (and old-conn (process-alive? old-conn))
+                (kill old-conn 'endpoint-changed))
+              ;; (3) the teardown consequences, reached the same way an
+              ;; ordinary death reaches them: stop-link! closes first and
+              ;; then wakes, and the link's own exit path runs
+              ;; remove-peer!, which is the one place those consequences
+              ;; live.
+              (when outbound?
+                (stop-link! (entry-conn ent) (entry-link ent) 'endpoint-changed))
+              ;; ⭐ THE COMPENSATION GUARD COVERS PHASE (a) AND THE REGION
+              ;; BOTH. A spawn leaves a process behind whether or not the
+              ;; write that was going to publish it succeeds, and the
+              ;; raise can come from either half.
+              (let ((p #f))
+                (guard (e (#t (when (and p (process-alive? p))
+                                (kill p 'connector-unpublished))
+                              (raise e)))
+                  ;; phase (a), outside the region: all of it may allocate.
+                  ;; Pre-place, do not pre-mint -- see the disconnect tail
+                  ;; for what pre-minting cost.
+                  (pretouch-dial-gen! peer)
+                  (set! p (spawn (lambda () (connector peer host port))))
+                  (let ((row (vector p host port)))
+                    (atomically
+                      (hashtable-delete! connectors peer)
+                      (hashtable-delete! peers-auth peer)
+                      (next-dial-gen! peer)
+                      (hashtable-set! connectors peer row)
+                      (registrar-dequeue! cell))))))))))
 
   ;; -> the generation this attempt is authorised under, or #f. The
   ;; connect is submitted INSIDE the region that consumes the row: an
@@ -6939,7 +7256,10 @@
   ;; revocation exists precisely because somebody decided this dial must
   ;; not happen.
   (define (authorised-connect! peer host port parent)
-    (send registrar (vector 'attempt-register peer (cons host port) parent self))
+    ;; The cell is built out here; appending it is pointer writes only.
+    (registrar-enqueue!
+      (list (vector 'attempt-register peer (cons host port) parent self)))
+    (registrar-poke!)
     (receive (after handshake-timeout-ms #f)
       (`#(no-go) #f)
       (`#(go)
@@ -7110,7 +7430,11 @@
     ;; The registrar starts with the node, not with the first dial: its
     ;; mailbox is the order in which permission to dial changes, and an
     ;; order that only begins once somebody dials is not one.
-    (set! registrar (spawn registrar-loop))
+    ;; ⛔ THE REGISTRAR IS NOT SPAWNED HERE ANY MORE. The warden starts
+    ;; it, and registrar-start assigns `registrar` itself. Nothing waits
+    ;; for that to happen: a command sent before the first incarnation is
+    ;; running goes into the queue and is executed when it starts, which
+    ;; is the same path a command sent during a restart takes.
     ;; The warden starts with the node and is marked critical: it is the
     ;; root the reaper's recoverability hangs from, so its own death is
     ;; not something to survive quietly.
@@ -7120,7 +7444,16 @@
                  (list (vector 'reaper reaper-loop
                                "hosted-monitor credit is no longer being returned")
                        (vector 'dispatcher dispatcher-loop
-                               "topology notifications are no longer being delivered"))))))
+                               "topology notifications are no longer being delivered")
+                       ;; ⭐ THE REGISTRAR IS A CHILD NOW. It was spawned
+                       ;; bare, so an unexpected raise inside it ended it
+                       ;; with nothing restarting it -- and it is the only
+                       ;; process that hands out permission to dial, so
+                       ;; its death was the quiet end of every future
+                       ;; dial. The queue is what makes restarting it
+                       ;; worth doing: the work survives the incarnation.
+                       (vector 'registrar registrar-start
+                               "no new peer can be authorised to dial"))))))
     (critical! reaper-warden 'node-warden)
     (when (pair? rest)
       (let ((port (car rest))
@@ -7171,9 +7504,17 @@
     ;; yet, B sees none and spawns its own, A resumes and spawns over it
     ;; -- and the endpoint that survived was not necessarily the one asked
     ;; for last. A mailbox is a total order for free.
-    (unless registrar
+    ;; ⚠ THE GUARD IS self-name, NOT registrar, for the reason
+    ;; node-disconnect! gives: `registrar` is #f until the warden's child
+    ;; has run, and a connect issued in that window belongs in the queue.
+    ;; Testing `registrar` here made node-connect! raise "call node-start!
+    ;; first" immediately after a successful node-start! -- true of the
+    ;; registrar, false of the node, and the message said the wrong thing
+    ;; about the wrong subject.
+    (unless self-name
       (assertion-violation 'node-connect! "call node-start! first" peer))
-    (send registrar (vector 'set-endpoint peer host port))
+    (registrar-enqueue! (list (vector 'set-endpoint peer host port)))
+    (registrar-poke!)
     (void))
 
   ;; Stop dialing and drop the live link, if any.
@@ -7185,8 +7526,15 @@
   ;; interleaving the mailbox exists to rule out -- a disconnect landing
   ;; between an endpoint change's take and its publish would be undone by
   ;; the publish.
+  ;; ⚠ THE GUARD IS self-name, NOT registrar. `registrar` is #f between
+  ;; incarnations, and a disconnect issued in that window belongs in the
+  ;; queue, not dropped. What must still be a no-op is a call made before
+  ;; node-start! at all -- there is no node to disconnect from then, and
+  ;; self-name is what says so.
   (define (node-disconnect! peer)
-    (when registrar (send registrar (vector 'disconnect peer)))
+    (when self-name
+      (registrar-enqueue! (list (vector 'disconnect peer)))
+      (registrar-poke!))
     (void))
 
   ;; Tune this node's ceilings, in order: the max serve-rcall processes in
