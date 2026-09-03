@@ -34,12 +34,12 @@
 ;;     and the close was still observed at 30002 ms, the same instant as the
 ;;     real one. So the explicit close is not the only supplier of that
 ;;     observable: with it removed the handler simply returns and the socket
-;;     goes away anyway. ⚠️ This cell therefore covers the BEHAVIOUR -- an
+;;     goes away anyway. This cell therefore covers the BEHAVIOUR -- an
 ;;     idle connection is closed, at read-timeout-ms, cleanly -- and NOT that
 ;;     particular line. Anyone deleting the line should not read a green suite
 ;;     as permission; nothing here distinguishes the two paths.
 ;;
-;; ⚠️ This cell costs read-timeout-ms of wall clock (30 s at the time of
+;; This cell costs read-timeout-ms of wall clock (30 s at the time of
 ;;; writing) because read-timeout-ms has no setter, unlike request-deadline-ms
 ;;; which http-request-deadline! can shorten for exactly this reason. That
 ;;; missing seam is why the branch went untested; if a setter is ever added,

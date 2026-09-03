@@ -8,7 +8,7 @@
 ;;; kills the node dispatcher on purpose, which test/poison.sc asserts never
 ;;; happens, so the two suites cannot share a node.
 ;;;
-;;; ⭐ WHICH POINTS PARK. In the fixed tree two of the four points sit inside
+;;; WHICH POINTS PARK. In the fixed tree two of the four points sit inside
 ;;; a region and are skipped by construction; only the mutant parks there.
 ;;;   'tcp-stop-listen-before-close  region  -> skipped (B1: mutant parks)
 ;;;   'fs-open-before-region         none    -> parks   (B2, W1-W3)
@@ -18,7 +18,7 @@
 ;;; mutant; it then runs the choreography the design wrote for that shape,
 ;;; so the red names the defect instead of a bare mismatch.
 ;;;
-;;; ⛔ resumed / skipped / timed-out say the RESERVATION was consumed. Every
+;;; resumed / skipped / timed-out say the RESERVATION was consumed. Every
 ;;; cell that needs the victim's work to have happened waits for a witness
 ;;; the victim sends.
 ;;;

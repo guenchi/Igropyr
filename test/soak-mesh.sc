@@ -26,7 +26,7 @@
 ;;; usage:
 ;;;   soak-mesh.sc ROLE SELF PORT HOST SECRET SECONDS P1 H1 PORT1 [P2 H2 PORT2]
 ;;; Every node binds HOST (the tunnel address) and dials the listed peers.
-;;; ⛔ P1/P2 ARE THE PEERS' SELF NAMES -- what each of them passes as SELF --
+;;; P1/P2 ARE THE PEERS' SELF NAMES -- what each of them passes as SELF --
 ;;; not role letters. node-connect! authenticates the far end against the
 ;;; name it was given; a mismatch is a silent handshake refusal, and the
 ;;; first mesh run formed no links at all for exactly that reason.
@@ -64,7 +64,7 @@
   (display (node-outbound-stats)) (newline)
   (display (list 'orphans (node-orphan-count) 'peers (node-peers))) (newline)
   (exit 2))
-;; ⚠ THE THREE CHECKS BELOW COMPARE THE COUNTS WITH EACH OTHER AND WITH
+;; THE THREE CHECKS BELOW COMPARE THE COUNTS WITH EACH OTHER AND WITH
 ;; NOTHING ELSE. a=g, p<=g and rm>=oa are all RELATIONS: a leak that grows
 ;; every chain together satisfies all three forever, and this suite would
 ;; report nothing for as long as it ran. Mutual consistency has no truth in
@@ -88,7 +88,7 @@
 ;; and live bytes rising under a flat held figure is the exact shape that
 ;; defeats an RSS-only instrument.
 ;;
-;; ⚠️ Read the difference as held-minus-live and nothing more. It is NOT
+;; Read the difference as held-minus-live and nothing more. It is NOT
 ;; reusable slack: fragmentation, collector metadata and reserved segments
 ;; live in it too, so a shrinking difference does not by itself mean the
 ;; heap is filling up. Both counters are read before the logging call so

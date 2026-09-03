@@ -4,7 +4,7 @@
 ;;; those parameters globally. This suite is what makes that claim
 ;;; falsifiable: without the pins the same reason renders differently.
 ;;;
-;;; ⭐ HOW A CHOSEN OBJECT REACHES THE RENDERER. The warden carries the
+;;; HOW A CHOSEN OBJECT REACHES THE RENDERER. The warden carries the
 ;;; registered name igropyr-node-warden precisely so a harness can put a
 ;;; message in front of its diagnostic branches (node.sc says so where the
 ;;; name is defined). Its receive matches #(DOWN pid reason) without
@@ -16,14 +16,14 @@
 ;;; warden's death counters. Capturing it is the same string-port swap
 ;;; test/node.sc already uses.
 ;;;
-;;; ⭐ TWO RENDERING SITES, AND EVERY WITNESS GOES THROUGH BOTH. An
+;;; TWO RENDERING SITES, AND EVERY WITNESS GOES THROUGH BOTH. An
 ;;; ordinary value is printed by `show`; a condition carrying a format
 ;;; string as its message is printed by `(apply format msg irr)`, which is
 ;;; a different entry to the printer. A pin that covers one and not the
 ;;; other would pass a suite that only tested the first, so each witness
 ;;; is rendered bare AND as the irritant of an errorf condition.
 ;;;
-;;; ⚠ THE CONTROLS ARE NOT DECORATION. Two cases use a parameter that is
+;;; THE CONTROLS ARE NOT DECORATION. Two cases use a parameter that is
 ;;; already pinned (print-radix). If the harness itself were broken -- the
 ;;; warden not reached, the error port not captured, the substring test
 ;;; inverted -- those would fail too, and a red run would say nothing about
@@ -56,7 +56,7 @@
         (let ((buf (open-output-string)) (old (current-error-port)))
           (current-error-port buf)
           (send w (vector 'DOWN self obj))
-          ;; ⚠ POLL FOR THE LINE, DO NOT SLEEP A FIXED TIME. The warden is
+          ;; POLL FOR THE LINE, DO NOT SLEEP A FIXED TIME. The warden is
           ;; another process and nothing orders its run against this one, so
           ;; a fixed wait is a guess that goes red under load rather than
           ;; when the renderer is wrong -- the same mistake this suite's
@@ -64,7 +64,7 @@
           ;; condition is the newline the diagnostic ends with: the warden
           ;; can be preempted part way through writing it.
           ;;
-          ;; ⚠ get-output-string CLEARS the port (measured on Chez 10.1.0:
+          ;; get-output-string CLEARS the port (measured on Chez 10.1.0:
           ;; a second read of an unwritten port returns ""), so each poll
           ;; must accumulate what it took rather than re-read the whole.
           (let poll ((n 0) (acc ""))
@@ -139,7 +139,7 @@
     ;; promise, not from watching it run: an expectation read off the
     ;; implementation would pin whatever it does today, including a defect.
     ;;
-    ;; ⚠ These share the harness with the pin cases above, so the two
+    ;; These share the harness with the pin cases above, so the two
     ;; print-radix controls cover them too: if the seam breaks, everything
     ;; here goes red together and the controls say why.
 

@@ -289,7 +289,7 @@
                (ms (- (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000)) t0)))
           (display "  node-up after ") (display ms) (display " ms (budget ")
           (display budget) (display ", drops ") (display drops) (display ")")
-          (when (> ms 15000) (display "  ⚠️ SLOWER THAN THE TWO-DROP BOUND"))
+          (when (> ms 15000) (display "  SLOWER THAN THE TWO-DROP BOUND"))
           (newline))))))
 (define (accounted-ok! label)
   (let ((s (node-monitor-stats)))
@@ -773,7 +773,7 @@
             (let ((c1 (receive (after 5000 (fail! "a2-first-connect-silent"))
                         (`#(tcp-connected ,c) c)
                         (`#(tcp-connect-failed ,e) 'failed))))
-              ;; ⚠ tcp-connected IS THE CLIENT'S EVENT, NOT THE LISTENER'S.
+              ;; tcp-connected IS THE CLIENT'S EVENT, NOT THE LISTENER'S.
               ;; The connect completion and the accept readiness reach the
               ;; loop as two separate kqueue/epoll events and nothing orders
               ;; them: the client's message can be delivered a poll

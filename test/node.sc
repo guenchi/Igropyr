@@ -1116,7 +1116,7 @@
     ;; reachable from this harness: the walk yields only on a tick-budget
     ;; preemption, which a few thousand monitors do not span, and send
     ;; does not yield the sender. So no cell turns red on the truncation
-    ;; itself; that is recorded beside the code, not here. ⛔ Do not read
+    ;; itself; that is recorded beside the code, not here. Do not read
     ;; this green as coverage of the race.
     ;;
     ;; What this DOES own is the ordinary path over a real chain: arm
@@ -1182,7 +1182,7 @@
       (display "hosted-monitor teardown drops every parked monitor ok\n"))
 
     ;; ---- S3: a dead agent's entry must not answer for a live one ------
-    ;; ⚠️ SCOPE, measured: this cell does NOT discriminate the liveness
+    ;; SCOPE, measured: this cell does NOT discriminate the liveness
     ;; precondition on its own. Removing that check from the arming path
     ;; leaves the cell green, because the reaper usually processes the
     ;; agent's DOWN and drops the entry before the re-arm arrives -- so
@@ -1195,7 +1195,7 @@
     ;; (arming reads liveness inside the same region that installs), not
     ;; by this cell.
     ;;
-    ;; ⚠️ And the green itself is contingent: the window stays shut only
+    ;; And the green itself is contingent: the window stays shut only
     ;; because the reaper currently drains its DOWN faster than a peer
     ;; can send the next frame. That is a property of today's timing,
     ;; not a guarantee -- if the sweep grows or the mailbox backs up, the
@@ -1259,7 +1259,7 @@
                 (else (sleep-ms 250) (loop (- tries 1))))))
       (display "S3 revive cell passed\n"))
     ;; ---- S3: the warden actually restores the function ----------------
-    ;; ⛔ THIS IS THE ONLY DEVICE COVERING THE POST-RESTART PATH. No probe
+    ;; THIS IS THE ONLY DEVICE COVERING THE POST-RESTART PATH. No probe
     ;; that does not kill the reaper can reach it -- deleting this cell
     ;; returns that path to zero coverage. It has already earned that
     ;; description once: it found a reaper that restarted, registered,
@@ -1318,7 +1318,7 @@
     ;; must not change `accounted` at all: it applies for nothing and can
     ;; therefore not fail.
     ;;
-    ;; ⚠️ WHAT THIS CELL DOES NOT WITNESS: retiring > 0. The whole
+    ;; WHAT THIS CELL DOES NOT WITNESS: retiring > 0. The whole
     ;; eviction -- splice, the walk that tells each agent to go, their
     ;; exits, and the reaper's DOWNs -- fits in one scheduling turn, and a
     ;; sampling loop is another green thread in that same scheduler: its
@@ -1359,7 +1359,7 @@
           (`#(,@ref ,armed)
             (unless (and armed (= armed 2))
               (fail! "s3-evict" 'arming-count armed (node-monitor-stats))))))
-      ;; ⚠️ MEASURED SCOPE: taking the evicted nodes off the GLOBAL chain
+      ;; MEASURED SCOPE: taking the evicted nodes off the GLOBAL chain
       ;; as well leaves this cell green. The walk tells each agent to go,
       ;; the agent exits, and the reaper returns the credit from its
       ;; DOWN -- none of which reads that chain. What the global chain
@@ -1583,7 +1583,7 @@
     ;; an agent this node hosts, and what the cells read is the mdown
     ;; FRAME ON THE WIRE -- the target's half and nothing else.
     ;;
-    ;; ⭐ TWO CELLS, ONE FIXTURE, ONE CONSTANT APART, OPPOSITE VERDICTS.
+    ;; TWO CELLS, ONE FIXTURE, ONE CONSTANT APART, OPPOSITE VERDICTS.
     ;; A replacement has two sources and they want opposite things:
     ;;   - SAME incarnation, new connection: the peer is the same process,
     ;;     its rmonitors entry is still there, so the hosted half MUST
@@ -1595,7 +1595,7 @@
     ;;     counter also restarts at 1, so the peer hears that a monitor it
     ;;     never armed has fired.
     ;;
-    ;; ⛔ WHICH SOURCE EACH CELL DRIVES IS STRUCTURAL, NOT A COMMENT.
+    ;; WHICH SOURCE EACH CELL DRIVES IS STRUCTURAL, NOT A COMMENT.
     ;; The same-incarnation cell keeps the boot id and RAISES the
     ;; generation (only I8a can replace on that). The new-incarnation cell
     ;; changes the boot id and KEEPS the generation (I8a refuses an equal
@@ -1637,7 +1637,7 @@
                                                   (list 'mon victim-name mref))
                                               #f))
                                 (send me (vector ref 'welcomed))
-                                ;; ⛔ TWO KINDS OF (mdown <mref> ...), and
+                                ;; TWO KINDS OF (mdown <mref> ...), and
                                 ;; they must not be added together: the
                                 ;; refusal a full node sends carries the
                                 ;; SAME tag and the SAME mref as a real
@@ -1885,7 +1885,7 @@
                                     'watch-victim me r2)))
             (welcomed! r2 "watch-same-incarnation")
             (sleep-ms 400)
-            ;; ⭐ THE MIDDLE SAMPLE separates the two ways this can break.
+            ;; THE MIDDLE SAMPLE separates the two ways this can break.
             ;; A teardown on the replacement path shows up here, as a count
             ;; that has already fallen; a gate on the reporting side leaves
             ;; the count alone and shows up below, as a notice that never
@@ -1923,7 +1923,7 @@
                            (list (callee-count) base))
                     (begin (sleep-ms 50) (poll (+ n 1))))))
             (kill victim 'for-the-cell)
-            ;; ⭐ AND IT MUST NOT SPEAK. A stale agent reports by peer NAME,
+            ;; AND IT MUST NOT SPEAK. A stale agent reports by peer NAME,
             ;; so it would write to the new incarnation -- which armed
             ;; nothing and whose mref counter restarts at 1.
             (receive (after 9000 'ok)
@@ -1937,7 +1937,7 @@
 
       ;; ---- a LATE control frame on a superseded same-incarnation link ---
       ;;
-      ;; ⭐ THE ONLY CELLS THAT SEPARATE THE TWO ADMISSION PREDICATES.
+      ;; THE ONLY CELLS THAT SEPARATE THE TWO ADMISSION PREDICATES.
       ;; The cells above replace the connection and then speak on the NEW
       ;; one, where "is this the current connection" and "is this the
       ;; current incarnation" give the same answer -- so they cannot tell
@@ -1946,7 +1946,7 @@
       ;; ALREADY been superseded: connection-identity drops it,
       ;; incarnation admits it.
       ;;
-      ;; ⛔ THE ANCHOR MEASURES AN ORDER, BECAUSE AN ORDER IS WHAT IS
+      ;; THE ANCHOR MEASURES AN ORDER, BECAUSE AN ORDER IS WHAT IS
       ;; CLAIMED. A first version asked whether an effect had appeared by
       ;; the time the welcome arrived -- one event, not two -- and a
       ;; mistimed run fails GREEN here, not red. What is asserted instead
@@ -1956,7 +1956,7 @@
       ;; welcome-then-marker means the replacement was in place while the
       ;; link still had the frame under test to dispatch.
       ;;
-      ;; ⛔ AND THE VERDICT IS COUNTED PER MREF, NOT READ OFF THE GLOBAL
+      ;; AND THE VERDICT IS COUNTED PER MREF, NOT READ OFF THE GLOBAL
       ;; COUNT. Every session here is the same peer name, so one cell's
       ;; teardown drops the monitors another cell parked: a global count
       ;; that falls proves nothing about this cell's cancel. Killing the
@@ -2075,7 +2075,7 @@
 
       ;; ---- a retired-but-living agent must not outlive its retirement ----
       ;;
-      ;; ⛔ RED FIRST. Retiring a stale record deletes the table entry,
+      ;; RED FIRST. Retiring a stale record deletes the table entry,
       ;; unlinks it and returns the credit -- and does NOT stop the agent.
       ;; While the sweep ran on every replacement that did not matter: the
       ;; stop was already on its way. Since the sweep became conditional on
@@ -2109,7 +2109,7 @@
             (kill victim 'for-the-cell)
             (receive (after 20000
                        (fail! "retired-agent-outlives-retirement" 'count-timeout))
-              ;; ⭐ TWO DIMENSIONS, because the fix changes BOTH -- and the
+              ;; TWO DIMENSIONS, because the fix changes BOTH -- and the
               ;; expected pair was got WRONG the first time, which is why
               ;; it is spelled out here rather than left to be inferred.
               ;;
@@ -2126,14 +2126,14 @@
               ;; turns into a remote-down, and the API says a later
               ;; attempt can succeed.
               ;;
-              ;; ⛔ Counting only the downs would call BOTH trees wrong in
+              ;; Counting only the downs would call BOTH trees wrong in
               ;; the same direction, and would also pass a node that
               ;; silently dropped the duplicate. The refusal is the
               ;; present-tense witness that it answered.
-              ;; ⛔ THIS PAIR HAS BEEN WRONG TWICE, and the second time is
+              ;; THIS PAIR HAS BEEN WRONG TWICE, and the second time is
               ;; the one worth keeping: it was set to (0 downs, 1 refusal)
               ;; because that is what the code did once a living stale
-              ;; record stopped making way. ⭐ But that behaviour was itself
+              ;; record stopped making way. But that behaviour was itself
               ;; the product of judging identity by CONNECTION -- an
               ;; expectation derived from an implementation, which pins a
               ;; defect down as the specification. With identity judged by
@@ -2146,7 +2146,7 @@
                          (list 'downs k 'want 1 'refusals ov 'want 0))))
               (`#(,@r2 ,other)
                 (fail! "retired-agent-outlives-retirement" other)))
-            ;; ⭐ A THIRD PROPERTY, ASSERTED SEPARATELY: the permits come
+            ;; A THIRD PROPERTY, ASSERTED SEPARATELY: the permits come
             ;; back. Written as "no more than we started with" rather than
             ;; equality because every session here is the same peer name,
             ;; so another cell's teardown can push this below base -- and
@@ -2227,7 +2227,7 @@
                     ;; the mutant tree -- `noconnection`, synthesized when
                     ;; the replacing session closes ~5s after its handshake.
                     ;;
-                    ;; ⚠ THAT SECOND SHAPE IS DEADLINE-TYPE. It comes from
+                    ;; THAT SECOND SHAPE IS DEADLINE-TYPE. It comes from
                     ;; watch-session!'s 5s no-mdown close, so on a CORRECT
                     ;; tree a sufficiently slow mdown takes the same road
                     ;; and reads as this red. Load can therefore make a
@@ -2266,7 +2266,7 @@
 
       ;; ---- a REPEAT on a superseded link must not revoke the watch -----
       ;;
-      ;; ⛔ RED FIRST, AND THE DEFECT IS SILENT. The protocol says so in
+      ;; RED FIRST, AND THE DEFECT IS SILENT. The protocol says so in
       ;; as many words a few hundred lines up: "A REPEAT OF THIS EXACT
       ;; REQUEST IS FREE". A peer may therefore send one, and a peer that
       ;; sent it just before a replacement has it dispatched by the link
@@ -2280,7 +2280,7 @@
       ;; remove-peer! sweeps only for the connection that is current, so
       ;; no noconnection is produced either.
       ;;
-      ;; ⭐ WHAT THE PEER SEES IS NOTHING AT ALL: its rmonitors row is
+      ;; WHAT THE PEER SEES IS NOTHING AT ALL: its rmonitors row is
       ;; still there, the agent that would have reported is gone, and the
       ;; process it is watching can die unremarked. That is why the
       ;; verdict asserts BOTH numbers -- a watch that reports once, and
@@ -3045,7 +3045,7 @@
     ;; above, so that event is done and gone. Anything arriving now was
     ;; invented by the restart.
     ;;
-    ;; ⚠️ NO DEMONSTRATED DISCRIMINATING POWER, and saying so is the
+    ;; NO DEMONSTRATED DISCRIMINATING POWER, and saying so is the
     ;; point. A completed event is unlinked from its head, so under this
     ;; implementation there is nothing left for a successor to replay --
     ;; the failure this cell describes is not reachable by mutating the

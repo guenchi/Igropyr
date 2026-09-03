@@ -197,7 +197,7 @@
     (check "H19v: resources back to baseline" (settled-to? base 3000) (snap) base)
 
     ;; ---- H11: close_notify vs bare FIN, seen by the server
-    ;; ⚠ (system …) blocks the single scheduler thread for its whole duration,
+    ;; (system …) blocks the single scheduler thread for its whole duration,
     ;; so a foreground s_client would starve the very server it talks to
     ;; (measured: nothing arrived until timeout killed it -- a bare FIN).
     ;; The client is started in the background and the test sleeps in the

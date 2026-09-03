@@ -14,7 +14,7 @@
 ;;; all of them. A tag with no test still gets read here, and a pairing
 ;;; that is right in the source but wrong at run time still fails there.
 ;;;
-;;; ⚠ TWO ASSUMPTIONS, BOTH LOAD-BEARING, BOTH GUARDED BY THE CONTROL:
+;;; TWO ASSUMPTIONS, BOTH LOAD-BEARING, BOTH GUARDED BY THE CONTROL:
 ;;;   - the tag is on the SAME LINE as the call. Split a call across lines
 ;;;     and this file stops seeing it -- silently, which is the failure
 ;;;     mode it exists to prevent.
@@ -87,7 +87,7 @@
                (cond ((null? xs) acc)
                      ((memq (car xs) acc) (loop (cdr xs) acc))
                      (else (loop (cdr xs) (cons (car xs) acc)))))))
-  ;; ⭐ THE CONTROL RUNS FIRST AND HAS ITS OWN NAME. A scanner that matches
+  ;; THE CONTROL RUNS FIRST AND HAS ITS OWN NAME. A scanner that matches
   ;; nothing reports zero one-sided tags, which reads exactly like a clean
   ;; source. These two outcomes must never share a message.
   (if (not (and (memq control ins) (memq control outs)))

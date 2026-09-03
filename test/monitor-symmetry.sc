@@ -16,13 +16,13 @@
 ;;; THIS pair of processes, arming moves both counts up and disarming
 ;;; moves both back.
 ;;;
-;;; ⭐ FOUR ASSERTIONS, IN TWO OPPOSED PAIRS. Two say a count rose, two
+;;; FOUR ASSERTIONS, IN TWO OPPOSED PAIRS. Two say a count rose, two
 ;;; say it returned. A count that never moved would satisfy the returning
 ;;; pair on its own, so the rising pair is what makes them mean anything;
 ;;; and a count that rose and stayed would satisfy the rising pair, so the
 ;;; returning pair is what makes THOSE mean anything.
 ;;;
-;;; ⛔ WHAT THIS DOES NOT COVER. The failure this shape produces in
+;;; WHAT THIS DOES NOT COVER. The failure this shape produces in
 ;;; practice is an allocation that fails between the two writes, which
 ;;; nothing here can ask for; these assertions catch an edit that drops a
 ;;; write, not a machine that runs out of memory. link/spawn&link have the

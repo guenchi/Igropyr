@@ -3,12 +3,12 @@
 ;;;
 ;;;   scheme --libdirs . --libexts .sc --script igropyr/test/inject-isolation.ss
 ;;;
-;;; ⛔ IT MUST RUN IN ITS OWN PROCESS, and with IGROPYR_INJECT unset. The
+;;; IT MUST RUN IN ITS OWN PROCESS, and with IGROPYR_INJECT unset. The
 ;;; switch is read when a library is visited, so a process that has
 ;;; already expanded something with injection on would answer for that
 ;;; expansion and not for the build under test.
 ;;;
-;;; ⭐ IT ASKS TWO QUESTIONS, and they fail differently on purpose:
+;;; IT ASKS TWO QUESTIONS, and they fail differently on purpose:
 ;;;   1. does an ordinary build refer to the injection runtime at all?
 ;;;   2. do the three primitives expand to nothing (or to the guarded
 ;;;      expression) when the switch is off?
@@ -33,7 +33,7 @@
     (exit 2)))
 
 ;; ---- 1. the graph, over the WHOLE production set --------------------
-;; ⭐ THE ROOTS ARE THE BUILD LIST, NOT A HANDFUL I CHOSE. A first version
+;; THE ROOTS ARE THE BUILD LIST, NOT A HANDFUL I CHOSE. A first version
 ;; walked four libraries I happened to think of; adding an inject-control
 ;; dependency to any of the other fifty would have gone unseen, and the
 ;; gate would have said so cheerfully. The denominator has to be the set
@@ -55,7 +55,7 @@
           ((library-name-of (car ps)) => (lambda (n) (loop (cdr ps) (cons n acc))))
           (else (fail! "unreadable-unit" (car ps)) (loop (cdr ps) acc)))))
 
-;; ⛔ A FAILURE TO ASK IS NOT AN ANSWER OF "NO". The first version wrapped
+;; A FAILURE TO ASK IS NOT AN ANSWER OF "NO". The first version wrapped
 ;; both the import and the requirements query in a guard that produced
 ;; the empty list, so a library that would not load shrank the graph and
 ;; the gate still printed success -- a check whose failure action is to
@@ -65,7 +65,7 @@
     (eval `(import ,lib) (interaction-environment))
     #t))
 
-;; ⛔ THE INSTRUMENT IS NOT ONE OF ITS OWN ROOTS. (igropyr inject) is a
+;; THE INSTRUMENT IS NOT ONE OF ITS OWN ROOTS. (igropyr inject) is a
 ;; production unit -- libuv imports it, so it has to resolve in a
 ;; compiled build -- which means it appears in the list this gate reads.
 ;; Rooting the walk at it makes it trivially a member of its own closure,
@@ -74,7 +74,7 @@
 ;; the roots and looked for in the closure of everything else.
 (define instrument '((igropyr inject) (igropyr inject-control)))
 
-;; ⛔ ONLY (igropyr inject) MAY BE EXCLUDED, and the asymmetry is the
+;; ONLY (igropyr inject) MAY BE EXCLUDED, and the asymmetry is the
 ;; point. It is a production unit on purpose -- libuv imports it -- so
 ;; rooting the walk at it would make it trivially its own closure member.
 ;; (igropyr inject-control) is a different case: its presence in this
@@ -88,13 +88,13 @@
   (filter import! (filter (lambda (l) (not (equal? l '(igropyr inject))))
                           production-libs)))
 
-;; ⭐ THE PROGRAMS ARE NOT LIBRARIES AND ARE NOT IN THAT LIST. app.sc is
+;; THE PROGRAMS ARE NOT LIBRARIES AND ARE NOT IN THAT LIST. app.sc is
 ;; compiled by every whole-program build and qjs-worker.sc is run as a
 ;; script; neither can be walked with library-requirements, so a direct
 ;; dependency from either on the instrument would be invisible to the
 ;; closure above. They are checked the only way they can be -- by reading
 ;; what they import.
-;; ⚠ A textual check, and weaker than the graph: it sees an import form
+;; A textual check, and weaker than the graph: it sees an import form
 ;; and not a transitive edge. It is here because the alternative was
 ;; nothing at all.
 (for-each
@@ -130,7 +130,7 @@
   (display "  production roots: ") (display (length production-libs))
   (display "; invoke closure: ") (display (length inv))
   (display "; import closure: ") (display (length imp)) (newline)
-  ;; ⭐ BOTH CLOSURES, AND THEY CATCH DIFFERENT MISTAKES. invoke is the
+  ;; BOTH CLOSURES, AND THEY CATCH DIFFERENT MISTAKES. invoke is the
   ;; property that matters -- nothing shipped may RUN the instrument.
   ;; import is wider and catches the mistake one edit earlier: a library
   ;; that names inject-control even only for expansion.
@@ -145,7 +145,7 @@
            "an ordinary build refers to the injection runtime; the switch was on when it was compiled")))
 
 ;; ---- 2. the off expansions ----------------------------------------------
-;; One outer form per primitive, compared as data. ⭐ The comparison is on
+;; One outer form per primitive, compared as data. The comparison is on
 ;; the EXPANSION, not on behaviour: behaviour can be right for a build
 ;; that still carries a disabled branch, and a disabled branch is the
 ;; thing this whole arrangement exists not to ship.
@@ -154,7 +154,7 @@
 
 (eval '(import (igropyr inject)) (interaction-environment))
 
-;; ⭐ COMPARED AGAINST A REFERENCE EXPANSION, NOT A GUESSED LITERAL.
+;; COMPARED AGAINST A REFERENCE EXPANSION, NOT A GUESSED LITERAL.
 ;; (begin) does not expand to the datum (begin) -- it expands to whatever
 ;; this Chez uses for "no value", which was ($primitive 2 void) the first
 ;; time this check ran and is nobody's business to predict. Expanding the
@@ -182,7 +182,7 @@
 ;; sub-form with the parker call outside it (parking inside a region would
 ;; hand the region's atomicity to the victim's scheduler).
 ;;
-;; ⛔ THE `on` CLAUSE IS SELECTED FIRST. The two meta-cond branches are not
+;; THE `on` CLAUSE IS SELECTED FIRST. The two meta-cond branches are not
 ;; symmetric -- three of the four primitives have an off-mode stub and one
 ;; does not -- so "the define with this name" answers differently per name
 ;; unless the clause is fixed before the name is looked up.

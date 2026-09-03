@@ -119,7 +119,7 @@
       (check "async scandirs: the ticker ticked during the calls (>= 2)" (>= (car a) 2) 'ticks (car a) 'elapsed-ms (cdr a))
       (check "positive control: ten synchronous directory-lists yield no tick" (= (car s) 0) 'ticks (car s) 'elapsed-ms (cdr s)))
     ;; ---- R12-4 owner dies before completion: nothing leaks, nothing is delivered
-    ;; ⚠️ The obvious construction -- an owner that submits and then exits --
+    ;; The obvious construction -- an owner that submits and then exits --
     ;; proves nothing: any yield after the submit is enough for a scandir to
     ;; complete and be reclaimed the ORDINARY way, and "fs-count 0 before, 0
     ;; after" is two zeros compared. So: this process submits, the OWNER is

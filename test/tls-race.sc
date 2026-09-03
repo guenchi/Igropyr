@@ -7,7 +7,7 @@
 ;;; cell then runs the mutant's choreography and fails by name, so the red
 ;;; names the split. Hooks outside any region park in correct code (AGG, Z6a).
 ;;;
-;;; ⭐ THE HOLD POINT. P (a spawned writer, never the connection's owner) is
+;;; THE HOLD POINT. P (a spawned writer, never the connection's owner) is
 ;;; parked at 'agg-chunk-boundary; a barrier row at another point may coexist
 ;;; (check-arm! refuses only a second barrier at the SAME point). While P is
 ;;; parked nothing else can release the gate or retire the session, so the

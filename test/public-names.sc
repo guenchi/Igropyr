@@ -12,7 +12,7 @@
 ;;; at expansion time when a name is absent, so this file does not need
 ;;; to call anything: loading it IS the assertion.
 
-;;; ⛔ THIS FILE IS A TRANSCRIPTION, NOT A DERIVED ARTIFACT, and the
+;;; THIS FILE IS A TRANSCRIPTION, NOT A DERIVED ARTIFACT, and the
 ;;; difference is the whole point. Its value comes from being a SECOND
 ;;; copy that does not move when a definition moves: a rename that
 ;;; rewrites a library and every use of it leaves this list behind, and
@@ -22,7 +22,7 @@
 ;;; still green, and no longer capable of failing.
 ;;;
 ;;; So: a new export is added HERE BY HAND, in the same change that adds
-;;; it to the library. ⛔ Never re-emit this file from a script.
+;;; it to the library. Never re-emit this file from a script.
 ;;;
 ;;; The first eleven libraries below were written by hand when the rename
 ;;; above happened. The rest were transcribed in one pass afterwards,
