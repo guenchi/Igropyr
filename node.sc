@@ -437,7 +437,23 @@
   ;; earlier version of this paragraph claimed -- it is a loud report
   ;; followed by the death of the registrar, which is the process that
   ;; issues generations, so no NEW attempt can be authorised for any
-  ;; peer. An attempt already authorised and in flight still completes.
+  ;; peer. An attempt already authorised is not stopped MERELY BY THIS:
+  ;; once its authorisation is consumed and the connect is submitted,
+  ;; dial! no longer consults the registrar. It is not a promise the
+  ;; attempt completes: the branches that reach exhaustion may stop it by
+  ;; their own means, on their own schedule, and an installed connection
+  ;; is reached separately by stop-link!. What is claimed here is only
+  ;; that neither the report nor the registrar's death is what stops it.
+  ;;
+  ;; ⚠ THAT IS DELIBERATELY LESS THAN THE PARAGRAPH USED TO SAY. Four
+  ;; successive revisions tried to enumerate what those branches do to a
+  ;; live attempt, and each one was wrong in a new way -- a queued
+  ;; node-stop described as a stop, a connector kill described as
+  ;; reaching a child that plain `spawn` never linked, and finally a flat
+  ;; "neither does" that dropped the "before this point" the sentence
+  ;; needed. The enumeration is not what this paragraph is for. Anyone
+  ;; who needs it should read `disconnect`, the endpoint-replacement
+  ;; branch and stop-link! rather than trust a summary here.
   ;; There is no node-wide stop primitive at this layer to call. The
   ;; difference is recorded rather than papered over; escalating it is a
   ;; design decision, not an implementation one. What is settled is the
@@ -471,7 +487,9 @@
                    "igropyr node: dial generations for peer "
                    (symbol->string peer)
                    " are exhausted; this node cannot dial it again without"
-                   " reusing one. The connector for it is stopping.\n")
+                   " reusing one. The registrar stops here, so no new"
+                   " attempt can be authorised for any peer; an attempt"
+                   " already authorised is not stopped merely by this.\n")
                  (current-error-port))
         (raise dial-gen-exhausted))
       n))
@@ -1546,7 +1564,15 @@
   (define outbound (make-eq-hashtable))
 
   ;; Charge n bytes to c, creating its entry if this is the first write.
-  ;; -> #t if THIS charge is what put the connection over the ceiling.
+  ;; -> #t if the connection is over the ceiling AFTER this charge.
+  ;;
+  ;; ⚠ Not "if THIS charge is what crossed it", which is what this said
+  ;; and is a different claim: the test is `(> v max-outbound-bytes)` on
+  ;; the new balance, so a connection already over the line answers #t
+  ;; for a charge of any size, including one that was over before this
+  ;; writer arrived. Already-over is reachable -- the sibling comment on
+  ;; outbound-over? names the two ways, another writer's charge and a
+  ;; lowered ceiling -- so the two readings do not coincide.
   ;;
   ;; THE ENTRY AND THE HOOK THAT REMOVES IT ARE ONE UNINTERRUPTIBLE STEP.
   ;; Written as two -- store, leave the atomic section, then register --
@@ -2692,7 +2718,13 @@
   ;; length -- handshake-max-frame during the handshake, max-frame once
   ;; the link is authenticated. A complete frame is consumed from the
   ;; buffer (an offset bump, not a copy of everything behind it).
-  ;; -> datum | incomplete ; raises 'protocol on junk
+  ;; -> (values datum body-text) | (values incomplete #f)
+  ;;    ; raises 'protocol on malformed FRAMING; a malformed datum inside
+  ;;    a well-formed frame is not that -- the body goes to
+  ;;    string->sexpr-extended, and its sexpr-error vector propagates.
+  ;; Every normal return has two values; read-frame binds both with
+  ;; let-values, and a caller wanting only the datum still accepts the
+  ;; second.
   (define (parse-frame buf limit)
     (let ((bv (inbuf-bv buf)) (base (inbuf-start buf)) (n (inbuf-length buf)))
       (let scan ((i 0) (len 0))
@@ -2713,10 +2745,12 @@
              (scan (fx+ i 1) (+ (* len 10) (fx- b 48)))))))))
 
   ;; Block (in the calling process) until one whole frame arrives.
-  ;; -> datum ; raises 'closed / 'timeout / 'protocol /
-  ;; the sexpr-error vector on a malformed datum
-  ;; -> (values datum body-text). The text is what canonical? compares
-  ;; against; a caller that does not need it ignores the second value.
+  ;; -> (values datum body-text) ; raises 'closed / 'timeout / 'protocol /
+  ;; 'stop (on a #(node-stop) message) / the sexpr-error vector on a
+  ;; malformed datum. The text is what
+  ;; canonical? compares against; a caller that does not need it ignores
+  ;; the second value. (A bare `-> datum` stood above this line, stale
+  ;; and contradicted by the line itself.)
   (define (read-frame c buf timeout limit)
     (let ((deadline (+ (now-ms) timeout)))
       (let loop ()
