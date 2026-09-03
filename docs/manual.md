@@ -682,7 +682,10 @@ Configuration options:
   Validated at boot (must be a positive fixnum). PROCESS-GLOBAL: the last
   `http-listen`/`app-listen` in the process wins, across all servers
 - `reuseport`: SO_REUSEPORT bind — run N OS processes on the same port,
-  kernel-balanced (Linux only)
+  kernel-balanced. Available on Linux 3.9+, DragonFlyBSD 3.6+,
+  FreeBSD 12.0+ (where libuv uses `SO_REUSEPORT_LB`), Solaris 11.4 and
+  AIX 7.2.5+ — not on macOS. This is what libuv implements, per its own
+  header and source; distribution has not been measured by this project.
 - `on-failure`: failure hook `(lambda (req res info))` when retries are
   exhausted or a stuck worker was killed (see the fault handler section)
 
