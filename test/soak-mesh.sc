@@ -84,9 +84,15 @@
 ;;
 ;; So the process reports it about itself. SOAK_HEAPLOG=<seconds> forces a
 ;; full collection and logs live bytes beside the bytes the heap holds from
-;; the OS; their difference is the slack. A rising live-bytes series is a
-;; leak whether or not RSS moves, and a falling slack with flat RSS is the
-;; exact shape that defeats an RSS-only instrument.
+;; the OS. A rising live-bytes series is a leak whether or not RSS moves,
+;; and live bytes rising under a flat held figure is the exact shape that
+;; defeats an RSS-only instrument.
+;;
+;; ⚠️ Read the difference as held-minus-live and nothing more. It is NOT
+;; reusable slack: fragmentation, collector metadata and reserved segments
+;; live in it too, so a shrinking difference does not by itself mean the
+;; heap is filling up. Both counters are read before the logging call so
+;; that formatting does not allocate into the figure being reported.
 ;;
 ;; It is opt-in, and must stay opt-in: forcing collections changes the
 ;; allocation profile being measured. A run with this enabled is a second,
