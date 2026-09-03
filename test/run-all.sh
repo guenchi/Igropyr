@@ -480,6 +480,15 @@ echo "HTTP NONCRITICAL OPT-OUT PASSED"
 #      not another build -- which is why this costs one suite, not a
 #      compile.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/inject.sc
+# item 9: a raise from the post-commit wake is not the caller's; the letter
+# still arrives on the dispatcher's timed receive
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/redeliver-wake.sc
+# item 8: the quarantine reason is a private record, and the observer message
+# carries its kind in a seventh slot -- readers that matched six slots must move
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/quarantine-reason.sc
+# item 5: fs-start-fd! owns its descriptor from its first instruction, with no
+# region around the call
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/fs-preregion.sc
 #   3. The poison-event suite lives in the same instrumented pass: its
 #      failure is injected at notify-list!'s entry, so it needs the
 #      hooks live and the sources, and it must not share a process with

@@ -62,7 +62,7 @@
                                                 'dispatcher (cond ((not (dispatcher-pid)) 'gone)
                                                                   ((eq? (dispatcher-pid) d0) 'same-pid)
                                                                   (else 'replaced))))
-                      (`#(event-quarantined ,name ,kind ,seq ,reason ,failures)
+                      (`#(event-quarantined ,name ,kind ,seq ,reason ,failures ,reason-kind)
                         (list name kind seq reason failures)))))
         (unless (eq? (car notice) 'b) (fail "quarantined-wrong-name" notice))
         (unless (eq? (cadr notice) 'node-down) (fail "quarantined-wrong-kind" notice))

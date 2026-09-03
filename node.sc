@@ -204,6 +204,7 @@
           node-monitor-stats node-outbound-stats reconnect-delay
           node-dead-letters node-dead-letter-stats
           node-redeliver-dead-letter!
+          quarantine-reason? quarantine-reason-kind quarantine-reason-payload
           submission-failure? node-install-rule-order node-orphan-count
           monitor-node/token demonitor-node/token)
   ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
@@ -4052,12 +4053,22 @@
   ;; ⚠ A send to a dead observer is silently dropped, which matches the
   ;; contract. The ring is the record -- in memory, overwritable when
   ;; full, and emptied by redelivery -- and this is the announcement.
-  (define (notify-observer! n why failures)
+  ;; ⭐ THE SEVENTH SLOT IS THE ONE THAT SEPARATES THE TWO OUTCOMES, and
+  ;; it is new. `why` keeps exactly the meaning it always had -- the
+  ;; raised object for a raise, the symbol for a kill -- so a consumer
+  ;; reading the first six positions is unaffected. But `why` CANNOT tell
+  ;; those apart: an application that raises the symbol
+  ;; 'lost-outcome-after-kill produces the same `why` as a real kill.
+  ;; reason-kind is taken from the record, which only this library can
+  ;; build, so it cannot be forged from outside.
+  (define (notify-observer! n r failures)
     (guard (e (#t (void)))
       (let* ((ev (qnode-event n))
+             (kind (quarantine-reason-kind r))
+             (why (if (eq? kind 'raised) (quarantine-reason-payload r) kind))
              (msg (vector 'event-quarantined
                           (event-name ev) (event-kind ev) (event-seq ev)
-                          why failures)))
+                          why failures kind)))
         (let ((p (whereis observer-name)))
           (if p
               (send p msg)
@@ -4184,7 +4195,7 @@
           ;; ⭐ LEAVING THE QUEUE AND ENTERING THE RING ARE ONE STEP, so
           ;; no kill lands between them. See quarantine! for why the
           ;; removal is checked rather than assumed.
-          (quarantine! h n e)
+          (quarantine! h n (make-quarantine-reason 'raised e))
           'quarantined)))
 
   ;; ⚠ WHY THE ATTEMPT IS COUNTED BEFORE IT IS MADE. Counting a FAILURE
@@ -4235,9 +4246,13 @@
                      ;; stored count alone and says the outcome is
                      ;; indeterminate.
                      (begin
-                       (quarantine! h n 'lost-outcome-after-kill)
-                       (notify-observer! n 'lost-outcome-after-kill
-                                         poison-event-limit)
+                       ;; ⚠ ONE RECORD, BOTH USES. The ring and the notice
+                       ;; describe the same event, and building two would
+                       ;; let a later edit change one of them.
+                       (let ((r (make-quarantine-reason
+                                  'lost-outcome-after-kill #f)))
+                         (quarantine! h n r)
+                         (notify-observer! n r poison-event-limit))
                        #t)
                      ;; ⭐ why IS CAPTURED LEXICALLY, and neither value in
                      ;; the notice may be re-read later: the reason cannot
@@ -4284,7 +4299,14 @@
                          ;; the retry would spin inside this process.
                          ((retry) (sleep-ms 1) (attempt))
                          ((quarantined)
-                          (notify-observer! n why poison-event-limit)
+                          ;; ⚠ A SECOND RECORD, equal in content to the one
+                          ;; poison-step! put in the ring but not eq? to
+                          ;; it. Nothing compares them; if anything ever
+                          ;; does, make poison-step! return its record
+                          ;; rather than teaching two places to agree.
+                          (notify-observer!
+                            n (make-quarantine-reason 'raised why)
+                            poison-event-limit)
                           #t))))))))))
 
   ;; A head leaves the chains only when it is empty, and emptiness is
@@ -4320,6 +4342,28 @@
   (define dead-letter-capacity 1024)
   (define dl-node    (make-vector dead-letter-capacity #f))
   (define dl-head    (make-vector dead-letter-capacity #f))
+  ;; ⛔ WHY THE REASON IS A RECORD AND NOT A SYMBOL-OR-OBJECT. This slot
+  ;; used to hold two different kinds of thing in one space: the object an
+  ;; attempt raised, or the bare symbol 'lost-outcome-after-kill meaning
+  ;; the dispatcher was killed mid-attempt. An application that raised
+  ;; that symbol was therefore recorded as a kill -- and notify-observer!
+  ;; called the reason the one field separating those outcomes, so the
+  ;; misclassification reached the observer as fact.
+  ;;
+  ;; ⭐ THE GUARANTEE IS THAT NOBODY OUTSIDE CAN BUILD ONE, and it comes
+  ;; from the constructor being unexported, not from opacity. The type is
+  ;; sealed and nongenerative; the three readers below ARE exported,
+  ;; because a consumer that cannot ask which kind it holds has been
+  ;; handed a reason it cannot read -- which is what the field is for.
+  ;;
+  ;; kind is 'raised (payload = the object that was raised) or
+  ;; 'lost-outcome-after-kill (payload #f: there is no object, the
+  ;; attempt's outcome was never learned).
+  (define-record-type quarantine-reason
+    (fields kind payload)
+    (nongenerative)
+    (sealed #t))
+
   (define dl-reason  (make-vector dead-letter-capacity #f))
   (define dl-ordinal (make-vector dead-letter-capacity 0))
   ;; Scratch for the renumbering below, allocated once so the region that
@@ -4420,12 +4464,23 @@
   ;; than handing back the qnode, whose failures field a redelivery
   ;; resets.
   ;;
+  ;; ⭐ THE REASON POSITION HOLDS A quarantine-reason RECORD. It used to
+  ;; hold the raw object -- whatever was raised, or the bare symbol
+  ;; 'lost-outcome-after-kill -- and that is a SHAPE CHANGE for anyone
+  ;; reading position 3 of these vectors. Read it with the three exported
+  ;; procedures: quarantine-reason? to recognise one, then
+  ;; quarantine-reason-kind ('raised or 'lost-outcome-after-kill) and
+  ;; quarantine-reason-payload (the raised object, or #f when there was
+  ;; never an object because the outcome was lost to a kill). The old
+  ;; reading -- treat the value itself as the reason -- now yields the
+  ;; wrapper rather than the cause.
+  ;;
   ;; ⚠ THE SNAPSHOT IS SHALLOW. Name, kind, seq and the failure count are
   ;; values taken at one atomic instant and cannot change afterwards. The
-  ;; REASON is a reference: R6RS lets any object be raised, so it may be
-  ;; a mutable one, and what comes back is the object that occupied the
-  ;; slot at that instant -- not a copy, which is not possible for an
-  ;; arbitrary object.
+  ;; record is immutable, but its PAYLOAD is a reference: R6RS lets any
+  ;; object be raised, so it may be a mutable one, and what comes back is
+  ;; the object that occupied the slot at that instant -- not a copy,
+  ;; which is not possible for an arbitrary object.
   ;;
   ;; ⚠ It aliases the ring only for as long as the slot still holds it.
   ;; The region ends before the sort and the result list are built, so a
@@ -4545,14 +4600,40 @@
                       (qhead-enqueue! h n (qnode-cut n))
                       d))
                    (else (find (fx+ i 1))))))))))
-        ;; ⚠ THE STATE CHANGE IS ALREADY COMMITTED HERE. send allocates a
-        ;; message, and a raise from that allocation leaves the caller an
-        ;; exception for a redelivery that did happen. Nothing can undo
-        ;; it -- a region has no rollback -- so this is a declared
-        ;; residual of the exported API, not something the ordering
-        ;; fixes; the ordering only keeps the region itself to pointer
-        ;; writes.
-        (when woke (send woke work))
+        ;; ⚠ THE STATE CHANGE IS ALREADY COMMITTED BY HERE, so the wake is
+        ;; best-effort and the return value reports the commit, not the
+        ;; wake. send allocates, and an allocation failure here used to
+        ;; leave the caller an exception for a redelivery that HAD
+        ;; happened -- the one outcome an exported call must not produce,
+        ;; because there is nothing the caller can do with it: retrying
+        ;; redelivers twice and giving up abandons an event that is
+        ;; already back on a queue.
+        ;;
+        ;; ⭐ SWALLOWING IS SAFE FOR EXACTLY THE REASON THE WAKE IS
+        ;; OUTSIDE THE REGION, argued in full above: the event is already
+        ;; on the ready chain when the region ends, dispatch-round! runs
+        ;; without being asked, and a lost wake costs latency rather than
+        ;; the event. send to a dead process is contractually silent, so
+        ;; the only raise this can swallow is an allocation failure --
+        ;; which is not recoverable at this point by anyone.
+        ;;
+        ;; ⚠ RESIDUAL, SMALLER BUT NOT GONE: entering the guard itself
+        ;; allocates a continuation, and that allocation is outside the
+        ;; guard it establishes. This is the floor every guard in this
+        ;; file stands on, not something particular to this one -- so it
+        ;; is named and left, and no claim is made here that the call
+        ;; cannot raise at all.
+        (when woke
+          (guard (e (#t (void)))
+            ;; INJECTION POINT 'dead-letter-wake -- OWNING GUARD: the
+            ;; guard on the line above, which is the subject: the point
+            ;; of this cell is that a raise from the wake does NOT reach
+            ;; the caller. Both this call and the send are lexically
+            ;; inside it, so a synchronous raise from either is caught
+            ;; before any dynamically outer handler. What lies beyond it
+            ;; depends on the runner and cannot be read off this file.
+            (inject-fault! 'dead-letter-wake)
+            (send woke work)))
         (and woke #t))))
 
   (define (dispatcher-loop)
