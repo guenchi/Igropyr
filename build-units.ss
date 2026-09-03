@@ -46,6 +46,11 @@
     "igropyr/inject.sc"
     "igropyr/buffer.sc"
     "igropyr/platform.sc"
+    ;; ⭐ BEFORE libuv.sc, WHICH IMPORTS IT. Compiling a unit after its
+    ;; importer makes Chez build the importer against a different
+    ;; instance of it; the order here is the dependency order, not a
+    ;; preference. It sits after platform.sc, its only dependency.
+    "igropyr/tls-core.sc"
     "igropyr/durable.sc"
     "igropyr/quickjs.sc"
     "igropyr/crypto.sc"
