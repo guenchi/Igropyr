@@ -314,9 +314,24 @@
                              (tls-agg-done? agg))))))
      ;; -> (registered . completed); registered in submission order, completed
      ;; in the order the completions actually ran.
-     (define (tls-raw-blocks t)
-       (cons (hashtable-ref raw-blocks-by-conn t '())
-             (hashtable-ref raw-completions-by-conn t '())))
+     ;;
+     ;; ⭐ IT TAKES THE CONN, NOT THE TLS STATE, like tls-conn-charge and
+     ;; tls-conn-totals beside it. conn-tls is not exported, so a cell holding
+     ;; a connection could not produce the t the earlier signature required:
+     ;; the reading existed and was unreachable -- a ruler nobody could pick
+     ;; up. The tables are still keyed by t; resolving it happens here.
+     ;;
+     ;; ⚠ A RETIRED CONN ANSWERS '(() . ()), NOT #f. Retirement detaches the
+     ;; state, so there is no key left to look under and nothing to report --
+     ;; which is not the same as "this connection wrote nothing". Read it
+     ;; while the connection is alive; a cell that reads after retirement is
+     ;; measuring the detach, not the writes.
+     (define (tls-raw-blocks c)
+       (let ((t (conn-tls c)))
+         (if (not t)
+             (cons '() '())
+             (cons (hashtable-ref raw-blocks-by-conn t '())
+                   (hashtable-ref raw-completions-by-conn t '())))))
      (define (tls-conn-charge c)
        (let ((t (conn-tls c)))
          (and t (cons (conn-tls-bio-held t) (conn-tls-raw-queued t)))))
@@ -3393,6 +3408,20 @@
                  (and t
                       (begin
                         (conn-set-tls! c #f)          ; <- the gate
+                        ;; INJECTION POINT 'ret-gate-closed -- OWNING REGION:
+                        ;; the with-interrupts-disabled this cond sits in.
+                        ;; Placed where the state is DETACHED but not yet
+                        ;; marked closed, which is the only moment those two
+                        ;; facts disagree.
+                        ;;
+                        ;; ⛔ SKIPPED BY CONSTRUCTION: the region is held, and
+                        ;; parking here would leave a connection detached from
+                        ;; its conn with closed? still #f -- the inconsistent
+                        ;; state this region exists to make unobservable.
+                        ;;
+                        ;; Interrupt state: injection ON -- depth 2, so
+                        ;; 'skipped; injection OFF -- (void).
+                        (inject-barrier! 'ret-gate-closed)
                         ;; the accumulator lives ON THE RECORD, not in a
                         ;; module variable: the effects below are preemptible,
                         ;; so another conn's retirement can interleave with
@@ -3557,6 +3586,19 @@
         ((conn-tls-closed? t) (cons 'refused 'tls-conn-closed))
         ((conn-tls-closing? t) (cons 'refused 'tls-closing))
         ((conn-tls-holder t)
+         ;; INJECTION POINT 'gate-holder-append -- OWNING REGION: the
+         ;; with-interrupts-disabled wrapping this cond. It sits after the
+         ;; holder test and before the waiter is on the list, the window in
+         ;; which a writer has been judged "must wait" but nothing yet records
+         ;; that it is waiting.
+         ;;
+         ;; ⛔ SKIPPED BY CONSTRUCTION: parking here would hold the region
+         ;; while the list is mid-update, and both release and retirement read
+         ;; that list atomically to decide who gets answered.
+         ;;
+         ;; Interrupt state: injection ON -- depth 2, so 'skipped;
+         ;; injection OFF -- (void).
+         (inject-barrier! 'gate-holder-append)
          ;; a pointer write on a cell the caller allocated before the region
          (conn-tls-set-waiters! t (append (conn-tls-waiters t) (list (cons me agg))))
          (cons 'parked #f))
@@ -3609,6 +3651,20 @@
                (tls-conn-write-chunks! c t agg segs on-done)
                (begin (when on-done (on-done -1)) #f))))
         (else
+          ;; INJECTION POINT 'tls-after-held -- OWNING REGION: NONE.
+          ;; ⭐ ANCHORED AS "after a successful acquire, before the first
+          ;; chunk", NOT as "after the announcement". tls-gate-announce-holder!
+          ;; only tells the watcher; it is asynchronous and its position may
+          ;; change, and this hook must NOT travel with it -- what a cell
+          ;; needs is the gap between holding the gate and writing anything.
+          ;;
+          ;; ⭐ PARKS: no region is held here, so a victim stops holding the
+          ;; gate with the aggregate still empty -- which is the state a
+          ;; competing writer or a retirement has to cope with.
+          ;;
+          ;; Interrupt state: injection ON -- depth 1, parks;
+          ;; injection OFF -- (void).
+          (inject-barrier! 'tls-after-held)
           (tls-conn-write-chunks! c t agg segs on-done)))))
 
   ;; The watcher tells us it is gone. Without this the live count only ever
@@ -3655,20 +3711,27 @@
   (define (tls-conn-set-holder-monitor! c m)
     (let ((t (conn-tls c))) (when t (conn-tls-set-holder-monitor! t m))))
 
-  ;; ⭐ GATE-OPEN AND THE ORDERED DRAIN ARE ONE TRANSITION (Z14). libuv
-  ;; callbacks run only when the scheduler polls the loop, which cannot happen
-  ;; inside this region, so no read callback can slip new plaintext between
-  ;; clearing the flag and the last buffered send: bytes either arrived before
-  ;; (buffered, drained here, in order) or after (delivered directly).
-  ;; ⭐ THE GATE STAYS SHUT UNTIL THE BUFFER IS EMPTY. Taking the batch and
-  ;; opening the gate in one region, then delivering outside it, let newer
-  ;; plaintext overtake older: the watcher was preempted after opening and a
-  ;; read callback delivered B directly while A was still in its hand, so the
-  ;; owner saw B before A. Z14's argument covers the region; it did not cover
-  ;; the window between leaving the region and the last send. Now each round
-  ;; takes a batch with the gate STILL CLOSED, delivers it, and only opens the
-  ;; gate once a round finds nothing left -- so anything arriving meanwhile is
-  ;; appended to the buffer and cannot pass what is already in flight.
+  ;; ⭐ "THE BUFFER IS EMPTY" AND "THE GATE IS OPEN" ARE ONE FACT (Z14).
+  ;; They are established in the SAME region, and that is the whole content of
+  ;; this procedure's correctness. Deciding emptiness in one region and opening
+  ;; in a second left a window in between: the watcher is interruptible there,
+  ;; the event-loop process can run a read callback, tls-read-plaintext! sees
+  ;; gated? still #t and appends B to inbound -- and then the second region
+  ;; opens the gate and this call returns. ⛔ NOTHING REVISITS B. The watcher
+  ;; calls open-and-drain ONCE (tls-watch.sc), so that plaintext was stranded
+  ;; for the life of the connection, with no error and no counter moving.
+  ;;
+  ;; ⭐ THE GATE STAYS SHUT UNTIL A ROUND FINDS NOTHING LEFT. Each round takes
+  ;; a batch with the gate STILL CLOSED and delivers it outside the region, so
+  ;; anything arriving meanwhile is appended to the buffer and cannot overtake
+  ;; what is already in flight. Only the round that finds the buffer empty
+  ;; opens the gate, in that same region. Bytes therefore either arrived
+  ;; before (buffered, drained here, in order) or after (delivered directly).
+  ;;
+  ;; ⚠ THE DELIVERIES MUST STAY OUTSIDE. deliver can raise and can be
+  ;; preempted; holding the region across an arbitrary number of them would
+  ;; make the drain's cost unbounded inside a no-interrupt window. Only the
+  ;; empty decision, the gate fields, the timestamps and the counters are in.
   ;;
   ;; ⛔ THE OWNER IS CHECKED BEFORE THE BUFFER IS TAKEN. Clearing first and
   ;; then finding no owner discarded that plaintext permanently. on-accept is
@@ -3683,6 +3746,28 @@
               (let ((batch (with-interrupts-disabled
                              (let ((held (conn-tls-inbound t)))
                                (conn-tls-set-inbound! t '())
+                               (when (null? held)
+                                 ;; INJECTION POINT 'z14-empty-open -- OWNING
+                                 ;; REGION: the with-interrupts-disabled on the
+                                 ;; line above, between deciding the buffer is
+                                 ;; empty and opening the gate. That is exactly
+                                 ;; the seam this fix closed, so the point
+                                 ;; exists to show it STAYS closed.
+                                 ;;
+                                 ;; ⛔ SKIPPED BY CONSTRUCTION: the region is
+                                 ;; held, so a victim cannot park here -- and
+                                 ;; must not, since parking would reopen the
+                                 ;; window by hand. A cell arms it to prove the
+                                 ;; skip happens inside the region, not to
+                                 ;; suspend anything.
+                                 ;;
+                                 ;; Interrupt state: injection ON -- depth 2,
+                                 ;; so 'skipped; injection OFF -- (void).
+                                 (inject-barrier! 'z14-empty-open)
+                                 (conn-tls-set-gated! t #f)
+                                 (conn-tls-set-gate-opened-ms! t (now-ms))
+                                 (bump-gate-open!)
+                                 (note-gate-open-ms! (now-ms)))
                                held))))
                 (cond
                   ((pair? batch)
@@ -3691,12 +3776,10 @@
                                batch))
                    (loop))
                   (else
-                    (with-interrupts-disabled
-                      (conn-tls-set-gated! t #f)
-                      (conn-tls-set-gate-opened-ms! t (now-ms))
-                      (bump-gate-open!)
-                      (note-gate-open-ms! (now-ms)))
-                    ;; the recorded close_notify, now that order is safe
+                    ;; the recorded close_notify, now that order is safe.
+                    ;; Outside the region as before: tls-deliver-eof-once!
+                    ;; sends after its own inner region, and eof-sent? is
+                    ;; atomic, so all three eof orderings stay correct.
                     (when (conn-tls-eof? t)
                       (tls-deliver-eof-once! c t))))))))))
 
@@ -3827,8 +3910,35 @@
                  (let ((cb (tls-agg-terminalise! agg 'tls-conn-closed)))
                    (when cb (cb -1)))
                  #f)
-                ((fx< (fx+ off take) n) (loop ss (fx+ off take)))
-                (else (loop (cdr ss) 0)))))))))
+                ;; INJECTION POINTS 'agg-chunk-boundary and
+                ;; 'agg-chunk-boundary-2 -- OWNING REGION: NONE. The per-chunk
+                ;; region closed when r was bound, which is what makes Y5's
+                ;; "preemption between chunk units is preserved" true; these
+                ;; points stand exactly in that gap.
+                ;;
+                ;; ⭐ PARK. A victim stops between two chunks of ONE aggregate
+                ;; while holding the gate -- the state that distinguishes
+                ;; "aggregates are serialised" from "steps are serialised".
+                ;; Two points rather than one so a cell can hold two
+                ;; successive boundaries; unarmed, each is a hit-free no-op.
+                ;;
+                ;; Interrupt state: injection ON -- depth 1, parks;
+                ;; injection OFF -- (void).
+                ((fx< (fx+ off take) n)
+                 (inject-barrier! 'agg-chunk-boundary)
+                 (inject-barrier! 'agg-chunk-boundary-2)
+                 (loop ss (fx+ off take)))
+                (else
+                 ;; ⛔ GUARDED so it never fires after the LAST chunk. Without
+                 ;; (pair? (cdr ss)) the final transition parks a victim whose
+                 ;; next act is to seal and release -- there is no following
+                 ;; chunk to race with, so the park would be a boundary that
+                 ;; is not a boundary, and the cell would be measuring the
+                 ;; teardown instead.
+                 (when (pair? (cdr ss))
+                   (inject-barrier! 'agg-chunk-boundary)
+                   (inject-barrier! 'agg-chunk-boundary-2))
+                 (loop (cdr ss) 0)))))))))
 
   ;; Accounting transfers (X4): ciphertext produced is bio-held until it is
   ;; submitted, then raw-queued until its completion runs.

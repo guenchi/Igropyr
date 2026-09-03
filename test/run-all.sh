@@ -494,6 +494,9 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/t
 # Reads the live-resource seams back to baseline in every cell. Spends 30 s in
 # H2' (a ClientHello on the plaintext port waits out read-timeout-ms).
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-listener.sc
+#      Race cells on the TLS write gate: writers parked by inject-barrier!
+#      at named boundaries in tcp.sc, the competing operation run meanwhile.
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-race.sc
 # item 5: fs-start-fd! owns its descriptor from its first instruction, with no
 # region around the call
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/fs-preregion.sc

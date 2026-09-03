@@ -17,7 +17,7 @@
 ;;; does; the caller sets it to the test CA before calling.
 
 (library (test tls-raw-client)
-  (export raw-tls-exchange raw-tls-send-and-drop raw-tls-two-requests)
+  (export raw-tls-exchange raw-tls-send-and-drop raw-tls-two-requests raw-tls-collect)
   (import (chezscheme)
           (igropyr actor)
           (only (igropyr libuv) tcp-connect! tcp-read-start! tcp-write! tcp-close! now-ms)
@@ -50,6 +50,18 @@
     (let-values (((plain writes eof? failure)
                   (raw-tls-exchange host port sni request #f timeout-ms 'drop)))
       (or failure writes)))
+
+  ;; Handshake, send the request, read to close_notify, then KEEP THE SOCKET
+  ;; OPEN 500 ms and keep every raw byte: the cell that uses this looks for
+  ;; bytes the server put on the wire AFTER retiring the session (RET').
+  ;; -> (values plaintext raw-stream) where raw-stream is every ciphertext
+  ;; byte received on the socket, from the first server flight to the end of
+  ;; the linger; the caller parses it as TLS records and judges the residue.
+  ;; In 'collect mode the exchange's failure slot carries that bytevector.
+  (define (raw-tls-collect host port sni request timeout-ms)
+    (let-values (((plain writes eof? raw)
+                  (raw-tls-exchange host port sni request #f timeout-ms 'collect)))
+      (values plain (if (bytevector? raw) raw (make-bytevector 0)))))
 
   ;; -> (values plaintext-received writes eof? failure)
   ;;   plaintext-received  every decrypted byte the server sent (bytevector)
@@ -123,17 +135,29 @@
                            (finish (make-bytevector 0) #f #f))
                          ;; read until eof or timeout; in 'second mode send B once
                          ;; `expect` plaintext bytes have arrived and stop at 2x
-                         (let-values (((port get) (open-bytevector-output-port)))
-                           (let ((second (and (pair? mode) (eq? (car mode) 'second) mode)) (got 0) (sent-b? #f))
+                         (let-values (((port get) (open-bytevector-output-port))
+                                      ((rport rget) (open-bytevector-output-port)))
+                           (let ((second (and (pair? mode) (eq? (car mode) 'second) mode)) (got 0) (sent-b? #f)
+                                 (collect? (and (pair? mode) (eq? (car mode) 'collect))))
+                           ;; 'collect: after close_notify keep reading raw bytes for
+                           ;; 500 ms of silence, then hand the whole raw stream back
+                           (define (linger-then-finish)
+                             (let linger ()
+                               (receive (after 500 (finish (get) #t (rget)))
+                                 (`#(tcp-data ,bv) (put-bytevector rport bv) (linger))
+                                 (`#(tcp-eof) (finish (get) #t (rget)))
+                                 (`#(tcp-error ,e) (finish (get) #t (rget))))))
                            (let read-loop ()
                              (receive (after (remaining) (finish (get) #f #f))
                                (`#(tcp-data ,bv)
+                                 (when collect? (put-bytevector rport bv))
                                  ;; decrypt! feeds the ciphertext itself (as establish! relies on);
                                  ;; feeding first would enter every byte twice
                                  (let-values (((out eof?) (tls-session-decrypt! sess bv)))
                                    (when out (put-bytevector port out) (set! got (+ got (bytevector-length out))))
                                    (flush! sess c)
                                    (cond
+                                     ((and eof? collect?) (linger-then-finish))
                                      (eof? (finish (get) #t #f))
                                      ((and second (not sent-b?) (>= got (caddr second)))
                                       (set! sent-b? #t)
@@ -141,7 +165,7 @@
                                       (read-loop))
                                      ((and second sent-b? (>= got (* 2 (caddr second)))) (finish (get) #f #f))
                                      (else (read-loop)))))
-                               (`#(tcp-eof) (finish (get) #t #f))
+                               (`#(tcp-eof) (finish (get) #t (and collect? (rget))))
                                (`#(tcp-error ,e) (finish (get) #f "tcp error")))))))
                         ((eq? verdict 'want-read)
                          (flush! sess c)
