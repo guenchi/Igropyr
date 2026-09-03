@@ -51,6 +51,12 @@
     ;; instance of it; the order here is the dependency order, not a
     ;; preference. It sits after platform.sc, its only dependency.
     "igropyr/tls-core.sc"
+    ;; ⭐ uv BELOW tcp BELOW the façade, and all three before libuv's
+    ;; consumers. uv owns the loop; tcp owns everything a connection or an
+    ;; owning process owns; "igropyr/libuv.sc" is now a façade with no
+    ;; definitions, so it must be compiled after both.
+    "igropyr/uv.sc"
+    "igropyr/tcp.sc"
     "igropyr/durable.sc"
     "igropyr/quickjs.sc"
     "igropyr/crypto.sc"

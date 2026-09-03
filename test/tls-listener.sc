@@ -226,7 +226,7 @@
     (let ((tls-syms (file-symbols "igropyr/tls.sc")))
       (check "ARCH: (igropyr tls) references no OpenSSL entry point or loader (parsed symbols)"
              (not (exists (lambda (s) (let ((n (symbol->string s))) (or (and (> (string-length n) 4) (member (substring n 0 4) '("SSL_" "BIO_" "EVP_" "OBJ_" "ERR_"))) (and (> (string-length n) 5) (string=? (substring n 0 5) "X509_")) (member n '("libssl" "libcrypto"))))) tls-syms))))
-    (let ((watch-syms (file-symbols "igropyr/tls-watch.sc")) (uv-syms (file-symbols "igropyr/libuv.sc")))
+    (let ((watch-syms (file-symbols "igropyr/tls-watch.sc")) (uv-syms (append (file-symbols "igropyr/uv.sc") (file-symbols "igropyr/tcp.sc"))))
       (check "STRUCT: no #(watching) message anywhere" (and (not (memq 'watching watch-syms)) (not (memq 'watching uv-syms))))
       (check "STRUCT: no 'tls-after-owner-installed point" (and (not (memq 'tls-after-owner-installed watch-syms)) (not (memq 'tls-after-owner-installed uv-syms)))))
 

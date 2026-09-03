@@ -1,5 +1,5 @@
 #!chezscheme
-;;; Every kind registered in libuv's owner index must be retired somewhere.
+;;; Every kind registered in the owner index (tcp.sc) must be retired somewhere.
 ;;;
 ;;; index-owner! files a resource under its owner so uv-owner-died! can
 ;;; reclaim it; unindex-owner! takes it back out when the resource goes on
@@ -28,7 +28,7 @@
 
 (import (chezscheme))
 
-(define source "libuv.sc")
+(define source "tcp.sc")
 (define control 'conn)
 
 (define (lines-of path)
