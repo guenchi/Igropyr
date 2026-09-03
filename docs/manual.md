@@ -4563,6 +4563,23 @@ another. The semantics deliberately mirror Erlang distribution:
 - `(rsend node reg-name msg)` → `#t`/`#f` — send `msg` to the process registered as `reg-name` on `node`; `#t` means handed to a live link (delivery still unconfirmed), `#f` means no link. The own node name is a plain local send.
 - `(rcall node reg-name msg [timeout])` → reply — synchronous call to the **gen-server** registered as `reg-name` on `node`; blocks the caller (default 5s). Raises `#(rcall-error ,reason ,target)` on no link, timeout, or a remote failure (no such server, it died, a non-serializable reply). The own node name is a plain local `gen-server-call`.
 - `(monitor-node name)` / `(demonitor-node name)` — receive `#(node-up ,name)` and `#(node-down ,name)`
+- `(monitor-node/token name)` → token / `(demonitor-node/token tok)` — the
+  same subscription, but each notice arrives as `#(node-up ,name ,tok ,seq)`
+  (and `#(node-down …)`) carrying your token and a sequence number that
+  rises across all notices. **A subscriber can see the same notice twice**:
+  an event leaves its queue only once it has been handed to every
+  subscriber, so a delivery that dies half way through is started again
+  rather than lost. The token form is what makes that absorbable — ignore
+  anything whose token is not yours, then ignore a sequence number you
+  have already passed. The two-element form above carries neither and
+  cannot tell a repeat from a new event; it is kept as it is for code
+  written before the token form existed.
+  **Compare sequence numbers with `=` and `<`, never with `fx=` or `fx<`.**
+  The counter is a plain integer and becomes a bignum once it passes the
+  fixnum ceiling — about 2^60, or some thirty-six thousand years at a
+  million events a second. Code that reaches for the fixnum operators is
+  correct for that long and then is not. The number is not a count of
+  anything and nothing but ordering may be read from it.
 - `(monitor-remote node name)` → ref / `(demonitor-remote ref)` — watch the process registered as `name` on `node`; the watcher receives one `#(remote-down ,node ,name ,reason)` where `reason` is the target's exit reason, `noproc` (name not registered when the watch is established), `noconnection` (the link dropped first — across a broken link the target being alive or dead is indistinguishable, as in Erlang), or `overload` (the node will not host this watch right now: it is already at its `node-set-limits!` ceiling for remote monitors, or a watch under this reference from a previous incarnation of *your* node has not finished leaving yet — the usual way to see this one is to re-arm immediately after restarting. Both are refusals to take a new permit, and a later attempt can succeed). This is the **process-level** counterpart to `monitor-node`.
 - `(node-peers)` — connected peer names; `(node-self)` — own name
 
