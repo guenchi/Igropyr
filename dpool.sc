@@ -283,7 +283,7 @@
     ;; answers "have I already seen this one". Both are needed and neither
     ;; substitutes for the other.
     ;;
-    ;; ⭐ THIS DEPENDS ON (igropyr node) STAMPING EACH EVENT EXACTLY ONCE,
+    ;; THIS DEPENDS ON (igropyr node) STAMPING EACH EVENT EXACTLY ONCE,
     ;; and it is worth naming what provides that rather than stating the
     ;; consequence as if it were a fact. `stamp-event!` there numbers an
     ;; event only if it is not numbered yet, in the same region that queues
@@ -298,7 +298,7 @@
     ;; arrives here for one peer is a subsequence of a rising sequence --
     ;; still rising, which is all the comparison needs.
     ;;
-    ;; ⚠ NOTHING PROMISES A GAP, and nothing promises there is not one.
+    ;; NOTHING PROMISES A GAP, and nothing promises there is not one.
     ;; Consecutive numbers for one peer mean only that no other peer had an
     ;; event in between, which is a fact about how busy the node happened
     ;; to be, not a property of anything here. Read this as "a gap is not a
@@ -323,7 +323,7 @@
         ((not (eq? tok (hashtable-ref node-tokens node #f)))
          (set! token-miss-n (+ token-miss-n 1))
          #f)
-        ;; ⭐ THE TOKEN TEST IS ABOVE AND THE WATERMARK BELOW, AND SWAPPING
+        ;; THE TOKEN TEST IS ABOVE AND THE WATERMARK BELOW, AND SWAPPING
         ;; THEM IS A REAL BUG rather than a style choice. A notice from a
         ;; subscription we no longer hold carries a number from somebody
         ;; else's counting; admitting it below would raise our watermark

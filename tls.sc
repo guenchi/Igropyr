@@ -9,7 +9,7 @@
 ;;;   (tls-enable!)
 ;;;   (http-get "https://example.com/")
 ;;;
-;;; ⭐ THE OpenSSL HALF LIVES IN (igropyr tls-core), NOT HERE. That library
+;;; THE OpenSSL HALF LIVES IN (igropyr tls-core), NOT HERE. That library
 ;;; owns the FFI, the sessions and the contexts, and hands out operations
 ;;; that take a session object; this file owns the transport half -- the
 ;;; socket, the deadline, the mailbox, the close hook -- and holds no SSL
@@ -146,7 +146,7 @@
 ;;;     a fixed string, not from the queue.)
 
 (library (igropyr tls)
-  ;; ⭐ THIS IS THE PROGRAM-FACING SURFACE, listed name by name rather than
+  ;; THIS IS THE PROGRAM-FACING SURFACE, listed name by name rather than
   ;; re-exported wholesale from (igropyr tls-core). A program enables TLS,
   ;; makes client connections, and -- if it listens -- builds and retires a
   ;; server context. The session-level primitives (tls-step!,
@@ -223,7 +223,7 @@
       ;; cost to itself.
       (let ((deadline (+ (now-ms) timeout)))
         (let handshake ()
-          ;; ⭐ CLASSIFY BEFORE FLUSHING. Draining the write BIO is itself
+          ;; CLASSIFY BEFORE FLUSHING. Draining the write BIO is itself
           ;; OpenSSL work and tcp-write! is a preemption point, so a flush
           ;; between the step and its classification would let any process
           ;; scheduled there decide whether this handshake lived.
@@ -281,7 +281,7 @@
             (decrypt
               (lambda (raw)
         (let-values (((out eof?) (tls-session-decrypt! sess raw)))
-          ;; ⭐ THE EOF IS SYNTHESISED HERE, NOT IN tls-core. A close_notify
+          ;; THE EOF IS SYNTHESISED HERE, NOT IN tls-core. A close_notify
           ;; ends the TLS stream now, and a close-wait peer (openssl s_server
           ;; does this) may hold the socket open waiting for OUR close_notify
           ;; -- so a close-delimited response must not depend on a TCP FIN.

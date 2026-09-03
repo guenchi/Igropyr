@@ -2,7 +2,7 @@
 ;;; (igropyr tls-core) -- OpenSSL/LibreSSL primitives, shared by the client
 ;;; codec in (igropyr tls) and by the server-side connection codec.
 ;;;
-;;; ⭐ THIS LIBRARY EXISTS TO BREAK A DEPENDENCY CYCLE, and that is its whole
+;;; THIS LIBRARY EXISTS TO BREAK A DEPENDENCY CYCLE, and that is its whole
 ;;; reason for being. (igropyr tls) drives a socket, so it imports
 ;;; (igropyr libuv); the server-side codec lives inside libuv and has to
 ;;; drive SSL, so it needs these primitives. Had they stayed in (igropyr tls)
@@ -28,7 +28,7 @@
 
 (library (igropyr tls-core)
   (export
-          ;; ⭐ NO OpenSSL ENTRY POINT IS EXPORTED. Everything a caller can do
+          ;; NO OpenSSL ENTRY POINT IS EXPORTED. Everything a caller can do
           ;; to a live session it does through the operations below, which take
           ;; the session object; the SSL*, the BIOs and the raw bindings stay
           ;; inside this library. (Still API curation, not a sandbox -- see the
@@ -50,18 +50,18 @@
           tls-context? tls-live-context-count
           tls-context-renegotiation-refused?
           )
-  ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- the same
+  ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- the same
   ;; arrangement libuv.sc documents. Its macros expand to the guarded
   ;; expression or to nothing unless IGROPYR_INJECT was on when this file was
   ;; compiled, so an ordinary build refers to none of its runtime part.
   ;;
-  ;; ⚠ (igropyr libuv) MUST NOT APPEAR HERE. That is the whole reason this
+  ;; (igropyr libuv) MUST NOT APPEAR HERE. That is the whole reason this
   ;; library exists; adding it recreates the cycle it was split out to break.
   (import (chezscheme) (igropyr platform) (igropyr inject))
 
   ;; ---- OpenSSL entry points, bound on first use -------------------------
   ;;
-  ;; ⭐ THESE ARE MUTABLE AND START #f, AND BOTH HALVES OF THAT MATTER.
+  ;; THESE ARE MUTABLE AND START #f, AND BOTH HALVES OF THAT MATTER.
   ;;
   ;; MUTABLE, because Chez resolves a foreign-procedure at BIND time, not at
   ;; call time: an unresolvable symbol raises where the define is evaluated.
@@ -78,7 +78,7 @@
   ;; ensure-loaded! fails immediately and locally rather than calling into
   ;; whatever the symbol would have been.
   ;;
-  ;; ⚠ Being assigned also means they CANNOT be exported (R6RS forbids
+  ;; Being assigned also means they CANNOT be exported (R6RS forbids
   ;; exporting an assigned variable), which is the property that keeps the
   ;; raw FFI inside this library -- the same rule that keeps ctx and
   ;; live-sessions in. Callers get the session and context operations below.
@@ -86,7 +86,7 @@
 
   (define ffi-bound? #f)
 
-  ;; ⭐ THE EXPORTED NAME IS A PROCEDURE, AND IT IS NEVER ASSIGNED. Chez
+  ;; THE EXPORTED NAME IS A PROCEDURE, AND IT IS NEVER ASSIGNED. Chez
   ;; resolves a foreign-procedure at BIND time, so binding these at
   ;; library-invoke time would make libcrypto/libssl a hard requirement of
   ;; every program that reaches this library -- and libuv imports it, so
@@ -171,7 +171,7 @@
     (foreign-procedure "SSL_CTX_use_PrivateKey_file" (void* string int) int))
   (define-ffi SSL_CTX_check_private_key
     (foreign-procedure "SSL_CTX_check_private_key" (void*) int))
-  ;; ⚠ THE WIDTH IS uint64_t ON OpenSSL 3 AND unsigned long ON 1.1.1 AND
+  ;; THE WIDTH IS uint64_t ON OpenSSL 3 AND unsigned long ON 1.1.1 AND
   ;; LibreSSL. Those are the same 64-bit word on every LP64 platform this
   ;; library builds on, which is what makes one binding serve all three;
   ;; on an ILP32 target it would not, and this binding would need a
@@ -261,7 +261,7 @@
   ;; probing rather than version-testing is what makes that automatic.)
   ;; Used only by the mark/pop regions: the TLS I/O path clears first and
   ;; therefore owns everything it can see (see with-ssl-call).
-  ;; ⛔ THE PROBE MUST NOT RUN AT LIBRARY-INVOKE TIME. It once did, and it
+  ;; THE PROBE MUST NOT RUN AT LIBRARY-INVOKE TIME. It once did, and it
   ;; was correct then only because this file used to load libcrypto eagerly
   ;; two forms above: foreign-entry? was asked its question with the library
   ;; already in the process. Once loading became lazy, the same expression
@@ -273,7 +273,7 @@
   ;;
   ;; So the selection is deferred exactly like the entry points are: decided
   ;; once, on first use, after ensure-loaded! has run.
-  ;; ⭐ THE CHOICE IS RECORDED, NOT RE-DERIVABLE. A cell has to be able to
+  ;; THE CHOICE IS RECORDED, NOT RE-DERIVABLE. A cell has to be able to
   ;; see WHICH implementation this actually selected; a seam that answered
   ;; by probing foreign-entry? a second time would be asking its own
   ;; question at its own moment, and would answer 'mark-count even in a
@@ -492,7 +492,7 @@
   ;; opposite actions -- there is nothing left to close, and nothing to say
   ;; about OpenSSL's queue.
   ;;
-  ;; ⚠ want-write IS UNREACHABLE TODAY and is still a verdict of its own.
+  ;; want-write IS UNREACHABLE TODAY and is still a verdict of its own.
   ;; The write BIO is an unbounded memory BIO, so OpenSSL never has to stop
   ;; for room. It is named rather than folded into `error` so that a driver
   ;; which one day writes into a bounded sink fails loudly at a case it does
@@ -526,11 +526,11 @@
   ;; counter in one file is what makes a leak visible as a count that never
   ;; comes back down. A caller that reached for SSL_new directly would open a
   ;; session this counter never saw.
-  ;; ⭐ THE SSL POINTER DOES NOT LEAVE THIS LIBRARY AS A BARE VALUE. SSL_new
+  ;; THE SSL POINTER DOES NOT LEAVE THIS LIBRARY AS A BARE VALUE. SSL_new
   ;; and SSL_free are not exported, so creation and retirement are the two
   ;; procedures below and a cooperating caller has no third way in.
   ;;
-  ;; ⚠ THIS IS API CURATION, NOT A SECURITY BOUNDARY, and the difference
+  ;; THIS IS API CURATION, NOT A SECURITY BOUNDARY, and the difference
   ;; matters enough to write down. Any caller may import this library and
   ;; bind SSL_free itself with foreign-procedure, or call the exported
   ;; SSL_CTX_set_verify on the client context and turn verification off for
@@ -560,7 +560,7 @@
   ;; -> a session, or #f when OpenSSL could not make one (the caller reads
   ;; the reason in its own scope).
   ;;
-  ;; ⭐ THE ORDER IS SSL_new -> COUNT -> RECORD, AND IT IS NOT ARBITRARY.
+  ;; THE ORDER IS SSL_new -> COUNT -> RECORD, AND IT IS NOT ARBITRARY.
   ;; make-tls-session allocates, so a kill can land between the count and
   ;; the record. The SSL is then genuinely orphaned -- nothing holds it and
   ;; nothing can ever retire it -- and this order has already counted it.
@@ -574,7 +574,7 @@
   ;; There is no window on the other side: SSL_new is a foreign call, a kill
   ;; cannot land inside it, and the increment follows it without allocating.
   ;;
-  ;; ⚠ DO NOT TIDY THESE TWO LINES INTO THE OTHER ORDER. They look
+  ;; DO NOT TIDY THESE TWO LINES INTO THE OTHER ORDER. They look
   ;; interchangeable and are not: the difference is invisible in every
   ;; ordinary run, and shows up only as a leak the instrument stops seeing.
   (define (tls-session-new! c)
@@ -617,7 +617,7 @@
     (tls-session-retire!
       sess (string-append "tls: codec is unusable after previous failure: " msg)))
 
-  ;; ⛔ THE GUARD IS THE SSL FIELD, NOT THE MESSAGE. An earlier version
+  ;; THE GUARD IS THE SSL FIELD, NOT THE MESSAGE. An earlier version
   ;; tested (unbox dead), which conflates "has something to say" with "has
   ;; been retired" -- two different facts that happen to travel together on
   ;; the client's paths because it always passes a string. Retiring with
@@ -642,7 +642,7 @@
 
   ;; ---- session operations ------------------------------------------------
   ;;
-  ;; ⭐ EVERY OpenSSL CALL ON A LIVE SESSION GOES THROUGH ONE OF THESE. They
+  ;; EVERY OpenSSL CALL ON A LIVE SESSION GOES THROUGH ONE OF THESE. They
   ;; take the session object, never a bare SSL*, so a caller cannot reach the
   ;; pointer, cannot free it, and cannot use one that has been retired: each
   ;; entry point tests the liveness cell inside the same region it uses the
@@ -691,14 +691,14 @@
 
   ;; One handshake step. Two values: verdict and payload (see tls-step!).
   ;;
-  ;; ⛔ THIS NEVER RETIRES THE SESSION, AND THAT IS NOT A DEFAULT -- IT IS THE
+  ;; THIS NEVER RETIRES THE SESSION, AND THAT IS NOT A DEFAULT -- IT IS THE
   ;; ONLY BEHAVIOUR. Retiring frees the SSL, and the SSL owns the write BIO,
   ;; so poisoning here would destroy the very alert a failed handshake just
   ;; produced: the peer would see the connection vanish instead of being told
   ;; protocol_version or handshake_failure. A caller that wants the session
   ;; gone drains first and retires afterwards.
   ;;
-  ;; ⚠ THERE USED TO BE A BOOLEAN HERE, and it was got wrong. The warning
+  ;; THERE USED TO BE A BOOLEAN HERE, and it was got wrong. The warning
   ;; above was written at ONE call site, in (igropyr tls); the next caller --
   ;; the server driver in (igropyr libuv) -- saw only a bare #t at the call
   ;; and passed it, destroying every fatal alert the listener ever produced.
@@ -748,7 +748,7 @@
                                 (values d #f)
                                 (values
                                   #f
-                                  ;; ⭐ CLASSIFY, THEN OVERRIDE THE
+                                  ;; CLASSIFY, THEN OVERRIDE THE
                                   ;; CLASSIFICATION -- not the return value.
                                   ;; The real SSL_write runs, so the session
                                   ;; state is genuine; what a cell forces is
@@ -766,7 +766,7 @@
                                          (code (cdr rc)))
                                     (cond
                                       ((= wrote n) #f)
-                                      ;; ⭐ W4: A WRITE THAT WANTS A READ IS AN
+                                      ;; W4: A WRITE THAT WANTS A READ IS AN
                                       ;; ERROR HERE. It means the peer asked to
                                       ;; renegotiate mid-write -- and a server
                                       ;; context refuses renegotiation, so
@@ -790,11 +790,11 @@
   ;; Ciphertext in. Two values: the plaintext read out, and #t when the peer's
   ;; close_notify ended the stream.
   ;;
-  ;; ⭐ THE close_notify IS REPORTED, NOT ACTED ON. Synthesising the transport
+  ;; THE close_notify IS REPORTED, NOT ACTED ON. Synthesising the transport
   ;; EOF is the caller's business -- it owns the socket and the mailbox -- and
   ;; doing it here would put an actor send inside this library.
   (define (tls-session-decrypt! sess raw)
-    ;; ⭐ STAGE MARKS INSIDE THE BODY. A read reached this procedure, returned
+    ;; STAGE MARKS INSIDE THE BODY. A read reached this procedure, returned
     ;; normally reporting no eof, and recorded NONE of the five per-call
     ;; classifications below -- which the source says is impossible, since
     ;; every exit records one. Three rounds of reading have not explained it,
@@ -837,7 +837,7 @@
   ;; complete, #f when it wants another round; either way the alert is in the
   ;; write BIO and the caller drains it.
   ;;
-  ;; ⚠ NEVER RETIRES. Retirement frees the SSL, and the SSL owns the write
+  ;; NEVER RETIRES. Retirement frees the SSL, and the SSL owns the write
   ;; BIO -- so retiring here would throw away the very alert this call exists
   ;; to produce, and the peer would have to infer the close from a dropped
   ;; connection. The caller drains first and retires after.
@@ -859,12 +859,12 @@
   ;; that an ordinary build cannot be measured by it at all: a build that
   ;; answers 0 because the counter was compiled out reads exactly like a
   ;; build with nothing leaking.
-  ;; ⭐ WHAT SSL_read ACTUALLY SAID. The read path's stage trace narrowed a
+  ;; WHAT SSL_read ACTUALLY SAID. The read path's stage trace narrowed a
   ;; missing EOF to "decrypt ran and did not report eof", which leaves exactly
   ;; one unmeasured step: how the return of SSL_read was classified. Rather
   ;; than reason about what OpenSSL ought to return for a close_notify, this
   ;; records what it did return, per call, newest last.
-  ;; ⛔ THE RECORDER IS GATED WITH ITS READER, and it was not. Only
+  ;; THE RECORDER IS GATED WITH ITS READER, and it was not. Only
   ;; tls-read-classes sat inside the meta-cond, so an ordinary build LOOKED
   ;; instrumented-out -- the trace could not be read at all -- while this
   ;; recorder went on running on the TLS read path: six to eight appends over
@@ -873,7 +873,7 @@
   ;; belong in one branch, and every call site below compiles to nothing when
   ;; the instrument is off.
   ;;
-  ;; ⚠ THE CAP IS GENEROUS ON PURPOSE. At 16 entries a handshake plus one read
+  ;; THE CAP IS GENEROUS ON PURPOSE. At 16 entries a handshake plus one read
   ;; could plausibly have pushed the interesting end out of the window, which
   ;; would make the instrument itself a candidate explanation for "nothing was
   ;; recorded" -- and the whole reason this exists is that the explanations
@@ -921,7 +921,7 @@
 
   ;; -> whether THIS context actually had SSL_OP_NO_RENEGOTIATION applied.
   ;;
-  ;; ⭐ IT READS THE RECORDED FACT AND DOES NOT RECOMPUTE THE VERSION TEST. A
+  ;; IT READS THE RECORDED FACT AND DOES NOT RECOMPUTE THE VERSION TEST. A
   ;; seam that re-derived the answer would run its own test at its own moment
   ;; and agree with itself, so a build whose version test is wrong would still
   ;; report "refused" -- the mutation this exists to catch would be invisible.
@@ -1088,7 +1088,7 @@
 
   ;; ---- contexts ----------------------------------------------------------
   ;;
-  ;; ⭐ A CONTEXT IS A RECORD BECAUSE RETIREMENT HAS TO BE ENFORCEABLE. Handing
+  ;; A CONTEXT IS A RECORD BECAUSE RETIREMENT HAS TO BE ENFORCEABLE. Handing
   ;; back the bare SSL_CTX* could not be: Scheme passes it by value, so freeing
   ;; it cannot clear the caller's copy, retiring the same address twice was a
   ;; double free with nothing able to notice, and any integer at all could be
@@ -1108,7 +1108,7 @@
     (nongenerative)
     (sealed #t))
 
-  ;; ⭐ TWO COUNTS, BECAUSE ONE NAME WAS COVERING TWO LIFETIMES. Every context
+  ;; TWO COUNTS, BECAUSE ONE NAME WAS COVERING TWO LIFETIMES. Every context
   ;; increments live-contexts, and the CLIENT context is a process-wide
   ;; singleton that is deliberately never retired -- so after a server shut its
   ;; listener down, a total of 1 was the client's singleton and said nothing
@@ -1142,7 +1142,7 @@
     (ensure-loaded!)
     (let ((err
             (with-openssl-scope
-              ;; ⛔ THE GATE READS THE POINTER FIELD, NOT MERELY WHETHER A
+              ;; THE GATE READS THE POINTER FIELD, NOT MERELY WHETHER A
               ;; CONTEXT OBJECT EXISTS. When this tested a bare non-zero
               ;; pointer, retiring the client singleton left the variable
               ;; non-zero, so this branch decided the context was still good
@@ -1155,7 +1155,7 @@
                     (if (zero? c)
                         (tls-reason "tls: SSL_CTX_new failed")
                         (begin
-                          ;; ⭐ COUNTED AT ALLOCATION, for the reason spelled
+                          ;; COUNTED AT ALLOCATION, for the reason spelled
                           ;; out at the listener constructor: a context
                           ;; abandoned between here and publication has leaked,
                           ;; and a counter that only learns about it on the
@@ -1163,7 +1163,7 @@
                           ;; exists to expose.
                           (with-interrupts-disabled
                             (set! live-contexts (fx+ live-contexts 1)))
-                          ;; ⭐ THE COMPENSATION COVERS ALLOCATION TO
+                          ;; THE COMPENSATION COVERS ALLOCATION TO
                           ;; PUBLICATION. Until ctx holds the record, nothing
                           ;; else in the process can reach this context, so a
                           ;; non-local exit here would leak it with no owner
@@ -1227,7 +1227,7 @@
   ;;
   ;; The reason is read before the cleanup and raised outside the scope, for
   ;; the reason ensure-ctx! gives above.
-  ;; ⚠ tls-reason's argument is a FALLBACK, used only when OpenSSL queued
+  ;; tls-reason's argument is a FALLBACK, used only when OpenSSL queued
   ;; nothing -- and for these calls it always queues something, so a path
   ;; put in that string is never printed. Measured, not assumed: a missing
   ;; certificate file and a missing key file both reported
@@ -1241,7 +1241,7 @@
   ;; Free a context that never became a tls-context, and give back the count
   ;; taken at allocation. Both discard paths in the constructor use this, so
   ;; the pair cannot drift apart.
-  ;; ⚠ listener? is a FLAG here, not a record field: this runs on a raw
+  ;; listener? is a FLAG here, not a record field: this runs on a raw
   ;; pointer, before any context object exists. The listener constructor
   ;; increments both counts up front, so its discards give both back; the
   ;; client's failure paths incremented only the total.
@@ -1267,11 +1267,11 @@
 
   (define (tls-listen-context! cert-chain-path key-path)
     (ensure-loaded!)
-    ;; ⛔ CHECKED BEFORE ANYTHING IS ALLOCATED. What this uniquely provides is
+    ;; CHECKED BEFORE ANYTHING IS ALLOCATED. What this uniquely provides is
     ;; THE ERROR ITSELF: a tls-error naming the wrong argument, instead of a
     ;; Chez FFI type error raised from inside one of the loading calls.
     ;;
-    ;; ⚠ IT IS NOT WHAT PREVENTS THE LEAK -- not any more. It was, when the
+    ;; IT IS NOT WHAT PREVENTS THE LEAK -- not any more. It was, when the
     ;; compensation guard below opened after the cond; the guard was then
     ;; widened to cover the loading calls, so a raise there is discarded and
     ;; counted back whether or not this check exists. Measured: with this
@@ -1286,7 +1286,7 @@
                  (if (zero? c)
                      (cons (tls-reason "tls: SSL_CTX_new failed") #f)
                      (begin
-                     ;; ⭐ COUNTED AT ALLOCATION, NOT AT PUBLICATION -- the same
+                     ;; COUNTED AT ALLOCATION, NOT AT PUBLICATION -- the same
                      ;; argument as tls-session-new! above, and it was got
                      ;; wrong here first. Counting on the success path meant a
                      ;; context abandoned between here and publication was one
@@ -1301,7 +1301,7 @@
                        (set! live-contexts (fx+ live-contexts 1))
                        (set! live-listener-contexts
                              (fx+ live-listener-contexts 1)))
-                     ;; ⛔ THE GUARD OPENS HERE, BEFORE THE COND, AND THAT
+                     ;; THE GUARD OPENS HERE, BEFORE THE COND, AND THAT
                      ;; POSITION IS THE POINT OF IT. It used to open after
                      ;; the cond -- it was written by replacing the success
                      ;; BRANCH -- which left the four loading calls below
@@ -1334,7 +1334,7 @@
                                                 c key-path SSL_FILETYPE_PEM)))
                                 (file-reason "tls: cannot load private key"
                                              key-path))
-                               ;; ⚠ NOT THE CATCHER IN THIS LOAD ORDER, and
+                               ;; NOT THE CATCHER IN THIS LOAD ORDER, and
                                ;; measured so: with the certificate loaded
                                ;; first, SSL_CTX_use_PrivateKey_file itself
                                ;; rejects a key that does not match it (it
@@ -1355,7 +1355,7 @@
                                (else #f))))
                        (if bad
                            (begin (discard-context! c #t) (cons bad #f))
-                           ;; ⛔ EVERYTHING PAST THE ALLOCATION IS GUARDED. The
+                           ;; EVERYTHING PAST THE ALLOCATION IS GUARDED. The
                            ;; failure branch above only covers calls that
                            ;; report failure by RETURNING; an allocation
                            ;; failure, or a lazy FFI binding whose symbol will
@@ -1363,7 +1363,7 @@
                            ;; SSL_CTX_set_options on LibreSSL), leaves by a
                            ;; route it cannot see, and the context would leak.
                            ;;
-                           ;; ⚠ This file's rule is "raise outside the scope,
+                           ;; This file's rule is "raise outside the scope,
                            ;; never inside", and that rule is NOT broken here:
                            ;; it governs the DELIBERATE error path, where the
                            ;; reason is captured and returned as a value so
@@ -1376,7 +1376,7 @@
                              ;; OWNING GUARD: the guard immediately above,
                              ;; which frees the context and re-raises.
                              ;;
-                             ;; ⭐ IT EXISTS BECAUSE THAT GUARD HAS NO OTHER
+                             ;; IT EXISTS BECAUSE THAT GUARD HAS NO OTHER
                              ;; WAY TO GO RED. The argument check above runs
                              ;; before the allocation, so a bad argument never
                              ;; reaches here; what is left for the guard to
@@ -1386,7 +1386,7 @@
                              ;; point here, deleting the guard passes every
                              ;; cell.
                              (inject-fault! 'tls-context-after-alloc)
-                             ;; ⭐ THREE INDEPENDENT CONDITIONS, ALL REQUIRED.
+                             ;; THREE INDEPENDENT CONDITIONS, ALL REQUIRED.
                              ;;
                              ;; The option bit arrived in OpenSSL 1.1.1, so
                              ;; older versions must not be asked for it.
@@ -1394,7 +1394,7 @@
                              ;; LibreSSL reports exactly 0x20000000 and has
                              ;; neither this bit nor the function as a real
                              ;; symbol -- it is a macro over SSL_CTX_ctrl
-                             ;; there. ⚠ THAT VALUE IS AN UNVERIFIED PREMISE:
+                             ;; there. THAT VALUE IS AN UNVERIFIED PREMISE:
                              ;; it cannot be checked on the machine this was
                              ;; written on, and it is now the only criterion
                              ;; separating LibreSSL out.
@@ -1405,7 +1405,7 @@
                              ;; set, not an unresolvable symbol raising inside
                              ;; a listener's construction.
                              ;;
-                             ;; ⚠ An earlier form of this test bounded the
+                             ;; An earlier form of this test bounded the
                              ;; version ABOVE (v < 0x20000000). OpenSSL 3 is
                              ;; 0x30000000 and up, so that range excluded the
                              ;; very library this runs on, and the option was

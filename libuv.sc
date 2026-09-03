@@ -1,7 +1,7 @@
 #!chezscheme
 ;;; (igropyr libuv) -- the façade over (igropyr uv) and (igropyr tcp).
 ;;;
-;;; ⭐ ZERO DEFINITIONS, BY DESIGN. Every name below is re-exported from the
+;;; ZERO DEFINITIONS, BY DESIGN. Every name below is re-exported from the
 ;;; library that defines it, so a consumer importing this one gets THE SAME
 ;;; BINDING it got before the split -- not a wrapper around it. That matters
 ;;; for more than tidiness: a façade that wrapped each name in
@@ -9,7 +9,7 @@
 ;;; changing arity introspection and adding an indirection on hot paths. The
 ;;; check that pins this is binding identity, not the export list.
 ;;;
-;;; ⚠ THE SPLIT IS INVISIBLE FROM HERE ON PURPOSE. Consumers -- actor, http,
+;;; THE SPLIT IS INVISIBLE FROM HERE ON PURPOSE. Consumers -- actor, http,
 ;;; node, qjspool, tls -- were not touched by this batch and must not need to
 ;;; be: the public API is unchanged name for name and binding for binding.
 ;;; New code should import (igropyr uv) or (igropyr tcp) directly and say
@@ -47,7 +47,7 @@
           uv-poll! uv-set-deliver! uv-set-gate-wait! uv-set-self!
           uv-set-tls-watcher-spawner! uv-strerror)
 
-  ;; ⭐ (only …) ON BOTH IMPORTS. Importing wholesale and re-exporting by name
+  ;; (only …) ON BOTH IMPORTS. Importing wholesale and re-exporting by name
   ;; would work today and would silently publish anything either library adds
   ;; later; naming what is taken keeps the façade's contract a statement
   ;; rather than a consequence.

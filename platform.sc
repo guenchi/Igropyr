@@ -83,7 +83,7 @@
   ;; backlog listen() was given to kern.ipc.soacceptqueue. FreeBSD has it;
   ;; Linux and macOS have no equivalent (checked on macOS: undefined).
   ;;
-  ;; ⛔ #f MEANS "NOT KNOWN HERE", AND THAT IS DELIBERATELY NOT A GUESS.
+  ;; #f MEANS "NOT KNOWN HERE", AND THAT IS DELIBERATELY NOT A GUESS.
   ;; A wrong option number does not fail loudly: getsockopt would answer
   ;; for whatever option that number names and hand back a plausible
   ;; integer, which the caller would report as the effective backlog. The
@@ -128,14 +128,14 @@
   ;;            st_ino st_size st_blksize st_blocks st_flags st_gen
   ;;   uv_timespec_t st_atim st_mtim st_ctim st_birthtim
   ;;
-  ;; ⚠ THE TIMESTAMP OFFSETS ARE 64-BIT-SPECIFIC and the field offsets
+  ;; THE TIMESTAMP OFFSETS ARE 64-BIT-SPECIFIC and the field offsets
   ;; above them are not. uv_timespec_t is two `long`s: 16 bytes here, 8
   ;; on a 32-bit target, where every offset from st_atim onward moves.
   ;; The twelve uint64_t fields are the same width everywhere, so only
   ;; the four timestamps carry that dependency -- which is why they are
   ;; the only ones this comment singles out.
   ;;
-  ;; ⭐ mode and size were here before the rest and their values were
+  ;; mode and size were here before the rest and their values were
   ;; arrived at independently; recomputing the whole layout reproduced
   ;; both. That agreement is the only check this table gets, so it is
   ;; worth saying that it happened.

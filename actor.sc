@@ -22,7 +22,7 @@
           sleep-ms process-alive? process-id process-count
           process-monitor-count
           critical! uncritical! start-scheduler)
-  ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- the
+  ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- the
   ;; off expansion of every primitive refers to no runtime name of it, so
   ;; this unit's invoke-requirements stay (), which is what
   ;; test/inject-isolation.ss measures for every unit in library-units.
@@ -239,13 +239,13 @@
   ;; The argument type checks stay OUTSIDE these regions anyway (see
   ;; send and link): failing early is still better than unwinding.
   ;;
-  ;; ⭐ WHEN TO USE THIS FORM, AND WHEN A BARE disable-interrupts IS
+  ;; WHEN TO USE THIS FORM, AND WHEN A BARE disable-interrupts IS
   ;; RIGHT. Some of this file does not use the form at all: it disables
   ;; and enables by hand, sometimes across a yield, sometimes in a place
   ;; that never enables again. That is not sloppiness left to tidy up
   ;; later, and the rule for telling the two apart is short:
   ;;
-  ;;   ⭐ A NEW hand-written disable-interrupts belongs in this form
+  ;;   A NEW hand-written disable-interrupts belongs in this form
   ;;   UNLESS no path out of it ever returns. If there is a path that
   ;;   comes back, write it lexically.
   ;;
@@ -518,7 +518,7 @@
 
   (define (@link p1 p2)
     (unless (memq p2 (pcb-links p1))
-      ;; ⛔ BOTH CELLS ARE ALLOCATED BEFORE EITHER IS PUBLISHED. A link is
+      ;; BOTH CELLS ARE ALLOCATED BEFORE EITHER IS PUBLISHED. A link is
       ;; one fact about two processes, and it was written as two steps
       ;; with an allocation between them: the second cons could fail with
       ;; p1 already listing p2 and p2 not listing p1. Nothing repairs
@@ -536,7 +536,7 @@
         ;; a disabled-interrupt region is not a guard: it does not catch,
         ;; so the raise leaves the region and reaches link's caller.
         ;;
-        ;; ⚠ THE POINT IS ANCHORED TO THE SECOND ALLOCATION, NOT TO A
+        ;; THE POINT IS ANCHORED TO THE SECOND ALLOCATION, NOT TO A
         ;; POSITION BETWEEN THE TWO WRITES. It models the second cons
         ;; failing, which is the only step here that can fail, and it
         ;; follows that cons wherever the cons goes. Between the two
@@ -588,7 +588,7 @@
             ;; way: to the second cons, which this call sits before in
             ;; either version of the code.
             (inject-fault! 'monitor-second-half)
-            ;; ⛔ (monitor self) IS LEGAL AND ALIASES THE TWO LISTS.
+            ;; (monitor self) IS LEGAL AND ALIASES THE TWO LISTS.
             ;; Unlike link, which refuses a self-target, monitor accepts
             ;; one, and the header of this file records the measured
             ;; consequence: such a call adds TWO entries, because the
@@ -967,7 +967,7 @@
     ;; identity for libuv's TLS write gate: it must record the holder's pid so
     ;; the per-conn watcher can monitor it, and it cannot import this library
     ;; (this one imports it). Same shape and direction as the delivery hook.
-    ;; ⛔ A THUNK, NOT `self`. `self` is identifier-syntax over a virtual
+    ;; A THUNK, NOT `self`. `self` is identifier-syntax over a virtual
     ;; register (see its definition above), so passing it here does not pass a
     ;; way to ask "who is running" -- it passes the register's value AT THIS
     ;; MOMENT, which is one line before the scheduler installs the first

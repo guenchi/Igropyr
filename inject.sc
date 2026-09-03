@@ -1,6 +1,6 @@
 ;;; inject.sc -- fault-injection primitives for igropyr's own test suite.
 ;;;
-;;; ⛔ THIS LIBRARY IS A TEST INSTRUMENT AND MUST NOT SHIP ARMED. What
+;;; THIS LIBRARY IS A TEST INSTRUMENT AND MUST NOT SHIP ARMED. What
 ;;; makes that true is not discipline; it is that the switch is read at
 ;;; EXPANSION time, exactly as (igropyr checked) reads IGROPYR_CONTRACTS,
 ;;; so a build made with IGROPYR_INJECT unset contains no injection code
@@ -13,7 +13,7 @@
 ;;;                                     anywhere a raise is already
 ;;;                                     possible.
 ;;;   (inject-return! 'point expr)   -- when armed, returns the
-;;;                                     configured value and ⛔ DOES NOT
+;;;                                     configured value and DOES NOT
 ;;;                                     EVALUATE expr AT ALL. See the
 ;;;                                     rule below for why that is the
 ;;;                                     only safe reading.
@@ -21,7 +21,7 @@
 ;;;                                     tranche; the 'on expansion is a
 ;;;                                     stub that refuses.
 ;;;
-;;; ⛔ THE RULE FOR inject-return!, and it is not a style note. The
+;;; THE RULE FOR inject-return!, and it is not a style note. The
 ;;; guarded call is SKIPPED, not called-then-overridden: faking "the
 ;;; write failed" while actually performing the write would hand the
 ;;; buffer to libuv and then free it on the failure path. Replacing a
@@ -31,12 +31,12 @@
 ;;; visible work, no output parameter initialised, no ownership
 ;;; transferred, no callback scheduled. A raw FFI call that failed
 ;;; satisfies this; anything that may have partially succeeded does not.
-;;; ⚠ The concrete counter-example is uv_try_write: injecting a positive
+;;; The concrete counter-example is uv_try_write: injecting a positive
 ;;; partial count there would make the caller queue only the suffix of a
 ;;; message whose prefix was never sent. Wrap the raw call, never a
 ;;; wrapper that has already acted on the result.
 ;;;
-;;; ⛔ AND A SECOND RULE, GOVERNING SOMETHING ELSE. The one above says
+;;; AND A SECOND RULE, GOVERNING SOMETHING ELSE. The one above says
 ;;; which VALUE may be injected -- the faked answer must be one the
 ;;; skipped call could have given with nothing else done. This one says
 ;;; where a point may be PLACED:
@@ -44,7 +44,7 @@
 ;;;   an injection point must sit INSIDE the guard that owns the failure
 ;;;   branch you intend to exercise.
 ;;;
-;;; ⚠ Outside it, what you measure is the OUTER recovery policy and not
+;;; Outside it, what you measure is the OUTER recovery policy and not
 ;;; the inner failure handling -- and an outer policy is usually the
 ;;; thing that makes the whole event look like nothing happened. Two
 ;;; instances turned up in one day, both silent:
@@ -56,14 +56,14 @@
 ;;;     caller's guard, where the raise was caught and dropped and the
 ;;;     submission-failure branch never ran at all.
 ;;;
-;;; ⛔ AND A THIRD RULE, ABOUT WHICH PRIMITIVE TO USE. inject-return!
+;;; AND A THIRD RULE, ABOUT WHICH PRIMITIVE TO USE. inject-return!
 ;;; SKIPS the call it wraps and answers in its place; inject-override!
 ;;; RUNS it and then replaces the answer. They are not interchangeable:
 ;;;
 ;;;   skipping a call is the same as that call failing ONLY IF the call
 ;;;   has no side effect the code after it depends on
 ;;;
-;;; ⚠ Measured, not reasoned: 'accept-refused was written with
+;;; Measured, not reasoned: 'accept-refused was written with
 ;;; inject-return! and produced a state no real failure produces. In
 ;;; libuv's unix stream.c, uv__server_io accept()s into
 ;;; server->accepted_fd BEFORE calling the connection callback, and when
@@ -74,12 +74,12 @@
 ;;; the caller, two different states underneath -- and the cell saw it as
 ;;; "the second connection was never accepted".
 ;;;
-;;; ⭐ So: use inject-return! for a submission that can genuinely be
+;;; So: use inject-return! for a submission that can genuinely be
 ;;; refused without running (uv_write, uv_getaddrinfo, uv_tcp_connect),
 ;;; and inject-override! wherever the call itself moves state the caller
 ;;; depends on.
 ;;;
-;;; ⚠ AND COUNT THEM OVER THE WHOLE DYNAMIC PATH, NOT THE LEXICAL ONE.
+;;; AND COUNT THEM OVER THE WHOLE DYNAMIC PATH, NOT THE LEXICAL ONE.
 ;;; The line you assert on is in the CELL, so the cell's own guards --
 ;;; including whatever the runner wraps every cell in -- are on that
 ;;; path and are part of the count. Every point comment in this batch
@@ -87,13 +87,13 @@
 ;;; of them therefore undercounted; the review that found it counted
 ;;; dynamically, which is what the rule already said to do.
 ;;;
-;;; ⭐ THE CHECK IS CHEAPER THAN THE RULE. Count the `guard`s between the
+;;; THE CHECK IS CHEAPER THAN THE RULE. Count the `guard`s between the
 ;;; injection point and the line you mean to assert on. If the answer is
 ;;; not zero, say for each of them why it does not catch this first --
 ;;; in the design table, where the next round can read it, and not in a
 ;;; message.
 ;;;
-;;; ⭐ THE 'on EXPANSION DELIBERATELY REFERENCES A RUNTIME IDENTIFIER OF
+;;; THE 'on EXPANSION DELIBERATELY REFERENCES A RUNTIME IDENTIFIER OF
 ;;; THIS LIBRARY. That is what makes the invoke-time check below reachable
 ;;; from a compiled artifact: a library is invoked when something refers
 ;;; to its runtime part, and an expansion that inlined everything would
@@ -112,7 +112,7 @@
   ;; ---- the switch, read once at expansion time --------------------------
   ;; Same shape as (igropyr checked)'s contract-mode, and for the same
   ;; reason: the value is decided by the process doing the COMPILING.
-  ;; ⚠ It is re-evaluated when this library is visited, so a compiled .so
+  ;; It is re-evaluated when this library is visited, so a compiled .so
   ;; does not carry a baked answer into a downstream build -- verified by
   ;; measurement, and the reason the stale-.so worry is narrower than it
   ;; looks. What a stale .so can still carry is its OWN injection code.
@@ -124,7 +124,7 @@
         (else (assertion-violation 'igropyr-inject
                 "IGROPYR_INJECT must be \"on\", \"off\", or unset" v)))))
 
-  ;; ⚠ A BANNER, AND ⛔ NOT EVEN A TRIPWIRE. It says "this expansion is
+  ;; A BANNER, AND NOT EVEN A TRIPWIRE. It says "this expansion is
   ;; happening with injection on", which is a statement about the CURRENT
   ;; process: inject-mode is recomputed from this process's environment
   ;; every time the library is visited. A tree still holding an armed .so,
@@ -132,7 +132,7 @@
   ;; an earlier note here claimed the opposite and it is the one thing
   ;; this line cannot do.
   ;;
-  ;; ⭐ WHAT ACTUALLY STOPS AN ARMED ARTIFACT, in the order it acts:
+  ;; WHAT ACTUALLY STOPS AN ARMED ARTIFACT, in the order it acts:
   ;; build-units.ss refuses to compile anything while the switch is on;
   ;; the inject suite is run from source with --libexts .sc so it never
   ;; produces one; and if one exists anyway, the invoke-time check below
@@ -146,7 +146,7 @@
   (meta-cond
     ((eq? inject-mode 'on)
      ;; ---- armed state ---------------------------------------------------
-     ;; ⭐ EVERY CELL IS ALLOCATED WHEN A POINT IS ARMED, never when one is
+     ;; EVERY CELL IS ALLOCATED WHEN A POINT IS ARMED, never when one is
      ;; hit. A hit does fx+ on an existing fixnum and set! on an existing
      ;; slot, so a point may sit inside a no-interrupt region without
      ;; putting an allocation there.
@@ -155,12 +155,12 @@
      ;;   6 ok?    7 delivered
      ;;   8 skipped    9 timeouts   10 state      11 victim
      ;;
-     ;; ⭐ 8-11 EXIST ON EVERY ROW, and only barrier rows use them: a
+     ;; 8-11 EXIST ON EVERY ROW, and only barrier rows use them: a
      ;; fault or return row carries 0/0/#f/#f and nothing ever writes
      ;; them. One shape for every row means take, release and disarm read
      ;; the same vector whatever armed it.
      ;;
-     ;; ⭐ EACH OF 8-11 HAS EXACTLY ONE WRITER, and that is what makes the
+     ;; EACH OF 8-11 HAS EXACTLY ONE WRITER, and that is what makes the
      ;; regions below sufficient rather than hopeful:
      ;;   8  skipped   -- $inject-barrier, in its one region
      ;;   9  timeouts  -- the parker, in its closing region
@@ -172,7 +172,7 @@
      ;; A second writer for any of them would need its own argument; there
      ;; is no lock here beyond the interrupt regions.
      ;;
-     ;; ⭐ delivered LIVES IN THE ARMING, NOT BESIDE IT. It was a separate
+     ;; delivered LIVES IN THE ARMING, NOT BESIDE IT. It was a separate
      ;; process-lifetime table, which neither release nor disarm cleared:
      ;; re-arming a point reset hits and kept deliveries, so one old
      ;; delivery could satisfy "delivered = 1" for a later run that never
@@ -190,14 +190,14 @@
        (set! $inject-next-ticket (fx+ $inject-next-ticket 1))
        $inject-next-ticket)
 
-     ;; ⛔ THE RULES ARE ENFORCED HERE, NOT IN THE CONTROL LIBRARY. They
+     ;; THE RULES ARE ENFORCED HERE, NOT IN THE CONTROL LIBRARY. They
      ;; began one level up, where the values are chosen, which reads as
      ;; the natural place -- and left this procedure exported and
      ;; unguarded, so any importer could arm anything and could overwrite
      ;; a validated arm with an unvalidated one. A check placed anywhere
      ;; but at the boundary it protects is a convention.
      ;;
-     ;; ⭐ THE FIELDS CHECKED HERE ARE occurrence AND, FOR 'return, THE
+     ;; THE FIELDS CHECKED HERE ARE occurrence AND, FOR 'return, THE
      ;; POINT/VALUE PAIR -- not every field. `point`, `kind` and `ok?`
      ;; are stored unvalidated, so a bad `ok?` raises at the HIT rather
      ;; than at the arm -- which is the very thing this procedure exists
@@ -207,7 +207,7 @@
      ;; dynamically interrupt-disabled; a string or a flonum arriving
      ;; there raises at the hit, in the region, far from the line that
      ;; chose it. Refusing at arm time puts the error where the mistake is.
-     ;; ⚠ CALLED INSIDE $inject-arm!'s REGION, because it reads the table.
+     ;; CALLED INSIDE $inject-arm!'s REGION, because it reads the table.
      ;; The barrier ban below is a read-then-write decision; outside a
      ;; region another process could arm between the two.
      (define (check-arm! point kind value occurrence)
@@ -215,7 +215,7 @@
                    (and (fixnum? occurrence) (fx> occurrence 0)))
          (assertion-violation '$inject-arm!
            "occurrence must be #f (every hit) or a positive fixnum" occurrence))
-       ;; ⛔ A LIVE BARRIER ROW BLOCKS EVERY NEW ARM AT ITS POINT, of any
+       ;; A LIVE BARRIER ROW BLOCKS EVERY NEW ARM AT ITS POINT, of any
        ;; kind, including another barrier. Re-arming a point whose barrier
        ;; row is still there would leave a parked victim holding a ticket
        ;; that names a row nobody will ever release, and the controller
@@ -233,7 +233,7 @@
          (unless (procedure? value)
            (assertion-violation '$inject-arm!
              "a barrier's value must be the parker procedure" point value))
-         ;; ⭐ #f (every hit) is refused for barriers alone. A barrier
+         ;; #f (every hit) is refused for barriers alone. A barrier
          ;; that fires on every hit parks every arrival, and the second
          ;; one parks before the controller has resumed the first.
          (unless (and (fixnum? occurrence) (fx> occurrence 0))
@@ -244,7 +244,7 @@
            ;; uv_write returning >= 0 means libuv accepted the request and
            ;; owns the block; the value also escapes to on-done as a
            ;; purported errno, so it has to be one a C int could hold.
-           ;; ⭐ THE BOUND IS libuv's OWN ERROR RANGE, NOT A SANITY
+           ;; THE BOUND IS libuv's OWN ERROR RANGE, NOT A SANITY
            ;; BOUND. On Unix libuv's codes are -errno, and its own most
            ;; negative code is UV_EOF = -4095 (uv-errno.h), so [-4095,-1]
            ;; is what the real API can return. An earlier version here
@@ -274,7 +274,7 @@
               (assertion-violation '$inject-arm!
                 "this point needs 0 or a libuv error code in [-4095,-1]"
                 value)))
-           ;; ⛔ A WHITELIST, AND THE DEFAULT IS REFUSAL. It read (void)
+           ;; A WHITELIST, AND THE DEFAULT IS REFUSAL. It read (void)
            ;; before -- an unlisted return point armed with whatever it
            ;; was given, so the one kind of mistake this table exists to
            ;; catch (a value the point's own caller cannot mean) was
@@ -282,7 +282,7 @@
            ;; other. That is backwards: the points needing the check are
            ;; exactly the ones nobody has reasoned about yet.
            ;;
-           ;; ⚠ Adding a return point therefore means adding a clause
+           ;; Adding a return point therefore means adding a clause
            ;; here, and that is the intent -- the clause is where you say
            ;; what the point's caller can possibly read. A fault point
            ;; carries no value, so nothing here constrains it.
@@ -291,7 +291,7 @@
               "unknown return point -- add a clause to check-arm! saying what values its caller can read"
               point)))))
 
-     ;; ⭐ CHECK, TICKET AND INSERT ARE ONE STEP. Split, a preemption
+     ;; CHECK, TICKET AND INSERT ARE ONE STEP. Split, a preemption
      ;; between the check and the insert lets another arm land in the
      ;; window the check just cleared -- and hashtable mutation is not
      ;; safe against preemption in the first place.
@@ -304,7 +304,7 @@
                      0 0 (and (eq? kind 'barrier) 'armed) #f))
            t)))
 
-     ;; Find the row a ticket names. ⚠ The caller must already hold the
+     ;; Find the row a ticket names. The caller must already hold the
      ;; region: this walks the table.
      (define (row-of-ticket ticket)
        (let ((found #f))
@@ -318,7 +318,7 @@
      ;; row (release is idempotent); raises when the row is a barrier that
      ;; is still live.
      ;;
-     ;; ⛔ WHAT "STILL LIVE" MEANS IS THE POINT OF THIS PROCEDURE. A
+     ;; WHAT "STILL LIVE" MEANS IS THE POINT OF THIS PROCEDURE. A
      ;; barrier row in 'reserved has been claimed by a victim that has not
      ;; reported yet; one in 'parked has a victim waiting for a resume
      ;; that deleting the row will never deliver. Deleting either strands
@@ -326,7 +326,7 @@
      ;; release. So the refusal is here, in the same region as take, and
      ;; not a rule the caller is asked to remember.
      ;;
-     ;; ⚠ alive? IS APPLIED TO THE STORED VICTIM, not to anything the
+     ;; alive? IS APPLIED TO THE STORED VICTIM, not to anything the
      ;; caller passes in. It carries the raw-face contract: it must not
      ;; yield and must not raise. 'reserved has no victim recorded yet, so
      ;; there is no dead-victim exit from it -- only 'parked has one.
@@ -346,13 +346,13 @@
                      (assertion-violation '$inject-release! "barrier still live"
                        (vector-ref v 0) st))))))))
 
-     ;; ⛔ NO DEAD-VICTIM EXIT HERE, deliberately, and it is not an
+     ;; NO DEAD-VICTIM EXIT HERE, deliberately, and it is not an
      ;; oversight copied from release. This face takes no alive?: (igropyr
      ;; inject) does not know what a process is, so a bulk clear cannot
      ;; ask whether any victim is still running. A caller holding a parked
      ;; row releases it BY TICKET first, where the question can be asked.
      ;;
-     ;; ⭐ THE SCAN COMPLETES BEFORE ANYTHING IS CLEARED. A partial disarm
+     ;; THE SCAN COMPLETES BEFORE ANYTHING IS CLEARED. A partial disarm
      ;; would leave the table in a state no caller asked for and no rule
      ;; describes.
      (define ($inject-disarm!)
@@ -368,7 +368,7 @@
              ks vs))
          (hashtable-clear! $inject-table)))
 
-     ;; ⚠ EVERY TABLE READ TAKES THE REGION TOO, not only the writes. A
+     ;; EVERY TABLE READ TAKES THE REGION TOO, not only the writes. A
      ;; reader preempted midway through a hashtable walk is the hazard
      ;; actor.sc warns about; a single ref is cheap enough not to argue.
      (define ($inject-hits point)
@@ -377,13 +377,13 @@
            (and v (vector-ref v 4)))))
 
      ;; How many times a substitute value was returned for the CURRENT
-     ;; arming. ⭐ NOT the same as hits: an occurrence is spent when the
+     ;; arming. NOT the same as hits: an occurrence is spent when the
      ;; point is entered, so a wrapped expression that raises spends one
      ;; and delivers nothing. A cell asserting only on hits proves that
      ;; an eligible call reached the point, not that the injected value
      ;; was ever seen.
      ;;
-     ;; ⚠ It answers 0 both for "never armed" and for "armed and never
+     ;; It answers 0 both for "never armed" and for "armed and never
      ;; delivered"; those are not distinguished.
      (define (inject-note-delivered! v)          ; v is the arming vector
        (vector-set! v 7 (fx+ (vector-ref v 7) 1)))
@@ -397,12 +397,12 @@
          (vector->list (hashtable-keys $inject-table))))
 
      ;; ---- barrier readings, BY TICKET -------------------------------
-     ;; ⭐ BY TICKET, NOT BY POINT, and that is the whole reason they
+     ;; BY TICKET, NOT BY POINT, and that is the whole reason they
      ;; exist. A reading taken by point after the row was released and the
      ;; point re-armed credits the old waiter with the new arming's
      ;; numbers. The ticket names one arming and no other.
      ;;
-     ;; ⚠ #f means "no barrier row with that ticket" -- released already,
+     ;; #f means "no barrier row with that ticket" -- released already,
      ;; or a ticket naming a fault/return row. A caller that reads #f where
      ;; it expected a number has its protocol order wrong, and should say
      ;; so rather than treat it as 0.
@@ -423,7 +423,7 @@
 
      ;; -> the slot when this hit should fire, else #f. Allocation-free.
      ;;
-     ;; ⭐ READ-INCREMENT-WRITE IS ONE STEP. It was three, which is
+     ;; READ-INCREMENT-WRITE IS ONE STEP. It was three, which is
      ;; correct only where every point sits inside a caller's region --
      ;; true of the fault and return points and NOT true of a barrier,
      ;; which is placed where a victim can be preempted. Taking the region
@@ -434,7 +434,7 @@
         (let ((v (hashtable-ref $inject-table point #f)))
          (and v
               (eq? (vector-ref v 1) kind)
-              ;; ⭐ THE PROCESS FILTER IS A PREDICATE SUPPLIED BY THE
+              ;; THE PROCESS FILTER IS A PREDICATE SUPPLIED BY THE
               ;; ARMING SIDE, not a pid compared here. This library
               ;; imports (chezscheme) and nothing else -- it has no idea
               ;; what a process is, and giving it one would make the
@@ -447,7 +447,7 @@
                 (let ((k (vector-ref v 3)))
                   (and (or (not k) (fx= n k))
                        (begin
-                         ;; ⚠ ONLY a barrier row has a state to advance;
+                         ;; ONLY a barrier row has a state to advance;
                          ;; fault and return rows carry #f there and mean
                          ;; nothing by it.
                          (when (eq? (vector-ref v 1) 'barrier)
@@ -475,7 +475,7 @@
      ;; does not come back. It takes its own regions internally, for the
      ;; state and counter writes; see inject-control.
      ;;
-     ;; ⛔ A VICTIM THAT ARRIVES ALREADY INSIDE A REGION IS NOT PARKED. It
+     ;; A VICTIM THAT ARRIVES ALREADY INSIDE A REGION IS NOT PARKED. It
      ;; cannot be: parking means blocking, and it is holding interrupts
      ;; off. It counts itself as skipped and walks on, which is the honest
      ;; outcome -- the alternative is a deadlock that would look like a
@@ -497,7 +497,7 @@
               ;; from here on.
               ((vector-ref v 2) point (vector-ref v 5) v))))))
 
-     ;; ⭐ INVOKE-TIME CHECK. It runs because an armed expansion refers to
+     ;; INVOKE-TIME CHECK. It runs because an armed expansion refers to
      ;; $inject-take!, which makes this library's runtime part reachable.
      ;; An artifact compiled with injection on therefore cannot be loaded
      ;; and used by a process that did not ask for injection.
@@ -519,7 +519,7 @@
      ;; roots and looked for in everything else's closure; the question
      ;; that gate asks is whether anything ELSE reaches it.
      ;;
-     ;; ⚠ A TEST FIXTURE MAY REFER TO THEM -- test/inject.sc's mode probe
+     ;; A TEST FIXTURE MAY REFER TO THEM -- test/inject.sc's mode probe
      ;; calls $inject-ticket -- and that is OUTSIDE the property, not an
      ;; exception to it: the gate's denominator is library-units, which
      ;; no fixture is in. An earlier version of this note said "nothing
@@ -539,14 +539,14 @@
 
   ;; ---- the four primitives ----------------------------------------------
 
-  ;; ⛔ THE OFF EXPANSION IS (void), NOT (begin), AND THE DIFFERENCE IS NOT
+  ;; THE OFF EXPANSION IS (void), NOT (begin), AND THE DIFFERENCE IS NOT
   ;; COSMETIC. (begin) with no forms is valid only in a definition context,
   ;; where it splices away to nothing. A guard body is NOT such a context
   ;; in this implementation -- it is a sequence of expressions -- so a
   ;; point placed inside a guard failed to expand at all, with an error
   ;; naming this line and not the call site.
   ;;
-  ;; ⭐ THAT IS EXACTLY WHERE THE RULE AT THE TOP OF THIS FILE SENDS EVERY
+  ;; THAT IS EXACTLY WHERE THE RULE AT THE TOP OF THIS FILE SENDS EVERY
   ;; POINT. Tranche 1 placed all of its points in ordinary bodies, so the
   ;; off expansion had never once been asked to stand where the placement
   ;; rule requires -- the rule's first application is what found this.
@@ -556,7 +556,7 @@
   ;; to the same primitive (begin) does, which is why the isolation gate's
   ;; "expands to nothing" comparison still holds.
   ;;
-  ;; ⚠ What (void) does NOT do is splice: it cannot stand before a define
+  ;; What (void) does NOT do is splice: it cannot stand before a define
   ;; in a body the way (begin) could. No point does that today; one that
   ;; needs to belongs after the definitions anyway.
   (define-syntax inject-fault!
@@ -585,7 +585,7 @@
   ;; inject-return!; the difference is that the wrapped expression is
   ;; EVALUATED.
   ;;
-  ;; ⚠ ONE OCCURRENCE IS SPENT BEFORE THE EXPRESSION RUNS -- the arm
+  ;; ONE OCCURRENCE IS SPENT BEFORE THE EXPRESSION RUNS -- the arm
   ;; itself is not removed, only that occurrence is consumed -- so
   ;; that "a hit" means the same thing for both primitives: this point
   ;; consumed one arming. An earlier version evaluated first, which meant

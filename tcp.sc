@@ -1,7 +1,7 @@
 #!chezscheme
 ;;; (igropyr tcp) -- everything a connection or an owning process owns.
 ;;;
-;;; ⭐ THE CUT ABOVE (igropyr uv) IS BY OWNERSHIP. What lives here hangs off an
+;;; THE CUT ABOVE (igropyr uv) IS BY OWNERSHIP. What lives here hangs off an
 ;;; owner or a connection: the conn record and its table, listeners and their
 ;;; incarnations, the owner index and owner-death sweep, outbound connects,
 ;;; DNS, files and file streams, the TLS connection codec with its gate,
@@ -9,13 +9,13 @@
 ;;; the loop itself -- the FFI, the constants, the loop handle and its shared
 ;;; buffers -- is (igropyr uv), below.
 ;;;
-;;; ⚠ THE SHARED BUFFERS ARRIVE AS LEASES. uv hands each one to a thunk inside
+;;; THE SHARED BUFFERS ARRIVE AS LEASES. uv hands each one to a thunk inside
 ;;; an interrupt-disabled region; the bodies below are the same sequences in
 ;;; the same order they always ran in, and the lambda parameters deliberately
 ;;; keep the buffers' old names so those bodies did not have to be rewritten
 ;;; to be moved.
 ;;;
-;;; ⚠ THE HOOKS KEEP THEIR uv- NAMES. uv-set-deliver!, uv-set-self!,
+;;; THE HOOKS KEEP THEIR uv- NAMES. uv-set-deliver!, uv-set-self!,
 ;;; uv-set-tls-watcher-spawner! and uv-set-gate-wait! serve THIS layer, not the
 ;;; loop, and they live here -- but the public API is unchanged name for name
 ;;; by ruling, so the names stay as they are. Reading oddly is the price of not
@@ -61,7 +61,7 @@
     tls-timer-free-path tls-conn-in-table? tls-eof-deliveries
     tls-swallowed-errors tls-read-trace)
 
-  ;; ⚠ (igropyr uv) IS BELOW THIS FILE and (igropyr tls-core) beside it; both
+  ;; (igropyr uv) IS BELOW THIS FILE and (igropyr tls-core) beside it; both
   ;; import neither this library nor each other's consumers, so there is no
   ;; cycle. (igropyr libuv) is the façade ABOVE both.
   (import (chezscheme) (igropyr platform) (igropyr inject)
@@ -76,7 +76,7 @@
       ;; one thunk, run exactly once when the handle's close completes --
       ;; see conn-on-close! below for why cleanup hangs off the conn
       (mutable cleanup conn-cleanup conn-set-cleanup!)
-      ;; ⭐ ONE FIELD, NOT FIFTEEN, AND THE CHOICE IS AN INVARIANT. #f on a
+      ;; ONE FIELD, NOT FIFTEEN, AND THE CHOICE IS AN INVARIANT. #f on a
       ;; plaintext connection; otherwise the conn-tls record below. Retirement
       ;; DETACHES IT with a single assignment inside one interrupt-disabled
       ;; region, so every later caller sees #f -- which is what makes
@@ -86,7 +86,7 @@
       ;; death and watcher death can arrive together, so no caller can promise
       ;; to run the retirement only once.
       (mutable tls conn-tls conn-set-tls!)
-      ;; ⭐ THE HANDSHAKING SLOT, HELD FROM BEFORE THE TLS RECORD EXISTS. It
+      ;; THE HANDSHAKING SLOT, HELD FROM BEFORE THE TLS RECORD EXISTS. It
       ;; cannot live on conn-tls, because the window this closes is precisely
       ;; the one before that record is built.
       (mutable slot conn-slot conn-set-slot!)))
@@ -110,7 +110,7 @@
       ;; inbound plaintext decrypted before the owner could receive it
       (mutable established? conn-tls-established? conn-tls-set-established!)
       (mutable eof? conn-tls-eof? conn-tls-set-eof!)
-      ;; ⭐ 'seen' AND 'delivered' ARE TWO FACTS. eof? alone meant a
+      ;; 'seen' AND 'delivered' ARE TWO FACTS. eof? alone meant a
       ;; close_notify followed by a FIN delivered two EOFs, and a FIN
       ;; arriving while the gate was shut delivered one AHEAD of the
       ;; buffered request -- the owner saw EOF, data, EOF.
@@ -157,7 +157,7 @@
 
   ;; ---- TLS observation seams ---------------------------------------------
   ;;
-  ;; ⭐ THE RECORDING IS GATED TOO, not just the reader. These counters sit on
+  ;; THE RECORDING IS GATED TOO, not just the reader. These counters sit on
   ;; the write and read paths -- once per raw write, once per SSL call -- so an
   ;; ordinary build compiles them out entirely and pays nothing. That differs
   ;; from tls-core's live-session counter deliberately: that one moves once per
@@ -172,7 +172,7 @@
   ;; The interrupt-disable depth. Safe to call INSIDE a region -- the probe
   ;; raises the count and lowers it again, so it never reaches 0 there.
   ;;
-  ;; ⚠ AT DEPTH 0 THE PROBE IS NOT FREE: enable-interrupts reaching 0 may run
+  ;; AT DEPTH 0 THE PROBE IS NOT FREE: enable-interrupts reaching 0 may run
   ;; a pending interrupt, so calling it outside a region manufactures a
   ;; preemption point. That is harmless where the design already says the code
   ;; is preemptible, and it is why no assertion anywhere may read this and
@@ -207,7 +207,7 @@
      ;; every tcp-eof handed to an owner, counted once at the one place
      ;; that delivers it -- the row asserting "exactly one EOF" reads this
      (define (bump-eof-delivery!) (set! eof-deliveries (fx+ eof-deliveries 1)))
-     ;; ⭐ WHAT THE NON-ESCAPING GUARDS SWALLOWED. Stopping exceptions from
+     ;; WHAT THE NON-ESCAPING GUARDS SWALLOWED. Stopping exceptions from
      ;; unwinding into C is necessary, but it also destroyed the evidence:
      ;; a connection that raised twice in its read callback left NO trace --
      ;; no EOF, no retire reason, no error -- and looked exactly like a
@@ -224,7 +224,7 @@
      (define (tls-swallowed-errors)
        (list swallowed-count swallowed-where swallowed-what))
 
-     ;; ⭐ A BOUNDED TRACE OF THE READ PATH'S STAGES. Two rounds of reasoning
+     ;; A BOUNDED TRACE OF THE READ PATH'S STAGES. Two rounds of reasoning
      ;; from the source failed to explain a read that increments the raw-read
      ;; counter, swallows no exception, records no retirement, and never
      ;; reaches the decrypt -- each of those readings is consistent with the
@@ -248,7 +248,7 @@
      (define (tls-ssl-op-count) ssl-op-count)
      (define (tls-server-raw-reads) (cons server-raw-reads server-raw-read-bytes))
      (define (tls-accept-callback-completions) accept-callback-completions)
-     ;; ⭐ GLOBAL, AND IT HAS TO BE: the cell watching this is the CLIENT, and
+     ;; GLOBAL, AND IT HAS TO BE: the cell watching this is the CLIENT, and
      ;; a client has no handle on the server's conn record -- when the bug is
      ;; that no handler ever ran, there is nothing to ask for one. A count plus
      ;; the last opening's timestamp answers "did the gate open, and when"
@@ -259,7 +259,7 @@
      (define (tls-live-timer-count) live-timers)
      (define (tls-active-timer-count) active-timers)
      (define (tls-handshaking-count) handshaking-count)
-     ;; ⛔ NO ABSOLUTE DEPTH SEAM. The event-loop process runs with
+     ;; NO ABSOLUTE DEPTH SEAM. The event-loop process runs with
      ;; interrupts PERMANENTLY disabled (actor.sc's header), so inside a
      ;; callback frame the depth is always >= 1 and the 0->1 transition
      ;; never happens. A token keyed on "this entry left depth 0" would
@@ -283,11 +283,11 @@
            (let ((i (case kind ((refusal) 3) ((session-retire) 4) (else 5))))
              (let ((cur (vector-ref v i)))
                (when (or (not cur) (fx> d cur)) (vector-set! v i d)))))))
-     ;; ⚠ READ IT OFF THE RECORD THE RETIREMENT WROTE, which means the caller
+     ;; READ IT OFF THE RECORD THE RETIREMENT WROTE, which means the caller
      ;; must hold the conn-tls state -- by the time retirement is done,
      ;; (conn-tls c) is #f. The cell keeps the record it was handed before the
      ;; close, which is why this takes the state and not the conn.
-     ;; ⭐ REGISTERED BEFORE SUBMISSION, so a snapshot list never records a
+     ;; REGISTERED BEFORE SUBMISSION, so a snapshot list never records a
      ;; block after its own inline completion. Each entry is
      ;; (id aggregate-id size pending sealed? completed?) sampled at
      ;; registration; the monotonic completion order is appended as blocks
@@ -315,13 +315,13 @@
      ;; -> (registered . completed); registered in submission order, completed
      ;; in the order the completions actually ran.
      ;;
-     ;; ⭐ IT TAKES THE CONN, NOT THE TLS STATE, like tls-conn-charge and
+     ;; IT TAKES THE CONN, NOT THE TLS STATE, like tls-conn-charge and
      ;; tls-conn-totals beside it. conn-tls is not exported, so a cell holding
      ;; a connection could not produce the t the earlier signature required:
      ;; the reading existed and was unreachable -- a ruler nobody could pick
      ;; up. The tables are still keyed by t; resolving it happens here.
      ;;
-     ;; ⚠ A RETIRED CONN ANSWERS '(() . ()), NOT #f. Retirement detaches the
+     ;; A RETIRED CONN ANSWERS '(() . ()), NOT #f. Retirement detaches the
      ;; state, so there is no key left to look under and nothing to report --
      ;; which is not the same as "this connection wrote nothing". Read it
      ;; while the connection is alive; a cell that reads after retirement is
@@ -340,7 +340,7 @@
          (and t (cons (conn-tls-charged t) (conn-tls-refunded t)))))
      (define (tls-conn-timer-id c)
        (let ((t (conn-tls c))) (and t (conn-tls-timer-id t))))
-     ;; ⭐ GLOBAL AND ARGUMENT-FREE, for the reason the gate mark is: when the
+     ;; GLOBAL AND ARGUMENT-FREE, for the reason the gate mark is: when the
      ;; question is "who closed this connection and why", the asker generally
      ;; cannot reach the connection any more -- retirement has detached it.
      (define last-retire-reason #f)
@@ -358,7 +358,7 @@
          (and v (let ((ctx (vector-ref v 3)))
                   (and ctx (cons (vector-ref v 0) ctx))))))
 
-     ;; ⭐ WHICH PATH GAVE THE TIMER BACK, because the two are not
+     ;; WHICH PATH GAVE THE TIMER BACK, because the two are not
      ;; interchangeable (Y4): an uninitialised handle is freed directly and
      ;; must never reach uv_close, while an initialised one must go out
      ;; through uv_close and be freed only by its close callback. A count of
@@ -446,7 +446,7 @@
   (define deliver (lambda (owner msg) (void)))
   (define (uv-set-deliver! proc) (set! deliver proc))
 
-  ;; ⭐ WHO IS CALLING. The write gate has to record the HOLDER's pid so the
+  ;; WHO IS CALLING. The write gate has to record the HOLDER's pid so the
   ;; watcher can monitor it, and this library sits BELOW (igropyr actor) --
   ;; actor imports it, never the other way round -- so identity arrives the
   ;; same way delivery does: a hook the upper layer installs at startup.
@@ -459,7 +459,7 @@
   (define uv-self #f)
   (define (uv-set-self! proc) (set! uv-self proc))
 
-  ;; ⭐ WHO MAKES THE WATCHER. Each established TLS connection needs one green
+  ;; WHO MAKES THE WATCHER. Each established TLS connection needs one green
   ;; process, and it must link, monitor and park in a timed receive -- none of
   ;; which exists at this layer. (igropyr tls-watch) installs this hook when it
   ;; is invoked, and http.sc's TLS listen entry imports that library, so any
@@ -468,7 +468,7 @@
   (define uv-tls-watcher-spawner #f)
   (define (uv-set-tls-watcher-spawner! proc) (set! uv-tls-watcher-spawner proc))
 
-  ;; ⭐ HOW A PARKED WRITER WAITS. receive is an actor primitive and does not
+  ;; HOW A PARKED WRITER WAITS. receive is an actor primitive and does not
   ;; exist at this layer, so the wait is supplied from above like identity and
   ;; the watcher are. It is legal to park here precisely because the writer is
   ;; a green process: the identity assertion above has already refused any
@@ -494,7 +494,7 @@
   ;; ended. The two quantities that grow under load were multiplying.
   (define owner-index (make-eq-hashtable))
 
-  ;; ⛔ THE READ AND THE WRITE ARE ONE STEP. Both of these are
+  ;; THE READ AND THE WRITE ARE ONE STEP. Both of these are
   ;; read-modify-write on a table several green processes touch, and
   ;; neither was uninterruptible: a preemption between the read and the
   ;; write dropped whatever the other process had just added. The region
@@ -508,14 +508,14 @@
 
   ;; A cell for owner-index-publish!, built where allocation is allowed.
   ;; Two pairs: the entry itself and the list cell that will carry it.
-  ;; ⚠ Publishing is set-cdr! plus hashtable-set!, and the latter CAN
+  ;; Publishing is set-cdr! plus hashtable-set!, and the latter CAN
   ;; allocate -- it adds a key the first time an owner appears, and may
-  ;; grow. ⚠ Preparing separately no longer shortens the region -- both
+  ;; grow. Preparing separately no longer shortens the region -- both
   ;; callers now prepare INSIDE theirs -- it survives because publishing
   ;; is then a set-cdr! and a store with the key already in hand, not
   ;; the region allocating nothing; an earlier version of this note
   ;; claimed the latter.
-  ;; ⚠ THE KEY IS FILLED IN AT PUBLISH TIME, not here, because the key
+  ;; THE KEY IS FILLED IN AT PUBLISH TIME, not here, because the key
   ;; is a foreign address that does not exist yet: the allocation that
   ;; produces it happens inside the region, so that a kill before the
   ;; region can lose nothing but Scheme objects the collector reclaims.
@@ -523,9 +523,9 @@
     (cons (cons kind #f) '()))
 
   ;; Push a prepared cell, filling in the key. Caller holds the region.
-  ;; ⚠ NOT allocation-free: the hashtable-set! can add a key or grow the
+  ;; NOT allocation-free: the hashtable-set! can add a key or grow the
   ;; table, and either allocates. The split survives because publishing
-  ;; is then a set-cdr! and a store with the key already in hand -- ⛔
+  ;; is then a set-cdr! and a store with the key already in hand --
   ;; not because it makes the region allocation-free, which an earlier
   ;; version of this note claimed.
   (define (owner-index-publish! owner cell key)
@@ -537,11 +537,11 @@
   ;; Undo owner-index-publish!, and ONLY when the cell is still the head.
   ;; Caller holds the region.
   ;;
-  ;; ⭐ IT IS A NO-OP OTHERWISE, ON PURPOSE. Inside one region nothing
+  ;; IT IS A NO-OP OTHERWISE, ON PURPOSE. Inside one region nothing
   ;; else can have pushed, so if the cell is the head it was published
   ;; here and popping it is exact.
   ;;
-  ;; ⚠ "NOT THE HEAD" DOES NOT MEAN "NEVER PUBLISHED" IN GENERAL -- a
+  ;; "NOT THE HEAD" DOES NOT MEAN "NEVER PUBLISHED" IN GENERAL -- a
   ;; synchronous re-entry that called index-owner! after this publish
   ;; would leave the cell below the new head, and this would silently do
   ;; nothing. Nothing does that today (the publish is the last expression
@@ -567,7 +567,7 @@
   ;; life of that process, and then walked every one of them inside a
   ;; no-interrupts region when it finally died. Removal keeps the cost
   ;; proportional to what removal has reached rather than to what has
-  ;; ever happened. ⚠ It is still a superset of what the owner holds: a
+  ;; ever happened. It is still a superset of what the owner holds: a
   ;; resource handed to another owner leaves its entry behind on purpose
   ;; (see conn-set-owner!).
   ;;
@@ -588,12 +588,12 @@
               n
               (loop (fx+ i 1) (fx+ n (length (vector-ref vs i)))))))))
 
-  ;; ⚠ THE SEARCH RUNS INSIDE THE REGION, AND THAT COST IS REAL. remp is
+  ;; THE SEARCH RUNS INSIDE THE REGION, AND THAT COST IS REAL. remp is
   ;; O(n) and allocates, and n is the number of resources this owner has
   ;; OPEN -- so a long-lived owner holding many open resources makes the
   ;; region correspondingly long. That is the price of the read-modify-
   ;; write being atomic, and it is named here rather than hidden: the
-  ;; bound is the length of that owner's index list. ⚠ That list is a
+  ;; bound is the length of that owner's index list. That list is a
   ;; SUPERSET of what the owner still holds -- a resource handed to
   ;; another owner leaves its entry behind on purpose, see the note at
   ;; conn-set-owner! -- so it is not exactly "open resources", only
@@ -647,7 +647,7 @@
                 ((conn)
                  (let ((c (hashtable-ref conn-table key #f)))
                    (when (and c (eq? (conn-owner c) owner))
-                     ;; ⛔ THIS OVERRIDE DISABLES A REAL PROTECTION, and it
+                     ;; THIS OVERRIDE DISABLES A REAL PROTECTION, and it
                      ;; exists only so a cell can make the WATCHER the sole
                      ;; supplier of the close and see whether it actually
                      ;; supplies it. With owner death closing the conn here
@@ -766,7 +766,7 @@
   (define on-read-code
     (foreign-callable
       (lambda (stream nread buf)
-        ;; ⭐ MARKED BEFORE ANY BRANCH. "No tls-branch in the trace" has two
+        ;; MARKED BEFORE ANY BRANCH. "No tls-branch in the trace" has two
         ;; very different causes -- libuv never called us, or it called us and
         ;; we took the plaintext arm because the tls field was gone -- and the
         ;; existing marks cannot tell them apart. This one is entered on every
@@ -778,7 +778,7 @@
             (let ((t (conn-tls c)))
               (unless t (note-read-stage! 'cb-plain))
               (cond
-                ;; ⭐ THE TLS BRANCH COMES FIRST, AND DELIBERATELY DOES NOT
+                ;; THE TLS BRANCH COMES FIRST, AND DELIBERATELY DOES NOT
                 ;; TEST conn-owner. A TLS connection has NO owner until its
                 ;; handshake completes (Z12 installs it at establishment), so
                 ;; the owner gate below would drop every handshake byte and
@@ -837,18 +837,18 @@
   ;; handed a negative status by libuv; `refused` is uv_accept declining
   ;; a connection that was already announced.
   ;;
-  ;; ⭐ COUNTED BECAUSE THE ALTERNATIVE WAS NOTHING AT ALL. Both branches
+  ;; COUNTED BECAUSE THE ALTERNATIVE WAS NOTHING AT ALL. Both branches
   ;; discard silently -- correctly, since the listener has to stay alive
   ;; -- so a server dropping every arrival looked exactly like a server
   ;; nobody was calling. The kernel counts what it refuses itself; this
   ;; is the half that happens after the kernel handed the connection up.
   ;;
-  ;; ⚠ SATURATING, NOT WRAPPING. A wrapped counter reports a small number
+  ;; SATURATING, NOT WRAPPING. A wrapped counter reports a small number
   ;; after a large failure, and small numbers are the ones that get
   ;; ignored; at the ceiling this one stops moving instead, which is
   ;; "at least this many".
   ;;
-  ;; ⛔ THAT IS STILL A LOSS, AND IN A MISLEADING DIRECTION: an observer
+  ;; THAT IS STILL A LOSS, AND IN A MISLEADING DIRECTION: an observer
   ;; watching deltas sees a saturated counter stop changing and can read
   ;; that as recovery. Saturation is chosen because the alternative is
   ;; worse, not because it is safe.
@@ -856,7 +856,7 @@
   (define accept-refused-count 0)
   (define (bump-saturating n)
     (if (fx< n (greatest-fixnum)) (fx+ n 1) n))
-  ;; ⚠ BOTH VALUES ARE READ IN ONE REGION, then the list is built
+  ;; BOTH VALUES ARE READ IN ONE REGION, then the list is built
   ;; outside it. Reading them across the allocations of the list would
   ;; let a bump land in between, so the pair returned could pair an old
   ;; error count with a new refused count -- a combination that never
@@ -872,7 +872,7 @@
   (define on-connection-code
     (foreign-callable
       (lambda (server status)
-       ;; ⛔ AN OUTER GUARD, BECAUSE THIS IS A FOREIGN CALLABLE FRAME. Before
+       ;; AN OUTER GUARD, BECAUSE THIS IS A FOREIGN CALLABLE FRAME. Before
        ;; tls-accept! is even entered, foreign-alloc and make-conn can raise
        ;; under allocation pressure, and an exception leaving here unwinds
        ;; into C. The handler does the least it can and cannot itself raise.
@@ -880,7 +880,7 @@
                      (set! accept-error-count (bump-saturating accept-error-count))
                      (void)))
         (if (< status 0)
-            ;; ⚠ NO CELL COVERS THIS BRANCH. Making libuv hand a negative
+            ;; NO CELL COVERS THIS BRANCH. Making libuv hand a negative
             ;; status to a listener callback needs a condition this suite
             ;; cannot create; the counter is here so it is visible if it
             ;; happens in the field, and it is recorded as uncovered
@@ -899,7 +899,7 @@
               ;; The injected value is a return rather than a raise, so it
               ;; takes the refusal branch as a real failure would.
               ;;
-              ;; ⛔ OVERRIDE, NOT RETURN, AND THE DIFFERENCE IS THE WHOLE
+              ;; OVERRIDE, NOT RETURN, AND THE DIFFERENCE IS THE WHOLE
               ;; POINT HERE. uv_accept must actually RUN. libuv's
               ;; uv__server_io accept()s into server->accepted_fd before
               ;; calling this callback, and if the callback returns
@@ -915,7 +915,7 @@
               ;; What override leaves behind was checked and is clean: the
               ;; real accepted socket is closed by uv-close, its block is
               ;; freed by the close callback, no conn is built, and
-              ;; neither conn-table nor owner-index gains an entry. ⚠ The
+              ;; neither conn-table nor owner-index gains an entry. The
               ;; timing differs from a real failure -- which closes the
               ;; descriptor inside uv_accept rather than attaching it to a
               ;; handle first -- but nothing persistent is left.
@@ -935,7 +935,7 @@
                        (hashtable-set! conn-table client c)
                        ;; listener already stopped: refuse the straggler
                        (tcp-close! c))
-                      ;; ⭐ THE TLS PATH PUBLISHES ITSELF. X2 requires the
+                      ;; THE TLS PATH PUBLISHES ITSELF. X2 requires the
                       ;; session to be installed in the conn BEFORE the conn
                       ;; reaches conn-table, so that a failure before
                       ;; publication is cleaned up by the only code that can
@@ -983,7 +983,7 @@
       (mutable owner fs-op-owner fs-op-owner-set!)   ; delivery target pid
       (immutable path fs-op-path)
       (immutable mode fs-op-mode)                    ; whole | stream
-      ;; ⚠ MUTABLE ONLY SO IT CAN BE FILLED IN AFTER THE ALLOCATION. The
+      ;; MUTABLE ONLY SO IT CAN BE FILLED IN AFTER THE ALLOCATION. The
       ;; record is built with req = #f and the foreign-alloc happens a
       ;; few lines later -- both inside the region now; see fs-start!.
       ;; Nothing else ever writes it, and it is set exactly once, before
@@ -1013,16 +1013,16 @@
 
   ;; ---- fs request blocks, counted -----------------------------------
   ;;
-  ;; ⭐ THE COUNT AND THE BLOCK MOVE IN ONE REGION. A counter bumped
+  ;; THE COUNT AND THE BLOCK MOVE IN ONE REGION. A counter bumped
   ;; outside the region that allocates can be read between the two, and
   ;; the reading is then a number that no state ever had. Callers that
   ;; already hold a region nest for nothing.
   ;;
-  ;; ⛔ IT RECORDS, IT DOES NOT RESCUE. Nothing here frees a block whose
+  ;; IT RECORDS, IT DOES NOT RESCUE. Nothing here frees a block whose
   ;; owner died; the count is how a test SEES that leak, not a mechanism
   ;; that prevents it. A rising count is a real leak and stays one.
   ;;
-  ;; ⚠ SCOPE IS fs-req-size BLOCKS ONLY. Write, connect and getaddrinfo
+  ;; SCOPE IS fs-req-size BLOCKS ONLY. Write, connect and getaddrinfo
   ;; requests, the dirent buffers and the read and write payloads are
   ;; foreign-alloc'd too and are NOT counted here, so this number is not
   ;; "libuv memory" and must not be read as a total.
@@ -1222,7 +1222,7 @@
                    (if (< result 0)
                        (begin (uv-fs-req-cleanup req) (fs-fail! op req result))
                        (let ((sb (uv-fs-get-statbuf req)))
-                         ;; ⭐ READ EVERY FIELD BEFORE THE CLEANUP. The
+                         ;; READ EVERY FIELD BEFORE THE CLEANUP. The
                          ;; statbuf belongs to the request; cleanup is
                          ;; free to release it, so a field fetched
                          ;; afterwards would be reading freed memory.
@@ -1254,7 +1254,7 @@
                   ((scandir)
                    (if (< result 0)
                        (begin (uv-fs-req-cleanup req) (fs-fail! op req result))
-                       ;; ⛔ NOTHING MAY UNWIND OUT OF HERE INTO C. This is
+                       ;; NOTHING MAY UNWIND OUT OF HERE INTO C. This is
                        ;; a libuv callback (see the file header); an
                        ;; exception crossing the C frame corrupts the
                        ;; process. The copy loop below allocates one
@@ -1263,13 +1263,13 @@
                        ;; out of memory -- hence a guard that turns any
                        ;; raise into an errno the owner can read.
                        ;;
-                       ;; ⚠ ORDER: copy every name, THEN clean up, THEN
+                       ;; ORDER: copy every name, THEN clean up, THEN
                        ;; deliver. libuv owns the name buffers and
                        ;; uv_fs_req_cleanup frees them, so a name
                        ;; retained past the cleanup is a dangling
                        ;; pointer. Nothing here keeps one.
                        ;;
-                       ;; ⚠ AND IT IS O(N) INSIDE THE CALLBACK. The
+                       ;; AND IT IS O(N) INSIDE THE CALLBACK. The
                        ;; scheduler is not running while this loop does;
                        ;; a directory of a million entries pauses the
                        ;; process for the length of a million string
@@ -1316,7 +1316,7 @@
           ;; question as the getaddrinfo-table entry a few lines up,
           ;; which is deliberately RETAINED for a dead owner because this
           ;; callback still has to free the request.
-          ;; ⛔ THE FREE BELOW IS MANDATORY AND THIS CALL CAN RAISE.
+          ;; THE FREE BELOW IS MANDATORY AND THIS CALL CAN RAISE.
           ;; unindex-owner! filters the owner's list with remp, so it
           ;; allocates. Unguarded it would skip the free -- and, in a
           ;; foreign callback, unwind into C; the same rule and the same
@@ -1325,7 +1325,7 @@
           ;; uv-owner-index-count reports, while the alternatives cost a
           ;; foreign block that nothing will ever free again.
           ;;
-          ;; ⚠ IT MUST STAY BEFORE THE FREE, not after. The key IS the
+          ;; IT MUST STAY BEFORE THE FREE, not after. The key IS the
           ;; freed pointer: once the block is returned, the same address
           ;; can be handed to the next getaddrinfo request, and a removal
           ;; running then would delete that request's registration
@@ -1766,7 +1766,7 @@
       (lock-object on-fsw-code)
       (lock-object on-tls-timer-code)
       (lock-object on-tls-timer-close-code)
-      ;; ⭐ ELEVEN, NOT THIRTEEN. on-timer-code and on-walk-code belong to the
+      ;; ELEVEN, NOT THIRTEEN. on-timer-code and on-walk-code belong to the
       ;; loop itself -- its wakeup timer and uv_walk -- and are locked in
       ;; (igropyr uv), beside the loop. Every code object must be locked in
       ;; whichever library holds it: libuv keeps only a raw entry pointer, so
@@ -1800,7 +1800,7 @@
   ;; optional trailing arg: uv_tcp_bind flags (UV_TCP_REUSEPORT = 2,
   ;; kernel-balanced multi-process listening).
   ;;
-  ;; ⭐ FreeBSD IS ON THE LIST, AND IT REACHES IT BY A DIFFERENT OPTION.
+  ;; FreeBSD IS ON THE LIST, AND IT REACHES IT BY A DIFFERENT OPTION.
   ;; This matters here more than anywhere else: every igropyr deployment
   ;; runs on FreeBSD, and a note saying "Linux only" would tell the one
   ;; audience that needs this flag that it has nothing to gain.
@@ -1812,7 +1812,7 @@
   ;; is why the platform note has to name the option and not just the
   ;; system.
   ;;
-  ;; ⚠ HOW FAR THE EVIDENCE GOES, because two different things are being
+  ;; HOW FAR THE EVIDENCE GOES, because two different things are being
   ;; claimed and only one of them is checked here:
   ;;   - The platform list above is read from libuv's uv.h. Confirmed in
   ;;     two versions independently: 1.50.0 (locally) and 1.52.1 (the
@@ -1820,7 +1820,7 @@
   ;;   - That FreeBSD's path is SO_REUSEPORT_LB is read from libuv's
   ;;     uv__sock_reuseport, in 1.52.1. NOT re-read here: this machine has
   ;;     only libuv's headers installed, not its C source.
-  ;;   - ⛔ THAT IT ACTUALLY DISTRIBUTES CONNECTIONS ON OUR MACHINES HAS
+  ;;   - THAT IT ACTUALLY DISTRIBUTES CONNECTIONS ON OUR MACHINES HAS
   ;;     NOT BEEN OBSERVED. That needs two processes on one port and a
   ;;     load run, and nobody has done it. What is written above is what
   ;;     libuv implements, not what we have measured.
@@ -1866,7 +1866,7 @@
         ;; server's handle value would match a later listener's, so the
         ;; old server would report itself live and its shutdown would
         ;; stop somebody else's listener.
-        ;; ⭐ THE HANDSHAKING COUNT LIVES ON THIS OBJECT, not on the table
+        ;; THE HANDSHAKING COUNT LIVES ON THIS OBJECT, not on the table
         ;; row (Y1). A handshaking conn holds a reference to this vector, so
         ;; the slot can still be released after the row is gone -- which is
         ;; exactly what happens when a listener is stopped while handshakes
@@ -1875,7 +1875,7 @@
         ;; slot 4 is the handle this incarnation belongs to, so a conn
         ;; holding the incarnation can ask whether it is STILL the current one
         ;; (X3) without a reverse scan of the table.
-        ;; ⛔ PUBLISHED COMPLETE, INCLUDING THE CONTEXT. Filling slot 3 after
+        ;; PUBLISHED COMPLETE, INCLUDING THE CONTEXT. Filling slot 3 after
         ;; this row was already in the table was a window, not an untidiness:
         ;; between publication and the patch the event loop can accept a
         ;; queued connection, read ctx = #f, and take the PLAINTEXT branch --
@@ -1902,7 +1902,7 @@
   ;; pointer -- uv_fileno included -- is a use-after-free, while using it
   ;; as a key is not.
   ;;
-  ;; ⛔ THE ADDRESS ALONE IS NOT AN IDENTITY, WHICH IS WHY THE TOKEN IS
+  ;; THE ADDRESS ALONE IS NOT AN IDENTITY, WHICH IS WHY THE TOKEN IS
   ;; REQUIRED. A freed address does not stay unmatched: a uv_tcp handle
   ;; was 264 bytes on the measured build -- the size is read at run time,
   ;; so treat the number as an illustration and the reuse as the point --
@@ -1912,7 +1912,7 @@
   ;; then answer #t for a dead listener, and a stale owner's
   ;; tcp-stop-listen! would stop the new one.
   ;;
-  ;; ⚠ IT CAN ANSWER #f WHILE THE HANDLE IS STILL OPEN. The row is
+  ;; IT CAN ANSWER #f WHILE THE HANDLE IS STILL OPEN. The row is
   ;; removed when the stop is REQUESTED and the handle lives until the
   ;; close callback runs, which is a later turn of the loop -- so the
   ;; conservative interval is that whole asynchronous close, not the gap
@@ -1934,12 +1934,12 @@
   ;; (tcp-stop-listen! h token)    -- that handle ONLY if it is still the
   ;;                                  incarnation the token came from
   ;;
-  ;; ⚠ THE TWO-ARGUMENT FORM IS THE ONE TO USE FROM A LONG-LIVED OWNER.
+  ;; THE TWO-ARGUMENT FORM IS THE ONE TO USE FROM A LONG-LIVED OWNER.
   ;; A handle address can be reused by a later listener (see tcp-listen!),
   ;; so a stale owner calling the one-argument form stops whoever holds
   ;; that address now. The token form makes that a no-op instead.
   ;;
-  ;; ⛔ HOLDING THE HANDLE DOES NOT MAKE A CALLER SAFE, and an earlier
+  ;; HOLDING THE HANDLE DOES NOT MAKE A CALLER SAFE, and an earlier
   ;; version of this note said it did ("a caller that created a listener
   ;; and stops it without ever releasing it cannot be stale"). Keeping
   ;; the number keeps nothing: the no-argument form, called by anyone,
@@ -1949,7 +1949,7 @@
   ;; listener and stops it within one flow, checked by grep -- and new
   ;; code should pass the token.
   (define (tcp-stop-listen! . rest)
-    ;; ⛔ THE TEST AND THE CLOSE ARE ONE UNINTERRUPTIBLE STEP, for the
+    ;; THE TEST AND THE CLOSE ARE ONE UNINTERRUPTIBLE STEP, for the
     ;; reason stated once for every call that passes a handle to libuv.
     ;; Two failures follow from splitting them, and both were reachable
     ;; before this region existed:
@@ -1963,7 +1963,7 @@
     ;; safe over a snapshot that may already be stale.
     (define (stop! l)                        ; caller holds the region
       (when (hashtable-ref listener-table l #f)
-        ;; ⭐ THE INCARNATION OWNS ITS CONTEXT, so stopping it gives the
+        ;; THE INCARNATION OWNS ITS CONTEXT, so stopping it gives the
         ;; context back. Leaving that to the caller meant a direct
         ;; tcp-listen-tls! / tcp-stop-listen! lifecycle leaked one SSL_CTX per
         ;; generation, which contradicts the ownership this vector claims.
@@ -1994,7 +1994,7 @@
            ;; which is the region the comment at the top of this
            ;; procedure says must not be split.
            ;;
-           ;; ⛔ IT ALWAYS SKIPS, and it must: parking between the token
+           ;; IT ALWAYS SKIPS, and it must: parking between the token
            ;; test and the close is exactly the split this region exists
            ;; to prevent. A barrier that parked here would reproduce the
            ;; stale-owner close it is meant to prove impossible.
@@ -2004,7 +2004,7 @@
            (inject-barrier! 'tcp-stop-listen-before-close)
            (stop! (car rest)))))))
 
-  ;; ⛔ NOTHING THAT NEEDS RETURNING EXISTS OUTSIDE THE REGION. The
+  ;; NOTHING THAT NEEDS RETURNING EXISTS OUTSIDE THE REGION. The
   ;; foreign allocation and both publications happen inside it -- the
   ;; state vector is built outside, but it is a Scheme object the
   ;; collector reclaims -- so a kill before the region can discard
@@ -2019,11 +2019,11 @@
   ;;
   ;; Allocation inside the region is allowed: a collect request is
   ;; deferred until the region is left, and the only failure shape is a
-  ;; raise, which the handler catches. ⚠ The prepare/publish split is
+  ;; raise, which the handler catches. The prepare/publish split is
   ;; NOT about the region being allocation-free: hashtable-set! may
   ;; allocate when it adds a key or grows, and both callers now prepare
   ;; inside their region anyway.
-  ;; ⭐ SHAPED LIKE fs-start-fd!: the submission is INSIDE the region.
+  ;; SHAPED LIKE fs-start-fd!: the submission is INSIDE the region.
   ;; Publishing and submitting have to be one step, because the state
   ;; between them is one nothing can reclaim -- a published op whose
   ;; phase is 'open has no callback coming, and uv-owner-died! reaches it
@@ -2031,35 +2031,35 @@
   ;; phase 'idle. So it sets the aborted flag and returns, and the row
   ;; and the request stay for the life of the process.
   ;;
-  ;; ⚠ An earlier version of this comment said pulling the submission in
+  ;; An earlier version of this comment said pulling the submission in
   ;; "would buy nothing". It buys exactly that window. The cost is an
   ;; uninterruptible foreign call, and it is the right trade here because
   ;; uv_fs_open with a callback is an enqueue, not the I/O itself.
   ;; Roll back a partly-started fs operation. TOP LEVEL, and taking its
   ;; state as a vector, for two reasons that both bit earlier versions:
   ;;
-  ;; ⭐ A LOCAL PROCEDURE WOULD ALLOCATE A CLOSURE BEFORE THE GUARD that
+  ;; A LOCAL PROCEDURE WOULD ALLOCATE A CLOSURE BEFORE THE GUARD that
   ;; is supposed to protect it. fs-start-fd! owns the caller's descriptor
   ;; from its first instruction, so an allocation failure there escaped
   ;; with the fd still open.
   ;;
-  ;; ⭐ ONE COPY, TWO CALL SITES. The handler and the refused-submission
+  ;; ONE COPY, TWO CALL SITES. The handler and the refused-submission
   ;; branch both need exactly this, and when they were written separately
   ;; they drifted -- see the cleanup-safe? note below for what that cost.
   ;;
   ;; State vector: #(cell req cleanup-safe? fd fd-open?).
   ;;
-  ;; ⚠ AT MOST ONCE, NOT EXACTLY ONCE. Each slot is cleared BEFORE the
+  ;; AT MOST ONCE, NOT EXACTLY ONCE. Each slot is cleared BEFORE the
   ;; operation it guards, so a raise part way cannot make a second call
   ;; repeat a free or a close. The price is the other direction: a raise
   ;; BEFORE the operation takes effect loses that one resource. No flag
   ;; order gives exactly-once for an operation that may raise on either
   ;; side of its effect; leaking one block beats freeing one twice.
-  ;; ⛔ This is exactly-once only under the premise that these calls do
+  ;; This is exactly-once only under the premise that these calls do
   ;; not raise, which is where they stand today.
   (define (fs-undo! st owner)
     (let ((cell (vector-ref st 0)) (req (vector-ref st 1)))
-      ;; ⭐ THE BOUNDARY IS DRAWN PER OPERATION, not uniformly. An
+      ;; THE BOUNDARY IS DRAWN PER OPERATION, not uniformly. An
       ;; idempotent step keeps its slot live across itself, so a retry
       ;; after a raise can complete it; a step that must not run twice
       ;; has its slot cleared first, at the price of leaking on a raise
@@ -2072,13 +2072,13 @@
       (when req
         (hashtable-delete! fs-table req)
         (vector-set! st 1 #f)
-        ;; ⚠ ONLY A REQUEST libuv HAS INITIALISED MAY BE CLEANED UP. Before
+        ;; ONLY A REQUEST libuv HAS INITIALISED MAY BE CLEANED UP. Before
         ;; the submission this is raw foreign-alloc memory and
         ;; uv_fs_req_cleanup would be reading fields nothing wrote. The
         ;; separate pre-submission and post-submission paths had this
         ;; right; merging them into one rollback is what lost it.
         ;;
-        ;; ⭐ cleanup-safe? (slot 2) IS SET AFTER THE CALL RETURNS,
+        ;; cleanup-safe? (slot 2) IS SET AFTER THE CALL RETURNS,
         ;; WHATEVER IT RETURNED, and that is safe because libuv
         ;; initialises the request before anything that can fail.
         ;; Verified by reading
@@ -2089,7 +2089,7 @@
         ;; returns UV_ENOMEM with INIT already done and the very fields
         ;; uv_fs_req_cleanup reads left NULL.
         ;;
-        ;; ⚠ RE-READ THIS AGAINST A NEWER libuv BEFORE TRUSTING IT. The
+        ;; RE-READ THIS AGAINST A NEWER libuv BEFORE TRUSTING IT. The
         ;; property is whether INIT still precedes every failing path in
         ;; those two functions. Nothing here breaks loudly if it stops
         ;; being true -- cleanup on a request libuv never saw is
@@ -2106,7 +2106,7 @@
   ;; the libuv call at the end differs -- three copies would be three
   ;; places to keep the region discipline in step.
   ;;
-  ;; ⛔ fd IS -1 HERE AND MUST STAY -1, and that is not cosmetic. When the
+  ;; fd IS -1 HERE AND MUST STAY -1, and that is not cosmetic. When the
   ;; owner dies, uv-owner-died! reaches these ops through the same 'fs
   ;; arm as a stream read: file-stream-close! marks the op aborted, the
   ;; completion lands in fs-abort-step!, falls to its `else`, and calls
@@ -2115,7 +2115,7 @@
   ;; and that same path will close a descriptor it does not own. The
   ;; reclaim path is correct for them BECAUSE the field is -1.
   ;;
-  ;; ⚠ THE OPERATION IS THE PHASE, not the mode. fs-op-mode already means
+  ;; THE OPERATION IS THE PHASE, not the mode. fs-op-mode already means
   ;; whole|stream -- the read pipeline's chunking policy, read in four
   ;; places -- and on-fs-code dispatches on phase alone. These ops carry
   ;; mode 'whole, which nothing on their path ever reads.
@@ -2156,7 +2156,7 @@
       op))
 
   ;; -> #(file-stat ,alist) or #(file-error ,errno) to owner.
-  ;; ⭐ THE FIELDS ARE KEYED, NOT POSITIONAL. A consumer reads with assq,
+  ;; THE FIELDS ARE KEYED, NOT POSITIONAL. A consumer reads with assq,
   ;; so a field added later breaks nothing that reads the ones before it.
   ;; Times are delivered as seconds AND nanoseconds, unconverted: a
   ;; consumer wanting milliseconds does that arithmetic itself, and one
@@ -2169,7 +2169,7 @@
   ;; -> #(file-entries ,names) or #(file-error ,errno) to owner. Names
   ;; only, without "." or "..", in whatever order the filesystem gave.
   ;;
-  ;; ⚠ EVERY ENTRY IS DELIVERED; there is no cap. A directory with a
+  ;; EVERY ENTRY IS DELIVERED; there is no cap. A directory with a
   ;; million names produces a million strings, built inside the libuv
   ;; callback -- see the scandir arm for what that costs. Truncating and
   ;; reporting success would be worse: the consumer cannot tell a short
@@ -2178,7 +2178,7 @@
   (define (file-scandir-async! path owner) (fs-start-simple! path owner 'scandir))
 
   (define (fs-start! path owner mode)
-    ;; ⚠ THE STATE VECTOR AND THE GUARD'S OWN CONTINUATION ARE ALLOCATED
+    ;; THE STATE VECTOR AND THE GUARD'S OWN CONTINUATION ARE ALLOCATED
     ;; BEFORE ANY HANDLER EXISTS. That is true of every guard in this
     ;; file and is not repaired here: a Chez allocation failure is an
     ;; unrecoverable out-of-memory condition, not something a handler
@@ -2188,7 +2188,7 @@
       ;; INJECTION POINT 'fs-open-before-region -- OWNING REGION: NONE,
       ;; and that is the whole reason this point exists here.
       ;;
-      ;; ⭐ THIS IS THE ONE OF THE THREE THAT CAN PARK. $inject-barrier
+      ;; THIS IS THE ONE OF THE THREE THAT CAN PARK. $inject-barrier
       ;; reads the interrupt depth and parks only when nothing above it
       ;; holds a region; here the state vector is allocated but the
       ;; region has not been entered, so a victim stops with an fs
@@ -2213,7 +2213,7 @@
           ;; with-interrupts-disabled opened above, and OWNING GUARD: the
           ;; guard above it.
           ;;
-          ;; ⛔ A BARRIER HERE ALWAYS SKIPS, BY CONSTRUCTION. The region
+          ;; A BARRIER HERE ALWAYS SKIPS, BY CONSTRUCTION. The region
           ;; is already held, so $inject-barrier takes the reservation,
           ;; counts slot 8 and runs on rather than parking -- a victim
           ;; CANNOT be suspended holding this region, because nothing
@@ -2232,7 +2232,7 @@
           (inject-fault! 'fs-submit-gap-open)
           (set! rc (uv-fs-open (uv-loop-handle) (vector-ref st 1) path
                                O-RDONLY 0 on-fs-entry))
-          ;; ⭐ THE SLOT MEANS "cleanup is defined on this request", NOT
+          ;; THE SLOT MEANS "cleanup is defined on this request", NOT
           ;; "it was submitted" -- an earlier name said submitted? and
           ;; was false: uv_fs_open can return UV_ENOMEM having submitted
           ;; nothing, and the request is still initialised and safe to
@@ -2244,7 +2244,7 @@
           (vector-set! st 2 #t)
           (when (< rc 0)
             (fs-undo! st owner)
-            ;; ⚠ REPORTED INSIDE THE REGION, and that is deliberate.
+            ;; REPORTED INSIDE THE REGION, and that is deliberate.
             ;; owner is an explicit parameter of the exported API and
             ;; need not be the process that called: A may submit on
             ;; behalf of B. Telling the owner outside the region let a
@@ -2256,7 +2256,7 @@
 
  ;; Start the ordinary asynchronous fstat/read pipeline from an fd that
   ;; has already been opened securely with openat.
-  ;; ⛔ THIS FUNCTION TAKES OWNERSHIP OF fd, INCLUDING WHEN IT FAILS. The
+  ;; THIS FUNCTION TAKES OWNERSHIP OF fd, INCLUDING WHEN IT FAILS. The
   ;; caller opened fd with openat and has no other handle on it, so a
   ;; raise that leaves this frame without closing it leaks a descriptor
   ;; that nothing in the process can name again -- it is not in fs-table,
@@ -2265,7 +2265,7 @@
   ;; failure between the allocation and the publish moved the /dev/fd
   ;; count from 12 to 13 with fs-count still 0.
   ;;
-  ;; ⭐ THE GUARD SPANS EVERYTHING, PUBLICATION AND SUBMISSION INCLUDED.
+  ;; THE GUARD SPANS EVERYTHING, PUBLICATION AND SUBMISSION INCLUDED.
   ;; Earlier versions of this note said it stopped before publication and
   ;; that an fs-table row alone made the request reachable to
   ;; uv-owner-died!. Both were wrong: teardown walks the OWNER INDEX
@@ -2273,9 +2273,9 @@
   ;; publish left the state that has no reclaimer at all -- published,
   ;; unsubmitted, phase not 'idle, so file-stream-close! only flags it.
   ;;
-  ;; ⚠ ONE ALLOCATION STILL PRECEDES THE REGION: the state vector. If
+  ;; ONE ALLOCATION STILL PRECEDES THE REGION: the state vector. If
   ;; Chez fails to allocate it, this frame is already holding the fd and
-  ;; nothing closes it. ⛔ SO THIS PATH IS NOT YET INDEPENDENT OF ITS
+  ;; nothing closes it. SO THIS PATH IS NOT YET INDEPENDENT OF ITS
   ;; CALLER, and file-stream-open-under!'s enclosing region is what
   ;; covers that instant today. Three versions of this comment have now
   ;; claimed independence: the first while op and cell were built in the
@@ -2298,11 +2298,11 @@
   ;;
   ;; This function OWNS fd from the call, success or failure. Its caller
   ;; opened it with openat and holds no other handle on it.
-  ;; ⛔ THIS FUNCTION OWNS fd FROM ITS FIRST INSTRUCTION, success or
+  ;; THIS FUNCTION OWNS fd FROM ITS FIRST INSTRUCTION, success or
   ;; failure. Its caller opened it with openat and holds no other handle
   ;; on it, so every exit has to close it.
   ;;
-  ;; ⭐ THE STATE VECTOR IS THE CALLER'S, AND IT IS OLDER THAN THE fd.
+  ;; THE STATE VECTOR IS THE CALLER'S, AND IT IS OLDER THAN THE fd.
   ;; This function used to allocate it here, after it already owned the
   ;; descriptor -- so the one allocation that could fail while holding an
   ;; unclosable fd was the first thing it did. Now the caller builds the
@@ -2311,13 +2311,13 @@
   ;; this function owns an fd and has not yet allocated the thing that
   ;; records it.
   ;;
-  ;; ⭐ AND THAT IS WHY THE CALLER'S REGION IS NO LONGER LOAD-BEARING for
+  ;; AND THAT IS WHY THE CALLER'S REGION IS NO LONGER LOAD-BEARING for
   ;; the fd. It was: the correctness of this function depended on being
   ;; called from inside one, which made it a part whose behaviour changed
   ;; with its context. It is self-contained now, and a cell can prove it
   ;; by deleting the caller's region and watching nothing leak.
   ;;
-  ;; ⚠ WHAT REMAINS, and it is smaller than what was here before but not
+  ;; WHAT REMAINS, and it is smaller than what was here before but not
   ;; nothing: entering the guard allocates a continuation, and that
   ;; allocation is outside the guard it establishes -- the same floor
   ;; every guard in this file stands on (see fs-start!). The fd IS owned
@@ -2468,14 +2468,14 @@
     ;; Keep the raw fd continuously protected: before fs-start-fd! installs
     ;; it in fs-table, actor teardown has no way to discover and close it.
     ;;
-    ;; ⚠ THE REGION COVERS PREEMPTION AND NOTHING ELSE. It stops actor
+    ;; THE REGION COVERS PREEMPTION AND NOTHING ELSE. It stops actor
     ;; teardown from running here; it does not unwind, so it never
     ;; covered fs-start-fd! RAISING with the fd in hand -- that half is
     ;; fs-start-fd!'s own contract, which is why that function closes fd
     ;; on any pre-publication failure. Read the two together: this line
     ;; hands the descriptor over, and the callee owns it from the call,
     ;; success or failure.
-    ;; ⭐ THE STATE VECTOR IS BUILT BEFORE THE fd EXISTS. If this
+    ;; THE STATE VECTOR IS BUILT BEFORE THE fd EXISTS. If this
     ;; allocation fails there is no descriptor yet to leak; built after
     ;; openat, the same failure would strand one. The two writes below
     ;; are the ownership transfer, and they happen only once openat has
@@ -2524,12 +2524,12 @@
   ;; be given 128, and overflow under a burst with no local symptom -- the
   ;; drops are counted in the kernel, not here.
   ;;
-  ;; ⛔ #f IS AN HONEST ANSWER AND A WRONG NUMBER IS NOT. Both the option
+  ;; #f IS AN HONEST ANSWER AND A WRONG NUMBER IS NOT. Both the option
   ;; and its level come from (igropyr platform) and are #f until read
   ;; from the target's headers; while either is #f this returns #f rather
   ;; than calling getsockopt with a guessed constant, which would answer
   ;; for some other option and hand back a plausible integer.
-  ;; ⛔ ALL THREE BLOCKS ARE ALLOCATED TOGETHER SO ONE HANDLER CAN NAME
+  ;; ALL THREE BLOCKS ARE ALLOCATED TOGETHER SO ONE HANDLER CAN NAME
   ;; ALL THREE. The first version allocated val and len INSIDE a guard
   ;; whose handler knew only about fdbuf, so a raise from getsockopt
   ;; would have returned one block and leaked two. That raise was not
@@ -2539,14 +2539,14 @@
   ;; third instance of that shape in one day; the check that catches it
   ;; is to ask, at every foreign-alloc, which handler knows this name.
   ;;
-  ;; ⚠ ONE RESIDUAL, STATED RATHER THAN PAPERED OVER: if the second or
+  ;; ONE RESIDUAL, STATED RATHER THAN PAPERED OVER: if the second or
   ;; third foreign-alloc raises, the first is still leaked, because the
   ;; bindings run before any handler is installed. That is an allocation
   ;; failure of twelve bytes total, and covering it would need three
   ;; nested guards for a case where the process is already out of
   ;; memory. The gap is named here so a reader can weigh it rather than
   ;; assume it was handled.
-  ;; ⛔ THE CHECK AND THE FOREIGN USE ARE ONE UNINTERRUPTIBLE STEP, which
+  ;; THE CHECK AND THE FOREIGN USE ARE ONE UNINTERRUPTIBLE STEP, which
   ;; is the rule this file already states for every call that passes a
   ;; handle to libuv. A membership test on its own does NOT make this
   ;; safe: between the test and uv_fileno the process can be preempted,
@@ -2608,13 +2608,13 @@
   ;; Async DNS. The owner process later receives #(dns-resolved ,ip-string)
   ;; or #(dns-failed ,errno). libuv resolves on its thread pool, so the
   ;; scheduler is not blocked.
-  ;; ⚠ TWO EXITS, AND BOTH OWE AN unindex-owner!. A submission that
+  ;; TWO EXITS, AND BOTH OWE AN unindex-owner!. A submission that
   ;; libuv refuses never reaches the callback, so the request is torn
   ;; down here instead; a submission it accepts is torn down there. The
   ;; index registration made below is one, and whichever exit runs has to
   ;; retire it -- neither of them covers the other.
   ;;
-  ;; ⛔ NEITHER OF THEM DID, AND NOTHING SAID SO. The entry survived every
+  ;; NEITHER OF THEM DID, AND NOTHING SAID SO. The entry survived every
   ;; completed resolution for the life of the owning process; only owner
   ;; death cleared it, by deleting that owner's list wholesale. The
   ;; symptom was growth alone, which is why unindex-owner! reports a
@@ -2639,7 +2639,7 @@
           ;; the table row is gone and a refused submission produces no
           ;; callback.
           ;;
-          ;; ⛔ ZERO COVERAGE, AND THE REASON IS NAMED. This branch runs
+          ;; ZERO COVERAGE, AND THE REASON IS NAMED. This branch runs
           ;; only when uv_getaddrinfo refuses SYNCHRONOUSLY. A name that
           ;; does not resolve is refused by the resolver instead, through
           ;; the callback with a negative status, so the suite's bad-host
@@ -2647,7 +2647,7 @@
           ;; this line leaves test/dns-owner-index.sc green. host is
           ;; always a string here, so it is not currently known whether
           ;; any public call can reach it at all.
-          ;; ⛔ Do not manufacture reachability by changing this code to
+          ;; Do not manufacture reachability by changing this code to
           ;; suit a test.
           (guard (e (#t (foreign-free req) (raise e)))
             (unindex-owner! owner 'dns req))
@@ -2726,7 +2726,7 @@
   ;; client cannot forge -- unlike any header it sends -- so it is what
   ;; per-client policy (rate limiting, banning) must key on.
   ;; THE STATE TEST AND THE HANDLE USE ARE ONE UNINTERRUPTIBLE STEP, here
-  ;; and at every other FFI call that passes conn-handle -- ⚠ a rule
+  ;; and at every other FFI call that passes conn-handle -- a rule
   ;; this file has not always followed: tcp-stop-listen! split its test
   ;; from its uv-close until the incarnation work put them back
   ;; together, and listener-backlog-effective did the same. This is the
@@ -2769,7 +2769,7 @@
 
   ;; Start delivering #(tcp-data ...) messages to the conn's owner.
   ;; Call after conn-set-owner!.
-  ;; ⛔ ASK WHETHER IT IS ALREADY READING; DO NOT DECODE AN ERRNO. Both the
+  ;; ASK WHETHER IT IS ALREADY READING; DO NOT DECODE AN ERRNO. Both the
   ;; accept path and the delayed on-accept start reading on a TLS connection,
   ;; so the second call is expected and must not read as a failure. An earlier
   ;; version compared the return against a hardcoded UV_EALREADY of -114 --
@@ -2816,12 +2816,12 @@
   ;; [payload]; write_cb frees it and runs on-done in callback context
   ;; (must not yield). Returns #t if queued, #f on immediate error.
   (define (enqueue-write! c len fill-data! on-done)
-    ;; ⭐ INJECTION POINT (E1, allocation failure). Placed BEFORE the
+    ;; INJECTION POINT (E1, allocation failure). Placed BEFORE the
     ;; allocation and before anything is published, so an injected raise
     ;; leaves exactly the state a real out-of-memory would: no block, no
     ;; write-table entry, nothing for the caller to unwind.
     ;;
-    ;; ⚠ IT IS NOT OUTSIDE EVERY INTERRUPT REGION, and an earlier note
+    ;; IT IS NOT OUTSIDE EVERY INTERRUPT REGION, and an earlier note
     ;; here said it was -- checked lexically, where it does sit before
     ;; this procedure's own region, and not against the callers.
     ;; tcp-writev!'s small-write path enters a region and reaches here
@@ -2864,7 +2864,7 @@
             (begin
               (hashtable-set! write-table block
                 (or on-done (lambda (status) (void))))
-              ;; ⭐ INJECTION POINT (E1, negative errno). It wraps the RAW
+              ;; INJECTION POINT (E1, negative errno). It wraps the RAW
               ;; FFI call and nothing else, which is what inject-return!
               ;; requires: when armed the call is SKIPPED, so the block is
               ;; never handed to libuv and the failure path below is free
@@ -2890,7 +2890,7 @@
   ;; caller context on the fast path (safe: not inside a libuv callback)
   ;; and in callback context on the queued path; either way it must not
   ;; yield. Returns #f if the connection is not open (on-done ran -1).
-  ;; ⭐ THE RAW SINK. Bytes go out exactly as given: no codec, no gate, no
+  ;; THE RAW SINK. Bytes go out exactly as given: no codec, no gate, no
   ;; accounting. For a TLS connection these bytes are always CIPHERTEXT, and
   ;; every kind of it comes through here -- handshake records, close_notify,
   ;; and application records alike (W1). tls-raw-sink-writes counts them all,
@@ -2913,7 +2913,7 @@
              ;; and our uv_try_write -- and we would send ITS bytes on OUR
              ;; socket.
              ;;
-             ;; ⭐ THE LEASE IS THAT REGION. It hands both buffers to this
+             ;; THE LEASE IS THAT REGION. It hands both buffers to this
              ;; thunk with interrupts disabled and takes them back on
              ;; return, so everything below -- the state test, the pack, the
              ;; try_write, the partial result, the fast-path on-done, the
@@ -2937,7 +2937,7 @@
                          (loop (cdr ss) (+ off n)))))
                    (foreign-set! 'void* scratch-buf 0 write-scratch)
                    (foreign-set! 'unsigned-64 scratch-buf 8 total)
-                   ;; ⭐ INJECTION POINT (E1, "nothing went out yet").
+                   ;; INJECTION POINT (E1, "nothing went out yet").
                    ;; Frames up to the scratch size finish here and never
                    ;; reach the queued path, so without this knob the
                    ;; small control frames -- mon, mdown, demon, a short
@@ -2945,7 +2945,7 @@
                    ;; (EAGAIN) sends the caller down the queue-it-all
                    ;; branch, where the other two knobs live.
                    ;;
-                   ;; ⛔ ZERO, NEVER A POSITIVE PARTIAL COUNT. ⚠ 0 is not
+                   ;; ZERO, NEVER A POSITIVE PARTIAL COUNT. 0 is not
                    ;; something uv_try_write actually returns for a
                    ;; non-empty buffer -- libuv gives a positive count or
                    ;; a negative UV_EAGAIN -- so this is a surrogate, and
@@ -3008,7 +3008,7 @@
 
   ;; ---- the conn's one timer (X3 / Y3 / Y4 / Z2) ---------------------------
   ;;
-  ;; ⭐ ONE TIMER FOR THE CONNECTION'S WHOLE LIFE. It is armed for the
+  ;; ONE TIMER FOR THE CONNECTION'S WHOLE LIFE. It is armed for the
   ;; handshake, STOPPED (not freed) on establishment, and re-armed for the
   ;; clean-shutdown deadline. So after a successful handshake the live timer
   ;; count is 1 and the active count is 0 -- allocating a second timer for
@@ -3021,7 +3021,7 @@
   (define timer-conns (make-eqv-hashtable))   ; timer address -> conn
   (define next-timer-id 0)
 
-  ;; ⭐ INIT FAILURE AND START FAILURE ARE NOT THE SAME BOOKKEEPING (Y4).
+  ;; INIT FAILURE AND START FAILURE ARE NOT THE SAME BOOKKEEPING (Y4).
   ;; uv_timer_init failing means the handle was never initialised: it is freed
   ;; DIRECTLY and must not be handed to uv_close. A uv_timer_start failure
   ;; after a successful init means libuv owns it, so it goes out through
@@ -3055,7 +3055,7 @@
         (uv-timer-stop tm)
         (bump-active-timers! -1))))
 
-  ;; ⛔ ONE REGION, AND THE HANDLE IS RE-READ INSIDE IT. As three separate
+  ;; ONE REGION, AND THE HANDLE IS RE-READ INSIDE IT. As three separate
   ;; steps this both drifted the count -- a timer due immediately could fire
   ;; and be closed before the armed flag was published, so nothing decremented
   ;; -- and, far worse, allowed uv_timer_start on freed memory: the handle was
@@ -3074,7 +3074,7 @@
   (define (tls-timer-close! t)
     (let ((tm (conn-tls-timer t)))
       (when tm
-        ;; ⛔ AN ARMED TIMER GIVES ITS ACTIVE COUNT BACK HERE. Closing one
+        ;; AN ARMED TIMER GIVES ITS ACTIVE COUNT BACK HERE. Closing one
         ;; without decrementing left active at 1 while live was already 0 --
         ;; which is what the clean-close path produced, because it RE-ARMS the
         ;; timer for the shutdown deadline and then closes it.
@@ -3117,7 +3117,7 @@
                          (bump-handshaking! 1)
                          #t))))))
 
-  ;; ⭐ RELEASED EXACTLY ONCE, and the flag that guarantees it lives on the
+  ;; RELEASED EXACTLY ONCE, and the flag that guarantees it lives on the
   ;; CONN, not on the listener: every exit path -- establishment, handshake
   ;; failure, timer expiry, hard or clean close, pre-publication failure --
   ;; converges here, and only the first of them decrements.
@@ -3134,19 +3134,19 @@
 
   ;; ---- accepting a TLS connection ----------------------------------------
   ;;
-  ;; ⛔ NOTHING HERE MAY RAISE INTO C. This runs in a libuv callback frame, so
+  ;; NOTHING HERE MAY RAISE INTO C. This runs in a libuv callback frame, so
   ;; every step that can raise -- session construction allocates and reads the
   ;; OpenSSL queue -- sits inside a guard that converts a raise into a local
   ;; close. Interrupt exclusion is no substitute: it has no rollback.
   (define (tls-accept! c v ctx)
-    ;; ⛔ A FAILURE HERE IS AN ABORT, NOT A CLEAN CLOSE. Calling tcp-close!
+    ;; A FAILURE HERE IS AN ABORT, NOT A CLEAN CLOSE. Calling tcp-close!
     ;; was wrong in a way a cell caught: by this point conn-set-tls! has run,
     ;; so tcp-close! dispatched to the CLEAN-close path -- which sends a
     ;; close_notify on a session that never established, and recorded the
     ;; retirement as (clean-close . tls-closed). X2/X5 say the opposite: a
     ;; pre-publication failure retires the session and closes the unpublished
     ;; handle, with no alert, and the reason recorded is this one.
-    ;; ⚠ THE HANDLER ITSELF MUST NOT RAISE. In R6RS a raise from the selected
+    ;; THE HANDLER ITSELF MUST NOT RAISE. In R6RS a raise from the selected
     ;; guard clause propagates outward, so cleanup that can fail -- a deliver,
     ;; a close -- would escape this frame after all. It is wrapped again.
     (guard (e (#t (note-swallowed! 'tls-accept e)
@@ -3162,12 +3162,12 @@
                         (conn-slot-release! c)
                         (tcp-close-raw! c))))
                   #f))
-      ;; ⭐ THE CEILING IS CHECKED BEFORE ANY SSL OBJECT EXISTS (X3): an
+      ;; THE CEILING IS CHECKED BEFORE ANY SSL OBJECT EXISTS (X3): an
       ;; over-limit connection costs a handle and nothing else.
       (if (not (listener-slot-take! v))
           (begin (tcp-close-raw! c) #f)
           (begin
-            ;; ⭐ THE SLOT IS RECORDED ON THE CONN BEFORE ANY ALLOCATION. It
+            ;; THE SLOT IS RECORDED ON THE CONN BEFORE ANY ALLOCATION. It
             ;; used to be tracked only on the conn-tls record, which does not
             ;; exist yet -- so a raise between taking the slot and attaching
             ;; that record leaked the slot for the life of the listener, and
@@ -3204,7 +3204,7 @@
                              #f #f #f    ; gate-opened-ms, retire-path, reason
                              #f          ; effect-depths
                              #f)))       ; abort-cb
-                    ;; ⭐ INSTALLED BEFORE THE CONN IS PUBLISHED (X2). Until
+                    ;; INSTALLED BEFORE THE CONN IS PUBLISHED (X2). Until
                     ;; conn-table has this handle nothing else in the process
                     ;; can reach the session, so a failure from here on is
                     ;; ours alone to clean up.
@@ -3223,7 +3223,7 @@
                             (tls-pump! c t)
                             #t)))))))))))
 
-  ;; ⭐ CIPHERTEXT STRAIGHT INTO THE READ PATH, for rows that must control how
+  ;; CIPHERTEXT STRAIGHT INTO THE READ PATH, for rows that must control how
   ;; many raw reads a flight arrives in. TCP may split or coalesce whatever a
   ;; client writes, so "the client sent two records in one write" is not
   ;; something a cell can assert from the client side; this hands the bytes to
@@ -3264,11 +3264,11 @@
         ((= nread 0) (note-read-stage! 'zero))
         ((= nread UV-EOF)
          (note-read-stage! 'fin)
-         ;; ⭐ A BARE FIN IS NOT AN EOF. close_notify sets eof? on the way
+         ;; A BARE FIN IS NOT AN EOF. close_notify sets eof? on the way
          ;; through the read loop; without it the stream was cut, and saying
          ;; "eof" would let a truncated response read as a complete one.
          ;;
-         ;; ⛔ AND IT WAITS FOR THE GATE. Delivering here while the gate is
+         ;; AND IT WAITS FOR THE GATE. Delivering here while the gate is
          ;; shut put the EOF in front of plaintext that was still buffered.
          (if (conn-tls-eof? t)
              (tls-deliver-eof-once! c t)
@@ -3285,7 +3285,7 @@
         (tls-read-plaintext! c t)
         (let loop ()
           (bump-ssl-op!)
-          ;; ⭐ THE OVERRIDE REPLACES BOTH VALUES, BEFORE ANY SUCCESS TEST
+          ;; THE OVERRIDE REPLACES BOTH VALUES, BEFORE ANY SUCCESS TEST
           ;; (W3). The real step runs -- the state is genuine -- and only the
           ;; verdict is forced; replacing a pair assembled after a success
           ;; branch had already been taken would change nothing.
@@ -3301,7 +3301,7 @@
             (case verdict
               ((done)
                (tls-established! c t)
-               ;; ⭐ DECRYPT IMMEDIATELY, AND THIS LINE IS THE WHOLE OF X3/H13.
+               ;; DECRYPT IMMEDIATELY, AND THIS LINE IS THE WHOLE OF X3/H13.
                ;; A client normally sends its request in the SAME flight as its
                ;; Finished, so by the time the handshake reports done those
                ;; bytes are ALREADY in the read BIO. There will be no further
@@ -3317,14 +3317,14 @@
                (tls-read-plaintext! c t))
               ((want-read) (void))                 ; wait for more ciphertext
               ((gone) (conn-tls-retire! c 'session-gone 'tls-conn-closed))
-              ;; ⭐ want-write IS AN ERROR HERE (W3), not a state to wait in:
+              ;; want-write IS AN ERROR HERE (W3), not a state to wait in:
               ;; the write BIO is unbounded, so OpenSSL asking for room means
               ;; something this code does not model.
               (else
                 (conn-tls-retire! c 'handshake-failed
                                   (or payload 'tls-handshake-failed))))))))
 
-  ;; ⭐ ESTABLISHMENT ORDER (Z12). The callback may not yield, and a spawned
+  ;; ESTABLISHMENT ORDER (Z12). The callback may not yield, and a spawned
   ;; process only runs after it returns, so this installs the owner, asks for
   ;; a watcher, leaves the gate CLOSED and returns. The watcher opens the gate
   ;; and drains what was buffered -- which is why the first plaintext of a TLS
@@ -3346,12 +3346,12 @@
                 "a TLS listener needs (igropyr tls-watch) imported: it installs the watcher spawner hook"))
             (conn-tls-set-watcher! t (uv-tls-watcher-spawner c))
             (bump-watchers! 1)
-            ;; ⭐ THE LAST LINE OF THE CALLBACK FRAME, which is exactly what
+            ;; THE LAST LINE OF THE CALLBACK FRAME, which is exactly what
             ;; H18(a) needs: it asserts this frame RETURNED before the watcher
             ;; ran. Establishment happens inside the read callback, so this --
             ;; not the accept callback -- is where that frame ends.
             ;;
-            ;; ⚠ IT COUNTS ARRIVAL AT THIS LINE, NOT SUCCESS. Reading it as
+            ;; IT COUNTS ARRIVAL AT THIS LINE, NOT SUCCESS. Reading it as
             ;; "the owner was installed" would be reading more than it says.
             ;; It had no call site at all until now, so any earlier reading of
             ;; it was structurally 0 and meant nothing.
@@ -3389,13 +3389,13 @@
 
   ;; ---- retirement of a TLS connection ------------------------------------
   ;;
-  ;; ⭐ IDEMPOTENT BY SHAPE. The conn's tls field is the gate: the region below
+  ;; IDEMPOTENT BY SHAPE. The conn's tls field is the gate: the region below
   ;; detaches it, and whoever loses that race finds #f and does nothing. That
   ;; matters because owner death and watcher death can arrive together, so no
   ;; caller can promise to run this once -- "exactly once" here means exactly
   ;; one EFFECTIVE retirement, not one call.
   ;;
-  ;; ⭐ THE REGION HOLDS SHARED-STATE EDITS ONLY (Delta 11). The refusal sends,
+  ;; THE REGION HOLDS SHARED-STATE EDITS ONLY (Delta 11). The refusal sends,
   ;; the session free and uv_close all happen after it: N sends and an
   ;; SSL_free inside one disabled region would be the widest region in this
   ;; file, and the waiter list has already been TAKEN, so nothing else can
@@ -3414,7 +3414,7 @@
                         ;; marked closed, which is the only moment those two
                         ;; facts disagree.
                         ;;
-                        ;; ⛔ SKIPPED BY CONSTRUCTION: the region is held, and
+                        ;; SKIPPED BY CONSTRUCTION: the region is held, and
                         ;; parking here would leave a connection detached from
                         ;; its conn with closed? still #f -- the inconsistent
                         ;; state this region exists to make unobservable.
@@ -3426,7 +3426,7 @@
                         ;; module variable: the effects below are preemptible,
                         ;; so another conn's retirement can interleave with
                         ;; them and would clobber a shared one.
-                        ;; ⭐ RECORDED IMMEDIATELY AFTER THE DETACH. It used
+                        ;; RECORDED IMMEDIATELY AFTER THE DETACH. It used
                         ;; to be written near the end of the region, so a
                         ;; failure in between left a retirement that had
                         ;; certainly happened with no reason attached -- and
@@ -3442,7 +3442,7 @@
                           (when a
                             (conn-tls-set-abort-cb! t
                               (tls-agg-terminalise! a reason))))
-                        ;; ⭐ ONLY THE WINNER WRITES THE REASON. A later
+                        ;; ONLY THE WINNER WRITES THE REASON. A later
                         ;; idempotent call must not overwrite it with a
                         ;; generic one: the first cause is the one worth
                         ;; keeping.
@@ -3451,7 +3451,7 @@
                         (let ((ws (conn-tls-waiters t)))
                           (conn-tls-set-waiters! t '())
                           (note-shared-depth! t)
-                          ;; ⭐ THE TIMER AND THE SESSION GO BACK INSIDE THE
+                          ;; THE TIMER AND THE SESSION GO BACK INSIDE THE
                           ;; REGION. They are foreign calls that allocate no
                           ;; Scheme memory, so they do not break the rule the
                           ;; region exists for -- and leaving them outside was
@@ -3461,7 +3461,7 @@
                           ;; sees #f and does nothing, and the expiring timer
                           ;; routes back through the same detached field.
                           ;;
-                          ;; ⚠ ONLY THE REFUSAL SENDS STAY OUTSIDE: they
+                          ;; ONLY THE REFUSAL SENDS STAY OUTSIDE: they
                           ;; allocate, and there are as many of them as there
                           ;; are waiters.
                           (note-effect-depth! t 'session-retire)
@@ -3480,7 +3480,7 @@
                       (note-effect-depth! t 'refusal)
                       (deliver (car w) (vector 'tcp-write-refused reason)))
                     ws)
-          ;; ⭐ THE CURRENT HOLDER IS REFUSED TOO. A writer granted the gate is
+          ;; THE CURRENT HOLDER IS REFUSED TOO. A writer granted the gate is
           ;; no longer on the waiter list, so refusing only the list left it
           ;; parked forever whenever the process that granted it died between
           ;; recording it as holder and telling it so. Refusing the holder
@@ -3526,10 +3526,10 @@
     (nongenerative)
     (sealed #t))
 
-  ;; ⭐ TERMINALISATION IS UNCONDITIONAL ON pending (Z4). An inline completion
+  ;; TERMINALISATION IS UNCONDITIONAL ON pending (Z4). An inline completion
   ;; can leave an unsealed aggregate at pending = 0, and an abort that skipped
   ;; it would let a surviving writer seal it later and fire the callback.
-  ;; ⭐ -> THE CALLBACK TO FIRE, OR #f, AND THE CALLER FIRES IT OUTSIDE THE
+  ;; -> THE CALLBACK TO FIRE, OR #f, AND THE CALLER FIRES IT OUTSIDE THE
   ;; REGION. Clearing cb without ever calling it meant an application write in
   ;; flight when the connection was retired NEVER completed: the raw
   ;; completion afterwards saw done? and did nothing, and the writer waited
@@ -3564,7 +3564,7 @@
   ;; 'parked when it was appended to the waiter list.
   ;; -> the pid of the process making an APPLICATION write.
   ;;
-  ;; ⛔ INTERNAL OUTPUT NEVER ASKS. Handshake records, close_notify and the
+  ;; INTERNAL OUTPUT NEVER ASKS. Handshake records, close_notify and the
   ;; post-handshake protocol output go straight to the raw sink and take no
   ;; gate: they originate in a libuv callback frame, where the caller is the
   ;; event-loop process, and making that process a gate HOLDER would mean the
@@ -3592,7 +3592,7 @@
          ;; which a writer has been judged "must wait" but nothing yet records
          ;; that it is waiting.
          ;;
-         ;; ⛔ SKIPPED BY CONSTRUCTION: parking here would hold the region
+         ;; SKIPPED BY CONSTRUCTION: parking here would hold the region
          ;; while the list is mid-update, and both release and retirement read
          ;; that list atomically to decide who gets answered.
          ;;
@@ -3607,7 +3607,7 @@
           (conn-tls-set-aggregate! t agg)
           (cons 'held #f)))))
 
-  ;; ⭐ EVERY GRANT IS ANNOUNCED, INCLUDING THE UNCONTENDED ONE. Z5 requires
+  ;; EVERY GRANT IS ANNOUNCED, INCLUDING THE UNCONTENDED ONE. Z5 requires
   ;; the holder to be monitored FROM THE MOMENT IT HOLDS, and the watcher is
   ;; the only process that can monitor on anyone's behalf. Recording a holder
   ;; without telling the watcher left the common case -- an uncontended
@@ -3632,7 +3632,7 @@
          (when on-done (on-done -1))
          #f)
         ((parked)
-         ;; ⛔ A PARKED WRITER MUST WAIT. Writing anyway was a defect: two
+         ;; A PARKED WRITER MUST WAIT. Writing anyway was a defect: two
          ;; writers on one connection would interleave their TLS records, and
          ;; serialising aggregates is the entire reason this gate exists
          ;; (Z3/Z5). It went unnoticed because HTTP allows one outstanding
@@ -3652,13 +3652,13 @@
                (begin (when on-done (on-done -1)) #f))))
         (else
           ;; INJECTION POINT 'tls-after-held -- OWNING REGION: NONE.
-          ;; ⭐ ANCHORED AS "after a successful acquire, before the first
+          ;; ANCHORED AS "after a successful acquire, before the first
           ;; chunk", NOT as "after the announcement". tls-gate-announce-holder!
           ;; only tells the watcher; it is asynchronous and its position may
           ;; change, and this hook must NOT travel with it -- what a cell
           ;; needs is the gap between holding the gate and writing anything.
           ;;
-          ;; ⭐ PARKS: no region is held here, so a victim stops holding the
+          ;; PARKS: no region is held here, so a victim stops holding the
           ;; gate with the aggregate still empty -- which is the state a
           ;; competing writer or a retirement has to cope with.
           ;;
@@ -3674,7 +3674,7 @@
 
   ;; ---- what the watcher may touch ----------------------------------------
   ;;
-  ;; ⭐ THE WATCHER LIVES ABOVE actor AND TOUCHES NO RECORD FIELD. It reaches
+  ;; THE WATCHER LIVES ABOVE actor AND TOUCHES NO RECORD FIELD. It reaches
   ;; the connection's shared state only through the operations below, which
   ;; are the same ones writers use, so there is exactly one discipline for the
   ;; gate rather than one per caller.
@@ -3711,29 +3711,29 @@
   (define (tls-conn-set-holder-monitor! c m)
     (let ((t (conn-tls c))) (when t (conn-tls-set-holder-monitor! t m))))
 
-  ;; ⭐ "THE BUFFER IS EMPTY" AND "THE GATE IS OPEN" ARE ONE FACT (Z14).
+  ;; "THE BUFFER IS EMPTY" AND "THE GATE IS OPEN" ARE ONE FACT (Z14).
   ;; They are established in the SAME region, and that is the whole content of
   ;; this procedure's correctness. Deciding emptiness in one region and opening
   ;; in a second left a window in between: the watcher is interruptible there,
   ;; the event-loop process can run a read callback, tls-read-plaintext! sees
   ;; gated? still #t and appends B to inbound -- and then the second region
-  ;; opens the gate and this call returns. ⛔ NOTHING REVISITS B. The watcher
+  ;; opens the gate and this call returns. NOTHING REVISITS B. The watcher
   ;; calls open-and-drain ONCE (tls-watch.sc), so that plaintext was stranded
   ;; for the life of the connection, with no error and no counter moving.
   ;;
-  ;; ⭐ THE GATE STAYS SHUT UNTIL A ROUND FINDS NOTHING LEFT. Each round takes
+  ;; THE GATE STAYS SHUT UNTIL A ROUND FINDS NOTHING LEFT. Each round takes
   ;; a batch with the gate STILL CLOSED and delivers it outside the region, so
   ;; anything arriving meanwhile is appended to the buffer and cannot overtake
   ;; what is already in flight. Only the round that finds the buffer empty
   ;; opens the gate, in that same region. Bytes therefore either arrived
   ;; before (buffered, drained here, in order) or after (delivered directly).
   ;;
-  ;; ⚠ THE DELIVERIES MUST STAY OUTSIDE. deliver can raise and can be
+  ;; THE DELIVERIES MUST STAY OUTSIDE. deliver can raise and can be
   ;; preempted; holding the region across an arbitrary number of them would
   ;; make the drain's cost unbounded inside a no-interrupt window. Only the
   ;; empty decision, the gate fields, the timestamps and the counters are in.
   ;;
-  ;; ⛔ THE OWNER IS CHECKED BEFORE THE BUFFER IS TAKEN. Clearing first and
+  ;; THE OWNER IS CHECKED BEFORE THE BUFFER IS TAKEN. Clearing first and
   ;; then finding no owner discarded that plaintext permanently. on-accept is
   ;; external code and may simply not install one, so the connection is
   ;; retired instead -- with a reason a cell can read.
@@ -3754,7 +3754,7 @@
                                  ;; the seam this fix closed, so the point
                                  ;; exists to show it STAYS closed.
                                  ;;
-                                 ;; ⛔ SKIPPED BY CONSTRUCTION: the region is
+                                 ;; SKIPPED BY CONSTRUCTION: the region is
                                  ;; held, so a victim cannot park here -- and
                                  ;; must not, since parking would reopen the
                                  ;; window by hand. A cell arms it to prove the
@@ -3786,7 +3786,7 @@
   ;; Best-effort nudge. A lost ping costs latency only: the watcher has a
   ;; timed receive and re-reads the waiter list on every wake (Z8).
   (define (tls-gate-ping! t)
-    ;; ⛔ SUPPRESSION IS A TEST CONTROL, NOT A FAILURE MODE. Armed, it drops
+    ;; SUPPRESSION IS A TEST CONTROL, NOT A FAILURE MODE. Armed, it drops
     ;; the ping so a waiter can only be woken by a release -- which is how the
     ;; row that claims "a lost ping costs latency only" is made to prove it
     ;; rather than assert it.
@@ -3797,7 +3797,7 @@
   ;; Release the gate and hand it to the next waiter, in ONE step on the shared
   ;; state; the reply to the woken writer is sent OUTSIDE it.
   ;;
-  ;; ⭐ WHOEVER TAKES THE ENTRY IS THE ONE WHO ANSWERS IT. The list is read and
+  ;; WHOEVER TAKES THE ENTRY IS THE ONE WHO ANSWERS IT. The list is read and
   ;; rewritten inside the region, so a retirement racing this either finds the
   ;; entry still on the list (and refuses it) or does not see it at all (and
   ;; this call answers it). There is no test of whether the watcher is alive
@@ -3827,7 +3827,7 @@
           ;; the new holder is monitored by the watcher, not by us (Z5)
           (tls-gate-announce-holder! t (car next)))
         (else
-          ;; ⭐ A CLEAN CLOSE THAT WAS WAITING FOR THIS RELEASE FINISHES HERE,
+          ;; A CLEAN CLOSE THAT WAS WAITING FOR THIS RELEASE FINISHES HERE,
           ;; and until now nothing did it. tls-conn-close-clean! returns when a
           ;; holder is mid-aggregate, and its comment said "its release finds
           ;; the closing flag and finishes the shutdown" -- a mechanism that
@@ -3850,7 +3850,7 @@
           (let* ((bv (car ss))
                  (n (bytevector-length bv))
                  (take (fxmin tls-chunk-size (fx- n off))))
-            ;; ⭐ ONE OUTER REGION PER CHUNK UNIT (Y5), and its FIRST act is
+            ;; ONE OUTER REGION PER CHUNK UNIT (Y5), and its FIRST act is
             ;; the field test (Delta 12). A conn retired between two chunks
             ;; must not start another one: the session it would write into has
             ;; been freed. The field is the same one retirement detaches, so
@@ -3874,7 +3874,7 @@
                                           (conn-tls-session t) piece)))
                                (tls-agg-set-pending!
                                  agg (fx+ (tls-agg-pending agg) 1))
-                               ;; ⭐ THE BLOCK IS REGISTERED BEFORE IT IS
+                               ;; THE BLOCK IS REGISTERED BEFORE IT IS
                                ;; SUBMITTED. uv_try_write can complete INLINE,
                                ;; so a completion can run before this call
                                ;; returns -- registering afterwards would
@@ -3884,7 +3884,7 @@
                                (let ((sz (bytevector-length out)))
                                  (note-raw-block! t agg sz)
                                  (inject-fault! 'tls-between-chunks)
-                                 ;; ⭐ CHARGED ONLY ONCE THE SUBMISSION IS
+                                 ;; CHARGED ONLY ONCE THE SUBMISSION IS
                                  ;; ACCEPTED. Charging before this point left
                                  ;; the money unrecoverable when anything
                                  ;; between the two raised: the completion
@@ -3892,7 +3892,7 @@
                                  ;; a raise before it means no completion will
                                  ;; ever exist to give it back.
                                  (tls-conn-charge! t sz)
-                                 ;; ⭐ THE SIZE TRAVELS IN THE CLOSURE. A side
+                                 ;; THE SIZE TRAVELS IN THE CLOSURE. A side
                                  ;; table keyed by (conn . aggregate) would
                                  ;; answer for the LAST block of an aggregate,
                                  ;; refunding the wrong amount whenever an
@@ -3916,7 +3916,7 @@
                 ;; "preemption between chunk units is preserved" true; these
                 ;; points stand exactly in that gap.
                 ;;
-                ;; ⭐ PARK. A victim stops between two chunks of ONE aggregate
+                ;; PARK. A victim stops between two chunks of ONE aggregate
                 ;; while holding the gate -- the state that distinguishes
                 ;; "aggregates are serialised" from "steps are serialised".
                 ;; Two points rather than one so a cell can hold two
@@ -3929,7 +3929,7 @@
                  (inject-barrier! 'agg-chunk-boundary-2)
                  (loop ss (fx+ off take)))
                 (else
-                 ;; ⛔ GUARDED so it never fires after the LAST chunk. Without
+                 ;; GUARDED so it never fires after the LAST chunk. Without
                  ;; (pair? (cdr ss)) the final transition parks a victim whose
                  ;; next act is to seal and release -- there is no following
                  ;; chunk to race with, so the park would be a boundary that
@@ -3946,7 +3946,7 @@
     (conn-tls-set-raw-queued! t (fx+ (conn-tls-raw-queued t) n))
     (conn-tls-set-charged! t (fx+ (conn-tls-charged t) n)))
 
-  ;; ⭐ THE REFUND HAPPENS ON EVERY OUTCOME (X4), and it is asserted BEFORE
+  ;; THE REFUND HAPPENS ON EVERY OUTCOME (X4), and it is asserted BEFORE
   ;; teardown clears the counters: charged-total and refunded-total are
   ;; monotonic, so a skipped refund shows up as an inequality that teardown
   ;; cannot hide.
@@ -3956,7 +3956,7 @@
       (when (and (fx< status 0) (not (tls-agg-error agg)))
         (tls-agg-set-error! agg status)))
     (tls-conn-refund! t sz)
-    ;; ⭐ THE COMPLETION IS APPENDED, so the snapshot carries the ORDER blocks
+    ;; THE COMPLETION IS APPENDED, so the snapshot carries the ORDER blocks
     ;; finished in rather than leaving a reader to infer it from registration
     ;; order. Inline completions make those two orders differ, which is the
     ;; whole reason the registration happens before the submit.
@@ -3970,13 +3970,13 @@
         (conn-tls-set-raw-queued! t (fx- (conn-tls-raw-queued t) n))
         (conn-tls-set-refunded! t (fx+ (conn-tls-refunded t) n)))))
 
-  ;; ⭐ THE CODEC-AWARE ENTRY, and the only one an application should call.
+  ;; THE CODEC-AWARE ENTRY, and the only one an application should call.
   ;; A plaintext connection goes straight to the raw sink, which is exactly
   ;; what it did before this split -- one field test more. A TLS connection
   ;; has its plaintext encrypted first, under the conn's write gate, and the
   ;; ciphertext reaches the socket through the raw sink above.
   ;;
-  ;; ⚠ THE TEST IS THE FIELD, not a flag someone sets alongside it: the same
+  ;; THE TEST IS THE FIELD, not a flag someone sets alongside it: the same
   ;; field retirement detaches. A conn retired mid-write therefore stops being
   ;; a TLS conn for every subsequent write, which is the behaviour the chunk
   ;; loop relies on (Delta 12).
@@ -4068,7 +4068,7 @@
   ;; for the guarantee this procedure advertises, NOT an optimisation, and
   ;; it costs nothing: uv_close only files the handle for its close
   ;; callback and does not block.
-  ;; ⭐ A TLS CONNECTION CLOSES CLEANLY, A PLAINTEXT ONE CLOSES. The dispatch
+  ;; A TLS CONNECTION CLOSES CLEANLY, A PLAINTEXT ONE CLOSES. The dispatch
   ;; is on the same field retirement detaches, so a conn already retired takes
   ;; the plain path -- which is what retirement itself relies on when it calls
   ;; this after detaching.
@@ -4084,7 +4084,7 @@
         (conn-set-state! c 'closing)
         (uv-close (conn-handle c) on-close-entry))))
 
-  ;; ⭐ CLEAN CLOSE REFUSES THE ALREADY-PARKED (Z9). Entering the closing
+  ;; CLEAN CLOSE REFUSES THE ALREADY-PARKED (Z9). Entering the closing
   ;; state refuses EVERY waiter already on the list, in the same step that
   ;; sets the flag -- refusing only new acquirers would leave whoever was
   ;; parked at that instant waiting for a gate that will never be granted.

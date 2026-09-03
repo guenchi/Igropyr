@@ -143,7 +143,7 @@
 ;;; directions), version 3 widened the call frame to carry the caller's
 ;;; own timeout, and version 4 added boot-id and dial-gen to hello.
 ;;;
-;;; ⚠ THIS SENTENCE COUNTS SOMETHING THAT CHANGES, so check it against
+;;; THIS SENTENCE COUNTS SOMETHING THAT CHANGES, so check it against
 ;;; protocol-version rather than trusting it: the count of raises is
 ;;; that constant minus one. It said "two" while the constant already
 ;;; read 4.
@@ -177,7 +177,7 @@
 ;;;    ceilings on what a peer can make this node spawn, outbound by a
 ;;;    ceiling on bytes queued for a peer that has stopped reading (see
 ;;;    max-outbound-bytes). Bulk data is not meant to ride the control
-;;;    link and should get its own connection -- ⚠ that is advice, not
+;;;    link and should get its own connection -- that is advice, not
 ;;;    something this layer enforces: rsend will carry whatever it is
 ;;;    given, and the suite sends a 70 000-character message through it.
 ;;;
@@ -209,7 +209,7 @@
           monitor-node/token demonitor-node/token
           $registrar-seed-gen! $registrar-pid $registrar-queue-length
           $registrar-peer-gen)
-  ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
+  ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
   ;; the note in libuv.sc; test/inject-isolation.ss is what measures it.
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv) (igropyr sexpr)
@@ -252,7 +252,7 @@
   ;; wire-safe symbol is restricted by the writer to a printable ASCII
   ;; subset, so a name is one byte per character today.
   ;;
-  ;; ⭐ RE-MEASURE RATHER THAN TRUST THESE. They were 112 and 367 for the
+  ;; RE-MEASURE RATHER THAN TRUST THESE. They were 112 and 367 for the
   ;; v3 shape and went stale the day boot-id and dial-gen were added, so
   ;; the next wire change stales them again:
   ;;
@@ -358,7 +358,7 @@
   ;; replaces the row addressed to itself, inside an atomic region, after
   ;; re-reading it and comparing with eq?.
   ;;
-  ;; ⭐ THE CORRECTNESS COMES FROM THE REGION, NOT FROM THE RE-READ. The
+  ;; THE CORRECTNESS COMES FROM THE REGION, NOT FROM THE RE-READ. The
   ;; region is uninterruptible under this scheduler, so nothing can land
   ;; between the read and the replace; that alone is why no update is
   ;; lost. The eq? comparison is redundant defence, not a synchronisation
@@ -413,7 +413,7 @@
   ;; condition carries a token so that a guard which sees it re-raises
   ;; rather than treating it as a refused proof.
   ;;
-  ;; ⛔ THAT TOKEN DOES NOT CROSS INTO THE CONNECTOR, AND AN EARLIER
+  ;; THAT TOKEN DOES NOT CROSS INTO THE CONNECTOR, AND AN EARLIER
   ;; VERSION HERE SAID IT DID. Written from a grep: every path to
   ;; next-dial-gen! runs in registrar-loop -- three direct calls, plus
   ;; peer-gen, whose only caller is also there. None of them is inside
@@ -423,7 +423,7 @@
   ;; reports and dies -- and with it every future dial, since it is the
   ;; process that hands out generations.
   ;;
-  ;; ⚠ NAMED RESIDUAL: the registrar is spawned bare, with no
+  ;; NAMED RESIDUAL: the registrar is spawned bare, with no
   ;; supervision, so an unexpected raise inside it ends it with nothing
   ;; restarting it. THIS trigger attempts to print a diagnostic first
   ;; (see the display below; display can itself raise or block, so even
@@ -448,7 +448,7 @@
   ;; is reached separately by stop-link!. What is claimed here is only
   ;; that neither the report nor the registrar's death is what stops it.
   ;;
-  ;; ⚠ THAT IS DELIBERATELY LESS THAN THE PARAGRAPH USED TO SAY. Four
+  ;; THAT IS DELIBERATELY LESS THAN THE PARAGRAPH USED TO SAY. Four
   ;; successive revisions tried to enumerate what those branches do to a
   ;; live attempt, and each one was wrong in a new way -- a queued
   ;; node-stop described as a stop, a connector kill described as
@@ -475,25 +475,25 @@
   ;; region of its own -- but it keeps one anyway, because "only the
   ;; registrar calls it" is a fact about today's callers and the counter
   ;; would be silently wrong if that stopped being true.
-  ;; ⛔ GENERATION 0 IS NEVER ISSUED, and a stored 0 means ABSENT. It is
+  ;; GENERATION 0 IS NEVER ISSUED, and a stored 0 means ABSENT. It is
   ;; the explicit spelling of "this peer has no generation yet", written
   ;; into the table so that the registrar's tails can advance the counter
   ;; with a replace-in-place instead of an insert -- an insert can grow
   ;; the table, and these tails advance inside a region where nothing may
   ;; allocate.
   ;;
-  ;; ⚠ THE READ HAS TO KNOW THAT, which is the whole cost of the trick: a
+  ;; THE READ HAS TO KNOW THAT, which is the whole cost of the trick: a
   ;; bare hashtable-ref would hand back 0 as though it were a generation,
   ;; because 0 is a true value in Scheme. Numbering starts at 1 and the
   ;; wire proof is built from it, so a 0 reaching an authorisation is a
   ;; peer dialling under a generation no epoch ever had.
   ;;
-  ;; ⭐ THIS IS ALSO WHAT MAKES A RAISE IN PHASE (a) HARMLESS. If a tail
+  ;; THIS IS ALSO WHAT MAKES A RAISE IN PHASE (a) HARMLESS. If a tail
   ;; dies after pre-placing 0 and before advancing, what it leaves is a
   ;; peer that reads as having no generation -- exactly its state before
   ;; the command arrived.
   ;;
-  ;; ⭐ A 0 IS WRITTEN HERE BUT NEVER READ. The command that wrote it holds
+  ;; A 0 IS WRITTEN HERE BUT NEVER READ. The command that wrote it holds
   ;; the queue head and either completes (advancing 0->1) or the node
   ;; fail-stops; peer-gen's only caller is attempt-register, behind it in
   ;; the FIFO. The guard is defensive, and 'registrar-endpoint-after-spawn
@@ -511,12 +511,12 @@
         (hashtable-set! dial-gens peer 0))))
 
   ;; ---- test seam ------------------------------------------------------
-  ;; ⛔ R6-8' NEEDS A PEER ONE GENERATION FROM EXHAUSTION, and there is no
+  ;; R6-8' NEEDS A PEER ONE GENERATION FROM EXHAUSTION, and there is no
   ;; way to get one by using the library: reaching 2^64-1 honestly would
   ;; take longer than the universe has had. So the counter is settable,
   ;; and only when this artifact was expanded with injection on.
   ;;
-  ;; ⚠ THIS READS IGROPYR_INJECT A SECOND TIME. (igropyr inject) has its
+  ;; THIS READS IGROPYR_INJECT A SECOND TIME. (igropyr inject) has its
   ;; own copy of this switch and this is deliberately not shared: the
   ;; alternative is exporting the mode from there, which would make a
   ;; production artifact's expansion depend on it. Both are computed from
@@ -527,7 +527,7 @@
     (let ((v (getenv "IGROPYR_INJECT")))
       (if (and v (string=? v "on")) 'on 'off)))
 
-  ;; ⭐ THE OFF FORM REFUSES RATHER THAN DOING NOTHING. A silent no-op
+  ;; THE OFF FORM REFUSES RATHER THAN DOING NOTHING. A silent no-op
   ;; would let a cell that forgot IGROPYR_INJECT=on run green while
   ;; seeding nothing -- the counter would stay at 0, no exhaustion would
   ;; happen, and the cell would be asserting about a peer it never
@@ -542,7 +542,7 @@
          "test seam: this artifact was expanded without IGROPYR_INJECT=on"
          peer))))
 
-  ;; ⚠ THE DEFAULT OF 0 IS LOAD-BEARING TWICE OVER: for a peer with no
+  ;; THE DEFAULT OF 0 IS LOAD-BEARING TWICE OVER: for a peer with no
   ;; row at all, and for one whose row was pre-placed at 0 by
   ;; pretouch-dial-gen!. Both mean "none yet", and both make this produce
   ;; 1 as the first generation -- which is the numbering the wire proof
@@ -553,7 +553,7 @@
                  (if (>= n dial-gen-limit)
                      #f
                      (begin (hashtable-set! dial-gens peer n) n))))))
-      ;; ⛔ THIS RAISES SILENTLY, and the silence is the point. The
+      ;; THIS RAISES SILENTLY, and the silence is the point. The
       ;; registrar calls this from inside an interrupt-disabled region,
       ;; and `display` there would put an I/O call -- which can block and
       ;; can itself raise -- inside a region whose whole purpose is that
@@ -561,7 +561,7 @@
       ;; caller, which is outside the region and knows which command it
       ;; was running.
       ;;
-      ;; ⚠ PRINTING IS THE CALLER'S JOB FROM HERE ON. Every caller today
+      ;; PRINTING IS THE CALLER'S JOB FROM HERE ON. Every caller today
       ;; is inside the registrar, which does it in one place, so the
       ;; obligation is discharged exactly once. A future caller from
       ;; anywhere else inherits it: raise reaches it with no message
@@ -605,7 +605,7 @@
   ;; opposite -- the peer mints it and we file entries under it, so its
   ;; counter can restart while our entries have not gone yet.
   ;;
-  ;; ⇒ "It is a counter" is not by itself an argument for either. What
+  ;; => "It is a counter" is not by itself an argument for either. What
   ;; settles it is whether the counter and the table that keys on it live
   ;; in the same process.
   (define rcall-counter 0)
@@ -626,20 +626,20 @@
   (define caller-agents (make-eqv-hashtable))
   (define owner-agents (make-eqv-hashtable))
   (define callee-agents (make-hashtable equal-hash equal?))
-  ;; ⚠ THIS IS A COUNTER, NOT A GENSYM, and code elsewhere depends on the
+  ;; THIS IS A COUNTER, NOT A GENSYM, and code elsewhere depends on the
   ;; difference. Within one run of this process it does not repeat, so
   ;; anything filed under an mref can be found again by that mref alone.
   ;; That is what lets several tables key on it without also recording
   ;; which connection an entry belongs to.
   ;;
-  ;; ⛔ ACROSS A RESTART IT REPEATS: it starts at zero again, so a peer
+  ;; ACROSS A RESTART IT REPEATS: it starts at zero again, so a peer
   ;; that restarts sends mref 1 for something new. What keeps that from
   ;; colliding is not this counter. Two things share the work, and the
   ;; division matters:
   ;;   - a real drop, and a replacement BY A NEW RUN, run the sweep that
   ;;     tells this peer's hosted monitors to stop, so entries filed
   ;;     under the old run's mrefs are on their way out;
-  ;;   - ⛔ a replacement by the SAME run does not, deliberately: those
+  ;;   - a replacement by the SAME run does not, deliberately: those
   ;;     watches are still wanted, and their mrefs did not restart.
   ;; The removal is not instant either way, and the window where an old
   ;; run's entry is still present is covered by the arming clause's
@@ -748,7 +748,7 @@
   ;; Node identity is never reused: a record is built once, for one
   ;; monitor, and is not recycled after it retires. That is what removes
   ;; the ABA question a token would otherwise have to answer.
-  ;; ⭐ SLOT 2 IS THE PEER'S BOOT ID, AND IT USED TO BE THE CONNECTION.
+  ;; SLOT 2 IS THE PEER'S BOOT ID, AND IT USED TO BE THE CONNECTION.
   ;; What this record has to answer is "is the request in front of me the
   ;; same watch as this one", and a connection is the wrong name for that
   ;; now that the outbound write is fenced on the run: an agent armed on
@@ -758,22 +758,22 @@
   ;; so calling it stale was measuring something that had stopped
   ;; mattering -- and the protocol advertises a repeat of the same
   ;; request as free, so peers are entitled to send one.
-  ;; ⛔ MERELY DELETING THE COMPARISON WOULD BE WRONG THE OTHER WAY: a
+  ;; MERELY DELETING THE COMPARISON WOULD BE WRONG THE OTHER WAY: a
   ;; NEW run reusing the same mref and name would then be told "already
   ;; armed" by the previous run's still-exiting agent, because that
   ;; counter restarts. The run has to be PART of the identity, not
   ;; absent from it.
   ;;
-  ;; ⛔ THIS SLOT'S MEANING IS NOT PROTECTED BY THE COMPILER. Renaming
+  ;; THIS SLOT'S MEANING IS NOT PROTECTED BY THE COMPILER. Renaming
   ;; the accessor catches every NAMED reader, and that is the whole of
   ;; what it catches: a positional (vector-ref r 2) elsewhere would go on
   ;; compiling and would now be reading a boot id where it meant a
   ;; connection. When this slot changed, the sweep for such readers was
   ;; done by hand -- every (vector-ref _ 2) in the file was read and
   ;; judged, and make-agent-rec's single call site was confirmed -- and
-  ;; it came back clean. ⚠ That is an enumeration, not a guarantee, and
+  ;; it came back clean. That is an enumeration, not a guarantee, and
   ;; it expires the moment somebody adds a POSITIONAL reader.
-  ;; ⛔ So do it again before changing this slot, and do not mistake the
+  ;; So do it again before changing this slot, and do not mistake the
   ;; accessor rename for cover.
   (define (make-agent-rec pid name boot-id key peer)
     (vector pid name boot-id key peer #f #f #f #f))
@@ -828,7 +828,7 @@
   ;; per-peer chain out in one operation and then walks it -- so each half
   ;; is idempotent and safe to call on a node already out of that chain.
   ;;
-  ;; ⭐ SECOND TIME IN THIS FILE that a property is bought by collapsing
+  ;; SECOND TIME IN THIS FILE that a property is bought by collapsing
   ;; call sites rather than by asking each of them to behave:
   ;; retire-rec-locked! does it for "the count comes down in one place". Said once so the
   ;; pattern reads as a decision rather than a coincidence -- when a rule
@@ -864,7 +864,7 @@
   ;; is exactly the shape a peer could aim at by parking as many as the
   ;; ceiling allows.
   ;;
-  ;; ⭐ THE CAPTURE IS NOW HELD BY THE CALLER'S TRANSACTION. Both callers
+  ;; THE CAPTURE IS NOW HELD BY THE CALLER'S TRANSACTION. Both callers
   ;; run this inside the same atomic region that publishes or removes the
   ;; peers entry, and hang the returned head under a sentinel they
   ;; allocated beforehand. This procedure therefore has exactly one job
@@ -898,12 +898,12 @@
   ;; incrementing another for every node of a spliced chain -- inside the
   ;; region, which is the O(N) this arrangement exists to avoid.
   ;;
-  ;; ⭐ BEING DERIVED IS ALSO WHY EVICTION CANNOT FAIL, and that is the
+  ;; BEING DERIVED IS ALSO WHY EVICTION CANNOT FAIL, and that is the
   ;; part worth guarding. There is no retiring table, so there is no
   ;; insertion into one, so there is nothing on that path that allocates
   ;; and nothing that can raise for want of memory.
   ;;
-  ;; ⚠ ONE EXCEPTION EXISTS AND IT IS NOT ON THIS PATH: next-event-seq!
+  ;; ONE EXCEPTION EXISTS AND IT IS NOT ON THIS PATH: next-event-seq!
   ;; allocates when the sequence counter first exceeds a fixnum. It is
   ;; named there, with why it is not fixed. Sentences like the one above
   ;; are only true because that one is written down somewhere. Storing the phase
@@ -911,7 +911,7 @@
   ;; allocation back inside the splice, and a splice that can fail is a
   ;; cleanup that can fail, which is the shape this design refused.
   ;;
-  ;; ⚠ THE DESIGN NOTE ON THIS SAYS SOMETHING ELSE, and it would go on
+  ;; THE DESIGN NOTE ON THIS SAYS SOMETHING ELSE, and it would go on
   ;; saying it. Its argument is that each admitted monitor pre-pays the
   ;; slot it will need at retirement, so eviction always has room. That
   ;; is true and it is not what makes eviction infallible here: paying in
@@ -1101,7 +1101,7 @@
           (`#(node-stop) (void))))))
 
   ;; THE WARDEN'S JOB IS TO KEEP ITS CHILDREN RUNNING, and every
-  ;; addition has to earn its place. ⚠ An earlier version of this line
+  ;; addition has to earn its place. An earlier version of this line
   ;; said it "does three things and may never do a fourth" -- monitor
   ;; the reaper, spawn a replacement, let it rescan -- which the body no
   ;; longer matches: it supervises two children, keeps death windows and
@@ -1114,7 +1114,7 @@
   ;; WHAT IS FAIL-STOP HERE IS THE WARDEN, NOT THE REAPER. The design says
   ;; a reaper failure must not take the node down, and it still does not --
   ;; it is restarted. What cannot be recovered from is losing the thing
-  ;; that restarts it. ⚠ That was "a dozen lines with no business logic"
+  ;; that restarts it. That was "a dozen lines with no business logic"
   ;; when this was written and is no longer: the body now carries death
   ;; windows, counters, backoff, diagnostics, a persistence rule, the
   ;; fail-stop policy and child shutdown. The argument does not depend on
@@ -1122,7 +1122,7 @@
   ;;
   ;; This is a trade rather than a removal: the risk moves from a process
   ;; that does ordinary per-workload work to one that does none (it is
-  ;; live alongside the workload, it just has no part in it) -- ⚠ not to
+  ;; live alongside the workload, it just has no part in it) -- not to
   ;; one
   ;; that "runs only when the first one dies", which an earlier version
   ;; of this line said and which is false: the warden starts both
@@ -1151,7 +1151,7 @@
   ;; five deaths whether they took a third of a second or an hour, and
   ;; the first of those is the definition of transient.
   ;;
-  ;; ⚠ THE COUNT IS A FLOOR, NOT A CEILING, and it used to be the other
+  ;; THE COUNT IS A FLOOR, NOT A CEILING, and it used to be the other
   ;; way round. While it was the only test, "max" was its name and its
   ;; meaning. As one half of a conjunction it is the number of deaths
   ;; before the elapsed-time test begins to apply, and restarts routinely
@@ -1169,7 +1169,7 @@
   ;; child-min-persist-ms; the death that crosses it is the one that
   ;; raises.
   ;;
-  ;; ⚠ THAT DEATH IS NOT FOLLOWED BY A RESTART. The give-up raises
+  ;; THAT DEATH IS NOT FOLLOWED BY A RESTART. The give-up raises
   ;; before start!, so the last restart is the one before the crossing --
   ;; a sentence here used to say "the restart that crosses it is the last
   ;; one", which counts one restart that never happens.
@@ -1190,7 +1190,7 @@
   ;; is recovered from; losing the thing that recovers is not, and that
   ;; thing is no longer the "page with no business logic" an earlier
   ;; version of this line claimed; see the fail-stop paragraph above for
-  ;; what it actually carries. ⚠ No size claim replaces it -- "smaller
+  ;; what it actually carries. No size claim replaces it -- "smaller
   ;; than the reaper" would be one more unmeasured comparison, and the
   ;; argument here never needed one.
   ;;
@@ -1281,7 +1281,7 @@
                     (vector-set! delays i
                       (fxmin child-restart-cap-ms
                              (if (fx= d 0) 50 (fx* d 2)))))
-                  ;; A CONJUNCTION, and ⚠ NEITHER HALF IS MONOTONE. Both
+                  ;; A CONJUNCTION, and NEITHER HALF IS MONOTONE. Both
                   ;; can fall: the count drops as timestamps leave the
                   ;; window, and the elapsed time shrinks when the oldest
                   ;; retained death is the one that left. An earlier note
@@ -1361,7 +1361,7 @@
   ;; is pointer writes plus at most an existing-key update or a delete,
   ;; and kill of a process nothing is watching sends nothing.
   ;;
-  ;; ⭐ "NOTHING IS WATCHING IT" IS NOT A CLAIM ABOUT TIMING. The whole
+  ;; "NOTHING IS WATCHING IT" IS NOT A CLAIM ABOUT TIMING. The whole
   ;; install runs in one region, and the reaper is told about the new
   ;; agent only after that region is left. So at the moment this runs,
   ;; nothing outside has had the opportunity to do anything at all --
@@ -1387,7 +1387,7 @@
   ;; REPLACEMENT -- leaving a live agent in no table, on no chain, in no
   ;; count, findable by no later demon, and its credit returned twice.
   ;;
-  ;; ⚠ THE NOTE THAT USED TO STAND FOR THIS SAID retire-agent! WAS
+  ;; THE NOTE THAT USED TO STAND FOR THIS SAID retire-agent! WAS
   ;; IDEMPOTENT. It is, and that is not the property required.
   ;; Idempotence says deleting twice does not break; it says nothing
   ;; about deleting the same thing twice. The distinction is the whole
@@ -1554,7 +1554,7 @@
 
   ;; Admit one holder, or refuse. Returns the new process, or #f.
   ;;
-  ;; ⭐ THE SPAWN IS INSIDE THE REGION, AND THAT IS THE WHOLE POINT: while
+  ;; THE SPAWN IS INSIDE THE REGION, AND THAT IS THE WHOLE POINT: while
   ;; this process holds interrupts off, the child it just created cannot
   ;; be scheduled, so there is no instant at which a slot exists with no
   ;; owner recorded, and none at which a child is serving before it is
@@ -1564,7 +1564,7 @@
   ;; is worse still, because the child can start serving before anyone
   ;; has decided it may.
   ;;
-  ;; ⚠ THIS IS ONLY SAFE BECAUSE INTERRUPT REGIONS NOW UNWIND. The spawn
+  ;; THIS IS ONLY SAFE BECAUSE INTERRUPT REGIONS NOW UNWIND. The spawn
   ;; is the one thing left in here that allocates, and allocation raises.
   ;; Before that change, a raise in here would have left this process's
   ;; interrupt count high and its preemption off for good -- silently.
@@ -1574,7 +1574,7 @@
   ;;
   ;; The pre-check outside is an optimisation and nothing more: it keeps
   ;; a flood from allocating a record and a process per refused call.
-  ;; ⛔ THE CHECK INSIDE THE REGION IS THE ONLY AUTHORITY. The one out
+  ;; THE CHECK INSIDE THE REGION IS THE ONLY AUTHORITY. The one out
   ;; here can be wrong in both directions, and simplifying it into the
   ;; only check would move the ceiling out of the one place where it is
   ;; ordered against everything else.
@@ -1647,7 +1647,7 @@
   ;; Charge n bytes to c, creating its entry if this is the first write.
   ;; -> #t if the connection is over the ceiling AFTER this charge.
   ;;
-  ;; ⚠ Not "if THIS charge is what crossed it", which is what this said
+  ;; Not "if THIS charge is what crossed it", which is what this said
   ;; and is a different claim: the test is `(> v max-outbound-bytes)` on
   ;; the new balance, so a connection already over the line answers #t
   ;; for a charge of any size, including one that was over before this
@@ -1690,7 +1690,7 @@
   ;; only user on the connections it owns (TLS uses it on TLS connections,
   ;; which this layer neither creates nor writes to); a second user here
   ;; would silently displace this one.
-  ;; ⚠ THE PARAGRAPH ABOVE IS TRUE AND IT IS NARROWER THAN IT READS.
+  ;; THE PARAGRAPH ABOVE IS TRUE AND IT IS NARROWER THAN IT READS.
   ;; Everything it describes about the phantom balance is right, and the
   ;; measure it prescribes -- keep interrupts off across both halves --
   ;; closes exactly one of the two ways to land between them. It closes
@@ -1720,13 +1720,13 @@
   ;; nothing -- restoring a balance writes a key already present, and
   ;; removing one cannot grow a table -- so on the implementation this
   ;; runs on there is nothing in it that allocates, which was measured
-  ;; rather than assumed. ⚠ That is a statement about this Chez and these
+  ;; rather than assumed. That is a statement about this Chez and these
   ;; two operations, not a law: a hashtable whose delete could compact,
   ;; or a rewrite that made the restore anything but an update in place,
   ;; would end it. "Cannot fail" is shorthand for that, and shorthand is
   ;; what the sentence above this one used to be.
   ;;
-  ;; ⚠ The re-raise is `raise`, so a continuable condition arriving here
+  ;; The re-raise is `raise`, so a continuable condition arriving here
   ;; leaves as non-continuable. Nothing in this file raises one on this
   ;; path today; it is said because a future one would be silently
   ;; downgraded rather than refused. It does not
@@ -1913,7 +1913,7 @@
 
   ;; #t if it removed n, #f if n was not this head's first node.
   ;;
-  ;; ⚠ `and`, NOT `when`. A `when` whose test fails yields the unspecified
+  ;; `and`, NOT `when`. A `when` whose test fails yields the unspecified
   ;; value, and that value is TRUE -- so every caller asking "did the
   ;; removal happen?" would have been told yes. The sibling comment on
   ;; lease-detach! already described this procedure as reporting #f; it
@@ -2106,7 +2106,7 @@
   ;; registration for that name -- and both are scoped to one name, so
   ;; nothing here reclaims a name that is never touched again.
   ;;
-  ;; ⛔ THERE IS NO THIRD MOMENT. A sweeper that filtered this table by
+  ;; THERE IS NO THIRD MOMENT. A sweeper that filtered this table by
   ;; pid used to sit in this file with no caller: it had been superseded
   ;; by the two above and left behind. It is deleted, and this sentence
   ;; replaces it, because a procedure that looks like a cleanup path is
@@ -2186,7 +2186,7 @@
   ;; to save a lookup. The token carries its own name instead, so there is
   ;; nothing for a caller to get wrong and no table to scan.
   ;;
-  ;; ⚠ EXPLICIT PREMISE: holding the token IS the authority to end that
+  ;; EXPLICIT PREMISE: holding the token IS the authority to end that
   ;; subscription. Tokens are not meant to be passed around, and nothing
   ;; here enforces that -- a process given someone else's token can
   ;; unsubscribe them. Said out loud because it is the kind of assumption
@@ -2209,7 +2209,7 @@
   ;; exactly right. What went with it was a subscription whose holder still
   ;; has a token and simply never hears anything again.
   ;;
-  ;; ⭐ The shape is worth naming: a defect that does MORE than it was
+  ;; The shape is worth naming: a defect that does MORE than it was
   ;; asked passes every check that only asks whether the requested thing
   ;; happened.
   (define (demonitor-node name)
@@ -2300,7 +2300,7 @@
   ;; identity, never by contents.
   ;; The name rides along so an unsubscribe can find the right bucket
   ;; without a second table and without asking the caller to remember it
-  ;; too. ⚠ It is routing information, never identity: two tokens for the
+  ;; too. It is routing information, never identity: two tokens for the
   ;; same name are different objects and are never equal, because nothing
   ;; ever compares their contents.
   (define (new-sub-token name) (list 'node-subscription name))
@@ -2323,7 +2323,7 @@
   ;; it as one.
   (define event-seq-counter 0)
 
-  ;; ⛔ THIS IS THE ONE ALLOCATING STEP LEFT ON THE ENQUEUE PATH, and it
+  ;; THIS IS THE ONE ALLOCATING STEP LEFT ON THE ENQUEUE PATH, and it
   ;; is the exception to every "nothing here allocates" written around
   ;; qhead-enqueue! and the eviction splice. The increment is generic `+`,
   ;; not fx+: one past the largest fixnum it builds a BIGNUM, and building
@@ -2331,7 +2331,7 @@
   ;; holding the region, so a raise there is a raise inside the region
   ;; those other comments describe as failure-free.
   ;;
-  ;; ⭐ CONSIDERED AND DELIBERATELY NOT FIXED. fx+ with wraparound or
+  ;; CONSIDERED AND DELIBERATELY NOT FIXED. fx+ with wraparound or
   ;; saturation removes the allocation and takes monotonicity with it,
   ;; and monotonicity is the whole content of a sequence number --
   ;; consumers compare these, and a counter that wraps makes an old event
@@ -2341,7 +2341,7 @@
   ;; recorded rather than closed, because closing it costs the property
   ;; the field exists for.
   ;;
-  ;; ⚠ READERS MUST NOT DO FX ARITHMETIC ON A seq, and this is an
+  ;; READERS MUST NOT DO FX ARITHMETIC ON A seq, and this is an
   ;; EXTERNAL contract, not an internal convention: the value leaves the
   ;; library in `#(node-up name token seq)` from monitor-node/token.
   ;; Inside, every reader today only displays it, stores it in a vector,
@@ -3111,14 +3111,14 @@
   ;; the number a reader can rely on rather than a number the truncation
   ;; suffix then overruns -- the earlier spelling capped the CONTENT at
   ;; 512 and returned 539.
-  ;; ⛔ THE ONE PIN THAT CANNOT NAME ITS OWN DEFAULT, and it is not the
+  ;; THE ONE PIN THAT CANNOT NAME ITS OWN DEFAULT, and it is not the
   ;; same kind of thing as the other thirteen.
   ;; print-select-flonum-exponential-format holds a PROCEDURE, not a
   ;; writable literal, so there is nothing to type into the parameterize
   ;; below. The value is captured here instead, when this library is
   ;; initialised.
   ;;
-  ;; ⚠ IT IS NAMED `captured`, NOT `default`, and the distinction is the
+  ;; IT IS NAMED `captured`, NOT `default`, and the distinction is the
   ;; whole point: if something replaced the parameter before this line
   ;; ran, this captures the REPLACEMENT and pins the log to it. Calling it
   ;; `default` would be a lie in exactly the case the pin exists to
@@ -3150,7 +3150,7 @@
   ;; exit reason, or whatever a guard caught. Used wherever such an object
   ;; is shown to a person.
   ;;
-  ;; ⛔ IT CANNOT BE format's ~s. Chez prints a condition under both ~s
+  ;; IT CANNOT BE format's ~s. Chez prints a condition under both ~s
   ;; and ~a as ONE OPAQUE TOKEN naming its shape and nothing else --
   ;; `#<compound condition>` for a compound one, and a plain one printing
   ;; its own component name -- no message, no irritants, no who. An
@@ -3158,7 +3158,7 @@
   ;; child that dies of a condition logs as that one token unless
   ;; something renders it.
   ;;
-  ;; ⛔ NOR IS display-condition ENOUGH, though it renders correctly.
+  ;; NOR IS display-condition ENOUGH, though it renders correctly.
   ;; Measured, not assumed, on Chez 10.1.0: print-length and print-level
   ;; DO NOT reach inside it (it applies its own). With who = x and a
   ;; 100000-character message it renders 100016 characters; with who = x,
@@ -3190,7 +3190,7 @@
   ;;     indistinguishable from the token in the finished line -- a
   ;;     property of printed Scheme, not a gap in this.
   ;;
-  ;; ⚠ RESIDUAL, and the earlier statement of it was too narrow. Only the
+  ;; RESIDUAL, and the earlier statement of it was too narrow. Only the
   ;; RETAINED RESULT is size-bounded. Not bounded: the time and temporary
   ;; allocation of rendering a piece before put! ever sees it (`show` and
   ;; the format expansion both build their whole result first); the
@@ -3200,7 +3200,7 @@
   ;; characters from a tiny condition, so a small reason is not a small
   ;; rendering.
   ;;
-  ;; ⛔ LOSSES THAT LEAVE NOTHING IN THE LINE. Not a closed list; each
+  ;; LOSSES THAT LEAVE NOTHING IN THE LINE. Not a closed list; each
   ;; entry carries how it is known.
   ;;   - A custom record writer that reads print-length and emits that
   ;;     many fields with no ellipsis of its own: the printer did not do
@@ -3232,7 +3232,7 @@
   ;; unannounced. The trade is deliberate: these silences in place of a
   ;; mark that was sometimes a lie.
   ;;
-  ;; ⛔ WHAT WOULD ACTUALLY BOUND IT is a different shape, recorded as a
+  ;; WHAT WOULD ACTUALLY BOUND IT is a different shape, recorded as a
   ;; gap rather than half-built here: an output port that stops accepting
   ;; characters, a printer that never calls a record-writer somebody else
   ;; wrote, and a restricted reading of the format string rather than
@@ -3273,7 +3273,7 @@
         ;; on ambient state this does not control (Chez 10.1.0, measured).
         ;; A death log should not read differently by accident.
         ;;
-        ;; ⛔ THAT IS A DECISION, AND IT COST THREE ATTEMPTS TO REACH IT.
+        ;; THAT IS A DECISION, AND IT COST THREE ATTEMPTS TO REACH IT.
         ;; Twice this carried machinery to say "something was dropped"
         ;; more loudly than the printer does, and twice the machinery put
         ;; that claim on lines where NOTHING had been dropped -- first a
@@ -3290,7 +3290,7 @@
         ;; about the value. Text a custom writer chose to emit carries no
         ;; such promise.
         ;;
-        ;; ⚠ THE AMBIGUITY IS IN THE NOTATION, not in this code. Under
+        ;; THE AMBIGUITY IS IN THE NOTATION, not in this code. Under
         ;; print-length 4 a trailing ellipsis after four items is always
         ;; the printer's: a fifth element that is itself the symbol `...`
         ;; is cut like any other (Chez 10.1.0, measured -- `(0 1 2 3 ...)`
@@ -3300,7 +3300,7 @@
         ;; in particular, whether the dropped one was also `...`.
         ;; Re-rendering the source object at print-length 5 separates
         ;; them, and a later reader of the log has only the line.
-        ;; ⭐ ONE SET OF PINS, USED BY BOTH RENDERERS -- of the print
+        ;; ONE SET OF PINS, USED BY BOTH RENDERERS -- of the print
         ;; parameters SELECTED below, which is not a claim about every
         ;; parameter that exists; see the scope note at the end. `show` is not the
         ;; only thing here that prints: a condition's own message can
@@ -3356,7 +3356,7 @@
         ;;                                      (captured, see the top of
         ;;                                      this library for why)
         ;;
-        ;; ⚠ THE SCOPE OF ALL THIS, stated because the list above reads
+        ;; THE SCOPE OF ALL THIS, stated because the list above reads
         ;; more complete than it is. In the Chez 10.1.0 matrix tried here,
         ;; every exported `print-*` parameter observed to change the
         ;; BUILT-IN `~s` renderings of the fixtures used is now pinned. It
@@ -3365,7 +3365,7 @@
         ;; does -- and a parameter whose effect none of those fixtures
         ;; provoked looks exactly like one with no effect.
         ;;
-        ;; ⛔ AND THE PINS DO NOT HOLD FOR THE WHOLE RENDER. parameterize
+        ;; AND THE PINS DO NOT HOLD FOR THE WHOLE RENDER. parameterize
         ;; establishes a MUTABLE dynamic binding, so a custom record
         ;; writer called from inside `show` can set any of these
         ;; parameters and change what is printed after it (Chez 10.1.0,
@@ -3403,7 +3403,7 @@
             (let ((who (and (who-condition? v) (condition-who v)))
                   (msg (and (message-condition? v) (condition-message v)))
                   (irr (if (irritants-condition? v) (condition-irritants v) '())))
-              ;; ⭐ WHO GOES LAST, and that is the whole reason the order
+              ;; WHO GOES LAST, and that is the whole reason the order
               ;; is written down. It used to go first, and a `who` long
               ;; enough to fill the budget then pushed the MESSAGE out
               ;; entirely -- the line stayed inside its limit and lost
@@ -3415,7 +3415,7 @@
               ;; printing them apart gives "~s is not a pair with
               ;; irritants ()". Filling it is what display-condition does.
               ;;
-              ;; ⛔ WHICH CONDITIONS THOSE ARE IS NOT A GUESS. Chez marks
+              ;; WHICH CONDITIONS THOSE ARE IS NOT A GUESS. Chez marks
               ;; them: format-condition? reports the presence of an
               ;; &format component. It is true of the primitive runtime
               ;; errors and of errorf, and false of ordinary assertion
@@ -3435,7 +3435,7 @@
               ;; format condition may also have NO irritants and still
               ;; need expanding, for ~~, so the count is not a secondary
               ;; test either.
-              ;; ⚠ Not `(not cut)`. cut means "a write has already
+              ;; Not `(not cut)`. cut means "a write has already
               ;; overflowed", which is not the same as "there is no room
               ;; left": a piece that fills the budget EXACTLY leaves cut
               ;; false, and an unbounded format would then still run
@@ -3449,7 +3449,7 @@
                 (if filled
                     (put! filled)
                     (begin
-                      ;; ⚠ put-shown!, not put! + show: show runs the
+                      ;; put-shown!, not put! + show: show runs the
                       ;; printer, and it must not run once the budget is
                       ;; gone.
                       (cond ((string? msg) (put! msg))
@@ -3616,7 +3616,7 @@
       ;; peer. Nothing about the old one survives it, so no ordering
       ;; question arises and no tie-break applies.
       ;;
-      ;; ⭐ THE PREDICATE IS NAMED BECAUSE TWO PLACES ASK IT. This rule
+      ;; THE PREDICATE IS NAMED BECAUSE TWO PLACES ASK IT. This rule
       ;; sends a new incarnation down the replacement path, and the
       ;; replacement path then has to treat it as the one case that is
       ;; NOT the same peer on a different connection. Spelled out twice
@@ -3678,7 +3678,7 @@
         ;; region below takes, ON A SUCCESSFUL PASS: the spare head and
         ;; one event for a fresh install, one event when adopting an
         ;; orphaned head, two events and no head for a replacement, and
-        ;; nothing for a non-mutating outcome. ⚠ A pass that raises part
+        ;; nothing for a non-mutating outcome. A pass that raises part
         ;; way can consume fewer -- see step 3 -- so this is the
         ;; successful-path enumeration, not an invariant.
         ;;
@@ -3695,7 +3695,7 @@
         ;; enqueue's sequence stamp can allocate a bignum (the enqueue
         ;; itself touches no table).
         ;;
-        ;; ⚠ It does not make the region allocation-free -- see
+        ;; It does not make the region allocation-free -- see
         ;; the note a few lines down, which lists what still allocates
         ;; inside it. An earlier version of this sentence claimed the
         ;; stronger property and was contradicted by its own neighbour. A
@@ -3709,7 +3709,7 @@
                ;; ELSE. The capture in the region below is two pointer
                ;; writes plus an eq-hashtable delete; building the record
                ;; there would add an allocation to a step that has none.
-               ;; ⚠ THE REGION AS A WHOLE IS NOT ALLOCATION-FREE, and an
+               ;; THE REGION AS A WHOLE IS NOT ALLOCATION-FREE, and an
                ;; earlier version of this note implied it was: the rule
                ;; list is built inside it, make-entry runs inside it, and
                ;; qhead-enqueue!'s sequence counter can allocate a bignum
@@ -3764,7 +3764,7 @@
                         ;;      thing that is not: qhead-enqueue! stamps
                         ;;      a sequence number, and that increment can
                         ;;      allocate a bignum at fixnum overflow.
-                        ;;      ⚠ SO THIS STEP CAN RAISE AFTER THE ENTRY
+                        ;;      SO THIS STEP CAN RAISE AFTER THE ENTRY
                         ;;      IS PUBLISHED, which the rest of this list
                         ;;      assumes cannot happen: the install branch
                         ;;      would then hold peers[name] with no
@@ -3783,7 +3783,7 @@
                         ;; undelivered events on it and no way to reach
                         ;; them.
                         (set! cut (hashtable-ref watchers name '()))
-                        ;; ⚠ STEPS 2 AND 3 USED TO BE THE OTHER WAY
+                        ;; STEPS 2 AND 3 USED TO BE THE OTHER WAY
                         ;; ROUND, and the argument for that order was
                         ;; correct when it was written. It said the push
                         ;; was safe because the head was reachable either
@@ -3883,7 +3883,7 @@
                           (qhead-enqueue! h (caddr spare) cut)
                           (hashtable-set! peers name ne))
                         (tcp-close! (entry-conn e))
-                        ;; ⭐ CAPTURE THE HOSTED CHAIN HERE, IN THE SAME
+                        ;; CAPTURE THE HOSTED CHAIN HERE, IN THE SAME
                         ;; TRANSACTION THAT PUBLISHED THE NEW ENTRY. It
                         ;; used to happen later, in a region of its own,
                         ;; and the gap between the two was a window: a
@@ -3891,7 +3891,7 @@
                         ;; under the head this sweep was about to take,
                         ;; and the sweep carried the new run's monitor
                         ;; away with the old run's.
-                        ;; ⭐ Publishing and capturing being one step is
+                        ;; Publishing and capturing being one step is
                         ;; what closes it -- any arm at all is now either
                         ;; before the capture (and belongs to the old run)
                         ;; or after it, under a head this walk cannot
@@ -3899,7 +3899,7 @@
                         ;; happened to buy and becomes one the transaction
                         ;; guarantees.
                         ;;
-                        ;; ⚠ LAST IN THE REGION, and that is not tidiness.
+                        ;; LAST IN THE REGION, and that is not tidiness.
                         ;; Everything above can still raise; if one of
                         ;; them did after mon-heads had been cleared, the
                         ;; chain would be off the table with nobody
@@ -3941,7 +3941,7 @@
              ;; does not do it, so its own death no longer takes the
              ;; events with it.
              ;;
-             ;; ⭐ TWO SWEEPS THE DEATH PATH RUNS AND THIS ONE MUST
+             ;; TWO SWEEPS THE DEATH PATH RUNS AND THIS ONE MUST
              ;; NOT. A replacement is not a death: it is the same peer on
              ;; a different connection, and a watch that crossed the old
              ;; one has to survive. Only state tied to the CONNECTION
@@ -3957,7 +3957,7 @@
              ;;     nothing re-arms it, so the watch would go on existing
              ;;     on one side and being unserviceable on the other.
              ;;
-             ;; ⭐ EXCEPT FOR I6, AND IT IS THE WHOLE REASON THE SECOND
+             ;; EXCEPT FOR I6, AND IT IS THE WHOLE REASON THE SECOND
              ;; SWEEP IS CONDITIONAL RATHER THAN GONE. Two rules send
              ;; work here and they want opposite things. I7/I8 are the
              ;; same peer on a different connection, and its watches must
@@ -3966,7 +3966,7 @@
              ;; parked here is a dead registration that nothing will ever
              ;; come back for.
              ;;
-             ;; ⛔ LEAVING I6'S BEHIND IS NOT A LEAK, IT IS A MISREPORT.
+             ;; LEAVING I6'S BEHIND IS NOT A LEAK, IT IS A MISREPORT.
              ;; A stale agent still watches a live local process. When
              ;; that process dies the agent writes mdown to the PEER
              ;; NAME, which now resolves to the new incarnation -- whose
@@ -3974,7 +3974,7 @@
              ;; name one of ITS watches. The far side then hears that a
              ;; process died which did not, and acts on it.
              ;;
-             ;; ⭐ AND IT IS NOT EXTRA CAUTION. Without the condition
+             ;; AND IT IS NOT EXTRA CAUTION. Without the condition
              ;; the stale records are still reclaimed -- but only lazily,
              ;; and only in part: the mon admission path retires a record
              ;; whose connection is no longer current, so it reaches
@@ -3983,14 +3983,14 @@
              ;; what the old run held and nothing reaches the rest. With
              ;; the condition there is no residue at all.
              ;;
-             ;; ⚠ THE TWO WERE ONE BRANCH ONCE AND THE ARGUMENT FOR
+             ;; THE TWO WERE ONE BRANCH ONCE AND THE ARGUMENT FOR
              ;; REMOVING THE SWEEP WAS CHECKED ON I7/I8 ONLY. It was also
              ;; called a return to what this path did before generations
              ;; existed -- and I6 did not exist before generations, so
              ;; there was no old behaviour for it to return to. A revert
              ;; only covers the paths the old version had.
              ;;
-             ;; ⚠ THE SECOND ONE WAS HERE AND HAD TO BE TAKEN OUT. It
+             ;; THE SECOND ONE WAS HERE AND HAD TO BE TAKEN OUT. It
              ;; was argued as the reading that "cannot lose a resource",
              ;; against a reading that "cannot lose a registration", with
              ;; the peer's re-registration left open. That symmetry is
@@ -4001,7 +4001,7 @@
              ;; lose a registration" but "loses it, silently, every
              ;; time".
              ;;
-             ;; ⛔ THAT FACT NOW CARRIES TWO PROPERTIES, AND A RE-ARMING
+             ;; THAT FACT NOW CARRIES TWO PROPERTIES, AND A RE-ARMING
              ;; PATH WOULD BREAK BOTH AT ONCE. It is the reason the sweep
              ;; can be skipped here, and it is also the only thing
              ;; keeping the mon admission's stale-record retirement from
@@ -4009,7 +4009,7 @@
              ;; retirement). Adding a re-arm is not a local change to
              ;; whoever adds it.
              ;;
-             ;; ⭐ AND THE RESOURCE ARGUMENT DOES NOT SURVIVE EITHER.
+             ;; AND THE RESOURCE ARGUMENT DOES NOT SURVIVE EITHER.
              ;; What drop-hosted-monitors! is for is a peer that
              ;; connects, parks monitors and DROPS, over and over; that
              ;; path is remove-peer! and still calls it. Here the same
@@ -4018,17 +4018,17 @@
              ;; admission ceiling bounds them even against a peer that
              ;; does re-arm.
              ;;
-             ;; ⛔ THE OMISSION IS DELIBERATE, AND IT LOOKS LIKE AN
+             ;; THE OMISSION IS DELIBERATE, AND IT LOOKS LIKE AN
              ;; OVERSIGHT: a diff shows the death path doing three things
              ;; and this path doing one, and the natural tidy-up is to
              ;; make them agree. Making them agree is how this broke the
              ;; first time.
              ;;
-             ;; ⚠ WHAT IS STILL OPEN is the semantics, not this: whether
+             ;; WHAT IS STILL OPEN is the semantics, not this: whether
              ;; a hosted watch belongs to the connection it was armed on
              ;; or to the peer. Until that is decided, this path does
              ;; what it did before generations existed.
-             ;; ⛔ THE WALK GOES FIRST, AND THE ORDER IS LOAD-BEARING.
+             ;; THE WALK GOES FIRST, AND THE ORDER IS LOAD-BEARING.
              ;; After the region, root is the only thing that can lead a
              ;; SWEEP to the captured chain: the records are still on the
              ;; global chain and still in callee-agents -- which is how
@@ -4038,7 +4038,7 @@
              ;; root and leaves those agents running with no path that
              ;; ends them.
              ;;
-             ;; ⚠ AND A KILL BETWEEN THE REGION AND HERE DOES THE SAME.
+             ;; AND A KILL BETWEEN THE REGION AND HERE DOES THE SAME.
              ;; Interrupts are back on the moment the region ends, and a
              ;; killed process's continuation is dropped, so this
              ;; ordering shortens the exposure and does not remove it.
@@ -4048,7 +4048,7 @@
              ;; surface wider than the window it would close. The same
              ;; hazard existed at the exit of the old splice
              ;; transaction.
-             ;; ⚠ Unconditional: for a same-incarnation replacement the
+             ;; Unconditional: for a same-incarnation replacement the
              ;; region captured nothing, root is empty, and this is a
              ;; no-op. The condition that used to be here now lives at
              ;; the capture, where it belongs -- deciding what to take is
@@ -4073,7 +4073,7 @@
   ;; was nobody: the container was there and the way in was gone. This is
   ;; the way in.
   ;;
-  ;; ⭐ WHAT A SUCCESSOR INHERITS IS THE WHOLE DESIGN. The ready chain is
+  ;; WHAT A SUCCESSOR INHERITS IS THE WHOLE DESIGN. The ready chain is
   ;; module state, not this process's mailbox. A replacement walks the
   ;; same chain and finds the same heads, including the one it was in the
   ;; middle of when its predecessor died, and including heads queued
@@ -4084,7 +4084,7 @@
   ;; ever becomes the thing that makes delivery work, something above is
   ;; broken.
   ;;
-  ;; ⚠ THE PRICE IS A DUPLICATE, and it is not evenly paid. Dying after
+  ;; THE PRICE IS A DUPLICATE, and it is not evenly paid. Dying after
   ;; the delivery and before the confirmation leaves the node at the
   ;; front, so the successor sends it again. A token subscriber has the
   ;; token and the sequence number in the message and can drop the
@@ -4115,7 +4115,7 @@
   ;; One failed attempt, counted and possibly quarantined. Runs INSIDE the
   ;; guard's handler, and makes its whole decision in one region.
   ;;
-  ;; ⭐ THE COUNT AND THE QUARANTINE ARE ONE STEP. Splitting them leaves a
+  ;; THE COUNT AND THE QUARANTINE ARE ONE STEP. Splitting them leaves a
   ;; window: a process killed after the third failure was recorded but
   ;; before the event was set aside leaves the successor to find it still
   ;; queued with failures = 3 and try a fourth time. Taking it off the
@@ -4132,10 +4132,10 @@
   ;; the dispatcher loop, which has none. Losing the notice is survivable;
   ;; losing the dispatcher is what this whole batch exists to prevent.
   ;;
-  ;; ⚠ A send to a dead observer is silently dropped, which matches the
+  ;; A send to a dead observer is silently dropped, which matches the
   ;; contract. The ring is the record -- in memory, overwritable when
   ;; full, and emptied by redelivery -- and this is the announcement.
-  ;; ⭐ THE SEVENTH SLOT IS THE ONE THAT SEPARATES THE TWO OUTCOMES, and
+  ;; THE SEVENTH SLOT IS THE ONE THAT SEPARATES THE TWO OUTCOMES, and
   ;; it is new. `why` keeps exactly the meaning it always had -- the
   ;; raised object for a raise, the symbol for a kill -- so a consumer
   ;; reading the first six positions is unaffected. But `why` CANNOT tell
@@ -4157,12 +4157,12 @@
               ;; stderr, not stdout: a cross-process test that merges the
               ;; two and reads by line position would take this for data.
               ;;
-              ;; ⭐ THE REASON IS RENDERED BEFORE ANY OF IT IS WRITTEN,
+              ;; THE REASON IS RENDERED BEFORE ANY OF IT IS WRITTEN,
               ;; and by the same procedure the warden uses. Writing it
               ;; straight to the port can raise partway, leaving half a
               ;; line with no newline for the next write to join onto.
               ;;
-              ;; ⛔ AND `display` WAS THE WRONG RENDERER. why is whatever
+              ;; AND `display` WAS THE WRONG RENDERER. why is whatever
               ;; was raised, which is usually a condition, and display
               ;; gives an OPAQUE CONDITION TOKEN for one -- `#<compound
               ;; condition>` for a compound condition, and for a plain one
@@ -4171,7 +4171,7 @@
               ;; That is the same defect the warden's death log had, and
               ;; fixing one of two sites is not fixing the shape.
               ;;
-              ;; ⚠ Without a reason at all the two quarantine outcomes
+              ;; Without a reason at all the two quarantine outcomes
               ;; were the same line: the reason is the only field that
               ;; separates an ordinary poisoned event from one whose
               ;; dispatcher was killed mid-attempt, and a deployment with
@@ -4180,7 +4180,7 @@
                     (r (raised-object-text why)))
                 (display "igropyr node: event set aside after " e)
                 (display failures e)
-                ;; ⚠ "attempts", not "failed deliveries": on the
+                ;; "attempts", not "failed deliveries": on the
                 ;; lost-outcome path the last attempt's result is exactly
                 ;; what is not known.
                 (display " attempts: " e)
@@ -4189,7 +4189,7 @@
                 (display (event-seq ev) e)
                 (display " reason " e) (display r e) (newline e)))))))
 
-  ;; ⭐ THE ONLY DOOR INTO THE RING. Both quarantine paths come through
+  ;; THE ONLY DOOR INTO THE RING. Both quarantine paths come through
   ;; here so that the check below cannot hold at one of them and be
   ;; missing at the other. Written at the caller instead, in poison-step!,
   ;; it would not cover the k > limit route at all -- and that route is
@@ -4200,12 +4200,12 @@
   ;; delivering path never calls poison-step! at all, and still owes a
   ;; qhead-done!.
   ;;
-  ;; ⚠ It is NOT reached by this assertion firing. That was the argument
+  ;; It is NOT reached by this assertion firing. That was the argument
   ;; first written here and it was wrong: the assertion fires only when n
   ;; is not the head, and the successor peeks the head afresh, so the
   ;; successor never sees that n at all.
   ;;
-  ;; ⚠ WHY IT RAISES. A false qhead-done! says directly only that n is no
+  ;; WHY IT RAISES. A false qhead-done! says directly only that n is no
   ;; longer this head's first node -- not that n is still queued. But the
   ;; removal paths are a closed set, so more follows: n was the head when
   ;; it was peeked, pushes only append, and the sole way the head advances
@@ -4213,11 +4213,11 @@
   ;; probably win, it NECESSARILY won. What is unknown is only which
   ;; outcome it took -- delivery, or a quarantine of its own.
   ;;
-  ;; ⇒ Skipping the insertion cannot undo the winner's outcome, and it
+  ;; => Skipping the insertion cannot undo the winner's outcome, and it
   ;; avoids manufacturing a second dead-letter for an event that may
   ;; already have one.
   ;;
-  ;; ⛔ It is NOT free, and the claim once written here -- that skipping
+  ;; It is NOT free, and the claim once written here -- that skipping
   ;; "would lose NOTHING, because each removal path records as it
   ;; removes" -- was false twice over. The delivered branch records
   ;; NOTHING: it sends to the live watchers and then removes, after which
@@ -4229,7 +4229,7 @@
   ;; and it would silently hide the forbidden overlap. Raising is what
   ;; preserves that evidence.
   ;;
-  ;; ⚠ WHERE THE RAISE GOES, and it differs by caller: from poison-step!
+  ;; WHERE THE RAISE GOES, and it differs by caller: from poison-step!
   ;; it escapes a guard handler that is already running (an R6RS guard
   ;; handler is not active during its own clause, so it does not catch
   ;; itself); from the k > limit branch it is raised before that guard is
@@ -4241,19 +4241,19 @@
   ;; a separate repair from this one -- and normally restarts it, unless
   ;; its give-up policy fires instead and stops the node.
   ;;
-  ;; ⚠ ONE FIRING IS ONE DISPATCHER DEATH -- and that is as far as the
+  ;; ONE FIRING IS ONE DISPATCHER DEATH -- and that is as far as the
   ;; guarantee goes. This particular n does not drag the successor down
   ;; with it: the successor peeks the head afresh, and the condition for
   ;; the assertion is precisely that n is not there.
   ;;
-  ;; ⛔ BUT IT DOES NOT FOLLOW THAT A RESTART HAPPENS. The warden counts
+  ;; BUT IT DOES NOT FOLLOW THAT A RESTART HAPPENS. The warden counts
   ;; recent deaths of this child WITHOUT LOOKING AT WHY THEY DIED, so this
   ;; death is added to whatever unrelated dispatcher deaths came before
   ;; it, and it may be the one that crosses the give-up threshold -- and
   ;; the crossing death is not restarted, it stops the node. Nothing here
   ;; requires the race to recur for that to happen.
   ;;
-  ;; ⛔ NO CELL, AND NOT REACHABLE TODAY: qhead-push! appends at the tail,
+  ;; NO CELL, AND NOT REACHABLE TODAY: qhead-push! appends at the tail,
   ;; every qhead-done! call is dynamically reached from dispatch-one!
   ;; (the two syntactic ones are here and in the delivered branch; this
   ;; one is reached only via poison-step! or the k > limit branch), and
@@ -4274,13 +4274,13 @@
     (if (fx< k poison-event-limit)
         'retry
         (begin
-          ;; ⭐ LEAVING THE QUEUE AND ENTERING THE RING ARE ONE STEP, so
+          ;; LEAVING THE QUEUE AND ENTERING THE RING ARE ONE STEP, so
           ;; no kill lands between them. See quarantine! for why the
           ;; removal is checked rather than assumed.
           (quarantine! h n (make-quarantine-reason 'raised e))
           'quarantined)))
 
-  ;; ⚠ WHY THE ATTEMPT IS COUNTED BEFORE IT IS MADE. Counting a FAILURE
+  ;; WHY THE ATTEMPT IS COUNTED BEFORE IT IS MADE. Counting a FAILURE
   ;; leaves a window nothing covers: interrupts are enabled between
   ;; notify-list! raising and the handler running, so a dispatcher killed
   ;; there leaves its successor reading the old count and making one more
@@ -4288,17 +4288,17 @@
   ;; every kill err in the same direction -- the count can only be too
   ;; high, which quarantines early and never retries too often.
   ;;
-  ;; ⇒ The invariant is "at most poison-event-limit attempts are STARTED",
+  ;; => The invariant is "at most poison-event-limit attempts are STARTED",
   ;; which is a statement that survives a kill anywhere. The previous one
   ;; ("up to three failures") did not.
   ;;
-  ;; ⭐ THAT KILL WINDOW IS NOW AIMED AT, and the barrier below is how.
+  ;; THAT KILL WINDOW IS NOW AIMED AT, and the barrier below is how.
   ;; A victim parked at 'poison-attempt-start is stopped between storing
   ;; the count and entering the guarded delivery -- the window itself --
   ;; and the controller kills it there rather than hoping a scheduling
   ;; accident lands in it. See test/barrier.sc, cell B4.
   ;;
-  ;; ⚠ What the cell demonstrates is that the SUCCESSOR reads the stored
+  ;; What the cell demonstrates is that the SUCCESSOR reads the stored
   ;; count and quarantines with 'lost-outcome-after-kill. It does not
   ;; show that the attempt never began: nothing can, and the reason name
   ;; says so.
@@ -4325,7 +4325,7 @@
                  ;; REGION: NONE. The atomically that stored the count
                  ;; has returned, and the guarded delivery has not begun.
                  ;;
-                 ;; ⭐ IT PARKS, because no region is held here -- which
+                 ;; IT PARKS, because no region is held here -- which
                  ;; is the point: this is the only place a kill can be
                  ;; aimed between the two, and aiming it by wall clock
                  ;; never landed. The count is ALREADY STORED when a
@@ -4336,7 +4336,7 @@
                  ;; injection OFF -- (void), and this costs nothing.
                  (inject-barrier! 'poison-attempt-start)
                  (if (fx> k poison-event-limit)
-                     ;; ⚠ THE LIMIT WAS ALREADY REACHED: a previous
+                     ;; THE LIMIT WAS ALREADY REACHED: a previous
                      ;; incarnation reserved the final attempt and died
                      ;; before removing the node. It is not known whether
                      ;; that attempt ever began -- the kill may have
@@ -4348,7 +4348,7 @@
                      ;; stored count alone and says the outcome is
                      ;; indeterminate.
                      (begin
-                       ;; ⚠ ONE RECORD, BOTH USES. The ring and the notice
+                       ;; ONE RECORD, BOTH USES. The ring and the notice
                        ;; describe the same event, and building two would
                        ;; let a later edit change one of them.
                        (let ((r (make-quarantine-reason
@@ -4356,7 +4356,7 @@
                          (quarantine! h n r)
                          (notify-observer! n r poison-event-limit))
                        #t)
-                     ;; ⭐ why IS CAPTURED LEXICALLY, and neither value in
+                     ;; why IS CAPTURED LEXICALLY, and neither value in
                      ;; the notice may be re-read later: the reason cannot
                      ;; come from the ring slot (a redelivery may have
                      ;; cleared it by then) and the count cannot come from
@@ -4384,7 +4384,7 @@
                          ;; delivered, and only now is it gone. A death
                          ;; anywhere above leaves the event where it was.
                          ;;
-                         ;; ⚠ THIS ONE DISCARDS THE RESULT, and the reason
+                         ;; THIS ONE DISCARDS THE RESULT, and the reason
                          ;; is that a failure here is unreachable while
                          ;; there is one dispatcher -- NOT that a failure
                          ;; would be harmless. If a second deliverer ever
@@ -4395,13 +4395,13 @@
                          ;; at-least-once redelivery this library
                          ;; promises. Whoever adds one checks here too.
                          ((delivered) (atomically (qhead-done! h n)) #t)
-                         ;; ⚠ sleep-ms 1, NOT 0. A zero wake time has
+                         ;; sleep-ms 1, NOT 0. A zero wake time has
                          ;; already passed when the receive is entered, so
                          ;; the timeout branch runs without yielding and
                          ;; the retry would spin inside this process.
                          ((retry) (sleep-ms 1) (attempt))
                          ((quarantined)
-                          ;; ⚠ A SECOND RECORD, equal in content to the one
+                          ;; A SECOND RECORD, equal in content to the one
                           ;; poison-step! put in the ring but not eq? to
                           ;; it. Nothing compares them; if anything ever
                           ;; does, make poison-step! return its record
@@ -4417,12 +4417,12 @@
   ;; holding an event is unreachable work.
   ;; ---- dead letters ----------------------------------------------------
   ;;
-  ;; ⛔ AN EVENT THAT CANNOT BE DELIVERED USED TO TAKE THE DISPATCHER WITH
+  ;; AN EVENT THAT CANNOT BE DELIVERED USED TO TAKE THE DISPATCHER WITH
   ;; IT. A raise from notify-list! escaped dispatch-one! into a loop with
   ;; no guard: the process died, every queue it served stopped draining,
   ;; and the only symptom was silence.
   ;;
-  ;; ⚠ No subscriber callback runs. The raises to expect are from
+  ;; No subscriber callback runs. The raises to expect are from
   ;; process-alive?, from building the notification vector, from send and
   ;; the message it allocates, from reading the watcher record -- and, on
   ;; the branch taken when the process is dead, from drop-watcher-of-rec!,
@@ -4444,7 +4444,7 @@
   (define dead-letter-capacity 1024)
   (define dl-node    (make-vector dead-letter-capacity #f))
   (define dl-head    (make-vector dead-letter-capacity #f))
-  ;; ⛔ WHY THE REASON IS A RECORD AND NOT A SYMBOL-OR-OBJECT. This slot
+  ;; WHY THE REASON IS A RECORD AND NOT A SYMBOL-OR-OBJECT. This slot
   ;; used to hold two different kinds of thing in one space: the object an
   ;; attempt raised, or the bare symbol 'lost-outcome-after-kill meaning
   ;; the dispatcher was killed mid-attempt. An application that raised
@@ -4452,7 +4452,7 @@
   ;; called the reason the one field separating those outcomes, so the
   ;; misclassification reached the observer as fact.
   ;;
-  ;; ⭐ THE GUARANTEE IS THAT NOBODY OUTSIDE CAN BUILD ONE, and it comes
+  ;; THE GUARANTEE IS THAT NOBODY OUTSIDE CAN BUILD ONE, and it comes
   ;; from the constructor being unexported, not from opacity. The type is
   ;; sealed and nongenerative; the three readers below ARE exported,
   ;; because a consumer that cannot ask which kind it holds has been
@@ -4481,7 +4481,7 @@
   ;; Give every stored slot a fresh ordinal, keeping their order. Caller
   ;; holds the region; no allocation -- dl-work is preallocated.
   ;;
-  ;; ⚠ THE OBVIOUS ALTERNATIVE IS WRONG. Subtracting (min-live - 1) from
+  ;; THE OBVIOUS ALTERNATIVE IS WRONG. Subtracting (min-live - 1) from
   ;; every ordinal looks equivalent and is not: an operator may redeliver
   ;; anything at any time, so the live span is unbounded and subtraction
   ;; cannot bring the counter down. It could even leave duplicates, or
@@ -4566,7 +4566,7 @@
   ;; than handing back the qnode, whose failures field a redelivery
   ;; resets.
   ;;
-  ;; ⭐ THE REASON POSITION HOLDS A quarantine-reason RECORD. It used to
+  ;; THE REASON POSITION HOLDS A quarantine-reason RECORD. It used to
   ;; hold the raw object -- whatever was raised, or the bare symbol
   ;; 'lost-outcome-after-kill -- and that is a SHAPE CHANGE for anyone
   ;; reading position 3 of these vectors. Read it with the three exported
@@ -4577,14 +4577,14 @@
   ;; reading -- treat the value itself as the reason -- now yields the
   ;; wrapper rather than the cause.
   ;;
-  ;; ⚠ THE SNAPSHOT IS SHALLOW. Name, kind, seq and the failure count are
+  ;; THE SNAPSHOT IS SHALLOW. Name, kind, seq and the failure count are
   ;; values taken at one atomic instant and cannot change afterwards. The
   ;; record is immutable, but its PAYLOAD is a reference: R6RS lets any
   ;; object be raised, so it may be a mutable one, and what comes back is
   ;; the object that occupied the slot at that instant -- not a copy,
   ;; which is not possible for an arbitrary object.
   ;;
-  ;; ⚠ It aliases the ring only for as long as the slot still holds it.
+  ;; It aliases the ring only for as long as the slot still holds it.
   ;; The region ends before the sort and the result list are built, so a
   ;; redelivery or an overwrite can take the slot before the caller ever
   ;; sees the snapshot, and a mutation would then change nothing the ring
@@ -4626,7 +4626,7 @@
                                acc)
                          acc))))))
 
-  ;; ⚠ lifetime and dropped SATURATE. Once either reaches the fixnum
+  ;; lifetime and dropped SATURATE. Once either reaches the fixnum
   ;; ceiling it stops moving, so both are lower bounds from then on, and
   ;; an observer watching deltas would read a saturated counter as
   ;; recovery.
@@ -4643,15 +4643,15 @@
   ;; dispatcher is registered -- the two are not distinguished, and in
   ;; both cases nothing has been touched.
   ;;
-  ;; ⭐ THE HEAD IS RESOLVED, NOT REMEMBERED. dl-head records where the
+  ;; THE HEAD IS RESOLVED, NOT REMEMBERED. dl-head records where the
   ;; event came from, but by now that head may have been retired. The
   ;; peer's current head is whatever peers says, and if the peer is gone
   ;; the orphan chain has it; only if neither does the spare get attached.
-  ;; ⛔ Using live-entry here would be wrong: an entry that is not yet
+  ;; Using live-entry here would be wrong: an entry that is not yet
   ;; open still owns the canonical head, and creating a second one breaks
   ;; the one-head-per-peer invariant.
   (define (node-redeliver-dead-letter! seq)
-    ;; ⛔ NO DISPATCHER, NO REDELIVERY -- checked before anything moves.
+    ;; NO DISPATCHER, NO REDELIVERY -- checked before anything moves.
     ;; Redelivery promises an attempt, and an event put back on a queue
     ;; nobody drains is not an attempt: it would leave the ring, report
     ;; success, and never be delivered or listed again. Refusing leaves
@@ -4660,7 +4660,7 @@
           (work (vector 'work)))             ; (R0): allocated outside
       (let ((woke                            ; the dispatcher, or #f
              (atomically
-               ;; ⛔ THE DISPATCHER IS RESOLVED IN HERE, with the slot
+               ;; THE DISPATCHER IS RESOLVED IN HERE, with the slot
                ;; clearing, not before it. Read outside, the answer can
                ;; go stale: the dispatcher may exit and unregister
                ;; between the check and the transaction, and the letter
@@ -4668,7 +4668,7 @@
                ;; sit on a queue nobody drains -- the exact outcome the
                ;; check exists to prevent, only harder to notice.
                ;;
-               ;; ⚠ ONLY THE LOOKUP HAS TO BE IN HERE. The wake does not:
+               ;; ONLY THE LOOKUP HAS TO BE IN HERE. The wake does not:
                ;; qhead-enqueue! ends in ready-attach!, so by the time
                ;; this region ends the event is already on the chain that
                ;; dispatch-round! walks, and dispatch-round! runs without
@@ -4677,7 +4677,7 @@
                ;; receive; one that lives has a 1000ms timed receive. So
                ;; a lost wake costs latency, not the event -- and keeping
                ;; the send out keeps its two allocations out with it.
-               ;; (⚠ that bound is on a live dispatcher noticing queued
+               ;; (that bound is on a live dispatcher noticing queued
                ;; work. During node shutdown, or after the warden gives
                ;; up, there is no successor and the work simply waits.)
                (let ((d (whereis dispatcher-name)))
@@ -4702,7 +4702,7 @@
                       (qhead-enqueue! h n (qnode-cut n))
                       d))
                    (else (find (fx+ i 1))))))))))
-        ;; ⚠ THE STATE CHANGE IS ALREADY COMMITTED BY HERE, so the wake is
+        ;; THE STATE CHANGE IS ALREADY COMMITTED BY HERE, so the wake is
         ;; best-effort and the return value reports the commit, not the
         ;; wake. send allocates, and an allocation failure here used to
         ;; leave the caller an exception for a redelivery that HAD
@@ -4711,7 +4711,7 @@
         ;; redelivers twice and giving up abandons an event that is
         ;; already back on a queue.
         ;;
-        ;; ⭐ SWALLOWING IS SAFE FOR EXACTLY THE REASON THE WAKE IS
+        ;; SWALLOWING IS SAFE FOR EXACTLY THE REASON THE WAKE IS
         ;; OUTSIDE THE REGION, argued in full above: the event is already
         ;; on the ready chain when the region ends, dispatch-round! runs
         ;; without being asked, and a lost wake costs latency rather than
@@ -4719,7 +4719,7 @@
         ;; the only raise this can swallow is an allocation failure --
         ;; which is not recoverable at this point by anyone.
         ;;
-        ;; ⚠ RESIDUAL, SMALLER BUT NOT GONE: entering the guard itself
+        ;; RESIDUAL, SMALLER BUT NOT GONE: entering the guard itself
         ;; allocates a continuation, and that allocation is outside the
         ;; guard it establishes. This is the floor every guard in this
         ;; file stands on, not something particular to this one -- so it
@@ -4787,7 +4787,7 @@
   ;; and over -- would leak agents and eventually exhaust
   ;; max-hosted-monitors.
   ;;
-  ;; ⛔ TWO CALLERS, AND THE CONDITION ON THE SECOND IS LOAD-BEARING.
+  ;; TWO CALLERS, AND THE CONDITION ON THE SECOND IS LOAD-BEARING.
   ;; The death path calls it unconditionally. The replacement path calls
   ;; it ONLY for a new incarnation (I6) -- see new-incarnation?. Calling
   ;; it for a same-incarnation replacement is the defect this condition
@@ -4796,10 +4796,10 @@
   ;; watch alive on one side and unserviceable on the other, with nothing
   ;; on either side that reports the difference.
   ;;
-  ;; ⚠ THE LEAK ARGUMENT ABOVE DOES NOT JUSTIFY AN UNCONDITIONAL CALL,
+  ;; THE LEAK ARGUMENT ABOVE DOES NOT JUSTIFY AN UNCONDITIONAL CALL,
   ;; though it reads as though it does. The accumulation it describes
   ;; comes from DROPS, which arrive through the death path.
-  ;; ⭐ THE WALK HANGS OFF A SENTINEL THAT NOTHING CAN RETIRE, and that
+  ;; THE WALK HANGS OFF A SENTINEL THAT NOTHING CAN RETIRE, and that
   ;; is the whole of the arrangement. `root` is a full record built out
   ;; here, before the region; it is never filed in callee-agents and
   ;; never joins the global chain, so the reaper has no way to reach it
@@ -4813,7 +4813,7 @@
   ;; every record still on the chain, no matter which ones leave while
   ;; the walk is between steps.
   ;;
-  ;; ⛔ AN EARLIER VERSION KEPT THE CURSOR IN A LOCAL AND WAS TRUNCATED.
+  ;; AN EARLIER VERSION KEPT THE CURSOR IN A LOCAL AND WAS TRUNCATED.
   ;; It read `next` before sending, on the argument -- written in the
   ;; comment it carried -- that this node's own links were about to be
   ;; cleared by whoever retires it. That argument protects the node the
@@ -4826,11 +4826,11 @@
   ;; splice removes only the per-peer head. What it has lost is the one
   ;; thing that would have ended it -- no later sweep of this peer can
   ;; reach it, because the chain it was on is gone.
-  ;; ⛔ Reading further ahead does not fix it; it moves the exposed node
+  ;; Reading further ahead does not fix it; it moves the exposed node
   ;; one place along. The cursor has to be a thing that cannot be
   ;; retired, which is what root is.
   ;;
-  ;; ⚠ EACH POP IS ITS OWN REGION, and the send is outside it. A record
+  ;; EACH POP IS ITS OWN REGION, and the send is outside it. A record
   ;; the walk has popped is fully detached before it is used, so a
   ;; concurrent retirement of it is a no-op: mon-unlink-peer! finds both
   ;; links already #f, so it touches no neighbour, and its head branch
@@ -4838,7 +4838,7 @@
   ;; (eq? (hashtable-ref mon-heads (agent-peer r) #f) r) -- and the head
   ;; on file is not this record.
   ;;
-  ;; ⛔ THE REASON IS THE IDENTITY TEST, NOT THE MISSING KEY, and the
+  ;; THE REASON IS THE IDENTITY TEST, NOT THE MISSING KEY, and the
   ;; difference is reachable. A note here said the branch could not fire
   ;; because the splice had deleted this peer's head; that holds on the
   ;; death path, where nothing re-creates it, and fails on the
@@ -4850,14 +4850,14 @@
   ;; new incarnation's monitors are filed under a fresh head, so they are
   ;; not in this snapshot.)
   ;;
-  ;; ⛔ NO CELL DISCRIMINATES THE RACE, and the reason is worth stating
+  ;; NO CELL DISCRIMINATES THE RACE, and the reason is worth stating
   ;; rather than leaving the surrounding green to imply otherwise. The
   ;; window is between a pop and the send that follows it, and reaching
   ;; it needs this process to yield there:
   ;;   - `send` does not CALL yield: it links the message into the
   ;;     target's inbox and wakes a parked target, inside a
   ;;     with-interrupts-disabled region.
-  ;;     ⚠ But LEAVING that region re-enables interrupts, and a timer
+  ;;     But LEAVING that region re-enables interrupts, and a timer
   ;;     that expired inside it is delivered right there -- so a walk CAN
   ;;     be preempted at a send's exit. What that does not change is the
   ;;     conclusion: the delivery still waits on the tick budget expiring
@@ -4867,32 +4867,32 @@
   ;;   - The retirement that would truncate it is usually several hops
   ;;     away: the target dies, its agent notices, the agent exits, the
   ;;     reaper sees THAT death, and only then does it unlink.
-  ;; ⚠ NEITHER OF THOSE IS A BOUND, and an earlier version of this note
+  ;; NEITHER OF THOSE IS A BOUND, and an earlier version of this note
   ;; stated them as though they were. max-hosted-monitors is settable
   ;; without a ceiling, so a large enough cap makes a sweep outlast a
   ;; slice; and a DOWN already sitting in the reaper's mailbox when the
-  ;; sweep starts collapses the hop count to one handoff. ⇒ What is
+  ;; sweep starts collapses the hop count to one handoff. => What is
   ;; true is narrower: nothing in the SUITE constructs the interleaving,
   ;; and no cell here discriminates it.
-  ;; ⭐ THIS PARAGRAPH HAS BEEN NARROWED THREE TIMES -- "the cap bounds
+  ;; THIS PARAGRAPH HAS BEEN NARROWED THREE TIMES -- "the cap bounds
   ;; the sweep and the reaper is several hops away", then "the suite does
   ;; not construct it", then the send bullet above -- and each time the
   ;; correction was the same one: something stated as impossible was only
-  ;; something we had not built. ⛔ So do not cite it as an impossibility
+  ;; something we had not built. So do not cite it as an impossibility
   ;; proof; it is a statement about this suite.
-  ;; ⭐ The structure never moved through any of that. The fix does not
+  ;; The structure never moved through any of that. The fix does not
   ;; rest on any timing claim -- it rests on the sentinel above, which is
   ;; why it survived all three. There is
   ;; a happy-path cell that sweeps many monitors and checks they are all
-  ;; stopped; it guards this loop against ordinary mistakes and ⛔ is not
+  ;; stopped; it guards this loop against ordinary mistakes and is not
   ;; coverage of the race. Do not read its green as though it were.
   (define (drop-hosted-monitors! root)
     ;; (R0): the one allocation, and it is out here where a failure has
     ;; changed nothing.
-    ;; ⭐ ROOT ARRIVES CAPTURED. The caller took this peer's chain off
+    ;; ROOT ARRIVES CAPTURED. The caller took this peer's chain off
     ;; mon-heads and hung it under root inside its OWN atomic transaction,
     ;; the same one that published the new entry or removed the old one.
-    ;; ⛔ This function does not read mon-heads and must not: doing the
+    ;; This function does not read mon-heads and must not: doing the
     ;; capture here would put it in a second transaction, and between the
     ;; two a new incarnation could file an arm under a head this walk
     ;; would then take away.
@@ -4933,14 +4933,14 @@
                         (qhead-enqueue! h node cut)
                         (hashtable-delete! peers name)
                         (orphan-attach! h name)
-                        ;; ⭐ CAPTURE IN THE SAME TRANSACTION, LAST, and
+                        ;; CAPTURE IN THE SAME TRANSACTION, LAST, and
                         ;; for the same reasons the replacement path
                         ;; gives at length: nothing after this point in
                         ;; the region can fail, so mon-heads is cleared
                         ;; only once the removal is certain, and a peer
                         ;; that comes back files its arms under a head
                         ;; this capture cannot reach.
-                        ;; ⛔ AND THIS PATH HAD THE SAME WINDOW, which an
+                        ;; AND THIS PATH HAD THE SAME WINDOW, which an
                         ;; earlier note here denied on the grounds that
                         ;; the entry is deleted in this very region.
                         ;; Deleting it does not prevent a reinstall -- it
@@ -4950,7 +4950,7 @@
                         ;; all before this process reached the separate
                         ;; splice transaction it used to run. That splice
                         ;; would then take the NEW peer's chain.
-                        ;; ⭐ Capturing here closes it, exactly as on the
+                        ;; Capturing here closes it, exactly as on the
                         ;; replacement path; the two paths are the same
                         ;; shape because they had the same defect, not
                         ;; only for tidiness.
@@ -4993,7 +4993,7 @@
 
   ;; the wire shapes a link may carry (peer is the node at the far end of
   ;; c). Anything else is a confused peer -> drop the link.
-  ;; ⭐ IF YOU ARE ADDING A CLAUSE HERE, READ THIS FIRST.
+  ;; IF YOU ARE ADDING A CLAUSE HERE, READ THIS FIRST.
   ;;
   ;; A frame arrives on a connection, and a connection is one GENERATION
   ;; of a peer. The peer's name outlives it: the same name is reachable
@@ -5004,7 +5004,7 @@
   ;;
   ;; The question to ask is not "did I remember to check". It is:
   ;;
-  ;;   ⭐ DOES THE KEY I FILE THIS UNDER CONTAIN AN IDENTITY?
+  ;;   DOES THE KEY I FILE THIS UNDER CONTAIN AN IDENTITY?
   ;;
   ;; A key that is a connection or a process is safe by construction. A
   ;; key that is a name, or a number scoped to a peer, is not: something
@@ -5092,7 +5092,7 @@
                       ;; who holds it, so the reaper gives it back on the
                       ;; DOWN it sees. This branch handles the raise; the
                       ;; owner handles the kill.
-                 ;; ⭐ AND THE WORKER OUTLIVES THIS CONNECTION. It resolves
+                 ;; AND THE WORKER OUTLIVES THIS CONNECTION. It resolves
                  ;; the peer by name when it answers, so a service begun
                  ;; under one generation can write its reply down the
                  ;; next one. That is the same shape as the defects fixed
@@ -5114,7 +5114,7 @@
       ;; but only if the reply arrives from the node that call targeted
       ;; (a ref is bound to its node, so one peer can't answer a call
       ;; the caller sent to another)
-      ;; ⭐ NO GENERATION TEST HERE, AND THE REASON IS THE KEY. A ref is
+      ;; NO GENERATION TEST HERE, AND THE REASON IS THE KEY. A ref is
       ;; minted by this node and never repeats within a run, so a reply
       ;; arriving on a superseded connection carries the ref of its own
       ;; call and nothing else: either that call is still waiting, in
@@ -5122,7 +5122,7 @@
       ;; is right, or the link teardown already failed it and the lookup
       ;; finds nothing. Late, not wrong.
       ;;
-      ;; ⚠ What makes the first case correct is the match below, which
+      ;; What makes the first case correct is the match below, which
       ;; compares the peer NAME and not the connection. That looks like
       ;; the omission this file spent a batch fixing elsewhere, and here
       ;; it is the point: the answer came from the peer this call was
@@ -5181,7 +5181,7 @@
          ;; and be told "already done" for something it never asked for.
          ;; A mismatch is not a replacement request: one reference cannot
          ;; mean two things, so the link goes.
-         ;; ⭐ WHICH GENERATION ASKED. This is the authoritative test and
+         ;; WHICH GENERATION ASKED. This is the authoritative test and
          ;; it is here rather than in the frame loop because here it is
          ;; atomic: the table that says which connection is current and
          ;; the table this clause writes are read and written inside one
@@ -5189,7 +5189,7 @@
          ;; installing. A test in the loop cannot say that -- it releases
          ;; its region before dispatch runs.
          ;;
-         ;; ⭐ THE TEST IS THE INCARNATION, NOT THE CONNECTION. It used
+         ;; THE TEST IS THE INCARNATION, NOT THE CONNECTION. It used
          ;; to be the connection, and that discarded a request from a
          ;; SUPERSEDED LINK OF THE SAME RUN -- a peer that is reachable
          ;; right now, whose request still means what it said, and which
@@ -5201,7 +5201,7 @@
          ;; refused: the process that sent it is gone, and refusing would
          ;; write a frame to a socket nobody is reading.
          ;;
-         ;; ⚠ THAT IS ONE OF TWO WAYS THE TEST ANSWERS NO, and the note
+         ;; THAT IS ONE OF TWO WAYS THE TEST ANSWERS NO, and the note
          ;; used to name only it. current-incarnation-locked? also
          ;; answers no when this peer has NO CURRENT ENTRY AT ALL -- the
          ;; window between an entry being removed and a reconnection
@@ -5234,7 +5234,7 @@
                           ;; for this exact request is retired here and the
                           ;; request treated as new.
                           ;;
-                          ;; ⚠ WHAT MAKES THAT SAFE IS NOT IDEMPOTENCE.
+                          ;; WHAT MAKES THAT SAFE IS NOT IDEMPOTENCE.
                           ;; This note used to say the reaper's DOWN would
                           ;; then find nothing left to do, because
                           ;; retiring is idempotent. Retiring is
@@ -5254,7 +5254,7 @@
                           ;; running, so it is stopped and the request is
                           ;; refused rather than replaced -- see the cond
                           ;; below.
-                          ;; ⛔ A record from a superseded CONNECTION of
+                          ;; A record from a superseded CONNECTION of
                           ;; the current run is not made stale by that
                           ;; supersession alone -- if its agent has died
                           ;; it is stale by the liveness test below, which
@@ -5263,7 +5263,7 @@
                           ;; working watches for peers doing what the
                           ;; protocol permits.
                           ;;
-                          ;; ⚠ "NO LONGER EXISTS" WOULD BE TOO STRONG for
+                          ;; "NO LONGER EXISTS" WOULD BE TOO STRONG for
                           ;; the second shape, and it is the whole reason
                           ;; this branch now splits. A record left by a
                           ;; superseded connection may still have a LIVING
@@ -5275,7 +5275,7 @@
                           ;; below, where the living case refuses instead
                           ;; of replacing.
                           ;;
-                          ;; ⛔ AN EARLIER NOTE HERE SAID THE RESULTING
+                          ;; AN EARLIER NOTE HERE SAID THE RESULTING
                           ;; WINDOW CLOSED BY ITSELF, on two mechanisms.
                           ;; Neither carried it, and how they failed is
                           ;; worth more than the conclusion:
@@ -5295,7 +5295,7 @@
                           ;;     when the orphan dies, and an orphan whose
                           ;;     target stays alive stays alive with it.
                           ;;
-                          ;; ⚠ THAT SECOND SENTENCE HAS BEEN WRONG TWICE
+                          ;; THAT SECOND SENTENCE HAS BEEN WRONG TWICE
                           ;; IN OPPOSITE DIRECTIONS -- once claiming the
                           ;; mechanism does not exist, once claiming it is
                           ;; reachable only through the sweep. Both errors
@@ -5304,14 +5304,14 @@
                           ;; watches agent pids; the agent exits for its
                           ;; own reasons; neither fact is about the sweep.
                           ;;
-                          ;; ⭐ WHAT HOLDS IT UP IS NO LONGER AN ARGUMENT
+                          ;; WHAT HOLDS IT UP IS NO LONGER AN ARGUMENT
                           ;; ABOUT THE PEER. It used to be: reaching the
                           ;; living case needs a SECOND mon under a key
                           ;; that already has an agent, and this library
                           ;; has no path that sends one -- monitor-remote
                           ;; mints a fresh mref per call and nothing
                           ;; re-arms.
-                          ;; ⛔ THAT IS A FACT ABOUT THIS IMPLEMENTATION
+                          ;; THAT IS A FACT ABOUT THIS IMPLEMENTATION
                           ;; AND WAS WRITTEN HERE AS ONE ABOUT CONFORMING
                           ;; PEERS, which it is not: the protocol makes an
                           ;; exact repeat free, a restarted peer's counter
@@ -5336,7 +5336,7 @@
                                               (retire-agent-of-rec-locked! key found))
                                           #f)))))
                      (cond
-                       ;; ⭐ A LIVING AGENT OF ANOTHER RUN DOES NOT MAKE
+                       ;; A LIVING AGENT OF ANOTHER RUN DOES NOT MAKE
                        ;; WAY, AND THE PERMIT IS WHY. The design fixes when a permit
                        ;; comes back -- "returned when its agent's DOWN
                        ;; arrives" -- so retiring a record whose process
@@ -5352,13 +5352,13 @@
                        ;; agent's DOWN reaches the reaper, which is where
                        ;; the permit was always meant to come back.
                        ;;
-                       ;; ⚠ THE DEAD CASE ABOVE IS NOT THE SAME CASE.
+                       ;; THE DEAD CASE ABOVE IS NOT THE SAME CASE.
                        ;; There the process is already gone, so no permit
                        ;; is still in use and there is nothing to stop;
                        ;; retiring it there is what that branch has always
                        ;; been for.
                        ;;
-                       ;; ⭐ AND A REPEAT FROM THE SAME RUN NO LONGER
+                       ;; AND A REPEAT FROM THE SAME RUN NO LONGER
                        ;; ARRIVES HERE AT ALL. It matches, so it takes
                        ;; the idempotent arm below -- which is what the
                        ;; protocol advertises when it calls an exact
@@ -5366,7 +5366,7 @@
                        ;; run reaches this line, and that run is gone.
                        (stale-live #f)
                        ((and cur (agent-matches? cur boot-id name)) #t)
-                       ;; ⛔ THIS ARM IS REACHABLE, AND A CELL HAS BEEN
+                       ;; THIS ARM IS REACHABLE, AND A CELL HAS BEEN
                        ;; PROVING IT EVERY RUN. A note here once said it
                        ;; was not, on the reasoning that reaching it would
                        ;; need two current connections for one peer. That
@@ -5408,7 +5408,7 @@
                         ;; while a later request for the same key reads it
                         ;; as current.
                         ;;
-                        ;; ⭐ THE GUARD IS INSIDE THE REGION. It is not a
+                        ;; THE GUARD IS INSIDE THE REGION. It is not a
                         ;; style choice: outside it, the moment between
                         ;; the failure and the cleanup is a moment another
                         ;; link can read the half-installed entry, be told
@@ -5426,14 +5426,14 @@
                               ;; last, and it cannot raise: reaching it
                               ;; means there is nothing left to undo
                               (set! active-monitors (fx+ active-monitors 1))))
-                          ;; ⛔ DELIBERATELY OUTSIDE THE GUARD. By here the
+                          ;; DELIBERATELY OUTSIDE THE GUARD. By here the
                           ;; state is complete and consistent, and this
                           ;; send allocates a mailbox node, so it can
                           ;; raise. Undoing the install because the
                           ;; ANNOUNCEMENT failed would delete a monitor
                           ;; that is correctly armed.
                           ;;
-                          ;; ⚠ AND THE RESCAN COVERS A LOST ANNOUNCEMENT
+                          ;; AND THE RESCAN COVERS A LOST ANNOUNCEMENT
                           ;; ON THE NEXT REAPER RESTART, NOT BEFORE. An
                           ;; earlier note said it "already covers" one,
                           ;; which reads as a standing backstop; the walk
@@ -5444,7 +5444,7 @@
                           ;; under memory pressure -- the agent is
                           ;; watched by nobody until then, and its record
                           ;; and permit stay behind after it dies.
-                          ;; ⛔ Recorded rather than mechanised: the
+                          ;; Recorded rather than mechanised: the
                           ;; residue is OOM-only, and the repair for it
                           ;; is not another announcement. The scope of the guard is
                           ;; the documentation: what is inside it is what
@@ -5467,28 +5467,28 @@
            ;; old guard swallowed everything; nothing it protected
            ;; against remains (this frame is (mdown <int> overload),
            ;; which always serializes).
-           ;; ⭐ THE STOP GOES FIRST, and that ordering is load-bearing.
+           ;; THE STOP GOES FIRST, and that ordering is load-bearing.
            ;; Both it and the refusal below allocate and can therefore
            ;; raise; with the stop second, a failed refusal would swallow
            ;; it. This way the agent is on its way out even when the peer
            ;; never hears why its request was declined.
            ;;
-           ;; ⚠ WHAT IS AND IS NOT A NO-OP HERE, stated narrowly because
+           ;; WHAT IS AND IS NOT A NO-OP HERE, stated narrowly because
            ;; a wider version of this sentence stood here and was false.
            ;; Nothing above this point touches the monitor accounting --
            ;; no row, no chain, no count -- so a raise BEFORE the stop
-           ;; leaves that accounting as the frame found it. ⛔ A raise
+           ;; leaves that accounting as the frame found it. A raise
            ;; AFTER the stop does not: the agent has the message, so the
            ;; watch is already leaving, and the next repeat meets a
            ;; different state from the one this one met.
-           ;; ⭐ WHAT IS BEING STOPPED BELONGS TO A RUN THAT IS OVER.
+           ;; WHAT IS BEING STOPPED BELONGS TO A RUN THAT IS OVER.
            ;; Reaching here means the key holds a living agent whose boot
            ;; id is not the one now installed -- an agent the peer's
            ;; previous incarnation armed, whose stop from the replacement
            ;; sweep has not been processed yet. Ending it loses nothing:
            ;; the process that asked for that watch no longer exists.
            ;;
-           ;; ⛔ AN EARLIER VERSION OF THIS BRANCH ALSO CAUGHT SAME-RUN
+           ;; AN EARLIER VERSION OF THIS BRANCH ALSO CAUGHT SAME-RUN
            ;; REPEATS, and cancelled a working watch for one. The note
            ;; here then argued that no conforming CALLER could produce
            ;; such a repeat, which was true and answered the wrong
@@ -5498,11 +5498,11 @@
            ;; has made that mistake at this line once before, in the
            ;; other direction -- see the frame loop's note about calling
            ;; such a peer a protocol violator.
-           ;; ⛔ The lesson is about which conformance is being claimed:
+           ;; The lesson is about which conformance is being claimed:
            ;; "our caller cannot do this" is not "no correct peer can".
            (when stale-live
              (send (agent-pid stale-live) (vector 'demon-local)))
-           ;; ⚠ THE REFUSAL GOES BACK ON THE CONNECTION IT ARRIVED ON,
+           ;; THE REFUSAL GOES BACK ON THE CONNECTION IT ARRIVED ON,
            ;; which may be a superseded one and therefore closed. What
            ;; that costs is now bounded: the watch being refused is one
            ;; the CURRENT run was trying to arm, so a peer that hears
@@ -5511,13 +5511,13 @@
            ;; has no arm-ack for, recorded elsewhere, and not made worse
            ;; here.
            ;;
-           ;; ⛔ IT USED TO COST MORE THAN THAT, and the sentence that
+           ;; IT USED TO COST MORE THAN THAT, and the sentence that
            ;; stood here got it wrong twice over. It said "nothing
            ;; downstream depends on it hearing: the permit and the
            ;; process stay in step" -- the second half true, the first
            ;; not following from it, because accounting staying in step
            ;; says nothing about whether the watcher still has a watch.
-           ;; ⭐ It answered a narrower question than it appeared to.
+           ;; It answered a narrower question than it appeared to.
            ;; What actually happened then was a working same-run watch
            ;; being stopped while its owner was told nothing at all; that
            ;; path is gone with the identity change above, not with this
@@ -5531,7 +5531,7 @@
       ;; (mdown ,mref ,reason) -> the watched process/link is gone; only
       ;; honor it from the node the monitor actually targets
       ((frame? d 'mdown 3)
-       ;; ⭐ THE MIRROR OF THE TEST IN mon-agent, and it asks the same
+       ;; THE MIRROR OF THE TEST IN mon-agent, and it asks the same
        ;; question: is this the run we are currently talking to? That one
        ;; keeps this node from sending a dead RUN's notice; this one keeps
        ;; a dead run's notice from ending a watch the new run set up. The
@@ -5539,7 +5539,7 @@
        ;; restarted peer's mref counter restarts too, so without this the
        ;; notice lands on whatever that mref means now.
        ;;
-       ;; ⚠ WHY THE OLD CONNECTION TEST WAS WRONG HERE. An mdown can be
+       ;; WHY THE OLD CONNECTION TEST WAS WRONG HERE. An mdown can be
        ;; submitted successfully on a link that is replaced before the
        ;; frame is dispatched, and a superseded link still serves what it
        ;; has buffered. Keyed on the connection, this dropped a notice
@@ -5558,7 +5558,7 @@
              (fire-remote-down! mref reason)))))
       ;; (demon ,mref) -> stop a monitor we host for this peer
       ((frame? d 'demon 2)
-       ;; ⭐ SAME INCARNATION TEST, AND THIS IS THE CLAUSE WHERE THE
+       ;; SAME INCARNATION TEST, AND THIS IS THE CLAUSE WHERE THE
        ;; CHANGE COSTS SOMETHING. The key here is (peer . mref) and
        ;; carries no connection. Keyed on the connection, a cancellation
        ;; buffered on a replaced link was dropped; that lost a
@@ -5567,7 +5567,7 @@
        ;; honoured, which is correct on its own and admits a case the
        ;; connection test excluded:
        ;;
-       ;; ⛔ THE mon/demon PAIR CAN NOW ARRIVE OUT OF ORDER. Same peer,
+       ;; THE mon/demon PAIR CAN NOW ARRIVE OUT OF ORDER. Same peer,
        ;; same run, two connections, the same mref: nothing orders a
        ;; frame buffered on the old link against one sent on the new. A
        ;; demon overtaken by a re-arm cancels a watch that is wanted; a
@@ -5577,7 +5577,7 @@
        ;; is created AFTER the cancellation and so is not covered by that
        ;; promise's "already in flight" exception.
        ;;
-       ;; ⚠ THIS IS RECORDED, NOT REPAIRED, AND THE TRADE IS DELIBERATE.
+       ;; THIS IS RECORDED, NOT REPAIRED, AND THE TRADE IS DELIBERATE.
        ;; Four failure shapes went away and these two appeared; the
        ;; trigger narrowed from "one late legitimate control frame" to
        ;; "same mref, same run, across two links, opposite operations,
@@ -5585,7 +5585,7 @@
        ;; it needs a per-incarnation epoch admitted before run-link and
        ;; retired on abnormal death too -- a lifetime-management surface
        ;; wider than the ordering window it would close.
-       ;; ⛔ So do not read this clause as a complete fix.
+       ;; So do not read this clause as a complete fix.
        ;;
        ;; The test is inside the same region as the lookup, which is what
        ;; makes it a decision rather than a guess.
@@ -5725,25 +5725,25 @@
   ;; handled: a datum the writer refuses is a different event with a
   ;; different repair, and mon-agent's degrade-to-'exit path depends on
   ;; still seeing it.
-  ;; ⭐ THE OPTIONAL FOURTH ARGUMENT IS AN INCARNATION FENCE, AND IT
+  ;; THE OPTIONAL FOURTH ARGUMENT IS AN INCARNATION FENCE, AND IT
   ;; LIVES HERE BECAUSE THE COMPARISON AND THE CONNECTION MUST COME FROM
-  ;; ONE ENTRY. ⛔ It was called a lock, and that word promised more than
+  ;; ONE ENTRY. It was called a lock, and that word promised more than
   ;; it does: it excludes nothing, as the paragraph below says. A caller that only matters to one
   ;; incarnation of the peer -- a hosted monitor agent, which was armed
   ;; against a particular run and whose reference means nothing to any
   ;; other -- can pass the boot id it was armed under. The comparison
   ;; then happens against the SAME entry the connection is taken from.
-  ;; ⚠ That is not the same as saying no replacement can land in
+  ;; That is not the same as saying no replacement can land in
   ;; between: it can, and this file says so a few lines up. What it
   ;; buys is that the decision and the connection describe ONE entry, so
   ;; a replacement landing afterwards cannot redirect this write onto the
   ;; new run -- the write goes to the connection that was matched, and a
   ;; failure on it retries and re-compares.
-  ;; ⛔ Said the other way round because the first phrasing claimed
+  ;; Said the other way round because the first phrasing claimed
   ;; atomicity this does not have, which is the same over-claim the gate
   ;; it replaced was written with.
   ;;
-  ;; ⛔ ASKING THE SAME QUESTION BEFORE THE CALL DOES NOT WORK, and that
+  ;; ASKING THE SAME QUESTION BEFORE THE CALL DOES NOT WORK, and that
   ;; is what this replaced. A predicate that reads the table, returns,
   ;; and leaves the caller to write is two operations: the entry can be
   ;; replaced in between, and the write then resolves the peer by NAME
@@ -5751,7 +5751,7 @@
   ;; Moving the comparison in here is not tidier, it is a different
   ;; property.
   ;;
-  ;; ⚠ A MISMATCH RETURNS #f AND TAKES NOTHING DOWN. It is the same
+  ;; A MISMATCH RETURNS #f AND TAKES NOTHING DOWN. It is the same
   ;; answer as "this peer has no current entry", and it means the same
   ;; thing to the caller: the node this frame was for is not reachable
   ;; any more, and the run it was for is gone. It is NOT a submission
@@ -5803,7 +5803,7 @@
                ;; connection is still the current one, then stop-link!.
                ;; That branch is the assertion's subject.
                ;;
-               ;; ⭐ TWO GUARDS STAND BETWEEN THIS POINT AND THE
+               ;; TWO GUARDS STAND BETWEEN THIS POINT AND THE
                ;; ASSERTION, AND ONLY THE INNER ONE FIRES. The inner one
                ;; is the guard on the next line, and it is the subject:
                ;; it turns the raise into ok = #f, which selects the
@@ -5841,7 +5841,7 @@
                ;; down by ten, so they were wrong on arrival. Tokens,
                ;; not lines.)
                ;;
-               ;; ⚠ THE COUNT ABOVE IS PRODUCT-SIDE. A test cell adds
+               ;; THE COUNT ABOVE IS PRODUCT-SIDE. A test cell adds
                ;; its own guards outside these; they receive nothing
                ;; here, because the inner guard consumes the raise, but
                ;; a point whose cell asserts on a RAISE rather than on
@@ -5888,32 +5888,32 @@
   (define (current-conn peer)
     (atomically (current-conn-locked peer)))
 
-  ;; ⭐ IS THIS FRAME'S CONNECTION THE PEER'S CURRENT INCARNATION? The
+  ;; IS THIS FRAME'S CONNECTION THE PEER'S CURRENT INCARNATION? The
   ;; reverse of new-incarnation?, asked from the other side: that one has
   ;; two entries in hand and asks whether they are different runs; this
   ;; one has a boot id carried up from a link and asks whether it is
   ;; still the run currently installed.
   ;;
-  ;; ⚠ IT DELIBERATELY DOES NOT ASK ABOUT THE CONNECTION. A superseded
+  ;; IT DELIBERATELY DOES NOT ASK ABOUT THE CONNECTION. A superseded
   ;; connection of the SAME run is still that run: its control frames
   ;; mean what they said, and dropping them was the defect this replaces.
   ;; Only a different run makes them meaningless, because the process
   ;; that sent them is gone.
   ;;
-  ;; ⛔ #f IS NOT AN INCARNATION, and this is the whole reason the test is
+  ;; #f IS NOT AN INCARNATION, and this is the whole reason the test is
   ;; not a bare equal?. equal? calls two unknowns equal, so an entry with
   ;; no boot id and a frame with no boot id would be judged the same run
   ;; of the same node -- the one answer this must never give. Both
   ;; install points supply one today (the accepted handshake's field, and
   ;; the dialler's own), so the #f arm cannot be reached from here.
-  ;; ⛔ It is written anyway: "no caller passes #f today" is a property of
+  ;; It is written anyway: "no caller passes #f today" is a property of
   ;; the callers, not of this predicate, and the callers are what change.
   (define (current-incarnation-locked? peer boot-id)   ; caller holds the region
     (let ((e (hashtable-ref peers peer #f)))
       (and e boot-id (entry-boot-id e)
            (equal? (entry-boot-id e) boot-id))))
 
-  ;; ⛔ THERE IS NO UNLOCKED FORM OF THIS, AND THERE WAS ONE. It wrapped
+  ;; THERE IS NO UNLOCKED FORM OF THIS, AND THERE WAS ONE. It wrapped
   ;; the locked form in a region and handed the answer back, which is
   ;; exactly the shape the outbound fence stopped using: outside a
   ;; region the answer is stale the instant it is returned, and every
@@ -5921,7 +5921,7 @@
   ;; Callers that need to act take the boot id to the step that reads the
   ;; entry -- link-write/critical's fourth argument -- instead of asking
   ;; here first.
-  ;; ⛔ Re-adding the wrapper is how the window comes back.
+  ;; Re-adding the wrapper is how the window comes back.
 
   ;; Take down whatever connection this peer is currently reached on.
   ;;
@@ -5940,7 +5940,7 @@
   ;; achieves it whichever generation that is. The cost of closing one
   ;; that just replaced the old is a reconnect -- and the failover still
   ;; happens, which is what was being asked for.
-  ;; ⭐ THE OPTIONAL BOOT ID IS THE SAME DEVICE AS link-write/critical'S,
+  ;; THE OPTIONAL BOOT ID IS THE SAME DEVICE AS link-write/critical'S,
   ;; and deliberately spelled the same way. A caller that failed to
   ;; deliver something belonging to ONE run must not take down the link
   ;; of another: "by name" resolves to whatever incarnation is current,
@@ -5948,7 +5948,7 @@
   ;; never saw the frame. Comparison and use come from the same entry, so
   ;; this is a lock and not a check.
   ;;
-  ;; ⚠ THE CALLER THAT NEEDS IT IS mon-agent, AND IT NEEDS IT BECAUSE OF
+  ;; THE CALLER THAT NEEDS IT IS mon-agent, AND IT NEEDS IT BECAUSE OF
   ;; A CHANGE MADE NEARBY. It used to skip building its frame once the
   ;; run was gone, so it never reached its own failure handler; the fence
   ;; moved into the write, so construction now happens first and a
@@ -5989,12 +5989,12 @@
   ;; this one included. The demon frame in remove-target-watch! is the
   ;; same case and takes the same route. See link-write/critical for the
   ;; rule, and for why an rcall reply is deliberately NOT in this class.
-  ;; ⚠ IT WRITES TO THE PEER, NOT TO A CONNECTION, and that is now a
+  ;; IT WRITES TO THE PEER, NOT TO A CONNECTION, and that is now a
   ;; decision rather than an accident. The watcher is a peer name and the
   ;; write resolves that name when the monitor fires, so a monitor armed
   ;; before a replacement reports down the connection that replaced it.
   ;;
-  ;; ⛔ A CONNECTION-KEYED GATE WAS TRIED HERE AND REMOVED. It carried
+  ;; A CONNECTION-KEYED GATE WAS TRIED HERE AND REMOVED. It carried
   ;; the connection the agent was armed on and wrote only while that
   ;; connection was still current. The argument for dropping the notice
   ;; otherwise was that the watcher's own fail-monitors-for! had already
@@ -6005,12 +6005,12 @@
   ;; every notice for the rest of the monitor's life, and the watcher
   ;; heard nothing.
   ;;
-  ;; ⭐ THE LESSON IS ABOUT THE MEASUREMENT, not about that gate. It was
+  ;; THE LESSON IS ABOUT THE MEASUREMENT, not about that gate. It was
   ;; described, and accepted, as NARROWING a window -- and a narrowing
   ;; whose remaining width is zero is a closure wearing a compromise's
   ;; name. Ask what is left after a narrowing, not how much came off.
   ;;
-  ;; ⭐ WHAT REPLACES IT IS A FENCE ON THE INCARNATION. The agent records
+  ;; WHAT REPLACES IT IS A FENCE ON THE INCARNATION. The agent records
   ;; the peer's boot id at arming and writes only while that run is still
   ;; the one installed. The difference from what was removed is the whole
   ;; point: a replacement of the SAME run leaves the fence open, because
@@ -6020,7 +6020,7 @@
   ;; delivering the notice would end one of the NEW run's watches and
   ;; report a death that did not happen.
   ;;
-  ;; ⭐ AND THE FENCE IS PART OF THE WRITE, NOT A TEST IN FRONT OF IT.
+  ;; AND THE FENCE IS PART OF THE WRITE, NOT A TEST IN FRONT OF IT.
   ;; The boot id goes to link-write/critical, which compares it against
   ;; the same entry it takes the connection from. A replacement can still
   ;; land while that write is in progress; what it cannot do is redirect
@@ -6029,18 +6029,18 @@
   ;; with it, and that is deliberate: a second place asking the same
   ;; question is a second place that can answer it differently.
   ;;
-  ;; ⛔ A PRE-CHECK IS WHAT THIS REPLACED, AND IT DID NOT WORK. Reading
+  ;; A PRE-CHECK IS WHAT THIS REPLACED, AND IT DID NOT WORK. Reading
   ;; the table, returning, and then writing is two operations; a new run
   ;; installed in the gap was written to anyway, carrying a reference the
   ;; previous run had minted. It was a narrowing described as a closure,
   ;; which is the same mistake as the connection gate it succeeded.
   ;;
-  ;; ⚠ NO CELL DISCRIMINATES THIS. Its window is the gap between two
+  ;; NO CELL DISCRIMINATES THIS. Its window is the gap between two
   ;; statements, and nothing in the suite can open it; the argument for
   ;; the fix is the structure, not a red run. Recorded so that nobody
   ;; reads the surrounding green as coverage of it.
   ;;
-  ;; ⛔ IT IS ALSO NOT A COMPLETE ANSWER TO THE QUESTION IT LOOKS LIKE IT
+  ;; IT IS ALSO NOT A COMPLETE ANSWER TO THE QUESTION IT LOOKS LIKE IT
   ;; ANSWERS. Whether a hosted watch belongs to the connection it was
   ;; armed on or to the peer is still open; this fence only settles what
   ;; happens across a change of RUN. Ordering between two links of the
@@ -6156,7 +6156,7 @@
   ;; there are no "did I do this step" flags here -- the freshness of the
   ;; key does the work bookkeeping would otherwise have to do.
   ;;
-  ;; ⭐ IT MUST REACH THE RMONITORS ENTRY, not only the agents. Undoing
+  ;; IT MUST REACH THE RMONITORS ENTRY, not only the agents. Undoing
   ;; the agents alone would leave a monitor that is armed, has nobody to
   ;; fire it, AND has consistent-looking books -- turning a residue two
   ;; exported counts disagree about into one that nothing disagrees
@@ -6178,7 +6178,7 @@
   ;; The entry and the agent that tears it down go in together or neither
   ;; goes in.
   ;;
-  ;; ⚠ THE REASON TO REPAIR THIS IS NOT THE COUNT. If the agent fails to
+  ;; THE REASON TO REPAIR THIS IS NOT THE COUNT. If the agent fails to
   ;; install, the stranded rmonitors entry IS collected: the sweep for a
   ;; dropped peer walks every entry naming that node and does not consult
   ;; owner-agents, so the books come back on their own. What does not
@@ -6187,7 +6187,7 @@
   ;; is holding on our behalf; without it, that registration stays on the
   ;; OTHER node for as long as it runs.
   ;;
-  ;; ⭐ So "recoverable" has to be asked about the consequence and not
+  ;; So "recoverable" has to be asked about the consequence and not
   ;; about the bookkeeping. Every reading this node has is local, which
   ;; means a residue that lands on the peer looks, from here, exactly
   ;; like nothing happening.
@@ -6296,7 +6296,7 @@
                     (raise why)
                     (link-loop c peer boot-id buf last-seen)))
               (`#(node-stop) (raise 'stop)))
-            ;; ⚠ A SUPERSEDED LINK CAN STILL SERVE WHAT IT HAS BUFFERED.
+            ;; A SUPERSEDED LINK CAN STILL SERVE WHAT IT HAS BUFFERED.
             ;; Replacing a peer's connection sends the old link a stop
             ;; message, and a message is only read where this loop reads
             ;; its mailbox -- the branch above, taken when no whole frame
@@ -6322,7 +6322,7 @@
             ;; connection; its admission lease is released by the serving
             ;; process itself, so no accounting is lost.
             ;;
-            ;; ⛔ THE BOUND IS NOT "WHAT FITS IN THE BUFFER", and an
+            ;; THE BOUND IS NOT "WHAT FITS IN THE BUFFER", and an
             ;; earlier sentence here said it was. This loop reads its
             ;; mailbox ONLY on the incomplete branch, so while buf still
             ;; holds a whole frame it neither takes new segments nor sees
@@ -6334,7 +6334,7 @@
             ;; at the moment of the stop, and that mailbox is unbounded
             ;; (libuv.sc says so where it delivers into it).
             ;;
-            ;; ⚠ THE CORRECTION MATTERS BECAUSE OF WHAT THIS SENTENCE IS
+            ;; THE CORRECTION MATTERS BECAUSE OF WHAT THIS SENTENCE IS
             ;; USED FOR. It is the line anyone reaches for to argue that
             ;; a superseded link's window is small, and any decision to
             ;; leave a residue unrepaired rests on that quantity.
@@ -6917,20 +6917,20 @@
   (define registrar #f)
 
   ;; ---- the command queue (C2) -----------------------------------------
-  ;; ⭐ THE WORK IS DURABLE, THE WAKE IS NOT. Commands used to live in the
+  ;; THE WORK IS DURABLE, THE WAKE IS NOT. Commands used to live in the
   ;; registrar's mailbox, which died with it: a registrar that was killed
   ;; mid-command took every queued command with it, and nothing could tell
   ;; that anything had been lost. The queue is module state, so it
   ;; outlives any one registrar incarnation; the restarted one finds the
   ;; head still there and runs it again.
   ;;
-  ;; ⭐ EVERY WRITE HERE IS A POINTER WRITE. Senders allocate their cell
+  ;; EVERY WRITE HERE IS A POINTER WRITE. Senders allocate their cell
   ;; OUTSIDE the region and hand it in already built, so appending is a
   ;; set-cdr! and two set!s -- nothing in the region can raise for want of
   ;; memory. That is the property that lets a sender append from any
   ;; process without a lock.
   ;;
-  ;; ⚠ NEVER CLEARED ON START. A restart is not a reason to drop work; the
+  ;; NEVER CLEARED ON START. A restart is not a reason to drop work; the
   ;; command at the head is precisely the one whose effects may be half
   ;; applied, and re-running it is the recovery.
   (define registrar-q-head '())
@@ -6945,7 +6945,7 @@
 
   (define (registrar-peek) (atomically registrar-q-head))
 
-  ;; ⭐ BY IDENTITY, NOT BY POSITION. The executor dequeues the cell it
+  ;; BY IDENTITY, NOT BY POSITION. The executor dequeues the cell it
   ;; actually ran; if anything has changed the head since -- it cannot
   ;; today, but a second consumer would -- this removes nothing rather
   ;; than removing someone else's work.
@@ -6963,13 +6963,13 @@
       (when registrar (send registrar (vector 'work)))))
 
   ;; ---- test seams (see $registrar-seed-gen! for why they are gated) ----
-  ;; ⭐ THE REGISTRAR HAS NO REGISTERED NAME, deliberately: `whereis` is
+  ;; THE REGISTRAR HAS NO REGISTERED NAME, deliberately: `whereis` is
   ;; how a peer's own processes find each other, and nothing outside this
   ;; file has business addressing the registrar. That leaves a cell that
   ;; wants to kill it with no way to name it, so this hands the pid over
   ;; -- read-only, and only in an artifact expanded for injection.
   ;;
-  ;; ⚠ The pid is #f between incarnations. A cell reading #f has caught
+  ;; The pid is #f between incarnations. A cell reading #f has caught
   ;; the window between a death and the warden's restart; that is a real
   ;; state, not an error.
   ;;
@@ -6983,7 +6983,7 @@
        (atomically
          (let loop ((c registrar-q-head) (n 0))
            (if (pair? c) (loop (cdr c) (fx+ n 1)) n))))
-     ;; ⛔ THE RAW STORED VALUE, AND IT MUST NOT GO THROUGH peer-gen. Two
+     ;; THE RAW STORED VALUE, AND IT MUST NOT GO THROUGH peer-gen. Two
      ;; reasons, and both are the point of the seam rather than details of
      ;; it: peer-gen MINTS when it finds nothing, so reading through it
      ;; would change the state a cell is trying to observe; and peer-gen
@@ -7010,18 +7010,18 @@
          peer))))
 
   ;; ---- the executor (C3) ----------------------------------------------
-  ;; ⭐ THE REGISTRAR IS A WARDEN CHILD NOW, and this is the shape that
+  ;; THE REGISTRAR IS A WARDEN CHILD NOW, and this is the shape that
   ;; makes that worth anything. Supervision alone would restart a process
   ;; whose work had died with it; the queue outlives the incarnation, so a
   ;; restart resumes rather than forgets.
   ;;
-  ;; ⚠ THE COMMAND IS DEQUEUED ONLY WHEN ITS HANDLER SAYS SO, and each
+  ;; THE COMMAND IS DEQUEUED ONLY WHEN ITS HANDLER SAYS SO, and each
   ;; handler puts the dequeue after the writes it must not be separated
   ;; from. A death between a command's effects and its dequeue therefore
   ;; re-runs the command -- which is why every handler is written so that
   ;; re-running it is harmless. R-d below is exactly that property.
   ;;
-  ;; ⛔ THERE ARE THREE COMMANDS AND THAT IS ALL. A fourth arm,
+  ;; THERE ARE THREE COMMANDS AND THAT IS ALL. A fourth arm,
   ;; #(auth-revoke ,peer), stood here for a long time and NOTHING EVER
   ;; SENT IT -- what the design notes call "auth-revoke" is the step
   ;; inside set-endpoint that deletes the auth row and advances the
@@ -7075,7 +7075,7 @@
             (raise (list 'registrar-command-stuck (car cell))))
           (loop)))))
 
-  ;; ⭐ THE DIAGNOSTIC LIVES HERE, not in next-dial-gen!. That procedure
+  ;; THE DIAGNOSTIC LIVES HERE, not in next-dial-gen!. That procedure
   ;; runs inside a region where display would be an I/O call that can
   ;; block and can raise; here we are outside every region and we hold the
   ;; command, so the message can name the peer and what was being done.
@@ -7110,7 +7110,7 @@
   ;; permission; a second one would dial the same name in parallel and
   ;; both would reach the far end.
   ;;
-  ;; ⚠ THE SEND IS AFTER THE REGION AND THE DEQUEUE IS AFTER THE SEND.
+  ;; THE SEND IS AFTER THE REGION AND THE DEQUEUE IS AFTER THE SEND.
   ;; Sending inside the region would put an allocation there; dequeuing
   ;; before the send would let a death between them lose the go, with the
   ;; command gone and the child waiting for a reply that will never come.
@@ -7161,7 +7161,7 @@
 
   ;; Stop dialling a peer and drop its link.
   ;;
-  ;; ⚠ THE STOPS HAPPEN BEFORE THE REGION AND THE ROW IS NOT DELETED YET.
+  ;; THE STOPS HAPPEN BEFORE THE REGION AND THE ROW IS NOT DELETED YET.
   ;; Deleting first and stopping after leaves, if the registrar dies
   ;; between them, a connector nothing has a record of -- alive, dialling,
   ;; and invisible to every count this file keeps. Stopping first costs
@@ -7189,7 +7189,7 @@
         ;; killed by the compensation guard. The executor re-runs the
         ;; command.
         ;;
-        ;; ⛔ AN EARLIER VERSION PRE-MINTED 1 HERE, and it was wrong in a
+        ;; AN EARLIER VERSION PRE-MINTED 1 HERE, and it was wrong in a
         ;; way ten rounds of design review did not see: the advance below
         ;; then took it to 2, so the first generation a fresh peer was
         ;; ever authorised under was 2, not 1. test/node.sc's
@@ -7204,7 +7204,7 @@
 
   ;; The endpoint change, in the order the design calls (0)-(4).
   ;;
-  ;; ⭐ THE ADVANCE COMES BEFORE THE PUBLISH. The publish is the only
+  ;; THE ADVANCE COMES BEFORE THE PUBLISH. The publish is the only
   ;; state write here that may allocate -- a new connector key can grow
   ;; the table -- so it is placed last among them. A raise there leaves
   ;; the old rows gone, the generation advanced and nothing published,
@@ -7254,7 +7254,7 @@
               ;; live.
               (when outbound?
                 (stop-link! (entry-conn ent) (entry-link ent) 'endpoint-changed))
-              ;; ⭐ THE COMPENSATION GUARD COVERS PHASE (a) AND THE REGION
+              ;; THE COMPENSATION GUARD COVERS PHASE (a) AND THE REGION
               ;; BOTH. A spawn leaves a process behind whether or not the
               ;; write that was going to publish it succeeds, and the
               ;; raise can come from either half.
@@ -7271,7 +7271,7 @@
                   ;; OWNING GUARD: the compensation guard just above, which
                   ;; kills the spawned-but-unpublished process and re-raises.
                   ;;
-                  ;; ⭐ THE POINT EXISTS TO SHOW THE WINDOW IS SURVIVABLE,
+                  ;; THE POINT EXISTS TO SHOW THE WINDOW IS SURVIVABLE,
                   ;; not to observe the 0. A raise here leaves the peer
                   ;; stored as 0 and kills the registrar, but the command
                   ;; that wrote the 0 holds the queue head: the warden
@@ -7283,7 +7283,7 @@
                   ;; live-entry while the published link is up, and re-dials
                   ;; the moment it goes down.
                   ;;
-                  ;; ⭐ WHICH IS WHY THE WINDOW MATTERS: while the link is up
+                  ;; WHICH IS WHY THE WINDOW MATTERS: while the link is up
                   ;; the orphan is silent, so a cell that looks for a second
                   ;; dial before the disconnect sees a healthy node and goes
                   ;; green whether or not the kill happened.
@@ -7320,7 +7320,7 @@
                  ;; still the same row we just read, not a replacement
                  ;; published between the read and here.
                  ;;
-                 ;; ⚠ NOT A COMPARE-AND-SWAP, though it has that shape,
+                 ;; NOT A COMPARE-AND-SWAP, though it has that shape,
                  ;; and this comment used to call it one. The whole
                  ;; sequence runs in an atomic region that cannot be
                  ;; interrupted under this scheduler, and THAT is why no
@@ -7339,7 +7339,7 @@
     (let* ((parent self)
            (ref (gensym))
            (child (spawn (lambda ()
-                           ;; ⛔ THE EXHAUSTION TOKEN DOES NOT REACH HERE,
+                           ;; THE EXHAUSTION TOKEN DOES NOT REACH HERE,
                            ;; and this paragraph used to say it did.
                            ;; next-dial-gen! is called only from
                            ;; registrar-loop (three direct calls plus
@@ -7477,7 +7477,7 @@
     ;; The registrar starts with the node, not with the first dial: its
     ;; mailbox is the order in which permission to dial changes, and an
     ;; order that only begins once somebody dials is not one.
-    ;; ⛔ THE REGISTRAR IS NOT SPAWNED HERE ANY MORE. The warden starts
+    ;; THE REGISTRAR IS NOT SPAWNED HERE ANY MORE. The warden starts
     ;; it, and registrar-start assigns `registrar` itself. Nothing waits
     ;; for that to happen: a command sent before the first incarnation is
     ;; running goes into the queue and is executed when it starts, which
@@ -7492,7 +7492,7 @@
                                "hosted-monitor credit is no longer being returned")
                        (vector 'dispatcher dispatcher-loop
                                "topology notifications are no longer being delivered")
-                       ;; ⭐ THE REGISTRAR IS A CHILD NOW. It was spawned
+                       ;; THE REGISTRAR IS A CHILD NOW. It was spawned
                        ;; bare, so an unexpected raise inside it ended it
                        ;; with nothing restarting it -- and it is the only
                        ;; process that hands out permission to dial, so
@@ -7551,7 +7551,7 @@
     ;; yet, B sees none and spawns its own, A resumes and spawns over it
     ;; -- and the endpoint that survived was not necessarily the one asked
     ;; for last. A mailbox is a total order for free.
-    ;; ⚠ THE GUARD IS self-name, NOT registrar, for the reason
+    ;; THE GUARD IS self-name, NOT registrar, for the reason
     ;; node-disconnect! gives: `registrar` is #f until the warden's child
     ;; has run, and a connect issued in that window belongs in the queue.
     ;; Testing `registrar` here made node-connect! raise "call node-start!
@@ -7573,7 +7573,7 @@
   ;; interleaving the mailbox exists to rule out -- a disconnect landing
   ;; between an endpoint change's take and its publish would be undone by
   ;; the publish.
-  ;; ⚠ THE GUARD IS self-name, NOT registrar. `registrar` is #f between
+  ;; THE GUARD IS self-name, NOT registrar. `registrar` is #f between
   ;; incarnations, and a disconnect issued in that window belongs in the
   ;; queue, not dropped. What must still be a no-op is a call made before
   ;; node-start! at all -- there is no node to disconnect from then, and
@@ -7844,7 +7844,7 @@
          ;; no equality between the counts to check. What there is, is a
          ;; baseline: rmonitors is reported, and after a failed arming it
          ;; has to be what it was before.
-         ;; ⚠ `caller` IS READ HERE, NOT IN THE AGENTS. `self` is a
+         ;; `caller` IS READ HERE, NOT IN THE AGENTS. `self` is a
          ;; property of whoever is running, so the same expression means
          ;; a different process once it is inside a spawned thunk -- it
          ;; would name the agent instead of the process being watched
@@ -7857,7 +7857,7 @@
                (hashtable-set! rmonitors mref (vector caller node name))
                (set! oa (spawn (lambda () (owner-mon-agent caller mref))))
                (hashtable-set! owner-agents mref oa)
-               ;; ⚠ WHAT REMOVES A caller-agents ROW, and whether
+               ;; WHAT REMOVES A caller-agents ROW, and whether
                ;; the agent has to be alive for it. The agent itself
                ;; deletes its row on each of self-mon-agent's three
                ;; exits. remove-target-watch! deletes it by mref --
@@ -7867,14 +7867,14 @@
                ;; way. The reaper is not on this list: it walks the
                ;; monitor chain and the lease chain, not this table.
                ;;
-               ;; ⚠ AN EARLIER NOTE SAID A KILLED AGENT WOULD LEAVE ITS
+               ;; AN EARLIER NOTE SAID A KILLED AGENT WOULD LEAVE ITS
                ;; ROW BEHIND "FOR GOOD". Too strong -- the two mref-keyed
                ;; deletions still reach it. What is true is narrower and
                ;; still worth avoiding: the row then survives until the
                ;; caller demonitors or dies, and forever if it does
                ;; neither.
                ;;
-               ;; ⭐ THE SAFETY ARGUMENT IS ABOUT THE ONE KILL PATH,
+               ;; THE SAFETY ARGUMENT IS ABOUT THE ONE KILL PATH,
                ;; NOT ABOUT THERE BEING NONE. The note this replaces said
                ;; "no path in here kills them -- so nothing can kill
                ;; one", and undo-remote-arm! kills exactly this agent.
@@ -7882,7 +7882,7 @@
                ;; all three rows BEFORE it kills, so it leaves nothing
                ;; behind. Safety rests on that ORDER.
                ;;
-               ;; ⛔ A second kill path that does not delete first
+               ;; A second kill path that does not delete first
                ;; breaks this while every sentence above it still reads
                ;; as true; giving these agents a name reaches the same
                ;; place by another route. Either way this table would

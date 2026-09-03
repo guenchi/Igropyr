@@ -1,18 +1,18 @@
 #!chezscheme
 ;;; (igropyr uv) -- the raw libuv binding layer.
 ;;;
-;;; ⭐ THE CUT IS BY OWNERSHIP, NOT BY SUBJECT. What lives here is what belongs
+;;; THE CUT IS BY OWNERSHIP, NOT BY SUBJECT. What lives here is what belongs
 ;;; to the LOOP: the FFI bindings and their constants, the loop handle and the
 ;;; process-wide buffers allocated with it, and the two callbacks the loop
 ;;; itself drives (its wakeup timer and uv_walk). Everything owned by a
 ;;; connection or by an owning process -- conns, listeners, DNS, files, the
 ;;; TLS codec -- is (igropyr tcp), one layer up.
 ;;;
-;;; ⛔ NEVER IMPORT (igropyr tcp) OR (igropyr tls-core) HERE. This library is
+;;; NEVER IMPORT (igropyr tcp) OR (igropyr tls-core) HERE. This library is
 ;;; below both; (igropyr libuv) is a façade above them that re-exports the
 ;;; public API name for name, so existing consumers see no change at all.
 ;;;
-;;; ⚠ THE SHARED BUFFERS ARE HANDED OUT AS LEASES, NOT AS POINTERS. Their
+;;; THE SHARED BUFFERS ARE HANDED OUT AS LEASES, NOT AS POINTERS. Their
 ;;; whole safety argument is "packed and used inside one interrupt-disabled
 ;;; region, with no yield between the pack and the syscall" -- and that
 ;;; argument lives HERE, next to the buffer. Exporting the raw address would
@@ -50,7 +50,7 @@
     memcpy-from-c memcpy-to-c memcpy-cc
     c-open c-openat c-close uv-fileno c-getsockopt)
 
-  ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF, the same
+  ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF, the same
   ;; arrangement the rest of the tree documents.
   (import (chezscheme) (igropyr platform) (igropyr inject))
 
@@ -113,7 +113,7 @@
   (define uv-fs-scandir-next
     (foreign-procedure "uv_fs_scandir_next" (void* void*) int))
 
-  ;; ⚠ THE ONLY ERRNO THIS FILE INVENTS. Every other #(file-error ,e)
+  ;; THE ONLY ERRNO THIS FILE INVENTS. Every other #(file-error ,e)
   ;; carries a number libuv returned; this one is reported when the
   ;; scandir callback itself runs out of memory building Scheme strings,
   ;; a failure libuv never saw and has no code for. It is spelled the way
@@ -289,7 +289,7 @@
   (define scratch-buf 0)             ; one reusable uv_buf_t
 
 
-  ;; ⭐ ARE WE IN A CALLBACK FRAME? Set around uv_run, which is the only place
+  ;; ARE WE IN A CALLBACK FRAME? Set around uv_run, which is the only place
   ;; libuv callbacks run from. This is used instead of comparing pids against
   ;; the event-loop process: it is the direct mechanism rather than an identity
   ;; test standing in for one, and it needs no second hook to tell us which pid
@@ -319,7 +319,7 @@
       void))
 
 
-  ;; ⭐ THE LOCK TABLE IS SPLIT BY OWNERSHIP, NOT MOVED WHOLE. Only these two
+  ;; THE LOCK TABLE IS SPLIT BY OWNERSHIP, NOT MOVED WHOLE. Only these two
   ;; code objects belong to the loop itself -- its wakeup timer and uv_walk.
   ;; The other eleven reach into connection and file tables and are locked in
   ;; (igropyr tcp), beside the state they touch. libuv holds raw entry
@@ -345,7 +345,7 @@
   ;; wakeup timer, so the number is compared against a baseline taken in
   ;; the same process rather than against zero.
   ;;
-  ;; ⚠ A CLOSING HANDLE IS STILL A HANDLE. uv_close is asynchronous: the
+  ;; A CLOSING HANDLE IS STILL A HANDLE. uv_close is asynchronous: the
   ;; handle leaves the loop when its close callback runs, which needs the
   ;; loop to turn. Read this number straight after a close and it counts
   ;; something that is on its way out, which reads exactly like a leak.

@@ -13,19 +13,19 @@
 ;;; Four copies of a list is four chances to forget. There is now one,
 ;;; and it is compared against the directory rather than trusted.
 
-;; ⛔ NO PRODUCTION BUILD MAY BE MADE WITH FAULT INJECTION ARMED, and
+;; NO PRODUCTION BUILD MAY BE MADE WITH FAULT INJECTION ARMED, and
 ;; this is the place that can say so once. The switch is read when a
 ;; library is expanded, so a .so compiled while IGROPYR_INJECT=on carries
 ;; injection code and an invoke-time refusal -- an artifact that is
 ;; neither usable in production nor obviously broken until something
 ;; loads it.
 ;;
-;; ⭐ IT LIVES HERE BECAUSE THE LIST DOES. build.ss is not the only thing
+;; IT LIVES HERE BECAUSE THE LIST DOES. build.ss is not the only thing
 ;; that compiles these units: build-whole.ss, build-profile.ss and
 ;; build-pgo.ss load this same file and compile the same names. A refusal
 ;; written into one of four consumers is a refusal three builds do not
 ;; have -- and the first version of this guard was exactly that.
-;; ⚠ AND ONLY A FIFTH ENTRY POINT THAT LOADS THIS FILE gets it. An
+;; AND ONLY A FIFTH ENTRY POINT THAT LOADS THIS FILE gets it. An
 ;; entry point calling compile-library or compile-program directly is
 ;; outside this guard entirely -- today there is none, and that is a
 ;; fact about the repository rather than a property of this line.
@@ -37,7 +37,7 @@
 (define library-units
   '("igropyr/util.sc"
     "igropyr/checked.sc"
-    ;; ⭐ COMPILED EVEN THOUGH IT SHIPS INERT. libuv imports it, so it has
+    ;; COMPILED EVEN THOUGH IT SHIPS INERT. libuv imports it, so it has
     ;; to resolve in a compiled build; with IGROPYR_INJECT unset its
     ;; macros expand to the guarded expression or to nothing and no
     ;; consumer refers to its runtime part. The refusal at the head of
@@ -46,12 +46,12 @@
     "igropyr/inject.sc"
     "igropyr/buffer.sc"
     "igropyr/platform.sc"
-    ;; ⭐ BEFORE libuv.sc, WHICH IMPORTS IT. Compiling a unit after its
+    ;; BEFORE libuv.sc, WHICH IMPORTS IT. Compiling a unit after its
     ;; importer makes Chez build the importer against a different
     ;; instance of it; the order here is the dependency order, not a
     ;; preference. It sits after platform.sc, its only dependency.
     "igropyr/tls-core.sc"
-    ;; ⭐ uv BELOW tcp BELOW the façade, and all three before libuv's
+    ;; uv BELOW tcp BELOW the façade, and all three before libuv's
     ;; consumers. uv owns the loop; tcp owns everything a connection or an
     ;; owning process owns; "igropyr/libuv.sc" is now a façade with no
     ;; definitions, so it must be compiled after both.
@@ -144,7 +144,7 @@
     ("qjs-worker.sc"
      . "standalone script, run as `scheme --script igropyr/qjs-worker.sc`; nothing imports it")
     ("inject-control.sc"
-     . "test-only: the arming side of fault injection. ⛔ Compiling it into a production build would put the instrument in the product; nothing in the library imports it, and test/inject-isolation.ss checks that mechanically by walking invoke edges")))
+     . "test-only: the arming side of fault injection. Compiling it into a production build would put the instrument in the product; nothing in the library imports it, and test/inject-isolation.ss checks that mechanically by walking invoke edges")))
 
 ;; Compare the list against the directory it claims to describe.
 ;;

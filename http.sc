@@ -56,7 +56,7 @@
           ;; http-server-pool-alive?, which answers without handing over
           ;; the means to end the process -- and anything asking "is this
           ;; server's machinery still in place" wants http-server-ready?,
-          ;; which checks the listener as well. ⚠ Neither answers "would
+          ;; which checks the listener as well. Neither answers "would
           ;; a request be served"; both report lifecycle state.
           http-server-sup http-server-pool-alive?
           http-server-backlog http-server-backlog-effective
@@ -85,7 +85,7 @@
           ;; never conflicts.
           start-scheduler spawn send receive self
           sleep-ms kill register whereis process-id)
-  ;; ⚠ (igropyr tls-core) COSTS A PLAINTEXT PROGRAM NOTHING. It loads no
+  ;; (igropyr tls-core) COSTS A PLAINTEXT PROGRAM NOTHING. It loads no
   ;; shared object until a context or session is built, so importing it here
   ;; does not make OpenSSL a requirement of every program that serves HTTP --
   ;; that is exactly what the lazy binding in that library is for.
@@ -1756,7 +1756,7 @@
 
   ;; Wait for the worker's response to complete. Data arriving meanwhile
   ;; (pipelining) is buffered; EOF is remembered so we stop after replying.
-  ;; ⭐ ONE DEFINITION, USED AT BOTH await SITES, AND THAT IS THE POINT (Y2).
+  ;; ONE DEFINITION, USED AT BOTH await SITES, AND THAT IS THE POINT (Y2).
   ;; A TLS stream cut without close_notify arrives as #(tcp-error
   ;; tls-truncated-eof) rather than #(tcp-eof). After a COMPLETE request has
   ;; been dispatched that is the same situation a half-close already is -- the
@@ -1764,7 +1764,7 @@
   ;; response is still sent. In any other state it stays fatal, and for WSS it
   ;; stays fatal everywhere.
   ;;
-  ;; ⚠ Duplicating this test into the two arms would be two places to change
+  ;; Duplicating this test into the two arms would be two places to change
   ;; the rule and one place to forget: the cell for this row asserts that this
   ;; predicate is defined exactly once.
   (define (half-close-error? e) (eq? e 'tls-truncated-eof))
@@ -1895,10 +1895,10 @@
   ;; IS THIS SERVER'S MACHINERY STILL IN PLACE? Both halves have to
   ;; hold: the listener must still be registered under this server's
   ;; incarnation token, and the pool that runs the handlers must still
-  ;; be alive. ⚠ That is not the same question as "would a request be
+  ;; be alive. That is not the same question as "would a request be
   ;; served" -- see below.
   ;;
-  ;; ⚠ BOTH HALVES ARE BOOKKEEPING, AND NEITHER ASKS libuv ANYTHING.
+  ;; BOTH HALVES ARE BOOKKEEPING, AND NEITHER ASKS libuv ANYTHING.
   ;; listener-open? consults a Scheme table this library maintains, and
   ;; pool-alive? asks whether a pid exists. An earlier version of this
   ;; comment called the listener half "a measurement, not bookkeeping,"
@@ -1906,7 +1906,7 @@
   ;; handle (true, and why it is safe), and it is an independent
   ;; observation of the socket (false).
   ;;
-  ;; ⛔ SO THIS IS LIFECYCLE STATE, NOT READINESS. #t means the table
+  ;; SO THIS IS LIFECYCLE STATE, NOT READINESS. #t means the table
   ;; still holds this listener under this incarnation token and the
   ;; supervisor pid still exists. It does NOT establish that a request
   ;; would be served: the event loop's progress, the workers' progress
@@ -1924,11 +1924,11 @@
            (http-server-pool-alive? srv) #t)))
 
   ;; What the kernel actually kept, or #f where it cannot be read.
-  ;; ⚠ THE TWO READBACKS ARE NOT INTERCHANGEABLE. http-server-backlog is
+  ;; THE TWO READBACKS ARE NOT INTERCHANGEABLE. http-server-backlog is
   ;; what we asked for and is always available; this one is what the
   ;; system granted.
   ;;
-  ;; ⚠ #f MEANS "NO ANSWER", AND SEVERAL THINGS PRODUCE IT: a platform
+  ;; #f MEANS "NO ANSWER", AND SEVERAL THINGS PRODUCE IT: a platform
   ;; with no such socket option, a failed read (uv_fileno or getsockopt
   ;; returning an error), a server already shut down, a handle whose
   ;; incarnation token no longer matches, and a successful read that
@@ -1950,7 +1950,7 @@
   ;; kernel spends on a deeper queue where it IS honoured is not
   ;; measured here.)
   ;;
-  ;; ⚠ 511 WAS THE OLD VALUE AND NOTHING HERE RECORDS WHY. It was a
+  ;; 511 WAS THE OLD VALUE AND NOTHING HERE RECORDS WHY. It was a
   ;; literal carried along, with no measurement behind it in this
   ;; repository and no note saying where it came from. That is the whole
   ;; claim: not that it is wrong, but that it was never justified, so it
@@ -1974,7 +1974,7 @@
   ;; death means this server cannot serve -- a false answer is conclusive.
   ;; A true answer is not: readiness would also need the listener, and this
   ;; does not look at it -- http-server-ready? is the predicate that looks
-  ;; at both. ⚠ Neither one establishes that a request would be served;
+  ;; at both. Neither one establishes that a request would be served;
   ;; both report lifecycle state, and it is their #f that settles
   ;; something. A #t here does say the pid existed when it was asked. It says nothing about load either; a pool with
   ;; every worker busy and a long queue is alive, and http-stats is where
@@ -2018,7 +2018,7 @@
          (http-stats srv)))
 
   ;; Graceful shutdown: stop accepting, then wait until the pool reports
-  ;; busy = pending = 0. ⚠ TWO LIMITS ON THAT PROMISE, both real:
+  ;; busy = pending = 0. TWO LIMITS ON THAT PROMISE, both real:
   ;; established keep-alive connections stay open and their readers can
   ;; still dispatch further requests -- nothing sets a shutdown flag on
   ;; them -- so "every accepted request" means every one counted at the
@@ -2027,7 +2027,7 @@
   ;; pool worker (the worker itself counts as busy -- deadlock).
   (define (http-shutdown! srv)
     (tcp-stop-listen! (http-server-listener srv) (http-server-ltoken srv))
-    ;; ⭐ THE CONTEXT IS RETIRED HERE, ONCE, AND THE FIELD IS CLEARED SO A
+    ;; THE CONTEXT IS RETIRED HERE, ONCE, AND THE FIELD IS CLEARED SO A
     ;; SECOND SHUTDOWN CANNOT RETIRE IT AGAIN. tls-context-retire! is itself
     ;; idempotent, so this is belt and braces -- but the field also stops
     ;; anything else reading a retired context out of the server record.
@@ -2035,10 +2035,10 @@
       (when ctx
         (http-server-tlsctx-set! srv #f)
         (tls-context-retire! ctx)))
-    ;; ⛔ AND DROP THE POINTER. uv_close's callback frees the handle, so
+    ;; AND DROP THE POINTER. uv_close's callback frees the handle, so
     ;; the field would otherwise hold freed memory that two readers take.
     ;;
-    ;; ⚠ THIS IS OWNERSHIP HYGIENE, NOT THE THING THAT MAKES ready?
+    ;; THIS IS OWNERSHIP HYGIENE, NOT THE THING THAT MAKES ready?
     ;; CORRECT, and an earlier version of this comment claimed otherwise
     ;; -- it said deleting the clear would leave ready? answering #t
     ;; forever. It would not: tcp-stop-listen! has already removed the
@@ -2050,14 +2050,14 @@
     ;; dereference it -- but the named test does not guard this line.
     (http-server-listener-set! srv #f)
     (http-server-ltoken-set! srv #f)
-    ;; ⛔ DRAINING NEEDS A LIVE POOL, AND SHUTDOWN MUST NOT NEED ONE.
+    ;; DRAINING NEEDS A LIVE POOL, AND SHUTDOWN MUST NOT NEED ONE.
     ;; pool-stats asks the supervisor and waits for its reply; against a
     ;; dead supervisor that wait ends in a pool-stats-timeout raise, and
     ;; http-shutdown! has no caller that expects to catch anything -- the
     ;; measured result was PANIC: boot pool-stats-timeout, taking the
     ;; image down.
     ;;
-    ;; ⚠ AND A DEAD POOL IS ONE OF THE TIMES SHUTDOWN GETS CALLED (the
+    ;; AND A DEAD POOL IS ONE OF THE TIMES SHUTDOWN GETS CALLED (the
     ;; ordinary one is a graceful stop with the pool alive): something
     ;; noticed the server was not serving and is now cleaning up. The
     ;; cleanup step must not be the thing that kills the process. With no
@@ -2072,7 +2072,7 @@
         ;; Re-checked each turn: the pool can die DURING the drain, and
         ;; the next pool-stats would raise exactly as above.
         ;;
-        ;; ⚠ THE LIVENESS TEST NARROWS THIS WINDOW AND DOES NOT CLOSE IT.
+        ;; THE LIVENESS TEST NARROWS THIS WINDOW AND DOES NOT CLOSE IT.
         ;; The pool can die between the test and the call below, and then
         ;; pool-stats raises anyway. So the raise is also caught -- and
         ;; caught BY NAME: otp's pool-stats raises the symbol
@@ -2137,7 +2137,7 @@
       (let ((p (assq key opts)))
         (if p (cdr p) default)))
     (define backlog (opt 'backlog default-backlog))
-    ;; ⛔ CHECKED HERE, WITH THE BACKLOG, AND FOR THE SAME REASON. It used to
+    ;; CHECKED HERE, WITH THE BACKLOG, AND FOR THE SAME REASON. It used to
     ;; sit further down, after start-worker-pool -- so a caller who gave a key
     ;; and no certificate got an assertion with a worker pool already running
     ;; and nothing left holding it. The comment below claimed validation
@@ -2147,7 +2147,7 @@
         (assertion-violation 'http-listen
           "tls-cert and tls-key must be given together"
           (list 'tls-cert cert 'tls-key key))))
-    ;; ⛔ VALIDATED BEFORE ANYTHING IS CREATED, which is why it is here
+    ;; VALIDATED BEFORE ANYTHING IS CREATED, which is why it is here
     ;; and not beside the host check further down. That check runs after
     ;; start-worker-pool, so a bad value there raises with a worker pool
     ;; already running and nothing left holding it -- the caller sees an
@@ -2194,7 +2194,7 @@
                   ;; success it will never see corrected.
                   (lambda (task) (not (unbox (vector-ref task 4))))))
            (host (opt 'host "0.0.0.0"))
-           ;; ⭐ TLS IS TWO OPTIONS AND BOTH ARE REQUIRED TOGETHER. One alone
+           ;; TLS IS TWO OPTIONS AND BOTH ARE REQUIRED TOGETHER. One alone
            ;; is a misconfiguration, not a default: a certificate with no key
            ;; cannot serve, and a key with no certificate would quietly start
            ;; a PLAINTEXT listener on the port an operator believed was
@@ -2204,7 +2204,7 @@
            ;; the pairing was checked above, before the pool existed
            (tlsctx (and tls-cert (tls-listen-context! tls-cert tls-key)))
            (srv (make-http-server sup hbox wsbox (now-ms) 0 backlog tlsctx #f)))
-      ;; ⛔ ANYTHING THAT RAISES FROM HERE GIVES THE CONTEXT BACK. Startup can
+      ;; ANYTHING THAT RAISES FROM HERE GIVES THE CONTEXT BACK. Startup can
       ;; still fail after the context exists -- an invalid host, a bind onto a
       ;; taken port, a watcher hook that will not install -- and http-listen
       ;; raises without returning a server. There is then no one to call
@@ -2256,7 +2256,7 @@
         (critical! sup (string->symbol
                          (string-append "http-worker-pool:"
                                         (number->string port)))))
-      ;; ⭐ THE on-accept LAMBDA IS THE SAME FOR BOTH. On a TLS listener libuv
+      ;; THE on-accept LAMBDA IS THE SAME FOR BOTH. On a TLS listener libuv
       ;; does not run it until the handshake has completed, so what it receives
       ;; is a connection that already speaks plaintext -- the reader, the
       ;; pre-auth ceiling and everything downstream see exactly what they see
@@ -2280,7 +2280,7 @@
                                  (http-server-tlsctx srv) flags)))
             (http-server-listener-set! srv
               (tcp-listen! host port backlog on-accept flags))))
-      ;; Taken immediately after tcp-listen! returns. ⚠ Not inside one
+      ;; Taken immediately after tcp-listen! returns. Not inside one
       ;; uninterruptible step with it: another process could in principle
       ;; stop this listener in between, in which case listener-token
       ;; answers #f and every later check fails closed -- the server
