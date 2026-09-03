@@ -215,9 +215,15 @@
     ;;     socket without close_notify; s_client cannot do this -- it shuts down
     ;;     cleanly on stdin eof) -> the server records the truncation, never a
     ;;     clean close
+    ;; The handler is slowed so the FIN reaches the server while the request is
+    ;; still in flight: with the default handler the response (Connection: close)
+    ;; and the server's own clean close can win the race and clean-close is what
+    ;; gets recorded -- a different shape, not this cell's.
+    (http-swap! srv (lambda (req res) (sleep-ms 800) (guard (e (#t #f)) (res-send! res (string->utf8 "late")))))
     (let ((r (raw-tls-send-and-drop "127.0.0.1" port "localhost" GET 5000)))
       (check "H11(b): premise -- the request went out before the bare FIN" (and (number? r) (>= r 2)) r)
       (sleep-ms 1500)
+      (http-swap! srv handler)
       (check "H11(b): a bare FIN is recorded as truncation, never as a clean close"
              (let ((r (tls-last-retire-reason))) (and (pair? r) (eq? (car r) 'truncated-eof))) (tls-last-retire-reason)))
     (check "H11(b): resources back to baseline" (settled-to? base 4000) (snap) base)
@@ -227,6 +233,11 @@
       (check "ARCH: (igropyr tls) references no OpenSSL entry point or loader (parsed symbols)"
              (not (exists (lambda (s) (let ((n (symbol->string s))) (or (and (> (string-length n) 4) (member (substring n 0 4) '("SSL_" "BIO_" "EVP_" "OBJ_" "ERR_"))) (and (> (string-length n) 5) (string=? (substring n 0 5) "X509_")) (member n '("libssl" "libcrypto"))))) tls-syms))))
     (let ((watch-syms (file-symbols "igropyr/tls-watch.sc")) (uv-syms (append (file-symbols "igropyr/uv.sc") (file-symbols "igropyr/tcp.sc"))))
+      ;; positive control: an absence check over a source file is only as good
+      ;; as its search surface. When libuv.sc became an 81-line facade the two
+      ;; checks below would have stayed green forever; this line reds instead.
+      (check "STRUCT: control -- the search surface is real (conn-tls-retire! in tcp.sc, tls-watch-install! in tls-watch.sc)"
+             (and (memq 'conn-tls-retire! uv-syms) (memq 'tls-watch-install! watch-syms) #t))
       (check "STRUCT: no #(watching) message anywhere" (and (not (memq 'watching watch-syms)) (not (memq 'watching uv-syms))))
       (check "STRUCT: no 'tls-after-owner-installed point" (and (not (memq 'tls-after-owner-installed watch-syms)) (not (memq 'tls-after-owner-installed uv-syms)))))
 

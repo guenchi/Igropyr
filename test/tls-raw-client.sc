@@ -42,8 +42,10 @@
                   (raw-tls-exchange host port sni req-a #f timeout-ms 'second req-b expect)))
       (values plain writes failure)))
 
-  ;; Handshake, send the request, then close the SOCKET without close_notify:
-  ;; a bare FIN after a complete request, the H11(b) shape. -> writes | failure string
+  ;; Handshake, drain the post-handshake tickets, send the request, then close
+  ;; the SOCKET without close_notify: a bare FIN right after a complete request,
+  ;; with no unread bytes behind it (so it is a FIN, not a reset), the H11(b)
+  ;; shape. -> writes | failure string
   (define (raw-tls-send-and-drop host port sni request timeout-ms)
     (let-values (((plain writes eof? failure)
                   (raw-tls-exchange host port sni request #f timeout-ms 'drop)))
@@ -99,9 +101,24 @@
                                (write! c (bv-append fin app)))
                              (begin
                                (flush! sess c)
+                               ;; 'drop only: the server answers our Finished with
+                               ;; TLS 1.3 session tickets. Read them out (200 ms of
+                               ;; silence) BEFORE the request goes, so the socket is
+                               ;; empty when it is closed below: closing with unread
+                               ;; bytes makes the kernel send RST instead of FIN and
+                               ;; the server records read-error -54, not the truncation
+                               ;; this shape exists to produce (seen 1 run in 4).
+                               (when (and (pair? mode) (eq? (car mode) 'drop))
+                                 (let drain ()
+                                   (receive (after 200 (void))
+                                     (`#(tcp-data ,bv) (tls-session-decrypt! sess bv) (flush! sess c) (drain))
+                                     (`#(tcp-eof) (finish (make-bytevector 0) #t "closed before the request"))
+                                     (`#(tcp-error ,e) (finish (make-bytevector 0) #f "tcp error")))))
                                (write! c (tls-session-encrypt! sess request))))
                          ;; 'drop: bare FIN right after the request, no close_notify,
-                         ;; nothing read (the socket close is what the server sees)
+                         ;; nothing read after it. The caller keeps the server from
+                         ;; answering before the FIN lands (a slow handler); the
+                         ;; tickets were drained above, so the close is a FIN.
                          (when (and (pair? mode) (eq? (car mode) 'drop))
                            (finish (make-bytevector 0) #f #f))
                          ;; read until eof or timeout; in 'second mode send B once
