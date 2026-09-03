@@ -85,9 +85,18 @@
           ;; never conflicts.
           start-scheduler spawn send receive self
           sleep-ms kill register whereis process-id)
+  ;; ⚠ (igropyr tls-core) COSTS A PLAINTEXT PROGRAM NOTHING. It loads no
+  ;; shared object until a context or session is built, so importing it here
+  ;; does not make OpenSSL a requirement of every program that serves HTTP --
+  ;; that is exactly what the lazy binding in that library is for.
+  ;; (igropyr tls-watch) is imported so the TLS listen path can install the
+  ;; watcher-spawner hook explicitly; it adds no layer, since this file
+  ;; already imports actor.
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr libuv) (igropyr otp)
-          (igropyr websocket))
+          (igropyr websocket)
+          (only (igropyr tls-core) tls-listen-context! tls-context-retire!)
+          (only (igropyr tls-watch) tls-watch-install!))
 
   (define header-limit 8192)
   ;; body-limit / pipeline-limit are configurable at http-listen time via the
@@ -1747,6 +1756,19 @@
 
   ;; Wait for the worker's response to complete. Data arriving meanwhile
   ;; (pipelining) is buffered; EOF is remembered so we stop after replying.
+  ;; ⭐ ONE DEFINITION, USED AT BOTH await SITES, AND THAT IS THE POINT (Y2).
+  ;; A TLS stream cut without close_notify arrives as #(tcp-error
+  ;; tls-truncated-eof) rather than #(tcp-eof). After a COMPLETE request has
+  ;; been dispatched that is the same situation a half-close already is -- the
+  ;; peer will send nothing more and is waiting for the response -- so the
+  ;; response is still sent. In any other state it stays fatal, and for WSS it
+  ;; stays fatal everywhere.
+  ;;
+  ;; ⚠ Duplicating this test into the two arms would be two places to change
+  ;; the rule and one place to forget: the cell for this row asserts that this
+  ;; predicate is defined exactly once.
+  (define (half-close-error? e) (eq? e 'tls-truncated-eof))
+
   (define (await-response c srv buf eof?)
     (receive (after await-timeout-ms (tcp-close! c))
       (`#(next-request)
@@ -1779,7 +1801,10 @@
       ;; once. Eof during reader-loop, where the request is INCOMPLETE, is a
       ;; different matter and still closes immediately.
       (`#(tcp-eof) (await-response c srv buf #t))
-      (`#(tcp-error ,e) (tcp-close! c) 'done)))
+      (`#(tcp-error ,e)
+        (if (half-close-error? e)
+            (await-response c srv buf #t)
+            (begin (tcp-close! c) 'done)))))
 
   ;; A streamed (chunked/SSE) response is in progress: wait without a
   ;; deadline. The producer notices a departed client through res-write!
@@ -1808,7 +1833,10 @@
       ;; still noticed -- by the writes failing, which is what stops the
       ;; producer either way.
       (`#(tcp-eof) (await-streaming c srv buf #t))
-      (`#(tcp-error ,e) (tcp-close! c) 'done))))
+      (`#(tcp-error ,e)
+        (if (half-close-error? e)
+            (await-streaming c srv buf #t)
+            (begin (tcp-close! c) 'done))))))
 
   ;; ---- websocket session ---------------------------------------------------------
 
@@ -1853,6 +1881,11 @@
       ;; not report what it granted through any path listen() uses, and
       ;; the request is the only half this process can state on its own.
       (mutable backlog http-server-backlog http-server-backlog-set!)
+      ;; This server's TLS context, or #f. Held so that shutdown retires it
+      ;; EXACTLY ONCE: a listener that changes incarnation without retiring
+      ;; leaks one SSL_CTX per generation, and nothing else in the process
+      ;; holds a reference to it.
+      (mutable tlsctx http-server-tlsctx http-server-tlsctx-set!)
       ;; The listener's incarnation token, taken right after tcp-listen!.
       ;; The handle ADDRESS is not an identity: a later listener can be
       ;; allocated at the same one. Every use of the handle carries this
@@ -1994,6 +2027,14 @@
   ;; pool worker (the worker itself counts as busy -- deadlock).
   (define (http-shutdown! srv)
     (tcp-stop-listen! (http-server-listener srv) (http-server-ltoken srv))
+    ;; ⭐ THE CONTEXT IS RETIRED HERE, ONCE, AND THE FIELD IS CLEARED SO A
+    ;; SECOND SHUTDOWN CANNOT RETIRE IT AGAIN. tls-context-retire! is itself
+    ;; idempotent, so this is belt and braces -- but the field also stops
+    ;; anything else reading a retired context out of the server record.
+    (let ((ctx (http-server-tlsctx srv)))
+      (when ctx
+        (http-server-tlsctx-set! srv #f)
+        (tls-context-retire! ctx)))
     ;; ⛔ AND DROP THE POINTER. uv_close's callback frees the handle, so
     ;; the field would otherwise hold freed memory that two readers take.
     ;;
@@ -2096,6 +2137,16 @@
       (let ((p (assq key opts)))
         (if p (cdr p) default)))
     (define backlog (opt 'backlog default-backlog))
+    ;; ⛔ CHECKED HERE, WITH THE BACKLOG, AND FOR THE SAME REASON. It used to
+    ;; sit further down, after start-worker-pool -- so a caller who gave a key
+    ;; and no certificate got an assertion with a worker pool already running
+    ;; and nothing left holding it. The comment below claimed validation
+    ;; happened before anything was created; for this check it did not.
+    (let ((cert (opt 'tls-cert #f)) (key (opt 'tls-key #f)))
+      (when (and (or cert key) (not (and cert key)))
+        (assertion-violation 'http-listen
+          "tls-cert and tls-key must be given together"
+          (list 'tls-cert cert 'tls-key key))))
     ;; ⛔ VALIDATED BEFORE ANYTHING IS CREATED, which is why it is here
     ;; and not beside the host check further down. That check runs after
     ;; start-worker-pool, so a bad value there raises with a worker pool
@@ -2143,7 +2194,27 @@
                   ;; success it will never see corrected.
                   (lambda (task) (not (unbox (vector-ref task 4))))))
            (host (opt 'host "0.0.0.0"))
-           (srv (make-http-server sup hbox wsbox (now-ms) 0 backlog #f)))
+           ;; ⭐ TLS IS TWO OPTIONS AND BOTH ARE REQUIRED TOGETHER. One alone
+           ;; is a misconfiguration, not a default: a certificate with no key
+           ;; cannot serve, and a key with no certificate would quietly start
+           ;; a PLAINTEXT listener on the port an operator believed was
+           ;; https. Refused here, before anything is created.
+           (tls-cert (opt 'tls-cert #f))
+           (tls-key (opt 'tls-key #f))
+           ;; the pairing was checked above, before the pool existed
+           (tlsctx (and tls-cert (tls-listen-context! tls-cert tls-key)))
+           (srv (make-http-server sup hbox wsbox (now-ms) 0 backlog tlsctx #f)))
+      ;; ⛔ ANYTHING THAT RAISES FROM HERE GIVES THE CONTEXT BACK. Startup can
+      ;; still fail after the context exists -- an invalid host, a bind onto a
+      ;; taken port, a watcher hook that will not install -- and http-listen
+      ;; raises without returning a server. There is then no one to call
+      ;; http-shutdown!, so the context and its listener count would stay live
+      ;; with nothing in the process able to reach them.
+      (guard (e (#t (let ((ctx (http-server-tlsctx srv)))
+                      (when ctx
+                        (http-server-tlsctx-set! srv #f)
+                        (tls-context-retire! ctx)))
+                    (raise e)))
       (unless (and (string? host) (> (string-length host) 0))
         (assertion-violation 'http-listen "host must be a non-empty string" host))
       (set-box! supbox sup)
@@ -2185,14 +2256,30 @@
         (critical! sup (string->symbol
                          (string-append "http-worker-pool:"
                                         (number->string port)))))
-      (http-server-listener-set! srv
-        (tcp-listen! host port backlog
-          (lambda (c)
-            ;; libuv callback context: spawn + register only, no yielding
-            (let ((pid (spawn (make-reader c srv))))
-              (conn-set-owner! c pid)
-              (tcp-read-start! c)))
-          (if (opt 'reuseport #f) 2 0)))  ; UV_TCP_REUSEPORT
+      ;; ⭐ THE on-accept LAMBDA IS THE SAME FOR BOTH. On a TLS listener libuv
+      ;; does not run it until the handshake has completed, so what it receives
+      ;; is a connection that already speaks plaintext -- the reader, the
+      ;; pre-auth ceiling and everything downstream see exactly what they see
+      ;; on a plaintext listener.
+      (let ((on-accept
+              (lambda (c)
+                ;; libuv callback context: spawn + register only, no yielding
+                (let ((pid (spawn (make-reader c srv))))
+                  (conn-set-owner! c pid)
+                  (tcp-read-start! c))))
+            (flags (if (opt 'reuseport #f) 2 0)))   ; UV_TCP_REUSEPORT
+        (if (http-server-tlsctx srv)
+            (begin
+              ;; explicit, not an invoke side effect: a library is invoked on
+              ;; first reference to one of its exports, so a program that
+              ;; imported tls-watch but called only libuv's own entries would
+              ;; never invoke it and the hook would silently stay uninstalled.
+              (tls-watch-install!)
+              (http-server-listener-set! srv
+                (tcp-listen-tls! host port backlog on-accept
+                                 (http-server-tlsctx srv) flags)))
+            (http-server-listener-set! srv
+              (tcp-listen! host port backlog on-accept flags))))
       ;; Taken immediately after tcp-listen! returns. ⚠ Not inside one
       ;; uninterruptible step with it: another process could in principle
       ;; stop this listener in between, in which case listener-token
@@ -2216,4 +2303,4 @@
                                 (if e (number->string e) "unavailable"))
                               ")\n"))
       srv))
-)
+))

@@ -40,10 +40,12 @@
           tls-session-configure-client! tls-session-configure-server!
           tls-session-handshake-step! tls-session-drain! tls-session-feed!
           tls-session-encrypt! tls-session-decrypt! tls-session-peer-cb-hash
+          tls-session-shutdown!
           ;; errors
           die tls-reason
           ;; seams
           tls-live-session-count tls-error-attribution
+          tls-live-listener-context-count tls-read-classes
           client-ctx ensure-ctx! tls-listen-context! tls-context-retire!
           tls-context? tls-live-context-count
           tls-context-renegotiation-refused?
@@ -688,11 +690,24 @@
         d)))
 
   ;; One handshake step. Two values: verdict and payload (see tls-step!).
-  (define (tls-session-handshake-step! sess retire-on-failure?)
+  ;;
+  ;; ⛔ THIS NEVER RETIRES THE SESSION, AND THAT IS NOT A DEFAULT -- IT IS THE
+  ;; ONLY BEHAVIOUR. Retiring frees the SSL, and the SSL owns the write BIO,
+  ;; so poisoning here would destroy the very alert a failed handshake just
+  ;; produced: the peer would see the connection vanish instead of being told
+  ;; protocol_version or handshake_failure. A caller that wants the session
+  ;; gone drains first and retires afterwards.
+  ;;
+  ;; ⚠ THERE USED TO BE A BOOLEAN HERE, and it was got wrong. The warning
+  ;; above was written at ONE call site, in (igropyr tls); the next caller --
+  ;; the server driver in (igropyr libuv) -- saw only a bare #t at the call
+  ;; and passed it, destroying every fatal alert the listener ever produced.
+  ;; A warning at a call site protects that call site. Removing the parameter
+  ;; is what protects the next one, and this comment lives on the callee for
+  ;; the same reason.
+  (define (tls-session-handshake-step! sess)
     (tls-step! (tls-session-dead sess)
-               (if retire-on-failure?
-                   (lambda (m) (tls-session-poison! sess m))
-                   (lambda (m) (void)))
+               (lambda (m) (void))
                (tls-session-ssl sess)
                "tls handshake failed"))
 
@@ -731,13 +746,43 @@
                           (let ((d (unbox dead)))
                             (if d
                                 (values d #f)
-                                (values #f
-                                        (let ((bad (not (= n (SSL_write ssl bv n)))))
-                                          (and bad
-                                               (let ((m (ssl-drain-reason
-                                                          "tls write failed")))
-                                                 (tls-session-poison! sess m)
-                                                 m)))))))))
+                                (values
+                                  #f
+                                  ;; ⭐ CLASSIFY, THEN OVERRIDE THE
+                                  ;; CLASSIFICATION -- not the return value.
+                                  ;; The real SSL_write runs, so the session
+                                  ;; state is genuine; what a cell forces is
+                                  ;; the verdict. Replacing the ciphertext
+                                  ;; further out would change nothing here,
+                                  ;; because the success branch has already
+                                  ;; been decided by then.
+                                  (let* ((r (SSL_write ssl bv n))
+                                         (rc (inject-override!
+                                               'tls-write-result
+                                               (cons r (if (fx> r 0)
+                                                           SSL_ERROR_NONE
+                                                           (SSL_get_error ssl r)))))
+                                         (wrote (car rc))
+                                         (code (cdr rc)))
+                                    (cond
+                                      ((= wrote n) #f)
+                                      ;; ⭐ W4: A WRITE THAT WANTS A READ IS AN
+                                      ;; ERROR HERE. It means the peer asked to
+                                      ;; renegotiate mid-write -- and a server
+                                      ;; context refuses renegotiation, so
+                                      ;; there is nothing this side could read
+                                      ;; that would let the write finish.
+                                      ;; Waiting for it would hang the writer
+                                      ;; on a condition that cannot arrive.
+                                      ((= code SSL_ERROR_WANT_READ)
+                                       (let ((m "tls: write wants read"))
+                                         (tls-session-poison! sess m)
+                                         m))
+                                      (else
+                                        (let ((m (ssl-drain-reason
+                                                   "tls write failed")))
+                                          (tls-session-poison! sess m)
+                                          m))))))))))
             (when gone (die gone))
             (when err (die err))
             (or (tls-session-drain! sess) empty-bv))))))
@@ -749,26 +794,58 @@
   ;; EOF is the caller's business -- it owns the socket and the mailbox -- and
   ;; doing it here would put an actor send inside this library.
   (define (tls-session-decrypt! sess raw)
+    ;; ⭐ STAGE MARKS INSIDE THE BODY. A read reached this procedure, returned
+    ;; normally reporting no eof, and recorded NONE of the five per-call
+    ;; classifications below -- which the source says is impossible, since
+    ;; every exit records one. Three rounds of reading have not explained it,
+    ;; so the body now says which of its own steps it actually executed.
+    (note-read-class! 'dec-enter (bytevector-length raw))
     (let ((ssl (tls-session-ssl sess))
           (dead (tls-session-dead sess))
           (scratch (tls-session-scratch sess)))
-      (cond ((unbox dead) => die))
+      (note-read-class! 'dec-fields (if ssl 1 0))
+      (cond ((unbox dead) => (lambda (d) (note-read-class! 'dec-dead 0) (die d))))
       (let ((werr (tls-session-feed! sess raw)))
+        (note-read-class! 'dec-fed (if werr 1 0))
         (when werr (die (cdr werr))))
       (let-values (((port get) (open-bytevector-output-port)))
         (let loop ((eof? #f))
+          (note-read-class! 'dec-iter (if eof? 1 0))
           (let-values (((gone n code reason)
                         (ssl-step dead (lambda (m) (tls-session-poison! sess m))
                                   ssl "tls read failed"
                                   (SSL_read ssl scratch 16384))))
+            (note-read-class! 'dec-step n)
             (cond
-              (gone (die gone))
-              ((> n 0) (put-bytevector port scratch 0 n) (loop eof?))
-              ((= code SSL_ERROR_WANT_READ) (values (get) eof?))
-              ((= code SSL_ERROR_ZERO_RETURN) (values (get) #t))
+              (gone (note-read-class! 'gone -1) (die gone))
+              ((> n 0)
+               (note-read-class! 'data n)
+               (put-bytevector port scratch 0 n) (loop eof?))
+              ((= code SSL_ERROR_WANT_READ)
+               (note-read-class! 'want-read code)
+               (values (get) eof?))
+              ((= code SSL_ERROR_ZERO_RETURN)
+               (note-read-class! 'zero-return code)
+               (values (get) #t))
               ;; a fatal read finishes the inbound record stream -- a TLS
               ;; session cannot be resynchronised past one
-              (else (die (or reason "tls read failed")))))))))
+              (else
+                (note-read-class! 'other code)
+                (die (or reason "tls read failed")))))))))
+
+  ;; Send our close_notify. -> #t when SSL_shutdown reported the exchange
+  ;; complete, #f when it wants another round; either way the alert is in the
+  ;; write BIO and the caller drains it.
+  ;;
+  ;; ⚠ NEVER RETIRES. Retirement frees the SSL, and the SSL owns the write
+  ;; BIO -- so retiring here would throw away the very alert this call exists
+  ;; to produce, and the peer would have to infer the close from a dropped
+  ;; connection. The caller drains first and retires after.
+  (define (tls-session-shutdown! sess)
+    (with-interrupts-disabled
+      (let ((d (unbox (tls-session-dead sess)))
+            (ssl (tls-session-ssl sess)))
+        (and (not d) ssl (fx> (SSL_shutdown ssl) 0)))))
 
   ;; RFC 5929 tls-server-end-point, or #f.
   (define (tls-session-peer-cb-hash sess)
@@ -782,11 +859,40 @@
   ;; that an ordinary build cannot be measured by it at all: a build that
   ;; answers 0 because the counter was compiled out reads exactly like a
   ;; build with nothing leaking.
+  ;; ⭐ WHAT SSL_read ACTUALLY SAID. The read path's stage trace narrowed a
+  ;; missing EOF to "decrypt ran and did not report eof", which leaves exactly
+  ;; one unmeasured step: how the return of SSL_read was classified. Rather
+  ;; than reason about what OpenSSL ought to return for a close_notify, this
+  ;; records what it did return, per call, newest last.
+  ;; ⛔ THE RECORDER IS GATED WITH ITS READER, and it was not. Only
+  ;; tls-read-classes sat inside the meta-cond, so an ordinary build LOOKED
+  ;; instrumented-out -- the trace could not be read at all -- while this
+  ;; recorder went on running on the TLS read path: six to eight appends over
+  ;; a 64-element list per decrypted record, each of them allocating. Gating
+  ;; the reader alone buys apparent absence and real cost. Recorder and reader
+  ;; belong in one branch, and every call site below compiles to nothing when
+  ;; the instrument is off.
+  ;;
+  ;; ⚠ THE CAP IS GENEROUS ON PURPOSE. At 16 entries a handshake plus one read
+  ;; could plausibly have pushed the interesting end out of the window, which
+  ;; would make the instrument itself a candidate explanation for "nothing was
+  ;; recorded" -- and the whole reason this exists is that the explanations
+  ;; kept turning out to be about the measurement rather than the subject.
   (meta-cond
     ((eq? tls-seam-mode 'on)
+     (define read-class-trace '())
+     (define (note-read-class! kind v)
+       (set! read-class-trace
+             (let ((l (append read-class-trace (list (cons kind v)))))
+               (if (fx> (length l) 64) (cdr l) l))))
+     (define (tls-read-classes) read-class-trace)
      (define (tls-live-session-count)
        (with-interrupts-disabled live-sessions)))
     (else
+     (define (note-read-class! kind v) (void))
+     (define (tls-read-classes)
+       (assertion-violation 'tls-read-classes
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"))
      (define (tls-live-session-count)
        (assertion-violation 'tls-live-session-count
          "test seam: this artifact was expanded without IGROPYR_INJECT=on"))))
@@ -802,10 +908,15 @@
   (meta-cond
     ((eq? tls-seam-mode 'on)
      (define (tls-live-context-count)
-       (with-interrupts-disabled live-contexts)))
+       (with-interrupts-disabled live-contexts))
+     (define (tls-live-listener-context-count)
+       (with-interrupts-disabled live-listener-contexts)))
     (else
      (define (tls-live-context-count)
        (assertion-violation 'tls-live-context-count
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"))
+     (define (tls-live-listener-context-count)
+       (assertion-violation 'tls-live-listener-context-count
          "test seam: this artifact was expanded without IGROPYR_INJECT=on"))))
 
   ;; -> whether THIS context actually had SSL_OP_NO_RENEGOTIATION applied.
@@ -990,11 +1101,22 @@
   ;; was actually applied -- see tls-listen-context! for why that has to be a
   ;; recorded fact rather than something recomputed later.
   (define-record-type tls-context
-    (fields (mutable ptr) reneg-refused?)
+    ;; listener? is carried ON THE CONTEXT rather than decided by each caller:
+    ;; both kinds share one discard path and one retirement, and the only
+    ;; place the difference is known for certain is where it was made.
+    (fields (mutable ptr) reneg-refused? listener?)
     (nongenerative)
     (sealed #t))
 
+  ;; ⭐ TWO COUNTS, BECAUSE ONE NAME WAS COVERING TWO LIFETIMES. Every context
+  ;; increments live-contexts, and the CLIENT context is a process-wide
+  ;; singleton that is deliberately never retired -- so after a server shut its
+  ;; listener down, a total of 1 was the client's singleton and said nothing
+  ;; about whether the listener's context had been given back. A cell reading
+  ;; the total could not tell "leaked" from "the client is still enabled".
+  ;; This second count answers only about listener contexts.
   (define live-contexts 0)
+  (define live-listener-contexts 0)
 
   (define ctx #f)
 
@@ -1046,7 +1168,7 @@
                           ;; else in the process can reach this context, so a
                           ;; non-local exit here would leak it with no owner
                           ;; and no way to observe it but the counter.
-                          (guard (e (#t (discard-context! c) (raise e)))
+                          (guard (e (#t (discard-context! c #f) (raise e)))
                             (let ((bad
                                     (cond
                                       ((zero? (SSL_CTX_ctrl
@@ -1065,7 +1187,7 @@
                                   ;; attempt for the life of the misconfiguration.
                                   ;; This returns normally, so the guard above
                                   ;; does not also fire.
-                                  (discard-context! c)
+                                  (discard-context! c #f)
                                   bad)
                                 (else
                                   ;; INJECTION POINT 'tls-client-context-after-alloc
@@ -1077,7 +1199,7 @@
                                   ;; the client context deliberately does NOT
                                   ;; refuse renegotiation: the read path carries
                                   ;; a server-initiated one (see (igropyr tls)).
-                                  (set! ctx (make-tls-context c #f))
+                                  (set! ctx (make-tls-context c #f #f))
                                   #f)))))))))))
       (when err (die err))))
 
@@ -1119,9 +1241,15 @@
   ;; Free a context that never became a tls-context, and give back the count
   ;; taken at allocation. Both discard paths in the constructor use this, so
   ;; the pair cannot drift apart.
-  (define (discard-context! c)
+  ;; ⚠ listener? is a FLAG here, not a record field: this runs on a raw
+  ;; pointer, before any context object exists. The listener constructor
+  ;; increments both counts up front, so its discards give both back; the
+  ;; client's failure paths incremented only the total.
+  (define (discard-context! c listener?)
     (with-interrupts-disabled
       (set! live-contexts (fx- live-contexts 1))
+      (when listener?
+        (set! live-listener-contexts (fx- live-listener-contexts 1)))
       (SSL_CTX_free c)))
 
   (define (tls-context-retire! c)
@@ -1130,6 +1258,8 @@
         (when p
           (tls-context-ptr-set! c #f)
           (set! live-contexts (fx- live-contexts 1))
+          (when (tls-context-listener? c)
+            (set! live-listener-contexts (fx- live-listener-contexts 1)))
           (SSL_CTX_free p)))))
 
   (define (file-reason default path)
@@ -1168,7 +1298,9 @@
                      ;; the count is taken where the allocation happens and
                      ;; given back on each path that frees it.
                      (with-interrupts-disabled
-                       (set! live-contexts (fx+ live-contexts 1)))
+                       (set! live-contexts (fx+ live-contexts 1))
+                       (set! live-listener-contexts
+                             (fx+ live-listener-contexts 1)))
                      ;; ⛔ THE GUARD OPENS HERE, BEFORE THE COND, AND THAT
                      ;; POSITION IS THE POINT OF IT. It used to open after
                      ;; the cond -- it was written by replacing the success
@@ -1180,7 +1312,7 @@
                      ;; not cover. Measured in a shadow tree: with the guard
                      ;; after the cond a raise there left the context count
                      ;; at 1; opening it here returns it to 0.
-                     (guard (e (#t (discard-context! c) (raise e)))
+                     (guard (e (#t (discard-context! c #t) (raise e)))
                      (let ((bad
                              (cond
                                ((zero? (SSL_CTX_ctrl
@@ -1222,7 +1354,7 @@
                                   " [key " key-path ", cert " cert-chain-path "]"))
                                (else #f))))
                        (if bad
-                           (begin (discard-context! c) (cons bad #f))
+                           (begin (discard-context! c #t) (cons bad #f))
                            ;; ⛔ EVERYTHING PAST THE ALLOCATION IS GUARDED. The
                            ;; failure branch above only covers calls that
                            ;; report failure by RETURNING; an allocation
@@ -1287,7 +1419,7 @@
                                                 #t))))
                                (when refuse?
                                  (SSL_CTX_set_options c SSL_OP_NO_RENEGOTIATION))
-                               (cons #f (make-tls-context c refuse?)))))))))))))
+                               (cons #f (make-tls-context c refuse? #t)))))))))))))
       (when (car r) (die (car r)))
       (cdr r)))
 

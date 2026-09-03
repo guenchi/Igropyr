@@ -228,15 +228,13 @@
           ;; between the step and its classification would let any process
           ;; scheduled there decide whether this handshake lived.
           ;;
-          ;; THE HANDSHAKE DOES NOT RETIRE IN-REGION: retiring frees the SSL,
-          ;; and the SSL owns the write BIO -- so poisoning here would throw
-          ;; away the alert that the flush below exists to send, and the peer
-          ;; would have to infer the failure from a dropped connection.
-          ;; Nothing is racing for this session: no codec has been handed out,
-          ;; so this code is its only user, and fail! retires it a few lines
-          ;; down once the alert is gone.
+          ;; The step never retires -- see tls-session-handshake-step! for
+          ;; why that is the only behaviour it has. Nothing is racing for this
+          ;; session either: no codec has been handed out, so this code is its
+          ;; only user, and fail! retires it a few lines down once the alert
+          ;; has gone out.
           (let-values (((verdict payload)
-                        (tls-session-handshake-step! sess #f)))
+                        (tls-session-handshake-step! sess)))
             ;; the connection's close hook can retire this session while the
             ;; handshake is parked below; then there is nothing left to hand
             ;; back and the stored message is the whole answer

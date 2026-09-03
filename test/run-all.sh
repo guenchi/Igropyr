@@ -489,6 +489,11 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/q
 # server-side TLS context layer (no port; mints its PKI with the openssl CLI like
 # tls.sc). Instrumented because it reads the error-attribution and lazy-load seams.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-server.sc
+# the HTTPS listener (stage 2b): real TLS listener on 18480/18481, http-client
+# over TLS, the raw driver (test/tls-raw-client.sc), openssl s_client, raw TCP.
+# Reads the live-resource seams back to baseline in every cell. Spends 30 s in
+# H2' (a ClientHello on the plaintext port waits out read-timeout-ms).
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-listener.sc
 # item 5: fs-start-fd! owns its descriptor from its first instruction, with no
 # region around the call
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/fs-preregion.sc

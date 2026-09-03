@@ -964,6 +964,17 @@
   (define (start-scheduler boot-thunk)
     (uv-init!)
     (uv-set-deliver! send)
+    ;; identity for libuv's TLS write gate: it must record the holder's pid so
+    ;; the per-conn watcher can monitor it, and it cannot import this library
+    ;; (this one imports it). Same shape and direction as the delivery hook.
+    ;; ⛔ A THUNK, NOT `self`. `self` is identifier-syntax over a virtual
+    ;; register (see its definition above), so passing it here does not pass a
+    ;; way to ask "who is running" -- it passes the register's value AT THIS
+    ;; MOMENT, which is one line before the scheduler installs the first
+    ;; process. libuv would then try to CALL that value and the caller would
+    ;; die. It reads exactly like (uv-set-deliver! send) one line up, and that
+    ;; is the trap: `send` is a procedure and `self` is not.
+    (uv-set-self! (lambda () self))
     (set! *self* (@make-process #f))
     (timer-interrupt-handler
       (lambda () (yield 'run 0)))

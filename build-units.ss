@@ -57,6 +57,9 @@
     "igropyr/blas.sc"
     "igropyr/libuv.sc"
     "igropyr/actor.sc"
+    ;; after actor and libuv: it is the watcher body libuv asks for through
+    ;; a hook, and it needs both. Nothing below it may import it.
+    "igropyr/tls-watch.sc"
     ;; after actor and libuv, which it drives, and after durable, whose
     ;; error predicates and traced step it re-uses. Missing from this
     ;; list until now, which made it the one source-only library in the

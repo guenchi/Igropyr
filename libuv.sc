@@ -26,7 +26,25 @@
           fs-o-directory fs-o-cloexec
           fs-count dns-count listener-backlog-effective
           uv-accept-failure-counts
-          tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
+          tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-writev-raw!
+          uv-set-self! tcp-write-foreign!
+          tcp-listen-tls! uv-set-tls-watcher-spawner! uv-set-gate-wait!
+          tls-watcher-exited!
+          tls-handshake-max-set! tls-handshake-ms-set! tls-shutdown-ms-set!
+          ;; the watcher's whole interface to a connection's shared state
+          tls-gate-grant-next! tls-gate-waiters-length tls-conn-holder
+          tls-conn-holder-monitor tls-conn-set-holder-monitor!
+          tls-open-gate-and-drain! conn-tls-retire!
+          ;; seams
+          tls-raw-sink-writes tls-ssl-op-count tls-server-raw-reads
+          tls-accept-callback-completions tls-gate-open-mark
+          tls-live-watcher-count tls-live-timer-count tls-active-timer-count
+          tls-handshaking-count tls-retire-effect-depths
+          tls-raw-blocks tls-conn-charge tls-conn-totals tls-conn-timer-id
+          tls-last-retire-reason tls-listener-context-id tls-eof-deliveries
+          tls-swallowed-errors tls-read-trace
+          tls-timer-free-path tls-conn-in-table?
+          tls-inject-ciphertext!
           tcp-close!
           conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
           conn-on-close!
@@ -38,7 +56,11 @@
   ;; ordinary build refers to none of its runtime part and does not
   ;; invoke it. Measured, not assumed: a consumer of it reports
   ;; invoke-requirements () when off and ((igropyr inject)) when on.
-  (import (chezscheme) (igropyr platform) (igropyr inject))
+  ;; ⚠ (igropyr tls-core) SITS BELOW THIS FILE and imports only chezscheme
+  ;; and platform. That is what lets the server codec here drive OpenSSL
+  ;; without a cycle: (igropyr tls) imports THIS file, so this file could
+  ;; never import that one.
+  (import (chezscheme) (igropyr platform) (igropyr inject) (igropyr tls-core))
 
   ;; Shared objects must be loaded before the foreign-procedure
   ;; definitions below are evaluated (library body runs in order).
@@ -132,6 +154,7 @@
   (define uv-try-write   (foreign-procedure "uv_try_write" (void* void* unsigned-int) int))
   (define uv-close       (foreign-procedure "uv_close" (void* void*) void))
   (define uv-is-closing  (foreign-procedure "uv_is_closing" (void*) int))
+  (define uv-is-active   (foreign-procedure "uv_is_active" (void*) int))
   (define uv-strerror    (foreign-procedure "uv_strerror" (int) string))
   (define uv-timer-init  (foreign-procedure "uv_timer_init" (void* void*) int))
   (define uv-timer-start (foreign-procedure "uv_timer_start" (void* void* unsigned-64 unsigned-64) int))
@@ -260,7 +283,340 @@
       (mutable state conn-state conn-set-state!) ; open | closing | closed
       ;; one thunk, run exactly once when the handle's close completes --
       ;; see conn-on-close! below for why cleanup hangs off the conn
-      (mutable cleanup conn-cleanup conn-set-cleanup!)))
+      (mutable cleanup conn-cleanup conn-set-cleanup!)
+      ;; ⭐ ONE FIELD, NOT FIFTEEN, AND THE CHOICE IS AN INVARIANT. #f on a
+      ;; plaintext connection; otherwise the conn-tls record below. Retirement
+      ;; DETACHES IT with a single assignment inside one interrupt-disabled
+      ;; region, so every later caller sees #f -- which is what makes
+      ;; conn-tls-retire! idempotent by shape rather than by agreement between
+      ;; its callers. Fifteen separate fields would need fifteen detaches, and
+      ;; "half detached" would be a state someone has to reason about; owner
+      ;; death and watcher death can arrive together, so no caller can promise
+      ;; to run the retirement only once.
+      (mutable tls conn-tls conn-set-tls!)
+      ;; ⭐ THE HANDSHAKING SLOT, HELD FROM BEFORE THE TLS RECORD EXISTS. It
+      ;; cannot live on conn-tls, because the window this closes is precisely
+      ;; the one before that record is built.
+      (mutable slot conn-slot conn-set-slot!)))
+
+  ;; ---- TLS state of one connection ---------------------------------------
+  ;;
+  ;; Reached only through conn-tls, and only while that field is non-#f. The
+  ;; session is an opaque (igropyr tls-core) object: this file never holds an
+  ;; SSL pointer, and every OpenSSL call goes through a session operation.
+  ;;
+  ;; The gate fields are shared state that both a writer and the watcher touch,
+  ;; so every read-modify-write of them happens in one interrupt-disabled step
+  ;; (Z8): a writer appends itself to waiters, the watcher pops it, and
+  ;; retirement TAKES THE WHOLE LIST and refuses whoever it took -- whichever
+  ;; of the two atomically takes a non-empty list is the one that answers, so
+  ;; there is no double wake and no test of whether the watcher is still alive.
+  (define-record-type (conn-tls-state make-conn-tls conn-tls?)
+    (fields
+      (immutable session conn-tls-session)      ; opaque tls-core session
+      (immutable listener conn-tls-listener)    ; listener incarnation, or #f
+      ;; inbound plaintext decrypted before the owner could receive it
+      (mutable established? conn-tls-established? conn-tls-set-established!)
+      (mutable eof? conn-tls-eof? conn-tls-set-eof!)
+      ;; ⭐ 'seen' AND 'delivered' ARE TWO FACTS. eof? alone meant a
+      ;; close_notify followed by a FIN delivered two EOFs, and a FIN
+      ;; arriving while the gate was shut delivered one AHEAD of the
+      ;; buffered request -- the owner saw EOF, data, EOF.
+      (mutable eof-sent? conn-tls-eof-sent? conn-tls-set-eof-sent!)
+      (mutable gated? conn-tls-gated? conn-tls-set-gated!)
+      (mutable inbound conn-tls-inbound conn-tls-set-inbound!)
+      ;; write gate
+      (mutable holder conn-tls-holder conn-tls-set-holder!)
+      (mutable holder-monitor conn-tls-holder-monitor conn-tls-set-holder-monitor!)
+      (mutable waiters conn-tls-waiters conn-tls-set-waiters!)
+      (mutable closed? conn-tls-closed? conn-tls-set-closed!)
+      (mutable closing? conn-tls-closing? conn-tls-set-closing!)
+      (mutable aggregate conn-tls-aggregate conn-tls-set-aggregate!)
+      ;; the one timer, live for the conn's whole life (Y3): armed for the
+      ;; handshake, stopped on establishment, re-armed for clean shutdown
+      (mutable timer conn-tls-timer conn-tls-set-timer!)
+      (immutable timer-id conn-tls-timer-id)
+      ;; armed? is tracked because active-timer accounting has three
+      ;; movers -- arm, stop, close -- and only a flag makes each of them
+      ;; idempotent with respect to the count.
+      (mutable timer-armed? conn-tls-timer-armed? conn-tls-set-timer-armed!)
+      ;; watcher
+      (mutable watcher conn-tls-watcher conn-tls-set-watcher!)
+      ;; accounting (X4)
+      (mutable bio-held conn-tls-bio-held conn-tls-set-bio-held!)
+      (mutable raw-queued conn-tls-raw-queued conn-tls-set-raw-queued!)
+      (mutable charged conn-tls-charged conn-tls-set-charged!)
+      (mutable refunded conn-tls-refunded conn-tls-set-refunded!)
+      ;; the handshaking-ceiling slot, released exactly once (Y1)
+      (mutable slot? conn-tls-slot? conn-tls-set-slot!)
+      ;; recorded facts the seams read back
+      (mutable gate-opened-ms conn-tls-gate-opened-ms conn-tls-set-gate-opened-ms!)
+      (mutable retire-path conn-tls-retire-path conn-tls-set-retire-path!)
+      (mutable retire-reason conn-tls-retire-reason conn-tls-set-retire-reason!)
+      ;; (entry shared-min shared-max refusal-max session-retire-max
+      ;;  uv-close-max), written ONLY by the retirement that wins the detach;
+      ;; #f in a slot means that kind of effect did not happen.
+      (mutable effect-depths conn-tls-effect-depths conn-tls-set-effect-depths!)
+      ;; carries a terminalised aggregate's callback OUT of the retirement
+      ;; region, so user code runs outside it
+      (mutable abort-cb conn-tls-abort-cb conn-tls-set-abort-cb!))
+    (nongenerative)
+    (sealed #t))
+
+  ;; ---- TLS observation seams ---------------------------------------------
+  ;;
+  ;; ⭐ THE RECORDING IS GATED TOO, not just the reader. These counters sit on
+  ;; the write and read paths -- once per raw write, once per SSL call -- so an
+  ;; ordinary build compiles them out entirely and pays nothing. That differs
+  ;; from tls-core's live-session counter deliberately: that one moves once per
+  ;; connection and its recording is always on.
+  ;;
+  ;; Gating both halves together also means there is never a recorded fact
+  ;; with no way to read it, nor a reader of a variable that was compiled out.
+  (meta define tls-seam-mode
+    (let ((v (getenv "IGROPYR_INJECT")))
+      (if (and v (string=? v "on")) 'on 'off)))
+
+  ;; The interrupt-disable depth. Safe to call INSIDE a region -- the probe
+  ;; raises the count and lowers it again, so it never reaches 0 there.
+  ;;
+  ;; ⚠ AT DEPTH 0 THE PROBE IS NOT FREE: enable-interrupts reaching 0 may run
+  ;; a pending interrupt, so calling it outside a region manufactures a
+  ;; preemption point. That is harmless where the design already says the code
+  ;; is preemptible, and it is why no assertion anywhere may read this and
+  ;; conclude "depth is 0 here" about a line that must NOT be preemptible.
+  (define (region-depth)
+    (let ((n (disable-interrupts)))
+      (enable-interrupts)
+      (fx- n 1)))
+
+  (meta-cond
+    ((eq? tls-seam-mode 'on)
+     (define raw-sink-writes 0)
+     (define ssl-op-count 0)
+     (define server-raw-reads 0)
+     (define server-raw-read-bytes 0)
+     (define accept-callback-completions 0)
+     (define gate-opens 0)
+     (define live-watchers 0)
+     (define live-timers 0)
+     (define active-timers 0)
+     (define handshaking-count 0)
+     (define (bump-raw-sink-writes!)
+       (set! raw-sink-writes (fx+ raw-sink-writes 1)))
+     (define (bump-ssl-op!) (set! ssl-op-count (fx+ ssl-op-count 1)))
+     (define (bump-server-raw-read! n)
+       (set! server-raw-reads (fx+ server-raw-reads 1))
+       (set! server-raw-read-bytes (fx+ server-raw-read-bytes n)))
+     (define (bump-accept-completion!)
+       (set! accept-callback-completions (fx+ accept-callback-completions 1)))
+     (define (bump-gate-open!) (set! gate-opens (fx+ gate-opens 1)))
+     (define eof-deliveries 0)
+     ;; every tcp-eof handed to an owner, counted once at the one place
+     ;; that delivers it -- the row asserting "exactly one EOF" reads this
+     (define (bump-eof-delivery!) (set! eof-deliveries (fx+ eof-deliveries 1)))
+     ;; ⭐ WHAT THE NON-ESCAPING GUARDS SWALLOWED. Stopping exceptions from
+     ;; unwinding into C is necessary, but it also destroyed the evidence:
+     ;; a connection that raised twice in its read callback left NO trace --
+     ;; no EOF, no retire reason, no error -- and looked exactly like a
+     ;; connection that had simply gone quiet. The condition object is kept
+     ;; as-is rather than rendered: rendering can itself fail, and this runs
+     ;; in the one place that must not raise.
+     (define swallowed-count 0)
+     (define swallowed-where #f)
+     (define swallowed-what #f)
+     (define (note-swallowed! where e)
+       (set! swallowed-count (fx+ swallowed-count 1))
+       (set! swallowed-where where)
+       (set! swallowed-what e))
+     (define (tls-swallowed-errors)
+       (list swallowed-count swallowed-where swallowed-what))
+
+     ;; ⭐ A BOUNDED TRACE OF THE READ PATH'S STAGES. Two rounds of reasoning
+     ;; from the source failed to explain a read that increments the raw-read
+     ;; counter, swallows no exception, records no retirement, and never
+     ;; reaches the decrypt -- each of those readings is consistent with the
+     ;; code as written, which means the model is wrong somewhere invisible.
+     ;; This records which stages were actually ENTERED, in order, instead of
+     ;; inviting a third guess.
+     (define read-trace '())
+     (define read-trace-max 32)
+     (define (note-read-stage! s)
+       (set! read-trace
+             (let ((l (append read-trace (list s))))
+               (if (fx> (length l) read-trace-max) (cdr l) l))))
+     (define (tls-read-trace) read-trace)
+     (define (tls-eof-deliveries) eof-deliveries)
+     (define (note-gate-open-ms! ms) (set! last-gate-open-ms ms))
+     (define (bump-watchers! d) (set! live-watchers (fx+ live-watchers d)))
+     (define (bump-live-timers! d) (set! live-timers (fx+ live-timers d)))
+     (define (bump-active-timers! d) (set! active-timers (fx+ active-timers d)))
+     (define (bump-handshaking! d) (set! handshaking-count (fx+ handshaking-count d)))
+     (define (tls-raw-sink-writes) raw-sink-writes)
+     (define (tls-ssl-op-count) ssl-op-count)
+     (define (tls-server-raw-reads) (cons server-raw-reads server-raw-read-bytes))
+     (define (tls-accept-callback-completions) accept-callback-completions)
+     ;; ⭐ GLOBAL, AND IT HAS TO BE: the cell watching this is the CLIENT, and
+     ;; a client has no handle on the server's conn record -- when the bug is
+     ;; that no handler ever ran, there is nothing to ask for one. A count plus
+     ;; the last opening's timestamp answers "did the gate open, and when"
+     ;; without needing the connection.
+     (define last-gate-open-ms #f)
+     (define (tls-gate-open-mark) (cons gate-opens last-gate-open-ms))
+     (define (tls-live-watcher-count) live-watchers)
+     (define (tls-live-timer-count) live-timers)
+     (define (tls-active-timer-count) active-timers)
+     (define (tls-handshaking-count) handshaking-count)
+     ;; ⛔ NO ABSOLUTE DEPTH SEAM. The event-loop process runs with
+     ;; interrupts PERMANENTLY disabled (actor.sc's header), so inside a
+     ;; callback frame the depth is always >= 1 and the 0->1 transition
+     ;; never happens. A token keyed on "this entry left depth 0" would
+     ;; never fire in the only host this code runs in -- measured in a
+     ;; plain script, where depth starts at 0, it looked like it worked.
+     ;; What survives is DIFFERENCES relative to a sampled entry depth.
+     ;; (entry shared-min shared-max refusal-max session-retire-max
+     ;;  uv-close-max); #f where that kind of effect never happened.
+     (define (retire-entry-depth) (region-depth))
+     (define (retire-depths-init! t entry)
+       (conn-tls-set-effect-depths! t (vector entry #f #f #f #f #f)))
+     (define (note-shared-depth! t)
+       (let ((v (conn-tls-effect-depths t)) (d (region-depth)))
+         (when v
+           (let ((lo (vector-ref v 1)) (hi (vector-ref v 2)))
+             (when (or (not lo) (fx< d lo)) (vector-set! v 1 d))
+             (when (or (not hi) (fx> d hi)) (vector-set! v 2 d))))))
+     (define (note-effect-depth! t kind)
+       (let ((v (conn-tls-effect-depths t)) (d (region-depth)))
+         (when v
+           (let ((i (case kind ((refusal) 3) ((session-retire) 4) (else 5))))
+             (let ((cur (vector-ref v i)))
+               (when (or (not cur) (fx> d cur)) (vector-set! v i d)))))))
+     ;; ⚠ READ IT OFF THE RECORD THE RETIREMENT WROTE, which means the caller
+     ;; must hold the conn-tls state -- by the time retirement is done,
+     ;; (conn-tls c) is #f. The cell keeps the record it was handed before the
+     ;; close, which is why this takes the state and not the conn.
+     ;; ⭐ REGISTERED BEFORE SUBMISSION, so a snapshot list never records a
+     ;; block after its own inline completion. Each entry is
+     ;; (id aggregate-id size pending sealed? completed?) sampled at
+     ;; registration; the monotonic completion order is appended as blocks
+     ;; finish, so the cell can read the ORDER rather than infer it.
+     (define next-raw-block-id 0)
+     (define raw-blocks-by-conn (make-eqv-hashtable))
+     (define (note-raw-block! t agg size)
+       (let ((id next-raw-block-id))
+         (set! next-raw-block-id (fx+ id 1))
+         (hashtable-set! raw-blocks-by-conn t
+           (append (hashtable-ref raw-blocks-by-conn t '())
+                   (list (list id (tls-agg-id agg) size
+                               (tls-agg-pending agg)
+                               (tls-agg-sealed? agg)
+                               (tls-agg-done? agg)))))
+         id))
+     (define raw-completions-by-conn (make-eqv-hashtable))
+     (define (note-raw-block-done! t agg sz status)
+       (hashtable-set! raw-completions-by-conn t
+         (append (hashtable-ref raw-completions-by-conn t '())
+                 (list (list (tls-agg-id agg) sz status
+                             (tls-agg-pending agg)
+                             (tls-agg-sealed? agg)
+                             (tls-agg-done? agg))))))
+     ;; -> (registered . completed); registered in submission order, completed
+     ;; in the order the completions actually ran.
+     (define (tls-raw-blocks t)
+       (cons (hashtable-ref raw-blocks-by-conn t '())
+             (hashtable-ref raw-completions-by-conn t '())))
+     (define (tls-conn-charge c)
+       (let ((t (conn-tls c)))
+         (and t (cons (conn-tls-bio-held t) (conn-tls-raw-queued t)))))
+     (define (tls-conn-totals c)
+       (let ((t (conn-tls c)))
+         (and t (cons (conn-tls-charged t) (conn-tls-refunded t)))))
+     (define (tls-conn-timer-id c)
+       (let ((t (conn-tls c))) (and t (conn-tls-timer-id t))))
+     ;; ⭐ GLOBAL AND ARGUMENT-FREE, for the reason the gate mark is: when the
+     ;; question is "who closed this connection and why", the asker generally
+     ;; cannot reach the connection any more -- retirement has detached it.
+     (define last-retire-reason #f)
+     (define (note-retire-reason! path reason)
+       (set! last-retire-reason (cons path reason)))
+     (define (tls-last-retire-reason) last-retire-reason)
+
+     ;; Which listener incarnation holds which context. The identity that
+     ;; matters is the INCARNATION's, not the handle's: a later listener at
+     ;; the same address is a different generation with its own context, and
+     ;; the row this serves is "exactly one reference, retired once per
+     ;; generation".
+     (define (tls-listener-context-id h)
+       (let ((v (hashtable-ref listener-table h #f)))
+         (and v (let ((ctx (vector-ref v 3)))
+                  (and ctx (cons (vector-ref v 0) ctx))))))
+
+     ;; ⭐ WHICH PATH GAVE THE TIMER BACK, because the two are not
+     ;; interchangeable (Y4): an uninitialised handle is freed directly and
+     ;; must never reach uv_close, while an initialised one must go out
+     ;; through uv_close and be freed only by its close callback. A count of
+     ;; timers cannot tell those apart; this records the route each one took.
+     (define timer-free-paths '())
+     (define (note-timer-free! how)
+       (set! timer-free-paths (append timer-free-paths (list how))))
+     (define (tls-timer-free-path) timer-free-paths)
+
+     ;; Publication, as X2 defines it: membership of conn-table, asked by
+     ;; handle so a cell can ask about a connection it no longer holds.
+     (define (tls-conn-in-table? h)
+       (and (hashtable-ref conn-table h #f) #t))
+     (define (tls-retire-effect-depths t)
+       (let ((v (and t (conn-tls-effect-depths t))))
+         (and v (vector->list v)))))
+    (else
+     (define (bump-raw-sink-writes!) (void))
+     (define (bump-ssl-op!) (void))
+     (define (bump-server-raw-read! n) (void))
+     (define (bump-accept-completion!) (void))
+     (define (bump-gate-open!) (void))
+     (define (bump-eof-delivery!) (void))
+     (define (note-swallowed! where e) (void))
+     (define (note-read-stage! s) (void))
+     (define (note-gate-open-ms! ms) (void))
+     (define (bump-watchers! d) (void))
+     (define (bump-live-timers! d) (void))
+     (define (bump-active-timers! d) (void))
+     (define (bump-handshaking! d) (void))
+     (define-syntax define-absent-seam
+       (syntax-rules ()
+         ((_ name)
+          (define (name . _)
+            (assertion-violation 'name
+              "test seam: this artifact was expanded without IGROPYR_INJECT=on")))))
+     (define-absent-seam tls-eof-deliveries)
+     (define-absent-seam tls-swallowed-errors)
+     (define-absent-seam tls-read-trace)
+     (define-absent-seam tls-raw-sink-writes)
+     (define-absent-seam tls-ssl-op-count)
+     (define-absent-seam tls-server-raw-reads)
+     (define-absent-seam tls-accept-callback-completions)
+     (define-absent-seam tls-gate-open-mark)
+     (define-absent-seam tls-live-watcher-count)
+     (define-absent-seam tls-live-timer-count)
+     (define-absent-seam tls-active-timer-count)
+     (define-absent-seam tls-handshaking-count)
+     (define (retire-entry-depth) 0)
+     (define (retire-depths-init! t entry) (void))
+     (define (note-shared-depth! t) (void))
+     (define (note-retire-reason! path reason) (void))
+     (define (note-timer-free! how) (void))
+     (define-absent-seam tls-listener-context-id)
+     (define-absent-seam tls-timer-free-path)
+     (define-absent-seam tls-conn-in-table?)
+     (define-absent-seam tls-last-retire-reason)
+     (define (note-effect-depth! t kind) (void))
+     (define (note-raw-block! t agg size) 0)
+     (define (note-raw-block-done! t agg sz status) (void))
+     (define-absent-seam tls-raw-blocks)
+     (define-absent-seam tls-conn-charge)
+     (define-absent-seam tls-conn-totals)
+     (define-absent-seam tls-conn-timer-id)
+     (define-absent-seam tls-retire-effect-depths)))
 
   ;; GC roots (the "keep-live" story):
   ;; - conn-table roots every live connection's Scheme state while libuv
@@ -282,6 +638,43 @@
   ;; delivery hook: (deliver owner-pid msg); installed by (igropyr actor)
   (define deliver (lambda (owner msg) (void)))
   (define (uv-set-deliver! proc) (set! deliver proc))
+
+  ;; ⭐ WHO IS CALLING. The write gate has to record the HOLDER's pid so the
+  ;; watcher can monitor it, and this library sits BELOW (igropyr actor) --
+  ;; actor imports it, never the other way round -- so identity arrives the
+  ;; same way delivery does: a hook the upper layer installs at startup.
+  ;;
+  ;; #f until installed. A pure libuv program never installs it and never
+  ;; needs it: only an APPLICATION write on a TLS connection asks, and such a
+  ;; write cannot exist without the actor layer. Asking while it is #f is
+  ;; therefore a wiring error and says so, rather than proceeding with no
+  ;; identity and a gate nobody can be monitored through.
+  (define uv-self #f)
+  (define (uv-set-self! proc) (set! uv-self proc))
+
+  ;; ⭐ WHO MAKES THE WATCHER. Each established TLS connection needs one green
+  ;; process, and it must link, monitor and park in a timed receive -- none of
+  ;; which exists at this layer. (igropyr tls-watch) installs this hook when it
+  ;; is invoked, and http.sc's TLS listen entry imports that library, so any
+  ;; program that can open a TLS listener has necessarily installed it while a
+  ;; plaintext or pure-libuv program pulls in nothing above actor.
+  (define uv-tls-watcher-spawner #f)
+  (define (uv-set-tls-watcher-spawner! proc) (set! uv-tls-watcher-spawner proc))
+
+  ;; ⭐ HOW A PARKED WRITER WAITS. receive is an actor primitive and does not
+  ;; exist at this layer, so the wait is supplied from above like identity and
+  ;; the watcher are. It is legal to park here precisely because the writer is
+  ;; a green process: the identity assertion above has already refused any
+  ;; caller running inside a libuv callback frame.
+  (define uv-gate-wait #f)
+  (define (uv-set-gate-wait! proc) (set! uv-gate-wait proc))
+
+  ;; ⭐ ARE WE IN A CALLBACK FRAME? Set around uv_run, which is the only place
+  ;; libuv callbacks run from. This is used instead of comparing pids against
+  ;; the event-loop process: it is the direct mechanism rather than an identity
+  ;; test standing in for one, and it needs no second hook to tell us which pid
+  ;; the loop is.
+  (define in-uv-run? #f)
 
   ;; owner pid -> list of resources it may own. This is an INDEX, not the
   ;; truth: entries are added when ownership is established and removed
@@ -452,7 +845,18 @@
                 ;; a conn this process handed on to someone else.
                 ((conn)
                  (let ((c (hashtable-ref conn-table key #f)))
-                   (when (and c (eq? (conn-owner c) owner)) (tcp-close! c))))
+                   (when (and c (eq? (conn-owner c) owner))
+                     ;; ⛔ THIS OVERRIDE DISABLES A REAL PROTECTION, and it
+                     ;; exists only so a cell can make the WATCHER the sole
+                     ;; supplier of the close and see whether it actually
+                     ;; supplies it. With owner death closing the conn here
+                     ;; AND the watcher aborting on DOWN, either one alone
+                     ;; produces the same visible outcome -- so neither can be
+                     ;; shown to work while the other is present. It is not a
+                     ;; configuration switch: an ordinary build has no such
+                     ;; branch at all.
+                     (unless (inject-override! 'tls-owner-close-skip #f)
+                       (tcp-close! c)))))
                 ;; A DESCRIPTOR THE DEAD PROCESS STILL HELD. The write
                 ;; side hands fds back to the caller and takes them again
                 ;; one syscall at a time, so a process that dies between
@@ -575,18 +979,37 @@
   (define on-read-code
     (foreign-callable
       (lambda (stream nread buf)
+        ;; ⭐ MARKED BEFORE ANY BRANCH. "No tls-branch in the trace" has two
+        ;; very different causes -- libuv never called us, or it called us and
+        ;; we took the plaintext arm because the tls field was gone -- and the
+        ;; existing marks cannot tell them apart. This one is entered on every
+        ;; read callback whatever happens next.
+        (note-read-stage! (if (fx> nread 0) 'cb+ (if (fx= nread 0) 'cb0 'cb-)))
         (let ((c (hashtable-ref conn-table stream #f)))
-          (when (and c (conn-owner c))
-            (cond
-              ((> nread 0)
-               (let ((bv (make-bytevector nread)))
-                 (memcpy-from-c bv (foreign-ref 'void* buf 0) nread)
-                 (deliver (conn-owner c) (vector 'tcp-data bv))))
-              ((= nread 0) (void))   ; spurious wakeup; ignore
-              ((= nread UV-EOF)
-               (deliver (conn-owner c) (vector 'tcp-eof)))
-              (else
-               (deliver (conn-owner c) (vector 'tcp-error nread)))))))
+          (unless c (note-read-stage! 'cb-no-conn))
+          (when c
+            (let ((t (conn-tls c)))
+              (unless t (note-read-stage! 'cb-plain))
+              (cond
+                ;; ⭐ THE TLS BRANCH COMES FIRST, AND DELIBERATELY DOES NOT
+                ;; TEST conn-owner. A TLS connection has NO owner until its
+                ;; handshake completes (Z12 installs it at establishment), so
+                ;; the owner gate below would drop every handshake byte and
+                ;; the handshake would never advance.
+                (t (note-read-stage! 'tls-branch) (tls-on-read c t nread buf))
+                ;; the plaintext path, unchanged: still owner-gated
+                ((conn-owner c)
+                 (cond
+                   ((> nread 0)
+                    (let ((bv (make-bytevector nread)))
+                      (memcpy-from-c bv (foreign-ref 'void* buf 0) nread)
+                      (deliver (conn-owner c) (vector 'tcp-data bv))))
+                   ((= nread 0) (void))   ; spurious wakeup; ignore
+                   ((= nread UV-EOF)
+                    (deliver (conn-owner c) (vector 'tcp-eof)))
+                   (else
+                    (deliver (conn-owner c) (vector 'tcp-error nread)))))
+                (else (void)))))))
       (void* ssize_t void*)
       void))
 
@@ -662,6 +1085,13 @@
   (define on-connection-code
     (foreign-callable
       (lambda (server status)
+       ;; ⛔ AN OUTER GUARD, BECAUSE THIS IS A FOREIGN CALLABLE FRAME. Before
+       ;; tls-accept! is even entered, foreign-alloc and make-conn can raise
+       ;; under allocation pressure, and an exception leaving here unwinds
+       ;; into C. The handler does the least it can and cannot itself raise.
+       (guard (e (#t (note-swallowed! 'on-connection e)
+                     (set! accept-error-count (bump-saturating accept-error-count))
+                     (void)))
         (if (< status 0)
             ;; ⚠ NO CELL COVERS THIS BRANCH. Making libuv hand a negative
             ;; status to a listener callback needs a condition this suite
@@ -708,15 +1138,26 @@
                     (set! accept-refused-count
                           (bump-saturating accept-refused-count))
                     (uv-close client on-close-entry))
-                (let ((c (make-conn client #f 'open #f))
-                      ;; #(token on-accept) -- see tcp-listen!
+                (let ((c (make-conn client #f 'open #f #f #f))
+                      ;; #(token on-accept handshaking tls-ctx handle)
                       (v (hashtable-ref listener-table server #f)))
                   (uv-tcp-nodelay client 1)
-                  (hashtable-set! conn-table client c)
-                  (if v
-                      ((vector-ref v 1) c)
-                      ;; listener already stopped: refuse the straggler
-                      (tcp-close! c)))))))
+                  (let ((ctx (incarnation-tls-ctx v)))
+                    (cond
+                      ((not v)
+                       (hashtable-set! conn-table client c)
+                       ;; listener already stopped: refuse the straggler
+                       (tcp-close! c))
+                      ;; ⭐ THE TLS PATH PUBLISHES ITSELF. X2 requires the
+                      ;; session to be installed in the conn BEFORE the conn
+                      ;; reaches conn-table, so that a failure before
+                      ;; publication is cleaned up by the only code that can
+                      ;; see the session. The insert therefore moves inside
+                      ;; tls-accept! rather than happening here.
+                      (ctx (tls-accept! c v ctx))
+                      (else
+                        (hashtable-set! conn-table client c)
+                        ((vector-ref v 1) c))))))))))
       (void* int)
       void))
 
@@ -1123,7 +1564,7 @@
                  ;; The owner died while connect was in flight.
                  (uv-close handle on-close-entry))
                 (else
-                 (let ((c (make-conn handle owner 'open #f)))
+                 (let ((c (make-conn handle owner 'open #f #f #f)))
                    ;; index and table together: an owner dying between them
                    ;; is told about a conn that teardown cannot find
                    (with-interrupts-disabled
@@ -1152,6 +1593,21 @@
   (define on-timer-code
     (foreign-callable
       (lambda (handle) (void))
+      (void*)
+      void))
+
+  ;; The per-conn TLS timer and its close callback. Both are locked with the
+  ;; rest below: libuv holds their raw entry points, so a collected code
+  ;; object would have the loop jump into freed memory.
+  (define on-tls-timer-code
+    (foreign-callable
+      (lambda (handle) (on-tls-timer handle))
+      (void*)
+      void))
+
+  (define on-tls-timer-close-code
+    (foreign-callable
+      (lambda (handle) (on-tls-timer-close handle))
       (void*)
       void))
 
@@ -1518,11 +1974,14 @@
       (lock-object on-fs-code)
       (lock-object on-fsw-code)
       (lock-object on-timer-code)
+      (lock-object on-tls-timer-code)
+      (lock-object on-tls-timer-close-code)
       (lock-object on-walk-code)
       (vector on-alloc-code on-read-code on-close-code
               on-write-code on-connection-code on-connect-code
               on-getaddrinfo-code on-fs-code on-fsw-code
-              on-timer-code on-walk-code)))
+              on-timer-code on-walk-code
+              on-tls-timer-code on-tls-timer-close-code)))
 
   (define on-fsw-entry (foreign-callable-entry-point on-fsw-code))
   (define on-alloc-entry (foreign-callable-entry-point on-alloc-code))
@@ -1534,6 +1993,9 @@
   (define on-getaddrinfo-entry (foreign-callable-entry-point on-getaddrinfo-code))
   (define on-fs-entry (foreign-callable-entry-point on-fs-code))
   (define on-timer-entry (foreign-callable-entry-point on-timer-code))
+  (define on-tls-timer-entry (foreign-callable-entry-point on-tls-timer-code))
+  (define on-tls-timer-close-entry
+    (foreign-callable-entry-point on-tls-timer-close-code))
   (define on-walk-entry (foreign-callable-entry-point on-walk-code))
 
   (define uv-walk-c
@@ -1576,12 +2038,16 @@
   ;; timeout-ms > 0: block in the OS poller until I/O arrives or the
   ;; wakeup timer fires -- zero busy-wait when idle.
   (define (uv-poll! timeout-ms)
-    (if (<= timeout-ms 0)
-        (uv-run uv-loop UV-RUN-NOWAIT)
-        (begin
-          (uv-timer-start wakeup-timer on-timer-entry timeout-ms 0)
-          (uv-run uv-loop UV-RUN-ONCE)
-          (uv-timer-stop wakeup-timer))))
+    (dynamic-wind
+      (lambda () (set! in-uv-run? #t))
+      (lambda ()
+        (if (<= timeout-ms 0)
+            (uv-run uv-loop UV-RUN-NOWAIT)
+            (begin
+              (uv-timer-start wakeup-timer on-timer-entry timeout-ms 0)
+              (uv-run uv-loop UV-RUN-ONCE)
+              (uv-timer-stop wakeup-timer))))
+      (lambda () (set! in-uv-run? #f))))
 
   ;; optional trailing arg: uv_tcp_bind flags (UV_TCP_REUSEPORT = 2,
   ;; kernel-balanced multi-process listening).
@@ -1610,6 +2076,8 @@
   ;;     NOT BEEN OBSERVED. That needs two processes on one port and a
   ;;     load run, and nobody has done it. What is written above is what
   ;;     libuv implements, not what we have measured.
+  ;; opts: (flags [tls-ctx]). The context is taken HERE rather than patched
+  ;; in afterwards -- see the incarnation vector below for why.
   (define (tcp-listen! host port backlog on-accept . opts)
     (with-interrupts-disabled          ; shared sockaddr-buf: see tcp-connect!
     (let ((flags (if (pair? opts) (car opts) 0))
@@ -1646,7 +2114,26 @@
         ;; server's handle value would match a later listener's, so the
         ;; old server would report itself live and its shutdown would
         ;; stop somebody else's listener.
-        (hashtable-set! listener-table l (vector (list 'listener) on-accept))
+        ;; ⭐ THE HANDSHAKING COUNT LIVES ON THIS OBJECT, not on the table
+        ;; row (Y1). A handshaking conn holds a reference to this vector, so
+        ;; the slot can still be released after the row is gone -- which is
+        ;; exactly what happens when a listener is stopped while handshakes
+        ;; are in flight. Slots 0/1 keep their meaning for every existing
+        ;; reader; 2 is the count and 3 is the server context (#f = plaintext).
+        ;; slot 4 is the handle this incarnation belongs to, so a conn
+        ;; holding the incarnation can ask whether it is STILL the current one
+        ;; (X3) without a reverse scan of the table.
+        ;; ⛔ PUBLISHED COMPLETE, INCLUDING THE CONTEXT. Filling slot 3 after
+        ;; this row was already in the table was a window, not an untidiness:
+        ;; between publication and the patch the event loop can accept a
+        ;; queued connection, read ctx = #f, and take the PLAINTEXT branch --
+        ;; a plain HTTP request reaching the reader on an https port. The
+        ;; caller's context therefore arrives as an argument and is in the
+        ;; vector the moment anything can see it.
+        (hashtable-set! listener-table l
+          (vector (list 'listener) on-accept 0
+                  (if (and (pair? opts) (pair? (cdr opts))) (cadr opts) #f)
+                  l))
         l))))
 
   ;; Stop accepting new connections (graceful shutdown step 1);
@@ -1724,6 +2211,13 @@
     ;; safe over a snapshot that may already be stale.
     (define (stop! l)                        ; caller holds the region
       (when (hashtable-ref listener-table l #f)
+        ;; ⭐ THE INCARNATION OWNS ITS CONTEXT, so stopping it gives the
+        ;; context back. Leaving that to the caller meant a direct
+        ;; tcp-listen-tls! / tcp-stop-listen! lifecycle leaked one SSL_CTX per
+        ;; generation, which contradicts the ownership this vector claims.
+        (let ((v (hashtable-ref listener-table l #f)))
+          (let ((ctx (and v (vector-ref v 3))))
+            (when ctx (tls-context-retire! ctx))))
         (hashtable-delete! listener-table l)
         (uv-close l on-close-entry)))
     (cond
@@ -2482,10 +2976,30 @@
 
   ;; Start delivering #(tcp-data ...) messages to the conn's owner.
   ;; Call after conn-set-owner!.
+  ;; ⛔ ASK WHETHER IT IS ALREADY READING; DO NOT DECODE AN ERRNO. Both the
+  ;; accept path and the delayed on-accept start reading on a TLS connection,
+  ;; so the second call is expected and must not read as a failure. An earlier
+  ;; version compared the return against a hardcoded UV_EALREADY of -114 --
+  ;; which is Linux's errno. EALREADY is 37 on macOS and on FreeBSD, where
+  ;; every igropyr deployment runs, so on the machines that matter the normal
+  ;; second start was counted as an error.
+  ;;
+  ;; uv_is_active answers the actual question and has no per-platform number
+  ;; in it, so the redundant call is skipped rather than made and forgiven --
+  ;; and any negative return that does happen is then a real failure.
   (define (tcp-read-start! c)
     (with-interrupts-disabled          ; test and use: see conn-peer-ip
-      (when (eq? (conn-state c) 'open)
-        (uv-read-start (conn-handle c) on-alloc-entry on-read-entry))))
+      (if (not (eq? (conn-state c) 'open))
+          #f
+          (if (not (fx= 0 (uv-is-active (conn-handle c))))
+              #t                        ; already reading: nothing to do
+              (let ((r (uv-read-start (conn-handle c)
+                                      on-alloc-entry on-read-entry)))
+                (if (fx>= r 0)
+                    #t
+                    (begin (set! accept-error-count
+                                 (bump-saturating accept-error-count))
+                           #f)))))))
 
   ;; Stop delivering #(tcp-data ...), so the kernel's receive window closes
   ;; and the PEER is slowed down.
@@ -2583,7 +3097,15 @@
   ;; caller context on the fast path (safe: not inside a libuv callback)
   ;; and in callback context on the queued path; either way it must not
   ;; yield. Returns #f if the connection is not open (on-done ran -1).
-  (define (tcp-writev! c segs on-done)
+  ;; ⭐ THE RAW SINK. Bytes go out exactly as given: no codec, no gate, no
+  ;; accounting. For a TLS connection these bytes are always CIPHERTEXT, and
+  ;; every kind of it comes through here -- handshake records, close_notify,
+  ;; and application records alike (W1). tls-raw-sink-writes counts them all,
+  ;; which makes it a consistency check and NOT an oracle: the discriminator
+  ;; for "handshake output went through the codec-aware entry by mistake" is
+  ;; the handshake failing from double encryption, not this counter moving.
+  (define (tcp-writev-raw! c segs on-done)
+    (bump-raw-sink-writes!)
     (if (not (eq? (conn-state c) 'open))
         (begin (when on-done (on-done -1)) #f)
         (let ((total (fold-left (lambda (a b) (+ a (bytevector-length b))) 0 segs)))
@@ -2675,6 +3197,899 @@
                on-done))))))
 
   ;; single-bytevector write (websocket / redis / mysql)
+  ;; A TLS listener is an ordinary listener whose incarnation carries a
+  ;; server context. The context belongs to THIS incarnation and is retired
+  ;; once when the listener is stopped -- a listener that changes incarnation
+  ;; without retiring leaks one context per generation.
+  (define (tcp-listen-tls! host port backlog on-accept ctx . opts)
+    (apply tcp-listen! host port backlog on-accept
+           (if (pair? opts) (car opts) 0) ctx '()))
+
+  ;; ---- the conn's one timer (X3 / Y3 / Y4 / Z2) ---------------------------
+  ;;
+  ;; ⭐ ONE TIMER FOR THE CONNECTION'S WHOLE LIFE. It is armed for the
+  ;; handshake, STOPPED (not freed) on establishment, and re-armed for the
+  ;; clean-shutdown deadline. So after a successful handshake the live timer
+  ;; count is 1 and the active count is 0 -- allocating a second timer for
+  ;; shutdown is the mutation that row exists to catch.
+  (define tls-handshake-ms 10000)
+  (define tls-shutdown-ms 2000)
+  (define (tls-handshake-ms-set! n) (set! tls-handshake-ms n))
+  (define (tls-shutdown-ms-set! n) (set! tls-shutdown-ms n))
+
+  (define timer-conns (make-eqv-hashtable))   ; timer address -> conn
+  (define next-timer-id 0)
+
+  ;; ⭐ INIT FAILURE AND START FAILURE ARE NOT THE SAME BOOKKEEPING (Y4).
+  ;; uv_timer_init failing means the handle was never initialised: it is freed
+  ;; DIRECTLY and must not be handed to uv_close. A uv_timer_start failure
+  ;; after a successful init means libuv owns it, so it goes out through
+  ;; uv_close and the close callback frees the memory -- the same distinction
+  ;; the listener allocation already makes.
+  ;; -> the timer address, or #f (the caller closes the conn).
+  (define (tls-timer-new! c ms)
+    (let ((tm (foreign-alloc timer-handle-size)))
+      (if (fx< (inject-override! 'tls-timer-init-fail
+                                 (uv-timer-init uv-loop tm)) 0)
+          (begin (note-timer-free! 'direct-free-uninitialised)
+                 (foreign-free tm) #f)          ; never initialised
+          (begin
+            (bump-live-timers! 1)
+            (hashtable-set! timer-conns tm c)
+            (if (fx< (inject-override! 'tls-timer-start-fail
+                                       (uv-timer-start tm on-tls-timer-entry ms 0)) 0)
+                (begin
+                  ;; initialised, so libuv owns it: out through uv_close
+                  (hashtable-delete! timer-conns tm)
+                  (uv-close tm on-tls-timer-close-entry)
+                  #f)
+                (begin (bump-active-timers! 1)
+                       (conn-tls-set-timer-armed! (conn-tls c) #t)
+                       tm))))))
+
+  (define (tls-timer-stop! t)
+    (let ((tm (conn-tls-timer t)))
+      (when (and tm (conn-tls-timer-armed? t))
+        (conn-tls-set-timer-armed! t #f)
+        (uv-timer-stop tm)
+        (bump-active-timers! -1))))
+
+  ;; ⛔ ONE REGION, AND THE HANDLE IS RE-READ INSIDE IT. As three separate
+  ;; steps this both drifted the count -- a timer due immediately could fire
+  ;; and be closed before the armed flag was published, so nothing decremented
+  ;; -- and, far worse, allowed uv_timer_start on freed memory: the handle was
+  ;; captured, another process retired the connection, the close callback
+  ;; freed it, and the original process then started it.
+  (define (tls-timer-rearm! t ms)
+    (with-interrupts-disabled
+      (let ((tm (conn-tls-timer t)))     ; re-read: retirement sets it to #f
+        (when (and tm (not (conn-tls-timer-armed? t)))
+          (when (fx>= (uv-timer-start tm on-tls-timer-entry ms 0) 0)
+            (conn-tls-set-timer-armed! t #t)
+            (bump-active-timers! 1))))))
+
+  ;; Idempotent, and the ONLY path that gives the timer back: stop, then
+  ;; uv_close, and only the close callback frees the memory.
+  (define (tls-timer-close! t)
+    (let ((tm (conn-tls-timer t)))
+      (when tm
+        ;; ⛔ AN ARMED TIMER GIVES ITS ACTIVE COUNT BACK HERE. Closing one
+        ;; without decrementing left active at 1 while live was already 0 --
+        ;; which is what the clean-close path produced, because it RE-ARMS the
+        ;; timer for the shutdown deadline and then closes it.
+        (when (conn-tls-timer-armed? t)
+          (conn-tls-set-timer-armed! t #f)
+          (bump-active-timers! -1))
+        (conn-tls-set-timer! t #f)
+        (uv-timer-stop tm)
+        (hashtable-delete! timer-conns tm)
+        (uv-close tm on-tls-timer-close-entry))))
+
+  (define on-tls-timer-close
+    (lambda (tm)
+      (bump-live-timers! -1)
+      (note-timer-free! 'close-callback)
+      (foreign-free tm)))
+
+  (define on-tls-timer
+    (lambda (tm)
+      (let ((c (hashtable-ref timer-conns tm #f)))
+        (when c
+          (conn-tls-retire! c 'timer-expiry 'tls-timeout)))))
+
+  ;; ---- the per-listener handshaking ceiling (Y1) --------------------------
+  (define tls-handshake-max 1024)
+  (define (tls-handshake-max-set! n) (set! tls-handshake-max n))
+
+  (define (listener-incarnation h) (hashtable-ref listener-table h #f))
+  (define (incarnation-tls-ctx v) (and v (vector-ref v 3)))
+  (define (listener-handle-of v) (and v (vector-ref v 4)))
+
+  ;; -> #t when a slot was taken. Refusal is the caller's business: an
+  ;; over-ceiling conn is closed at once, with no SSL object created (X3).
+  (define (listener-slot-take! v)
+    (and v
+         (with-interrupts-disabled
+           (let ((n (vector-ref v 2)))
+             (and (fx< n tls-handshake-max)
+                  (begin (vector-set! v 2 (fx+ n 1))
+                         (bump-handshaking! 1)
+                         #t))))))
+
+  ;; ⭐ RELEASED EXACTLY ONCE, and the flag that guarantees it lives on the
+  ;; CONN, not on the listener: every exit path -- establishment, handshake
+  ;; failure, timer expiry, hard or clean close, pre-publication failure --
+  ;; converges here, and only the first of them decrements.
+  ;; Released exactly once, and it reads the slot off the CONN so it works
+  ;; both before and after the TLS record exists.
+  (define (conn-slot-release! c)
+    (let ((v (with-interrupts-disabled
+               (let ((v (conn-slot c)))
+                 (when v (conn-set-slot! c #f))
+                 v))))
+      (when v
+        (vector-set! v 2 (fx- (vector-ref v 2) 1))
+        (bump-handshaking! -1))))
+
+  ;; ---- accepting a TLS connection ----------------------------------------
+  ;;
+  ;; ⛔ NOTHING HERE MAY RAISE INTO C. This runs in a libuv callback frame, so
+  ;; every step that can raise -- session construction allocates and reads the
+  ;; OpenSSL queue -- sits inside a guard that converts a raise into a local
+  ;; close. Interrupt exclusion is no substitute: it has no rollback.
+  (define (tls-accept! c v ctx)
+    ;; ⛔ A FAILURE HERE IS AN ABORT, NOT A CLEAN CLOSE. Calling tcp-close!
+    ;; was wrong in a way a cell caught: by this point conn-set-tls! has run,
+    ;; so tcp-close! dispatched to the CLEAN-close path -- which sends a
+    ;; close_notify on a session that never established, and recorded the
+    ;; retirement as (clean-close . tls-closed). X2/X5 say the opposite: a
+    ;; pre-publication failure retires the session and closes the unpublished
+    ;; handle, with no alert, and the reason recorded is this one.
+    ;; ⚠ THE HANDLER ITSELF MUST NOT RAISE. In R6RS a raise from the selected
+    ;; guard clause propagates outward, so cleanup that can fail -- a deliver,
+    ;; a close -- would escape this frame after all. It is wrapped again.
+    (guard (e (#t (note-swallowed! 'tls-accept e)
+                  (guard (e2 (#t (note-swallowed! 'tls-accept-cleanup e2)))
+                    (if (conn-tls c)
+                      (conn-tls-retire! c 'pre-publication e)
+                      (begin
+                        ;; nothing was attached, so retirement cannot run --
+                        ;; but the slot may already be held (it is taken
+                        ;; before any allocation), and it is released here or
+                        ;; nowhere.
+                        (note-retire-reason! 'pre-publication e)
+                        (conn-slot-release! c)
+                        (tcp-close-raw! c))))
+                  #f))
+      ;; ⭐ THE CEILING IS CHECKED BEFORE ANY SSL OBJECT EXISTS (X3): an
+      ;; over-limit connection costs a handle and nothing else.
+      (if (not (listener-slot-take! v))
+          (begin (tcp-close-raw! c) #f)
+          (begin
+            ;; ⭐ THE SLOT IS RECORDED ON THE CONN BEFORE ANY ALLOCATION. It
+            ;; used to be tracked only on the conn-tls record, which does not
+            ;; exist yet -- so a raise between taking the slot and attaching
+            ;; that record leaked the slot for the life of the listener, and
+            ;; the ceiling drifted down one place per failure.
+            (conn-set-slot! c v)
+            (inject-fault! 'tls-accept-after-slot)
+          (let ((sess (tls-session-new! ctx)))
+            (let ((why (tls-session-configure-server! sess)))
+              (if why
+                  (begin
+                    ;; same shape as above: nothing is published yet, so this
+                    ;; is a direct retire-and-close, and it says so.
+                    (note-retire-reason! 'pre-publication why)
+                    (tls-session-retire! sess why)
+                    (conn-slot-release! c)
+                    (tcp-close-raw! c)
+                    #f)
+                  (let ((t (make-conn-tls
+                             sess v
+                             #f          ; established?
+                             #f          ; eof?
+                             #f          ; eof-sent?
+                             #t          ; gated? -- Z12: nothing is delivered
+                             '()         ; inbound
+                             #f #f '()   ; holder, holder-monitor, waiters
+                             #f #f #f    ; closed?, closing?, aggregate
+                             #f          ; timer
+                             (let ((i next-timer-id))
+                               (set! next-timer-id (fx+ i 1)) i)
+                             #f          ; timer-armed?
+                             #f          ; watcher
+                             0 0 0 0     ; bio-held raw-queued charged refunded
+                             #t          ; slot? -- taken above
+                             #f #f #f    ; gate-opened-ms, retire-path, reason
+                             #f          ; effect-depths
+                             #f)))       ; abort-cb
+                    ;; ⭐ INSTALLED BEFORE THE CONN IS PUBLISHED (X2). Until
+                    ;; conn-table has this handle nothing else in the process
+                    ;; can reach the session, so a failure from here on is
+                    ;; ours alone to clean up.
+                    (conn-set-tls! c t)
+                    (inject-fault! 'tls-accept-before-publish)
+                    (hashtable-set! conn-table (conn-handle c) c)
+                    (inject-fault! 'tls-accept-after-publish)
+                    (let ((tm (tls-timer-new! c tls-handshake-ms)))
+                      (if (not tm)
+                          (begin (conn-tls-retire! c 'timer-failed 'tls-timer-failed) #f)
+                          (begin
+                            (conn-tls-set-timer! t tm)
+                            ;; the handshake is driven by the read callback, so
+                            ;; reading has to start before there is an owner
+                            (tcp-read-start! c)
+                            (tls-pump! c t)
+                            #t)))))))))))
+
+  ;; ⭐ CIPHERTEXT STRAIGHT INTO THE READ PATH, for rows that must control how
+  ;; many raw reads a flight arrives in. TCP may split or coalesce whatever a
+  ;; client writes, so "the client sent two records in one write" is not
+  ;; something a cell can assert from the client side; this hands the bytes to
+  ;; the same code the read callback would, in one delivery.
+  (define (tls-inject-ciphertext! c bv)
+    (guard (e (#t (note-swallowed! 'tls-inject e)
+                  (guard (e2 (#t (note-swallowed! 'tls-inject-cleanup e2)))
+                    (conn-tls-retire! c 'inject-raise 'tls-read-failed))
+                  #f))
+    (let ((t (conn-tls c)))
+      (when t
+        (bump-server-raw-read! (bytevector-length bv))
+        (let ((werr (tls-session-feed! (conn-tls-session t) bv)))
+          (if werr
+              (conn-tls-retire! c 'feed-failed 'tls-read-failed)
+              (tls-pump! c t)))))))
+
+  ;; ---- the handshake driver and the read path ----------------------------
+  (define (tls-on-read c t nread buf)
+    ;; same shape as the accept guard: the handler's own cleanup is wrapped,
+    ;; because a raise from a guard clause propagates out of this callback.
+    (guard (e (#t (note-swallowed! 'tls-on-read e)
+                  (guard (e2 (#t (note-swallowed! 'tls-on-read-cleanup e2)))
+                    (conn-tls-retire! c 'read-raise 'tls-read-failed))
+                  #f))
+      (cond
+        ((> nread 0)
+         (let ((bv (make-bytevector nread)))
+           (memcpy-from-c bv (foreign-ref 'void* buf 0) nread)
+           (bump-server-raw-read! nread)
+           (note-read-stage! 'data)
+           (inject-fault! 'tls-read-step)
+           (let ((werr (tls-session-feed! (conn-tls-session t) bv)))
+             (note-read-stage! (if werr 'fed-err 'fed-ok))
+             (if werr
+                 (conn-tls-retire! c 'feed-failed 'tls-read-failed)
+                 (tls-pump! c t)))))
+        ((= nread 0) (note-read-stage! 'zero))
+        ((= nread UV-EOF)
+         (note-read-stage! 'fin)
+         ;; ⭐ A BARE FIN IS NOT AN EOF. close_notify sets eof? on the way
+         ;; through the read loop; without it the stream was cut, and saying
+         ;; "eof" would let a truncated response read as a complete one.
+         ;;
+         ;; ⛔ AND IT WAITS FOR THE GATE. Delivering here while the gate is
+         ;; shut put the EOF in front of plaintext that was still buffered.
+         (if (conn-tls-eof? t)
+             (tls-deliver-eof-once! c t)
+             (let ((o (conn-owner c)))
+               (when o (deliver o (vector 'tcp-error 'tls-truncated-eof)))
+               (conn-tls-retire! c 'truncated-eof 'tls-truncated-eof))))
+        (else (note-read-stage! 'err) (conn-tls-retire! c 'read-error nread)))))
+
+  ;; Not established: step, drain to the raw sink, stop when OpenSSL wants
+  ;; more. Established: decrypt and deliver or buffer.
+  (define (tls-pump! c t)
+    (note-read-stage! (if (conn-tls-established? t) 'pump-est 'pump-hs))
+    (if (conn-tls-established? t)
+        (tls-read-plaintext! c t)
+        (let loop ()
+          (bump-ssl-op!)
+          ;; ⭐ THE OVERRIDE REPLACES BOTH VALUES, BEFORE ANY SUCCESS TEST
+          ;; (W3). The real step runs -- the state is genuine -- and only the
+          ;; verdict is forced; replacing a pair assembled after a success
+          ;; branch had already been taken would change nothing.
+          (let-values (((verdict payload)
+                        (let-values (((v p) (tls-session-handshake-step!
+                                              (conn-tls-session t))))
+                          (let ((forced (inject-override! 'tls-handshake-result #f)))
+                            (if forced (values forced #f) (values v p))))))
+            ;; classify BEFORE draining, then send whatever the step produced
+            ;; -- including the alert that explains a failure
+            (let ((out (tls-session-drain! (conn-tls-session t))))
+              (when out (tcp-writev-raw! c (list out) #f)))
+            (case verdict
+              ((done)
+               (tls-established! c t)
+               ;; ⭐ DECRYPT IMMEDIATELY, AND THIS LINE IS THE WHOLE OF X3/H13.
+               ;; A client normally sends its request in the SAME flight as its
+               ;; Finished, so by the time the handshake reports done those
+               ;; bytes are ALREADY in the read BIO. There will be no further
+               ;; read callback -- the client has said everything it intends to
+               ;; and is waiting for the response -- so if nothing decrypts
+               ;; here the request is never seen and both ends wait forever.
+               ;; Measured before this line existed: handshake complete, two
+               ;; raw reads with the request in the second, ssl-op-count frozen
+               ;; at the handshake's three, and the client giving up after 4 s.
+               ;;
+               ;; The gate is still closed at this point (Z12), so what comes
+               ;; out is buffered and the watcher delivers it in order.
+               (tls-read-plaintext! c t))
+              ((want-read) (void))                 ; wait for more ciphertext
+              ((gone) (conn-tls-retire! c 'session-gone 'tls-conn-closed))
+              ;; ⭐ want-write IS AN ERROR HERE (W3), not a state to wait in:
+              ;; the write BIO is unbounded, so OpenSSL asking for room means
+              ;; something this code does not model.
+              (else
+                (conn-tls-retire! c 'handshake-failed
+                                  (or payload 'tls-handshake-failed))))))))
+
+  ;; ⭐ ESTABLISHMENT ORDER (Z12). The callback may not yield, and a spawned
+  ;; process only runs after it returns, so this installs the owner, asks for
+  ;; a watcher, leaves the gate CLOSED and returns. The watcher opens the gate
+  ;; and drains what was buffered -- which is why the first plaintext of a TLS
+  ;; connection arrives one scheduling turn later than on a plaintext one
+  ;; (declared residual R-h).
+  (define (tls-established! c t)
+    (conn-tls-set-established! t #t)
+    (tls-timer-stop! t)                      ; stopped, NOT freed (Z2/Y3)
+    (conn-slot-release! c)
+    ;; revalidate the incarnation: the listener row can go during a handshake
+    (let ((v (conn-tls-listener t)))
+      (if (not (and v (eq? v (hashtable-ref listener-table
+                                            (listener-handle-of v) #f))))
+          (conn-tls-retire! c 'listener-gone 'tls-listener-stopped)
+          (begin
+            ((vector-ref v 1) c)             ; the delayed on-accept: owner in
+            (unless uv-tls-watcher-spawner
+              (assertion-violation 'tls-accept!
+                "a TLS listener needs (igropyr tls-watch) imported: it installs the watcher spawner hook"))
+            (conn-tls-set-watcher! t (uv-tls-watcher-spawner c))
+            (bump-watchers! 1)
+            ;; ⭐ THE LAST LINE OF THE CALLBACK FRAME, which is exactly what
+            ;; H18(a) needs: it asserts this frame RETURNED before the watcher
+            ;; ran. Establishment happens inside the read callback, so this --
+            ;; not the accept callback -- is where that frame ends.
+            ;;
+            ;; ⚠ IT COUNTS ARRIVAL AT THIS LINE, NOT SUCCESS. Reading it as
+            ;; "the owner was installed" would be reading more than it says.
+            ;; It had no call site at all until now, so any earlier reading of
+            ;; it was structurally 0 and meant nothing.
+            (bump-accept-completion!)))))
+
+  ;; EOF goes to the owner at most once, and only once the gate is open --
+  ;; before that it stays recorded and the watcher delivers it after the
+  ;; buffered plaintext, in order.
+  (define (tls-deliver-eof-once! c t)
+    (let ((send? (with-interrupts-disabled
+                   (and (not (conn-tls-gated? t))
+                        (not (conn-tls-eof-sent? t))
+                        (begin (conn-tls-set-eof-sent! t #t) #t)))))
+      (when send?
+        (let ((o (conn-owner c))) (when o (deliver o (vector 'tcp-eof)))
+          (bump-eof-delivery!)))))
+
+  ;; Decrypt what arrived and either deliver it or hold it until the watcher
+  ;; opens the gate.
+  (define (tls-read-plaintext! c t)
+    (note-read-stage! 'decrypt)
+    (bump-ssl-op!)
+    (let-values (((out eof?) (tls-session-decrypt! (conn-tls-session t) #vu8())))
+      (when eof? (conn-tls-set-eof! t #t))
+      ;; post-handshake protocol output (ticket acks, key updates)
+      (let ((back (tls-session-drain! (conn-tls-session t))))
+        (when back (tcp-writev-raw! c (list back) #f)))
+      (when (fx> (bytevector-length out) 0)
+        (if (conn-tls-gated? t)
+            (conn-tls-set-inbound! t (append (conn-tls-inbound t) (list out)))
+            (let ((o (conn-owner c)))
+              (when o (deliver o (vector 'tcp-data out))))))
+      (note-read-stage! (if eof? 'decrypt-eof 'decrypt-done))
+      (when eof? (tls-deliver-eof-once! c t))))
+
+  ;; ---- retirement of a TLS connection ------------------------------------
+  ;;
+  ;; ⭐ IDEMPOTENT BY SHAPE. The conn's tls field is the gate: the region below
+  ;; detaches it, and whoever loses that race finds #f and does nothing. That
+  ;; matters because owner death and watcher death can arrive together, so no
+  ;; caller can promise to run this once -- "exactly once" here means exactly
+  ;; one EFFECTIVE retirement, not one call.
+  ;;
+  ;; ⭐ THE REGION HOLDS SHARED-STATE EDITS ONLY (Delta 11). The refusal sends,
+  ;; the session free and uv_close all happen after it: N sends and an
+  ;; SSL_free inside one disabled region would be the widest region in this
+  ;; file, and the waiter list has already been TAKEN, so nothing else can
+  ;; answer those waiters no matter how long we take to do it.
+  (define (conn-tls-retire! c path reason)
+    (let* ((entry (retire-entry-depth))
+           (taken
+             (with-interrupts-disabled
+               (let ((t (conn-tls c)))
+                 (and t
+                      (begin
+                        (conn-set-tls! c #f)          ; <- the gate
+                        ;; the accumulator lives ON THE RECORD, not in a
+                        ;; module variable: the effects below are preemptible,
+                        ;; so another conn's retirement can interleave with
+                        ;; them and would clobber a shared one.
+                        ;; ⭐ RECORDED IMMEDIATELY AFTER THE DETACH. It used
+                        ;; to be written near the end of the region, so a
+                        ;; failure in between left a retirement that had
+                        ;; certainly happened with no reason attached -- and
+                        ;; "no reason" reads exactly like "never retired".
+                        (note-retire-reason! path reason)
+                        (retire-depths-init! t entry)
+                        (note-shared-depth! t)
+                        (conn-tls-set-closed! t #t)
+                        (conn-slot-release! c)
+                        ;; the aggregate is shared state, so it is terminalised
+                        ;; here; unconditionally on pending (Z4)
+                        (let ((a (conn-tls-aggregate t)))
+                          (when a
+                            (conn-tls-set-abort-cb! t
+                              (tls-agg-terminalise! a reason))))
+                        ;; ⭐ ONLY THE WINNER WRITES THE REASON. A later
+                        ;; idempotent call must not overwrite it with a
+                        ;; generic one: the first cause is the one worth
+                        ;; keeping.
+                        (conn-tls-set-retire-path! t path)
+                        (conn-tls-set-retire-reason! t reason)
+                        (let ((ws (conn-tls-waiters t)))
+                          (conn-tls-set-waiters! t '())
+                          (note-shared-depth! t)
+                          ;; ⭐ THE TIMER AND THE SESSION GO BACK INSIDE THE
+                          ;; REGION. They are foreign calls that allocate no
+                          ;; Scheme memory, so they do not break the rule the
+                          ;; region exists for -- and leaving them outside was
+                          ;; measured to be worse: once conn-tls is detached,
+                          ;; a kill before them orphans the timer and the
+                          ;; session forever, because every later retirement
+                          ;; sees #f and does nothing, and the expiring timer
+                          ;; routes back through the same detached field.
+                          ;;
+                          ;; ⚠ ONLY THE REFUSAL SENDS STAY OUTSIDE: they
+                          ;; allocate, and there are as many of them as there
+                          ;; are waiters.
+                          (note-effect-depth! t 'session-retire)
+                          (tls-session-retire! (conn-tls-session t)
+                                               "tls: connection retired")
+                          (when (conn-tls-timer t) (tls-timer-close! t))
+                          (note-effect-depth! t 'uv-close)
+                          (unless (eq? (conn-state c) 'closed)
+                            (tcp-close-raw! c))
+                          (cons t ws))))))))
+      (when taken
+        (let ((t (car taken)) (ws (cdr taken)))
+          ;; whoever took the list answers it; these are sends, so they are
+          ;; out here
+          (for-each (lambda (w)
+                      (note-effect-depth! t 'refusal)
+                      (deliver (car w) (vector 'tcp-write-refused reason)))
+                    ws)
+          ;; ⭐ THE CURRENT HOLDER IS REFUSED TOO. A writer granted the gate is
+          ;; no longer on the waiter list, so refusing only the list left it
+          ;; parked forever whenever the process that granted it died between
+          ;; recording it as holder and telling it so. Refusing the holder
+          ;; closes that case; the residual -- a kill between the atomic take
+          ;; and the send -- needs a deterministic handoff and is declared,
+          ;; not fixed, here.
+          (let ((h (conn-tls-holder t)))
+            (when h
+              (note-effect-depth! t 'refusal)
+              (deliver h (vector 'tcp-write-refused reason))))
+          ;; the aborted write's own callback, fired outside the region
+          (let ((cb (conn-tls-abort-cb t)))
+            (when cb
+              (conn-tls-set-abort-cb! t #f)
+              (cb (if (fixnum? reason) reason -1))))
+          ;; the watcher's exit is a consequence of the close, never a
+          ;; prerequisite: nothing below waits for it
+          (let ((w (conn-tls-watcher t)))
+            (when w (deliver w (vector 'tls-retire))))
+          #t))))
+
+  ;; ---- application writes on a TLS connection ----------------------------
+  ;;
+  ;; Bounded chunks so that computing the charge cannot itself create an
+  ;; unbounded transient (W4/X4).
+  (define tls-chunk-size 16384)
+
+  ;; ONE aggregate per application write, however many TLS records it becomes
+  ;; (X1). Raw completions -- which may run INLINE on a full uv_try_write --
+  ;; may only decrement pending, record first-error, and mark completed? once
+  ;; sealed? and pending = 0; they never call user code and never re-enter SSL.
+  (define next-agg-id 0)
+  (define (fresh-agg-id) (let ((i next-agg-id)) (set! next-agg-id (fx+ i 1)) i))
+
+  (define-record-type (tls-agg make-tls-agg tls-agg?)
+    (fields
+      (immutable id tls-agg-id)
+      (mutable pending tls-agg-pending tls-agg-set-pending!)
+      (mutable sealed? tls-agg-sealed? tls-agg-set-sealed!)
+      (mutable error tls-agg-error tls-agg-set-error!)
+      (mutable done? tls-agg-done? tls-agg-set-done!)
+      (mutable cb tls-agg-cb tls-agg-set-cb!))
+    (nongenerative)
+    (sealed #t))
+
+  ;; ⭐ TERMINALISATION IS UNCONDITIONAL ON pending (Z4). An inline completion
+  ;; can leave an unsealed aggregate at pending = 0, and an abort that skipped
+  ;; it would let a surviving writer seal it later and fire the callback.
+  ;; ⭐ -> THE CALLBACK TO FIRE, OR #f, AND THE CALLER FIRES IT OUTSIDE THE
+  ;; REGION. Clearing cb without ever calling it meant an application write in
+  ;; flight when the connection was retired NEVER completed: the raw
+  ;; completion afterwards saw done? and did nothing, and the writer waited
+  ;; for an answer that could not come. Terminalising is a shared-state edit
+  ;; and belongs in the region; invoking user code does not.
+  (define (tls-agg-terminalise! a why)
+    (and (not (tls-agg-sealed? a))
+         (let ((cb (tls-agg-cb a)))
+           (unless (tls-agg-error a) (tls-agg-set-error! a why))
+           (tls-agg-set-done! a #t)
+           (tls-agg-set-cb! a #f)
+           cb)))
+
+  ;; The user callback runs exactly once, OUTSIDE the serialised unit, by
+  ;; whichever side observes sealed? and pending = 0 first.
+  (define (tls-agg-maybe-finish! a)
+    (let ((cb (with-interrupts-disabled
+                (and (tls-agg-sealed? a)
+                     (fx= (tls-agg-pending a) 0)
+                     (not (tls-agg-done? a))
+                     (let ((cb (tls-agg-cb a)))
+                       (tls-agg-set-done! a #t)
+                       (tls-agg-set-cb! a #f)
+                       cb)))))
+      (when cb (cb (or (tls-agg-error a) 0)))))
+
+  ;; Acquire the write gate. ONE interrupt-disabled step on shared state, and
+  ;; the message to the watcher is only a ping (Z8): testing the gate and then
+  ;; sending would lose the request when retirement runs between the two.
+  ;;
+  ;; -> 'held when this caller now holds it, 'refused with the reason, or
+  ;; 'parked when it was appended to the waiter list.
+  ;; -> the pid of the process making an APPLICATION write.
+  ;;
+  ;; ⛔ INTERNAL OUTPUT NEVER ASKS. Handshake records, close_notify and the
+  ;; post-handshake protocol output go straight to the raw sink and take no
+  ;; gate: they originate in a libuv callback frame, where the caller is the
+  ;; event-loop process, and making that process a gate HOLDER would mean the
+  ;; watcher monitoring the loop itself. The assertion below states that as a
+  ;; mechanism rather than a convention -- if internal output ever reaches the
+  ;; gate, it fails here instead of installing an unmonitorable holder.
+  (define (tls-writer-identity)
+    (when in-uv-run?
+      (assertion-violation 'tls-gate-acquire!
+        "internal TLS output must use the raw sink, not the write gate"))
+    (unless uv-self
+      (assertion-violation 'tls-gate-acquire!
+        "an application write on a TLS connection needs the actor layer's identity hook (uv-set-self!); a pure libuv program cannot make one"))
+    (uv-self))
+
+  (define (tls-gate-acquire! t me agg)
+    (with-interrupts-disabled
+      (cond
+        ((conn-tls-closed? t) (cons 'refused 'tls-conn-closed))
+        ((conn-tls-closing? t) (cons 'refused 'tls-closing))
+        ((conn-tls-holder t)
+         ;; a pointer write on a cell the caller allocated before the region
+         (conn-tls-set-waiters! t (append (conn-tls-waiters t) (list (cons me agg))))
+         (cons 'parked #f))
+        (else
+          (conn-tls-set-holder! t me)
+          (conn-tls-set-aggregate! t agg)
+          (cons 'held #f)))))
+
+  ;; ⭐ EVERY GRANT IS ANNOUNCED, INCLUDING THE UNCONTENDED ONE. Z5 requires
+  ;; the holder to be monitored FROM THE MOMENT IT HOLDS, and the watcher is
+  ;; the only process that can monitor on anyone's behalf. Recording a holder
+  ;; without telling the watcher left the common case -- an uncontended
+  ;; acquisition -- unwatched: a WebSocket sender that died mid-aggregate
+  ;; produced no DOWN at all and the gate stayed held for the connection's
+  ;; life. The rare contended path was watched and the ordinary one was not,
+  ;; which is the worst way round.
+  (define (tls-gate-announce-holder! t pid)
+    (let ((w (conn-tls-watcher t)))
+      (when w (deliver w (vector 'tls-gate-granted pid)))))
+
+  ;; Application write. The gate is held for the WHOLE aggregate; preemption
+  ;; between chunk units is preserved (Y5), so what is serialised is
+  ;; aggregates, not steps.
+  (define (tls-conn-writev! c t segs on-done)
+    (let* ((agg (make-tls-agg (fresh-agg-id) 0 #f #f #f on-done))
+           (me  (tls-writer-identity))
+           (got (tls-gate-acquire! t me agg)))
+      (when (eq? (car got) 'held) (tls-gate-announce-holder! t me))
+      (case (car got)
+        ((refused)
+         (when on-done (on-done -1))
+         #f)
+        ((parked)
+         ;; ⛔ A PARKED WRITER MUST WAIT. Writing anyway was a defect: two
+         ;; writers on one connection would interleave their TLS records, and
+         ;; serialising aggregates is the entire reason this gate exists
+         ;; (Z3/Z5). It went unnoticed because HTTP allows one outstanding
+         ;; write per connection, so the gate is uncontended there -- the
+         ;; WebSocket senders it was built for are where it would have bitten.
+         ;;
+         ;; No timeout: every waiter gets exactly one outcome, because both
+         ;; release and retirement answer whoever they atomically took off the
+         ;; list (Z7/Z8).
+         (tls-gate-ping! t)
+         (unless uv-gate-wait
+           (assertion-violation 'tls-conn-writev!
+             "an application write on a TLS connection needs the actor layer's gate wait hook (uv-set-gate-wait!), installed by (igropyr tls-watch)"))
+         (let ((answer (uv-gate-wait)))
+           (if (eq? answer 'held)
+               (tls-conn-write-chunks! c t agg segs on-done)
+               (begin (when on-done (on-done -1)) #f))))
+        (else
+          (tls-conn-write-chunks! c t agg segs on-done)))))
+
+  ;; The watcher tells us it is gone. Without this the live count only ever
+  ;; rises, and a reading of 1 after retirement says nothing about whether the
+  ;; watcher actually exited -- which is exactly how it was read once.
+  (define (tls-watcher-exited! c) (bump-watchers! -1))
+
+  ;; ---- what the watcher may touch ----------------------------------------
+  ;;
+  ;; ⭐ THE WATCHER LIVES ABOVE actor AND TOUCHES NO RECORD FIELD. It reaches
+  ;; the connection's shared state only through the operations below, which
+  ;; are the same ones writers use, so there is exactly one discipline for the
+  ;; gate rather than one per caller.
+
+  ;; -> the entry granted the gate (pid . aggregate), or #f. Takes it in one
+  ;; step, so a retirement racing this either finds the entry on the list or
+  ;; does not see it at all.
+  (define (tls-gate-grant-next! c)
+    (let ((t (conn-tls c)))
+      (and t
+           (with-interrupts-disabled
+             (let ((ws (conn-tls-waiters t)))
+               (cond
+                 ((or (null? ws) (conn-tls-closed? t) (conn-tls-holder t)) #f)
+                 (else
+                   (conn-tls-set-waiters! t (cdr ws))
+                   (conn-tls-set-holder! t (car (car ws)))
+                   (conn-tls-set-aggregate! t (cdr (car ws)))
+                   (car ws))))))))
+
+  ;; The live shared list's length -- read off the list itself, never off a
+  ;; count kept beside it: a separate counter zeroed at teardown would answer
+  ;; for a list that still had entries on it.
+  (define (tls-gate-waiters-length c)
+    (let ((t (conn-tls c)))
+      (if (not t) 0 (with-interrupts-disabled (length (conn-tls-waiters t))))))
+
+  (define (tls-conn-holder c)
+    (let ((t (conn-tls c))) (and t (conn-tls-holder t))))
+
+  (define (tls-conn-holder-monitor c)
+    (let ((t (conn-tls c))) (and t (conn-tls-holder-monitor t))))
+
+  (define (tls-conn-set-holder-monitor! c m)
+    (let ((t (conn-tls c))) (when t (conn-tls-set-holder-monitor! t m))))
+
+  ;; ⭐ GATE-OPEN AND THE ORDERED DRAIN ARE ONE TRANSITION (Z14). libuv
+  ;; callbacks run only when the scheduler polls the loop, which cannot happen
+  ;; inside this region, so no read callback can slip new plaintext between
+  ;; clearing the flag and the last buffered send: bytes either arrived before
+  ;; (buffered, drained here, in order) or after (delivered directly).
+  ;; ⭐ THE GATE STAYS SHUT UNTIL THE BUFFER IS EMPTY. Taking the batch and
+  ;; opening the gate in one region, then delivering outside it, let newer
+  ;; plaintext overtake older: the watcher was preempted after opening and a
+  ;; read callback delivered B directly while A was still in its hand, so the
+  ;; owner saw B before A. Z14's argument covers the region; it did not cover
+  ;; the window between leaving the region and the last send. Now each round
+  ;; takes a batch with the gate STILL CLOSED, delivers it, and only opens the
+  ;; gate once a round finds nothing left -- so anything arriving meanwhile is
+  ;; appended to the buffer and cannot pass what is already in flight.
+  ;;
+  ;; ⛔ THE OWNER IS CHECKED BEFORE THE BUFFER IS TAKEN. Clearing first and
+  ;; then finding no owner discarded that plaintext permanently. on-accept is
+  ;; external code and may simply not install one, so the connection is
+  ;; retired instead -- with a reason a cell can read.
+  (define (tls-open-gate-and-drain! c)
+    (let ((t (conn-tls c)))
+      (when t
+        (if (not (conn-owner c))
+            (conn-tls-retire! c 'no-owner 'tls-no-owner)
+            (let loop ()
+              (let ((batch (with-interrupts-disabled
+                             (let ((held (conn-tls-inbound t)))
+                               (conn-tls-set-inbound! t '())
+                               held))))
+                (cond
+                  ((pair? batch)
+                   (let ((o (conn-owner c)))
+                     (for-each (lambda (bv) (deliver o (vector 'tcp-data bv)))
+                               batch))
+                   (loop))
+                  (else
+                    (with-interrupts-disabled
+                      (conn-tls-set-gated! t #f)
+                      (conn-tls-set-gate-opened-ms! t (now-ms))
+                      (bump-gate-open!)
+                      (note-gate-open-ms! (now-ms)))
+                    ;; the recorded close_notify, now that order is safe
+                    (when (conn-tls-eof? t)
+                      (tls-deliver-eof-once! c t))))))))))
+
+  ;; Best-effort nudge. A lost ping costs latency only: the watcher has a
+  ;; timed receive and re-reads the waiter list on every wake (Z8).
+  (define (tls-gate-ping! t)
+    ;; ⛔ SUPPRESSION IS A TEST CONTROL, NOT A FAILURE MODE. Armed, it drops
+    ;; the ping so a waiter can only be woken by a release -- which is how the
+    ;; row that claims "a lost ping costs latency only" is made to prove it
+    ;; rather than assert it.
+    (unless (inject-override! 'tls-ping-suppress #f)
+      (let ((w (conn-tls-watcher t)))
+        (when w (deliver w (vector 'tls-gate-ping))))))
+
+  ;; Release the gate and hand it to the next waiter, in ONE step on the shared
+  ;; state; the reply to the woken writer is sent OUTSIDE it.
+  ;;
+  ;; ⭐ WHOEVER TAKES THE ENTRY IS THE ONE WHO ANSWERS IT. The list is read and
+  ;; rewritten inside the region, so a retirement racing this either finds the
+  ;; entry still on the list (and refuses it) or does not see it at all (and
+  ;; this call answers it). There is no test of whether the watcher is alive
+  ;; and no way for a waiter to get two answers.
+  (define (tls-gate-release! c t)
+    ;; the holder is stepping down, so its monitor should go with it --
+    ;; otherwise a writer that finishes and later exits produces a DOWN for a
+    ;; connection it no longer has anything to do with.
+    (let ((w (conn-tls-watcher t)))
+      (when w (deliver w (vector 'tls-gate-released))))
+    (let ((next (with-interrupts-disabled
+                  (conn-tls-set-holder! t #f)
+                  (conn-tls-set-holder-monitor! t #f)
+                  (conn-tls-set-aggregate! t #f)
+                  (let ((ws (conn-tls-waiters t)))
+                    (cond
+                      ((null? ws) #f)
+                      ((conn-tls-closed? t) #f)
+                      (else
+                        (conn-tls-set-waiters! t (cdr ws))
+                        (conn-tls-set-holder! t (car (car ws)))
+                        (conn-tls-set-aggregate! t (cdr (car ws)))
+                        (car ws)))))))
+      (cond
+        (next
+          (deliver (car next) (vector 'tls-gate-held))
+          ;; the new holder is monitored by the watcher, not by us (Z5)
+          (tls-gate-announce-holder! t (car next)))
+        (else
+          ;; ⭐ A CLEAN CLOSE THAT WAS WAITING FOR THIS RELEASE FINISHES HERE,
+          ;; and until now nothing did it. tls-conn-close-clean! returns when a
+          ;; holder is mid-aggregate, and its comment said "its release finds
+          ;; the closing flag and finishes the shutdown" -- a mechanism that
+          ;; did not exist, so the connection was left open with no
+          ;; close_notify, no retirement and no uv_close. The comment was
+          ;; describing an intention; this is the code.
+          (when (and (conn-tls c) (conn-tls-closing? t))
+            (tls-conn-finish-shutdown! c t))))))
+
+  (define (tls-conn-write-chunks! c t agg segs on-done)
+    (let loop ((ss segs) (off 0))
+      (cond
+        ((null? ss)
+         ;; sealing is the whole-aggregate act; the callback fires outside it
+         (with-interrupts-disabled (tls-agg-set-sealed! agg #t))
+         (tls-gate-release! c t)
+         (tls-agg-maybe-finish! agg)
+         #t)
+        (else
+          (let* ((bv (car ss))
+                 (n (bytevector-length bv))
+                 (take (fxmin tls-chunk-size (fx- n off))))
+            ;; ⭐ ONE OUTER REGION PER CHUNK UNIT (Y5), and its FIRST act is
+            ;; the field test (Delta 12). A conn retired between two chunks
+            ;; must not start another one: the session it would write into has
+            ;; been freed. The field is the same one retirement detaches, so
+            ;; this needs no second agreement with the retirement path.
+            (let ((r (with-interrupts-disabled
+                       (inject-fault! 'tls-chunk-step)
+                       (if (not (conn-tls c))
+                           'retired
+                           (let ((piece (if (and (fx= off 0) (fx= take n))
+                                            bv
+                                            (let ((b (make-bytevector take)))
+                                              (bytevector-copy! bv off b 0 take)
+                                              b))))
+                             (bump-ssl-op!)
+                             ;; no override here: forcing the CLASSIFICATION
+                             ;; of SSL_write is done where the classification
+                             ;; happens, inside (igropyr tls-core). Replacing
+                             ;; the ciphertext at this level would leave the
+                             ;; success branch already taken.
+                             (let ((out (tls-session-encrypt!
+                                          (conn-tls-session t) piece)))
+                               (tls-agg-set-pending!
+                                 agg (fx+ (tls-agg-pending agg) 1))
+                               ;; ⭐ THE BLOCK IS REGISTERED BEFORE IT IS
+                               ;; SUBMITTED. uv_try_write can complete INLINE,
+                               ;; so a completion can run before this call
+                               ;; returns -- registering afterwards would
+                               ;; record the block after its own completion
+                               ;; had already been recorded, and the ordering
+                               ;; the cell reads would be a lie.
+                               (let ((sz (bytevector-length out)))
+                                 (note-raw-block! t agg sz)
+                                 (inject-fault! 'tls-between-chunks)
+                                 ;; ⭐ CHARGED ONLY ONCE THE SUBMISSION IS
+                                 ;; ACCEPTED. Charging before this point left
+                                 ;; the money unrecoverable when anything
+                                 ;; between the two raised: the completion
+                                 ;; that refunds is installed BY this call, so
+                                 ;; a raise before it means no completion will
+                                 ;; ever exist to give it back.
+                                 (tls-conn-charge! t sz)
+                                 ;; ⭐ THE SIZE TRAVELS IN THE CLOSURE. A side
+                                 ;; table keyed by (conn . aggregate) would
+                                 ;; answer for the LAST block of an aggregate,
+                                 ;; refunding the wrong amount whenever an
+                                 ;; application write became more than one
+                                 ;; record -- which is the normal case.
+                                 (tcp-writev-raw!
+                                   c (list out)
+                                   (lambda (status)
+                                     (tls-raw-done! c t agg sz status))))
+                               'wrote))))))
+              (cond
+                ((eq? r 'retired)
+                 ;; the stored reason is the whole answer; the aggregate is
+                 ;; terminal and the gate is already closed by the retirement
+                 (let ((cb (tls-agg-terminalise! agg 'tls-conn-closed)))
+                   (when cb (cb -1)))
+                 #f)
+                ((fx< (fx+ off take) n) (loop ss (fx+ off take)))
+                (else (loop (cdr ss) 0)))))))))
+
+  ;; Accounting transfers (X4): ciphertext produced is bio-held until it is
+  ;; submitted, then raw-queued until its completion runs.
+  (define (tls-conn-charge! t n)
+    (conn-tls-set-raw-queued! t (fx+ (conn-tls-raw-queued t) n))
+    (conn-tls-set-charged! t (fx+ (conn-tls-charged t) n)))
+
+  ;; ⭐ THE REFUND HAPPENS ON EVERY OUTCOME (X4), and it is asserted BEFORE
+  ;; teardown clears the counters: charged-total and refunded-total are
+  ;; monotonic, so a skipped refund shows up as an inequality that teardown
+  ;; cannot hide.
+  (define (tls-raw-done! c t agg sz status)
+    (with-interrupts-disabled
+      (tls-agg-set-pending! agg (fx- (tls-agg-pending agg) 1))
+      (when (and (fx< status 0) (not (tls-agg-error agg)))
+        (tls-agg-set-error! agg status)))
+    (tls-conn-refund! t sz)
+    ;; ⭐ THE COMPLETION IS APPENDED, so the snapshot carries the ORDER blocks
+    ;; finished in rather than leaving a reader to infer it from registration
+    ;; order. Inline completions make those two orders differ, which is the
+    ;; whole reason the registration happens before the submit.
+    (note-raw-block-done! t agg sz status)
+    (inject-fault! 'tls-after-refund)
+    (tls-agg-maybe-finish! agg))
+
+  (define (tls-conn-refund! t n)
+    (when t
+      (with-interrupts-disabled
+        (conn-tls-set-raw-queued! t (fx- (conn-tls-raw-queued t) n))
+        (conn-tls-set-refunded! t (fx+ (conn-tls-refunded t) n)))))
+
+  ;; ⭐ THE CODEC-AWARE ENTRY, and the only one an application should call.
+  ;; A plaintext connection goes straight to the raw sink, which is exactly
+  ;; what it did before this split -- one field test more. A TLS connection
+  ;; has its plaintext encrypted first, under the conn's write gate, and the
+  ;; ciphertext reaches the socket through the raw sink above.
+  ;;
+  ;; ⚠ THE TEST IS THE FIELD, not a flag someone sets alongside it: the same
+  ;; field retirement detaches. A conn retired mid-write therefore stops being
+  ;; a TLS conn for every subsequent write, which is the behaviour the chunk
+  ;; loop relies on (Delta 12).
+  (define (tcp-writev! c segs on-done)
+    (let ((t (conn-tls c)))
+      (if t
+          (tls-conn-writev! c t segs on-done)
+          (tcp-writev-raw! c segs on-done))))
+
   (define (tcp-write! c bv on-done)
     (tcp-writev! c (list bv) on-done))
 
@@ -2757,10 +4172,55 @@
   ;; for the guarantee this procedure advertises, NOT an optimisation, and
   ;; it costs nothing: uv_close only files the handle for its close
   ;; callback and does not block.
+  ;; ⭐ A TLS CONNECTION CLOSES CLEANLY, A PLAINTEXT ONE CLOSES. The dispatch
+  ;; is on the same field retirement detaches, so a conn already retired takes
+  ;; the plain path -- which is what retirement itself relies on when it calls
+  ;; this after detaching.
   (define (tcp-close! c)
+    (if (conn-tls c)
+        (tls-conn-close-clean! c)
+        (tcp-close-raw! c)))
+
+  (define (tcp-close-raw! c)
     (with-interrupts-disabled
       (when (and (eq? (conn-state c) 'open)
                  (= 0 (uv-is-closing (conn-handle c))))
         (conn-set-state! c 'closing)
         (uv-close (conn-handle c) on-close-entry))))
+
+  ;; ⭐ CLEAN CLOSE REFUSES THE ALREADY-PARKED (Z9). Entering the closing
+  ;; state refuses EVERY waiter already on the list, in the same step that
+  ;; sets the flag -- refusing only new acquirers would leave whoever was
+  ;; parked at that instant waiting for a gate that will never be granted.
+  ;; Only the current holder's aggregate is allowed to seal.
+  ;;
+  ;; The alert then goes out under the shutdown deadline, on the SAME timer
+  ;; the handshake used (Y3): re-armed, not re-allocated.
+  (define (tls-conn-close-clean! c)
+    (let* ((t (conn-tls c))
+           (parked (and t (with-interrupts-disabled
+                            (conn-tls-set-closing! t #t)
+                            (let ((ws (conn-tls-waiters t)))
+                              (conn-tls-set-waiters! t '())
+                              ws)))))
+      (when t
+        (for-each (lambda (w)
+                    (deliver (car w) (vector 'tcp-write-refused 'tls-closing)))
+                  (or parked '()))
+        (if (conn-tls-holder t)
+            ;; a holder is mid-aggregate: it seals, and its release finds the
+            ;; closing flag and finishes the shutdown. Nothing is torn here --
+            ;; a half-emitted application frame on the wire is worse than a
+            ;; late close.
+            (void)
+            (tls-conn-finish-shutdown! c t)))))
+
+  (define (tls-conn-finish-shutdown! c t)
+    (bump-ssl-op!)
+    (tls-session-shutdown! (conn-tls-session t))
+    (inject-fault! 'tls-closenotify-delay)
+    (let ((out (tls-session-drain! (conn-tls-session t))))
+      (when out (tcp-writev-raw! c (list out) #f)))
+    (tls-timer-rearm! t tls-shutdown-ms)
+    (conn-tls-retire! c 'clean-close 'tls-closed))
 )

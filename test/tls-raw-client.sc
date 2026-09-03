@@ -17,7 +17,7 @@
 ;;; does; the caller sets it to the test CA before calling.
 
 (library (test tls-raw-client)
-  (export raw-tls-exchange)
+  (export raw-tls-exchange raw-tls-send-and-drop raw-tls-two-requests)
   (import (chezscheme)
           (igropyr actor)
           (only (igropyr libuv) tcp-connect! tcp-read-start! tcp-write! tcp-close! now-ms)
@@ -33,6 +33,22 @@
       (bytevector-copy! b 0 r (bytevector-length a) (bytevector-length b))
       r))
 
+  ;; Two requests on ONE connection (keep-alive): send A, wait until `expect`
+  ;; bytes of plaintext have arrived, send B, wait for `expect` more (or eof /
+  ;; timeout). -> (values plaintext writes failure). A listener that only
+  ;; decrypts the read that completed the handshake answers A and ignores B.
+  (define (raw-tls-two-requests host port sni req-a req-b expect timeout-ms)
+    (let-values (((plain writes eof? failure)
+                  (raw-tls-exchange host port sni req-a #f timeout-ms 'second req-b expect)))
+      (values plain writes failure)))
+
+  ;; Handshake, send the request, then close the SOCKET without close_notify:
+  ;; a bare FIN after a complete request, the H11(b) shape. -> writes | failure string
+  (define (raw-tls-send-and-drop host port sni request timeout-ms)
+    (let-values (((plain writes eof? failure)
+                  (raw-tls-exchange host port sni request #f timeout-ms 'drop)))
+      (or failure writes)))
+
   ;; -> (values plaintext-received writes eof? failure)
   ;;   plaintext-received  every decrypted byte the server sent (bytevector)
   ;;   writes              number of socket writes this exchange performed
@@ -42,7 +58,7 @@
   ;; coalesce? when #t the request is encrypted BEFORE the handshake's final
   ;;          drain, so Finished and the request leave in one write
   ;; Must be called from inside an igropyr process (it receives tcp messages).
-  (define (raw-tls-exchange host port sni request coalesce? timeout-ms)
+  (define (raw-tls-exchange host port sni request coalesce? timeout-ms . mode)
     (ensure-ctx!)
     (call/cc (lambda (k)
     (let ((writes 0) (deadline (+ (now-ms) timeout-ms)))
@@ -67,7 +83,7 @@
               (if err
                   (finish (make-bytevector 0) #f err)
                   (let handshake ()
-                    (let-values (((verdict payload) (tls-session-handshake-step! sess #f)))
+                    (let-values (((verdict payload) (tls-session-handshake-step! sess)))
                       (cond
                         ((eq? verdict 'gone) (finish (make-bytevector 0) #f payload))
                         ((eq? verdict 'done)
@@ -84,19 +100,32 @@
                              (begin
                                (flush! sess c)
                                (write! c (tls-session-encrypt! sess request))))
-                         ;; read until eof or timeout
+                         ;; 'drop: bare FIN right after the request, no close_notify,
+                         ;; nothing read (the socket close is what the server sees)
+                         (when (and (pair? mode) (eq? (car mode) 'drop))
+                           (finish (make-bytevector 0) #f #f))
+                         ;; read until eof or timeout; in 'second mode send B once
+                         ;; `expect` plaintext bytes have arrived and stop at 2x
                          (let-values (((port get) (open-bytevector-output-port)))
+                           (let ((second (and (pair? mode) (eq? (car mode) 'second) mode)) (got 0) (sent-b? #f))
                            (let read-loop ()
                              (receive (after (remaining) (finish (get) #f #f))
                                (`#(tcp-data ,bv)
                                  ;; decrypt! feeds the ciphertext itself (as establish! relies on);
                                  ;; feeding first would enter every byte twice
                                  (let-values (((out eof?) (tls-session-decrypt! sess bv)))
-                                   (when out (put-bytevector port out))
+                                   (when out (put-bytevector port out) (set! got (+ got (bytevector-length out))))
                                    (flush! sess c)
-                                   (if eof? (finish (get) #t #f) (read-loop))))
+                                   (cond
+                                     (eof? (finish (get) #t #f))
+                                     ((and second (not sent-b?) (>= got (caddr second)))
+                                      (set! sent-b? #t)
+                                      (write! c (tls-session-encrypt! sess (cadr second)))
+                                      (read-loop))
+                                     ((and second sent-b? (>= got (* 2 (caddr second)))) (finish (get) #f #f))
+                                     (else (read-loop)))))
                                (`#(tcp-eof) (finish (get) #t #f))
-                               (`#(tcp-error ,e) (finish (get) #f "tcp error"))))))
+                               (`#(tcp-error ,e) (finish (get) #f "tcp error")))))))
                         ((eq? verdict 'want-read)
                          (flush! sess c)
                          (receive (after (remaining) (finish (make-bytevector 0) #f "handshake timeout"))
