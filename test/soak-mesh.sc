@@ -73,6 +73,36 @@
 ;; So the absolute values are logged as well. Growth is only visible against
 ;; a number, and no relation among these five can supply one. Once every
 ;; 30 s, not every check: the point is a series, not a trace.
+
+;; HEAP SLACK IS THE ONE THING AN EXTERNAL SAMPLER CANNOT SEE. Resident size
+;; counts the pages a process holds, not the live objects inside them. A
+;; reachability leak can fill the free slots of pages that are already
+;; resident: live bytes climb, RSS does not move, and the series only steps
+;; up at the next heap expansion -- which may fall outside any window one
+;; happens to measure. No sampling interval fixes this; the quantity is not
+;; on the outside of the process.
+;;
+;; So the process reports it about itself. SOAK_HEAPLOG=<seconds> forces a
+;; full collection and logs live bytes beside the bytes the heap holds from
+;; the OS; their difference is the slack. A rising live-bytes series is a
+;; leak whether or not RSS moves, and a falling slack with flat RSS is the
+;; exact shape that defeats an RSS-only instrument.
+;;
+;; It is opt-in, and must stay opt-in: forcing collections changes the
+;; allocation profile being measured. A run with this enabled is a second,
+;; deliberately perturbed instrument to be read alongside an untouched
+;; canary, never a replacement for one.
+(define heap-log-every
+  (let ((s (getenv "SOAK_HEAPLOG")))
+    (and s (string->number s))))
+(define last-heap-log 0)
+(define (heap-log!)
+  (when (and heap-log-every
+             (> (- (elapsed) last-heap-log) (* 1000 heap-log-every)))
+    (set! last-heap-log (elapsed))
+    (collect (collect-maximum-generation))
+    (let ((live (bytes-allocated)) (held (current-memory-bytes)))
+      (log "heap live" live "held" held "slack" (- held live)))))
 (define last-counts-log 0)
 (define (always-check! label)
   (let ((g (stat 'mon-chain)) (p (stat 'mon-peer-chains)) (a (stat 'accounted))
@@ -85,7 +115,8 @@
       (log "counts mon-chain" g "peer-chains" p "accounted" a
            "rmonitors" rm "owner-agents" oa
            "orphans" (node-orphan-count) "procs" (process-count)
-           "conns" (conn-count)))))
+           "conns" (conn-count)))
+    (heap-log!)))
 ;; AT REST IS A STATE THE NODE HAS TO REACH, NOT AN INSTANT. A node spliced
 ;; off its peer's chain is "retiring" until its agent has run demon-local,
 ;; exited, and been reaped -- three scheduling turns on a scheduler that
