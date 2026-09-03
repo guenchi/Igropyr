@@ -61,6 +61,11 @@
             ((<= left 0) #f)
             (else (sleep-ms 20) (loop (- left 20)))))))
 (define (now-ms) (let ((t (current-time))) (+ (* 1000 (time-second t)) (div (time-nanosecond t) 1000000))))
+;; wall clock of the first registrar death in this run: the warden gives up at
+;; child-restart-min-count (5) deaths inside child-restart-window-ms (60 s), and
+;; the cells above R6-9 kill it four times, so R6-9's death must fall outside
+;; that window or the node fail-stops -- which is the warden being right.
+(define first-death-ms #f)
 (define (drain-node-events!) (receive (after 300 'ok) (`#(node-up ,x) (drain-node-events!)) (`#(node-down ,x) (drain-node-events!))))
 
 (start-scheduler
@@ -72,6 +77,7 @@
     ;; ---- R6-1 kill the registrar; a later node-connect! still establishes
     (let ((p0 (wait-pid 5000)))
       (check "registrar is alive (started asynchronously by the warden)" (and p0 (process-alive? p0)) p0)
+      (set! first-death-ms (now-ms))
       (kill p0 'test-kill)
       (let ((p1 (wait-restart p0 5000)))
         (check "the warden restarted the registrar (new pid)" (and p1 (not (eq? p1 p0))) p0 p1)
@@ -139,30 +145,60 @@
               ;; with the resend the child gets `go` on the re-run; without it the child
               ;; waits out its 5 s timeout and starts a new attempt -- so the bound is 5 s
               (check "R6-4: established via the re-run's resend, not via the child's 5 s timeout" (< dt 5000) 'ms dt))))))
-    ;; ---- R6-9 a pre-touched 0 becomes generation 1 on the next authorisation
-    ;; What this pins: the seam sees the stored 0 (it does not launder), and
-    ;; the connect that follows issues 1. What it does NOT yet pin: peer-gen's
-    ;; own "0 is absent" guard. That guard is reachable only if a death or a
-    ;; raise lands between the pre-placement and the advance -- set-endpoint's
-    ;; phase (a) spawns (allocates, and is a scheduling point) between the two
-    ;; -- which is R-e's window. No injection point exists there today, so no
-    ;; cell covers it: reachable and untested, not unreachable. A mutant that
-    ;; hands a stored 0 back stays green here for that reason. Queued: an
-    ;; injection point 'registrar-endpoint-after-spawn and a cell that arms it.
-    ;; The registrar's tails pre-touch dial-gens with 0 before their region so
-    ;; the advance inside it replaces in place; peer-gen must therefore treat
-    ;; a stored 0 as absent (mint 1) -- generation 0 is never issued. The seam
-    ;; reads the raw table, not through peer-gen, so a 0 is visible to it.
+    ;; ---- R6-9 R-e's window is survivable: a death in set-endpoint's phase (a)
+    ;; (after the pre-placement and the spawn, before the region) restarts the
+    ;; registrar, the command is re-run from the queue head, and the link comes
+    ;; up exactly once -- no fail-stop, no orphan connector from the first spawn.
+    ;; What this cell does NOT pin: peer-gen's 0 guard. The stored 0 is written
+    ;; here but never read -- the command that wrote it holds the queue head
+    ;; until it completes (advancing 0->1) or the node fail-stops, and
+    ;; peer-gen's only caller (attempt-register) is behind it in the FIFO. So
+    ;; the "generation is 1" line below is a state check the peer-gen mutant
+    ;; also passes; the discriminator is the orphan check (a compensation
+    ;; guard that fails to kill the first spawn lets it dial too).
     (node-disconnect! 'b)
     (receive (after 15000 (check "disconnect for R6-9" #f)) (`#(node-down b) 'ok))
+    ;; let the restart window of the four earlier deaths expire (see first-death-ms)
+    (let ((rem (- (+ first-death-ms 61000) (now-ms))))
+      (when (> rem 0) (sleep-ms rem)))
     (drain-node-events!)
-    (check "R6-9 precondition: the seam sees a stored value, not a minted one" (integer? ($registrar-peer-gen 'b)) ($registrar-peer-gen 'b))
-    ($registrar-seed-gen! 'b 0)
-    (check "R6-9: the seeded 0 is visible as 0 (the seam does not launder it)" (eqv? ($registrar-peer-gen 'b) 0) ($registrar-peer-gen 'b))
+    (let ((p ($registrar-pid)))
+      ;; seed 0: identical to the state the pre-placement leaves (the pre-placement
+      ;; finds the key present and does nothing), so the injected death below
+      ;; leaves exactly "a 0 with no advance behind it"
+      ($registrar-seed-gen! 'b 0)
+      (inject-arm-fault! 'registrar-endpoint-after-spawn 1)
+      (node-connect! 'b "127.0.0.1" peer-port)
+      (let ((q (wait-restart p 5000)))
+        (check "R6-9: the registrar died in phase (a), after the spawn, and was restarted"
+               (and q (eqv? (inject-hits 'registrar-endpoint-after-spawn) 2)) (inject-hits 'registrar-endpoint-after-spawn))
+        (inject-disarm!)
+        ;; the re-run of the queued set-endpoint completes and the connector dials
+        (receive (after 15000 (check "R6-9: the queued set-endpoint completed after the restart" #f))
+          (`#(node-up b) 'ok))
+        ;; the first spawn was killed by the compensation guard: no second link,
+        ;; no flap, for longer than reconnect-base-ms (3000)
+        (let ((extra (receive (after 8000 #f)
+                       (`#(node-up b) 'second-node-up)
+                       (`#(node-down b) 'node-down))))
+          (check "R6-9: exactly one link came up after the re-run (no orphan connector)" (not extra) extra))
+        (check "R6-9: the pre-placed 0 was advanced by the re-run (state check, not a discriminator)"
+               (eqv? ($registrar-peer-gen 'b) 1) ($registrar-peer-gen 'b))
+        ;; THE DISCRIMINATOR. An orphan from the first spawn is invisible
+        ;; while the published link is up: the connector loop takes the
+        ;; live-entry branch and idles, one wake per reconnect-delay. It
+        ;; shows itself the moment the link goes down -- it is the one
+        ;; connector nobody's row names, so a disconnect does not kill it,
+        ;; and it re-dials within reconnect-delay (base 3 s). Same shape as
+        ;; R6-2's orphan check.
+        (node-disconnect! 'b)
+        (receive (after 15000 (check "R6-9: disconnect after the survived death" #f)) (`#(node-down b) 'ok))
+        (let ((orphan (receive (after 8000 #f) (`#(node-up b) 'orphan-redialled))))
+          (check "R6-9: no orphan connector from the killed first spawn re-dialled after the disconnect"
+                 (not orphan) orphan))))
+    ;; reconnect so the quit reaches the child over a live link
     (node-connect! 'b "127.0.0.1" peer-port)
-    (receive (after 15000 (check "R6-9: reconnect after seeding 0" #f)) (`#(node-up b) 'ok))
-    (check "R6-9: a stored 0 was treated as absent -- the issued generation is 1, never 0"
-           (eqv? ($registrar-peer-gen 'b) 1) ($registrar-peer-gen 'b))
+    (receive (after 15000 (check "reconnect before quit" #f)) (`#(node-up b) 'ok))
     (rsend 'b 'svc (vector 'quit))
     (sleep-ms 300)
     (if (zero? failures) (begin (display "ALL REGISTRAR-SUPERVISION TESTS PASSED\n") (exit 0))

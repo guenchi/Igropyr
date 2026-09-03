@@ -492,6 +492,12 @@
   ;; dies after pre-placing 0 and before advancing, what it leaves is a
   ;; peer that reads as having no generation -- exactly its state before
   ;; the command arrived.
+  ;;
+  ;; ⭐ A 0 IS WRITTEN HERE BUT NEVER READ. The command that wrote it holds
+  ;; the queue head and either completes (advancing 0->1) or the node
+  ;; fail-stops; peer-gen's only caller is attempt-register, behind it in
+  ;; the FIFO. The guard is defensive, and 'registrar-endpoint-after-spawn
+  ;; exists to show the window is survivable, not observable.
   (define (peer-gen peer)
     (let ((g (atomically (hashtable-ref dial-gens peer #f))))
       (if (and g (> g 0)) g (next-dial-gen! peer))))
@@ -7241,6 +7247,27 @@
                   ;; for what pre-minting cost.
                   (pretouch-dial-gen! peer)
                   (set! p (spawn (lambda () (connector peer host port))))
+                  ;; INJECTION POINT 'registrar-endpoint-after-spawn --
+                  ;; OWNING GUARD: the compensation guard just above, which
+                  ;; kills the spawned-but-unpublished process and re-raises.
+                  ;;
+                  ;; ⭐ THE POINT EXISTS TO SHOW THE WINDOW IS SURVIVABLE,
+                  ;; not to observe the 0. A raise here leaves the peer
+                  ;; stored as 0 and kills the registrar, but the command
+                  ;; that wrote the 0 holds the queue head: the warden
+                  ;; restarts us and the replay completes it, advancing 0
+                  ;; to 1. Armed once, the node comes up on generation 1
+                  ;; and does not fail-stop. What a cell here discriminates
+                  ;; is the compensation guard: without the kill, the
+                  ;; connector spawned by the first attempt idles behind
+                  ;; live-entry while the published link is up, and re-dials
+                  ;; the moment it goes down.
+                  ;;
+                  ;; ⭐ WHICH IS WHY THE WINDOW MATTERS: while the link is up
+                  ;; the orphan is silent, so a cell that looks for a second
+                  ;; dial before the disconnect sees a healthy node and goes
+                  ;; green whether or not the kill happened.
+                  (inject-fault! 'registrar-endpoint-after-spawn)
                   (let ((row (vector p host port)))
                     (atomically
                       (hashtable-delete! connectors peer)
