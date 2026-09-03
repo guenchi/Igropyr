@@ -30,7 +30,8 @@
 ;;; not role letters. node-connect! authenticates the far end against the
 ;;; name it was given; a mismatch is a silent handshake refusal, and the
 ;;; first mesh run formed no links at all for exactly that reason.
-(import (chezscheme) (igropyr actor) (igropyr node) (igropyr gen-server) (igropyr http))
+(import (chezscheme) (igropyr actor) (igropyr node) (igropyr gen-server) (igropyr http)
+        (only (igropyr libuv) conn-count))
 
 (define args (cdr (command-line)))
 (unless (>= (length args) 9)
@@ -63,12 +64,28 @@
   (display (node-outbound-stats)) (newline)
   (display (list 'orphans (node-orphan-count) 'peers (node-peers))) (newline)
   (exit 2))
+;; ⚠ THE THREE CHECKS BELOW COMPARE THE COUNTS WITH EACH OTHER AND WITH
+;; NOTHING ELSE. a=g, p<=g and rm>=oa are all RELATIONS: a leak that grows
+;; every chain together satisfies all three forever, and this suite would
+;; report nothing for as long as it ran. Mutual consistency has no truth in
+;; it -- it says the books agree, not that either is right.
+;;
+;; So the absolute values are logged as well. Growth is only visible against
+;; a number, and no relation among these five can supply one. Once every
+;; 30 s, not every check: the point is a series, not a trace.
+(define last-counts-log 0)
 (define (always-check! label)
   (let ((g (stat 'mon-chain)) (p (stat 'mon-peer-chains)) (a (stat 'accounted))
         (rm (stat 'rmonitors)) (oa (stat 'owner-agents)))
     (unless (= a g) (anomaly! label 'accounted/=global a g))
     (unless (<= p g) (anomaly! label 'peer-chains>global p g))
-    (unless (>= rm oa) (anomaly! label 'owner-agents>rmonitors rm oa))))
+    (unless (>= rm oa) (anomaly! label 'owner-agents>rmonitors rm oa))
+    (when (> (- (elapsed) last-counts-log) 30000)
+      (set! last-counts-log (elapsed))
+      (log "counts mon-chain" g "peer-chains" p "accounted" a
+           "rmonitors" rm "owner-agents" oa
+           "orphans" (node-orphan-count) "procs" (process-count)
+           "conns" (conn-count)))))
 ;; AT REST IS A STATE THE NODE HAS TO REACH, NOT AN INSTANT. A node spliced
 ;; off its peer's chain is "retiring" until its agent has run demon-local,
 ;; exited, and been reaped -- three scheduling turns on a scheduler that
