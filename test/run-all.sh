@@ -508,6 +508,10 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/r
 #      hooks live and the sources, and it must not share a process with
 #      inject.sc (it owns a node and a child of its own).
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/poison.sc
+#   4. The barrier suite parks victims at named points and kills them there.
+#      It kills the node dispatcher on purpose (B4), which poison.sc asserts
+#      never happens, so it owns a node of its own on another port.
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/barrier.sc
 
 # reached only when every suite above ran and passed
 echo "=== WHOLE SUITE RUN: every suite was reached ==="

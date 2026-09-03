@@ -4292,10 +4292,16 @@
   ;; which is a statement that survives a kill anywhere. The previous one
   ;; ("up to three failures") did not.
   ;;
-  ;; ⛔ NO CELL COVERS THAT KILL WINDOW -- it cannot be aimed at with what
-  ;; the suite has, and this is closed by construction rather than
-  ;; demonstrated. Recorded as such; it is the fourth thing waiting on a
-  ;; barrier primitive.
+  ;; ⭐ THAT KILL WINDOW IS NOW AIMED AT, and the barrier below is how.
+  ;; A victim parked at 'poison-attempt-start is stopped between storing
+  ;; the count and entering the guarded delivery -- the window itself --
+  ;; and the controller kills it there rather than hoping a scheduling
+  ;; accident lands in it. See test/barrier.sc, cell B4.
+  ;;
+  ;; ⚠ What the cell demonstrates is that the SUCCESSOR reads the stored
+  ;; count and quarantines with 'lost-outcome-after-kill. It does not
+  ;; show that the attempt never began: nothing can, and the reason name
+  ;; says so.
   ;;
   ;; A successful delivery is counted too. That count stops being
   ;; reachable only once qhead-done! has run -- notify-list! returning is
@@ -4315,6 +4321,20 @@
                             (if (fx> k poison-event-limit)
                                 k                ; do not record another
                                 (begin (qnode-failures-set! n k) k))))))
+                 ;; INJECTION POINT 'poison-attempt-start -- OWNING
+                 ;; REGION: NONE. The atomically that stored the count
+                 ;; has returned, and the guarded delivery has not begun.
+                 ;;
+                 ;; ⭐ IT PARKS, because no region is held here -- which
+                 ;; is the point: this is the only place a kill can be
+                 ;; aimed between the two, and aiming it by wall clock
+                 ;; never landed. The count is ALREADY STORED when a
+                 ;; victim parks, so killing it leaves exactly the state
+                 ;; the successor must cope with.
+                 ;;
+                 ;; Interrupt state: injection ON -- depth 1, parks;
+                 ;; injection OFF -- (void), and this costs nothing.
+                 (inject-barrier! 'poison-attempt-start)
                  (if (fx> k poison-event-limit)
                      ;; ⚠ THE LIMIT WAS ALREADY REACHED: a previous
                      ;; incarnation reserved the final attempt and died

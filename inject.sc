@@ -104,7 +104,9 @@
 (library (igropyr inject)
   (export inject-fault! inject-return! inject-override! inject-barrier!
           $inject-arm! $inject-release! $inject-disarm! $inject-hits
-          $inject-ticket $inject-armed-points $inject-delivered-count)
+          $inject-ticket $inject-armed-points $inject-delivered-count
+          $inject-barrier-state $inject-barrier-skipped
+          $inject-barrier-timeouts)
   (import (chezscheme))
 
   ;; ---- the switch, read once at expansion time --------------------------
@@ -148,7 +150,27 @@
      ;; hit. A hit does fx+ on an existing fixnum and set! on an existing
      ;; slot, so a point may sit inside a no-interrupt region without
      ;; putting an allocation there.
-     ;; Slot layout: #(point kind value occurrence hits ticket ok? delivered)
+     ;; Slot layout:
+     ;;   0 point  1 kind  2 value  3 occurrence  4 hits  5 ticket
+     ;;   6 ok?    7 delivered
+     ;;   8 skipped    9 timeouts   10 state      11 victim
+     ;;
+     ;; ⭐ 8-11 EXIST ON EVERY ROW, and only barrier rows use them: a
+     ;; fault or return row carries 0/0/#f/#f and nothing ever writes
+     ;; them. One shape for every row means take, release and disarm read
+     ;; the same vector whatever armed it.
+     ;;
+     ;; ⭐ EACH OF 8-11 HAS EXACTLY ONE WRITER, and that is what makes the
+     ;; regions below sufficient rather than hopeful:
+     ;;   8  skipped   -- $inject-barrier, in its one region
+     ;;   9  timeouts  -- the parker, in its closing region
+     ;;   10 state     -- $inject-arm! ('armed), $inject-take! ('reserved),
+     ;;                   $inject-barrier ('skipped), the parker
+     ;;                   ('parked/'resumed/'timed-out); each in its own
+     ;;                   region, and the transitions do not overlap
+     ;;   11 victim    -- the parker, once, when it writes 'parked
+     ;; A second writer for any of them would need its own argument; there
+     ;; is no lock here beyond the interrupt regions.
      ;;
      ;; ⭐ delivered LIVES IN THE ARMING, NOT BESIDE IT. It was a separate
      ;; process-lifetime table, which neither release nor disarm cleared:
@@ -185,11 +207,38 @@
      ;; dynamically interrupt-disabled; a string or a flonum arriving
      ;; there raises at the hit, in the region, far from the line that
      ;; chose it. Refusing at arm time puts the error where the mistake is.
+     ;; ⚠ CALLED INSIDE $inject-arm!'s REGION, because it reads the table.
+     ;; The barrier ban below is a read-then-write decision; outside a
+     ;; region another process could arm between the two.
      (define (check-arm! point kind value occurrence)
        (unless (or (not occurrence)
                    (and (fixnum? occurrence) (fx> occurrence 0)))
          (assertion-violation '$inject-arm!
            "occurrence must be #f (every hit) or a positive fixnum" occurrence))
+       ;; ⛔ A LIVE BARRIER ROW BLOCKS EVERY NEW ARM AT ITS POINT, of any
+       ;; kind, including another barrier. Re-arming a point whose barrier
+       ;; row is still there would leave a parked victim holding a ticket
+       ;; that names a row nobody will ever release, and the controller
+       ;; waiting on the new one. Release it first; that is the whole
+       ;; protocol, and this is the part of it that is mechanical.
+       (let ((cur (hashtable-ref $inject-table point #f)))
+         (when (and cur (eq? (vector-ref cur 1) 'barrier))
+           (assertion-violation '$inject-arm!
+             "barrier already armed at point; release it after its wait returned"
+             point (vector-ref cur 10))))
+       (when (eq? kind 'barrier)
+         ;; The value IS the parker: $inject-barrier applies it. A
+         ;; non-procedure here raises at the hit, in the victim, far from
+         ;; the arm that chose it.
+         (unless (procedure? value)
+           (assertion-violation '$inject-arm!
+             "a barrier's value must be the parker procedure" point value))
+         ;; ⭐ #f (every hit) is refused for barriers alone. A barrier
+         ;; that fires on every hit parks every arrival, and the second
+         ;; one parks before the controller has resumed the first.
+         (unless (and (fixnum? occurrence) (fx> occurrence 0))
+           (assertion-violation '$inject-arm!
+             "a barrier needs a positive occurrence, not #f" point occurrence)))
        (when (eq? kind 'return)
          (case point
            ;; uv_write returning >= 0 means libuv accepted the request and
@@ -242,25 +291,90 @@
               "unknown return point -- add a clause to check-arm! saying what values its caller can read"
               point)))))
 
+     ;; ⭐ CHECK, TICKET AND INSERT ARE ONE STEP. Split, a preemption
+     ;; between the check and the insert lets another arm land in the
+     ;; window the check just cleared -- and hashtable mutation is not
+     ;; safe against preemption in the first place.
      (define ($inject-arm! point kind value occurrence ok?)
-       (check-arm! point kind value occurrence)
-       (let ((t ($inject-ticket)))
-         (hashtable-set! $inject-table point
-                         (vector point kind value occurrence 0 t ok? 0))
-         t))
+       (with-interrupts-disabled
+         (check-arm! point kind value occurrence)
+         (let ((t ($inject-ticket)))
+           (hashtable-set! $inject-table point
+             (vector point kind value occurrence 0 t ok? 0
+                     0 0 (and (eq? kind 'barrier) 'armed) #f))
+           t)))
 
-     (define ($inject-release! ticket)
-       (let-values (((ks vs) (hashtable-entries $inject-table)))
-         (vector-for-each
-           (lambda (k v) (when (eqv? (vector-ref v 5) ticket)
-                           (hashtable-delete! $inject-table k)))
-           ks vs)))
+     ;; Find the row a ticket names. ⚠ The caller must already hold the
+     ;; region: this walks the table.
+     (define (row-of-ticket ticket)
+       (let ((found #f))
+         (let-values (((ks vs) (hashtable-entries $inject-table)))
+           (vector-for-each
+             (lambda (k v) (when (eqv? (vector-ref v 5) ticket) (set! found (cons k v))))
+             ks vs))
+         found))
 
-     (define ($inject-disarm!) (hashtable-clear! $inject-table))
+     ;; -> the row vector when it was removed, #f when the ticket names no
+     ;; row (release is idempotent); raises when the row is a barrier that
+     ;; is still live.
+     ;;
+     ;; ⛔ WHAT "STILL LIVE" MEANS IS THE POINT OF THIS PROCEDURE. A
+     ;; barrier row in 'reserved has been claimed by a victim that has not
+     ;; reported yet; one in 'parked has a victim waiting for a resume
+     ;; that deleting the row will never deliver. Deleting either strands
+     ;; that victim until its timeout, and the controller sees a clean
+     ;; release. So the refusal is here, in the same region as take, and
+     ;; not a rule the caller is asked to remember.
+     ;;
+     ;; ⚠ alive? IS APPLIED TO THE STORED VICTIM, not to anything the
+     ;; caller passes in. It carries the raw-face contract: it must not
+     ;; yield and must not raise. 'reserved has no victim recorded yet, so
+     ;; there is no dead-victim exit from it -- only 'parked has one.
+     (define ($inject-release! ticket alive?)
+       (with-interrupts-disabled
+         (let ((found (row-of-ticket ticket)))
+           (and found
+                (let* ((k (car found)) (v (cdr found)) (st (vector-ref v 10)))
+                  (cond
+                    ((not (eq? (vector-ref v 1) 'barrier))
+                     (hashtable-delete! $inject-table k) v)
+                    ((memq st '(armed resumed timed-out skipped))
+                     (hashtable-delete! $inject-table k) v)
+                    ((and (eq? st 'parked) (not (alive? (vector-ref v 11))))
+                     (hashtable-delete! $inject-table k) v)
+                    (else
+                     (assertion-violation '$inject-release! "barrier still live"
+                       (vector-ref v 0) st))))))))
 
+     ;; ⛔ NO DEAD-VICTIM EXIT HERE, deliberately, and it is not an
+     ;; oversight copied from release. This face takes no alive?: (igropyr
+     ;; inject) does not know what a process is, so a bulk clear cannot
+     ;; ask whether any victim is still running. A caller holding a parked
+     ;; row releases it BY TICKET first, where the question can be asked.
+     ;;
+     ;; ⭐ THE SCAN COMPLETES BEFORE ANYTHING IS CLEARED. A partial disarm
+     ;; would leave the table in a state no caller asked for and no rule
+     ;; describes.
+     (define ($inject-disarm!)
+       (with-interrupts-disabled
+         (let-values (((ks vs) (hashtable-entries $inject-table)))
+           (vector-for-each
+             (lambda (k v)
+               (when (and (eq? (vector-ref v 1) 'barrier)
+                          (memq (vector-ref v 10) '(reserved parked)))
+                 (assertion-violation '$inject-disarm!
+                   "barrier still live: release it by ticket first"
+                   (vector-ref v 0) (vector-ref v 10))))
+             ks vs))
+         (hashtable-clear! $inject-table)))
+
+     ;; ⚠ EVERY TABLE READ TAKES THE REGION TOO, not only the writes. A
+     ;; reader preempted midway through a hashtable walk is the hazard
+     ;; actor.sc warns about; a single ref is cheap enough not to argue.
      (define ($inject-hits point)
-       (let ((v (hashtable-ref $inject-table point #f)))
-         (and v (vector-ref v 4))))
+       (with-interrupts-disabled
+         (let ((v (hashtable-ref $inject-table point #f)))
+           (and v (vector-ref v 4)))))
 
      ;; How many times a substitute value was returned for the CURRENT
      ;; arming. ⭐ NOT the same as hits: an occurrence is spent when the
@@ -274,15 +388,50 @@
      (define (inject-note-delivered! v)          ; v is the arming vector
        (vector-set! v 7 (fx+ (vector-ref v 7) 1)))
      (define ($inject-delivered-count point)
-       (let ((v (hashtable-ref $inject-table point #f)))
-         (if v (vector-ref v 7) 0)))
+       (with-interrupts-disabled
+         (let ((v (hashtable-ref $inject-table point #f)))
+           (if v (vector-ref v 7) 0))))
 
      (define ($inject-armed-points)
-       (vector->list (hashtable-keys $inject-table)))
+       (with-interrupts-disabled
+         (vector->list (hashtable-keys $inject-table))))
+
+     ;; ---- barrier readings, BY TICKET -------------------------------
+     ;; ⭐ BY TICKET, NOT BY POINT, and that is the whole reason they
+     ;; exist. A reading taken by point after the row was released and the
+     ;; point re-armed credits the old waiter with the new arming's
+     ;; numbers. The ticket names one arming and no other.
+     ;;
+     ;; ⚠ #f means "no barrier row with that ticket" -- released already,
+     ;; or a ticket naming a fault/return row. A caller that reads #f where
+     ;; it expected a number has its protocol order wrong, and should say
+     ;; so rather than treat it as 0.
+     (define (barrier-row ticket)             ; caller holds the region
+       (let ((found (row-of-ticket ticket)))
+         (and found
+              (eq? (vector-ref (cdr found) 1) 'barrier)
+              (cdr found))))
+     (define ($inject-barrier-state ticket)
+       (with-interrupts-disabled
+         (let ((v (barrier-row ticket))) (and v (vector-ref v 10)))))
+     (define ($inject-barrier-skipped ticket)
+       (with-interrupts-disabled
+         (let ((v (barrier-row ticket))) (and v (vector-ref v 8)))))
+     (define ($inject-barrier-timeouts ticket)
+       (with-interrupts-disabled
+         (let ((v (barrier-row ticket))) (and v (vector-ref v 9)))))
 
      ;; -> the slot when this hit should fire, else #f. Allocation-free.
+     ;;
+     ;; ⭐ READ-INCREMENT-WRITE IS ONE STEP. It was three, which is
+     ;; correct only where every point sits inside a caller's region --
+     ;; true of the fault and return points and NOT true of a barrier,
+     ;; which is placed where a victim can be preempted. Taking the region
+     ;; here makes the reservation atomic for every kind; the fault and
+     ;; return points that already hold one nest for nothing.
      (define ($inject-take! point kind)
-       (let ((v (hashtable-ref $inject-table point #f)))
+       (with-interrupts-disabled
+        (let ((v (hashtable-ref $inject-table point #f)))
          (and v
               (eq? (vector-ref v 1) kind)
               ;; ⭐ THE PROCESS FILTER IS A PREDICATE SUPPLIED BY THE
@@ -296,7 +445,57 @@
               (let ((n (fx+ (vector-ref v 4) 1)))
                 (vector-set! v 4 n)
                 (let ((k (vector-ref v 3)))
-                  (and (or (not k) (fx= n k)) v))))))
+                  (and (or (not k) (fx= n k))
+                       (begin
+                         ;; ⚠ ONLY a barrier row has a state to advance;
+                         ;; fault and return rows carry #f there and mean
+                         ;; nothing by it.
+                         (when (eq? (vector-ref v 1) 'barrier)
+                           (vector-set! v 10 'reserved))
+                         v))))))))
+
+     ;; The barrier itself: probe, reserve, park. Three steps, and the
+     ;; atomicity of each comes from somewhere different -- which is why
+     ;; they are written apart rather than wrapped together.
+     ;;
+     ;; (a) THE PROBE reads this process's own interrupt-disable count.
+     ;; disable-interrupts returns the new depth, so a depth above one
+     ;; means the caller was already inside a region. Nothing between the
+     ;; two primitives can raise, so the hand-rolled pair is safe here in
+     ;; a way it would not be around anything larger. The scheduler saves
+     ;; and restores this count per process, so no other process's running
+     ;; changes the answer.
+     ;;
+     ;; (b) THE RESERVATION is $inject-take!'s own region. Not wrapped
+     ;; again here: the window between the probe and the take can only
+     ;; change the table, and the take reads it atomically.
+     ;;
+     ;; (c) PARKING HAPPENS OUTSIDE EVERY REGION. The parker sends and
+     ;; then blocks, and a process that blocks with interrupts disabled
+     ;; does not come back. It takes its own regions internally, for the
+     ;; state and counter writes; see inject-control.
+     ;;
+     ;; ⛔ A VICTIM THAT ARRIVES ALREADY INSIDE A REGION IS NOT PARKED. It
+     ;; cannot be: parking means blocking, and it is holding interrupts
+     ;; off. It counts itself as skipped and walks on, which is the honest
+     ;; outcome -- the alternative is a deadlock that would look like a
+     ;; timeout. A point placed where the victim is always inside a region
+     ;; therefore never parks, and its cell must assert on `skipped`
+     ;; rather than wait for a report.
+     (define ($inject-barrier point)
+       (let ((depth (let ((d (disable-interrupts))) (enable-interrupts) d)))
+         (let ((v ($inject-take! point 'barrier)))
+           (cond
+             ((not v) (void))
+             ((fx> depth 1)
+              ;; the one region in this procedure
+              (with-interrupts-disabled
+                (vector-set! v 8 (fx+ (vector-ref v 8) 1))
+                (vector-set! v 10 'skipped)))
+             (else
+              ;; parker: (point ticket row). It owns slots 9, 10 and 11
+              ;; from here on.
+              ((vector-ref v 2) point (vector-ref v 5) v))))))
 
      ;; ⭐ INVOKE-TIME CHECK. It runs because an armed expansion refers to
      ;; $inject-take!, which makes this library's runtime part reachable.
@@ -329,8 +528,11 @@
      ;; reader finding the probe would have read a violated design.
      (define ($inject-ticket) 0)
      (define ($inject-arm! point kind value occurrence ok?) 0)
-     (define ($inject-release! ticket) (void))
+     (define ($inject-release! ticket alive?) (void))
      (define ($inject-disarm!) (void))
+     (define ($inject-barrier-state ticket) #f)
+     (define ($inject-barrier-skipped ticket) #f)
+     (define ($inject-barrier-timeouts ticket) #f)
      (define ($inject-hits point) #f)
      (define ($inject-delivered-count point) 0)
      (define ($inject-armed-points) '())))
@@ -409,8 +611,7 @@
       (syntax-case x ()
         ((_ point)
          (if (eq? inject-mode 'on)
-             #'(assertion-violation 'inject-barrier!
-                 "not implemented in tranche 1" point)
+             #'($inject-barrier point)
              ;; (void) for the reason given at inject-fault!; a barrier is
              ;; if anything MORE likely to be placed inside a guard.
              #'(void)))))))

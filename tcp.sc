@@ -30,7 +30,8 @@
     file-stream-close! file-stream-open! file-stream-open-under! file-stream-own!
     file-stream-raw! file-stream-read! file-unlink-async! fs-close-async!
     fs-count fs-fd-count fs-fsync-async! fs-job-count
-    fs-mkdir-async! fs-open-async! fs-rename-async! fs-write-async!
+    fs-mkdir-async! fs-open-async! fs-rename-async! fs-req-block-count
+    fs-write-async!
     listener-backlog-effective listener-open? listener-token tcp-close!
     tcp-connect! tcp-listen! tcp-listen-tls! tcp-read-start!
     tcp-read-stop! tcp-stop-listen! tcp-write! tcp-write-foreign!
@@ -995,20 +996,47 @@
             (loop (cdr xs) (+ off (bytevector-length bv))))))
       out))
 
+  ;; ---- fs request blocks, counted -----------------------------------
+  ;;
+  ;; ⭐ THE COUNT AND THE BLOCK MOVE IN ONE REGION. A counter bumped
+  ;; outside the region that allocates can be read between the two, and
+  ;; the reading is then a number that no state ever had. Callers that
+  ;; already hold a region nest for nothing.
+  ;;
+  ;; ⛔ IT RECORDS, IT DOES NOT RESCUE. Nothing here frees a block whose
+  ;; owner died; the count is how a test SEES that leak, not a mechanism
+  ;; that prevents it. A rising count is a real leak and stays one.
+  ;;
+  ;; ⚠ SCOPE IS fs-req-size BLOCKS ONLY. Write, connect and getaddrinfo
+  ;; requests, the dirent buffers and the read and write payloads are
+  ;; foreign-alloc'd too and are NOT counted here, so this number is not
+  ;; "libuv memory" and must not be read as a total.
+  (define fs-req-blocks 0)
+  (define (fs-req-block-count) fs-req-blocks)
+  (define (fs-req-alloc!)
+    (with-interrupts-disabled
+      (let ((p (foreign-alloc fs-req-size)))
+        (set! fs-req-blocks (fx+ fs-req-blocks 1))
+        p)))
+  (define (fs-req-free! p)
+    (with-interrupts-disabled
+      (foreign-free p)
+      (set! fs-req-blocks (fx- fs-req-blocks 1))))
+
   (define (fs-cleanup! op req)
     (when (> (fs-op-data op) 0) (foreign-free (fs-op-data op)))
     (when (> (fs-op-buf op) 0) (foreign-free (fs-op-buf op)))
     (unindex-owner! (fs-op-owner op) 'fs req)
     (hashtable-delete! fs-table req)
-    (foreign-free req))
+    (fs-req-free! req))
 
   (define (fs-fail! op req errno)
     ;; if a fd is open, close it (fire-and-forget) before reporting
     (when (>= (fs-op-fd op) 0)
-      (let ((creq (foreign-alloc fs-req-size)))
+      (let ((creq (fs-req-alloc!)))
         (uv-fs-close (uv-loop-handle) creq (fs-op-fd op) 0)   ; sync close, ignore
         (uv-fs-req-cleanup creq)
-        (foreign-free creq)))
+        (fs-req-free! creq)))
     (deliver (fs-op-owner op) (vector 'file-error errno))
     (fs-cleanup! op req))
 
@@ -1038,10 +1066,10 @@
           (let ((r (uv-fs-close (uv-loop-handle) req (fs-op-fd op) on-fs-entry)))
             (when (< r 0)
               (uv-fs-req-cleanup req)
-              (let ((creq (foreign-alloc fs-req-size)))
+              (let ((creq (fs-req-alloc!)))
                 (uv-fs-close (uv-loop-handle) creq (fs-op-fd op) 0)   ; sync close
                 (uv-fs-req-cleanup creq)
-                (foreign-free creq))
+                (fs-req-free! creq))
               (fs-cleanup! op req))))))
 
   ;; A callback fired on a stream that was aborted while the op was in
@@ -1062,10 +1090,10 @@
         ;; could not queue the close: close synchronously instead, and
         ;; still deliver -- the data was fully read before this point
         (uv-fs-req-cleanup req)
-        (let ((creq (foreign-alloc fs-req-size)))
+        (let ((creq (fs-req-alloc!)))
           (uv-fs-close (uv-loop-handle) creq (fs-op-fd op) 0)   ; sync close, ignore
           (uv-fs-req-cleanup creq)
-          (foreign-free creq))
+          (fs-req-free! creq))
         (fs-finish! op req))))
 
   (define (start-fs-fstat! op req)
@@ -1445,10 +1473,10 @@
   ;; failed close, so a second attempt can reach a number that has since
   ;; been reissued.
   (define (close-fd-now! fd)
-    (let ((creq (foreign-alloc fs-req-size)))
+    (let ((creq (fs-req-alloc!)))
       (uv-fs-close (uv-loop-handle) creq fd 0)
       (uv-fs-req-cleanup creq)
-      (foreign-free creq)))
+      (fs-req-free! creq)))
 
   ;; Descriptors whose owner has died while a job still refers to them.
   ;; See uv-owner-died!: closing one while a pool thread is about to act
@@ -1534,7 +1562,7 @@
     (unindex-owner! (fsw-job-owner job) 'fsjob req)
     (hashtable-delete! fsw-table req)
     (uv-fs-req-cleanup req)
-    (foreign-free req))
+    (fs-req-free! req))
 
   ;; A job whose owner died is completed and dropped rather than
   ;; delivered: the callback still runs, and it still has to free the
@@ -1630,7 +1658,7 @@
   ;; until inside; what the gap can lose is C memory.
   (define (fsw-submit! owner kind fd data buf go)
     (with-interrupts-disabled
-      (let* ((req (foreign-alloc fs-req-size))
+      (let* ((req (fs-req-alloc!))
              (job (make-fsw-job (fsw-fresh-id!) owner kind fd #f data buf)))
         ;; Captured here, inside the atom that registers the job: which
         ;; tenancy of this number the job meant.
@@ -1946,6 +1974,19 @@
       (else
        (with-interrupts-disabled
          (when (listener-open? (car rest) (cadr rest))
+           ;; INJECTION POINT 'tcp-stop-listen-before-close -- OWNING
+           ;; REGION: the with-interrupts-disabled on the line above,
+           ;; which is the region the comment at the top of this
+           ;; procedure says must not be split.
+           ;;
+           ;; ⛔ IT ALWAYS SKIPS, and it must: parking between the token
+           ;; test and the close is exactly the split this region exists
+           ;; to prevent. A barrier that parked here would reproduce the
+           ;; stale-owner close it is meant to prove impossible.
+           ;;
+           ;; Interrupt state: injection ON -- depth 2, so 'skipped;
+           ;; injection OFF -- (void).
+           (inject-barrier! 'tcp-stop-listen-before-close)
            (stop! (car rest)))))))
 
   ;; ⛔ NOTHING THAT NEEDS RETURNING EXISTS OUTSIDE THE REGION. The
@@ -2040,7 +2081,7 @@
         ;; undefined, and undefined has been observed to mean SIGABRT
         ;; (measured, with a deliberately poisoned request).
         (when (vector-ref st 2) (uv-fs-req-cleanup req))
-        (foreign-free req))
+        (fs-req-free! req))
       (when (vector-ref st 4)
         (vector-set! st 4 #f)
         (c-close (vector-ref st 3)))))
@@ -2073,7 +2114,7 @@
         (guard (e (#t (fs-undo! st owner) (raise e)))
           (set! op (make-fs-op owner path 'whole #f phase #f #f -1 0 0 '() 0 0))
           (vector-set! st 0 (owner-index-prepare! 'fs))
-          (vector-set! st 1 (foreign-alloc fs-req-size))
+          (vector-set! st 1 (fs-req-alloc!))
           (fs-op-req-set! op (vector-ref st 1))
           (hashtable-set! fs-table (vector-ref st 1) op)
           (owner-index-publish! owner (vector-ref st 0) (vector-ref st 1))
@@ -2129,17 +2170,45 @@
     ;; could act on. Recorded as a residual rather than papered over.
     ;; This path holds nothing but Scheme objects at that moment anyway.
     (let ((st (vector #f #f #f -1 #f)) (op #f) (rc 0))
+      ;; INJECTION POINT 'fs-open-before-region -- OWNING REGION: NONE,
+      ;; and that is the whole reason this point exists here.
+      ;;
+      ;; ⭐ THIS IS THE ONE OF THE THREE THAT CAN PARK. $inject-barrier
+      ;; reads the interrupt depth and parks only when nothing above it
+      ;; holds a region; here the state vector is allocated but the
+      ;; region has not been entered, so a victim stops with an fs
+      ;; request NOT yet allocated and nothing published.
+      ;;
+      ;; Interrupt state: injection ON -- depth 1 (whatever the caller
+      ;; had, plus nothing), so the barrier parks; injection OFF -- the
+      ;; form expands to (void) and this line costs nothing.
+      (inject-barrier! 'fs-open-before-region)
       (with-interrupts-disabled
         (guard (e (#t (fs-undo! st owner) (raise e)))
           (set! op (make-fs-op owner path mode #f 'open #f #f -1 0 0 '() 0 0))
           (vector-set! st 0 (owner-index-prepare! 'fs))
-          (vector-set! st 1 (foreign-alloc fs-req-size))
+          (vector-set! st 1 (fs-req-alloc!))
           (fs-op-req-set! op (vector-ref st 1))
           (hashtable-set! fs-table (vector-ref st 1) op)
           ;; INJECTION POINT 'fs-publish-second-half-open -- OWNING
           ;; GUARD: the guard above.
           (inject-fault! 'fs-publish-second-half-open)
           (owner-index-publish! owner (vector-ref st 0) (vector-ref st 1))
+          ;; INJECTION POINT 'fs-open-after-publish -- OWNING REGION: the
+          ;; with-interrupts-disabled opened above, and OWNING GUARD: the
+          ;; guard above it.
+          ;;
+          ;; ⛔ A BARRIER HERE ALWAYS SKIPS, BY CONSTRUCTION. The region
+          ;; is already held, so $inject-barrier takes the reservation,
+          ;; counts slot 8 and runs on rather than parking -- a victim
+          ;; CANNOT be suspended holding this region, because nothing
+          ;; else would ever run to resume it. The point is here so a
+          ;; cell can assert that skip happened where the row was armed,
+          ;; which is the only evidence that the depth test is live.
+          ;;
+          ;; Interrupt state: injection ON -- depth 2, so 'skipped;
+          ;; injection OFF -- (void).
+          (inject-barrier! 'fs-open-after-publish)
           ;; INJECTION POINT 'fs-submit-gap-open -- OWNING GUARD: the
           ;; same one. It stands for ANY raise between publishing and
           ;; submitting, the state nothing reclaims: file-stream-close!
@@ -2255,7 +2324,7 @@
             ;; the only one on this path. It stands for the allocation
             ;; below failing; either Scheme allocation reaches it too.
             (inject-fault! 'fs-oom-fd)
-            (vector-set! st 1 (foreign-alloc fs-req-size))
+            (vector-set! st 1 (fs-req-alloc!))
             (fs-op-req-set! op (vector-ref st 1))
             (hashtable-set! fs-table (vector-ref st 1) op)
             ;; INJECTION POINT 'fs-publish-second-half -- OWNING GUARD: the
@@ -2338,7 +2407,7 @@
   ;; surrounding code already pays for file-exists?; do not put it on a
   ;; path that runs per request when the answer can be cached.
   (define (file-realpath path)
-    (let ((req (foreign-alloc fs-req-size)))
+    (let ((req (fs-req-alloc!)))
       (dynamic-wind
         (lambda () (void))
         (lambda ()
@@ -2356,7 +2425,7 @@
                                 (loop (fx+ i 1) (cons b acc))))))))))
         (lambda ()
           (uv-fs-req-cleanup req)
-          (foreign-free req)))))
+          (fs-req-free! req)))))
 
   ;; Read a whole file on libuv's thread pool. The owner process later
   ;; receives #(file-read ,bytevector) or #(file-error ,errno). Never

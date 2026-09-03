@@ -174,6 +174,62 @@
   (unless (equal? e nothing)
     (fail! "inject-barrier-off-expansion" e 'expected nothing)))
 
+;; ---- the barrier's atomicity, at the form level -------------------------
+;; No instrument can force a take and a release to interleave, so the one
+;; claim that CAN be checked is that each of them is one region: the body
+;; of $inject-take!, $inject-release! and $inject-disarm! begins with
+;; with-interrupts-disabled, and $inject-barrier holds exactly ONE such
+;; sub-form with the parker call outside it (parking inside a region would
+;; hand the region's atomicity to the victim's scheduler).
+;;
+;; ⛔ THE `on` CLAUSE IS SELECTED FIRST. The two meta-cond branches are not
+;; symmetric -- three of the four primitives have an off-mode stub and one
+;; does not -- so "the define with this name" answers differently per name
+;; unless the clause is fixed before the name is looked up.
+;;
+;; This proves "wrapped", not "wrapped correctly": what the region encloses
+;; is read by people, not by this file.
+(define inject-forms
+  (guard (e (#t (fail! "inject-source-unreadable" "igropyr/inject.sc") '()))
+    (let ((port (open-input-file "igropyr/inject.sc")))
+      (let loop ((acc '()))
+        (let ((x (read port)))
+          (if (eof-object? x) (begin (close-port port) (reverse acc)) (loop (cons x acc))))))))
+
+(define (find-forms pred tree)
+  (cond ((pred tree) (list tree))
+        ((pair? tree) (append (find-forms pred (car tree)) (find-forms pred (cdr tree))))
+        (else '())))
+
+(define on-clause
+  (let ((mc (find-forms (lambda (x) (and (pair? x) (eq? (car x) 'meta-cond))) inject-forms)))
+    (if (null? mc)
+        (begin (fail! "inject-meta-cond-not-found") '())
+        (let ((cl (filter (lambda (c) (and (pair? c) (equal? (car c) '(eq? inject-mode 'on)))) (cdr (car mc)))))
+          (if (= (length cl) 1) (cdr (car cl)) (begin (fail! "inject-on-clause-count" (length cl)) '()))))))
+
+(define (definition-body name)
+  (let ((ds (filter (lambda (d) (and (pair? d) (eq? (car d) 'define) (pair? (cadr d)) (eq? (car (cadr d)) name))) on-clause)))
+    (if (= (length ds) 1) (cddr (car ds)) (begin (fail! "inject-definition-count" name (length ds)) '()))))
+
+(for-each
+  (lambda (name)
+    (let ((body (definition-body name)))
+      (unless (and (pair? body) (pair? (car body)) (eq? (car (car body)) 'with-interrupts-disabled) (null? (cdr body)))
+        (fail! "inject-primitive-not-one-region" name (and (pair? body) (car body))))))
+  '($inject-take! $inject-release! $inject-disarm!))
+
+(let* ((body (definition-body '$inject-barrier))
+       (regions (find-forms (lambda (x) (and (pair? x) (eq? (car x) 'with-interrupts-disabled))) body))
+       (parker-calls (find-forms (lambda (x) (and (pair? x) (pair? (car x)) (eq? (car (car x)) 'vector-ref) (equal? (cdr (car x)) '(v 2)))) body)))
+  (unless (= (length regions) 1)
+    (fail! "inject-barrier-region-count" (length regions)))
+  (unless (= (length parker-calls) 1)
+    (fail! "inject-barrier-parker-call-count" (length parker-calls)))
+  (when (and (= (length regions) 1) (= (length parker-calls) 1)
+             (pair? (find-forms (lambda (x) (eq? x (car parker-calls))) (car regions))))
+    (fail! "inject-barrier-parker-called-inside-region")))
+
 (if (= failures 0)
     (begin (display "inject isolation: instrument absent from an ordinary build\n") (exit 0))
     (begin (display "inject isolation: FAILED\n") (exit 1)))
