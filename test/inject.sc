@@ -773,8 +773,19 @@
             (let ((c1 (receive (after 5000 (fail! "a2-first-connect-silent"))
                         (`#(tcp-connected ,c) c)
                         (`#(tcp-connect-failed ,e) 'failed))))
-              (unless (eqv? (inject-hits 'accept-refused) 1)
-                (fail! "a2-hits" (inject-hits 'accept-refused)))
+              ;; ⚠ tcp-connected IS THE CLIENT'S EVENT, NOT THE LISTENER'S.
+              ;; The connect completion and the accept readiness reach the
+              ;; loop as two separate kqueue/epoll events and nothing orders
+              ;; them: the client's message can be delivered a poll
+              ;; iteration before the accept callback has run, and hits then
+              ;; reads 0 for a refusal that is still on its way. Seen once,
+              ;; on a loaded machine, as "a2-hits 0". So the witness is the
+              ;; point itself, polled with a bound -- the peer's event is
+              ;; evidence that a connection exists, not that it was handled.
+              (let poll ((n 0))
+                (cond ((eqv? (inject-hits 'accept-refused) 1) 'hit)
+                      ((= n 200) (fail! "a2-hits" (inject-hits 'accept-refused)))
+                      (else (sleep-ms 10) (poll (+ n 1)))))
               ;; hits says the point consumed its arm; delivered says the
               ;; point took the substitute branch for it. A wrapped call
               ;; that raises consumes the arm without delivering, and the
@@ -808,8 +819,12 @@
               (let ((c1b (receive (after 5000 (fail! "a2-second-refusal-silent"))
                            (`#(tcp-connected ,c) c)
                            (`#(tcp-connect-failed ,e) 'failed))))
-                (unless (eqv? (inject-delivered 'accept-refused) 1)
-                  (fail! "a2-delivered-round-two" (inject-delivered 'accept-refused)))
+                ;; same witness rule as round one: the client's event does
+                ;; not order the listener's callback, so poll the point.
+                (let poll ((n 0))
+                  (cond ((eqv? (inject-delivered 'accept-refused) 1) 'delivered)
+                        ((= n 200) (fail! "a2-delivered-round-two" (inject-delivered 'accept-refused)))
+                        (else (sleep-ms 10) (poll (+ n 1)))))
                 (let ((c2n (uv-accept-failure-counts)))
                   (unless (= (cdr (assq 'refused c2n)) (+ refused0 2))
                     (fail! "a2-second-refusal-not-counted" (cdr (assq 'refused c2n)) refused0)))
@@ -820,8 +835,12 @@
               (let ((c2 (receive (after 5000 (fail! "a2-listener-dead-after-refusal"))
                           (`#(tcp-connected ,c) c)
                           (`#(tcp-connect-failed ,e) (fail! "a2-second-connect-failed" e)))))
-                (sleep-ms 100)
-                (unless (>= accepted 1) (fail! "a2-second-connection-not-accepted" accepted))
+                ;; and once more for the accept callback itself: a fixed
+                ;; sleep is a guess, a bounded poll on the count is a witness
+                (let poll ((n 0))
+                  (cond ((>= accepted 1) 'accepted)
+                        ((= n 200) (fail! "a2-second-connection-not-accepted" accepted))
+                        (else (sleep-ms 10) (poll (+ n 1)))))
                 (tcp-close! c2)
                 ;; every handle the refusal or the second connection made is gone
                 (let ((h1 (handles-stable! "a2-final")))

@@ -202,6 +202,8 @@
           rsend rcall monitor-node demonitor-node node-peers
           monitor-remote demonitor-remote node-set-limits!
           node-monitor-stats node-outbound-stats reconnect-delay
+          node-dead-letters node-dead-letter-stats
+          node-redeliver-dead-letter!
           submission-failure? node-install-rule-order node-orphan-count
           monitor-node/token demonitor-node/token)
   ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
@@ -1137,7 +1139,7 @@
                   ;; has quietly stopped watching something.
                   (display (string-append
                              "igropyr node: warden saw a DOWN from a process "
-                             "it does not manage (" (claimed-version-text reason)
+                             "it does not manage (" (raised-object-text reason)
                              "); this means a child was started or replaced "
                              "outside the warden\n")
                            (current-error-port))
@@ -1152,7 +1154,7 @@
                   (vector-set! deaths i recent)
                   (display (string-append
                              "igropyr node: " nm " exited ("
-                             (claimed-version-text reason)
+                             (raised-object-text reason)
                              "); death " (number->string k)
                              ", giving up after "
                              (number->string child-restart-min-count)
@@ -1732,8 +1734,19 @@
   ;; that subscribed after the event happened would receive it. The
   ;; snapshot has to be part of the event or the rule "you are told
   ;; about what happened while you were watching" has no owner.
+  ;; `failures` counts how many delivery attempts have been STARTED for
+  ;; THIS event -- not how many have failed. The last one counted may
+  ;; still have been in flight when its dispatcher was killed, so its
+  ;; outcome is unknown; see the block above dispatch-one! for why the
+  ;; count has to be taken before the attempt rather than after it.
+  ;; It lives on the node because the node is what a retry, a handover to
+  ;; the orphan chain and a redelivery all carry along. (The event would
+  ;; do as well -- redelivery reuses it and stamp-event! keeps its seq --
+  ;; but the head would not: an event moves between heads.) Redelivery resets it to 0:
+  ;; an operator asking for another attempt is asking for a fresh three,
+  ;; not for the next failure to quarantine it again.
   (define-record-type qnode
-    (fields event (mutable next) (mutable cut)))
+    (fields event (mutable next) (mutable cut) (mutable failures)))
 
   ;; `onext` is the head's OWN link into the global orphan chain. A
   ;; separate chain cell would have to be allocated at the moment of
@@ -1791,12 +1804,20 @@
 
   (define (qhead-peek h) (qhead-first h))
 
+  ;; #t if it removed n, #f if n was not this head's first node.
+  ;;
+  ;; ⚠ `and`, NOT `when`. A `when` whose test fails yields the unspecified
+  ;; value, and that value is TRUE -- so every caller asking "did the
+  ;; removal happen?" would have been told yes. The sibling comment on
+  ;; lease-detach! already described this procedure as reporting #f; it
+  ;; did not, and nothing noticed because until now no caller looked.
   (define (qhead-done! h n)
-    (when (eq? (qhead-first h) n)
-      (qhead-first-set! h (qnode-next n))
-      (unless (qhead-first h) (qhead-last-set! h #f))
-      (qnode-next-set! n #f)
-      #t))
+    (and (eq? (qhead-first h) n)
+         (begin
+           (qhead-first-set! h (qnode-next n))
+           (unless (qhead-first h) (qhead-last-set! h #f))
+           (qnode-next-set! n #f)
+           #t)))
 
   (define (qhead-empty? h) (not (qhead-first h)))
 
@@ -2945,12 +2966,343 @@
             ((fx= i 0) (car l))
             (else (loop (cdr l) (fx- i 1))))))
 
+  ;; The whole rendered line, marker included, fits in reason-text-total.
+  ;; The marker's own length is reserved up front, so the number below is
+  ;; the number a reader can rely on rather than a number the truncation
+  ;; suffix then overruns -- the earlier spelling capped the CONTENT at
+  ;; 512 and returned 539.
+  (define reason-text-total 512)
+  (define reason-text-marker "...[truncated]")
+  (define reason-text-budget
+    (let ((b (fx- reason-text-total (string-length reason-text-marker))))
+      ;; The real boundary is stricter than "the marker fits". At equal
+      ;; lengths it does fit -- the budget is 0, substring 0 0 is legal --
+      ;; but then no ordinary rendering survives at all: anything nonempty
+      ;; is cut to nothing and the line is the marker by itself. (Not
+      ;; every line, strictly: a writer emitting the empty string would
+      ;; leave it empty, and one that raises gives the placeholder. Both
+      ;; are equally useless.) Longer still makes the budget negative and
+      ;; substring raises. Both are refused here, at load, rather than at
+      ;; the moment a supervisor is trying to report a death.
+      (unless (fx> b 0)
+        (assertion-violation 'reason-text-budget
+          "truncation marker does not fit in reason-text-total"
+          reason-text-total reason-text-marker))
+      b))
+
+  ;; One line of log text for an object somebody raised -- a dead child's
+  ;; exit reason, or whatever a guard caught. Used wherever such an object
+  ;; is shown to a person.
+  ;;
+  ;; ⛔ IT CANNOT BE format's ~s. Chez prints a condition under both ~s
+  ;; and ~a as ONE OPAQUE TOKEN naming its shape and nothing else --
+  ;; `#<compound condition>` for a compound one, and a plain one printing
+  ;; its own component name -- no message, no irritants, no who. An
+  ;; uncaught raise becomes the process's exit reason unchanged, so a
+  ;; child that dies of a condition logs as that one token unless
+  ;; something renders it.
+  ;;
+  ;; ⛔ NOR IS display-condition ENOUGH, though it renders correctly.
+  ;; Measured, not assumed, on Chez 10.1.0: print-length and print-level
+  ;; DO NOT reach inside it (it applies its own). With who = x and a
+  ;; 100000-character message it renders 100016 characters; with who = x,
+  ;; message "oops" and a 100000-character string irritant, 100037. The
+  ;; fixtures are named because the numbers are theirs -- a message-only
+  ;; condition of the same size gives 100011. A
+  ;; log renderer that can emit a hundred kilobytes on the path where a
+  ;; supervisor is already reporting a death is worse than the defect it
+  ;; replaced -- and this is called from the warden, which is critical,
+  ;; so a raise here stops the node.
+  ;;
+  ;; So it is built from the condition's parts instead:
+  ;;   - the whole procedure is guarded, both branches, and any failure
+  ;;     becomes a fixed placeholder -- rendering a reason must never
+  ;;     itself raise;
+  ;;   - a string handed to put! is cut to the remaining budget BEFORE it
+  ;;     is scanned, so the scrubbed copy is bounded;
+  ;;   - control characters go to spaces on every string that is kept --
+  ;;     C0, DEL, C1 and U+2028/2029 -- because a log line is not just
+  ;;     newline-free, it is also free of tabs, NULs and terminal
+  ;;     escapes;
+  ;;   - the SELECTED print parameters are pinned in one place and both
+  ;;     printing sites go through it -- `show`, and the expansion of a
+  ;;     condition's own message, which may carry ~s directives of its
+  ;;     own. Selected, not all: three that also affect the rendering are
+  ;;     still ambient, named at the pin set. What they no longer do is
+  ;;     purport to bound display-condition, which was the false claim.
+  ;;     Where they cut, the printer writes its own ellipsis; nothing
+  ;;     here marks that further, and a literal `...` in the data is
+  ;;     indistinguishable from the token in the finished line -- a
+  ;;     property of printed Scheme, not a gap in this.
+  ;;
+  ;; ⚠ RESIDUAL, and the earlier statement of it was too narrow. Only the
+  ;; RETAINED RESULT is size-bounded. Not bounded: the time and temporary
+  ;; allocation of rendering a piece before put! ever sees it (`show` and
+  ;; the format expansion both build their whole result first); the
+  ;; termination of a custom record-writer that ~s may call; and that
+  ;; writer's allocations and side effects. Nor is the input's size the
+  ;; limit on any of it -- `(format "~1000000a" 'x)` returns a million
+  ;; characters from a tiny condition, so a small reason is not a small
+  ;; rendering.
+  ;;
+  ;; ⛔ LOSSES THAT LEAVE NOTHING IN THE LINE. Not a closed list; each
+  ;; entry carries how it is known.
+  ;;   - A custom record writer that reads print-length and emits that
+  ;;     many fields with no ellipsis of its own: the printer did not do
+  ;;     the cutting, so it wrote no token. (Chez 10.1.0, measured: a
+  ;;     writer built this way gave `#<cr a b c d>` where the record held
+  ;;     five fields.) The two-render comparison that once stood here
+  ;;     caught this case when the extra field changed the string and the
+  ;;     first render fit; it was removed because the same comparison
+  ;;     also marked ordinary values that had lost nothing.
+  ;;   - A custom writer that omits for its own reasons, unrelated to any
+  ;;     print parameter. (Structurally: `format "~s"` invokes the writer
+  ;;     and keeps what it WRITES TO THE PORT -- its return value is
+  ;;     discarded, and under print-graph it may be invoked twice, once
+  ;;     to discover shared structure and once to emit.)
+  ;;   - Condition components other than who, message and irritants
+  ;;     never appear. (Structurally: no CONTENTS are extracted from any
+  ;;     other component -- though the presence of &format is separately
+  ;;     tested, to decide whether the message is a format string.)
+  ;;   - Control characters, replaced with spaces by put!. (Structurally:
+  ;;     the scrub loop in put!, below.)
+  ;;   - A format directive that consumes an irritant without showing it,
+  ;;     such as ~*, in a condition-controlled expansion. (Chez 10.1.0,
+  ;;     measured: `(format "A~*B" 'dropped)` gives "AB".)
+  ;;   - Gensym identity, erased by our own print-gensym pin: two
+  ;;     distinct gensyms sharing a pretty name render alike. (Chez
+  ;;     10.1.0, measured: two non-eq? gensyms both print `tmp`.) This
+  ;;     one is not the printer's doing or a writer's -- it is ours.
+  ;; It is not claimed that nothing a maintainer wants can go missing
+  ;; unannounced. The trade is deliberate: these silences in place of a
+  ;; mark that was sometimes a lie.
+  ;;
+  ;; ⛔ WHAT WOULD ACTUALLY BOUND IT is a different shape, recorded as a
+  ;; gap rather than half-built here: an output port that stops accepting
+  ;; characters, a printer that never calls a record-writer somebody else
+  ;; wrote, and a restricted reading of the format string rather than
+  ;; Chez's. Those are liveness guarantees; this batch has no timeout and
+  ;; no restricted printer to build them from, and a half-made liveness
+  ;; guarantee reads exactly like a whole one.
+  (define (raised-object-text v)
+    (guard (ex (#t "<reason could not be rendered>"))
+      (let ((acc '()) (used 0) (cut #f))
+        ;; cut to budget, scrub, append -- one pass, no second copy
+        (define (put! s)
+          (unless cut
+            (let* ((s (if (string? s) s "?"))
+                   (n (string-length s))
+                   (room (fx- reason-text-budget used))
+                   (s (if (fx<= n room) s (begin (set! cut #t) (substring s 0 room))))
+                   (m (string-length s))
+                   (out (make-string m)))
+              (do ((i 0 (fx+ i 1))) ((fx= i m))
+                (let* ((ch (string-ref s i)) (c (char->integer ch)))
+                  (string-set! out i
+                    (if (or (fx< c 32) (fx= c 127)
+                            (and (fx>= c 128) (fx<= c 159))
+                            (fx= c 8232) (fx= c 8233))
+                        #\space ch))))
+              (set! acc (cons out acc))
+              (set! used (fx+ used m)))))
+        ;; The bounds the line is printed under. Chez marks both kinds of
+        ;; cut with an ellipsis. Measured on Chez 10.1.0 under exactly
+        ;; these parameters: print-length cuts give `(0 1 2 3 ...)` and
+        ;; `#(0 1 2 3 ...)`; print-level cuts give `(((...)))` and
+        ;; `#(#(#(...)))`. The `#` in those belongs to the vector prefix,
+        ;; not to the cut. Nothing here adds a second mark on top of the
+        ;; printer's.
+        ;;
+        ;; print-gensym is pinned with the rest: unpinned, the same gensym
+        ;; renders `#{tmp htuzytse4nyctyrj5g34fisev-0}` or `tmp` depending
+        ;; on ambient state this does not control (Chez 10.1.0, measured).
+        ;; A death log should not read differently by accident.
+        ;;
+        ;; ⛔ THAT IS A DECISION, AND IT COST THREE ATTEMPTS TO REACH IT.
+        ;; Twice this carried machinery to say "something was dropped"
+        ;; more loudly than the printer does, and twice the machinery put
+        ;; that claim on lines where NOTHING had been dropped -- first a
+        ;; structural predicate that marked a graph-shared list the
+        ;; printer renders whole, then a second render at looser bounds,
+        ;; which can disagree with the first when a custom writer reads
+        ;; the print parameters, or when another process mutates the value
+        ;; between the two renders. (Can, not must: a writer may read a
+        ;; parameter and ignore it, and a mutation may touch a part that
+        ;; is not printed.) Neither needed an adversary; a concurrent
+        ;; mutation is ordinary here. A truncation mark that is sometimes
+        ;; false is worse than the printer's own ellipsis, which -- when
+        ;; Chez's own traversal is what emitted it -- is at least always
+        ;; about the value. Text a custom writer chose to emit carries no
+        ;; such promise.
+        ;;
+        ;; ⚠ THE AMBIGUITY IS IN THE NOTATION, not in this code. Under
+        ;; print-length 4 a trailing ellipsis after four items is always
+        ;; the printer's: a fifth element that is itself the symbol `...`
+        ;; is cut like any other (Chez 10.1.0, measured -- `(0 1 2 3 ...)`
+        ;; and `(0 1 2 3 4)` both render `(0 1 2 3 ...)`, while a literal
+        ;; `...` shows only as `(0 1 2 ...)`, three items deep). What the
+        ;; finished line cannot disclose is WHICH element was dropped --
+        ;; in particular, whether the dropped one was also `...`.
+        ;; Re-rendering the source object at print-length 5 separates
+        ;; them, and a later reader of the log has only the line.
+        ;; ⭐ ONE SET OF PINS, USED BY BOTH RENDERERS -- of the print
+        ;; parameters SELECTED below, which is not all of them; three
+        ;; known ones are still ambient and named at the end. `show` is not the
+        ;; only thing here that prints: a condition's own message can
+        ;; carry ~s directives, and expanding it runs a printer too. Pin
+        ;; only `show` and that expansion keeps reading whatever the
+        ;; process happens to have set -- so both go through this.
+        ;; Whoever adds a third rendering site sends it through here too.
+        ;;
+        ;; Two different things are being done, and confusing them would
+        ;; invite someone to "restore the defaults" and silently change
+        ;; the log:
+        ;;
+        ;;   DELIBERATELY NOT THE DEFAULT, each with a cost --
+        ;;     print-length 4   bounds a long collection; the cost is
+        ;;                      that what is past the fourth element is
+        ;;                      gone, marked only by the printer's `...`
+        ;;     print-level 2    bounds depth, same trade
+        ;;     print-graph #t   makes ordinary cyclic pairs, vectors and
+        ;;                      records printable; a custom writer can
+        ;;                      still loop. It also relabels shared
+        ;;                      structure as `#0=`/`#0#`
+        ;;     print-gensym #f  gives `tmp` instead of
+        ;;                      `#{tmp htuzytse4nyctyrj5g34fisev-0}`;
+        ;;                      the cost is real -- two DISTINCT gensyms
+        ;;                      with the same pretty name now render
+        ;;                      identically, `(tmp tmp)` (measured)
+        ;;
+        ;;   HELD AT THE DEFAULT, so ambient state cannot move them.
+        ;;   Nothing changes in a process that left them alone; the pin
+        ;;   only bites when something did not. Each was measured on Chez
+        ;;   10.1.0 to change this rendering with the others held fixed:
+        ;;     print-radix 10                 `255` vs `#b11111111`
+        ;;     print-vector-length #f         `#(0 0 0 0 ...)` vs `#6(0)`
+        ;;     print-unicode #t               accented characters kept
+        ;;                                    vs escaped to `\xE9;`
+        ;;     print-precision #f             `1.5` vs `1.5|53`
+        ;;     print-record #t                `#[pt 1 2]` vs
+        ;;                                    `#<record of type pt>`
+        ;;     print-extended-identifiers #f  `\x31;abc` vs `1abc` for the
+        ;;                                    symbol 1abc. #f is the
+        ;;                                    default and reads back;
+        ;;                                    `1abc` would be prettier and
+        ;;                                    would not
+        ;;     print-positive-exponent-sign #f  `1e20` vs `1e+20`
+        ;;
+        ;; ⛔ WHAT IS STILL AMBIENT, because this list is selected rather
+        ;; than complete. Each of these was measured on Chez 10.1.0 to
+        ;; change this rendering with the eleven above held fixed, and
+        ;; each belongs in the held-at-default group; they are deferred to
+        ;; a follow-up rather than added here, and the gap ledger carries
+        ;; them:
+        ;;     print-char-name                  `#\x85` vs `#\nel`
+        ;;     print-subnormal-precision        `5e-324|1` vs `5e-324`
+        ;;     print-select-flonum-exponential-format
+        ;;                                      `1e20` vs
+        ;;                                      `100000000000000000000.0`
+        ;;
+        ;; print-brackets is a different case: Chez's built-in `~s`
+        ;; traversal does not consult it (it belongs to pretty-print), so
+        ;; pinning it would say nothing about that traversal. A custom
+        ;; writer invoked from `~s` can read it, or any other ambient
+        ;; parameter, and no pin here constrains that.
+        ;;
+        ;; (An earlier note said two measurements of print-char-name
+        ;; disagreed. They did not. One of them set the parameter to the
+        ;; value it already held, so that run compared nothing -- a
+        ;; reading with no treatment in it, written up as a conflict. The
+        ;; same mistake hid print-subnormal-precision.)
+        (define (with-print-pins thunk)
+          (parameterize ((print-length 4) (print-level 2) (print-graph #t)
+                         (print-gensym #f) (print-radix 10)
+                         (print-vector-length #f) (print-unicode #t)
+                         (print-precision #f) (print-record #t)
+                         (print-extended-identifiers #f)
+                         (print-positive-exponent-sign #f))
+            (thunk)))
+        (define (show x) (with-print-pins (lambda () (format "~s" x))))
+        (define (put-shown! x) (unless cut (put! (show x))))
+        (if (condition? v)
+            (let ((who (and (who-condition? v) (condition-who v)))
+                  (msg (and (message-condition? v) (condition-message v)))
+                  (irr (if (irritants-condition? v) (condition-irritants v) '())))
+              ;; ⭐ WHO GOES LAST, and that is the whole reason the order
+              ;; is written down. It used to go first, and a `who` long
+              ;; enough to fill the budget then pushed the MESSAGE out
+              ;; entirely -- the line stayed inside its limit and lost
+              ;; the only part naming what went wrong. Whoever raised it
+              ;; is the part worth dropping when something must be.
+              (put! "Exception: ")
+              ;; A Chez runtime condition keeps a FORMAT STRING as its
+              ;; message and the values to fill it as its irritants, so
+              ;; printing them apart gives "~s is not a pair with
+              ;; irritants ()". Filling it is what display-condition does.
+              ;;
+              ;; ⛔ WHICH CONDITIONS THOSE ARE IS NOT A GUESS. Chez marks
+              ;; them: format-condition? reports the presence of an
+              ;; &format component. It is true of the primitive runtime
+              ;; errors and of errorf, and false of ordinary assertion
+              ;; violations -- but it is a component test, NOT a
+              ;; provenance test, so do not read it as "came from the
+              ;; runtime": (assert #f) is false too.
+              ;;
+              ;; This used to test `(string? msg)` and `(pair? irr)`
+              ;; instead and get it deterministically WRONG -- given
+              ;; (assertion-violation 'foo "literal ~a text" 'bar), whose
+              ;; tilde is literal text, the counts happened to match, so
+              ;; it printed "literal bar text". `bar` was not lost: it
+              ;; was consumed AS THE INTERPOLATION, and what went missing
+              ;; was its presentation as an irritant. Chez's own
+              ;; rendering is `literal ~a text with irritant bar`.
+              ;; Directives like ~* can drop one silently. A genuine
+              ;; format condition may also have NO irritants and still
+              ;; need expanding, for ~~, so the count is not a secondary
+              ;; test either.
+              ;; ⚠ Not `(not cut)`. cut means "a write has already
+              ;; overflowed", which is not the same as "there is no room
+              ;; left": a piece that fills the budget EXACTLY leaves cut
+              ;; false, and an unbounded format would then still run
+              ;; with zero characters to spend.
+              (let ((filled (and (fx< used reason-text-budget)
+                                 (format-condition? v)
+                                 (string? msg)
+                                 (guard (e2 (#t #f))
+                                   (with-print-pins
+                                     (lambda () (apply format msg irr)))))))
+                (if filled
+                    (put! filled)
+                    (begin
+                      ;; ⚠ put-shown!, not put! + show: show runs the
+                      ;; printer, and it must not run once the budget is
+                      ;; gone.
+                      (cond ((string? msg) (put! msg))
+                            (msg (put-shown! msg))
+                            (else (put! "condition")))
+                      (cond ((null? irr) (values))
+                            ((null? (cdr irr))
+                             (put! " with irritant ") (put-shown! (car irr)))
+                            (else
+                             (put! " with irritants ")
+                             (put-shown! irr))))))
+              ;; who last -- see above
+              (when who (put! " in ") (put-shown! who)))
+            (put-shown! v))
+        (let ((s (apply string-append (reverse acc))))
+          ;; The marker says one thing only, and says it exactly: THIS
+          ;; procedure's budget cut the line. It is not a claim about what
+          ;; the print bounds did inside a value -- that is the printer's
+          ;; own `...` and `#`.
+          (if cut (string-append s reason-text-marker) s)))))
+
   ;; What the other end claimed, for a diagnostic. A peer's datum is
   ;; untrusted input and may be a cycle or a megabyte, so this is bounded
   ;; by construction rather than by hoping the value is small: print-graph
   ;; removes the cycle warning (which is a raised condition, not merely a
   ;; printed line), print-length and print-level bound the traversal, and
   ;; the substring bounds a single enormous atom.
+
   (define (claimed-version-text v)
     (if (eq? v #f)
         "pre-2 (no version field)"
@@ -3176,8 +3528,8 @@
         ;; roll back -- a half-finished handover there is unreachable
         ;; state, not a retryable failure.
         (let* ((spare (list (new-qhead)
-                            (make-qnode (make-event 'node-down name) #f '())
-                            (make-qnode (make-event 'node-up name) #f '())))
+                            (make-qnode (make-event 'node-down name) #f '() 0)
+                            (make-qnode (make-event 'node-up name) #f '() 0)))
                ;; (R0) THE SWEEP'S ANCHOR, BUILT OUT HERE WITH EVERYTHING
                ;; ELSE. The capture in the region below is two pointer
                ;; writes plus an eq-hashtable delete; building the record
@@ -3578,20 +3930,373 @@
 
   ;; At most one event from this head. The answer is also the signal that
   ;; another round is worth running.
+  ;; One failed attempt, counted and possibly quarantined. Runs INSIDE the
+  ;; guard's handler, and makes its whole decision in one region.
+  ;;
+  ;; ⭐ THE COUNT AND THE QUARANTINE ARE ONE STEP. Splitting them leaves a
+  ;; window: a process killed after the third failure was recorded but
+  ;; before the event was set aside leaves the successor to find it still
+  ;; queued with failures = 3 and try a fourth time. Taking it off the
+  ;; queue and putting it in the ring in the same region removes that
+  ;; window rather than narrowing it.
+  ;;
+  ;; The condition is carried in as an argument, not re-raised: it is the
+  ;; reason recorded with the event, and here is the only place it exists.
+  (define observer-name 'igropyr-node-observer)
+
+  ;; Say that an event was set aside. Best effort, and the guard is the
+  ;; point: this runs on the dispatcher's stack, and a raise from here --
+  ;; a formatting error, a write to a closed stderr -- would escape into
+  ;; the dispatcher loop, which has none. Losing the notice is survivable;
+  ;; losing the dispatcher is what this whole batch exists to prevent.
+  ;;
+  ;; ⚠ A send to a dead observer is silently dropped, which matches the
+  ;; contract. The ring is the record -- in memory, overwritable when
+  ;; full, and emptied by redelivery -- and this is the announcement.
+  (define (notify-observer! n why failures)
+    (guard (e (#t (void)))
+      (let* ((ev (qnode-event n))
+             (msg (vector 'event-quarantined
+                          (event-name ev) (event-kind ev) (event-seq ev)
+                          why failures)))
+        (let ((p (whereis observer-name)))
+          (if p
+              (send p msg)
+              ;; stderr, not stdout: a cross-process test that merges the
+              ;; two and reads by line position would take this for data.
+              ;;
+              ;; ⭐ THE REASON IS RENDERED BEFORE ANY OF IT IS WRITTEN,
+              ;; and by the same procedure the warden uses. Writing it
+              ;; straight to the port can raise partway, leaving half a
+              ;; line with no newline for the next write to join onto.
+              ;;
+              ;; ⛔ AND `display` WAS THE WRONG RENDERER. why is whatever
+              ;; was raised, which is usually a condition, and display
+              ;; gives an OPAQUE CONDITION TOKEN for one -- `#<compound
+              ;; condition>` for a compound condition, and for a plain one
+              ;; a token naming whichever component it is -- never the
+              ;; diagnostic text.
+              ;; That is the same defect the warden's death log had, and
+              ;; fixing one of two sites is not fixing the shape.
+              ;;
+              ;; ⚠ Without a reason at all the two quarantine outcomes
+              ;; were the same line: the reason is the only field that
+              ;; separates an ordinary poisoned event from one whose
+              ;; dispatcher was killed mid-attempt, and a deployment with
+              ;; no observer registered has nothing else to read.
+              (let ((e (current-error-port))
+                    (r (raised-object-text why)))
+                (display "igropyr node: event set aside after " e)
+                (display failures e)
+                ;; ⚠ "attempts", not "failed deliveries": on the
+                ;; lost-outcome path the last attempt's result is exactly
+                ;; what is not known.
+                (display " attempts: " e)
+                (display (event-kind ev) e) (display " " e)
+                (display (event-name ev) e) (display " seq " e)
+                (display (event-seq ev) e)
+                (display " reason " e) (display r e) (newline e)))))))
+
+  ;; ⭐ THE ONLY DOOR INTO THE RING. Both quarantine paths come through
+  ;; here so that the check below cannot hold at one of them and be
+  ;; missing at the other. Written at the caller instead, in poison-step!,
+  ;; it would not cover the k > limit route at all -- and that route is
+  ;; reached on its own account, by a predecessor exiting after it stored
+  ;; the final-attempt count and before it successfully removed the node.
+  ;; "Before poison-step!" was the wrong boundary: the attempt may not
+  ;; have begun, may have failed, or may ALREADY HAVE DELIVERED -- the
+  ;; delivering path never calls poison-step! at all, and still owes a
+  ;; qhead-done!.
+  ;;
+  ;; ⚠ It is NOT reached by this assertion firing. That was the argument
+  ;; first written here and it was wrong: the assertion fires only when n
+  ;; is not the head, and the successor peeks the head afresh, so the
+  ;; successor never sees that n at all.
+  ;;
+  ;; ⚠ WHY IT RAISES. A false qhead-done! says directly only that n is no
+  ;; longer this head's first node -- not that n is still queued. But the
+  ;; removal paths are a closed set, so more follows: n was the head when
+  ;; it was peeked, pushes only append, and the sole way the head advances
+  ;; is a successful qhead-done!. So another remover did not merely
+  ;; probably win, it NECESSARILY won. What is unknown is only which
+  ;; outcome it took -- delivery, or a quarantine of its own.
+  ;;
+  ;; ⇒ Skipping the insertion cannot undo the winner's outcome, and it
+  ;; avoids manufacturing a second dead-letter for an event that may
+  ;; already have one.
+  ;;
+  ;; ⛔ It is NOT free, and the claim once written here -- that skipping
+  ;; "would lose NOTHING, because each removal path records as it
+  ;; removes" -- was false twice over. The delivered branch records
+  ;; NOTHING: it sends to the live watchers and then removes, after which
+  ;; the event is in neither the queue nor the ring. And the quarantine
+  ;; path's ring record is not permanent either -- the ring is
+  ;; overwritable, and redelivery clears the slot it came from.
+  ;;
+  ;; What skipping actually discards is THIS remover's failure reason,
+  ;; and it would silently hide the forbidden overlap. Raising is what
+  ;; preserves that evidence.
+  ;;
+  ;; ⚠ WHERE THE RAISE GOES, and it differs by caller: from poison-step!
+  ;; it escapes a guard handler that is already running (an R6RS guard
+  ;; handler is not active during its own clause, so it does not catch
+  ;; itself); from the k > limit branch it is raised before that guard is
+  ;; ever entered. dispatch-one! does contain a guard -- the delivery one
+  ;; on the line above -- but it is inactive in its own clause on the
+  ;; first path and unentered on the second, and neither dispatch-round!
+  ;; nor dispatcher-loop installs another. So the dispatcher dies. The
+  ;; warden logs the reason -- readably, via raised-object-text, which is
+  ;; a separate repair from this one -- and normally restarts it, unless
+  ;; its give-up policy fires instead and stops the node.
+  ;;
+  ;; ⚠ ONE FIRING IS ONE DISPATCHER DEATH -- and that is as far as the
+  ;; guarantee goes. This particular n does not drag the successor down
+  ;; with it: the successor peeks the head afresh, and the condition for
+  ;; the assertion is precisely that n is not there.
+  ;;
+  ;; ⛔ BUT IT DOES NOT FOLLOW THAT A RESTART HAPPENS. The warden counts
+  ;; recent deaths of this child WITHOUT LOOKING AT WHY THEY DIED, so this
+  ;; death is added to whatever unrelated dispatcher deaths came before
+  ;; it, and it may be the one that crosses the give-up threshold -- and
+  ;; the crossing death is not restarted, it stops the node. Nothing here
+  ;; requires the race to recur for that to happen.
+  ;;
+  ;; ⛔ NO CELL, AND NOT REACHABLE TODAY: qhead-push! appends at the tail,
+  ;; every qhead-done! call is dynamically reached from dispatch-one!
+  ;; (the two syntactic ones are here and in the delivered branch; this
+  ;; one is reached only via poison-step! or the k > limit branch), and
+  ;; the dispatcher is a warden child restarted only on DOWN, so no
+  ;; second deliverer is ever live to displace n. This assertion is not
+  ;; for today's code. It is for the second deliverer somebody adds
+  ;; later, who will not read the paragraph above.
+  (define (quarantine! h n reason)          ; caller does NOT hold the region
+    (atomically
+      (unless (qhead-done! h n)
+        (assertion-violation 'quarantine!
+          "event was not at the head of its queue when quarantined" n))
+      (ring-put! n h reason)))
+
+  ;; The decision after an attempt has failed. The count was already
+  ;; taken before the attempt, so this only reads it.
+  (define (poison-step! h n k e)            ; -> 'retry | 'quarantined
+    (if (fx< k poison-event-limit)
+        'retry
+        (begin
+          ;; ⭐ LEAVING THE QUEUE AND ENTERING THE RING ARE ONE STEP, so
+          ;; no kill lands between them. See quarantine! for why the
+          ;; removal is checked rather than assumed.
+          (quarantine! h n e)
+          'quarantined)))
+
+  ;; ⚠ WHY THE ATTEMPT IS COUNTED BEFORE IT IS MADE. Counting a FAILURE
+  ;; leaves a window nothing covers: interrupts are enabled between
+  ;; notify-list! raising and the handler running, so a dispatcher killed
+  ;; there leaves its successor reading the old count and making one more
+  ;; attempt than the limit allows. Counting the ATTEMPT instead makes
+  ;; every kill err in the same direction -- the count can only be too
+  ;; high, which quarantines early and never retries too often.
+  ;;
+  ;; ⇒ The invariant is "at most poison-event-limit attempts are STARTED",
+  ;; which is a statement that survives a kill anywhere. The previous one
+  ;; ("up to three failures") did not.
+  ;;
+  ;; ⛔ NO CELL COVERS THAT KILL WINDOW -- it cannot be aimed at with what
+  ;; the suite has, and this is closed by construction rather than
+  ;; demonstrated. Recorded as such; it is the fourth thing waiting on a
+  ;; barrier primitive.
+  ;;
+  ;; A successful delivery is counted too. That count stops being
+  ;; reachable only once qhead-done! has run -- notify-list! returning is
+  ;; not the end of the attempt, and a kill in between leaves the node
+  ;; queued with its count already stored, for the successor to read and
+  ;; increment. That is the same window that makes delivery at-least-once
+  ;; rather than exactly-once; it is not closed here and is not meant to
+  ;; be. A redelivery resets the count, so a redelivered event's first
+  ;; attempt is again 1.
   (define (dispatch-one! h)
     (let ((n (atomically (qhead-peek h))))
       (and n
            (let ((ev (qnode-event n)))
-             (notify-list! (qnode-cut n) (event-name ev) (event-kind ev) (event-seq ev))
-             ;; delivered, and only now is it gone. A death anywhere above
-             ;; this line leaves the event where it was, for the successor.
-             (atomically (qhead-done! h n))
-             #t))))
+             (let attempt ()
+               (let ((k (atomically
+                          (let ((k (fx+ (qnode-failures n) 1)))
+                            (if (fx> k poison-event-limit)
+                                k                ; do not record another
+                                (begin (qnode-failures-set! n k) k))))))
+                 (if (fx> k poison-event-limit)
+                     ;; ⚠ THE LIMIT WAS ALREADY REACHED: a previous
+                     ;; incarnation reserved the final attempt and died
+                     ;; before removing the node. It is not known whether
+                     ;; that attempt ever began -- the kill may have
+                     ;; landed between storing the count and entering the
+                     ;; guarded delivery -- let alone whether it
+                     ;; succeeded. Quarantining without starting another
+                     ;; is what keeps the start limit; note this branch
+                     ;; does NOT record a further failure, it leaves the
+                     ;; stored count alone and says the outcome is
+                     ;; indeterminate.
+                     (begin
+                       (quarantine! h n 'lost-outcome-after-kill)
+                       (notify-observer! n 'lost-outcome-after-kill
+                                         poison-event-limit)
+                       #t)
+                     ;; ⭐ why IS CAPTURED LEXICALLY, and neither value in
+                     ;; the notice may be re-read later: the reason cannot
+                     ;; come from the ring slot (a redelivery may have
+                     ;; cleared it by then) and the count cannot come from
+                     ;; the qnode (a redelivery resets it). Both are true
+                     ;; at the moment of quarantine and only then.
+                     (let* ((why #f)
+                            (r (guard (e (#t (set! why e)
+                                             (poison-step! h n k e)))
+                                 ;; INJECTION POINT 'notify-deliver --
+                                 ;; OWNING GUARD: the guard on the line
+                                 ;; above, which is the subject: it turns
+                                 ;; a raise into a counted attempt. Both
+                                 ;; this call and notify-list! are
+                                 ;; lexically inside it, so a synchronous
+                                 ;; raise from either reaches it before
+                                 ;; any dynamically outer handler. How
+                                 ;; many guards lie beyond it depends on
+                                 ;; the runner and cannot be read off
+                                 ;; this file.
+                                 (inject-fault! 'notify-deliver)
+                                 (notify-list! (qnode-cut n) (event-name ev)
+                                               (event-kind ev) (event-seq ev))
+                                 'delivered)))
+                       (case r
+                         ;; delivered, and only now is it gone. A death
+                         ;; anywhere above leaves the event where it was.
+                         ;;
+                         ;; ⚠ THIS ONE DISCARDS THE RESULT, and the reason
+                         ;; is that a failure here is unreachable while
+                         ;; there is one dispatcher -- NOT that a failure
+                         ;; would be harmless. If a second deliverer ever
+                         ;; existed, a false result could equally mean it
+                         ;; had already quarantined this event, which
+                         ;; would leave it delivered AND listed as a dead
+                         ;; letter. That is misleading state, not the
+                         ;; at-least-once redelivery this library
+                         ;; promises. Whoever adds one checks here too.
+                         ((delivered) (atomically (qhead-done! h n)) #t)
+                         ;; ⚠ sleep-ms 1, NOT 0. A zero wake time has
+                         ;; already passed when the receive is entered, so
+                         ;; the timeout branch runs without yielding and
+                         ;; the retry would spin inside this process.
+                         ((retry) (sleep-ms 1) (attempt))
+                         ((quarantined)
+                          (notify-observer! n why poison-event-limit)
+                          #t))))))))))
 
   ;; A head leaves the chains only when it is empty, and emptiness is
   ;; re-tested inside the region: something may have been queued on it
   ;; between the delivery above and this test, and a head dropped while
   ;; holding an event is unreachable work.
+  ;; ---- dead letters ----------------------------------------------------
+  ;;
+  ;; ⛔ AN EVENT THAT CANNOT BE DELIVERED USED TO TAKE THE DISPATCHER WITH
+  ;; IT. A raise from notify-list! escaped dispatch-one! into a loop with
+  ;; no guard: the process died, every queue it served stopped draining,
+  ;; and the only symptom was silence.
+  ;;
+  ;; ⚠ No subscriber callback runs. The raises to expect are from
+  ;; process-alive?, from building the notification vector, from send and
+  ;; the message it allocates, from reading the watcher record -- and, on
+  ;; the branch taken when the process is dead, from drop-watcher-of-rec!,
+  ;; which allocates a filtered list and mutates the watcher table. None
+  ;; of it is code a subscriber supplied, and all of it can raise. Retrying forever is the other bad answer -- one poisoned
+  ;; event then starves every other peer's queue.
+  ;;
+  ;; So: three attempts, then the event is set aside and the dispatcher
+  ;; goes on. Three is a ruling, not a measurement.
+  (define poison-event-limit 3)
+
+  ;; The ring holds set-aside events. Four parallel vectors rather than a
+  ;; record per slot: everything here is written inside a no-allocation
+  ;; region, and a record would have to be built there.
+  ;;
+  ;; ordinal is the insertion order and doubles as the occupancy flag --
+  ;; 0 means empty. Order cannot come from the slot index because
+  ;; redelivery leaves holes anywhere in the ring.
+  (define dead-letter-capacity 1024)
+  (define dl-node    (make-vector dead-letter-capacity #f))
+  (define dl-head    (make-vector dead-letter-capacity #f))
+  (define dl-reason  (make-vector dead-letter-capacity #f))
+  (define dl-ordinal (make-vector dead-letter-capacity 0))
+  ;; Scratch for the renumbering below, allocated once so the region that
+  ;; uses it allocates nothing.
+  (define dl-work    (make-vector dead-letter-capacity 0))
+  (define dl-ordinal-counter 1)
+  (define dl-lifetime 0)            ; ever set aside, saturating
+  (define dl-dropped 0)             ; overwritten because the ring was full
+
+  (define (dl-bump n)
+    (if (fx< n (greatest-fixnum)) (fx+ n 1) n))
+
+  ;; Give every stored slot a fresh ordinal, keeping their order. Caller
+  ;; holds the region; no allocation -- dl-work is preallocated.
+  ;;
+  ;; ⚠ THE OBVIOUS ALTERNATIVE IS WRONG. Subtracting (min-live - 1) from
+  ;; every ordinal looks equivalent and is not: an operator may redeliver
+  ;; anything at any time, so the live span is unbounded and subtraction
+  ;; cannot bring the counter down. It could even leave duplicates, or
+  ;; overflow inside ring-put! -- at a point where the event has already
+  ;; been taken off its queue by qhead-done! and exists nowhere else.
+  ;;
+  ;; Insertion sort over at most 1024 entries, on a path taken roughly
+  ;; once per (greatest-fixnum) insertions -- about 2^60 on a 64-bit
+  ;; Chez, though nothing here checks the width. Only roughly: the first
+  ;; renumber happens at (greatest-fixnum) - capacity, and each one
+  ;; resets the counter to one past the number of occupied slots, so
+  ;; later intervals are shorter by that much. ~5*10^5 comparisons in the
+  ;; worst case, inside a region; recorded rather than optimised.
+  (define (dl-renumber!)                    ; caller holds the region
+    (let scan ((i 0) (k 0))
+      (if (fx< i dead-letter-capacity)
+          (if (fx> (vector-ref dl-ordinal i) 0)
+              (begin (vector-set! dl-work k i) (scan (fx+ i 1) (fx+ k 1)))
+              (scan (fx+ i 1) k))
+          ;; k slots collected; insertion-sort dl-work[0..k) by ordinal
+          (begin
+            (let sort ((a 1))
+              (when (fx< a k)
+                (let ((v (vector-ref dl-work a)))
+                  (let shift ((b (fx- a 1)))
+                    (if (and (fx>= b 0)
+                             (fx> (vector-ref dl-ordinal (vector-ref dl-work b))
+                                  (vector-ref dl-ordinal v)))
+                        (begin
+                          (vector-set! dl-work (fx+ b 1) (vector-ref dl-work b))
+                          (shift (fx- b 1)))
+                        (vector-set! dl-work (fx+ b 1) v))))
+                (sort (fx+ a 1))))
+            (let assign ((a 0))
+              (if (fx< a k)
+                  (begin (vector-set! dl-ordinal (vector-ref dl-work a) (fx+ a 1))
+                         (assign (fx+ a 1)))
+                  (set! dl-ordinal-counter (fx+ k 1))))))))
+
+  ;; Set an event aside. Caller holds the region; no allocation.
+  (define (ring-put! n h reason)            ; caller holds the region
+    (when (fx>= dl-ordinal-counter (fx- (greatest-fixnum) dead-letter-capacity))
+      (dl-renumber!))
+    (let find ((i 0) (empty -1) (oldest 0))
+      (cond
+        ((fx= i dead-letter-capacity)
+         (let ((slot (if (fx>= empty 0) empty oldest)))
+           (when (fx< empty 0) (set! dl-dropped (dl-bump dl-dropped)))
+           (vector-set! dl-node slot n)
+           (vector-set! dl-head slot h)
+           (vector-set! dl-reason slot reason)
+           (vector-set! dl-ordinal slot dl-ordinal-counter)
+           (set! dl-ordinal-counter (dl-bump dl-ordinal-counter))
+           (set! dl-lifetime (dl-bump dl-lifetime))))
+        ((fx= (vector-ref dl-ordinal i) 0)
+         (find (fx+ i 1) (if (fx< empty 0) i empty) oldest))
+        ((fx< (vector-ref dl-ordinal i) (vector-ref dl-ordinal oldest))
+         (find (fx+ i 1) empty i))
+        (else (find (fx+ i 1) empty oldest)))))
+
   (define (dispatch-retire! h)
     (atomically
       (when (qhead-empty? h)
@@ -3608,6 +4313,148 @@
             (let ((did (dispatch-one! h)))
               (dispatch-retire! h)
               (loop next (or any did)))))))
+
+  ;; ---- dead-letter API -------------------------------------------------
+
+  ;; What is set aside, newest first. The scratch vectors are allocated
+  ;; OUTSIDE the region and the region copies out of the slots rather
+  ;; than handing back the qnode, whose failures field a redelivery
+  ;; resets.
+  ;;
+  ;; ⚠ THE SNAPSHOT IS SHALLOW. Name, kind, seq and the failure count are
+  ;; values taken at one atomic instant and cannot change afterwards. The
+  ;; REASON is a reference: R6RS lets any object be raised, so it may be
+  ;; a mutable one, and what comes back is the object that occupied the
+  ;; slot at that instant -- not a copy, which is not possible for an
+  ;; arbitrary object.
+  ;;
+  ;; ⚠ It aliases the ring only for as long as the slot still holds it.
+  ;; The region ends before the sort and the result list are built, so a
+  ;; redelivery or an overwrite can take the slot before the caller ever
+  ;; sees the snapshot, and a mutation would then change nothing the ring
+  ;; will report. It may equally alias the originally raised object or
+  ;; anything else still holding it. Treat a reason as read-only: which
+  ;; of those is true is not something the caller can tell.
+  (define (node-dead-letters)
+    (let ((ords (make-vector dead-letter-capacity 0))
+          (nms  (make-vector dead-letter-capacity #f))
+          (kds  (make-vector dead-letter-capacity #f))
+          (sqs  (make-vector dead-letter-capacity #f))
+          (rsns (make-vector dead-letter-capacity #f))
+          (fls  (make-vector dead-letter-capacity 0)))
+      (atomically                            ; read-only: copy, decide nothing
+        (let loop ((i 0))
+          (when (fx< i dead-letter-capacity)
+            (let ((o (vector-ref dl-ordinal i)))
+              (vector-set! ords i o)
+              (when (fx> o 0)
+                (let* ((n (vector-ref dl-node i)) (ev (qnode-event n)))
+                  (vector-set! nms i (event-name ev))
+                  (vector-set! kds i (event-kind ev))
+                  (vector-set! sqs i (event-seq ev))
+                  (vector-set! rsns i (vector-ref dl-reason i))
+                  (vector-set! fls i (qnode-failures n)))))
+            (loop (fx+ i 1)))))
+      (let collect ((i 0) (acc '()))
+        (if (fx= i dead-letter-capacity)
+            (map (lambda (p) (cdr p))
+                 (list-sort (lambda (a b) (> (car a) (car b))) acc))
+            (collect (fx+ i 1)
+                     (if (fx> (vector-ref ords i) 0)
+                         (cons (cons (vector-ref ords i)
+                                     (vector (vector-ref nms i)
+                                             (vector-ref kds i)
+                                             (vector-ref sqs i)
+                                             (vector-ref rsns i)
+                                             (vector-ref fls i)))
+                               acc)
+                         acc))))))
+
+  ;; ⚠ lifetime and dropped SATURATE. Once either reaches the fixnum
+  ;; ceiling it stops moving, so both are lower bounds from then on, and
+  ;; an observer watching deltas would read a saturated counter as
+  ;; recovery.
+  (define (node-dead-letter-stats)
+    (let ((s 0) (l 0) (d 0))
+      (atomically
+        (let loop ((i 0) (k 0))
+          (if (fx< i dead-letter-capacity)
+              (loop (fx+ i 1) (if (fx> (vector-ref dl-ordinal i) 0) (fx+ k 1) k))
+              (begin (set! s k) (set! l dl-lifetime) (set! d dl-dropped)))))
+      (list (cons 'stored s) (cons 'lifetime l) (cons 'dropped d))))
+
+  ;; Put one back on a queue. #f if that seq is not set aside OR if no
+  ;; dispatcher is registered -- the two are not distinguished, and in
+  ;; both cases nothing has been touched.
+  ;;
+  ;; ⭐ THE HEAD IS RESOLVED, NOT REMEMBERED. dl-head records where the
+  ;; event came from, but by now that head may have been retired. The
+  ;; peer's current head is whatever peers says, and if the peer is gone
+  ;; the orphan chain has it; only if neither does the spare get attached.
+  ;; ⛔ Using live-entry here would be wrong: an entry that is not yet
+  ;; open still owns the canonical head, and creating a second one breaks
+  ;; the one-head-per-peer invariant.
+  (define (node-redeliver-dead-letter! seq)
+    ;; ⛔ NO DISPATCHER, NO REDELIVERY -- checked before anything moves.
+    ;; Redelivery promises an attempt, and an event put back on a queue
+    ;; nobody drains is not an attempt: it would leave the ring, report
+    ;; success, and never be delivered or listed again. Refusing leaves
+    ;; it where the operator can still see it and try later.
+    (let ((spare (new-qhead))                ; (R0): allocated outside
+          (work (vector 'work)))             ; (R0): allocated outside
+      (let ((woke                            ; the dispatcher, or #f
+             (atomically
+               ;; ⛔ THE DISPATCHER IS RESOLVED IN HERE, with the slot
+               ;; clearing, not before it. Read outside, the answer can
+               ;; go stale: the dispatcher may exit and unregister
+               ;; between the check and the transaction, and the letter
+               ;; would then leave the ring, be reported delivered, and
+               ;; sit on a queue nobody drains -- the exact outcome the
+               ;; check exists to prevent, only harder to notice.
+               ;;
+               ;; ⚠ ONLY THE LOOKUP HAS TO BE IN HERE. The wake does not:
+               ;; qhead-enqueue! ends in ready-attach!, so by the time
+               ;; this region ends the event is already on the chain that
+               ;; dispatch-round! walks, and dispatch-round! runs without
+               ;; being asked. A dispatcher that dies after the region is
+               ;; replaced by one that runs a round BEFORE its first
+               ;; receive; one that lives has a 1000ms timed receive. So
+               ;; a lost wake costs latency, not the event -- and keeping
+               ;; the send out keeps its two allocations out with it.
+               ;; (⚠ that bound is on a live dispatcher noticing queued
+               ;; work. During node shutdown, or after the warden gives
+               ;; up, there is no successor and the work simply waits.)
+               (let ((d (whereis dispatcher-name)))
+                (and d
+                 (let find ((i 0))
+                  (cond
+                   ((fx= i dead-letter-capacity) #f)
+                   ((and (fx> (vector-ref dl-ordinal i) 0)
+                         (equal? (event-seq (qnode-event (vector-ref dl-node i)))
+                                 seq))
+                    (let* ((n (vector-ref dl-node i))
+                           (name (event-name (qnode-event n)))
+                           (e (hashtable-ref peers name #f))
+                           (h (cond (e (entry-head e))
+                                    ((orphan-find name))
+                                    (else (orphan-attach! spare name) spare))))
+                      (vector-set! dl-node i #f)
+                      (vector-set! dl-head i #f)
+                      (vector-set! dl-reason i #f)
+                      (vector-set! dl-ordinal i 0)
+                      (qnode-failures-set! n 0)
+                      (qhead-enqueue! h n (qnode-cut n))
+                      d))
+                   (else (find (fx+ i 1))))))))))
+        ;; ⚠ THE STATE CHANGE IS ALREADY COMMITTED HERE. send allocates a
+        ;; message, and a raise from that allocation leaves the caller an
+        ;; exception for a redelivery that did happen. Nothing can undo
+        ;; it -- a region has no rollback -- so this is a declared
+        ;; residual of the exported API, not something the ordering
+        ;; fixes; the ordering only keeps the region itself to pointer
+        ;; writes.
+        (when woke (send woke work))
+        (and woke #t))))
 
   (define (dispatcher-loop)
     (register dispatcher-name self)
@@ -3791,7 +4638,7 @@
   ;; ready chain in the same region, so the dispatcher finds it with no
   ;; entry to reach it through; it leaves both chains when it empties.
   (define (remove-peer! name c)
-    (let* ((node (make-qnode (make-event 'node-down name) #f '()))  ; (R0): outside
+    (let* ((node (make-qnode (make-event 'node-down name) #f '() 0))  ; (R0): outside
            ;; (R0) The sweep's anchor, as on the replacement path.
            (root (make-agent-rec #f #f #f #f #f))
            (cut #f)

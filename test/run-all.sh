@@ -471,6 +471,11 @@ echo "HTTP NONCRITICAL OPT-OUT PASSED"
 #      not another build -- which is why this costs one suite, not a
 #      compile.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/inject.sc
+#   3. The poison-event suite lives in the same instrumented pass: its
+#      failure is injected at notify-list!'s entry, so it needs the
+#      hooks live and the sources, and it must not share a process with
+#      inject.sc (it owns a node and a child of its own).
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/poison.sc
 
 # reached only when every suite above ran and passed
 echo "=== WHOLE SUITE RUN: every suite was reached ==="
