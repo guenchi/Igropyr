@@ -86,6 +86,11 @@ fi' EXIT
 IGROPYR_CONTRACTS=full "$scheme_bin" --script test/checked-full.sc
 env -u IGROPYR_CONTRACTS "$scheme_bin" --script test/checked-off.sc
 "$scheme_bin" --script test/smoke-actor.sc
+# the death-log renderer pins the print parameters it renders under; these
+# cells drive it through the warden's registered name (the seam node.sc leaves
+# for a harness) with the globals set hostile, and two of the eight use an
+# already-pinned parameter so a broken harness cannot read as a missing pin
+"$scheme_bin" --script test/render-pins.sc
 # monitor and demonitor each write both sides of the pair; a record that
 # reaches only one side is a watch that never fires or never clears
 "$scheme_bin" --script test/monitor-symmetry.sc

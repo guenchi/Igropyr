@@ -3005,6 +3005,22 @@
   ;; the number a reader can rely on rather than a number the truncation
   ;; suffix then overruns -- the earlier spelling capped the CONTENT at
   ;; 512 and returned 539.
+  ;; ⛔ THE ONE PIN THAT CANNOT NAME ITS OWN DEFAULT, and it is not the
+  ;; same kind of thing as the other thirteen.
+  ;; print-select-flonum-exponential-format holds a PROCEDURE, not a
+  ;; writable literal, so there is nothing to type into the parameterize
+  ;; below. The value is captured here instead, when this library is
+  ;; initialised.
+  ;;
+  ;; ⚠ IT IS NAMED `captured`, NOT `default`, and the distinction is the
+  ;; whole point: if something replaced the parameter before this line
+  ;; ran, this captures the REPLACEMENT and pins the log to it. Calling it
+  ;; `default` would be a lie in exactly the case the pin exists to
+  ;; handle. The other nine held-at-default pins have literal defaults and
+  ;; do not have that hole.
+  (define captured-flonum-exponential-format
+    (print-select-flonum-exponential-format))
+
   (define reason-text-total 512)
   (define reason-text-marker "...[truncated]")
   (define reason-text-budget
@@ -3061,8 +3077,7 @@
   ;;   - the SELECTED print parameters are pinned in one place and both
   ;;     printing sites go through it -- `show`, and the expansion of a
   ;;     condition's own message, which may carry ~s directives of its
-  ;;     own. Selected, not all: three that also affect the rendering are
-  ;;     still ambient, named at the pin set. What they no longer do is
+  ;;     own. What they no longer do is
   ;;     purport to bound display-condition, which was the false claim.
   ;;     Where they cut, the printer writes its own ellipsis; nothing
   ;;     here marks that further, and a literal `...` in the data is
@@ -3180,8 +3195,8 @@
         ;; Re-rendering the source object at print-length 5 separates
         ;; them, and a later reader of the log has only the line.
         ;; ⭐ ONE SET OF PINS, USED BY BOTH RENDERERS -- of the print
-        ;; parameters SELECTED below, which is not all of them; three
-        ;; known ones are still ambient and named at the end. `show` is not the
+        ;; parameters SELECTED below, which is not a claim about every
+        ;; parameter that exists; see the scope note at the end. `show` is not the
         ;; only thing here that prints: a condition's own message can
         ;; carry ~s directives, and expanding it runs a printer too. Pin
         ;; only `show` and that expansion keeps reading whatever the
@@ -3207,10 +3222,12 @@
         ;;                      with the same pretty name now render
         ;;                      identically, `(tmp tmp)` (measured)
         ;;
-        ;;   HELD AT THE DEFAULT, so ambient state cannot move them.
-        ;;   Nothing changes in a process that left them alone; the pin
-        ;;   only bites when something did not. Each was measured on Chez
-        ;;   10.1.0 to change this rendering with the others held fixed:
+        ;;   HELD AT THE DEFAULT -- with one exception noted at the end of
+        ;;   this list, which is held at a CAPTURED value that is normally
+        ;;   the default. Nothing changes in a process that left these
+        ;;   alone; a pin only bites when something did not. Each was
+        ;;   measured on Chez 10.1.0 to change this rendering with the
+        ;;   others held fixed:
         ;;     print-radix 10                 `255` vs `#b11111111`
         ;;     print-vector-length #f         `#(0 0 0 0 ...)` vs `#6(0)`
         ;;     print-unicode #t               accented characters kept
@@ -3225,23 +3242,37 @@
         ;;                                    would not
         ;;     print-positive-exponent-sign #f  `1e20` vs `1e+20`
         ;;
-        ;; ⛔ WHAT IS STILL AMBIENT, because this list is selected rather
-        ;; than complete. Each of these was measured on Chez 10.1.0 to
-        ;; change this rendering with the eleven above held fixed, and
-        ;; each belongs in the held-at-default group; they are deferred to
-        ;; a follow-up rather than added here, and the gap ledger carries
-        ;; them:
-        ;;     print-char-name                  `#\x85` vs `#\nel`
-        ;;     print-subnormal-precision        `5e-324|1` vs `5e-324`
+        ;;     print-char-name #f             `#\x85` vs `#\nel`
+        ;;     print-subnormal-precision #t     `5e-324|1` vs `5e-324`
         ;;     print-select-flonum-exponential-format
         ;;                                      `1e20` vs
         ;;                                      `100000000000000000000.0`
+        ;;                                      (captured, see the top of
+        ;;                                      this library for why)
         ;;
-        ;; print-brackets is a different case: Chez's built-in `~s`
-        ;; traversal does not consult it (it belongs to pretty-print), so
-        ;; pinning it would say nothing about that traversal. A custom
-        ;; writer invoked from `~s` can read it, or any other ambient
-        ;; parameter, and no pin here constrains that.
+        ;; ⚠ THE SCOPE OF ALL THIS, stated because the list above reads
+        ;; more complete than it is. In the Chez 10.1.0 matrix tried here,
+        ;; every exported `print-*` parameter observed to change the
+        ;; BUILT-IN `~s` renderings of the fixtures used is now pinned. It
+        ;; establishes nothing about untried parameter values, untried
+        ;; rendered values, format directives, or what a custom writer
+        ;; does -- and a parameter whose effect none of those fixtures
+        ;; provoked looks exactly like one with no effect.
+        ;;
+        ;; ⛔ AND THE PINS DO NOT HOLD FOR THE WHOLE RENDER. parameterize
+        ;; establishes a MUTABLE dynamic binding, so a custom record
+        ;; writer called from inside `show` can set any of these
+        ;; parameters and change what is printed after it (Chez 10.1.0,
+        ;; measured: a writer that replaced the flonum selector made the
+        ;; NEXT value in the same line print unpinned). What these pins
+        ;; hold is the ambient state entering with-print-pins; they do not
+        ;; hold against the rendering thunk itself.
+        ;;
+        ;; print-brackets is the one deliberately left out: Chez's
+        ;; built-in `~s` traversal does not consult it (it belongs to
+        ;; pretty-print), so pinning it would say nothing about that
+        ;; traversal. A custom writer invoked from `~s` can read it, or
+        ;; any other ambient parameter, and no pin here constrains that.
         ;;
         ;; (An earlier note said two measurements of print-char-name
         ;; disagreed. They did not. One of them set the parameter to the
@@ -3254,7 +3285,11 @@
                          (print-vector-length #f) (print-unicode #t)
                          (print-precision #f) (print-record #t)
                          (print-extended-identifiers #f)
-                         (print-positive-exponent-sign #f))
+                         (print-positive-exponent-sign #f)
+                         (print-char-name #f)
+                         (print-subnormal-precision #t)
+                         (print-select-flonum-exponential-format
+                           captured-flonum-exponential-format))
             (thunk)))
         (define (show x) (with-print-pins (lambda () (format "~s" x))))
         (define (put-shown! x) (unless cut (put! (show x))))
