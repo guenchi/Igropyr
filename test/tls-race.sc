@@ -128,8 +128,8 @@
   (spawn (lambda ()
            (case mode
              ((collect)
-              (let-values (((plain raw) (raw-tls-collect "127.0.0.1" port "localhost" GET-KA 60000)))
-                (send main-pid (vector 'client-done (bytevector-length plain) #t plain raw))))
+              (let-values (((plain raw cause) (raw-tls-collect "127.0.0.1" port "localhost" GET-KA 60000)))
+                (send main-pid (vector 'client-done (bytevector-length plain) cause plain raw))))
              (else
               (let-values (((plain writes eof? fail) (raw-tls-exchange "127.0.0.1" port "localhost" GET-KA #f 60000)))
                 (send main-pid (vector 'client-done (bytevector-length plain) eof? plain fail))))))))

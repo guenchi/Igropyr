@@ -54,19 +54,22 @@
   ;; Handshake, send the request, read to close_notify, then KEEP THE SOCKET
   ;; OPEN 500 ms and keep every raw byte: the cell that uses this looks for
   ;; bytes the server put on the wire AFTER retiring the session (RET').
-  ;; -> (values plaintext raw-stream) where raw-stream is every ciphertext
+  ;; -> (values plaintext raw-stream eof-cause) where raw-stream is every ciphertext
   ;; byte received on the socket, from the first server flight to the end of
   ;; the linger; the caller parses it as TLS records and judges the residue.
   ;; In 'collect mode the exchange's failure slot carries that bytevector.
   (define (raw-tls-collect host port sni request timeout-ms)
     (let-values (((plain writes eof? raw)
                   (raw-tls-exchange host port sni request #f timeout-ms 'collect)))
-      (values plain (if (bytevector? raw) raw (make-bytevector 0)))))
+      (values plain (if (bytevector? raw) raw (make-bytevector 0)) eof?)))
 
   ;; -> (values plaintext-received writes eof? failure)
   ;;   plaintext-received  every decrypted byte the server sent (bytevector)
   ;;   writes              number of socket writes this exchange performed
-  ;;   eof?                the server sent close_notify or closed
+  ;;   eof?                #f, or WHY the exchange ended: 'close-notify (the
+  ;;                       server's TLS alert was decrypted) | 'transport (bare
+  ;;                       TCP EOF, no alert) -- callers that only need truth
+  ;;                       may test it as a boolean
   ;;   failure             #f, or a string naming why the exchange stopped early
   ;; request  bytevector to send after the handshake
   ;; coalesce? when #t the request is encrypted BEFORE the handshake's final
@@ -124,7 +127,7 @@
                                  (let drain ()
                                    (receive (after 200 (void))
                                      (`#(tcp-data ,bv) (tls-session-decrypt! sess bv) (flush! sess c) (drain))
-                                     (`#(tcp-eof) (finish (make-bytevector 0) #t "closed before the request"))
+                                     (`#(tcp-eof) (finish (make-bytevector 0) 'transport "closed before the request"))
                                      (`#(tcp-error ,e) (finish (make-bytevector 0) #f "tcp error")))))
                                (write! c (tls-session-encrypt! sess request))))
                          ;; 'drop: bare FIN right after the request, no close_notify,
@@ -143,10 +146,10 @@
                            ;; 500 ms of silence, then hand the whole raw stream back
                            (define (linger-then-finish)
                              (let linger ()
-                               (receive (after 500 (finish (get) #t (rget)))
+                               (receive (after 500 (finish (get) 'close-notify (rget)))
                                  (`#(tcp-data ,bv) (put-bytevector rport bv) (linger))
-                                 (`#(tcp-eof) (finish (get) #t (rget)))
-                                 (`#(tcp-error ,e) (finish (get) #t (rget))))))
+                                 (`#(tcp-eof) (finish (get) 'close-notify (rget)))
+                                 (`#(tcp-error ,e) (finish (get) 'close-notify (rget))))))
                            (let read-loop ()
                              (receive (after (remaining) (finish (get) #f #f))
                                (`#(tcp-data ,bv)
@@ -158,14 +161,14 @@
                                    (flush! sess c)
                                    (cond
                                      ((and eof? collect?) (linger-then-finish))
-                                     (eof? (finish (get) #t #f))
+                                     (eof? (finish (get) 'close-notify #f))
                                      ((and second (not sent-b?) (>= got (caddr second)))
                                       (set! sent-b? #t)
                                       (write! c (tls-session-encrypt! sess (cadr second)))
                                       (read-loop))
                                      ((and second sent-b? (>= got (* 2 (caddr second)))) (finish (get) #f #f))
                                      (else (read-loop)))))
-                               (`#(tcp-eof) (finish (get) #t (and collect? (rget))))
+                               (`#(tcp-eof) (finish (get) 'transport (and collect? (rget))))
                                (`#(tcp-error ,e) (finish (get) #f "tcp error")))))))
                         ((eq? verdict 'want-read)
                          (flush! sess c)
