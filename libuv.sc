@@ -1831,42 +1831,62 @@
   ;; failure. Its caller opened it with openat and holds no other handle
   ;; on it, so every exit has to close it.
   ;;
-  ;; ⚠ Same residual as fs-start!: the state vector and the guard's own
-  ;; continuation are allocated before any handler exists. Unlike that
-  ;; path, this one already holds the descriptor at that moment -- so if
-  ;; Chez fails to allocate there, the fd leaks. It is left as a declared
-  ;; residual because an allocation failure in Chez is an unrecoverable
-  ;; out-of-memory condition; the honest statement is that this window
-  ;; exists and is not covered, not that nothing precedes the guard.
-  (define (fs-start-fd! fd path owner mode)
-    (let ((st (vector #f #f #f fd #t)) (op #f) (rc 0))
-      (with-interrupts-disabled
+  ;; ⭐ THE STATE VECTOR IS THE CALLER'S, AND IT IS OLDER THAN THE fd.
+  ;; This function used to allocate it here, after it already owned the
+  ;; descriptor -- so the one allocation that could fail while holding an
+  ;; unclosable fd was the first thing it did. Now the caller builds the
+  ;; vector BEFORE openat and only writes the fd into it once openat has
+  ;; returned one, inside its own region. There is no moment at which
+  ;; this function owns an fd and has not yet allocated the thing that
+  ;; records it.
+  ;;
+  ;; ⭐ AND THAT IS WHY THE CALLER'S REGION IS NO LONGER LOAD-BEARING for
+  ;; the fd. It was: the correctness of this function depended on being
+  ;; called from inside one, which made it a part whose behaviour changed
+  ;; with its context. It is self-contained now, and a cell can prove it
+  ;; by deleting the caller's region and watching nothing leak.
+  ;;
+  ;; ⚠ WHAT REMAINS, and it is smaller than what was here before but not
+  ;; nothing: entering the guard allocates a continuation, and that
+  ;; allocation is outside the guard it establishes -- the same floor
+  ;; every guard in this file stands on (see fs-start!). The fd IS owned
+  ;; at that instant, because the caller transferred it before the call.
+  ;; So the honest statement is that the window shrank from "a vector and
+  ;; a continuation" to "a continuation", not that it closed.
+  (define (fs-start-fd! st fd path owner mode)
+    (with-interrupts-disabled
         (guard (e (#t (fs-undo! st owner) (raise e)))
-          (set! op (make-fs-op owner path mode #f 'fstat #f #f fd 0 0 '() 0 0))
-          (vector-set! st 0 (owner-index-prepare! 'fs))
-          ;; INJECTION POINT 'fs-oom-fd -- OWNING GUARD: the guard above,
-          ;; the only one on this path. It stands for the allocation
-          ;; below failing; either Scheme allocation reaches it too.
-          (inject-fault! 'fs-oom-fd)
-          (vector-set! st 1 (foreign-alloc fs-req-size))
-          (fs-op-req-set! op (vector-ref st 1))
-          (hashtable-set! fs-table (vector-ref st 1) op)
-          ;; INJECTION POINT 'fs-publish-second-half -- OWNING GUARD: the
-          ;; same one. A failure between the two publications.
-          (inject-fault! 'fs-publish-second-half)
-          (owner-index-publish! owner (vector-ref st 0) (vector-ref st 1))
-          ;; INJECTION POINT 'fs-submit-gap-fd -- OWNING GUARD: the same
-          ;; one. See fs-start! for what this window costs if it is left
-          ;; outside the guard.
-          (inject-fault! 'fs-submit-gap-fd)
-          (fs-op-phase-set! op 'fstat)
-          (set! rc (uv-fs-fstat uv-loop (vector-ref st 1)
-                                (fs-op-fd op) on-fs-entry))
-          (vector-set! st 2 #t)
-          (when (< rc 0)
-            (fs-undo! st owner)
-            (deliver owner (vector 'file-error rc)))))
-      op))
+          ;; INJECTION POINT 'fs-preregion-fd -- OWNING GUARD: this one,
+          ;; and it is placed first on purpose: it stands for "the very
+          ;; first thing after ownership raises", which is the case the
+          ;; old shape could not survive. A cell arming it must see the
+          ;; fd closed.
+          (inject-fault! 'fs-preregion-fd)
+          (let ((op (make-fs-op owner path mode #f 'fstat #f #f fd 0 0 '() 0 0)))
+            (vector-set! st 0 (owner-index-prepare! 'fs))
+            ;; INJECTION POINT 'fs-oom-fd -- OWNING GUARD: the guard above,
+            ;; the only one on this path. It stands for the allocation
+            ;; below failing; either Scheme allocation reaches it too.
+            (inject-fault! 'fs-oom-fd)
+            (vector-set! st 1 (foreign-alloc fs-req-size))
+            (fs-op-req-set! op (vector-ref st 1))
+            (hashtable-set! fs-table (vector-ref st 1) op)
+            ;; INJECTION POINT 'fs-publish-second-half -- OWNING GUARD: the
+            ;; same one. A failure between the two publications.
+            (inject-fault! 'fs-publish-second-half)
+            (owner-index-publish! owner (vector-ref st 0) (vector-ref st 1))
+            ;; INJECTION POINT 'fs-submit-gap-fd -- OWNING GUARD: the same
+            ;; one. See fs-start! for what this window costs if it is left
+            ;; outside the guard.
+            (inject-fault! 'fs-submit-gap-fd)
+            (fs-op-phase-set! op 'fstat)
+            (let ((rc (uv-fs-fstat uv-loop (vector-ref st 1)
+                                   (fs-op-fd op) on-fs-entry)))
+              (vector-set! st 2 #t)
+              (when (< rc 0)
+                (fs-undo! st owner)
+                (deliver owner (vector 'file-error rc))))
+            op))))
 
   (define (relative-parts rel)
     (let ((n (string-length rel)))
@@ -1984,9 +2004,19 @@
     ;; on any pre-publication failure. Read the two together: this line
     ;; hands the descriptor over, and the callee owns it from the call,
     ;; success or failure.
+    ;; ⭐ THE STATE VECTOR IS BUILT BEFORE THE fd EXISTS. If this
+    ;; allocation fails there is no descriptor yet to leak; built after
+    ;; openat, the same failure would strand one. The two writes below
+    ;; are the ownership transfer, and they happen only once openat has
+    ;; actually returned a descriptor.
     (with-interrupts-disabled
-      (let ((fd (open-under root rel)))
-        (and (>= fd 0) (fs-start-fd! fd rel owner 'stream)))))
+      (let ((st (vector #f #f #f -1 #f)))
+        (let ((fd (open-under root rel)))
+          (and (>= fd 0)
+               (begin
+                 (vector-set! st 3 fd)
+                 (vector-set! st 4 #t)
+                 (fs-start-fd! st fd rel owner 'stream)))))))
 
   ;; Switch chunk delivery to lengths: the bytes stay in the stream's C
   ;; buffer (file-stream-chunk-ptr) until the next pull, so a consumer
