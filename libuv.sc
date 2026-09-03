@@ -15,6 +15,7 @@
           tcp-listen! tcp-stop-listen! listener-open? listener-token
           tcp-connect! dns-resolve!
           file-read-async! file-realpath
+          file-stat-async! file-unlink-async! file-scandir-async!
           file-stream-open! file-stream-open-under!
           file-stream-read! file-stream-close!
           file-stream-own! file-stream-raw! file-stream-chunk-ptr
@@ -84,6 +85,28 @@
   (define uv-fs-fstat (foreign-procedure "uv_fs_fstat" (void* void* int void*) int))
   (define uv-fs-realpath
     (foreign-procedure "uv_fs_realpath" (void* void* string void*) int))
+  ;; The three path-only operations. They take no descriptor and open
+  ;; none: uv_fs_scandir's int is its flags word, which libuv ignores.
+  (define uv-fs-stat
+    (foreign-procedure "uv_fs_stat" (void* void* string void*) int))
+  (define uv-fs-unlink
+    (foreign-procedure "uv_fs_unlink" (void* void* string void*) int))
+  (define uv-fs-scandir
+    (foreign-procedure "uv_fs_scandir" (void* void* string int void*) int))
+  ;; Pulls one entry out of a completed scandir request into a caller-owned
+  ;; uv_dirent_t. Returns UV_EOF when the listing is exhausted.
+  (define uv-fs-scandir-next
+    (foreign-procedure "uv_fs_scandir_next" (void* void*) int))
+
+  ;; ⚠ THE ONLY ERRNO THIS FILE INVENTS. Every other #(file-error ,e)
+  ;; carries a number libuv returned; this one is reported when the
+  ;; scandir callback itself runs out of memory building Scheme strings,
+  ;; a failure libuv never saw and has no code for. It is spelled the way
+  ;; libuv spells it so a consumer's existing errno handling covers it:
+  ;; uv/errno.h defines UV__ENOMEM as UV__ERR(ENOMEM), and UV__ERR(x) is
+  ;; -(x) on everything but Windows, with ENOMEM = 12.
+  (define uv-enomem -12)
+
   (define uv-fs-get-ptr (foreign-procedure "uv_fs_get_ptr" (void*) void*))
   (define uv-fs-get-result (foreign-procedure "uv_fs_get_result" (void*) ssize_t))
   (define uv-fs-get-statbuf (foreign-procedure "uv_fs_get_statbuf" (void*) void*))
@@ -939,7 +962,92 @@
                                  (start-fs-read! op req)))))))))
                   ((close)
                    (uv-fs-req-cleanup req)
-                   (fs-finish! op req)))))))
+                   (fs-finish! op req))
+                  ;; ---- the three path-only operations ----------------
+                  ;; Each delivers once and retires the op; none of them
+                  ;; ever held a descriptor, so none goes near the close
+                  ;; machinery above.
+                  ((stat)
+                   (if (< result 0)
+                       (begin (uv-fs-req-cleanup req) (fs-fail! op req result))
+                       (let ((sb (uv-fs-get-statbuf req)))
+                         ;; ⭐ READ EVERY FIELD BEFORE THE CLEANUP. The
+                         ;; statbuf belongs to the request; cleanup is
+                         ;; free to release it, so a field fetched
+                         ;; afterwards would be reading freed memory.
+                         (let ((fields
+                                (list
+                                  (cons 'dev   (foreign-ref 'unsigned-64 sb uv-stat-dev-offset))
+                                  (cons 'mode  (foreign-ref 'unsigned-64 sb uv-stat-mode-offset))
+                                  (cons 'nlink (foreign-ref 'unsigned-64 sb uv-stat-nlink-offset))
+                                  (cons 'uid   (foreign-ref 'unsigned-64 sb uv-stat-uid-offset))
+                                  (cons 'gid   (foreign-ref 'unsigned-64 sb uv-stat-gid-offset))
+                                  (cons 'ino   (foreign-ref 'unsigned-64 sb uv-stat-ino-offset))
+                                  (cons 'size  (foreign-ref 'unsigned-64 sb uv-stat-size-offset))
+                                  (cons 'mtime-sec  (foreign-ref 'long sb uv-stat-mtime-sec-offset))
+                                  (cons 'mtime-nsec (foreign-ref 'long sb uv-stat-mtime-nsec-offset))
+                                  (cons 'ctime-sec  (foreign-ref 'long sb uv-stat-ctime-sec-offset))
+                                  (cons 'ctime-nsec (foreign-ref 'long sb uv-stat-ctime-nsec-offset)))))
+                           (uv-fs-req-cleanup req)
+                           (unless (fs-op-aborted? op)
+                             (deliver (fs-op-owner op) (vector 'file-stat fields)))
+                           (fs-cleanup! op req)))))
+                  ((unlink)
+                   (uv-fs-req-cleanup req)
+                   (if (< result 0)
+                       (fs-fail! op req result)
+                       (begin
+                         (unless (fs-op-aborted? op)
+                           (deliver (fs-op-owner op) (vector 'file-unlinked)))
+                         (fs-cleanup! op req))))
+                  ((scandir)
+                   (if (< result 0)
+                       (begin (uv-fs-req-cleanup req) (fs-fail! op req result))
+                       ;; ⛔ NOTHING MAY UNWIND OUT OF HERE INTO C. This is
+                       ;; a libuv callback (see the file header); an
+                       ;; exception crossing the C frame corrupts the
+                       ;; process. The copy loop below allocates one
+                       ;; Scheme string per entry, so on a large listing
+                       ;; it is the most likely place in this file to run
+                       ;; out of memory -- hence a guard that turns any
+                       ;; raise into an errno the owner can read.
+                       ;;
+                       ;; ⚠ ORDER: copy every name, THEN clean up, THEN
+                       ;; deliver. libuv owns the name buffers and
+                       ;; uv_fs_req_cleanup frees them, so a name
+                       ;; retained past the cleanup is a dangling
+                       ;; pointer. Nothing here keeps one.
+                       ;;
+                       ;; ⚠ AND IT IS O(N) INSIDE THE CALLBACK. The
+                       ;; scheduler is not running while this loop does;
+                       ;; a directory of a million entries pauses the
+                       ;; process for the length of a million string
+                       ;; allocations. That is the cost of one message
+                       ;; carrying a whole listing.
+                       (let ((ent (foreign-alloc uv-dirent-size)))
+                         (let ((names
+                                (guard (e (#t 'oom))
+                                  (let loop ((acc '()))
+                                    (if (< (uv-fs-scandir-next req ent) 0)
+                                        (reverse acc)
+                                        (let ((p (foreign-ref 'void* ent
+                                                   uv-dirent-name-offset)))
+                                          (loop
+                                            (cons (let rd ((i 0) (bs '()))
+                                                    (let ((b (foreign-ref 'unsigned-8 p i)))
+                                                      (if (fx= b 0)
+                                                          (utf8->string
+                                                            (u8-list->bytevector (reverse bs)))
+                                                          (rd (fx+ i 1) (cons b bs)))))
+                                                  acc))))))))
+                           (foreign-free ent)
+                           (uv-fs-req-cleanup req)
+                           (unless (fs-op-aborted? op)
+                             (deliver (fs-op-owner op)
+                               (if (eq? names 'oom)
+                                   (vector 'file-error uv-enomem)
+                                   (vector 'file-entries names))))
+                           (fs-cleanup! op req))))))))))
       (void*)
       void))
 
@@ -1733,6 +1841,82 @@
       (when (vector-ref st 4)
         (vector-set! st 4 #f)
         (c-close (vector-ref st 3)))))
+
+  ;; The three operations that need no descriptor: stat, unlink, scandir.
+  ;; One routine because their submission sequence is identical and only
+  ;; the libuv call at the end differs -- three copies would be three
+  ;; places to keep the region discipline in step.
+  ;;
+  ;; ⛔ fd IS -1 HERE AND MUST STAY -1, and that is not cosmetic. When the
+  ;; owner dies, uv-owner-died! reaches these ops through the same 'fs
+  ;; arm as a stream read: file-stream-close! marks the op aborted, the
+  ;; completion lands in fs-abort-step!, falls to its `else`, and calls
+  ;; fs-quiet-close! -- whose FIRST test is (< fd 0), and which therefore
+  ;; frees the request and delivers nothing. Give one of these ops an fd
+  ;; and that same path will close a descriptor it does not own. The
+  ;; reclaim path is correct for them BECAUSE the field is -1.
+  ;;
+  ;; ⚠ THE OPERATION IS THE PHASE, not the mode. fs-op-mode already means
+  ;; whole|stream -- the read pipeline's chunking policy, read in four
+  ;; places -- and on-fs-code dispatches on phase alone. These ops carry
+  ;; mode 'whole, which nothing on their path ever reads.
+  ;;
+  ;; The state vector is allocated before the region for the reason
+  ;; fs-start! gives: at that instant nothing is owned, so the only
+  ;; residual is the guard's own entry allocation, the file-wide floor.
+  (define (fs-start-simple! path owner phase)
+    (let ((st (vector #f #f #f -1 #f)) (op #f) (rc 0))
+      (with-interrupts-disabled
+        (guard (e (#t (fs-undo! st owner) (raise e)))
+          (set! op (make-fs-op owner path 'whole #f phase #f #f -1 0 0 '() 0 0))
+          (vector-set! st 0 (owner-index-prepare! 'fs))
+          (vector-set! st 1 (foreign-alloc fs-req-size))
+          (fs-op-req-set! op (vector-ref st 1))
+          (hashtable-set! fs-table (vector-ref st 1) op)
+          (owner-index-publish! owner (vector-ref st 0) (vector-ref st 1))
+          ;; INJECTION POINT 'fs-simple-submit-gap -- OWNING GUARD: the
+          ;; guard above. Same window and same consequence as
+          ;; 'fs-submit-gap-open: a published, unsubmitted op is only
+          ;; flagged by file-stream-close!, so its row and request would
+          ;; stay forever.
+          (inject-fault! 'fs-simple-submit-gap)
+          (set! rc
+            (case phase
+              ((stat)   (uv-fs-stat   uv-loop (vector-ref st 1) path on-fs-entry))
+              ((unlink) (uv-fs-unlink uv-loop (vector-ref st 1) path on-fs-entry))
+              (else     (uv-fs-scandir uv-loop (vector-ref st 1) path 0
+                                       on-fs-entry))))
+          ;; Set for the reason fs-start! sets it: the request is
+          ;; initialised and safe to clean whatever the call returned.
+          (vector-set! st 2 #t)
+          (when (< rc 0)
+            (fs-undo! st owner)
+            ;; Inside the region, and for fs-start!'s reason: owner need
+            ;; not be the caller, and it holds no handle to ask with.
+            (deliver owner (vector 'file-error rc)))))
+      op))
+
+  ;; -> #(file-stat ,alist) or #(file-error ,errno) to owner.
+  ;; ⭐ THE FIELDS ARE KEYED, NOT POSITIONAL. A consumer reads with assq,
+  ;; so a field added later breaks nothing that reads the ones before it.
+  ;; Times are delivered as seconds AND nanoseconds, unconverted: a
+  ;; consumer wanting milliseconds does that arithmetic itself, and one
+  ;; wanting the full resolution still has it.
+  (define (file-stat-async! path owner) (fs-start-simple! path owner 'stat))
+
+  ;; -> #(file-unlinked) or #(file-error ,errno) to owner.
+  (define (file-unlink-async! path owner) (fs-start-simple! path owner 'unlink))
+
+  ;; -> #(file-entries ,names) or #(file-error ,errno) to owner. Names
+  ;; only, without "." or "..", in whatever order the filesystem gave.
+  ;;
+  ;; ⚠ EVERY ENTRY IS DELIVERED; there is no cap. A directory with a
+  ;; million names produces a million strings, built inside the libuv
+  ;; callback -- see the scandir arm for what that costs. Truncating and
+  ;; reporting success would be worse: the consumer cannot tell a short
+  ;; listing from a complete one. A directory big enough for that to
+  ;; matter wants a batched opendir/readdir API, which this is not.
+  (define (file-scandir-async! path owner) (fs-start-simple! path owner 'scandir))
 
   (define (fs-start! path owner mode)
     ;; ⚠ THE STATE VECTOR AND THE GUARD'S OWN CONTINUATION ARE ALLOCATED

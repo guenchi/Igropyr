@@ -6,7 +6,12 @@
           so-listenqlimit sol-socket
           load-first-shared-object! shared-object-candidates
           addrinfo-address-offset addrinfo-next-offset
-          uv-stat-mode-offset uv-stat-size-offset)
+          uv-stat-dev-offset uv-stat-mode-offset uv-stat-nlink-offset
+          uv-stat-uid-offset uv-stat-gid-offset uv-stat-ino-offset
+          uv-stat-size-offset
+          uv-stat-mtime-sec-offset uv-stat-mtime-nsec-offset
+          uv-stat-ctime-sec-offset uv-stat-ctime-nsec-offset
+          uv-dirent-size uv-dirent-name-offset)
   (import (chezscheme) (igropyr util))
 
   (define machine-name (symbol->string (machine-type)))
@@ -113,8 +118,48 @@
       ((freebsd) 65535)                 ; 0xffff, from the same header
       (else #f)))
 
-  ;; libuv's uv_stat_t is a platform-independent struct of uint64_t fields
-  ;; before its timestamp fields.
-  (define uv-stat-mode-offset 8)
-  (define uv-stat-size-offset 56)
+  ;; ---- uv_stat_t ------------------------------------------------------
+  ;; libuv's own struct, not the platform's: twelve uint64_t fields, then
+  ;; four uv_timespec_t. Read from include/uv.h of libuv 1.52.1 (the
+  ;; version on the deployment machines) and cross-checked against 1.50.0
+  ;; locally -- the declaration is identical.
+  ;;
+  ;;   uint64_t st_dev st_mode st_nlink st_uid st_gid st_rdev
+  ;;            st_ino st_size st_blksize st_blocks st_flags st_gen
+  ;;   uv_timespec_t st_atim st_mtim st_ctim st_birthtim
+  ;;
+  ;; ⚠ THE TIMESTAMP OFFSETS ARE 64-BIT-SPECIFIC and the field offsets
+  ;; above them are not. uv_timespec_t is two `long`s: 16 bytes here, 8
+  ;; on a 32-bit target, where every offset from st_atim onward moves.
+  ;; The twelve uint64_t fields are the same width everywhere, so only
+  ;; the four timestamps carry that dependency -- which is why they are
+  ;; the only ones this comment singles out.
+  ;;
+  ;; ⭐ mode and size were here before the rest and their values were
+  ;; arrived at independently; recomputing the whole layout reproduced
+  ;; both. That agreement is the only check this table gets, so it is
+  ;; worth saying that it happened.
+  (define uv-stat-dev-offset         0)
+  (define uv-stat-mode-offset        8)
+  (define uv-stat-nlink-offset      16)
+  (define uv-stat-uid-offset        24)
+  (define uv-stat-gid-offset        32)
+  ;; st_rdev is 40 -- not exported, nothing asks for it yet
+  (define uv-stat-ino-offset        48)
+  (define uv-stat-size-offset       56)
+  ;; st_blksize 64, st_blocks 72, st_flags 80, st_gen 88 -- likewise
+  ;; st_atim is 96/104
+  (define uv-stat-mtime-sec-offset  112)
+  (define uv-stat-mtime-nsec-offset 120)
+  (define uv-stat-ctime-sec-offset  128)
+  (define uv-stat-ctime-nsec-offset 136)
+  ;; st_birthtim is 144/152
+
+  ;; ---- uv_dirent_t ----------------------------------------------------
+  ;; `{ const char* name; uv_dirent_type_t type; }` -- a pointer then an
+  ;; enum, padded to a pointer boundary. Only the name is read; the type
+  ;; is deliberately not surfaced yet (see the scandir comment in
+  ;; libuv.sc), so no offset is given for it.
+  (define uv-dirent-size 16)
+  (define uv-dirent-name-offset 0)
 )

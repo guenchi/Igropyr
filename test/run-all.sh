@@ -489,6 +489,9 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/q
 # item 5: fs-start-fd! owns its descriptor from its first instruction, with no
 # region around the call
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/fs-preregion.sc
+# item 12: stat / unlink / scandir on the thread pool; the ticker keeps ticking
+# during a 20k-entry scandir, and the synchronous call is the positive control
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/fs-async-ops.sc
 #   3. The poison-event suite lives in the same instrumented pass: its
 #      failure is injected at notify-list!'s entry, so it needs the
 #      hooks live and the sources, and it must not share a process with
