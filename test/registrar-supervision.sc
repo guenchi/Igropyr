@@ -141,12 +141,14 @@
               (check "R6-4: established via the re-run's resend, not via the child's 5 s timeout" (< dt 5000) 'ms dt))))))
     ;; ---- R6-9 a pre-touched 0 becomes generation 1 on the next authorisation
     ;; What this pins: the seam sees the stored 0 (it does not launder), and
-    ;; the connect that follows issues 1. What it cannot pin: peer-gen's own
-    ;; "0 is absent" guard -- by construction no attempt can observe a stored
-    ;; 0, because the tail that pre-touched it advances it in the same command
-    ;; and any attempt for that peer is behind it in the FIFO. The guard is
-    ;; defensive; a mutant that removes it stays green here, and that is the
-    ;; honest reading, not a defect of the cell.
+    ;; the connect that follows issues 1. What it does NOT yet pin: peer-gen's
+    ;; own "0 is absent" guard. That guard is reachable only if a death or a
+    ;; raise lands between the pre-placement and the advance -- set-endpoint's
+    ;; phase (a) spawns (allocates, and is a scheduling point) between the two
+    ;; -- which is R-e's window. No injection point exists there today, so no
+    ;; cell covers it: reachable and untested, not unreachable. A mutant that
+    ;; hands a stored 0 back stays green here for that reason. Queued: an
+    ;; injection point 'registrar-endpoint-after-spawn and a cell that arms it.
     ;; The registrar's tails pre-touch dial-gens with 0 before their region so
     ;; the advance inside it replaces in place; peer-gen must therefore treat
     ;; a stored 0 as absent (mint 1) -- generation 0 is never issued. The seam
