@@ -28,33 +28,22 @@
 
 (library (igropyr tls-core)
   (export
-          ;; OpenSSL / LibreSSL entry points
-          TLS_client_method TLS_server_method
-          SSL_CTX_new SSL_CTX_ctrl SSL_CTX_set_verify
-          SSL_CTX_set_default_verify_paths SSL_CTX_set_options
-          SSL_CTX_use_certificate_chain_file SSL_CTX_use_PrivateKey_file
-          SSL_CTX_check_private_key
-          SSL_set_bio SSL_set_connect_state SSL_set_accept_state
-          SSL_ctrl/string SSL_set1_host SSL_get0_param SSL_do_handshake
-          SSL_get_error SSL_read SSL_write SSL_shutdown SSL_get-peer-cert
-          X509_VERIFY_PARAM_set1_ip_asc X509_free X509_get_signature_nid
-          X509_digest OBJ_find_sigid_algs OBJ_nid2sn
-          EVP_get_digestbyname EVP_sha256
-          BIO_s_mem BIO_new BIO_read BIO_write BIO_ctrl_pending BIO_free
-          ERR_get_error ERR_peek_error ERR_peek_last_error ERR_clear_error
-          ERR_error_string_n ERR_set_mark ERR_pop_to_mark
-          ;; constants
-          SSL_VERIFY_PEER SSL_CTRL_SET_MIN_PROTO_VERSION TLS1_2_VERSION
-          SSL_CTRL_SET_TLSEXT_HOSTNAME SSL_ERROR_NONE SSL_ERROR_WANT_READ
-          SSL_ERROR_WANT_WRITE SSL_ERROR_ZERO_RETURN SSL_FILETYPE_PEM
-          SSL_OP_NO_RENEGOTIATION max-c-int
-          ;; error-queue discipline
-          with-openssl-scope with-ssl-call ssl-step
-          err-own-entry? bv-prefix->string err-entry->string
-          tls-reason ssl-reason-max ssl-drain-reason die
-          ;; sessions and contexts
-          tls-step! tls-session-retire! tls-session-new! tls-live-session-count
-          tls-session? tls-session-ssl tls-session-dead tls-error-attribution
+          ;; ⭐ NO OpenSSL ENTRY POINT IS EXPORTED. Everything a caller can do
+          ;; to a live session it does through the operations below, which take
+          ;; the session object; the SSL*, the BIOs and the raw bindings stay
+          ;; inside this library. (Still API curation, not a sandbox -- see the
+          ;; note at the session record.)
+          ;;
+          ;; session lifetime and operations
+          tls-session? tls-session-new! tls-session-retire! tls-session-poison!
+          tls-session-dead
+          tls-session-configure-client! tls-session-configure-server!
+          tls-session-handshake-step! tls-session-drain! tls-session-feed!
+          tls-session-encrypt! tls-session-decrypt! tls-session-peer-cb-hash
+          ;; errors
+          die tls-reason
+          ;; seams
+          tls-live-session-count tls-error-attribution
           client-ctx ensure-ctx! tls-listen-context! tls-context-retire!
           tls-context? tls-live-context-count
           tls-context-renegotiation-refused?
@@ -553,8 +542,16 @@
   ;; dead is the liveness cell: #f while the session is usable, otherwise the
   ;; message every later call raises. It is a box because the client codec's
   ;; regions already read and write it directly.
+  ;; rbio/wbio are held for access only: SSL_set_bio hands OWNERSHIP to the
+  ;; SSL, so SSL_free frees them and nothing here ever frees them again.
+  ;; After retirement the ssl field is #f and these two are dangling, which
+  ;; is why every operation below tests the session before dereferencing.
+  ;;
+  ;; scratch is per session rather than shared: the read loop fills it inside
+  ;; a region, and one buffer shared between sessions would be a second
+  ;; session's plaintext in the first one's port if the two ever interleaved.
   (define-record-type tls-session
-    (fields (mutable ssl) dead)
+    (fields (mutable ssl) dead rbio wbio scratch)
     (nongenerative)
     (sealed #t))
 
@@ -580,22 +577,44 @@
   ;; ordinary run, and shows up only as a leak the instrument stops seeing.
   (define (tls-session-new! c)
     (ensure-loaded!)
-    ;; the pointer is read out here and nowhere else: a retired context is a
-    ;; checked error, not a dereference of freed memory.
     (let ((p (and (tls-context? c) (tls-context-ptr c))))
       (unless p (die "tls: context has been retired"))
-    (let ((s (SSL_new p)))
-      (and (not (zero? s))
-           (begin
-             (with-interrupts-disabled (set! live-sessions (fx+ live-sessions 1)))
-             (make-tls-session s (box #f)))))))
+      ;; allocated OUTSIDE the region: 16 KiB inside a scope would be the one
+      ;; allocation in it that is not an OpenSSL call.
+      (let* ((scratch (make-bytevector 16384))
+             (r (with-openssl-scope
+                  (let ((rbio (BIO_new (BIO_s_mem)))
+                        (wbio (BIO_new (BIO_s_mem))))
+                    (if (or (zero? rbio) (zero? wbio))
+                        (begin
+                          ;; free whichever succeeded: ownership passes to the
+                          ;; SSL only at SSL_set_bio below
+                          (unless (zero? rbio) (BIO_free rbio))
+                          (unless (zero? wbio) (BIO_free wbio))
+                          (cons "tls: BIO_new failed" #f))
+                        (let ((s (SSL_new p)))
+                          (if (zero? s)
+                              ;; the reason must come from THIS call, read in
+                              ;; the same scope, and not be eaten by the frees
+                              (let ((why (tls-reason "tls: SSL_new failed")))
+                                (BIO_free rbio) (BIO_free wbio)
+                                (cons why #f))
+                              (begin
+                                (set! live-sessions (fx+ live-sessions 1))
+                                (SSL_set_bio s rbio wbio)
+                                (cons #f (make-tls-session
+                                           s (box #f) rbio wbio scratch))))))))))
+        (when (car r) (die (car r)))
+        (cdr r))))
 
-  ;; THE SINGLE FREE, and it frees exactly once. Setting a flag and then
-  ;; freeing was two acts: a process killed between them left a session that
-  ;; the close hook would skip (the flag said "done") and that nothing else
-  ;; would ever free. Whoever gets here first inside the region does both or
-  ;; neither -- so a second call, from either side of an ownership handover,
-  ;; is a no-op rather than a double free.
+  ;; A failure that touched TLS state: the session is finished, and the FIRST
+  ;; caller still gets its own message. What is stored is the sentence later
+  ;; callers get, and it says plainly that this is a second use of a broken
+  ;; codec rather than a second TLS fault.
+  (define (tls-session-poison! sess msg)
+    (tls-session-retire!
+      sess (string-append "tls: codec is unusable after previous failure: " msg)))
+
   ;; ⛔ THE GUARD IS THE SSL FIELD, NOT THE MESSAGE. An earlier version
   ;; tested (unbox dead), which conflates "has something to say" with "has
   ;; been retired" -- two different facts that happen to travel together on
@@ -618,6 +637,142 @@
           (set! live-sessions (fx- live-sessions 1))
           (unless (zero? ssl)
             (SSL_free ssl))))))            ; frees both BIOs too (SSL owns them)
+
+  ;; ---- session operations ------------------------------------------------
+  ;;
+  ;; ⭐ EVERY OpenSSL CALL ON A LIVE SESSION GOES THROUGH ONE OF THESE. They
+  ;; take the session object, never a bare SSL*, so a caller cannot reach the
+  ;; pointer, cannot free it, and cannot use one that has been retired: each
+  ;; entry point tests the liveness cell inside the same region it uses the
+  ;; pointer in. What is left outside this library is the transport -- sockets,
+  ;; timeouts, actor messages -- which is the whole of the cut.
+
+  ;; Client posture on a fresh session. -> #f, or the message to raise.
+  ;; Split from tls-session-new! so the caller can tie the free to its
+  ;; connection between the two: the session exists after the constructor and
+  ;; a kill can land before this runs.
+  (define (tls-session-configure-client! sess host)
+    (let ((ssl (tls-session-ssl sess))
+          (dead (tls-session-dead sess)))
+      (or (with-openssl-scope
+            (cond
+              ((unbox dead))
+              ((not ssl) "tls: session has been retired")
+              ((ip-literal? host)
+               (and (zero? (X509_VERIFY_PARAM_set1_ip_asc
+                             (SSL_get0_param ssl) host))
+                    "tls: bad ip literal"))
+              (else
+                ;; SNI is checked too: it can fail, and a handshake that went
+                ;; ahead WITHOUT the extension gets whatever certificate the
+                ;; virtual host serves by default.
+                (cond
+                  ((zero? (SSL_ctrl/string
+                            ssl SSL_CTRL_SET_TLSEXT_HOSTNAME 0 host))
+                   "tls: could not set SNI host name")
+                  ((zero? (SSL_set1_host ssl host))
+                   "tls: SSL_set1_host failed")
+                  (else #f)))))
+          ;; the last configuration call, in its own region
+          (with-interrupts-disabled
+            (let ((d (unbox dead)))
+              (unless d (SSL_set_connect_state ssl))
+              d)))))
+
+  ;; Server posture: the mirror of the above, and the only other way a session
+  ;; is put into a handshake state.
+  (define (tls-session-configure-server! sess)
+    (with-interrupts-disabled
+      (let ((d (unbox (tls-session-dead sess))))
+        (unless d (SSL_set_accept_state (tls-session-ssl sess)))
+        d)))
+
+  ;; One handshake step. Two values: verdict and payload (see tls-step!).
+  (define (tls-session-handshake-step! sess retire-on-failure?)
+    (tls-step! (tls-session-dead sess)
+               (if retire-on-failure?
+                   (lambda (m) (tls-session-poison! sess m))
+                   (lambda (m) (void)))
+               (tls-session-ssl sess)
+               "tls handshake failed"))
+
+  ;; Everything the write BIO holds, or #f. Never retires: a drain on a dead
+  ;; session simply has nothing to give.
+  (define (tls-session-drain! sess)
+    (with-openssl-scope
+      (and (not (unbox (tls-session-dead sess)))
+           (tls-session-ssl sess)
+           (drain-wbio (tls-session-wbio sess)))))
+
+  ;; Feed ciphertext in. -> #f, or (kind . message); kind is 'arg when nothing
+  ;; was touched and 'state when the session was retired by the failure.
+  (define (tls-session-feed! sess bv)
+    (bio-write! (tls-session-dead sess)
+                (lambda (m) (tls-session-poison! sess m))
+                (tls-session-rbio sess) bv))
+
+  ;; Plaintext in, ciphertext out. Raises the stored message on a dead session.
+  (define (tls-session-encrypt! sess bv)
+    (let ((ssl (tls-session-ssl sess))
+          (dead (tls-session-dead sess))
+          (n (bytevector-length bv)))
+      (cond
+        ;; A RETIRED SESSION ANSWERS THE SAME TO EVERY BYTEVECTOR. Without
+        ;; this an empty buffer would return successfully from a dead session.
+        ((unbox dead) => die)
+        ((zero? n) empty-bv)
+        ;; the length argument is a C int; a longer plaintext would be
+        ;; truncated by the conversion and its tail never encrypted. Decided
+        ;; before OpenSSL is entered, so the session stays usable.
+        ((> n max-c-int) (die "tls: plaintext segment too large"))
+        (else
+          (let-values (((gone err)
+                        (with-ssl-call
+                          (let ((d (unbox dead)))
+                            (if d
+                                (values d #f)
+                                (values #f
+                                        (let ((bad (not (= n (SSL_write ssl bv n)))))
+                                          (and bad
+                                               (let ((m (ssl-drain-reason
+                                                          "tls write failed")))
+                                                 (tls-session-poison! sess m)
+                                                 m)))))))))
+            (when gone (die gone))
+            (when err (die err))
+            (or (tls-session-drain! sess) empty-bv))))))
+
+  ;; Ciphertext in. Two values: the plaintext read out, and #t when the peer's
+  ;; close_notify ended the stream.
+  ;;
+  ;; ⭐ THE close_notify IS REPORTED, NOT ACTED ON. Synthesising the transport
+  ;; EOF is the caller's business -- it owns the socket and the mailbox -- and
+  ;; doing it here would put an actor send inside this library.
+  (define (tls-session-decrypt! sess raw)
+    (let ((ssl (tls-session-ssl sess))
+          (dead (tls-session-dead sess))
+          (scratch (tls-session-scratch sess)))
+      (cond ((unbox dead) => die))
+      (let ((werr (tls-session-feed! sess raw)))
+        (when werr (die (cdr werr))))
+      (let-values (((port get) (open-bytevector-output-port)))
+        (let loop ((eof? #f))
+          (let-values (((gone n code reason)
+                        (ssl-step dead (lambda (m) (tls-session-poison! sess m))
+                                  ssl "tls read failed"
+                                  (SSL_read ssl scratch 16384))))
+            (cond
+              (gone (die gone))
+              ((> n 0) (put-bytevector port scratch 0 n) (loop eof?))
+              ((= code SSL_ERROR_WANT_READ) (values (get) eof?))
+              ((= code SSL_ERROR_ZERO_RETURN) (values (get) #t))
+              ;; a fatal read finishes the inbound record stream -- a TLS
+              ;; session cannot be resynchronised past one
+              (else (die (or reason "tls read failed")))))))))
+
+  ;; RFC 5929 tls-server-end-point, or #f.
+  (define (tls-session-peer-cb-hash sess)
+    (peer-cb-hash (tls-session-dead sess) (tls-session-ssl sess)))
 
   (meta define tls-seam-mode
     (let ((v (getenv "IGROPYR_INJECT")))
@@ -680,6 +835,145 @@
          "test seam: this artifact was expanded without IGROPYR_INJECT=on"))))
 
   ;; ---- context (one per program) ------------------------------------------
+
+  ;; ---- byte plumbing and certificate helpers (moved from (igropyr tls)
+  ;; in stage 2a: they touch OpenSSL, so they belong on this side of the
+  ;; cut; nothing here reads or writes a socket) --------------------------
+
+  ;; ---- helpers -------------------------------------------------------------
+
+  ;; a dotted-quad or colon-hex literal? (then verify as IP, and no SNI)
+  (define (ip-literal? host)
+    (let ((n (string-length host)))
+      (let loop ((i 0) (digits-and-dots #t))
+        (if (= i n)
+            digits-and-dots
+            (let ((ch (string-ref host i)))
+              (cond ((char=? ch #\:) #t)     ; any colon: IPv6 literal
+                    ((or (char-numeric? ch) (char=? ch #\.))
+                     (loop (+ i 1) digits-and-dots))
+                    (else (loop (+ i 1) #f))))))))
+
+  ;; everything the wbio holds, as a fresh bytevector (or #f when empty)
+  ;;
+  ;; BIO_READ'S RETURN VALUE DECIDES THE LENGTH, not BIO_ctrl_pending.
+  ;; Sizing the buffer from pending and then keeping all of it assumed the
+  ;; read filled it exactly; when it does not, the tail of the bytevector
+  ;; is uninitialised memory that goes out on the socket as ciphertext, and
+  ;; the bytes actually still in the BIO are dropped. Reading in a loop
+  ;; keeps the property that matters: every byte reported is a byte the
+  ;; BIO actually handed over, and nothing is invented. The per-read size
+  ;; is capped at C int range, which the loop then walks.
+  ;;
+  ;; TWO CONDITIONS END IT EARLY, and neither loses data -- a memory BIO
+  ;; is FIFO, so later output queues behind whatever is left and the next
+  ;; drain still emits in order:
+  ;;   - a read that delivers nothing while bytes are still pending. This
+  ;;     should not happen for a memory BIO, but the loop has to terminate
+  ;;     on it rather than spin.
+  ;;   - more than C int range accumulated in one call, which bounds the
+  ;;     bytevector returned.
+  ;; So a caller must not assume one call empties the BIO. Every drain
+  ;; site here is reached again -- each handshake step, each decrypt, each
+  ;; encrypt -- and what is left goes out on the next one.
+  (define (drain-wbio wbio)
+    (let loop ((chunks '()) (total 0))
+      (let ((n (BIO_ctrl_pending wbio)))
+        (if (or (= n 0) (> total max-c-int))
+            (and (pair? chunks) (join-chunks (reverse chunks) total))
+            (let* ((k (if (> n max-c-int) max-c-int n))
+                   (bv (make-bytevector k))
+                   (rc (BIO_read wbio bv k)))
+              (cond
+                ((fx= rc k) (loop (cons bv chunks) (+ total k)))
+                ((fx> rc 0)
+                 (let ((part (make-bytevector rc)))
+                   (bytevector-copy! bv 0 part 0 rc)
+                   (loop (cons part chunks) (+ total rc))))
+                (else (and (pair? chunks) (join-chunks (reverse chunks) total)))))))))
+
+  (define (join-chunks chunks total)
+    (if (null? (cdr chunks))
+        (car chunks)
+        (let ((out (make-bytevector total)))
+          (let loop ((cs chunks) (off 0))
+            (if (null? cs)
+                out
+                (let ((n (bytevector-length (car cs))))
+                  (bytevector-copy! (car cs) 0 out off n)
+                  (loop (cdr cs) (+ off n))))))))
+
+  ;; Ciphertext INTO a memory BIO: all of it or none of it.
+  ;;
+  ;; A memory BIO grows to take what it is given, so a short write is not
+  ;; backpressure -- it is an allocation failure, and the bytes that did
+  ;; not fit are gone from a stream that cannot tolerate a hole. The
+  ;; return value used to be discarded at both call sites, so such a
+  ;; connection carried on and failed later as a decryption error with no
+  ;; trace of where the gap came from.
+  ;; -> #f on success, or (kind . message). The caller raises the message;
+  ;;   the retiring, where it is due, has already happened in here.
+  ;;      'dead  the codec was already unusable; message is the stored one
+  ;;      'arg   the CALLER's input was impossible, before OpenSSL was
+  ;;             touched -- nothing is broken and a smaller segment works
+  ;;      'state the BIO took part of it; the record stream now has a hole,
+  ;;             and the codec has been retired inside the region that saw it
+  (define (bio-write! dead poison! bio bv)
+    (let ((n (bytevector-length bv)))
+      (cond
+        ((unbox dead) => (lambda (d) (cons 'dead d)))
+        ((fx= n 0) #f)
+        ((> n max-c-int)
+         (cons 'arg "tls: ciphertext segment too large for this platform"))
+        (else
+          (with-openssl-scope
+            (let ((d (unbox dead)))
+              (if d
+                  (cons 'dead d)
+                  (let ((rc (BIO_write bio bv n)))
+                    (and (not (fx= rc n))
+                         (let ((m (tls-reason
+                                    "tls: could not buffer ciphertext")))
+                           ;; retired HERE, still inside the region that
+                           ;; saw the hole appear
+                           (poison! m)
+                           (cons 'state m)))))))))))
+
+  (define empty-bv (make-bytevector 0))
+
+  (define NID-md5 4)
+
+  (define NID-sha1 64)
+
+  ;; Scoped: several of these push on failure (no peer certificate, an
+  ;; unknown signature OID), and this runs once at the end of a handshake
+  ;; whose entries nobody is going to read.
+  (define (peer-cb-hash dead ssl)
+   (with-openssl-scope
+    (let ((x (if (unbox dead) 0 (SSL_get-peer-cert ssl))))
+      (if (zero? x)
+          #f
+          (let ((dignid-bv (make-bytevector 4 0))
+                (pknid-bv (make-bytevector 4 0)))
+            (if (zero? (OBJ_find_sigid_algs (X509_get_signature_nid x)
+                                            dignid-bv pknid-bv))
+                (begin (X509_free x) #f)
+                (let* ((dignid (bytevector-s32-native-ref dignid-bv 0))
+                       (md (if (or (= dignid NID-md5) (= dignid NID-sha1))
+                               (EVP_sha256)
+                               (let ((sn (OBJ_nid2sn dignid)))
+                                 (if sn (EVP_get_digestbyname sn) 0)))))
+                  (if (zero? md)
+                      (begin (X509_free x) #f)
+                      (let ((buf (make-bytevector 64 0))
+                            (lenbv (make-bytevector 4 0)))
+                        (let ((r (X509_digest x md buf lenbv)))
+                          (X509_free x)
+                          (and (= r 1)
+                               (let* ((n (bytevector-u32-native-ref lenbv 0))
+                                      (out (make-bytevector n)))
+                                 (bytevector-copy! buf 0 out 0 n)
+                                 out))))))))))))
 
   ;; ---- contexts ----------------------------------------------------------
   ;;
