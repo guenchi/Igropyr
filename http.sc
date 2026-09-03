@@ -2074,8 +2074,13 @@
   ;;                             ; e.g. an admin/metrics port that must not
   ;;                             ; be reachable off-box.
   ;;       (reuseport . #t)      ; SO_REUSEPORT bind: run N OS processes
-  ;;                             ; on the same port, kernel-balanced
-  ;;                             ; (Linux; not macOS)
+  ;;                             ; on the same port, kernel-balanced.
+  ;;                             ; libuv documents this for Linux 3.9+,
+  ;;                             ; DragonFlyBSD 3.6+, FreeBSD 12.0+,
+  ;;                             ; Solaris 11.4 and AIX 7.2.5+; NOT macOS.
+  ;;                             ; See tcp-listen! in libuv.sc for what
+  ;;                             ; FreeBSD actually uses and how far the
+  ;;                             ; evidence goes.
   ;;       (body-limit . N)))    ; request body cap in bytes (default 1 MiB,
   ;;                             ; 413 beyond it). PROCESS-GLOBAL: the last
   ;;                             ; http-listen wins across all servers in

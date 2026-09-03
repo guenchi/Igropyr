@@ -1476,7 +1476,32 @@
           (uv-timer-stop wakeup-timer))))
 
   ;; optional trailing arg: uv_tcp_bind flags (UV_TCP_REUSEPORT = 2,
-  ;; kernel-balanced multi-process listening; Linux/FreeBSD only)
+  ;; kernel-balanced multi-process listening).
+  ;;
+  ;; ⭐ FreeBSD IS ON THE LIST, AND IT REACHES IT BY A DIFFERENT OPTION.
+  ;; This matters here more than anywhere else: every igropyr deployment
+  ;; runs on FreeBSD, and a note saying "Linux only" would tell the one
+  ;; audience that needs this flag that it has nothing to gain.
+  ;;
+  ;; libuv's own header lists Linux 3.9+, DragonFlyBSD 3.6+, FreeBSD
+  ;; 12.0+, Solaris 11.4 and AIX 7.2.5+ -- and NOT macOS. On FreeBSD the
+  ;; kernel option is SO_REUSEPORT_LB, not SO_REUSEPORT: a different name
+  ;; with the load-balancing semantics Linux gives the plain one, which
+  ;; is why the platform note has to name the option and not just the
+  ;; system.
+  ;;
+  ;; ⚠ HOW FAR THE EVIDENCE GOES, because two different things are being
+  ;; claimed and only one of them is checked here:
+  ;;   - The platform list above is read from libuv's uv.h. Confirmed in
+  ;;     two versions independently: 1.50.0 (locally) and 1.52.1 (the
+  ;;     version installed on the deployment machines). They agree.
+  ;;   - That FreeBSD's path is SO_REUSEPORT_LB is read from libuv's
+  ;;     uv__sock_reuseport, in 1.52.1. NOT re-read here: this machine has
+  ;;     only libuv's headers installed, not its C source.
+  ;;   - ⛔ THAT IT ACTUALLY DISTRIBUTES CONNECTIONS ON OUR MACHINES HAS
+  ;;     NOT BEEN OBSERVED. That needs two processes on one port and a
+  ;;     load run, and nobody has done it. What is written above is what
+  ;;     libuv implements, not what we have measured.
   (define (tcp-listen! host port backlog on-accept . opts)
     (with-interrupts-disabled          ; shared sockaddr-buf: see tcp-connect!
     (let ((flags (if (pair? opts) (car opts) 0))
