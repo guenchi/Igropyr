@@ -228,6 +228,10 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script test/checked-off.sc
 "$scheme_bin" --script test/sse-framing.sc
 # the whole-request deadline must span head AND body, not restart between
 "$scheme_bin" --script test/request-deadline.sc
+# the OTHER arm of that timeout: a connection that sends nothing at all is
+# closed rather than held. Costs read-timeout-ms of wall clock because that
+# constant, unlike request-deadline-ms, has no setter to shorten it.
+"$scheme_bin" --script test/idle-close.sc
 "$scheme_bin" --script test/http-client-stream.sc
 # connection reuse, counted at the SERVER (accepts vs requests served),
 # plus the cases that must NOT be pooled and the stale-handout retry
