@@ -825,7 +825,12 @@
   ;; ⭐ BEING DERIVED IS ALSO WHY EVICTION CANNOT FAIL, and that is the
   ;; part worth guarding. There is no retiring table, so there is no
   ;; insertion into one, so there is nothing on that path that allocates
-  ;; and nothing that can raise for want of memory. Storing the phase
+  ;; and nothing that can raise for want of memory.
+  ;;
+  ;; ⚠ ONE EXCEPTION EXISTS AND IT IS NOT ON THIS PATH: next-event-seq!
+  ;; allocates when the sequence counter first exceeds a fixnum. It is
+  ;; named there, with why it is not fixed. Sentences like the one above
+  ;; are only true because that one is written down somewhere. Storing the phase
   ;; instead -- a set of retiring nodes, say -- would put a failable
   ;; allocation back inside the splice, and a splice that can fail is a
   ;; cleanup that can fail, which is the shape this design refused.
@@ -2242,6 +2247,31 @@
   ;; it as one.
   (define event-seq-counter 0)
 
+  ;; ⛔ THIS IS THE ONE ALLOCATING STEP LEFT ON THE ENQUEUE PATH, and it
+  ;; is the exception to every "nothing here allocates" written around
+  ;; qhead-enqueue! and the eviction splice. The increment is generic `+`,
+  ;; not fx+: one past the largest fixnum it builds a BIGNUM, and building
+  ;; one allocates, and allocation can raise. It runs with the caller
+  ;; holding the region, so a raise there is a raise inside the region
+  ;; those other comments describe as failure-free.
+  ;;
+  ;; ⭐ CONSIDERED AND DELIBERATELY NOT FIXED. fx+ with wraparound or
+  ;; saturation removes the allocation and takes monotonicity with it,
+  ;; and monotonicity is the whole content of a sequence number --
+  ;; consumers compare these, and a counter that wraps makes an old event
+  ;; compare as newer than a new one. Measured on this Chez: the ceiling
+  ;; is (most-positive-fixnum) = 2^60-1, so at a MILLION events a second
+  ;; the first bignum arrives after about 36,000 years. The exception is
+  ;; recorded rather than closed, because closing it costs the property
+  ;; the field exists for.
+  ;;
+  ;; ⚠ READERS MUST NOT DO FX ARITHMETIC ON A seq, and this is an
+  ;; EXTERNAL contract, not an internal convention: the value leaves the
+  ;; library in `#(node-up name token seq)` from monitor-node/token.
+  ;; Inside, every reader today only displays it, stores it in a vector,
+  ;; or compares it with equal? -- checked, not assumed. An application
+  ;; that reaches for fx= or fx< on it is correct for 36,000 years and
+  ;; then is not.
   (define (next-event-seq!)                   ; caller holds the region
     (set! event-seq-counter (+ event-seq-counter 1))
     event-seq-counter)
