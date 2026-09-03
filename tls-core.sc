@@ -56,8 +56,17 @@
           tls-step! tls-session-retire! tls-session-new! tls-live-session-count
           tls-session? tls-session-ssl tls-session-dead tls-error-attribution
           client-ctx ensure-ctx! tls-listen-context! tls-context-retire!
+          tls-context? tls-live-context-count
+          tls-context-renegotiation-refused?
           )
-  (import (chezscheme) (igropyr platform))
+  ;; ⭐ (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- the same
+  ;; arrangement libuv.sc documents. Its macros expand to the guarded
+  ;; expression or to nothing unless IGROPYR_INJECT was on when this file was
+  ;; compiled, so an ordinary build refers to none of its runtime part.
+  ;;
+  ;; ⚠ (igropyr libuv) MUST NOT APPEAR HERE. That is the whole reason this
+  ;; library exists; adding it recreates the cycle it was split out to break.
+  (import (chezscheme) (igropyr platform) (igropyr inject))
 
   ;; ---- OpenSSL entry points, bound on first use -------------------------
   ;;
@@ -151,6 +160,11 @@
   (define-ffi SSL_read          (foreign-procedure "SSL_read" (void* u8* int) int))
   (define-ffi SSL_write         (foreign-procedure "SSL_write" (void* u8* int) int))
   (define-ffi SSL_shutdown      (foreign-procedure "SSL_shutdown" (void*) int))
+  ;; Both OpenSSL and LibreSSL export this as a real function (verified
+  ;; here: crypto.h:181 declares it, libcrypto exports it, and it returns
+  ;; 0x30600030 on the 3.6.3 this is developed against).
+  (define-ffi OpenSSL_version_num
+    (foreign-procedure "OpenSSL_version_num" () unsigned-long))
 
   ;; ---- server side ------------------------------------------------------
   ;; Bound here, unused by the client half. A context built by
@@ -522,9 +536,16 @@
   ;; comes back down. A caller that reached for SSL_new directly would open a
   ;; session this counter never saw.
   ;; ⭐ THE SSL POINTER DOES NOT LEAVE THIS LIBRARY AS A BARE VALUE. SSL_new
-  ;; and SSL_free are not exported, so no caller can open a session this
-  ;; counter never saw, and no caller can free one twice: creation and
-  ;; retirement are the two procedures below and there is no third way in.
+  ;; and SSL_free are not exported, so creation and retirement are the two
+  ;; procedures below and a cooperating caller has no third way in.
+  ;;
+  ;; ⚠ THIS IS API CURATION, NOT A SECURITY BOUNDARY, and the difference
+  ;; matters enough to write down. Any caller may import this library and
+  ;; bind SSL_free itself with foreign-procedure, or call the exported
+  ;; SSL_CTX_set_verify on the client context and turn verification off for
+  ;; every later connection. Against hostile code in the same process no
+  ;; export list can be a sandbox. What this prevents is accidental misuse
+  ;; by cooperating modules, which is the whole of the claim.
   ;; The ssl field is mutable because retirement detaches it before the free
   ;; -- v3's "clear the pointer, then free" -- so a retired session reads as
   ;; #f rather than as a dangling pointer.
@@ -559,11 +580,15 @@
   ;; ordinary run, and shows up only as a leak the instrument stops seeing.
   (define (tls-session-new! c)
     (ensure-loaded!)
-    (let ((s (SSL_new c)))
+    ;; the pointer is read out here and nowhere else: a retired context is a
+    ;; checked error, not a dereference of freed memory.
+    (let ((p (and (tls-context? c) (tls-context-ptr c))))
+      (unless p (die "tls: context has been retired"))
+    (let ((s (SSL_new p)))
       (and (not (zero? s))
            (begin
              (with-interrupts-disabled (set! live-sessions (fx+ live-sessions 1)))
-             (make-tls-session s (box #f))))))
+             (make-tls-session s (box #f)))))))
 
   ;; THE SINGLE FREE, and it frees exactly once. Setting a flag and then
   ;; freeing was two acts: a process killed between them left a session that
@@ -617,6 +642,33 @@
   ;; recomputed, so a build that decided at the wrong moment reports the
   ;; answer it actually decided on. Calling err-own-entry? only peeks or
   ;; counts; it consumes nothing from the error queue.
+  ;; -> how many SSL_CTX this library currently holds. +1 at construction,
+  ;; -1 in tls-context-retire!, the same shape as the session counter.
+  (meta-cond
+    ((eq? tls-seam-mode 'on)
+     (define (tls-live-context-count)
+       (with-interrupts-disabled live-contexts)))
+    (else
+     (define (tls-live-context-count)
+       (assertion-violation 'tls-live-context-count
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"))))
+
+  ;; -> whether THIS context actually had SSL_OP_NO_RENEGOTIATION applied.
+  ;;
+  ;; ⭐ IT READS THE RECORDED FACT AND DOES NOT RECOMPUTE THE VERSION TEST. A
+  ;; seam that re-derived the answer would run its own test at its own moment
+  ;; and agree with itself, so a build whose version test is wrong would still
+  ;; report "refused" -- the mutation this exists to catch would be invisible.
+  ;; Same discipline as tls-error-attribution.
+  (meta-cond
+    ((eq? tls-seam-mode 'on)
+     (define (tls-context-renegotiation-refused? c)
+       (tls-context-reneg-refused? c)))
+    (else
+     (define (tls-context-renegotiation-refused? c)
+       (assertion-violation 'tls-context-renegotiation-refused?
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"))))
+
   (meta-cond
     ((eq? tls-seam-mode 'on)
      (define (tls-error-attribution)
@@ -629,11 +681,33 @@
 
   ;; ---- context (one per program) ------------------------------------------
 
-  (define ctx 0)
+  ;; ---- contexts ----------------------------------------------------------
+  ;;
+  ;; ⭐ A CONTEXT IS A RECORD BECAUSE RETIREMENT HAS TO BE ENFORCEABLE. Handing
+  ;; back the bare SSL_CTX* could not be: Scheme passes it by value, so freeing
+  ;; it cannot clear the caller's copy, retiring the same address twice was a
+  ;; double free with nothing able to notice, and any integer at all could be
+  ;; handed to the retire procedure and reach native code. The pointer field is
+  ;; mutable and swapped to #f by retirement, so a second retire is a no-op and
+  ;; a use after retirement is a checked error rather than a dereference of
+  ;; freed memory.
+  ;;
+  ;; reneg-refused? records, at construction, whether SSL_OP_NO_RENEGOTIATION
+  ;; was actually applied -- see tls-listen-context! for why that has to be a
+  ;; recorded fact rather than something recomputed later.
+  (define-record-type tls-context
+    (fields (mutable ptr) reneg-refused?)
+    (nongenerative)
+    (sealed #t))
+
+  (define live-contexts 0)
+
+  (define ctx #f)
 
   ;; The client context is read by the establish! path in (igropyr tls).
   ;; It is handed out through a procedure because ensure-ctx! assigns it,
-  ;; and an assigned variable cannot be exported.
+  ;; and an assigned variable cannot be exported. What comes back is the
+  ;; RECORD: the bare pointer never leaves this library.
   (define (client-ctx) ctx)
 
   ;; EVERY POSTURE CALL IS CHECKED, because each one of them is a claim
@@ -652,30 +726,65 @@
     (ensure-loaded!)
     (let ((err
             (with-openssl-scope
-              (if (not (zero? ctx))
+              ;; ⛔ THE GATE READS THE POINTER FIELD, NOT MERELY WHETHER A
+              ;; CONTEXT OBJECT EXISTS. When this tested a bare non-zero
+              ;; pointer, retiring the client singleton left the variable
+              ;; non-zero, so this branch decided the context was still good
+              ;; and never rebuilt it -- and every later client session ran
+              ;; against freed memory. Retirement now sets the field to #f,
+              ;; which is exactly the condition that must cause a rebuild.
+              (if (and ctx (tls-context-ptr ctx))
                   #f
                   (let ((c (SSL_CTX_new (TLS_client_method))))
                     (if (zero? c)
                         (tls-reason "tls: SSL_CTX_new failed")
-                        (let ((bad
-                                (cond
-                                  ((zero? (SSL_CTX_ctrl
-                                            c SSL_CTRL_SET_MIN_PROTO_VERSION
-                                            TLS1_2_VERSION 0))
-                                   (tls-reason "tls: could not require TLS >= 1.2"))
-                                  (else
-                                    (SSL_CTX_set_verify c SSL_VERIFY_PEER 0)
-                                    (and (zero? (SSL_CTX_set_default_verify_paths c))
-                                         (tls-reason "tls: no system trust store"))))))
-                          (cond
-                            (bad
-                              ;; free before raising: a caller in a reconnect
-                              ;; loop (e.g. a database pool retrying every
-                              ;; second) would otherwise leak one SSL_CTX per
-                              ;; attempt for the life of the misconfiguration
-                              (SSL_CTX_free c)
-                              bad)
-                            (else (set! ctx c) #f)))))))))
+                        (begin
+                          ;; ⭐ COUNTED AT ALLOCATION, for the reason spelled
+                          ;; out at the listener constructor: a context
+                          ;; abandoned between here and publication has leaked,
+                          ;; and a counter that only learns about it on the
+                          ;; success path reads 0 for exactly the failure it
+                          ;; exists to expose.
+                          (with-interrupts-disabled
+                            (set! live-contexts (fx+ live-contexts 1)))
+                          ;; ⭐ THE COMPENSATION COVERS ALLOCATION TO
+                          ;; PUBLICATION. Until ctx holds the record, nothing
+                          ;; else in the process can reach this context, so a
+                          ;; non-local exit here would leak it with no owner
+                          ;; and no way to observe it but the counter.
+                          (guard (e (#t (discard-context! c) (raise e)))
+                            (let ((bad
+                                    (cond
+                                      ((zero? (SSL_CTX_ctrl
+                                                c SSL_CTRL_SET_MIN_PROTO_VERSION
+                                                TLS1_2_VERSION 0))
+                                       (tls-reason "tls: could not require TLS >= 1.2"))
+                                      (else
+                                        (SSL_CTX_set_verify c SSL_VERIFY_PEER 0)
+                                        (and (zero? (SSL_CTX_set_default_verify_paths c))
+                                             (tls-reason "tls: no system trust store"))))))
+                              (cond
+                                (bad
+                                  ;; free before raising: a caller in a reconnect
+                                  ;; loop (e.g. a database pool retrying every
+                                  ;; second) would otherwise leak one SSL_CTX per
+                                  ;; attempt for the life of the misconfiguration.
+                                  ;; This returns normally, so the guard above
+                                  ;; does not also fire.
+                                  (discard-context! c)
+                                  bad)
+                                (else
+                                  ;; INJECTION POINT 'tls-client-context-after-alloc
+                                  ;; -- OWNING GUARD: the compensation guard just
+                                  ;; above, which discards the context and
+                                  ;; re-raises. Placed before publication, which
+                                  ;; is the window the guard exists for.
+                                  (inject-fault! 'tls-client-context-after-alloc)
+                                  ;; the client context deliberately does NOT
+                                  ;; refuse renegotiation: the read path carries
+                                  ;; a server-initiated one (see (igropyr tls)).
+                                  (set! ctx (make-tls-context c #f))
+                                  #f)))))))))))
       (when err (die err))))
 
   ;; ---- server context (one per listener) ----------------------------------
@@ -713,18 +822,71 @@
   ;; deliberately not exported: a listener incarnation holds exactly one
   ;; reference to its context and retires it once at teardown, and a context
   ;; freed by any other hand is a listener generation that leaks one.
+  ;; Free a context that never became a tls-context, and give back the count
+  ;; taken at allocation. Both discard paths in the constructor use this, so
+  ;; the pair cannot drift apart.
+  (define (discard-context! c)
+    (with-interrupts-disabled
+      (set! live-contexts (fx- live-contexts 1))
+      (SSL_CTX_free c)))
+
   (define (tls-context-retire! c)
-    (unless (zero? c) (SSL_CTX_free c)))
+    (with-interrupts-disabled
+      (let ((p (tls-context-ptr c)))
+        (when p
+          (tls-context-ptr-set! c #f)
+          (set! live-contexts (fx- live-contexts 1))
+          (SSL_CTX_free p)))))
 
   (define (file-reason default path)
     (string-append (tls-reason default) " [" path "]"))
 
   (define (tls-listen-context! cert-chain-path key-path)
     (ensure-loaded!)
+    ;; ⛔ CHECKED BEFORE ANYTHING IS ALLOCATED. What this uniquely provides is
+    ;; THE ERROR ITSELF: a tls-error naming the wrong argument, instead of a
+    ;; Chez FFI type error raised from inside one of the loading calls.
+    ;;
+    ;; ⚠ IT IS NOT WHAT PREVENTS THE LEAK -- not any more. It was, when the
+    ;; compensation guard below opened after the cond; the guard was then
+    ;; widened to cover the loading calls, so a raise there is discarded and
+    ;; counted back whether or not this check exists. Measured: with this
+    ;; check removed the context count stays 0 and only the error TYPE goes
+    ;; red. The two mechanisms now shadow each other -- deleting either one
+    ;; alone leaves the leak cell green -- and the cell that still
+    ;; discriminates THIS line is the one asserting a tls-error.
+    (unless (and (string? cert-chain-path) (string? key-path))
+      (die "tls: certificate and key paths must be strings"))
     (let ((r (with-openssl-scope
                (let ((c (SSL_CTX_new (TLS_server_method))))
                  (if (zero? c)
-                     (cons (tls-reason "tls: SSL_CTX_new failed") 0)
+                     (cons (tls-reason "tls: SSL_CTX_new failed") #f)
+                     (begin
+                     ;; ⭐ COUNTED AT ALLOCATION, NOT AT PUBLICATION -- the same
+                     ;; argument as tls-session-new! above, and it was got
+                     ;; wrong here first. Counting on the success path meant a
+                     ;; context abandoned between here and publication was one
+                     ;; the counter had never seen: it leaked, and the reading
+                     ;; stayed 0. That is not merely an under-count, it is an
+                     ;; instrument that cannot see the failure it exists for --
+                     ;; deleting the compensating guard below left every cell
+                     ;; green. What is measured is live SSL_CTX allocations, so
+                     ;; the count is taken where the allocation happens and
+                     ;; given back on each path that frees it.
+                     (with-interrupts-disabled
+                       (set! live-contexts (fx+ live-contexts 1)))
+                     ;; ⛔ THE GUARD OPENS HERE, BEFORE THE COND, AND THAT
+                     ;; POSITION IS THE POINT OF IT. It used to open after
+                     ;; the cond -- it was written by replacing the success
+                     ;; BRANCH -- which left the four loading calls below
+                     ;; outside it. Those calls are lazily bound, so on a
+                     ;; library missing any one of them the first call
+                     ;; raises while resolving the symbol: exactly the class
+                     ;; this guard exists for, and exactly the class it did
+                     ;; not cover. Measured in a shadow tree: with the guard
+                     ;; after the cond a raise there left the context count
+                     ;; at 1; opening it here returns it to 0.
+                     (guard (e (#t (discard-context! c) (raise e)))
                      (let ((bad
                              (cond
                                ((zero? (SSL_CTX_ctrl
@@ -735,8 +897,15 @@
                                          c cert-chain-path))
                                 (file-reason "tls: cannot load certificate chain"
                                              cert-chain-path))
-                               ((zero? (SSL_CTX_use_PrivateKey_file
-                                         c key-path SSL_FILETYPE_PEM))
+                               ;; INJECTION POINT 'tls-context-during-load -- OWNING GUARD:
+                               ;; the compensation guard above, which discards the context and
+                               ;; re-raises. It sits INSIDE the cond, between the two loads,
+                               ;; because that is the region the guard was widened to cover;
+                               ;; without a point here nothing holds the guard at its new
+                               ;; position and shrinking it back passes every cell.
+                               ((begin (inject-fault! 'tls-context-during-load)
+                                       (zero? (SSL_CTX_use_PrivateKey_file
+                                                c key-path SSL_FILETYPE_PEM)))
                                 (file-reason "tls: cannot load private key"
                                              key-path))
                                ;; ⚠ NOT THE CATCHER IN THIS LOAD ORDER, and
@@ -757,12 +926,74 @@
                                   (tls-reason
                                     "tls: private key does not match the certificate")
                                   " [key " key-path ", cert " cert-chain-path "]"))
-                               (else
-                                 (SSL_CTX_set_options c SSL_OP_NO_RENEGOTIATION)
-                                 #f))))
+                               (else #f))))
                        (if bad
-                           (begin (SSL_CTX_free c) (cons bad 0))
-                           (cons #f c))))))))
+                           (begin (discard-context! c) (cons bad #f))
+                           ;; ⛔ EVERYTHING PAST THE ALLOCATION IS GUARDED. The
+                           ;; failure branch above only covers calls that
+                           ;; report failure by RETURNING; an allocation
+                           ;; failure, or a lazy FFI binding whose symbol will
+                           ;; not resolve (which is exactly what happens to
+                           ;; SSL_CTX_set_options on LibreSSL), leaves by a
+                           ;; route it cannot see, and the context would leak.
+                           ;;
+                           ;; ⚠ This file's rule is "raise outside the scope,
+                           ;; never inside", and that rule is NOT broken here:
+                           ;; it governs the DELIBERATE error path, where the
+                           ;; reason is captured and returned as a value so
+                           ;; that SSL_CTX_free cannot overwrite it. What is
+                           ;; re-raised here is an exceptional condition, and
+                           ;; the scope's dynamic-wind runs ERR_pop_to_mark and
+                           ;; restores interrupts on the way out.
+                           (let ()
+                             ;; INJECTION POINT 'tls-context-after-alloc --
+                             ;; OWNING GUARD: the guard immediately above,
+                             ;; which frees the context and re-raises.
+                             ;;
+                             ;; ⭐ IT EXISTS BECAUSE THAT GUARD HAS NO OTHER
+                             ;; WAY TO GO RED. The argument check above runs
+                             ;; before the allocation, so a bad argument never
+                             ;; reaches here; what is left for the guard to
+                             ;; catch -- an allocation failure, or a lazy FFI
+                             ;; symbol that will not resolve -- cannot be
+                             ;; provoked through the public API. Without a
+                             ;; point here, deleting the guard passes every
+                             ;; cell.
+                             (inject-fault! 'tls-context-after-alloc)
+                             ;; ⭐ THREE INDEPENDENT CONDITIONS, ALL REQUIRED.
+                             ;;
+                             ;; The option bit arrived in OpenSSL 1.1.1, so
+                             ;; older versions must not be asked for it.
+                             ;;
+                             ;; LibreSSL reports exactly 0x20000000 and has
+                             ;; neither this bit nor the function as a real
+                             ;; symbol -- it is a macro over SSL_CTX_ctrl
+                             ;; there. ⚠ THAT VALUE IS AN UNVERIFIED PREMISE:
+                             ;; it cannot be checked on the machine this was
+                             ;; written on, and it is now the only criterion
+                             ;; separating LibreSSL out.
+                             ;;
+                             ;; foreign-entry? is the backstop for exactly that
+                             ;; premise being wrong: if the version test lets a
+                             ;; LibreSSL through, the cost is one option not
+                             ;; set, not an unresolvable symbol raising inside
+                             ;; a listener's construction.
+                             ;;
+                             ;; ⚠ An earlier form of this test bounded the
+                             ;; version ABOVE (v < 0x20000000). OpenSSL 3 is
+                             ;; 0x30000000 and up, so that range excluded the
+                             ;; very library this runs on, and the option was
+                             ;; silently never set. The LibreSSL number is a
+                             ;; sentinel to exclude, not an upper bound.
+                             (let* ((v (OpenSSL_version_num))
+                                    (refuse?
+                                      (and (>= v #x10101000)
+                                           (not (= v #x20000000))
+                                           (and (foreign-entry? "SSL_CTX_set_options")
+                                                #t))))
+                               (when refuse?
+                                 (SSL_CTX_set_options c SSL_OP_NO_RENEGOTIATION))
+                               (cons #f (make-tls-context c refuse?)))))))))))))
       (when (car r) (die (car r)))
       (cdr r)))
 
