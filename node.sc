@@ -3241,6 +3241,63 @@
   ;; Chez's. Those are liveness guarantees; this batch has no timeout and
   ;; no restricted printer to build them from, and a half-made liveness
   ;; guarantee reads exactly like a whole one.
+  ;; The largest numeric parameter any directive in a rendered condition
+  ;; message may carry. Nothing legitimate needs a 4097-column field here:
+  ;; this is an error string on its way into a bounded reason slot.
+  ;;
+  ;; Measured: a width directive allocates about 12 bytes per unit, so
+  ;; "~50000000a" asks for 572 MB and leaves 644 bytes of heap -- from a
+  ;; condition whose message an attacker may have supplied.
+  (define format-parameter-cap 4096)
+
+  ;; -> #t if msg may safely be handed to format. A REFUSAL, NOT A REPAIR:
+  ;; a message that fails here is printed literally with its irritants
+  ;; beside it, which is what the non-format branch does anyway and is
+  ;; strictly more informative than a truncated expansion.
+  ;;
+  ;; TWO KINDS OF OVERSIZED PARAMETER, AND THE SECOND IS NOT IN THE STRING.
+  ;; A literal one ("~99999999a") is read here digit by digit. But Chez also
+  ;; accepts `v`, which takes the parameter FROM AN ARGUMENT: (format "~va"
+  ;; 50000000 (quote x)) allocates exactly as much, and no amount of scanning
+  ;; the string reveals the 50000000 -- it arrives as an irritant. Both come
+  ;; from the same condition, so whoever can shape the message can shape the
+  ;; irritants too; `v` is therefore refused outright rather than bounded.
+  ;; `#` is safe: it means "the number of remaining arguments", which this
+  ;; call site already bounds.
+  ;;
+  ;; Negative parameters and quoted character parameters need no clause:
+  ;; measured, Chez's own format rejects both before allocating anything.
+  (define (format-directives-bounded? msg)
+    (let ((n (string-length msg)))
+      (let outer ((i 0))
+        (cond
+          ((fx>= i n) #t)
+          ((not (char=? (string-ref msg i) #\~)) (outer (fx+ i 1)))
+          (else
+            ;; inside a directive: read the parameter prefix, then hand the
+            ;; rest back to the outer scan at the directive character
+            (let param ((j (fx+ i 1)) (acc 0))
+              (cond
+                ((fx>= j n) #t)              ; truncated: format refuses it
+                (else
+                  (let ((ch (string-ref msg j)))
+                    (cond
+                      ((and (char<=? #\0 ch) (char<=? ch #\9))
+                       ;; acc cannot run away: it is compared every digit and
+                       ;; the scan leaves as soon as it passes the cap
+                       (let ((acc2 (fx+ (fx* acc 10)
+                                        (fx- (char->integer ch)
+                                             (char->integer #\0)))))
+                         (if (fx> acc2 format-parameter-cap)
+                             #f
+                             (param (fx+ j 1) acc2))))
+                      ((or (char=? ch #\v) (char=? ch #\V)) #f)
+                      ((char=? ch #\,) (param (fx+ j 1) 0))
+                      ((or (char=? ch #\@) (char=? ch #\:) (char=? ch #\#))
+                       (param (fx+ j 1) acc))
+                      ;; the directive character itself; resume after it
+                      (else (outer (fx+ j 1)))))))))))))
+
   (define (raised-object-text v)
     (guard (ex (#t "<reason could not be rendered>"))
       (let ((acc '()) (used 0) (cut #f))
@@ -3442,9 +3499,15 @@
               ;; left": a piece that fills the budget EXACTLY leaves cut
               ;; false, and an unbounded format would then still run
               ;; with zero characters to spend.
+              ;; AND THE DIRECTIVES MUST BE SANE BEFORE THEY ARE RUN. The
+              ;; budget above bounds what is KEPT, not what is ALLOCATED on
+              ;; the way: format builds the whole string first, so a width
+              ;; directive spends the memory long before anything here can
+              ;; trim it.
               (let ((filled (and (fx< used reason-text-budget)
                                  (format-condition? v)
                                  (string? msg)
+                                 (format-directives-bounded? msg)
                                  (guard (e2 (#t #f))
                                    (with-print-pins
                                      (lambda () (apply format msg irr)))))))

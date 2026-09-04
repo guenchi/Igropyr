@@ -212,6 +212,48 @@
                (fail! "raising-writer-not-caught" txt))
               (else (display "  ok raising-record-writer-is-caught\n")))))
 
+    ;; ---- R10: a width directive must not become an allocation bomb.
+    ;; A width directive allocates about 12 bytes per unit (measured: ~50000000a
+    ;; allocated 572 MB to keep 644 bytes). R10-1: a plain &message condition
+    ;; carrying the same text is NOT a format condition and must not be
+    ;; expanded at all (the format-condition? gate). R10-2: the same text as a
+    ;; genuine format string (errorf) is refused by the pre-scan (parameter
+    ;; above the cap) and shown raw. R10-3: an ordinary ~a still expands, so the
+    ;; pre-scan is not a blanket refusal. Allocation is measured with the
+    ;; cumulative sstats-bytes (a current-bytes reading goes negative across a
+    ;; collection).
+    (let ((allocated-by (lambda (thunk)
+                          (let ((b0 (sstats-bytes (statistics))))
+                            (thunk)
+                            (- (sstats-bytes (statistics)) b0))))
+          (bomb "x ~9999999a y"))                       ; ~120 MB if expanded
+    (let* ((txt #f)
+           (bytes (allocated-by (lambda () (set! txt (render-through-warden
+                                                      (condition (make-error) (make-who-condition 'r10)
+                                                                 (make-message-condition bomb)
+                                                                 (make-irritants-condition (list 'z)))))))))
+      (cond ((not (has-substr? txt "~9999999a")) (fail! "R10-1-plain-message-was-expanded" txt))
+            ((> bytes 1000000) (fail! "R10-1-plain-message-allocated" bytes))
+            (else (display "  ok R10-1 a literal width directive in a plain message is neither expanded nor allocated for\n"))))
+    (let* ((txt #f)
+           (bytes (allocated-by (lambda () (set! txt (render-through-warden
+                                                      (guard (e (#t e)) (errorf 'r10 bomb 'z))))))))
+      (cond ((> bytes 1000000) (fail! "R10-2-format-width-bomb-expanded" bytes))
+            ((not (has-substr? txt "~9999999a")) (fail! "R10-2-refused-directive-not-shown-raw" txt))
+            (else (display "  ok R10-2 a format string whose width parameter exceeds the cap is shown raw, not expanded\n"))))
+    (let ((txt (render-through-warden (guard (e (#t e)) (errorf 'r10 "plain ~a text" 'keep)))))
+      (if (has-substr? txt "plain keep text")
+          (display "  ok R10-3 an ordinary directive still expands (the pre-scan is not a blanket refusal)\n")
+          (fail! "R10-3-ordinary-directive-refused" txt)))
+    ;; R10-4: ~v takes the width from an IRRITANT, so a scan of the string never
+    ;; sees it; the same condition shapes both, so ~v is refused outright.
+    (let* ((txt #f)
+           (bytes (allocated-by (lambda () (set! txt (render-through-warden
+                                                      (guard (e (#t e)) (errorf 'r10 "x ~va y" 9999999 'z))))))))
+      (cond ((> bytes 1000000) (fail! "R10-4-v-directive-width-from-irritant-expanded" bytes))
+            ((not (has-substr? txt "~va")) (fail! "R10-4-refused-v-directive-not-shown-raw" txt))
+            (else (display "  ok R10-4 a ~v directive (width from an irritant) is refused, not expanded\n")))))
+
     (if (zero? fails)
         (begin (display "ALL RENDER PIN TESTS PASSED\n") (exit 0))
         (begin (display "RENDER PIN VERDICT: ") (display fails)
