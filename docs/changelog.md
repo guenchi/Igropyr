@@ -2,7 +2,7 @@
 
 ## 1.5.2 — 2026-09-04
 
-*140 commits.* Wire protocol v4 and the accounting behind hosted monitors; then
+*142 commits.* Wire protocol v4 and the accounting behind hosted monitors; then
 server-side TLS, and a libuv layer split in two.
 
 ### API
@@ -124,7 +124,15 @@ surface is `(igropyr tcp)` and everything above it.
   starting point for one.
 - **http, libuv**: the reuseport option says which platforms it works on, and
   FreeBSD is one of them.
-- **comments**: the emoji markers are gone from the source.
+- **tls-core**: the LibreSSL premises are measured rather than assumed.
+  LibreSSL 4.1.0 does report the sentinel version this code excludes, and
+  `SSL_CTX_set_options` is not an exported symbol there, so the
+  no-renegotiation option is not set on it; the peer-certificate and ERR-mark
+  probes each take their LibreSSL branch. The `foreign-entry?` backstop stays,
+  and now covers the LibreSSL versions that have not been measured.
+- **tests**: a cell pins the order of a replacement's node-down/node-up pair and
+  the head-only dispatch behind `quarantine!`'s head assertion; it goes red
+  under a peek-last mutation.
 
 ---
 
