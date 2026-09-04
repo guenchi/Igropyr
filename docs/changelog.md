@@ -1,14 +1,56 @@
 # Changelog
 
-## Unreleased
+## 1.5.2 — 2026-09-04
 
-*77 commits.* Wire protocol v4, and the accounting behind hosted monitors.
+*140 commits.* Wire protocol v4 and the accounting behind hosted monitors; then
+server-side TLS, and a libuv layer split in two.
 
 ### API
 
+Five new libraries: `(igropyr tcp)` — the connection and owner layer, split out
+of `(igropyr libuv)`; `(igropyr tls-core)` — TLS sessions and contexts, the only
+place OpenSSL is called; `(igropyr tls-watch)` — the per-connection watcher;
+`(igropyr inject)` and `(igropyr inject-control)` — fault injection for the test
+suite, compiled out unless `IGROPYR_INJECT=on`.
+
 `(igropyr node)` gains `monitor-node/token`, `demonitor-node/token`,
-`node-install-rule-order` and `node-orphan-count`; `(igropyr libuv)` gains
-`uv-live-handle-count` and `uv-owner-index-count`. **6 added, none removed.**
+`node-install-rule-order`, `node-orphan-count`, `node-dead-letters`,
+`node-dead-letter-stats`, `node-redeliver-dead-letter!` and the
+`quarantine-reason` accessors; `(igropyr http)` gains `http-server-ready?`,
+`http-server-backlog` and `http-server-backlog-effective`; `(igropyr libuv)`
+gains `uv-live-handle-count` and `uv-owner-index-count`.
+**Curated: 17 added, none removed** — but see **Breaking** for 38 names that
+moved library.
+
+⚠️ `(igropyr libuv)` also exports about 85 raw libuv bindings — `uv-fs-open`,
+`uv-write`, `memcpy-cc`, the `*-size` constants and their kin — which were
+internal to that file before the split. They are the **low-level face of the
+binding layer and are not stable API**: they exist because the layer is now a
+library of its own, and they may be narrowed without a major version. The stable
+surface is `(igropyr tcp)` and everything above it.
+
+### Breaking
+
+- **`(igropyr libuv)` is now only the libuv binding layer.** The connection and
+  owner layer moved to the new `(igropyr tcp)`: 38 names left `(igropyr libuv)`,
+  among them `tcp-listen!`, `tcp-connect!`, `tcp-close!`, `tcp-read-start!`,
+  `tcp-write!`, `tcp-writev!`, `tcp-write-foreign!`, `dns-resolve!`,
+  `file-read-async!`, `file-realpath`, the `file-stream-*` family, the
+  `fs-*-async!` family, `fs-count`, `fs-fd-count`, `fs-job-count`, the `conn`
+  record accessors (`conn?`, `conn-handle`, `conn-owner`, `conn-set-owner!`,
+  `conn-peer-ip`, `conn-state`, `conn-on-close!`, `conn-count`),
+  `uv-owner-died!` and `uv-set-deliver!`.
+
+  **Migration.** A file that took any of those from `(igropyr libuv)` must now
+  import `(igropyr tcp)` as well:
+
+  ```scheme
+  (import (igropyr libuv) (igropyr tcp))
+  ```
+
+  Code that used only binding-layer names — `now-ms`, `uv-init!`, `uv-poll!`,
+  `uv-live-handle-count` and the like — needs no change. The two libraries
+  export disjoint sets, so importing both is always safe.
 
 ### Added
 
@@ -20,6 +62,27 @@
   sequence number. Deduplication is within a variant and not across them, so
   ending a legacy subscription cannot end a token one.
 - **dpool**: subscribes with a token and drops what it has already seen.
+- **http, tls**: **HTTPS server.** `http-listen` accepts `tls-cert` and
+  `tls-key` (both or neither); the connection layer carries the TLS codec, and
+  every OpenSSL call is confined to `(igropyr tls-core)`. Each TLS connection
+  gets a watcher process that owns the write gate and the connection's timers.
+  A write gate serialises whole aggregates, so two writers cannot interleave
+  their records.
+- **node**: **dead letters.** An event that fails delivery three times is
+  quarantined instead of taking the node down; `node-dead-letters`,
+  `node-dead-letter-stats` and `node-redeliver-dead-letter!` read and replay
+  them, an observer is told through an `event-quarantined` notice, and the
+  reason is a record (`quarantine-reason-kind`, `quarantine-reason-payload`)
+  rather than a bare symbol.
+- **tcp**: `stat`, `unlink` and `scandir` run on the thread pool
+  (`file-stat-async!`, `file-unlink-async!`, `file-scandir-async!`).
+- **http**: the listen backlog is an option with a default, and both the asked
+  and the granted value read back; readiness asks the listener and the pool, and
+  shutdown survives a dead pool.
+- **inject**: fault injection for the test suite, switched at expansion time and
+  compiled out entirely unless `IGROPYR_INJECT=on`. Fault, return, override and
+  barrier points; a barrier parks a process between two expressions so a test
+  can act in a window that is otherwise too short to reach.
 
 ### Fixed
 
@@ -30,11 +93,38 @@
   and an install that stops half way undoes itself.
 - **libuv**: a connect or listen that fails partway releases what it took; a DNS
   request retires its owner-index entry on both exits.
+- **tls**: **a clean close now drains before the handle closes.** Closing a TLS
+  connection submitted the alert and retired in the next expression — and
+  retirement calls `uv_close`, which cancels every queued write request on the
+  handle. A connection with application ciphertext still queued lost all of it
+  along with the `close_notify`, and the peer saw a truncated stream. The
+  connection is now retired by the alert's own completion or by an idle bound
+  that only successful completions extend. Nothing reported the old behaviour,
+  because cancelled requests still run their completions and still refund.
+- **tls**: the gate's open-and-drain decides "the buffer is empty" and opens the
+  gate in one region. Split across two, a read callback could append plaintext
+  in between; the drain runs once, so those bytes were stranded for the life of
+  the connection.
+- **node**: the death-log renderer caps format-directive parameters. A message
+  carrying `~50000000a` allocated 572 MB before anything could trim it;
+  parameters above 4096, and argument-supplied `~v` parameters, now fall back to
+  printing the message literally with its irritants.
+- **node**: the death-log renderer pins every print parameter that changes what
+  it writes.
+- **tcp**: `fs-start-fd!` owns its descriptor from its first instruction.
+- **node**: the registrar is supervised, and what it was asked to do survives
+  its death.
 
 ### Changed
 
 - **actor**: interrupt regions unwind; about 5% on send and receive.
 - **build**: one library list, compared against the directory.
+- **imports**: every library names what it takes from `(igropyr libuv)` and
+  `(igropyr tcp)`, so an import list is now the dependency rather than a
+  starting point for one.
+- **http, libuv**: the reuseport option says which platforms it works on, and
+  FreeBSD is one of them.
+- **comments**: the emoji markers are gone from the source.
 
 ---
 

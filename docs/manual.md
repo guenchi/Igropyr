@@ -61,8 +61,13 @@ Igropyr is organized as a layered stack:
 │  spawn, send, receive, link, monitor    │
 └─────────────────┬───────────────────────┘
 ┌─────────────────┴───────────────────────┐
-│     libuv FFI Layer                     │
-│  tcp-listen!, tcp-read-start!, etc.     │
+│   Connection / Owner Layer (tcp.sc)     │
+│  tcp-listen!, tcp-read-start!, conn-*   │
+│  fs-*-async!, the TLS codec             │
+└─────────────────┬───────────────────────┘
+┌─────────────────┴───────────────────────┐
+│     libuv Binding Layer (libuv.sc)      │
+│  the loop, the buffers, the raw FFI     │
 └─────────────────────────────────────────┘
 
 Independent libraries:
@@ -76,7 +81,13 @@ Independent libraries:
 
 ### Each Layer's Responsibility
 
-- **libuv (libuv.sc)**: Direct FFI bindings to libuv. Manages TCP handles, read/write buffers, and event polling. Delivers data into the upper layers via callbacks.
+- **libuv (libuv.sc)**: Direct FFI bindings to libuv — the event loop, the process-wide buffers, event polling, and nothing that outlives a single call. It knows nothing about connections, owners or processes.
+
+- **Connection / owner layer (tcp.sc)**: Everything that hangs off a connection or an owning process — the `conn` record, listeners, DNS, the asynchronous filesystem operations, and the TLS codec. It imports `(igropyr libuv)`; nothing below it imports back.
+
+  **The two are separate libraries, and a consumer that needs both imports both.** Names such as `tcp-listen!`, `tcp-write!`, `dns-resolve!`, `file-read-async!` and the `conn-*` accessors live in `(igropyr tcp)`; `now-ms`, `uv-init!`, `uv-poll!` and the raw bindings live in `(igropyr libuv)`. The two export disjoint sets, so `(import (igropyr libuv) (igropyr tcp))` is always safe. Before 1.5.2 they were one library named `(igropyr libuv)` — see the changelog's Breaking section for the migration.
+
+  `(igropyr libuv)` also exports the raw libuv bindings themselves (`uv-write`, `uv-fs-open`, the size constants). Those are the binding layer's low-level face and are **not stable API**; build on `(igropyr tcp)` and above.
 
 - **Actor (actor.sc)**: Green process scheduler with continuation-based context switching. One OS thread, preemptive scheduling via timer interrupt, message-passing mailboxes, link/monitor for process relationships.
 
@@ -88,7 +99,7 @@ Independent libraries:
 
 - **WebSocket (websocket.sc)**: RFC 6455 codec, handshake, frame masking, fragmentation, ping/pong. Each socket is a green process that calls a user session handler.
 
-- **JSON, gen-server, pubsub, Redis, MySQL, PostgreSQL**: Standalone libraries with no interdependencies (except JSON uses Scheme primitives, gen-server uses actor, pubsub uses gen-server+actor, redis/mysql/postgresql use actor+uv; MySQL, PostgreSQL and the render pool share the `(igropyr connpool)` connection-pool engine).
+- **JSON, gen-server, pubsub, Redis, MySQL, PostgreSQL**: Standalone libraries with no interdependencies (except JSON uses Scheme primitives, gen-server uses actor, pubsub uses gen-server+actor, redis/mysql/postgresql use actor plus the connection layer; MySQL, PostgreSQL and the render pool share the `(igropyr connpool)` connection-pool engine).
 
 ### Data Flow: An HTTP Request
 
@@ -688,6 +699,31 @@ Configuration options:
   header and source; distribution has not been measured by this project.
 - `on-failure`: failure hook `(lambda (req res info))` when retries are
   exhausted or a stuck worker was killed (see the fault handler section)
+- `tls-cert`, `tls-key`: paths to a PEM certificate chain and its private key.
+  Giving both serves HTTPS on this port; giving neither serves plaintext.
+  **Giving one without the other is refused at startup** rather than quietly
+  falling back to plaintext — a listener that was meant to be encrypted and is
+  not is worse than one that will not start
+
+##### HTTPS
+
+```scheme
+(app-listen app 443 '((tls-cert . "/etc/ssl/site.pem")
+                      (tls-key  . "/etc/ssl/site.key")))
+```
+
+Serving HTTPS needs OpenSSL at run time. `(igropyr http)` imports
+`(igropyr tls-core)` and `(igropyr tls-watch)` unconditionally, but that costs a
+plaintext program nothing: **tls-core opens no shared object until a context or
+session is actually built**, so a server that never serves TLS never loads
+libcrypto or libssl and does not require them to be installed.
+
+Each accepted TLS connection gets a **watcher process** that owns the
+connection's write gate and its timers. The gate serialises whole *aggregates*
+rather than individual writes, so two processes writing to the same connection
+cannot interleave their TLS records — one waits for the other's message to
+finish. A closed connection drains what it has already queued before the socket
+goes away, so a response in flight is not truncated by the close.
 
 On startup, `app-listen` prints one line naming the contract level baked
 into the build:
