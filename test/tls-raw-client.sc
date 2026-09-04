@@ -17,10 +17,11 @@
 ;;; does; the caller sets it to the test CA before calling.
 
 (library (test tls-raw-client)
-  (export raw-tls-exchange raw-tls-send-and-drop raw-tls-two-requests raw-tls-collect)
+  (export raw-tls-exchange raw-tls-send-and-drop raw-tls-two-requests raw-tls-collect
+          raw-tls-stall-then-collect raw-tls-slow-collect)
   (import (chezscheme)
           (igropyr actor)
-          (only (igropyr libuv) now-ms) (only (igropyr tcp) tcp-connect! tcp-read-start! tcp-write! tcp-close!)
+          (only (igropyr libuv) now-ms) (only (igropyr tcp) tcp-connect! tcp-read-start! tcp-read-stop! tcp-write! tcp-close!)
           (only (igropyr tls-core)
                 ensure-ctx! client-ctx tls-session-new! tls-session-retire!
                 tls-session-configure-client! tls-session-handshake-step!
@@ -61,6 +62,23 @@
   (define (raw-tls-collect host port sni request timeout-ms)
     (let-values (((plain writes eof? raw)
                   (raw-tls-exchange host port sni request #f timeout-ms 'collect)))
+      (values plain (if (bytevector? raw) raw (make-bytevector 0)) eof?)))
+
+  ;; Handshake, request, then STALL: reads stop until the caller (which knows
+  ;; this process's pid) sends #(resume); afterwards every byte is collected.
+  ;; -> (values plaintext raw-stream eof-cause); must run in its own process.
+  (define (raw-tls-stall-then-collect host port sni request timeout-ms)
+    (let-values (((plain writes eof? raw)
+                  (raw-tls-exchange host port sni request #f timeout-ms 'stall)))
+      (values plain (if (bytevector? raw) raw (make-bytevector 0)) eof?)))
+
+  ;; Handshake, request, STALL until #(resume) (so the server's output has
+  ;; queued), then read with a pause of pause-ms after every read callback (a
+  ;; slow but progressing consumer); collects the raw stream.
+  ;; -> (values plaintext raw-stream eof-cause)
+  (define (raw-tls-slow-collect host port sni request timeout-ms pause-ms)
+    (let-values (((plain writes eof? raw)
+                  (raw-tls-exchange host port sni request #f timeout-ms 'slow pause-ms)))
       (values plain (if (bytevector? raw) raw (make-bytevector 0)) eof?)))
 
   ;; -> (values plaintext-received writes eof? failure)
@@ -136,12 +154,22 @@
                          ;; tickets were drained above, so the close is a FIN.
                          (when (and (pair? mode) (eq? (car mode) 'drop))
                            (finish (make-bytevector 0) #f #f))
+                         ;; 'stall: stop reading right after the request and hold the socket
+                         ;; open until the test sends #(resume) -- the server's output queues
+                         ;; behind a closed receive window (the close-drain cells' stimulus).
+                         ;; Reads resume on #(resume) and the exchange continues in collect
+                         ;; mode. A stall that nobody resumes ends by the exchange's deadline.
+                         (when (and (pair? mode) (memq (car mode) '(stall slow)))
+                           (tcp-read-stop! c)
+                           (receive (after (remaining) (finish (make-bytevector 0) #f "stalled and never resumed"))
+                             (`#(resume) (tcp-read-start! c))))
                          ;; read until eof or timeout; in 'second mode send B once
                          ;; `expect` plaintext bytes have arrived and stop at 2x
                          (let-values (((port get) (open-bytevector-output-port))
                                       ((rport rget) (open-bytevector-output-port)))
                            (let ((second (and (pair? mode) (eq? (car mode) 'second) mode)) (got 0) (sent-b? #f)
-                                 (collect? (and (pair? mode) (eq? (car mode) 'collect))))
+                                 (collect? (and (pair? mode) (memq (car mode) '(collect stall slow))))
+                                 (slow-ms (and (pair? mode) (eq? (car mode) 'slow) (cadr mode))))
                            ;; 'collect: after close_notify keep reading raw bytes for
                            ;; 500 ms of silence, then hand the whole raw stream back
                            (define (linger-then-finish)
@@ -154,6 +182,8 @@
                              (receive (after (remaining) (finish (get) #f #f))
                                (`#(tcp-data ,bv)
                                  (when collect? (put-bytevector rport bv))
+                                 ;; 'slow: a reader that pauses after every read (a slow consumer)
+                                 (when slow-ms (sleep-ms slow-ms))
                                  ;; decrypt! feeds the ciphertext itself (as establish! relies on);
                                  ;; feeding first would enter every byte twice
                                  (let-values (((out eof?) (tls-session-decrypt! sess bv)))

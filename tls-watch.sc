@@ -23,7 +23,11 @@
   (export tls-watch-install! tls-watcher-idle-ms-set!
           tls-watcher-observer-set!)
   (import (chezscheme) (igropyr actor) (igropyr inject)
-          (only (igropyr tcp) conn-owner conn-tls-retire! tls-conn-holder tls-conn-set-holder-monitor! tls-gate-grant-next! tls-open-gate-and-drain! tls-watcher-exited! uv-set-gate-wait! uv-set-tls-watcher-spawner!))
+          (only (igropyr tcp) conn-owner conn-tls-retire! tls-conn-holder
+                tls-conn-set-holder-monitor! tls-conn-shutdown?
+                tls-gate-grant-next! tls-open-gate-and-drain!
+                tls-watcher-exited! uv-set-alive?! uv-set-gate-wait!
+                uv-set-tls-watcher-spawner!))
 
   (define tls-watcher-idle-ms 1000)
   (define (tls-watcher-idle-ms-set! n) (set! tls-watcher-idle-ms n))
@@ -49,7 +53,11 @@
       (lambda ()
         (let ((first? (with-interrupts-disabled
                         (and (not done?) (begin (set! done? #t) #t)))))
-          (when first? (tls-watcher-exited! c))))))
+          ;; ITS OWN PID, NOT THE CONN. By the time this runs the connection
+          ;; may already be detached, so c can no longer name the process
+          ;; that is leaving; self can. This closure only ever runs inside
+          ;; the watcher, which is what makes self the right process here.
+          (when first? (tls-watcher-exited! self))))))
 
   (define (watcher-body c)
     ;; THE GUARD IS THE MECHANISM (Z15). On any raise the connection is
@@ -107,13 +115,29 @@
                     ;; produces one, and acting on it would retire a healthy
                     ;; connection because somebody who finished writing has
                     ;; since exited.
+                    ;; AN OWNER DOWN DURING A CLEAN-CLOSE DRAIN IS NOT A
+                    ;; REASON TO RETIRE (E9). The alert is already queued
+                    ;; under its own bound and the owner has no further part
+                    ;; in getting it out; retiring here would uv_close the
+                    ;; handle and cancel exactly the bytes the drain exists
+                    ;; to deliver. The bound still ends it if the peer stops
+                    ;; reading.
+                    ;;
+                    ;; A HOLDER DOWN STILL RETIRES, drain or no drain: a dead
+                    ;; holder's aggregate can never complete, so there is
+                    ;; nothing left to wait for.
                     (`#(DOWN ,pid ,reason)
-                      (if (or (eq? pid (tls-conn-holder c))
-                              (eq? pid (conn-owner c)))
-                          (begin (exited!)
-                                 (conn-tls-retire! c 'down reason)
-                                 (raise 'tls-watcher-done))
-                          'stale)))))
+                      (cond
+                        ((eq? pid (tls-conn-holder c))
+                         (exited!)
+                         (conn-tls-retire! c 'down reason)
+                         (raise 'tls-watcher-done))
+                        ((and (eq? pid (conn-owner c))
+                              (not (tls-conn-shutdown? c)))
+                         (exited!)
+                         (conn-tls-retire! c 'down reason)
+                         (raise 'tls-watcher-done))
+                        (else 'stale))))))
             ;; grant the gate to whoever is next; the grant announces itself
             ;; through the same message the uncontended path uses
             (let ((granted (tls-gate-grant-next! c)))
@@ -150,5 +174,8 @@
 
   (define (tls-watch-install!)
     (uv-set-tls-watcher-spawner! spawn-watcher)
-    (uv-set-gate-wait! gate-wait))
+    (uv-set-gate-wait! gate-wait)
+    ;; the watcher-count seam prunes dead pids through this; without it the
+    ;; seam reports every pid it was ever told about
+    (uv-set-alive?! process-alive?))
   )

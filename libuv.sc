@@ -50,9 +50,7 @@
     memcpy-from-c memcpy-to-c memcpy-cc
     c-open c-openat c-close uv-fileno c-getsockopt)
 
-  ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF, the same
-  ;; arrangement the rest of the tree documents.
-  (import (chezscheme) (igropyr platform) (igropyr inject))
+  (import (chezscheme) (igropyr platform))
 
 
   ;; Shared objects must be loaded before the foreign-procedure

@@ -274,6 +274,41 @@
               (assertion-violation '$inject-arm!
                 "this point needs 0 or a libuv error code in [-4095,-1]"
                 value)))
+           ;; The three timer points are read the same way -- their
+           ;; callers all ask (fx< result 0), "did libuv refuse" -- so
+           ;; only a NEGATIVE code means anything: a non-negative one is
+           ;; indistinguishable from not arming the point at all, and a
+           ;; cell armed with 0 would be asserting on an unperturbed run.
+           ;; init and start cover creation, rearm covers the clean-close
+           ;; drain's bound; they are separate points so a cell can say
+           ;; which arm it broke.
+           ((tls-timer-rearm-fail tls-timer-init-fail tls-timer-start-fail)
+            (unless (and (fixnum? value) (fx< value 0) (fx>= value -4095))
+              (assertion-violation '$inject-arm!
+                "this point needs a libuv error code in [-4095,-1]"
+                value)))
+           ;; Read by `unless`, so the ONLY value that does anything is a
+           ;; true one -- #f is exactly what the unarmed point already
+           ;; yields, and arming with it would suppress nothing while
+           ;; looking like a live arm. #t rather than any truthy object
+           ;; because neither caller inspects it further.
+           ((tls-owner-close-skip tls-ping-suppress)
+            (unless (eq? value #t)
+              (assertion-violation '$inject-arm!
+                "this point is read as a flag: it takes #t (#f is indistinguishable from unarmed)"
+                value)))
+           ;; Replaces the handshake step's VERDICT, which its caller
+           ;; feeds to a case: done, want-read and gone are handled by
+           ;; name and every other symbol selects the failure branch. #f
+           ;; is the point's own "not forced" sentinel and so cannot be
+           ;; armed; a non-symbol would reach the failure branch too, but
+           ;; only by falling off the end of a comparison that was never
+           ;; meant to see it.
+           ((tls-handshake-result)
+            (unless (symbol? value)
+              (assertion-violation '$inject-arm!
+                "this point supplies a handshake verdict symbol (done, want-read, gone, or a failure symbol)"
+                value)))
            ;; A WHITELIST, AND THE DEFAULT IS REFUSAL. It read (void)
            ;; before -- an unlisted return point armed with whatever it
            ;; was given, so the one kind of mistake this table exists to

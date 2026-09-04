@@ -242,10 +242,11 @@
       (check "STRUCT: no 'tls-after-owner-installed point" (and (not (memq 'tls-after-owner-installed watch-syms)) (not (memq 'tls-after-owner-installed uv-syms)))))
 
     ;; ---- H16': a clean close requested while the holder is mid-aggregate (v9):
-    ;; the IN-FLIGHT aggregate completes, later writes are refused (not hung),
-    ;; and then the connection closes cleanly. http sends a 4 MB body as several
-    ;; writes, so the client sees a prefix -- at least one whole aggregate --
-    ;; and a clean close, never a hang. The handler reports how res-send! ended.
+    ;; the IN-FLIGHT aggregate completes ON THE WIRE, later writes are refused
+    ;; (not hung), and then the connection closes cleanly with close_notify.
+    ;; Until E9 the expectation here was "a prefix -- at least one whole
+    ;; aggregate": an expectation read off the implementation, which cancelled
+    ;; the queued ciphertext at uv_close. The handler reports how res-send! ended.
     (let ((me self))
       (http-swap! srv (lambda (req res)
                         (let ((c (res-conn res)))
@@ -256,9 +257,10 @@
     (let-values (((plain writes eof? fail) (raw-tls-exchange "127.0.0.1" port "localhost" GET #f 15000)))
       (let ((outcome (receive (after 6000 'no-report) (`#(h16 ,o) o))))
         (check "H16': the handler's write completed (returned or refused), did not hang" (not (eq? outcome 'no-report)) outcome)
-        (check "H16': the client received at least one whole aggregate before the close" (> (bytevector-length plain) 0) (bytevector-length plain))
-        (check "H16': then the connection closed cleanly (eof seen, clean-close recorded)"
-               (and eof? (let ((r (tls-last-retire-reason))) (and (pair? r) (eq? (car r) 'clean-close)))) eof? (tls-last-retire-reason))))
+        ;; the response is headers + the 4 MB body; the whole aggregate is at least the body
+        (check "H16': the client received the WHOLE in-flight aggregate (headers + 4 MB) before the close" (>= (bytevector-length plain) (bytevector-length big)) (bytevector-length plain))
+        (check "H16': then the connection closed cleanly (close_notify seen, clean-close recorded)"
+               (and (eq? eof? 'close-notify) (let ((r (tls-last-retire-reason))) (and (pair? r) (eq? (car r) 'clean-close)))) eof? (tls-last-retire-reason))))
     (check "H16': resources back to baseline" (settled-to? base 4000) (snap) base)
 
     ;; ---- ABORT-CB: an application write cut short by a hard retirement must

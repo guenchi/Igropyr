@@ -21,6 +21,7 @@
         (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http) (igropyr tls)
         (igropyr inject-control) (igropyr inject)
         (only (igropyr tls-core) tls-live-session-count)
+        (only (igropyr tcp) tcp-writev-raw! tls-conn-charge tls-conn-totals tls-shutdown-ms-set! tls-raw-blocks tls-live-watcher-count)
         (test tls-raw-client))
 
 (define failures 0)
@@ -80,6 +81,7 @@
 (define small-q (make-bytevector (* 64 1024) 81))          ; Q: 64 KB of Q
 (define small-r (make-bytevector (* 64 1024) 82))          ; Q': 64 KB of R
 (define sentinel (bv "Q2LEAKQ2LEAKQ2LEAKQ2LEAKQ2LEAKQ2LEAK"))
+(define huge (make-bytevector (* 32 1024 1024) 66))         ; 32 MB of B, to out-size loopback buffers
 
 ;; Does a raw byte stream consist of complete TLS records only? -> residue length
 ;; (0 = clean). Header: type in {20,21,22,23}, version 0x03xx, length <= 2^14+256.
@@ -129,17 +131,31 @@
            (case mode
              ((collect)
               (let-values (((plain raw cause) (raw-tls-collect "127.0.0.1" port "localhost" GET-KA 60000)))
-                (send main-pid (vector 'client-done (bytevector-length plain) cause plain raw))))
+                (send main-pid (vector 'client-done self (bytevector-length plain) cause plain raw))))
+             ((stall)
+              (let-values (((plain raw cause) (raw-tls-stall-then-collect "127.0.0.1" port "localhost" GET-KA 150000)))
+                (send main-pid (vector 'client-done self (bytevector-length plain) cause plain raw))))
+             ((slow)
+              (let-values (((plain raw cause) (raw-tls-slow-collect "127.0.0.1" port "localhost" GET-KA 150000 50)))
+                (send main-pid (vector 'client-done self (bytevector-length plain) cause plain raw))))
              (else
               (let-values (((plain writes eof? fail) (raw-tls-exchange "127.0.0.1" port "localhost" GET-KA #f 60000)))
-                (send main-pid (vector 'client-done (bytevector-length plain) eof? plain fail))))))))
+                (send main-pid (vector 'client-done self (bytevector-length plain) eof? plain fail))))))))
 (define (client-result ms)
-  (receive (after ms #f) (`#(client-done ,n ,eof? ,plain ,extra) (list n eof? plain extra))))
+  ;; matched by the CURRENT client's pid: a late result from an earlier cell's
+  ;; client must not be taken for this one's
+  (let ((cli client-pid))
+    (receive (after ms #f) (`#(client-done ,@cli ,n ,eof? ,plain ,extra) (list n eof? plain extra)))))
 
 ;; open a connection through the holding handler; -> (conn . handler-pid)
+(define client-pid #f)
 (define (open-held-conn! mode)
-  (spawn-client! mode)
+  (set! client-pid (spawn-client! mode))
   (receive (after 10000 #f) (`#(conn ,c ,h) (cons c h))))
+;; the server-side raw queue of a connection (bytes charged, not yet refunded)
+(define (raw-queued c) (let ((ch (tls-conn-charge c))) (and ch (cdr ch))))
+(define (retire-reason) (tls-last-retire-reason))
+(define (raw-completions c) (let ((b (tls-raw-blocks c))) (if (pair? b) (length (cdr b)) 0)))
 
 (start-scheduler
   (lambda ()
@@ -350,6 +366,144 @@
           (send (cdr ch) (vector 'release))
           (check "Z6a: resources back to baseline" (settled-to? base 4000) (snap) base))
 
+
+        ;; ======== E9: a clean close drains before the handle closes ========
+        ;; tcp-close! while the holder still has queued ciphertext: the queue
+        ;; and the close_notify must reach the peer; only the idle bound may
+        ;; cut a peer that stops reading. The client stalls (stops reading) so
+        ;; the server's output queues; raw-queued > 0 on the server witnesses it.
+
+        ;; ---- CLOSE-DRAIN: 4 MB queued, close, everything arrives, then close_notify
+        (let* ((s0 (tls-live-session-count))
+               (ch (open-held-conn! 'stall)) (c (car ch)) (cli client-pid)
+               (p (spawn-writer! c 'p big)))
+          (check "CLOSE-DRAIN: the server queued output behind the stalled client" (within? 5000 (lambda () (let ((q (raw-queued c))) (and q (> q 0))))) (raw-queued c))
+          (let ((q-at-close (raw-queued c)))
+            (tcp-close! c)
+            (check "CLOSE-DRAIN: premise -- raw-queued > 0 at the moment of the close" (and q-at-close (> q-at-close 0)) q-at-close))
+          (check "CLOSE-DRAIN: P's aggregate ended (no hang)" (number? (writer-outcome 'p 20000)))
+          (send cli (vector 'resume))
+          (let ((r (client-result 30000)))
+            (check "CLOSE-DRAIN: the client received the whole 4 MB after resuming" (and r (eqv? (car r) (bytevector-length big))) (and r (car r)))
+            (check "CLOSE-DRAIN: and then close_notify (not a bare transport EOF)" (and r (eq? (cadr r) 'close-notify)) (and r (cadr r)))
+            (check "CLOSE-DRAIN: every byte on the wire parsed as a TLS record" (and r (bytevector? (cadddr r)) (eqv? (tls-record-residue (cadddr r)) 0)) (and r (bytevector? (cadddr r)) (tls-record-residue (cadddr r)))))
+          (check "CLOSE-DRAIN: the retirement is the clean close" (equal? (retire-reason) '(clean-close . tls-closed)) (retire-reason))
+          (check "CLOSE-DRAIN: live sessions back to the pre-connection count" (within? 4000 (lambda () (eqv? (tls-live-session-count) s0))) (tls-live-session-count) s0)
+          (send (cdr ch) (vector 'release))
+          (check "CLOSE-DRAIN: resources back to baseline" (settled-to? base 6000) (snap) base))
+
+        ;; ---- CLOSE-DRAIN-REPEAT: the owner exits normally while the alert is queued
+        (let* ((ch (open-held-conn! 'stall)) (c (car ch)) (cli client-pid)
+               (owner (conn-owner c))
+               (p (spawn-writer! c 'p big)))
+          (check "CLOSE-DRAIN-REPEAT: queued output" (within? 5000 (lambda () (let ((q (raw-queued c))) (and q (> q 0))))) (raw-queued c))
+          (tcp-close! c)
+          (check "CLOSE-DRAIN-REPEAT: P ended" (number? (writer-outcome 'p 20000)))
+          ;; the alert is now queued behind the stalled data; the owner dies NORMALLY
+          ;; (no link cascade): uv-owner-died!'s tcp-close! and the watcher's owner
+          ;; DOWN must not cut the drain
+          (check "CLOSE-DRAIN-REPEAT: premise -- the connection is still draining when the owner dies" (let ((q (raw-queued c))) (and q (> q 0))) (raw-queued c))
+          (when owner (kill owner 'normal))
+          (send cli (vector 'resume))
+          (let ((r (client-result 30000)))
+            (check "CLOSE-DRAIN-REPEAT: the client still received the whole 4 MB" (and r (eqv? (car r) (bytevector-length big))) (and r (car r)))
+            (check "CLOSE-DRAIN-REPEAT: and close_notify" (and r (eq? (cadr r) 'close-notify)) (and r (cadr r))))
+          (check "CLOSE-DRAIN-REPEAT: clean close recorded" (equal? (retire-reason) '(clean-close . tls-closed)) (retire-reason))
+          (send (cdr ch) (vector 'release))
+          (check "CLOSE-DRAIN-REPEAT: resources back to baseline" (settled-to? base 6000) (snap) base))
+
+        ;; ---- CLOSE-DRAIN-OWNER-KILLED: the owner dies abnormally mid-drain
+        (let* ((ch (open-held-conn! 'stall)) (c (car ch)) (cli client-pid)
+               (owner (conn-owner c))
+               (p (spawn-writer! c 'p big)))
+          (check "CLOSE-DRAIN-OWNER-KILLED: queued output" (within? 5000 (lambda () (let ((q (raw-queued c))) (and q (> q 0))))) (raw-queued c))
+          (tcp-close! c)
+          (check "CLOSE-DRAIN-OWNER-KILLED: P ended" (number? (writer-outcome 'p 20000)))
+          (when owner (kill owner 'owner-killed-mid-drain))
+          (send cli (vector 'resume))
+          (let ((r (client-result 30000)))
+            (check "CLOSE-DRAIN-OWNER-KILLED: the drain was not cut by the owner's abnormal death (4 MB + close_notify)" (and r (eqv? (car r) (bytevector-length big)) (eq? (cadr r) 'close-notify)) (and r (car r)) (and r (cadr r))))
+          (send (cdr ch) (vector 'release))
+          (check "CLOSE-DRAIN-OWNER-KILLED: resources incl. the watcher count back to baseline" (settled-to? base 6000) (snap) base))
+
+        ;; ---- CLOSE-DRAIN-DRAINS: a stalled client is resumed and receives the
+        ;; whole 32 MB and close_notify -- the drain is not truncated even for a
+        ;; large body. (The idle-bound-vs-total-deadline distinction is NOT cell-
+        ;; testable on loopback: a fast reader drains 32 MB in ~40 ms, below any
+        ;; usable bound, and a slow reader's scheduling gaps exceed a small bound
+        ;; so correct code would be cut too -- the window closes on both sides.
+        ;; The rearm/idle path is covered deterministically by CLOSE-DRAIN-REARM-
+        ;; FAIL below, which is barrier-driven rather than timing-driven.)
+        (let* ((ch (open-held-conn! 'stall)) (c (car ch)) (cli client-pid)
+               (p (spawn-writer! c 'p huge)))
+          (check "CLOSE-DRAIN-DRAINS: output queued behind the stalled client" (within? 8000 (lambda () (let ((q (raw-queued c))) (and q (> q 0))))) (raw-queued c))
+          (tcp-close! c)
+          (send cli (vector 'resume))
+          (check "CLOSE-DRAIN-DRAINS: P ended" (number? (writer-outcome 'p 60000)))
+          (let ((r (client-result 90000)))
+            (check "CLOSE-DRAIN-DRAINS: the client received the whole 32 MB and close_notify" (and r (eqv? (car r) (bytevector-length huge)) (eq? (cadr r) 'close-notify)) (and r (car r)) (and r (cadr r))))
+          (check "CLOSE-DRAIN-DRAINS: clean close recorded" (equal? (retire-reason) '(clean-close . tls-closed)) (retire-reason))
+          (send (cdr ch) (vector 'release))
+          (check "CLOSE-DRAIN-DRAINS: resources back to baseline" (settled-to? base 8000) (snap) base))
+
+        ;; ---- CLOSE-DRAIN-SEAL: nothing can be submitted after the alert
+        ;; P is held at a chunk boundary so that the close is requested while P
+        ;; still holds the gate: then P's own release runs finish-shutdown and P
+        ;; is the process that parks at 'tls-after-alert (a controller cannot park).
+        (let* ((ch (open-held-conn! 'stall)) (c (car ch)) (cli client-pid)
+               (th (inject-arm-barrier! 'agg-chunk-boundary 1 30000))
+               (p (spawn-writer! c 'p big))
+               (wh (inject-barrier-wait th 'agg-chunk-boundary 5000))
+               (t (inject-arm-barrier! 'tls-after-alert 1 30000)))
+          (check "CLOSE-DRAIN-SEAL: P held at a chunk boundary" (and (pair? wh) (eq? (cdr wh) p)) (desc wh))
+          (tcp-close! c)
+          (when (pair? wh) (inject-barrier-drain! p th 5000))
+          (inject-release! th)
+          (check "CLOSE-DRAIN-SEAL: queued output" (within? 5000 (lambda () (let ((q (raw-queued c))) (and q (> q 0))))) (raw-queued c))
+          (let ((w (inject-barrier-wait t 'tls-after-alert 10000)))
+            (check "CLOSE-DRAIN-SEAL: the finishing process parked right after the alert was queued" (pair? w) (desc w) (inject-barrier-state t))
+            (cond
+              ((pair? w)
+               (check "CLOSE-DRAIN-SEAL: premise -- still open and attached while parked" (let ((q (raw-queued c))) (and q (> q 0))) (raw-queued c))
+               (let ((st 'no-callback))
+                 (let ((accepted (tcp-writev-raw! c (list sentinel) (lambda (s) (set! st s)))))
+                   (check "CLOSE-DRAIN-SEAL: a raw submission after the alert is refused synchronously" (and (not accepted) (eqv? st -1)) accepted st)))
+               (inject-barrier-drain! (cdr w) t 5000)
+               (inject-release! t))
+              (else (inject-barrier-cleanup! t 'tls-after-alert 31000))))
+          (writer-outcome 'p 20000)
+          (send cli (vector 'resume))
+          (let ((r (client-result 30000)))
+            (check "CLOSE-DRAIN-SEAL: the client received 4 MB, close_notify, and no sentinel bytes (residue 0)" (and r (eqv? (car r) (bytevector-length big)) (eq? (cadr r) 'close-notify) (bytevector? (cadddr r)) (eqv? (tls-record-residue (cadddr r)) 0)) (and r (car r)) (and r (cadr r)) (and r (bytevector? (cadddr r)) (tls-record-residue (cadddr r)))))
+          (send (cdr ch) (vector 'release))
+          (check "CLOSE-DRAIN-SEAL: resources back to baseline" (settled-to? base 6000) (snap) base))
+
+        ;; ---- CLOSE-DRAIN-REARM-FAIL: a failed PROGRESS rearm retires at once
+        (let* ((ch (open-held-conn! 'slow)) (c (car ch)) (cli client-pid)
+               (th (inject-arm-barrier! 'agg-chunk-boundary 1 30000))
+               (p (spawn-writer! c 'p big))
+               (wh (inject-barrier-wait th 'agg-chunk-boundary 5000))
+               (t (inject-arm-barrier! 'tls-after-alert 1 30000)))
+          (check "CLOSE-DRAIN-REARM-FAIL: P held at a chunk boundary" (and (pair? wh) (eq? (cdr wh) p)) (desc wh))
+          (tcp-close! c)
+          (when (pair? wh) (inject-barrier-drain! p th 5000))
+          (inject-release! th)
+          (check "CLOSE-DRAIN-REARM-FAIL: queued output" (within? 5000 (lambda () (let ((q (raw-queued c))) (and q (> q 0))))) (raw-queued c))
+          (let ((w (inject-barrier-wait t 'tls-after-alert 10000)))
+            (check "CLOSE-DRAIN-REARM-FAIL: parked after the alert (initial arm succeeded)" (pair? w) (desc w))
+            (when (pair? w)
+              ;; the NEXT successful application completion's progress rearm fails
+              (inject-arm-return! 'tls-timer-rearm-fail -1 1)
+              (inject-barrier-drain! (cdr w) t 5000))
+            (inject-release! t))
+          (send cli (vector 'resume))         ; progress begins: the first completion's rearm fails
+          (writer-outcome 'p 30000)
+          (check "CLOSE-DRAIN-REARM-FAIL: retired promptly with the timer-failed reason" (within? 5000 (lambda () (equal? (retire-reason) '(clean-close . tls-shutdown-timer-failed)))) (retire-reason))
+          (client-result 30000)
+          (inject-disarm!)
+          (send (cdr ch) (vector 'release))
+          (check "CLOSE-DRAIN-REARM-FAIL: resources back to baseline" (settled-to? base 8000) (snap) base))
+
         ;; ---- Z14: the empty check and the gate opening are one step
         ;; A is coalesced with Finished and delivered by the watcher's first
         ;; drain; the drain's EMPTY round reaches the hook. The client sends B as
@@ -366,10 +520,11 @@
         (set! handler-count 0)
         (let* ((t (inject-arm-barrier! 'z14-empty-open 1 30000))
                (expect resp-len)
-               (client (spawn (lambda ()
+               (client (let ((cp (spawn (lambda ()
                                 (let-values (((plain writes eof? fail)
                                               (raw-tls-exchange "127.0.0.1" port "localhost" GET-KA #t 8000 'second GET-KA resp-len)))
-                                  (send main-pid (vector 'client-done (bytevector-length plain) eof? plain fail))))))
+                                  (send main-pid (vector 'client-done self (bytevector-length plain) eof? plain fail)))))))
+                         (set! client-pid cp) cp))
                (w (inject-barrier-wait t 'z14-empty-open 1500)))
           (cond
             ((eq? w 'skipped)
