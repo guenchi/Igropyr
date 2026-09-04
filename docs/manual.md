@@ -5699,6 +5699,71 @@ scheme --script test-myfeature.sc
 echo $?  # Exit code 0 = success
 ```
 
+### Fault Injection
+
+`(igropyr inject)` lets a test force a failure at a named point in the library
+code. Like `(igropyr checked)`, the switch is read at **expansion time**, not at
+run time: with `IGROPYR_INJECT` unset, the injection forms expand to nothing at
+all, so a normal build contains no injection code — not a disabled branch, not a
+flag test. This is a test instrument, and like contracts it must never be relied
+on for a production requirement.
+
+There are four primitives, placed in the library source at 56 named points:
+
+- `(inject-fault! 'point)` — raises when armed. Allocates nothing, so it may sit
+  anywhere a raise is already possible, including inside an interrupt region.
+- `(inject-return! 'point expr)` — when armed, **skips `expr` entirely** and
+  returns the configured value in its place.
+- `(inject-override! 'point expr)` — **evaluates `expr`** and then replaces the
+  answer.
+- `(inject-barrier! 'point)` — parks the process that reaches the point and
+  tells the arming process, so a test can act in the window between two
+  expressions. A point inside an interrupt region cannot park and is recorded as
+  skipped instead.
+
+**`inject-return!` and `inject-override!` are not interchangeable.** Skipping a
+call is the same as that call failing *only* when the call has no side effect
+the code after it depends on. Use `inject-return!` to wrap a raw submission that
+can genuinely be refused without running; use `inject-override!` wherever the
+call itself moves state the caller depends on. Getting this wrong produces a
+state no real failure produces: `accept-refused` was originally written with
+`inject-return!`, and skipping `uv_accept` left libuv's `accepted_fd` set and
+froze the listener — the same errno to the caller, a different world underneath.
+
+Arming happens from `(igropyr inject-control)`, which the library proper never
+imports:
+
+- `(inject-arm-fault! point [occurrence [pid]])`,
+  `(inject-arm-return! point value [occurrence [pid]])`,
+  `(inject-arm-barrier! point occurrence [timeout-ms [before-report]])` — each
+  returns a **ticket**. `occurrence` is `#f` for every hit or `k` for the k-th
+  only; a barrier requires a positive `k`.
+- `(inject-release! ticket)` ends one arming; `(inject-disarm!)` clears them all.
+- `(inject-hits point)` and `(inject-delivered point)` read back what happened —
+  they differ when the wrapped expression raised.
+- For barriers: `(inject-barrier-wait ticket point bound-ms)` returns
+  `(parked . pid)`, `skipped` or `timeout`;
+  `(inject-barrier-drain! pid ticket bound-ms)` resumes a parked victim and waits
+  for a terminal state; `(inject-barrier-cleanup! ticket point ms)` is the
+  recovery path after a wait timed out.
+
+A value passed to `inject-arm-return!` is checked against a **whitelist in
+`inject.sc`**, and an unlisted point is refused rather than armed. The clause is
+where a point says what values its caller can actually read — a libuv errno in
+`[-4095,-1]`, say, rather than any fixnum. Adding a return or override point
+therefore means adding a clause.
+
+`test/run-all.sh` sets the switch itself for the suites that need it. Running one
+of those by hand requires it explicitly:
+
+```bash
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' scheme --script test/inject.sc
+```
+
+Without it, a cell that reaches for an injection seam fails with `test seam:
+this artifact was expanded without IGROPYR_INJECT=on` — which is the switch
+working, not a broken test.
+
 ### Load Testing
 
 For concurrent load tests, use Apache Bench or `wrk`:
