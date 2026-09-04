@@ -20,7 +20,7 @@
           ws-recv ws-send-text! ws-send-binary! ws-close!
           ws-write-timeout!)
   (import (chezscheme) (igropyr buffer)
-          (igropyr actor) (igropyr libuv)
+          (igropyr actor) (igropyr libuv) (igropyr tcp)
           (only (igropyr crypto) sha1 base64-encode base64-decode))
 
   (define max-frame 1048576)          ; single frame payload cap

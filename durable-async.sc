@@ -110,7 +110,7 @@
           durable-error? durable-error-op durable-error-path)
   (import (chezscheme)
           (igropyr actor)
-          (igropyr libuv)
+          (igropyr libuv) (igropyr tcp)
           (only (igropyr durable)
                 durable-error? durable-error-op durable-error-path
                 fs-trace-step))

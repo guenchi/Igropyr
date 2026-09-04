@@ -190,26 +190,7 @@
               kdf-pbkdf2-sha256 kdf-scrypt kdf-argon2id
               kdf-argon2id-available? password-hash
               password-verify)
-        (only (igropyr libuv)
-              uv-init! uv-poll! now-ms now-ns uv-set-deliver!
-              uv-owner-died! tcp-listen! tcp-stop-listen!
-              listener-open? listener-token
-              tcp-connect! dns-resolve! file-read-async!
-              file-realpath file-stream-open!
-              file-stream-open-under! file-stream-read!
-              file-stream-close! file-stream-own!
-              file-stream-raw! file-stream-chunk-ptr
-              fs-open-async! fs-write-async! fs-fsync-async!
-              fs-rename-async! fs-close-async! fs-mkdir-async!
-              fs-job-count fs-fd-count fs-o-rdonly fs-o-wronly
-              fs-o-creat fs-o-trunc fs-o-excl fs-o-directory
-              fs-o-cloexec fs-count tcp-read-start!
-              tcp-read-stop! tcp-write! tcp-writev!
-              tcp-write-foreign! tcp-close! conn? conn-handle
-              conn-owner conn-set-owner! conn-peer-ip
-              conn-on-close! conn-state conn-count
-              uv-owner-index-count uv-live-handle-count
-              uv-strerror)
+        (only (igropyr libuv) uv-init! uv-poll! now-ms now-ns fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc fs-o-excl fs-o-directory fs-o-cloexec uv-live-handle-count uv-strerror) (only (igropyr tcp) uv-set-deliver! uv-owner-died! tcp-listen! tcp-stop-listen! listener-open? listener-token tcp-connect! dns-resolve! file-read-async! file-realpath file-stream-open! file-stream-open-under! file-stream-read! file-stream-close! file-stream-own! file-stream-raw! file-stream-chunk-ptr fs-open-async! fs-write-async! fs-fsync-async! fs-rename-async! fs-close-async! fs-mkdir-async! fs-job-count fs-fd-count fs-count tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign! tcp-close! conn? conn-handle conn-owner conn-set-owner! conn-peer-ip conn-on-close! conn-state conn-count uv-owner-index-count)
         (only (igropyr metrics)
               make-metrics metrics-middleware metrics-endpoint
               metrics-count! metrics-snapshot metrics-json

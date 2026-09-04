@@ -17,7 +17,7 @@
 ;;; from the pooled handler would be bounded by stuck-ms and would pass
 ;;; without the timeout existing at all.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http)
         (igropyr express))
 
 (define failures 0)

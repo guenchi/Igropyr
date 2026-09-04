@@ -15,7 +15,7 @@
 ;;; Requires the openssl CLI. Certs are ephemeral (test/tls-certs.sh).
 
 (import (chezscheme) (igropyr http-client) (igropyr tls) (igropyr http)
-        (igropyr actor) (igropyr libuv) (igropyr platform))
+        (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr platform))
 
 ;; NAMED IF ABSENT. Without the openssl CLI the s_server instances below
 ;; never start, and every case fails on a connection that was refused --

@@ -15,9 +15,9 @@
 ;;; Requires IGROPYR_INJECT=on (seams) and the openssl CLI (test/tls-certs.sh).
 
 (import (chezscheme)
-        (igropyr actor) (igropyr libuv) (igropyr http) (igropyr http-client) (igropyr tls)
+        (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http) (igropyr http-client) (igropyr tls)
         (igropyr inject-control) (igropyr inject)
-        (only (igropyr libuv) conn-tls-retire! tls-conn-totals tls-eof-deliveries)
+        (only (igropyr tcp) conn-tls-retire! tls-conn-totals tls-eof-deliveries)
         (only (igropyr tls-core) tls-live-session-count tls-live-context-count tls-live-listener-context-count)
         (test tls-raw-client))
 
@@ -232,7 +232,7 @@
     (let ((tls-syms (file-symbols "igropyr/tls.sc")))
       (check "ARCH: (igropyr tls) references no OpenSSL entry point or loader (parsed symbols)"
              (not (exists (lambda (s) (let ((n (symbol->string s))) (or (and (> (string-length n) 4) (member (substring n 0 4) '("SSL_" "BIO_" "EVP_" "OBJ_" "ERR_"))) (and (> (string-length n) 5) (string=? (substring n 0 5) "X509_")) (member n '("libssl" "libcrypto"))))) tls-syms))))
-    (let ((watch-syms (file-symbols "igropyr/tls-watch.sc")) (uv-syms (append (file-symbols "igropyr/uv.sc") (file-symbols "igropyr/tcp.sc"))))
+    (let ((watch-syms (file-symbols "igropyr/tls-watch.sc")) (uv-syms (append (file-symbols "igropyr/libuv.sc") (file-symbols "igropyr/tcp.sc"))))
       ;; positive control: an absence check over a source file is only as good
       ;; as its search surface. When libuv.sc became an 81-line facade the two
       ;; checks below would have stayed green forever; this line reds instead.

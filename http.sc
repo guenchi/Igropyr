@@ -93,7 +93,7 @@
   ;; watcher-spawner hook explicitly; it adds no layer, since this file
   ;; already imports actor.
   (import (chezscheme) (igropyr buffer)
-          (igropyr actor) (igropyr libuv) (igropyr otp)
+          (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr otp)
           (igropyr websocket)
           (only (igropyr tls-core) tls-listen-context! tls-context-retire!)
           (only (igropyr tls-watch) tls-watch-install!))

@@ -21,7 +21,7 @@
 ;;; formulas give the same answer, and the test passes against the bug. What
 ;;; is asserted is WHEN the request ends relative to its FIRST byte.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http)
         (igropyr express))
 
 (define failures 0)

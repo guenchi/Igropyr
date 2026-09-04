@@ -24,7 +24,7 @@
 ;;; is not enough -- case (c) already closed the fd and still left the
 ;;; reader parked, which is precisely how it went unnoticed.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http)
         (igropyr express) (igropyr middleware))
 
 (define failures 0)

@@ -20,7 +20,7 @@
 ;;;   * a round whose leader has died is not one to join, and a waiter
 ;;;     that was KILLED does not pin the key in follower-forever mode.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr buffer)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr buffer)
         (igropyr qjspool)
         (only (igropyr ssr) make-ssr ssr-render ssr-invalidate! ssr-stats))
 

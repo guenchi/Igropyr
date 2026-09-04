@@ -22,7 +22,7 @@
 ;;; The test server selects its behavior from the startup "database"
 ;;; parameter: scram / cleartext / notice / badlen.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr postgresql)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr postgresql)
         (only (igropyr crypto)
               sha256 hmac-sha256 pbkdf2-hmac-sha256 base64-encode base64-decode))
 

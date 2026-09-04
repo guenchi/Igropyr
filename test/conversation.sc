@@ -10,7 +10,7 @@
 ;;;     never 'gone; a commit! whose thunk raised is still 'gone
 
 (import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
-        (igropyr json) (igropyr conversation) (igropyr libuv)
+        (igropyr json) (igropyr conversation) (igropyr libuv) (igropyr tcp)
         ;; process-count: the hook cases below assert that a wedged hook
         ;; leaves no process behind, which is the observation the counters
         ;; cannot make

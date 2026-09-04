@@ -18,7 +18,7 @@
 ;;;     than failing: the server reads a wrong length and every byte after
 ;;;     it becomes the next packet.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr mysql))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr mysql))
 
 (define failures 0)
 (define (check label ok)

@@ -1,4 +1,4 @@
-;;; Smoke test for (igropyr libuv): a bare echo server with no actor layer.
+;;; Smoke test for (igropyr libuv) (igropyr tcp): a bare echo server with no actor layer.
 ;;; The deliver hook is abused to handle messages synchronously; the
 ;;; conn itself plays the role of the owner pid.
 ;;; Run: scheme --script test/smoke-echo.sc  (from the project root,

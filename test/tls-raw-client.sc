@@ -20,7 +20,7 @@
   (export raw-tls-exchange raw-tls-send-and-drop raw-tls-two-requests raw-tls-collect)
   (import (chezscheme)
           (igropyr actor)
-          (only (igropyr libuv) tcp-connect! tcp-read-start! tcp-write! tcp-close! now-ms)
+          (only (igropyr libuv) now-ms) (only (igropyr tcp) tcp-connect! tcp-read-start! tcp-write! tcp-close!)
           (only (igropyr tls-core)
                 ensure-ctx! client-ctx tls-session-new! tls-session-retire!
                 tls-session-configure-client! tls-session-handshake-step!

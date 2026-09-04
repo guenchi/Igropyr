@@ -13,7 +13,7 @@
 ;;; desynchronises the stream, so the only correct outcome is to tell every
 ;;; waiter and drop the connection.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp)
         (igropyr redis) (igropyr util))
 
 (define port 18815)

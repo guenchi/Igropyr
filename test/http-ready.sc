@@ -6,7 +6,7 @@
 ;;; both. The discriminating pair is a server whose listener has been
 ;;; stopped: pool-alive? still #t, ready? #f. Then the other side: a pool
 ;;; that died under a live listener, ready? #f as well.
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http))   ; libuv for the no-argument tcp-stop-listen!
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http))   ; libuv for the no-argument tcp-stop-listen!
 
 (define (fail label . info)
   (display "FAIL ") (display label)

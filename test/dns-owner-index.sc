@@ -22,7 +22,7 @@
 ;;; status. Both shapes below therefore leave through the same exit. The
 ;;; submission exit has no coverage here.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp))
 
 (define failures 0)
 (define (check label ok)

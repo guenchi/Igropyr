@@ -1,7 +1,7 @@
 #!chezscheme
 ;;; WebSocket client verification against deliberately malformed 101 replies.
 
-(import (chezscheme) (igropyr ws-client) (igropyr libuv)
+(import (chezscheme) (igropyr ws-client) (igropyr libuv) (igropyr tcp)
         (only (igropyr websocket) ws-accept-key))
 
 (define port 18101)

@@ -24,7 +24,7 @@
 ;;;
 ;;; A WATCHDOG ENDS THE RUN: a parked victim nobody resumes is a hang, and a
 ;;; hang has no voice of its own.
-(import (chezscheme) (igropyr actor) (igropyr node) (igropyr libuv)
+(import (chezscheme) (igropyr actor) (igropyr node) (igropyr libuv) (igropyr tcp)
         (only (igropyr tcp) fs-req-block-count)
         (igropyr inject-control) (igropyr inject))
 

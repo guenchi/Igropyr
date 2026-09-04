@@ -8,7 +8,7 @@
 (import (chezscheme) (igropyr http) (igropyr express) (igropyr session)
         (igropyr auth) (igropyr jwt) (igropyr ws-client)
         (only (igropyr websocket) ws-conn ws-send-text! ws-close! ws-accept-key)
-        (igropyr json) (igropyr sexpr) (igropyr libuv))
+        (igropyr json) (igropyr sexpr) (igropyr libuv) (igropyr tcp))
 
 (define port 18088)
 (define empty-bv (make-bytevector 0))

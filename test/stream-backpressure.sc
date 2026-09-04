@@ -14,7 +14,7 @@
 ;;; stops at a small number; without it the loop runs to completion,
 ;;; queueing every chunk in memory.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http)
         (igropyr express))
 
 (define failures 0)

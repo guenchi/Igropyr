@@ -24,7 +24,7 @@
 ;;; (bellard's, loaded on its own) fails loudly at the boot symbol
 ;;; check, and a wrong engine must not read as no engine.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr qjspool)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr qjspool)
         (only (igropyr ssr) make-ssr ssr-render ssr-try-render ssr-invalidate! ssr-stats)
 
         (only (igropyr quickjs) qjs-boot! qjs-call/bytes))

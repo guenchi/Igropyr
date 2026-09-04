@@ -17,7 +17,7 @@
 ;;; streaming one (an on-chunk handler), because they parse separately and
 ;;; had the same gap in each.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http-client))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http-client))
 
 (define failures 0)
 (define (check label ok)

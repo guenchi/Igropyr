@@ -11,7 +11,7 @@
 ;;; Server C (18083): no on-failure -> plain 500 (default unchanged).
 
 (import (chezscheme) (igropyr util) (igropyr http) (igropyr express)
-        (igropyr libuv))
+        (igropyr libuv) (igropyr tcp))
 
 (define empty-bv (make-bytevector 0))
 

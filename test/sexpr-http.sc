@@ -3,7 +3,7 @@
 ;;; answers (tag arg ...) requests with (ok ...) / (error ...) data.
 
 (import (chezscheme) (igropyr http) (igropyr express)
-        (igropyr sexpr) (igropyr libuv))
+        (igropyr sexpr) (igropyr libuv) (igropyr tcp))
 
 (define port 18085)
 (define empty-bv (make-bytevector 0))

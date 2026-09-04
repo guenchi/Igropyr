@@ -1,5 +1,5 @@
 #!chezscheme
-(import (chezscheme) (igropyr actor) (igropyr libuv))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp))
 
 (define prefix (string-append "/tmp/igropyr-file-read-"
                               (number->string (get-process-id))))

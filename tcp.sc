@@ -1,13 +1,13 @@
 #!chezscheme
 ;;; (igropyr tcp) -- everything a connection or an owning process owns.
 ;;;
-;;; THE CUT ABOVE (igropyr uv) IS BY OWNERSHIP. What lives here hangs off an
+;;; THE CUT ABOVE (igropyr libuv) IS BY OWNERSHIP. What lives here hangs off an
 ;;; owner or a connection: the conn record and its table, listeners and their
 ;;; incarnations, the owner index and owner-death sweep, outbound connects,
 ;;; DNS, files and file streams, the TLS connection codec with its gate,
 ;;; watcher side and per-conn timers, and the accept counters. What belongs to
 ;;; the loop itself -- the FFI, the constants, the loop handle and its shared
-;;; buffers -- is (igropyr uv), below.
+;;; buffers -- is (igropyr libuv), below.
 ;;;
 ;;; THE SHARED BUFFERS ARRIVE AS LEASES. uv hands each one to a thunk inside
 ;;; an interrupt-disabled region; the bodies below are the same sequences in
@@ -61,11 +61,11 @@
     tls-timer-free-path tls-conn-in-table? tls-eof-deliveries
     tls-swallowed-errors tls-read-trace)
 
-  ;; (igropyr uv) IS BELOW THIS FILE and (igropyr tls-core) beside it; both
+  ;; (igropyr libuv) IS BELOW THIS FILE and (igropyr tls-core) beside it; both
   ;; import neither this library nor each other's consumers, so there is no
   ;; cycle. (igropyr libuv) is the façade ABOVE both.
   (import (chezscheme) (igropyr platform) (igropyr inject)
-          (igropyr uv) (igropyr tls-core))
+          (igropyr libuv) (igropyr tls-core))
 
   ;; connection record; one per accepted TCP client
   (define-record-type (conn make-conn conn?)
@@ -1768,7 +1768,7 @@
       (lock-object on-tls-timer-close-code)
       ;; ELEVEN, NOT THIRTEEN. on-timer-code and on-walk-code belong to the
       ;; loop itself -- its wakeup timer and uv_walk -- and are locked in
-      ;; (igropyr uv), beside the loop. Every code object must be locked in
+      ;; (igropyr libuv), beside the loop. Every code object must be locked in
       ;; whichever library holds it: libuv keeps only a raw entry pointer, so
       ;; a collected object means the loop jumps into freed memory. The
       ;; invariant is the ORDER -- construct, lock, take the entry, hand it

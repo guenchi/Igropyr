@@ -31,7 +31,7 @@
 ;;; name it was given; a mismatch is a silent handshake refusal, and the
 ;;; first mesh run formed no links at all for exactly that reason.
 (import (chezscheme) (igropyr actor) (igropyr node) (igropyr gen-server) (igropyr http)
-        (only (igropyr libuv) conn-count))
+        (only (igropyr tcp) conn-count))
 
 (define args (cdr (command-line)))
 (unless (>= (length args) 9)

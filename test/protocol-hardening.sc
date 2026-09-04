@@ -12,7 +12,7 @@
 ;;; #25 chunked framing was sent to HTTP/1.0 clients, which do not
 ;;;     implement it and read the hex size lines as body content.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http)
         (igropyr websocket)
         (igropyr express) (igropyr http-client))
 

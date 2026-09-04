@@ -15,7 +15,7 @@
 ;;; exercises the losing side.
 
 (import (chezscheme) (igropyr actor) (igropyr express) (igropyr http)
-        (igropyr libuv) (igropyr session))
+        (igropyr libuv) (igropyr tcp) (igropyr session))
 
 (define port 18816)
 (define failures 0)

@@ -19,7 +19,7 @@
 ;;; server enqueues the whole body either way. That is what the first
 ;;; version of this test did, and it failed against the fix.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http-client))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http-client))
 
 (define failures 0)
 (define (check label ok)

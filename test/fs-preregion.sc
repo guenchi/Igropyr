@@ -13,7 +13,7 @@
 ;;; function's own guard: a raise there is the earliest possible raise
 ;;; after ownership transfers, and the fd must still be closed.
 ;;; Needs IGROPYR_INJECT=on, from source. Shape of test/inject.sc T2-2.
-(import (chezscheme) (igropyr actor) (igropyr libuv)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp)
         (igropyr inject-control) (igropyr inject))
 (unless (equal? (getenv "IGROPYR_INJECT") "on")
   (display "fs-preregion suite requires IGROPYR_INJECT=on\n") (exit 1))

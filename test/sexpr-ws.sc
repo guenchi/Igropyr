@@ -3,7 +3,7 @@
 ;;; one datum -- write to send, safe-parse on receive.
 
 (import (chezscheme) (igropyr http) (igropyr express)
-        (igropyr sexpr) (igropyr ws-client) (igropyr libuv))
+        (igropyr sexpr) (igropyr ws-client) (igropyr libuv) (igropyr tcp))
 
 (define port 18086)
 (define empty-bv (make-bytevector 0))

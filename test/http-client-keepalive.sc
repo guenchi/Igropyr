@@ -16,7 +16,7 @@
 ;;; caller opted out of. Reusing any of them desynchronises the next request
 ;;; on that socket.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http-client))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http-client))
 
 (define failures 0)
 (define (check label ok)

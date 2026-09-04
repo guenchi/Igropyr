@@ -26,7 +26,7 @@
   ;; off expansion of every primitive refers to no runtime name of it, so
   ;; this unit's invoke-requirements stay (), which is what
   ;; test/inject-isolation.ss measures for every unit in library-units.
-  (import (chezscheme) (igropyr libuv) (igropyr inject))
+  (import (chezscheme) (igropyr libuv) (igropyr tcp) (igropyr inject))
 
   (define process-default-ticks 100000)
 

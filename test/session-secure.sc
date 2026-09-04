@@ -26,7 +26,7 @@
 ;;; cleartext side, while adding it merely costs one cookie.
 
 (import (chezscheme) (igropyr actor) (igropyr express) (igropyr session)
-        (igropyr http) (igropyr libuv))
+        (igropyr http) (igropyr libuv) (igropyr tcp))
 
 (define failures 0)
 (define (fail label . info)

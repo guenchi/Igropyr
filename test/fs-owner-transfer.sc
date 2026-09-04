@@ -10,7 +10,7 @@
 ;;; A killed process runs no dynamic-wind exit handlers, so nothing else
 ;;; was ever going to close them.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp))
 
 (define failures 0)
 (define (check label ok)

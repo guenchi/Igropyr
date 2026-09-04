@@ -5,7 +5,7 @@
 ;;; check leaves a check/use window between those two effects.
 
 (import (chezscheme) (igropyr actor) (igropyr express) (igropyr http)
-        (igropyr libuv) (igropyr session))
+        (igropyr libuv) (igropyr tcp) (igropyr session))
 
 (define port 18814)
 (define failures 0)

@@ -158,7 +158,8 @@
   (export tls-enable! tls-establish!
           tls-listen-context! tls-context-retire!)
   (import (chezscheme) (igropyr actor) (igropyr tls-core)
-          (only (igropyr libuv) tcp-write! conn-on-close! now-ms)
+          (only (igropyr libuv) now-ms)
+          (only (igropyr tcp) tcp-write! conn-on-close!)
           (only (igropyr http-client) set-https-connector!))
 
 

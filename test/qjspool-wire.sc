@@ -13,7 +13,7 @@
 ;;; library's. Two implementations of the same format disagree loudly; one
 ;;; implementation tested against itself agrees with its own bugs.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr buffer)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr buffer)
         (igropyr qjspool))
 
 (define failures 0)

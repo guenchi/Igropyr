@@ -51,17 +51,16 @@
     ;; instance of it; the order here is the dependency order, not a
     ;; preference. It sits after platform.sc, its only dependency.
     "igropyr/tls-core.sc"
-    ;; uv BELOW tcp BELOW the façade, and all three before libuv's
-    ;; consumers. uv owns the loop; tcp owns everything a connection or an
-    ;; owning process owns; "igropyr/libuv.sc" is now a façade with no
-    ;; definitions, so it must be compiled after both.
-    "igropyr/uv.sc"
+    ;; libuv BELOW tcp, and both before their consumers. libuv is the raw
+    ;; binding layer and owns the loop; tcp owns everything a connection or
+    ;; an owning process owns, and imports libuv. There is no facade: a
+    ;; consumer that needs both binds both.
+    "igropyr/libuv.sc"
     "igropyr/tcp.sc"
     "igropyr/durable.sc"
     "igropyr/quickjs.sc"
     "igropyr/crypto.sc"
     "igropyr/blas.sc"
-    "igropyr/libuv.sc"
     "igropyr/actor.sc"
     ;; after actor and libuv: it is the watcher body libuv asks for through
     ;; a hook, and it needs both. Nothing below it may import it.

@@ -18,7 +18,7 @@
 ;;; the right string" was never in doubt; what the client parses out of it
 ;;; is the question.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http)
         (igropyr express))
 
 (define failures 0)

@@ -28,7 +28,7 @@
           sse-start! sse-send! make-fault-handler
           static-cache-limits! static-cache-stats)
   (import (chezscheme) (igropyr checked)
-          (igropyr actor) (igropyr libuv) (igropyr http)
+          (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http)
           (igropyr json) (igropyr gzip) (igropyr sexpr)
           (only (igropyr websocket) ws-recv ws-send-text! ws?))
 

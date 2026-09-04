@@ -8,7 +8,7 @@
 ;;;   - a client that disconnects mid-download doesn't wedge the server
 ;;;   - small files still come from the in-memory cache
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http)
         (igropyr express))
 
 (define port 18085)

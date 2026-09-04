@@ -6,7 +6,7 @@
 ;;; (Gemini streamGenerateContent alt=sse).
 
 (import (chezscheme) (igropyr http) (igropyr express) (igropyr http-client)
-        (igropyr libuv))
+        (igropyr libuv) (igropyr tcp))
 
 (define port 18091)
 (define raw-port 18092)

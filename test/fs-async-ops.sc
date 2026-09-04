@@ -16,7 +16,7 @@
 ;;; the wrong reason.
 ;;;
 ;;; Needs IGROPYR_INJECT=on, from source (R12-5 injects a fault).
-(import (chezscheme) (igropyr actor) (igropyr libuv)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp)
         (igropyr inject-control) (igropyr inject))
 (unless (equal? (getenv "IGROPYR_INJECT") "on")
   (display "fs-async-ops suite requires IGROPYR_INJECT=on\n") (exit 1))

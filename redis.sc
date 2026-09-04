@@ -22,7 +22,8 @@
 
 (library (igropyr redis)
   (export redis-connect redis redis-close! redis-set-limits!)
-  (import (chezscheme) (igropyr actor) (igropyr buffer) (igropyr libuv))
+  (import (chezscheme) (igropyr actor) (igropyr buffer) (igropyr libuv)
+          (igropyr tcp))
 
   (define connect-timeout-ms 5000)
   (define reply-timeout-ms 30000)

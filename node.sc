@@ -212,7 +212,7 @@
   ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
   ;; the note in libuv.sc; test/inject-isolation.ss is what measures it.
   (import (chezscheme) (igropyr buffer)
-          (igropyr actor) (igropyr libuv) (igropyr sexpr)
+          (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr sexpr)
           (igropyr gen-server) (igropyr inject)
           (only (igropyr crypto) hmac-sha256 bytevector->hex))
 

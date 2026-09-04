@@ -20,7 +20,7 @@
 ;;;     replayable, so a POST the server had already performed could be
 ;;;     sent a second time when the connection dropped before its answer.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http-client))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http-client))
 
 (define failures 0)
 (define (check label ok)

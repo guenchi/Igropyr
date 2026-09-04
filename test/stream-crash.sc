@@ -17,7 +17,7 @@
 ;;; live-connection table (which spans both sides here, so a leaked server
 ;;; connection also pins its client).
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http)
         (igropyr express))
 
 (define failures 0)

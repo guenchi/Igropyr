@@ -12,7 +12,7 @@
 ;;;
 ;;; No server needed: the fake below speaks the wire format directly.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr redis))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr redis))
 
 (define port 18815)
 (define failures 0)

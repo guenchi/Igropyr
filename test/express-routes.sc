@@ -3,7 +3,7 @@
 ;;; splat (captured under param "0"), registration-order precedence,
 ;;; and the 404 fallthrough. Driven end to end over real HTTP.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp)
         (igropyr http) (igropyr express))
 
 (define port 18089)

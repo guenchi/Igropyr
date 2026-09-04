@@ -22,7 +22,7 @@
 ;;; retiring it anyway would put two Set-Cookie fields in one response.
 
 (import (chezscheme) (igropyr actor) (igropyr express) (igropyr session)
-        (igropyr http) (igropyr libuv))
+        (igropyr http) (igropyr libuv) (igropyr tcp))
 
 (define failures 0)
 (define (fail label . info)

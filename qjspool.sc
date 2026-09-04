@@ -121,7 +121,7 @@
           qjspool qjspool-connect qjspool?
           qjspool-render qjspool-render/bytes
           qjspool-timeout-ms qjspool-stats qjspool-close!)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr connpool)
+  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr connpool)
           (igropyr buffer)
           (only (igropyr quickjs) qjs-boot! qjs-call/bytes))
 

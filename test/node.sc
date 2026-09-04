@@ -12,7 +12,7 @@
 ;;;     promptly, paced traffic is not, the accounting dies with the conn
 ;;;   - reconnect delay: bounded, deterministic, dispersed across names
 
-(import (chezscheme) (igropyr actor) (igropyr libuv)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp)
         (igropyr node) (igropyr pubsub)
         (only (igropyr crypto) hmac-sha256 bytevector->hex))
 

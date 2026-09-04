@@ -45,7 +45,7 @@
 ;;; missing seam is why the branch went untested; if a setter is ever added,
 ;;; shorten this cell rather than deleting it.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr http)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http)
         (igropyr express))
 
 (define failures 0)

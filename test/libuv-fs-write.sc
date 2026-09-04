@@ -19,10 +19,7 @@
 ;;; counts drain to zero.
 
 (import (chezscheme) (igropyr actor)
-        (only (igropyr libuv)
-              fs-open-async! fs-write-async! fs-fsync-async!
-              fs-rename-async! fs-close-async! fs-job-count fs-fd-count
-              fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc))
+        (only (igropyr libuv) fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc) (only (igropyr tcp) fs-open-async! fs-write-async! fs-fsync-async! fs-rename-async! fs-close-async! fs-job-count fs-fd-count))
 
 (define failures 0)
 (define (fail label . info)

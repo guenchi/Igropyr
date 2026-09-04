@@ -17,7 +17,7 @@
 ;;; refused outright, so the input cannot be built. redis-limits.sc asserts
 ;;; that ceiling instead.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp)
         (igropyr redis))
 
 (define port 18813)

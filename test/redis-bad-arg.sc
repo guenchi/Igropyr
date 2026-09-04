@@ -19,7 +19,7 @@
 ;;; error is raised" would have passed against the old code too, because the
 ;;; dying actor did raise -- in the wrong process.
 
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr redis))
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr redis))
 
 (define port 18817)
 (define failures 0)

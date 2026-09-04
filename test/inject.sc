@@ -29,7 +29,7 @@
 ;;; the arming is cleared, and the next cell runs; the verdict is the
 ;;; list at the end. Setup failures (the child never came up) still abort,
 ;;; since no cell means anything without the link.
-(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr node)
+(import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr node)
         (igropyr inject-control) (igropyr inject))
 
 (define scheme-bin (or (getenv "SCHEME_BIN") "scheme"))

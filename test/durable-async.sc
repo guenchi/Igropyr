@@ -30,8 +30,7 @@
 ;;; POLICY is asserted after the fact instead).
 
 (import (chezscheme) (igropyr actor)
-        (only (igropyr libuv) fs-job-count fs-fd-count now-ms
-              fs-open-async! fs-o-wronly fs-o-creat)
+        (only (igropyr libuv) now-ms fs-o-wronly fs-o-creat) (only (igropyr tcp) fs-job-count fs-fd-count fs-open-async!)
         (igropyr durable-async)
         (only (igropyr durable)
               durable-write-file! durable-error? durable-error-op

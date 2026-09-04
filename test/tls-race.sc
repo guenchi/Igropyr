@@ -18,7 +18,7 @@
 ;;; inject-disarm! (bulk disarm refuses a live row).
 
 (import (chezscheme)
-        (igropyr actor) (igropyr libuv) (igropyr http) (igropyr tls)
+        (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http) (igropyr tls)
         (igropyr inject-control) (igropyr inject)
         (only (igropyr tls-core) tls-live-session-count)
         (test tls-raw-client))
