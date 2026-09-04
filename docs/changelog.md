@@ -22,7 +22,7 @@ gains `uv-live-handle-count` and `uv-owner-index-count`.
 **Curated: 17 added, none removed** — but see **Breaking** for 38 names that
 moved library.
 
-⚠️ `(igropyr libuv)` also exports about 85 raw libuv bindings — `uv-fs-open`,
+`(igropyr libuv)` also exports about 85 raw libuv bindings — `uv-fs-open`,
 `uv-write`, `memcpy-cc`, the `*-size` constants and their kin — which were
 internal to that file before the split. They are the **low-level face of the
 binding layer and are not stable API**: they exist because the layer is now a
