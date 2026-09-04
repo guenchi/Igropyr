@@ -209,7 +209,10 @@
   (define-ffi BIO_free          (foreign-procedure "BIO_free" (void*) int))
 
   ;; peer certificate hash for RFC 5929 tls-server-end-point channel
-  ;; binding (OpenSSL 3 renamed the accessor; 1.1 has only the old name)
+  ;; binding (OpenSSL 3 renamed the accessor; 1.1 has only the old name).
+  ;; Measured 2026-09-04: LibreSSL 4.1.0 has only the old name too
+  ;; (foreign-entry? "SSL_get1_peer_certificate" = #f there, #t on
+  ;; OpenSSL 3.5.6), so it takes the same branch as 1.1.
   (define-ffi SSL_get-peer-cert
     (foreign-procedure
       (if (foreign-entry? "SSL_get1_peer_certificate")
@@ -282,6 +285,9 @@
   ;; variable, set exactly where the decision is taken.
   (define err-attribution #f)          ; 'mark-count | 'queue-nonempty
 
+  ;; Measured 2026-09-04: ERR_count_to_mark is absent on LibreSSL 4.1.0
+  ;; (present on OpenSSL 3.5.6), so LibreSSL takes the queue-nonempty
+  ;; attribution below. ERR_set_mark and ERR_pop_to_mark are present on both.
   (define err-own-entry?
     (let ((impl #f))
       (lambda ()
@@ -1394,16 +1400,24 @@
                              ;; LibreSSL reports exactly 0x20000000 and has
                              ;; neither this bit nor the function as a real
                              ;; symbol -- it is a macro over SSL_CTX_ctrl
-                             ;; there. THAT VALUE IS AN UNVERIFIED PREMISE:
-                             ;; it cannot be checked on the machine this was
-                             ;; written on, and it is now the only criterion
-                             ;; separating LibreSSL out.
+                             ;; there.
                              ;;
-                             ;; foreign-entry? is the backstop for exactly that
-                             ;; premise being wrong: if the version test lets a
-                             ;; LibreSSL through, the cost is one option not
-                             ;; set, not an unresolvable symbol raising inside
-                             ;; a listener's construction.
+                             ;; MEASURED, NOT ASSUMED: LibreSSL 4.1.0 on
+                             ;; FreeBSD 15.1 (2026-09-04), probing its
+                             ;; libcrypto.so.56 / libssl.so.59 directly,
+                             ;; reports OpenSSL_version_num = 0x20000000 and
+                             ;; foreign-entry? "SSL_CTX_set_options" = #f, so
+                             ;; refuse? comes out #f. The positive control on
+                             ;; OpenSSL 3.5.6 reports 0x30500060 with the
+                             ;; symbol present and refuse? #t.
+                             ;;
+                             ;; foreign-entry? REMAINS THE BACKSTOP, and the
+                             ;; measurement does not retire it: it covers the
+                             ;; LibreSSL versions nobody has run this against.
+                             ;; If a version test ever lets one through, the
+                             ;; cost is one option not set, not an unresolvable
+                             ;; symbol raising inside a listener's
+                             ;; construction.
                              ;;
                              ;; An earlier form of this test bounded the
                              ;; version ABOVE (v < 0x20000000). OpenSSL 3 is
