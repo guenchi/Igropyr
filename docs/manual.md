@@ -725,6 +725,24 @@ cannot interleave their TLS records — one waits for the other's message to
 finish. A closed connection drains what it has already queued before the socket
 goes away, so a response in flight is not truncated by the close.
 
+##### Deployment: TLS in front, plaintext behind
+
+Native HTTPS does not replace a reverse proxy, and for a public deployment the
+recommendation is unchanged: **terminate TLS at nginx** (or any proxy), let it
+serve static files and balance across processes, and have igropyr listen in
+plaintext on loopback or a private interface. A proxy is also where certificate
+renewal, HTTP/2 and request logging already live.
+
+Serve HTTPS directly when there is no proxy to put in front: a single-machine
+deployment, an internal service, local development, or a path where one hop
+fewer is worth more than what a proxy adds.
+
+Behind a proxy, two things stated elsewhere in this manual apply and are not
+repeated here: say how many proxies you have with `trust-proxy` rather than
+keying on `X-Forwarded-For` (see [Rate Limiter](#rate-limiter)), and a cookie
+set on the HTTPS side is not on the same origin as a plaintext internal hop
+(see [Cookie options](#cookie-options-and-the-one-that-cannot-be-a-constant)).
+
 On startup, `app-listen` prints one line naming the contract level baked
 into the build:
 
@@ -1045,6 +1063,13 @@ these.
    administered as one unit and upgraded in lockstep. Scaling is
    processes times machines under that assumption, not a thousand-node
    substrate.
+
+   **Trusted includes the link.** The shared secret authenticates peers; it
+   does not encrypt the connection, and the distribution protocol has no
+   TLS. A mesh spanning machines therefore *must* run on a private network.
+   What that costs at configuration time is under [What the cluster has to
+   look like](#what-the-cluster-has-to-look-like); what it means for
+   exposure is under [Security](#security).
 
 ### Lineage: ChezErlang
 
@@ -3375,7 +3400,9 @@ The client performs DNS resolution asynchronously on libuv's thread pool, so the
 
 A bad chain or a wrong hostname fails the request with `#(http-client-error "tls: …")` rather than silently connecting.
 
-**Requirements.** OpenSSL 3 or 1.1 (or LibreSSL) present as a shared library, found via the usual platform paths (including Homebrew's `openssl@3`). This is a TLS *client* only; inbound HTTPS still belongs at a reverse proxy.
+**Requirements.** OpenSSL 3 or 1.1 (or LibreSSL) present as a shared library, found via the usual platform paths (including Homebrew's `openssl@3`). This is the TLS *client*. Inbound HTTPS is a separate path — see
+[Listening](#listening) for `tls-cert` / `tls-key`, and for when to put a
+reverse proxy in front instead.
 
 **A generic connector for other protocols.** `(igropyr tls)` also exports `tls-establish!`, the same handshake as a bare byte-codec connector, not tied to HTTP. It performs the same verification (peer chain, hostname/IP, TLS 1.2 minimum, system trust store) and raises the neutral `#(tls-error "tls: …")` on failure — the https connector that `tls-enable!` installs is a thin re-tag of it. Other clients accept it directly: the PostgreSQL client takes it as its `'tls` option (see [PostgreSQL](#postgresql)). The MySQL client, by contrast, has no TLS support yet and **rejects** a `'tls` option loudly rather than silently sending plaintext.
 
