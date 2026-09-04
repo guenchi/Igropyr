@@ -1519,9 +1519,18 @@
       ;; as soon as it read the reply and was red for that reason, both
       ;; before and after the defect it was supposed to be watching: it
       ;; named I8a and exercised I5.
+      ;; Q13 (below) watches 'repeat across the replacement. Register the
+      ;; watch BEFORE the first install and consume that install's node-up
+      ;; here: the dispatcher delivers asynchronously and reads the watcher
+      ;; list at delivery time, so a watch registered after the install
+      ;; can still receive the install's node-up later and mistake it for
+      ;; the first event of the replacement pair.
+      (monitor-node 'repeat)
       (let ((held (hold-open-as! "s2-rep-gen8" 8)))
         (unless (eq? (car held) 'welcomed)
           (fail! "s2-replacement" 'higher-gen-not-welcomed (car held)))
+        (receive (after 3000 (fail! "q13-first-install-node-up-not-delivered"))
+          (`#(node-up repeat) 'ok))
         ;; THE DISCRIMINATOR. Without this the cell cannot tell "I8a
         ;; refused" from "I5 accepted": both answers look the same on the
         ;; wire, and only the presence of a live entry says which rule
@@ -1557,14 +1566,50 @@
         ;; and the difference is invisible from our own tables. The held
         ;; session parks until EOF, so if the close were neutralised it
         ;; would still be alive here.
-        (let ((h2 (hold-open-as! "s2-rep-gen10" 10)))
-          (unless (eq? (car h2) 'welcomed)
-            (fail! "s2-replacement" 'gen10-not-welcomed (car h2)))
-          (sleep-ms 800)
+        ;; ---- Q13: the replacement's down/up pair leaves the queue in order.
+        ;; (R1) enqueues node-down and node-up for the SAME name in one
+        ;; region, so for a moment one queue holds two events. The
+        ;; dispatcher must take the head, deliver it, and only then take
+        ;; the next: a dispatcher that selected any other node would
+        ;; deliver them out of order, leave the real head in place, and
+        ;; -- once that node's attempts ran out -- trip quarantine!'s
+        ;; "event was not at the head of its queue" assertion, which the
+        ;; warden renders to the error port as the dispatcher's death.
+        ;; That assertion has no legal path (the head only moves in
+        ;; qhead-done!, appends never displace a non-empty head, and the
+        ;; warden restarts a dispatcher only after its DOWN), so this cell
+        ;; watches the two things a wrong selection WOULD change: the
+        ;; order the watcher sees, and the error port. Red-proof: with
+        ;; qhead-peek reading qhead-last instead of qhead-first, the
+        ;; order inverts and the warden line appears.
+        (let ((errbuf (open-output-string)) (old-err (current-error-port)))
+          (current-error-port errbuf)
+          (let ((h2 (hold-open-as! "s2-rep-gen10" 10)))
+            (unless (eq? (car h2) 'welcomed)
+              (fail! "s2-replacement" 'gen10-not-welcomed (car h2)))
+            ;; let*, not let: the two receives must run in this order, and
+            ;; let evaluates its inits in an unspecified order (Chez: right
+            ;; to left here, which read the pair backwards)
+            (let* ((first (receive (after 3000 'none)
+                            (`#(node-down repeat) 'down)
+                            (`#(node-up repeat) 'up)))
+                   (second (receive (after 3000 'none)
+                             (`#(node-down repeat) 'down)
+                             (`#(node-up repeat) 'up))))
+              (unless (and (eq? first 'down) (eq? second 'up))
+                (fail! "q13-replacement-pair-order" first second)))
+            (sleep-ms 800)
+            (current-error-port old-err)
+            (let ((txt (get-output-string errbuf)))
+              (when (has-substr? txt "not at the head")
+                (fail! "q13-quarantine-head-assertion-fired" txt))
+              (when (has-substr? txt "dispatcher exited")
+                (fail! "q13-dispatcher-died-across-replacement" txt)))
+            (demonitor-node 'repeat)
           (when (process-alive? (cdr held))
             (fail! "s2-old-conn-not-closed-by-replacement" 'still-parked))
           (kill (cdr h2) 'done)
-          (sleep-ms 300))
+          (sleep-ms 300)))
         ;; leave nothing parked: the held session would otherwise still
         ;; own a connection when the later baseline cells count them
         (kill (cdr held) 'done)
