@@ -17,9 +17,17 @@
 ;;;                                     EVALUATE expr AT ALL. See the
 ;;;                                     rule below for why that is the
 ;;;                                     only safe reading.
-;;;   (inject-barrier! 'point)       -- reports and parks. Not in this
-;;;                                     tranche; the 'on expansion is a
-;;;                                     stub that refuses.
+;;;   (inject-override! 'point expr) -- when armed, EVALUATES expr and
+;;;                                     then replaces its answer. The
+;;;                                     third rule below says which of
+;;;                                     these two a point needs.
+;;;   (inject-barrier! 'point)       -- when armed, reports to the
+;;;                                     arming process and parks this
+;;;                                     one, so a controller can act
+;;;                                     between two expressions. A point
+;;;                                     inside an interrupt region
+;;;                                     cannot park: it counts a skip
+;;;                                     and runs on.
 ;;;
 ;;; THE RULE FOR inject-return!, and it is not a style note. The
 ;;; guarded call is SKIPPED, not called-then-overridden: faking "the
