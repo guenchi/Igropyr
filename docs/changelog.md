@@ -42,11 +42,7 @@ surface is `(igropyr tcp)` and everything above it.
   `uv-owner-died!` and `uv-set-deliver!`.
 
   **Migration.** A file that took any of those from `(igropyr libuv)` must now
-  import `(igropyr tcp)` as well:
-
-  ```scheme
-  (import (igropyr libuv) (igropyr tcp))
-  ```
+  import `(igropyr tcp)` as well: `(import (igropyr libuv) (igropyr tcp))`.
 
   Code that used only binding-layer names — `now-ms`, `uv-init!`, `uv-poll!`,
   `uv-live-handle-count` and the like — needs no change. The two libraries
