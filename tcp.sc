@@ -35,15 +35,8 @@
     listener-backlog-effective listener-open? listener-token tcp-close!
     tcp-connect! tcp-listen! tcp-listen-tls! tcp-read-start!
     tcp-read-stop! tcp-stop-listen! tcp-write! tcp-write-foreign!
-    tcp-writev! tcp-writev-raw! tls-accept-callback-completions tls-active-timer-count
-    tls-conn-charge tls-conn-holder tls-conn-holder-monitor tls-conn-in-table?
-    tls-conn-set-holder-monitor! tls-conn-timer-id tls-conn-totals tls-eof-deliveries
-    tls-gate-grant-next! tls-gate-open-mark tls-gate-waiters-length tls-handshake-max-set!
-    tls-handshake-ms-set! tls-handshaking-count tls-inject-ciphertext! tls-last-retire-reason
-    tls-listener-context-id tls-live-timer-count tls-live-watcher-count tls-open-gate-and-drain!
-    tls-raw-blocks tls-raw-sink-writes tls-read-trace tls-retire-effect-depths
-    tls-server-raw-reads tls-shutdown-ms-set! tls-ssl-op-count tls-swallowed-errors
-    tls-timer-free-path tls-watcher-exited! uv-accept-failure-counts uv-owner-died!
+    tcp-writev! tcp-writev-raw!
+    uv-accept-failure-counts uv-owner-died!
     uv-owner-index-count uv-set-deliver! uv-set-gate-wait! uv-set-self!
     uv-set-tls-watcher-spawner!
     ;; the watcher's interface to a connection's shared state
@@ -63,9 +56,26 @@
 
   ;; (igropyr libuv) IS BELOW THIS FILE and (igropyr tls-core) beside it; both
   ;; import neither this library nor each other's consumers, so there is no
-  ;; cycle. (igropyr libuv) is the façade ABOVE both.
+  ;; cycle. There is no facade: this file names what it takes from the binding
+  ;; layer, so the import list IS the dependency, checkable by reading it.
   (import (chezscheme) (igropyr platform) (igropyr inject)
-          (igropyr libuv) (igropyr tls-core))
+          (only (igropyr libuv) AF-INET O-CLOEXEC O-DIRECTORY O-NOFOLLOW
+            O-RDONLY S-IFMT S-IFREG UV-EINVAL UV-EOF buf-t-size c-close
+            c-getsockopt c-open c-openat check connect-req-size fs-req-size
+            getaddrinfo-req-size memcpy-cc memcpy-from-c memcpy-to-c now-ms
+            tcp-handle-size timer-handle-size uv-accept uv-close uv-enomem
+            uv-fileno uv-freeaddrinfo uv-fs-close uv-fs-fstat uv-fs-fsync
+            uv-fs-get-ptr uv-fs-get-result uv-fs-get-statbuf uv-fs-mkdir
+            uv-fs-open uv-fs-read uv-fs-realpath uv-fs-rename
+            uv-fs-req-cleanup uv-fs-scandir uv-fs-scandir-next uv-fs-stat
+            uv-fs-unlink uv-fs-write uv-getaddrinfo uv-in-callback?
+            uv-ip4-addr uv-is-active uv-is-closing uv-listen uv-loop-handle
+            uv-peername-lease uv-read-buf-base uv-read-buf-size uv-read-start
+            uv-read-stop uv-scratch-lease uv-sockaddr-lease uv-strerror
+            uv-tcp-bind uv-tcp-connect uv-tcp-init uv-tcp-nodelay
+            uv-timer-init uv-timer-start uv-timer-stop uv-try-write uv-write
+            uv-write-scratch-size write-req-size)
+          (igropyr tls-core))
 
   ;; connection record; one per accepted TCP client
   (define-record-type (conn make-conn conn?)

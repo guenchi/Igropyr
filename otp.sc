@@ -75,7 +75,8 @@
 
 (library (igropyr otp)
   (export start-worker-pool pool-stats)
-  (import (chezscheme) (igropyr actor) (igropyr libuv))
+  (import (chezscheme) (igropyr actor)
+          (only (igropyr libuv) now-ms))
 
   (define default-max-retries 3)
   (define default-stuck-ms 30000)

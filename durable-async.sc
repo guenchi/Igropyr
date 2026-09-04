@@ -110,7 +110,8 @@
           durable-error? durable-error-op durable-error-path)
   (import (chezscheme)
           (igropyr actor)
-          (igropyr libuv) (igropyr tcp)
+          (only (igropyr libuv) fs-o-cloexec fs-o-creat fs-o-directory fs-o-excl fs-o-rdonly fs-o-wronly)
+          (only (igropyr tcp) fs-close-async! fs-fsync-async! fs-mkdir-async! fs-open-async! fs-rename-async! fs-write-async!)
           (only (igropyr durable)
                 durable-error? durable-error-op durable-error-path
                 fs-trace-step))

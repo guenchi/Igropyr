@@ -70,7 +70,8 @@
   (export make-ssr ssr-render ssr-render/bytes ssr-try-render ssr-try-render/bytes
           ssr-invalidate! ssr-clear! ssr-stats)
   (import (chezscheme)
-          (igropyr actor) (igropyr libuv) (igropyr gen-server)
+          (igropyr actor) (igropyr gen-server)
+          (only (igropyr libuv) now-ms)
           (only (igropyr quickjs) qjs-boot! qjs-call/bytes)
           (only (igropyr qjspool) qjspool? qjspool-render/bytes qjspool-timeout-ms)
           (only (igropyr json) json->string)

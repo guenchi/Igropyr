@@ -15,7 +15,8 @@
 
 (library (igropyr middleware)
   (export cors security-headers logger rate-limit error-handler)
-  (import (chezscheme) (igropyr util) (igropyr actor) (igropyr libuv)
+  (import (chezscheme) (igropyr util) (igropyr actor)
+          (only (igropyr libuv) check now-ms)
           (igropyr gen-server) (igropyr http) (igropyr express))
 
   ;; ---- CORS ------------------------------------------------------------

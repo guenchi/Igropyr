@@ -44,7 +44,8 @@
 (library (igropyr metrics)
   (export make-metrics metrics-middleware metrics-endpoint metrics-count!
           metrics-snapshot metrics-json metrics-sexpr metrics-announce!)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr gen-server)
+  (import (chezscheme) (igropyr actor) (igropyr gen-server)
+          (only (igropyr libuv) now-ms)
           (igropyr http) (igropyr express)
           (only (igropyr node) node-self node-peers rcall))
 

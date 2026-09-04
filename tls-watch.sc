@@ -22,7 +22,8 @@
 (library (igropyr tls-watch)
   (export tls-watch-install! tls-watcher-idle-ms-set!
           tls-watcher-observer-set!)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr inject))
+  (import (chezscheme) (igropyr actor) (igropyr inject)
+          (only (igropyr tcp) conn-owner conn-tls-retire! tls-conn-holder tls-conn-set-holder-monitor! tls-gate-grant-next! tls-open-gate-and-drain! tls-watcher-exited! uv-set-gate-wait! uv-set-tls-watcher-spawner!))
 
   (define tls-watcher-idle-ms 1000)
   (define (tls-watcher-idle-ms-set! n) (set! tls-watcher-idle-ms n))

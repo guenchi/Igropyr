@@ -67,8 +67,9 @@
           ;; conflicts.
           start-scheduler spawn send receive self
           sleep-ms kill register whereis process-id)
-  (import (chezscheme) (igropyr buffer) (igropyr actor) (igropyr libuv)
-          (igropyr tcp))
+  (import (chezscheme) (igropyr buffer) (igropyr actor)
+          (only (igropyr libuv) check now-ms uv-strerror)
+          (only (igropyr tcp) dns-resolve! tcp-close! tcp-connect! tcp-read-start! tcp-read-stop! tcp-write!))
 
   (define default-timeout-ms 30000)
   (define default-port 80)

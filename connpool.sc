@@ -72,7 +72,8 @@
           sql-transaction connpool-lease connpool-close!
           connpool-stats
           connpool-cfg-set-observer! connpool-observer-failures)
-  (import (chezscheme) (igropyr actor) (igropyr libuv))
+  (import (chezscheme) (igropyr actor)
+          (only (igropyr libuv) now-ms))
 
   (define default-query-ms 60000)
   (define default-checkout-ms 60000)   ; how long a caller parks for a free lease

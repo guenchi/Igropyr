@@ -29,7 +29,9 @@
           start-scheduler spawn send receive self
           sleep-ms kill register whereis process-id)
   (import (chezscheme) (igropyr buffer)
-          (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr websocket)
+          (igropyr actor) (igropyr websocket)
+          (only (igropyr libuv) now-ms uv-strerror)
+          (only (igropyr tcp) dns-resolve! tcp-close! tcp-connect! tcp-read-start! tcp-write!)
           (only (igropyr crypto) base64-encode))
 
   (define connect-timeout-ms 10000)

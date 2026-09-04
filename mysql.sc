@@ -34,7 +34,9 @@
 (library (igropyr mysql)
   (export mysql-connect mysql-pool mysql-query mysql-close! mysql-pool-stats
           mysql-transaction mysql-observe! call-with-mysql-connection)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr connpool)
+  (import (chezscheme) (igropyr actor) (igropyr connpool)
+          (only (igropyr libuv) now-ms uv-strerror)
+          (only (igropyr tcp) tcp-close! tcp-connect! tcp-read-start! tcp-write!)
           (igropyr buffer)
           (only (igropyr crypto) sha1 sha256 base64-decode))
 

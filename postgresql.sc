@@ -91,7 +91,9 @@
   (export postgresql-connect postgresql-pool postgresql-query
           postgresql-execute postgresql-close! postgresql-pool-stats
           postgresql-transaction call-with-postgresql-connection)
-  (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr buffer)
+  (import (chezscheme) (igropyr actor) (igropyr buffer)
+          (only (igropyr libuv) now-ms uv-strerror)
+          (only (igropyr tcp) tcp-close! tcp-connect! tcp-read-start! tcp-write!)
           (igropyr connpool)
           (only (igropyr crypto)
                 sha256 hmac-sha256 pbkdf2-hmac-sha256

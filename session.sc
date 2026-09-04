@@ -21,7 +21,8 @@
           req-session session-get session-set! session-clear! session-regenerate!
           session-peek)
   (import (chezscheme) (igropyr checked)
-          (igropyr actor) (igropyr libuv) (igropyr gen-server)
+          (igropyr actor) (igropyr gen-server)
+          (only (igropyr libuv) now-ms)
           (igropyr http) (igropyr express))
 
   (define default-ttl-ms (* 30 60 1000))    ; 30 minutes
