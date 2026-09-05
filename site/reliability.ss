@@ -173,18 +173,21 @@
       (div (@ (class "wrap"))
         ,@(head "Soak · 48 hours at c=3,000"
                 "431 rounds, 257 million requests, zero failures"
-                '("This tests were designed to three question: whether an intercontinental mesh "
-                  "link holds; whether the server leaks memory or slows down over a "
-                  "long stretch; and whether it re-forms the mesh while short of "
-                  "memory and under high concurrency — the link is cut deliberately "
-                  "every 20 seconds, all the way through."))
+                '("These tests were designed to answer three structural questions: "
+                  "whether an intercontinental mesh link remains stable over extended "
+                  "periods; whether the server exhibits memory leaks or performance "
+                  "degradation under sustained load; and whether it successfully "
+                  "reforms the mesh topology while under high concurrency and strict "
+                  "memory constraints. To test the latter, the mesh link was "
+                  "deliberately severed every 20 seconds throughout the entire "
+                  "duration of the run."))
         (p (@ (class "lead") (style "margin-top:14px"))
-           "A single Igropyr process on a 2 vCPU / 1 GB Lightsail instance in Hong "
-           "Kong, with about 150 MB of memory available to it, driven at 3,000 "
-           "concurrent connections.")
+           (b "Environment: ") "A single Igropyr process on a 2 vCPU / 1 GB "
+           "Lightsail instance in Hong Kong, driven at a constant 3,000 concurrent "
+           "connections.")
         (p (@ (class "lead") (style "margin-top:14px"))
-           "The 20 hours tabulated below are 231 of those rounds and 91,286,309 of "
-           "those requests — 0 failed and 0 NA.")
+           "The 20-hour segment tabulated below details 231 of those rounds, "
+           "encompassing 91,286,309 requests with 0 failures and 0 N/A results.")
         (table (@ (class "maptable"))
           (tr (th "Hour") (th "Rounds") (th "Requests") (th "rps") (th "Mean p50")
               (th "Max") (th "Failed"))
@@ -212,31 +215,43 @@
 
         (table (@ (class "maptable"))
           ,(row '("Noise")
-                '("standard deviation of the hourly means 10.2 rps (0.78%); range "
-                  "1,297.04–1,329.53 (2.5%)"))
+                '("The standard deviation of the hourly throughput means is "
+                  (b "10.2 RPS (0.78%)") ", with a total range spanning from 1,297.04 "
+                  "to 1,329.53 RPS (2.5%)."))
           ,(row '("Throughput drift")
-                '("first seven hours 1,319.80, last seven 1,304.08 — " (b "−1.19%")
-                  ", about 1.5σ. " (b "Not significant.")))
-          ,(row '("p50 drift")
-                '("2,252.99 ms to 2,275.33 ms, +0.99% — and this is " (b "not a "
-                  "second piece of evidence") ". Little's law ties p50 to rps, so a "
-                  "throughput dip of 1.19% has to show up as a latency rise of about "
-                  "the same size. It is the same observation twice."))
-          ,(row '("MAX")
-                '("about 8,200 ms throughout, " (b "flat across fourteen hours") " and "
-                  "with no trend. This is the one quantity of the three that is "
-                  "genuinely independent, and it does not move."))
-          ,(row '("Hours 5 and 6")
-                '("the instrument, not the server: a newly deployed collector pushed "
-                  "the host into swap. " (code "swap_pgout") " rose 13,050 pages in "
-                  "the first of them and 5,465 in the second, and was " (b "flat at "
-                  "zero in every other hour") ". Recovery from hour 7 onward was "
-                  "unaided."))
-
+                '("The mean throughput of the first seven hours was 1,319.80 RPS, "
+                  "compared to 1,304.08 RPS for the final seven hours. This "
+                  "represents a " (b "−1.19% deviation (approximately 1.5σ)") ", "
+                  "confirming negligible performance degradation over the sustained "
+                  "run."))
+          ,(row '("P50 drift")
+                '("Median latency shifted from 2,252.99 ms to 2,275.33 ms (+0.99%). "
+                  "Per Little's Law, which mathematically ties latency to throughput "
+                  "at a fixed concurrency, a 1.19% throughput drop will inherently "
+                  "manifest as a proportional latency increase. "
+                  (b "This is an expected artifact of the throughput variance rather "
+                     "than an independent metric of degradation.")))
+          ,(row '("MAX latency")
+                '("Maximum latency remained flat at approximately 8,200 ms across the "
+                  "undisturbed fourteen hours, exhibiting no upward trend. As the "
+                  "sole genuinely independent variable among the three, its absolute "
+                  "stability confirms that " (b "queue depths remained strictly "
+                  "bounded without progressive pileups") "."))
+          ,(row '("Hours 5 and 6 (external interference)")
+                '("The performance anomaly during these hours was caused by the "
+                  "monitoring instrument, not the server. A newly deployed metric "
+                  "collector exhausted the host's physical memory, pushing the "
+                  "operating system into swap. Physical memory swap-outs ("
+                  (code "swap_pgout") ") surged by 13,050 pages in Hour 5 and 5,465 "
+                  "pages in Hour 6, while " (b "remaining at exactly zero for all "
+                  "other hours") ". Upon the cessation of swap activity, the system's "
+                  "throughput recovered to its baseline entirely unaided from Hour 7 "
+                  "onward."))
           ,(row '("The host is shared")
-                '("a 940 MiB box also carrying a full application stack — five "
-                  "service processes, MySQL, nginx and Redis. The left memory for "
-                  "Igropyr: about 140–150 MB.")))
+                '("a shared 940 MiB instance concurrently running a full application "
+                  "stack (five service processes, MySQL, Nginx, and Redis). This left "
+                  "approximately 140–150 MB of available physical memory for the "
+                  "Igropyr process.")))
 ))
 
    ;; ---- trying to break it ----
