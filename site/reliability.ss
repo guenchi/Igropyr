@@ -350,12 +350,30 @@
 
         (h3 (@ (style "margin-top:44px;font-size:18px")) "What the host was doing meanwhile")
         (table (@ (class "maptable"))
-          (tr (th "Time") (th "Process RSS") (th "Free") (th "Pages in / min")
-              (th "Pages out / min") (th "Major faults / min"))
-          ,(trow "00:30" "165 MB" "71 MB" "+3.5k" "+4.4k" "+1k")
-          ,(trow "00:35" "168 MB" "21 MB" "+5.4k" "+9.1k" "+1.3k")
-          ,(trow "00:37" "163 MB" "34 MB" "+51k" "+44k" "+22k")
-          ,(trow "00:39" "178 MB" "20 MB" "+43k" "+40k" "+19k"))
+          (tr (th "Time") (th "pid") (th "Process RSS") (th "Free")
+              (th "Pages in / min") (th "Pages out / min") (th "Major faults / min")
+              (th "Event"))
+          (tr (td "00:35") (td "10827") (td "168 MB") (td (b "21 MB")) (td "+5.4k") (td "+9.1k") (td (b "+1.3k")) (td "15,000 connections just established"))
+          (tr (td "00:36") (td "10827") (td "166 MB") (td (b "23 MB")) (td "+39.3k") (td "+41.0k") (td (b "+13.5k")) (td "thrashing begins"))
+          (tr (td "00:37") (td "10827") (td "163 MB") (td (b "34 MB")) (td "+51.2k") (td "+44.1k") (td (b "+21.7k")) (td ""))
+          (tr (td "00:38") (td "10827") (td "167 MB") (td (b "38 MB")) (td "+57.9k") (td "+45.0k") (td (b "+23.3k")) (td ""))
+          (tr (td "00:39") (td "10827") (td "178 MB") (td (b "20 MB")) (td "+42.5k") (td "+40.4k") (td (b "+18.7k")) (td "ab round 7 ends 00:39:18 (10,903 rps)"))
+          (tr (td "00:40") (td "10827") (td "153 MB") (td (b "71 MB")) (td "+12.9k") (td "+11.5k") (td (b "+6.1k")) (td "subsides"))
+          (tr (td "00:41") (td "10827") (td "162 MB") (td (b "39 MB")) (td "+7.2k")
+              (td "+18.5k") (td (b "+2.6k"))
+              (td "00:41:21 " (code "swap_pager: I/O error - pageout failed")
+                  " — twice, error 5"))
+          (tr (td "00:42") (td "10827") (td "156 MB") (td (b "62 MB")) (td "+48.1k") (td "+47.5k") (td (b "+17.9k")) (td "thrashing resumes"))
+          (tr (td "00:43") (td "10827") (td "159 MB") (td (b "34 MB")) (td "+55.7k") (td "+43.9k") (td (b "+21.9k")) (td ""))
+          (tr (td "00:44") (td "—") (td "0, killed") (td (b "234 MB"))
+              (td "+33.3k up to death") (td "+28.7k") (td (b "counter gone with it"))
+              (td "00:44:05 " (code "pid 10827 killed: failed to reclaim memory")
+                  "; sockstat killed in the same second; 00:44:47 "
+                  (code "cannot allocate bio")))
+          (tr (td "00:45") (td "16504") (td "151 MB") (td (b "71 MB")) (td "+13.0k")
+              (td "+27.4k") (td (b "2.5k, new process"))
+              (td "00:44:08 supervisor restart; all 15,000 re-established within a "
+                  "minute")))
         (table (@ (class "maptable"))
           ,(row '("What ran out")
                 '("The application process was not the constraint; the Resident Set "
@@ -378,9 +396,10 @@
                   "the run; the second execution terminated a background sampling "
                   "process.)"))
           ,(row '("After the kill")
-                '("The supervisor process automatically restarted the engine. Within "
-                  "three minutes, it " (b "resumed the full 15,000-connection load")
-                  " and immediately re-entered the paging state.")))
+                '("The supervisor restarted the engine three seconds later, at "
+                  "00:44:08. Within a minute it had " (b "resumed the full "
+                  "15,000-connection load") " and immediately re-entered the paging "
+                  "state.")))
 
         (h3 (@ (style "margin-top:44px;font-size:18px")) "What this test concludes")
         (p (@ (class "lead") (style "margin-top:26px")) (b "1. Cost per connection"))
