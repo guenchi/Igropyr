@@ -332,7 +332,7 @@
                   "errors induced by extreme OS paging."))
         (p (@ (class "lead") (style "margin-top:14px"))
            "The run intentionally forces the server into physical swap from the "
-           "outset by initiating " (b "15,000 concurrent connections on a host with "
+           "outset by requesting " (b "15,000 concurrent connections on a host with "
            "under 460 MB of available memory") ". As in previous tests, the node is "
            "configured to deliberately sever and redial its mesh link every 20 "
            "seconds.")
