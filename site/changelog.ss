@@ -10,6 +10,7 @@
       (p (@ (class "md-loading")) "Loading the changelog…"))
    (foot (list `(a (@ (href "index.html")) "Igropyr")
                `(a (@ (href "manual.html")) "Manual")
+               `(a (@ (href "reliability.html")) "Reliability")
                `(a (@ (href "agent.html")) "Agent")
                `(a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub")))))
 

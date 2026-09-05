@@ -137,6 +137,7 @@
    (foot (list `(a (@ (href "index.html")) "Igropyr")
                `(a (@ (href "manual.html")) "Manual")
                `(a (@ (href "changelog.html")) "Changelog")
+               `(a (@ (href "reliability.html")) "Reliability")
                `(a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub"))
          "Two AI agents for Igropyr — build new services in the actor model, "
          "or port an existing Node/Express app.")))

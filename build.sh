@@ -3,7 +3,7 @@
 # then recompile the hero fire program. Run from the site root.
 set -e
 cd "$(dirname "$0")"
-for p in index manual changelog agent; do
+for p in index manual changelog agent reliability; do
     node rt/compile.mjs goeteia.wasm "site/$p.ss" "/tmp/ig-$p.wasm"
     node rt/run.mjs "/tmp/ig-$p.wasm"
     echo "built $p.html ($(wc -c < "$p.html" | tr -d ' ') bytes)"

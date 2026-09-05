@@ -401,6 +401,7 @@
    (foot (list `(a (@ (href "https://github.com/guenchi/Igropyr")) "GitHub")
                `(a (@ (href "manual.html")) "Manual")
                `(a (@ (href "changelog.html")) "Changelog")
+               `(a (@ (href "reliability.html")) "Reliability")
                `(a (@ (href "https://github.com/guenchi/Igropyr/blob/master/LICENSE")) "MIT License"))
          "Igropyr — a high-concurrency HTTP server for Chez Scheme, built on "
          "libuv with Erlang-style message passing.")))

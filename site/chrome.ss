@@ -241,6 +241,7 @@
             (div (@ (class "logo"))
               (a (@ (href "index.html") (style "color:inherit")) (span "λ") " Igropyr"))
             (div (@ (class "links"))
+              (a (@ (href "reliability.html")) "Reliability")
               (a (@ (href "manual.html")) "Manual")
               (a (@ (href "changelog.html")) "Changelog")
               (a (@ (href "agent.html")) "Agent")
