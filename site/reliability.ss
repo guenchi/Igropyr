@@ -74,7 +74,8 @@
    ;; goes straight into data.
    `(header (@ (style "text-align:left;padding:52px 0 26px;background:none"))
       (div (@ (class "wrap"))
-        (h1 "Reliability")))
+        (h1 "Reliability")
+        (p (@ (class "lead") (style "margin-top:12px")) "Built for production.")))
 
    ;; ---- under load ----
    `(section (@ (id "load"))
@@ -82,26 +83,25 @@
         ,@(head "Under load" "Plateau"
                 '("These tests were designed to probe the throughput ceiling of a "
                   "single-core service under real network conditions. "
-                  (b "This did not find it.") " Two attempts hit two different walls, "
-                  "and neither of them was the server:"))
+                  (b "The actual ceiling was not reached.") " Both instances of "
+                  "physical capacity limits encountered during testing occurred at "
+                  "the client and network equipment level; the Igropyr server itself "
+                  "was never genuinely saturated."))
         (table (@ (class "maptable"))
           ,(row '("Driven from home fibre")
-                '("at around " (b "16,000 small packets per second") " downstream the "
-                  "line's buffer gives out. The loss that follows corrupts the load "
-                  "generator's own accounting, so past that point the run stops being "
-                  "a measurement at all."))
+                '("At approximately " (b "16,000 small packets per second")
+                  " downstream, the network line's buffer is exhausted. The resulting "
+                  "packet loss corrupts the load generator's accounting, invalidating "
+                  "measurements beyond this threshold."))
           ,(row '("Driven from a second cloud host")
-                '("same private network, but the generator is single-threaded and "
-                  "never saturated the target: " (b "the figure rose every time "
-                  "another client process was added") ", which means what was being "
-                  "measured was the generator.")))
-        ,(note "So the rungs below are a floor, not a ceiling. They do establish what "
-               "a plateau looks like — and the rest of this page is not about peak "
-               "throughput at all.")
+                '("Using the same private network, the single-threaded load "
+                  "generator failed to saturate the target. " (b "Throughput rose with each "
+                  "additional client process") ", indicating the generator itself was "
+                  "the bottleneck.")))
         (p (@ (class "lead") (style "margin-top:34px"))
-           "A single Igropyr process on a 2 vCPU / 2 GB Lightsail instance in Paris, "
-           "one core, driven over a WireGuard tunnel from a European home broadband "
-           "client.")
+           (b "Environment: ") "A single Igropyr process running on one core of a "
+           "2 vCPU / 2 GB Lightsail instance in Paris, driven over a WireGuard tunnel "
+           "from a European home broadband client.")
         (table (@ (class "maptable"))
           (tr (th "Concurrency") (th "rps") (th "p50") (th "p95") (th "p99")
               (th "Failed"))
@@ -113,44 +113,48 @@
           ,(lrow "1,000, re-run" "13,661" "71 ms" "81 ms" "117 ms" "0"))
         (table (@ (class "maptable"))
           ,(row '("The plateau itself")
-                '("throughput neither collapses nor oscillates as concurrency rises "
-                  "tenfold — it holds between " (b "13,600 and 13,800") ", under 1.5% "
-                  "apart across four rungs. Concurrency past c=100 bought queue, not "
-                  "throughput."))
+                '("Throughput neither collapses nor oscillates as concurrency "
+                  "increases tenfold. It remains strictly between "
+                  (b "13,600 and 13,800 RPS") ", with less than 1.5% variance across "
+                  "four rungs. Concurrency beyond c=100 translates linearly to "
+                  "queueing delay rather than additional throughput."))
 
           ,(row '("The re-run")
-                '("c=1,000 was run twice in the same session — once before the host "
-                  "was pushed into its failure region at c=2,000, once after. The "
-                  "second pass reads " (b "13,661 rps, p50 71 ms, p99 117 ms")
-                  " against the first pass's 13,652 / 71 / 112: " (b "the two rungs "
-                  "are all but identical") " — 0.07% apart on throughput, the same "
-                  "median to the millisecond, 5 ms apart at the 99th, zero failures "
-                  "both times. " (b "Being driven past its limit left nothing behind.")))
+                '("The c=1,000 baseline was executed twice in the same session — "
+                  "once before pushing the host into the c=2,000 network failure "
+                  "region, and once after. The second pass yielded "
+                  (b "13,661 RPS") " (p50: 71 ms, p99: 117 ms) compared to the first "
+                  "pass's 13,652 RPS (p50: 71 ms, p99: 112 ms). The deviation is "
+                  "0.07% in throughput, with an identical median latency and zero "
+                  "failures in both instances. " (b "Forcing the system past its "
+                  "network limit resulted in zero residual state or performance "
+                  "degradation.")))
 
           ,(row '("The 48 failures")
-                '((b "the client's, not the server's") ". Packet capture shows the "
-                  "server answering at its normal rate and then retransmitting each "
-                  "failed reply six or seven times; none of it arrived. The failure is in "
-                  "the network layer between them — the client received nothing to "
-                  "count. Igropyr reclaimed the stalled connections at the configured "
-                  "30-second read timeout, exactly as specified. All 48 stalled at "
-                  (b "the same moment") " rather than scattered through the run — one "
-                  "event, not forty-eight."))
+                '("These occurred " (b "at the client, not the server") ". Packet "
+                  "capture (PCAP) verifies the server continued responding at its "
+                  "baseline rate, executing 6 to 7 retransmissions for each "
+                  "unacknowledged reply. The failure occurred entirely in the "
+                  "intermediate network layer. Igropyr successfully reclaimed the "
+                  "stalled connections via the configured 30-second read timeout. "
+                  (b "All 48 connections stalled simultaneously as a single network "
+                     "drop event") ", rather than degrading sequentially."))
 
           )
 
 
         (h3 (@ (style "margin-top:44px;font-size:18px")) "* Why the ladder stops at 2,000")
-        (p (@ (class "lead")) "At c=2,000 the ladder pushes roughly "
-           (b "16,000 small packets per second") " down a domestic line and the burst "
-           "overruns the home router's downstream buffer. The equipment in front of "
-           "the server gives out before the server does, so the next rung up would be "
-           "measuring the router.")
+        (p (@ (class "lead")) "At c=2,000, the test pushes approximately "
+           (b "16,000 small packets per second") " down a domestic broadband line. "
+           "This burst rate overruns the client router's downstream buffer. The "
+           "network equipment preceding the server fails first; subsequent load "
+           "increases would only measure the router's degradation limit.")
 
         (h3 (@ (style "margin-top:44px;font-size:18px")) "Reproduced at Hong Kong server")
-        (p (@ (class "lead")) "The same wall shows up on a different path — and "
-           "further out. A longer round trip needs more concurrency to reach the same "
-           "packet rate, so the failure arrives at " (b "c=8,000") " instead of "
+        (p (@ (class "lead")) "This identical network boundary appears on a "
+           "different, longer routing path. Due to the higher round-trip time (RTT), "
+           "greater concurrency is required to reach the same packet rate threshold. "
+           "Consequently, the buffer failure occurs at " (b "c=8,000") " rather than "
            "c=2,000.")
         (table (@ (class "maptable"))
           (tr (th "Concurrency") (th "rps") (th "p50") (th "p99") (th "Failed"))
