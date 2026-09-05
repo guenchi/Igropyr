@@ -336,12 +336,12 @@
         (p (@ (class "lead") (style "margin-top:26px"))
            (b "3. Extrapolated capacity for a 1 GB host"))
         (table (@ (class "maptable") (style "margin-top:26px"))
-          ,(row '("Per gigabyte, steady state")
+          ,(row '("Steady state")
                 '("Approximately " (b "30,000 concurrent connections") " with zero "
                   "paging. This is an empirical measurement, not a projection: a "
                   "subsequent test maintained ≥30,000 connections successfully "
                   "throughout a 23-hour window on a 1 GB host."))
-          ,(row '("Per gigabyte, burst limit")
+          ,(row '("Burst limit")
                 '("Approximately " (b "50,000 concurrent connections") ". At this "
                   "volume, the system survives strictly by relying on the kernel "
                   "pager (derived via the capacity formula above, not physically "
@@ -403,7 +403,7 @@
                   "network.")))
 
         (h3 (@ (style "margin-top:44px;font-size:18px"))
-            "Adversarial edge-case validation (single-process fixture)")
+            "Adversarial edge-case validation")
         (p (@ (class "lead")) "Because the distributed soak test relies on "
            "well-behaved nodes that do not transmit malicious states, a localized "
            "single-process fixture is used to enforce strict event ordering and "
