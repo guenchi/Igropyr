@@ -257,7 +257,8 @@
 
         (h3 (@ (style "margin-top:44px;font-size:18px"))
             "Long-term memory stability and resident set analysis")
-        (p (@ (class "lead")) "This test evaluates the application's Resident Set Size "
+        (p (@ (class "lead") (style "margin-top:26px"))
+           "This test evaluates the application's Resident Set Size "
            "(RSS) trajectory to mathematically rule out long-term memory leakage. "
            "Measurements were sampled at one-minute intervals across two consecutive "
            "24-hour node lifetimes. The datasets were linearly regressed separately "
