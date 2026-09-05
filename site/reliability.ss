@@ -188,7 +188,9 @@
         (p (@ (class "lead") (style "margin-top:14px"))
            (b "Environment: ") "A single Igropyr process on a 2 vCPU / 1 GB "
            "Lightsail instance in Hong Kong, driven at a constant 3,000 concurrent "
-           "connections.")
+           "connections, concurrently running a full application stack (five service "
+           "processes, MySQL, Nginx, and Redis). This left approximately 140–150 MB "
+           "of available physical memory for the Igropyr process.")
         (p (@ (class "lead") (style "margin-top:14px"))
            "The 20-hour segment tabulated below details 231 of those rounds, "
            "encompassing 91,286,309 requests with 0 failures and 0 N/A results.")
@@ -251,11 +253,7 @@
                   "other hours") ". Upon the cessation of swap activity, the system's "
                   "throughput recovered to its baseline entirely unaided from Hour 7 "
                   "onward."))
-          ,(row '("The host is shared")
-                '("a shared 940 MiB instance concurrently running a full application "
-                  "stack (five service processes, MySQL, Nginx, and Redis). This left "
-                  "approximately 140–150 MB of available physical memory for the "
-                  "Igropyr process.")))
+          )
 
         (h3 (@ (style "margin-top:44px;font-size:18px"))
             "Long-term memory stability and resident set analysis")
