@@ -241,28 +241,6 @@
                   "sole genuinely independent variable among the three, its absolute "
                   "stability confirms that " (b "queue depths remained strictly "
                   "bounded without progressive pileups") "."))
-          ,(row '("Memory, resident set")
-                '("Sampled once a minute across two consecutive 24-hour node "
-                  "lifetimes and regressed separately, since the two ran different "
-                  "builds at different connection counts. The later one, at c=3,094, "
-                  "gives a slope of " (b "−0.021 ± 0.022 MB/h") " — negative, and "
-                  "indistinguishable from zero. Hourly-median regression agrees "
-                  "independently at −0.016 ± 0.033."))
-          ,(row '("What that bounds")
-                '("The 2σ detection floor over 24 hours is " (b "0.044 MB/h")
-                  ", which is 1.1 MB across the window, or " (b "0.004 bytes per "
-                  "request") " over the 278 million requests served in it. Growth "
-                  "slower than that would not be visible here — that figure is the "
-                  "sensitivity of the measurement, and the measured slope sits below "
-                  "it."))
-          ,(row '("Filling, not leaking")
-                '("The slope over the two lifetimes runs " (b "+1.28 → +0.075 → "
-                  "−0.021 MB/h") ": significantly positive for the first 4.8 hours, "
-                  "then flat, then slightly negative. That trajectory is a bounded "
-                  "structure filling up, not a leak — a leak does not stop on its "
-                  "own. Hourly troughs carry no monotone component in either "
-                  "lifetime, and every hour but one in each had samples below its "
-                  "segment's p10, so the troughs have collections behind them."))
           ,(row '("Hours 5 and 6 (external interference)")
                 '("The performance anomaly during these hours was caused by the "
                   "monitoring instrument, not the server. A newly deployed metric "
