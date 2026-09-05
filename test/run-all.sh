@@ -494,6 +494,9 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/t
 # Reads the live-resource seams back to baseline in every cell. Spends 30 s in
 # H2' (a ClientHello on the plaintext port waits out read-timeout-ms).
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-listener.sc
+# WebSocket upgrade on an HTTPS listener (wss): the frames ride the connection's
+# TLS codec; asserted from the wire by the raw TLS driver. Needs the openssl CLI.
+"$scheme_bin" --script test/tls-ws.sc
 #      Race cells on the TLS write gate: writers parked by inject-barrier!
 #      at named boundaries in tcp.sc, the competing operation run meanwhile.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-race.sc
