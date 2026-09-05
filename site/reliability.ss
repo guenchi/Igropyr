@@ -66,7 +66,7 @@
    ;; One step down from the shared type scale: this page is mostly tables, and
    ;; the default 16px body / 14.5px table type runs wide for that.
    `(style "body{font-size:15px}h1{font-size:46px}h2{font-size:29px}"
-           ".lead{font-size:16px}.maptable{font-size:13px}"
+           ".lead{font-size:16px;max-width:none}.maptable{font-size:13px}"
            ".backlink{font-size:13px}.kicker{font-size:12px}"
            ".maptable th{font-size:11px}")
 
@@ -115,7 +115,7 @@
           ,(row '("The plateau itself")
                 '("Throughput neither collapses nor oscillates as concurrency "
                   "increases tenfold. It remains strictly between "
-                  (b "13,600 and 13,800 RPS") ", with less than 1.5% variance across "
+                  (b "13,6K and 13,8K RPS") ", with less than 1.5% variance across "
                   "four rungs. Concurrency beyond c=100 translates linearly to "
                   "queueing delay rather than additional throughput."))
 
@@ -450,4 +450,7 @@
                   "kills with no missed recovery, and a 512 MB host driven into OOM "
                   "on purpose alongside the capacity formula that predicted it — each "
                   "figure with the scope it was measured in.")
-   body))
+   body
+   '()
+   ;; the same column the manual uses, so the nav bar lines up with the text
+   820))
