@@ -75,7 +75,12 @@
    `(header (@ (style "padding:52px 0 26px;background:none"))
       (div (@ (class "wrap"))
         (h1 (@ (style "color:var(--acc)")) "Reliability")
-        (p (@ (class "lead") (style "margin-top:12px")) "Rigorously tested for production use.")))
+        (div (@ (style "margin-top:12px;display:flex;justify-content:space-between;align-items:baseline;gap:24px;flex-wrap:wrap;text-align:left"))
+          (p (@ (class "lead")) "Rigorously tested for production use.")
+          (p (@ (class "lead"))
+             (b (@ (style "color:var(--acc)")) "0") " server-side failures and "
+             (b (@ (style "color:var(--acc)")) "0") " N/A across the entire test "
+             "period."))))
 
    ;; ---- under load ----
    `(section (@ (id "load"))
