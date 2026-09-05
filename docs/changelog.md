@@ -128,7 +128,8 @@ surface is `(igropyr tcp)` and everything above it.
   and now covers the LibreSSL versions that have not been measured.
 - **tests**: a cell pins the order of a replacement's node-down/node-up pair and
   the head-only dispatch behind `quarantine!`'s head assertion; it goes red
-  under a peek-last mutation.
+  under a peek-last mutation. Another pins a WebSocket upgrade end to end on an
+  HTTPS listener (wss), through the handshake, an echoed frame and the close.
 
 ---
 

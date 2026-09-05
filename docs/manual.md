@@ -718,6 +718,11 @@ plaintext program nothing: **tls-core opens no shared object until a context or
 session is actually built**, so a server that never serves TLS never loads
 libcrypto or libssl and does not require them to be installed.
 
+A WebSocket upgrade on an HTTPS listener needs no extra option: the upgrade and
+every frame after it travel over the same TLS connection, encoded and decoded by
+that connection's own codec. This is the `wss` case, and it is covered by a cell
+end to end.
+
 Each accepted TLS connection gets a **watcher process** that owns the
 connection's write gate and its timers. The gate serialises whole *aggregates*
 rather than individual writes, so two processes writing to the same connection
@@ -858,7 +863,7 @@ Connect to a remote WebSocket server with the same session object. Outbound fram
 - `(ws-send-text! ws string)`, `(ws-send-binary! ws bv)`, `(ws-close! ws)` — same as server-side
 - `(ws-recv ws)` — same as server-side
 
-Note: `wss://` works once the optional `(igropyr tls)` library is enabled — `(import (igropyr tls))` then `(tls-enable!)` once at startup. See [Outbound TLS](#outbound-tls) under the HTTP client section. Without it, `wss://` is refused.
+Note: **this client speaks `ws://` only.** `wss://` is refused when the URL is parsed, and `(igropyr tls)` does not change that — the refusal is in the client itself, not a missing TLS dependency. To reach a `wss://` endpoint from Scheme, put TLS termination in front of it. Serving `wss` is a different matter and is supported: see [Listening](#listening).
 
 #### Example: Client
 
@@ -3375,7 +3380,7 @@ The client performs DNS resolution asynchronously on libuv's thread pool, so the
 
 ### Outbound TLS
 
-`https://` (and `ws-client`'s `wss://`) work once you enable the optional `(igropyr tls)` library. Import it and call `(tls-enable!)` once at startup — before the first `https` request — and every `http-get` / `http-request` can reach TLS endpoints:
+`https://` works once you enable the optional `(igropyr tls)` library. Import it and call `(tls-enable!)` once at startup — before the first `https` request — and every `http-get` / `http-request` can reach TLS endpoints:
 
 ```scheme
 (import (igropyr http-client) (igropyr tls))
