@@ -175,8 +175,8 @@
    ;; ---- soak 3 ----
    `(section (@ (id "soak-c"))
       (div (@ (class "wrap"))
-        ,@(head "Soak · 48 hours at c=3,000"
-                "431 rounds, 257 million requests, zero failures"
+        ,@(head "Soak · 56 hours at c=3,000"
+                "675 rounds, 439 million requests, zero failures"
                 '("These tests were designed to answer three structural questions: "
                   "whether an intercontinental mesh link remains stable over extended "
                   "periods; whether the server exhibits memory leaks or performance "
