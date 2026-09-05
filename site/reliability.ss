@@ -79,8 +79,7 @@
           (p (@ (class "lead")) "Rigorously tested for production use.")
           (p (@ (class "lead"))
              (b (@ (style "color:var(--acc)")) "0") " server-side failures and "
-             (b (@ (style "color:var(--acc)")) "0") " N/A across the entire test "
-             "period."))))
+             (b (@ (style "color:var(--acc)")) "0") " N/A across the tests."))))
 
    ;; ---- under load ----
    `(section (@ (id "load"))
