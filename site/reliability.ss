@@ -74,8 +74,8 @@
    ;; goes straight into data.
    `(header (@ (style "text-align:left;padding:52px 0 26px;background:none"))
       (div (@ (class "wrap"))
-        (h1 "Reliability")
-        (p (@ (class "lead") (style "margin-top:12px")) "Built for production.")))
+        (h1 (@ (style "color:var(--acc)")) "Reliability")
+        (p (@ (class "lead") (style "margin-top:12px")) "Rigorously tested for production use.")))
 
    ;; ---- under load ----
    `(section (@ (id "load"))
