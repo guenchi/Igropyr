@@ -14,7 +14,8 @@
         (only (igropyr libuv) now-ms)
         (only (igropyr crypto) bytevector->hex hmac-sha256)
         (only (igropyr tls-core) tls-live-context-count tls-live-session-count)
-        (only (igropyr tcp) tls-live-watcher-count tls-last-retire-reason)
+        (only (igropyr tcp) tls-live-watcher-count tls-last-retire-reason tcp-listen! tcp-stop-listen!)
+        (igropyr inject-control)     ; barrier controls: arm/wait/release/cleanup
         (test tls-raw-client) (test mesh-proof))
 
 (define fails 0)
@@ -80,9 +81,49 @@
   (lambda ()
     (register 'main self)
     (let ((base (list (tls-live-context-count) (tls-live-session-count) (tls-live-watcher-count))))
-      ;; ---- M12 first: startup failures publish nothing
+      ;; a definition must precede every expression in this body
       (define (start-fails? opts)
         (guard (e (#t #t)) (node-start! 'a secret port "127.0.0.1" opts) #f))
+      ;; ---- M12b: a bind failure while a warden child exists but has NOT yet
+      ;; registered must still unwind it. The starter is parked between the warden
+      ;; spawn and the bind; the FIRST child to reach its register is parked there
+      ;; (one live barrier per point is the rule), so it exists without a name.
+      ;; Then the bind fails on a port another listener holds, and the rollback
+      ;; must kill that nameless child by reference -- a name-based cleanup cannot
+      ;; see it (that was the P2). The other two children register and are killed
+      ;; by pid as well; their names must be gone afterwards.
+      (let* ((squat (tcp-listen! "127.0.0.1" port 4 (lambda (c) (void))))
+             (t-start (inject-arm-barrier! 'node-start-before-bind 1 30000))
+             (t-kid (inject-arm-barrier! 'warden-child-before-register 1 30000))
+             (main self)
+             (starter (spawn (lambda ()
+                               (send main (vector 'start-result
+                                                  (guard (e (#t (list 'raised (if (condition? e) (condition-message e) e))))
+                                                    (node-start! 'a secret port "127.0.0.1") 'started))))))
+             (w (inject-barrier-wait t-start 'node-start-before-bind 5000)))
+        (check "M12b: the starter parked between the warden spawn and the bind" (and (pair? w) (eq? (cdr w) starter)) w)
+        (let* ((k (inject-barrier-wait t-kid 'warden-child-before-register 5000))
+               (kid (and (pair? k) (cdr k))))
+          (check "M12b: one child parked before registering (exists, nameless)" (and kid (process-alive? kid)) k)
+          (sleep-ms 200)                           ; the other two register normally
+          (check "M12b: premise -- the parked child is not registered under any of the three names"
+                 (and kid (not (memq kid (list (whereis 'igropyr-node-reaper) (whereis 'igropyr-node-dispatcher) (whereis 'igropyr-node-registrar))))))
+          ;; resume the parked starter (by message; release! is for a row whose victim is gone) -- the bind now fails
+          (when (pair? w) (send starter (vector 'inject-resume t-start)))
+          (receive (after 8000 (check "M12b: the start returned" #f 'timeout))
+            (`#(start-result ,r) (check "M12b: the bind on a taken port failed the start" (and (pair? r) (eq? (car r) 'raised)) r)))
+          (check "M12b: the rollback killed the parked, nameless child by reference" (and kid (within? 3000 (lambda () (not (process-alive? kid))))) (and kid (process-alive? kid)))
+          (check "M12b: no warden after the rollback" (within? 2000 (lambda () (not (whereis 'igropyr-node-warden)))))
+          (check "M12b: nothing registered after the rollback (reaper/dispatcher/registrar)"
+                 (within? 2000 (lambda () (and (not (whereis 'igropyr-node-reaper)) (not (whereis 'igropyr-node-dispatcher)) (not (whereis 'igropyr-node-registrar))))))
+          ;; the child died parked: release its row, then clean up both points
+          (guard (e (#t (void))) (inject-release! t-kid))
+          (guard (e (#t (void))) (inject-barrier-cleanup! t-kid 'warden-child-before-register 31000)))
+        (guard (e (#t (void))) (inject-barrier-cleanup! t-start 'node-start-before-bind 31000))
+        (tcp-stop-listen! squat)
+        (sleep-ms 200))
+
+      ;; ---- M12: startup failures publish nothing
       (check "M12: tls-cert without tls-key is refused" (start-fails? (list (cons 'tls-cert (in-dir "good.pem")))))
       (check "M12: tls-ca without cert/key is refused" (start-fails? (list (cons 'tls-ca (in-dir "ca.pem")))))
       (check "M12: an unreadable certificate file is refused" (start-fails? (list (cons 'tls-cert (in-dir "missing.pem")) (cons 'tls-key (in-dir "good.key")))))

@@ -1006,9 +1006,49 @@
   ;; argue it. That makes this name part of what this file promises, not
   ;; an accident of the implementation.
   (define reaper-name 'igropyr-node-reaper)
+  ;; The registrar publishes itself through the `registrar` variable, which is
+  ;; how the code reaches it. The NAME is for observation: with it, a rollback
+  ;; that left a registrar behind shows up as a name collision on the next
+  ;; start rather than as a second process nothing can see.
+  (define registrar-name 'igropyr-node-registrar)
   (define (reaper-pid) (whereis reaper-name))
 
   (define reaper-warden #f)
+  ;; THE WARDEN'S OWN CURRENT-CHILDREN VECTOR, held by reference, so a failed
+  ;; startup can stop children that have no registered name yet. Looking them up
+  ;; by name cannot: a child registers its name inside its own body, so one that
+  ;; is spawned but has not been scheduled yet has no name to find -- and that is
+  ;; exactly the window a startup failure lands in.
+  ;;
+  ;; BY REFERENCE TO THE VECTOR THE WARDEN ALREADY DISPATCHES ON, not a separate
+  ;; list. A list appended to at every spawn would have to be pruned at every
+  ;; death to stay finite, and a supervisor whose children die and restart for as
+  ;; long as the node lives would otherwise hold every dead PCB it ever spawned.
+  ;; Sharing the vector makes a restart's vector-set! the only update there is:
+  ;; the set cannot grow, and it cannot drift from the warden's own view of who
+  ;; its children are, because it is not a second copy of that view.
+  (define warden-children #f)
+
+  ;; STARTUP IS COMPLETE. self-name is published in the middle of node-start!,
+  ;; several steps before the bind, so it answers "does this node have an
+  ;; identity" and NOT "is this node running" -- and every entry below used it
+  ;; for the second question. In the window between the two, a concurrent
+  ;; node-connect! passed the identity check, queued work, and the registrar
+  ;; spawned a connector: a process that is not one of the warden's children,
+  ;; is not linked to anything, and therefore survived the unwind that killed
+  ;; everything the failed startup was supposed to take with it.
+  ;;
+  ;; Refusing the work is what closes that, rather than teaching the unwind to
+  ;; chase descendants: a rollback that has to find every process its children
+  ;; might have spawned is a rollback that is wrong again the next time someone
+  ;; adds a spawn. With this flag there is nothing to chase, because during
+  ;; startup nothing can be commanded into existence.
+  ;;
+  ;; Set only after the bind succeeds; cleared by the unwind. It stays true
+  ;; across registrar incarnations, which is the property the two entries below
+  ;; needed and the reason they must not test `registrar` instead.
+  (define node-ready? #f)
+
   ;; The warden carries a registered name for the same reason its child
   ;; does: the two branches below that report a mistake can only be shown
   ;; to work by a harness that can put a message in front of them, and a
@@ -1091,6 +1131,12 @@
     ;; it to the process fixes the class: a new reaper cannot see the old
     ;; one's index, because there is no longer anywhere for it to persist.
     (let ((watched (make-eq-hashtable)))
+      ;; INJECTION POINT 'warden-child-before-register -- OWNING REGION: none.
+      ;; Interrupt state: injection ON -- depth 0, parks; OFF -- (void).
+      ;; Parks the child SPAWNED BUT UNNAMED, which is the state a startup
+      ;; failure finds its children in and the only state in which killing by
+      ;; name and killing by reference differ.
+      (inject-barrier! 'warden-child-before-register)
       (register reaper-name self)
       (reaper-rescan! watched)
       (let loop ()
@@ -1230,9 +1276,18 @@
            (pids (make-vector n #f))
            (deaths (make-vector n (list)))
            (delays (make-vector n 0)))
+      ;; THE SPAWN AND THE RECORD ARE ONE STEP. Split, a preemption between
+      ;; them leaves a child that exists and that the startup unwind cannot
+      ;; see -- which is the same hole as looking children up by name, just
+      ;; narrower. spawn only appends to the run queue, so the region costs
+      ;; nothing and the child cannot run before it is recorded.
       (define (start! i)
-        (let ((p (spawn (child-thunk (vector-ref v i)))))
-          (vector-set! pids i p)
+        (let ((p (with-interrupts-disabled
+                   (let ((p (spawn (child-thunk (vector-ref v i)))))
+                     ;; the slot is filled in the same region: a restart
+                     ;; REPLACES the dead pid rather than adding to a set
+                     (vector-set! pids i p)
+                     p))))
           (monitor p)))
       (define (index-of p)
         (let loop ((i 0))
@@ -1240,6 +1295,9 @@
                 ((eq? (vector-ref pids i) p) i)
                 (else (loop (fx+ i 1))))))
       (register warden-name self)
+      ;; PUBLISHED BEFORE THE FIRST SPAWN, so there is no instant at which a
+      ;; child exists and the unwind cannot reach it.
+      (set! warden-children pids)
       (let init ((i 0)) (when (fx< i n) (start! i) (init (fx+ i 1))))
       (let loop ()
         (receive
@@ -4881,6 +4939,8 @@
         (and woke #t))))
 
   (define (dispatcher-loop)
+    ;; INJECTION POINT 'warden-child-before-register -- see the reaper's copy.
+    (inject-barrier! 'warden-child-before-register)
     (register dispatcher-name self)
     ;; A ROUND BEFORE THE FIRST RECEIVE. This is what makes a restart
     ;; recover rather than merely resume: whatever was queued while the
@@ -7199,6 +7259,9 @@
   ;; R6-2 and R6-3 check this under injected kills.
   (define (registrar-start)
     (set! registrar self)
+    ;; INJECTION POINT 'warden-child-before-register -- see the reaper's copy.
+    (inject-barrier! 'warden-child-before-register)
+    (register registrar-name self)
     ;; C7. Hygiene, not correctness. A row whose child is dead is already
     ;; treated as absent by the `held` test; this removes it so the table
     ;; does not accumulate the dead. Commands are durable in the queue, so
@@ -7784,20 +7847,28 @@
         ;; assigns itself to. A dead process is unregistered automatically, so
         ;; the names go with them.
         (when warden-spawned?
+          ;; THE WARDEN DIES FIRST, so it cannot spawn a replacement while the
+          ;; children are being stopped.
           (guard (e2 (#t (void)))
             (when (process-alive? reaper-warden)
               (kill reaper-warden 'node-start-failed)))
+          ;; BY PID, NOT BY NAME. A child registers its name inside its own body,
+          ;; so one that is spawned but not yet scheduled has no name to look up --
+          ;; and a startup failing before bind lands in exactly that window, with
+          ;; all three children queued behind the starter. Killing only what could
+          ;; be found by name left the rest running unsupervised, and the registrar
+          ;; then wrote itself back into the variable this unwind had just cleared.
           (for-each
             (lambda (p)
               (guard (e2 (#t (void)))
                 (when (and p (process-alive? p)) (kill p 'node-start-failed))))
-            (list (whereis reaper-name)
-                  (whereis dispatcher-name)
-                  registrar))
-          ;; the registrar publishes itself through this variable and through
-          ;; no name, so nothing else would ever clear it
+            (if warden-children (vector->list warden-children) '()))
+          (set! warden-children #f)
+          ;; cleared AFTER the children are dead, so nothing survives that could
+          ;; publish itself back into it
           (set! registrar #f))
         (when published?
+          (set! node-ready? #f)
           (set! self-name #f)
           (set! self-secret #f)
           (set! self-boot-id #f)
@@ -7852,6 +7923,16 @@
         (set! warden-spawned? #t)
         (critical! reaper-warden 'node-warden)
         (set! warden-up? #t)
+        ;; INJECTION POINT 'node-start-before-bind -- OWNING REGION: none, this
+        ;; is ordinary process context. Interrupt state: injection ON -- depth
+        ;; 0, parks; injection OFF -- (void).
+        ;;
+        ;; The starter parks here with the warden and its three children
+        ;; SPAWNED BUT NOT YET SCHEDULED, which is the only window in which a
+        ;; child exists and has not registered its name. Releasing the children
+        ;; and then failing the bind is what separates an unwind that reaches
+        ;; every child from one that reaches only the ones that happened to run.
+        (inject-barrier! 'node-start-before-bind)
         ;; (4) bind LAST
         (when port
           (let ((on-accept
@@ -7866,6 +7947,9 @@
             (if lctx
                 (tcp-listen-tls! host port 128 on-accept lctx)
                 (tcp-listen! host port 128 on-accept))))
+        ;; AFTER THE BIND, so no window this sits open in can fail. Everything
+        ;; that hands the registrar work refuses until this is true.
+        (set! node-ready? #t)
         name))))
 
   ;; Dial a peer (and keep dialing whenever the link is down).
@@ -7873,7 +7957,7 @@
   ;; RETURNS ON ACCEPTANCE, NOT ON EFFECT -- see the note at the top of
   ;; this file. The work is done by the registrar, in its order.
   (define (node-connect! peer host port)
-    (unless self-name
+    (unless node-ready?
       (assertion-violation 'node-connect! "call node-start! first" peer))
     ;; A PEER NAME IS A SYMBOL, and it is worth refusing here rather than
     ;; where the damage appears: this value becomes a hashtable key, is the
@@ -7910,7 +7994,10 @@
     ;; first" immediately after a successful node-start! -- true of the
     ;; registrar, false of the node, and the message said the wrong thing
     ;; about the wrong subject.
-    (unless self-name
+    ;; node-ready?, NOT self-name: see the flag. self-name is true from the
+    ;; middle of node-start!, and a connect accepted there had the registrar
+    ;; spawn a connector that outlived the unwind.
+    (unless node-ready?
       (assertion-violation 'node-connect! "call node-start! first" peer))
     (registrar-enqueue! (list (vector 'set-endpoint peer host port)))
     (registrar-poke!)
@@ -7931,7 +8018,7 @@
   ;; node-start! at all -- there is no node to disconnect from then, and
   ;; self-name is what says so.
   (define (node-disconnect! peer)
-    (when self-name
+    (when node-ready?
       (registrar-enqueue! (list (vector 'disconnect peer)))
       (registrar-poke!))
     (void))
@@ -8171,7 +8258,16 @@
   ;; local watch (still reported as remote-down, for a uniform API).
   ;; This is process-level; monitor-node is the node-level counterpart.
   (define (monitor-remote node name)
-    (unless self-name
+    ;; node-ready?, NOT self-name, AND THE LOCAL BRANCH IS GATED TOO. Both
+    ;; branches spawn -- the local one two agents here, the remote one through
+    ;; arm-rmonitor! -- and none of those processes is a warden child or is
+    ;; linked to the starter, so a call landing between the identity publish and
+    ;; the bind leaves them running after the unwind has torn the node down.
+    ;; Before node-start! returns, the only caller that can reach this is a
+    ;; process running concurrently with startup, which is precisely the case
+    ;; that leaks; a local monitor-remote issued in that window is not supported
+    ;; usage, so refusing it costs nothing that was promised.
+    (unless node-ready?
       (assertion-violation 'monitor-remote "call node-start! first" node))
     (let ((mref (next-mref!)))
       (cond
