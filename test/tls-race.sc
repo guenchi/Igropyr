@@ -18,7 +18,7 @@
 ;;; inject-disarm! (bulk disarm refuses a live row).
 
 (import (chezscheme)
-        (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http) (igropyr tls)
+        (igropyr actor) (igropyr libuv) (igropyr tcp) (igropyr http) (only (igropyr websocket) ws-conn) (igropyr tls)
         (igropyr inject-control) (igropyr inject)
         (only (igropyr tls-core) tls-live-session-count)
         (only (igropyr tcp) tcp-writev-raw! tls-conn-charge tls-conn-totals tls-shutdown-ms-set! tls-raw-blocks tls-live-watcher-count)
@@ -112,7 +112,27 @@
 (define handler-count 0)
 (define (holding-handler req res)
   (send main-pid (vector 'conn (res-conn res) self))
-  (receive (`#(release) 'ok)))
+  (let loop ()
+    (receive
+      (`#(release) 'ok)
+      ;; E10: the OWNER itself becomes the gate holder by writing a big body
+      (`#(write-big) (tcp-writev! (res-conn res) (list big) (lambda (st) (send main-pid (vector 'done 'owner st)))) (loop)))))
+
+;; E10b: a WebSocket session runs in the READER process, which is the conn's
+;; owner (http.sc:1649 calls run-ws-session inside the reader loop). Through it
+;; the owner itself can become the write-gate holder.
+(define (ws-owner-session w req)
+  (let ((c (ws-conn w)))
+    (send main-pid (vector 'ws-owner c self))
+    (let loop ()
+      (receive
+        (`#(release) 'ok)
+        (`#(write-big) (tcp-writev! c (list big) (lambda (st) (send main-pid (vector 'done 'owner st)))) (loop))))))
+(define upgrade-request
+  (string->utf8
+    (string-append "GET /hold HTTP/1.1\r\nHost: localhost\r\n"
+                   "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                   "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")))
 (define (counting-handler req res)
   (set! handler-count (+ handler-count 1))
   (res-send! res (string->utf8 "ok-over-tls")))
@@ -165,6 +185,7 @@
     (let ((srv (http-listen port holding-handler
                  (list (cons 'host "127.0.0.1") (cons 'workers 2)
                        (cons 'tls-cert (in-dir "good.pem")) (cons 'tls-key (in-dir "good.key"))))))
+      (http-set-ws! srv (lambda (req) ws-owner-session))
       (sleep-ms 200)
       (let ((base (snap)))
         (display (list 'baseline base)) (newline)
@@ -366,6 +387,67 @@
           (send (cdr ch) (vector 'release))
           (check "Z6a: resources back to baseline" (settled-to? base 4000) (snap) base))
 
+
+        ;; ---- E10: the OWNER holds the write gate and dies abnormally.
+        ;; The holder is monitored by the watcher, the owner is linked to it.
+        ;; When the same process is both, its death reaches the watcher as a
+        ;; linked exit before the DOWN it monitors for, and the owner sweep's
+        ;; tcp-close! turns into a clean close that waits for a holder who is
+        ;; dead. Expected: the connection retires, a waiting writer is refused,
+        ;; resources return to baseline.
+        (let* ((ch (open-held-conn! 'plain)) (c (car ch)) (owner (cdr ch))
+               (t (inject-arm-barrier! 'agg-chunk-boundary 1 30000)))
+          (send owner (vector 'write-big))
+          (let ((w (inject-barrier-wait t 'agg-chunk-boundary 5000)))
+            (check "E10: the owner parked at a chunk boundary holding the gate" (and (pair? w) (eq? (cdr w) owner)) (desc w))
+            (cond
+              ((pair? w)
+               (spawn-writer! c 'q small-q)
+               (check "E10: Q is waiting behind the owner" (within? 2000 (lambda () (eqv? (tls-gate-waiters-length c) 1))) (tls-gate-waiters-length c))
+               (kill owner 'e10-owner-holder-kill)
+               (check "E10: the owner is dead" (dead-within? owner 3000))
+               (check "E10: Q was refused within bound (the connection retired on the owner-holder's death)" (eqv? (writer-outcome 'q 5000) -1))
+               (check "E10: release of the parked-and-dead row succeeds" (vector? (inject-release! t))))
+              (else (inject-barrier-cleanup! t 'agg-chunk-boundary 31000) (tcp-close! c))))
+          (client-result 20000)
+          (check "E10: resources back to baseline (session, watcher, timers, handles)" (settled-to? base 6000) (snap) base))
+
+        ;; ---- E10b: the OWNER IS the holder. A WebSocket session runs in the
+        ;; reader, the connection's owner; it writes a big body, parks holding the
+        ;; gate, and is killed abnormally. The owner sweep's tcp-close! turns into
+        ;; a clean close that waits for a holder who is dead, and the watcher --
+        ;; linked to the owner without trapping exits -- is killed by the link
+        ;; before its DOWN branch can run. Expected: the connection retires, the
+        ;; waiting writer is refused, resources return to baseline.
+        (let ((cli (spawn (lambda ()
+                            (let-values (((plain raw cause) (raw-tls-collect "127.0.0.1" port "localhost" upgrade-request 20000)))
+                              (send main-pid (vector 'client-done self (bytevector-length plain) cause plain raw)))))))
+          (set! client-pid cli)
+          (let ((wo (receive (after 10000 #f) (`#(ws-owner ,c ,h) (cons c h)))))
+            (check "E10b: premise -- the WebSocket session handed over the connection" (pair? wo))
+            (when (pair? wo)
+              (let* ((c (car wo)) (owner (cdr wo))
+                     (t (inject-arm-barrier! 'agg-chunk-boundary 1 30000)))
+                (check "E10b: premise -- the session process IS the connection owner" (eq? owner (conn-owner c)) owner (conn-owner c))
+                (send owner (vector 'write-big))
+                (let ((w (inject-barrier-wait t 'agg-chunk-boundary 5000)))
+                  (check "E10b: the owner parked at a chunk boundary holding the gate" (and (pair? w) (eq? (cdr w) owner) (eq? (tls-conn-holder c) owner)) (desc w) (tls-conn-holder c))
+                  (cond
+                    ((pair? w)
+                     (spawn-writer! c 'q small-q)
+                     (check "E10b: Q is waiting behind the owner" (within? 2000 (lambda () (eqv? (tls-gate-waiters-length c) 1))) (tls-gate-waiters-length c))
+                     (kill owner 'e10b-owner-is-holder)
+                     (check "E10b: the owner is dead" (dead-within? owner 3000))
+                     (check "E10b: Q was refused within bound" (eqv? (writer-outcome 'q 5000) -1))
+                     ;; THE DISCRIMINATOR: retired within a bound while the peer is still
+                     ;; connected (the client's collect runs 20 s; nothing but the owner's
+                     ;; death can retire the connection here). Baseline later is NOT the
+                     ;; witness: the client's own disconnect would reach it either way.
+                     (check "E10b: the connection retired within 3 s of the owner-holder's death, peer still connected (conn-tls detached)" (within? 3000 (lambda () (not (raw-queued c)))) (raw-queued c))
+                     (check "E10b: release of the parked-and-dead row succeeds" (vector? (inject-release! t))))
+                    (else (inject-barrier-cleanup! t 'agg-chunk-boundary 31000) (tcp-close! c))))))
+            (client-result 25000)
+            (check "E10b: resources back to baseline (session, watcher, timers, handles)" (settled-to? base 6000) (snap) base)))
 
         ;; ======== E9: a clean close drains before the handle closes ========
         ;; tcp-close! while the holder still has queued ciphertext: the queue

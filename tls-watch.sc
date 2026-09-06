@@ -64,8 +64,12 @@
     ;; retired by this process's own hand and the condition is re-raised; that
     ;; path does not depend on who the owner is or whether it traps exits. A
     ;; WSS owner runs arbitrary code and may trap, in which case a link only
-    ;; delivers an EXIT it may never read -- so the link below is belt and
-    ;; braces for non-trapping owners and nothing is claimed for it.
+    ;; delivers an EXIT it may never read.
+    ;;
+    ;; THE LINK IS NOW LOAD-BEARING, and it was not before (E10). This process
+    ;; traps exits, so the link delivers an EXIT that this procedure reads and
+    ;; acts on -- it is what stands between a dying owner and a connection that
+    ;; never retires. See the EXIT branch below for the sequence.
     ;; THE COUNT IS GIVEN BACK ON BOTH EXITS. Returning it only on the
     ;; normal path would leave the live count rising forever after any abort,
     ;; and then "still 1 after retirement" would say nothing about whether this
@@ -75,6 +79,18 @@
                   (conn-tls-retire! c 'watcher-raise e)
                   (raise e)))
       (let ((owner (conn-owner c)))
+        ;; TRAP BEFORE LINKING, AND THE ORDER IS THE POINT (E10). An owner that
+        ;; is also the write gate's holder and dies abnormally used to leave the
+        ;; connection open for good: uv-owner-died! runs first and calls
+        ;; tcp-close!, which sees a holder still in place and returns without
+        ;; retiring; the link then CASCADES and kills this process before any
+        ;; DOWN is delivered, so the holder branch below never ran. A killed
+        ;; process runs no guard, and nothing else is watching.
+        ;;
+        ;; Trapping turns that kill into a message this process can read. It is
+        ;; set BEFORE the link exists, because a cascade arriving in the window
+        ;; between linking and trapping would kill us anyway.
+        (process-trap-exit #t)
         (inject-fault! 'tls-watcher-link)
         (when owner (link owner))
         (inject-fault! 'tls-watcher-monitor)
@@ -127,6 +143,34 @@
                     ;; holder's aggregate can never complete, so there is
                     ;; nothing left to wait for.
                     (`#(DOWN ,pid ,reason)
+                      (cond
+                        ((eq? pid (tls-conn-holder c))
+                         (exited!)
+                         (conn-tls-retire! c 'down reason)
+                         (raise 'tls-watcher-done))
+                        ((and (eq? pid (conn-owner c))
+                              (not (tls-conn-shutdown? c)))
+                         (exited!)
+                         (conn-tls-retire! c 'down reason)
+                         (raise 'tls-watcher-done))
+                        (else 'stale)))
+                    ;; AN EXIT IS THE SAME EVENT ARRIVING BY THE OTHER ROAD
+                    ;; (E10), so it is judged by exactly the same test. When
+                    ;; the dying process is the owner, the link cascade reaches
+                    ;; this process before the monitor DOWN does; with trapping
+                    ;; on, that cascade is this message rather than a kill.
+                    ;;
+                    ;; THE E9 CLAUSE IS PART OF THE COPY, NOT AN OVERSIGHT. An
+                    ;; owner dying while a clean-close drain is already running
+                    ;; must not cut the drain: the alert is queued under its own
+                    ;; bound and the owner has no further part in getting it
+                    ;; out. A dead HOLDER still retires, drain or not, because
+                    ;; its aggregate can never complete.
+                    ;;
+                    ;; Anything else is swallowed. A linked process that is
+                    ;; neither the holder nor the owner says nothing about this
+                    ;; connection.
+                    (`#(EXIT ,pid ,reason)
                       (cond
                         ((eq? pid (tls-conn-holder c))
                          (exited!)
