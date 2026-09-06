@@ -214,7 +214,13 @@
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr sexpr)
           (only (igropyr libuv) now-ms)
-          (only (igropyr tcp) conn-on-close! conn-set-owner! conn-state tcp-close! tcp-connect! tcp-listen! tcp-read-start! tcp-writev!)
+          (only (igropyr tcp) conn-on-close! conn-set-owner! conn-state
+                tcp-close! tcp-connect! tcp-connect-tls! tcp-listen!
+                tcp-listen-tls! tcp-read-start! tcp-writev!
+                tls-conn-peer-cb-hash)
+          (only (igropyr tls-core) tls-listen-context! tls-mesh-client-context!
+                tls-context-retire! tls-context-cb-hash)
+          (only (igropyr tls-watch) tls-watch-install!)
           (igropyr gen-server) (igropyr inject)
           (only (igropyr crypto) hmac-sha256 bytevector->hex))
 
@@ -306,7 +312,10 @@
   ;; The first three were made while the distributed layer carried no
   ;; production traffic. From here on every wire evolution goes through
   ;; this number.
-  (define protocol-version 4)
+  ;; 5 adds the channel binding to both proofs (mesh over TLS). It is compared
+  ;; verbatim in the handshake, so a version-5 node cannot talk to a version-4
+  ;; one in either direction -- the mesh upgrades in lockstep or not at all.
+  (define protocol-version 5)
   (define handshake-timeout-ms 5000)
   (define tick-ms 15000)            ; heartbeat interval
   (define dead-ms 60000)            ; silence longer than this = dead link
@@ -330,6 +339,11 @@
   ;; therefore loud here and silent everywhere else, which is the reason
   ;; to say plainly where it is minted.
   (define self-boot-id #f)          ; 16 lowercase hex chars
+  ;; The node's TLS contexts, or #f when the node is plaintext. The listener's
+  ;; is also the source of the ACCEPTOR's channel binding: RFC 5929 binds to
+  ;; the server's certificate, and on this side that is our own.
+  (define self-tls-context #f)          ; listener context, #f = plaintext node
+  (define self-mesh-client-context #f)  ; dialer context, #f = plaintext node
 
   ;; DIAL GENERATION: ONE PER AUTHORISATION, ISSUED BY THE REGISTRAR.
   ;;
@@ -3081,22 +3095,85 @@
   ;; Every field is separator-free by its own grammar (hex, or the wire
   ;; name charset, or a decimal), so the colon-joined encoding is
   ;; injective without escaping.
-  (define (proof-d nonce-a name-d bootid-d dialgen name-a bootid-a)
+  ;; cb is the channel binding: the ACCEPTOR's leaf-certificate digest as a
+  ;; bytevector, or an EMPTY bytevector on a plaintext link. It is mandatory,
+  ;; and deliberately so -- an omitted argument and a plaintext link would look
+  ;; identical at a call site, which is exactly the confusion a binding exists
+  ;; to prevent. An empty one hashes to "" and leaves the preimage ending in
+  ;; ':', a different string from any nonempty binding, so no proof made on one
+  ;; transport can be replayed on the other.
+  ;; The binding a PLAINTEXT link contributes. Named rather than written
+  ;; out at each call site so that "this link has no binding" reads as a
+  ;; decision, not an empty literal someone might take for a placeholder.
+  (define plaintext-binding (make-bytevector 0))
+
+  ;; THE TWO ROLES READ DIFFERENT SOURCES, AND BOTH MEAN THE ACCEPTOR'S LEAF.
+  ;; RFC 5929 tls-server-end-point binds to the SERVER's certificate: the dialer
+  ;; sees it as the peer's, the acceptor as its own. Reading "the peer's
+  ;; certificate" on the accept side would bind to the CLIENT's -- which a mesh
+  ;; client does not present at all, so every proof would bind to nothing.
+  ;;
+  ;; A MISSING BINDING ON A TLS LINK IS A REFUSAL, NOT AN EMPTY ONE. Mapping #f
+  ;; to the empty bytevector would make a TLS link produce exactly the proof a
+  ;; plaintext link produces, which is the one substitution the binding exists
+  ;; to prevent. 'auth is the same signal a bad proof raises.
+  ;;
+  ;; Whether this node speaks TLS is a NODE-WIDE fact (the switch is lockstep),
+  ;; so each side reads its own context rather than interrogating the socket.
+  ;; ONE REPORTER FOR THE THREE SILENT PATHS. They used to differ only in
+  ;; being silent in three separate ways: a discarded reason, and two timeouts
+  ;; that landed in guards. A mixed-transport mesh is the case that needs them
+  ;; -- one side TLS, the other plaintext -- because the visible symptom is a
+  ;; peer that never comes up, with nothing said anywhere about why.
+  ;;
+  ;; RATE-LIMITED BY THE BACKOFF ITSELF, which is already 45-75 s between
+  ;; attempts at the cap; no separate suppression is kept here, and the
+  ;; per-peer once-only policy stays out of this batch.
+  ;;
+  ;; It never names the secret or any frame content, and the acceptor stays
+  ;; silent on unauthenticated failures as before -- this is the DIAL side's
+  ;; report about its own attempt.
+  (define (report-dial-failure! peer category)
+    (display (string-append "igropyr node: dial to " (symbol->string peer)
+                            " failed (" category
+                            "); if the peers disagree about TLS, check the"
+                            " configuration -- both nodes must use TLS or both"
+                            " plaintext")
+             (console-error-port))
+    (newline (console-error-port)))
+
+  (define (dialer-binding c)
+    (if self-mesh-client-context
+        (or (tls-conn-peer-cb-hash c) (raise 'auth))
+        plaintext-binding))
+
+  (define (acceptor-binding)
+    (if self-tls-context
+        ;; node-start! already refused a certificate whose leaf yields no
+        ;; binding, so this cannot be #f today. Kept because that refusal and
+        ;; this read are far apart, and a later way to install a context must
+        ;; not slip past silently.
+        (or (tls-context-cb-hash self-tls-context) (raise 'auth))
+        plaintext-binding))
+
+  (define (proof-d nonce-a name-d bootid-d dialgen name-a bootid-a cb)
     (bytevector->hex
       (hmac-sha256 self-secret
         (string->utf8
           (string-append nonce-a ":" name-d ":"
                          (number->string protocol-version) ":"
                          bootid-d ":" (number->string dialgen) ":"
-                         name-a ":" bootid-a)))))
+                         name-a ":" bootid-a ":" (bytevector->hex cb))))))
 
-  (define (proof-a nonce-b name-a bootid-a)
+  ;; Same rule and the same position as proof-d: last, mandatory, empty for a
+  ;; plaintext link.
+  (define (proof-a nonce-b name-a bootid-a cb)
     (bytevector->hex
       (hmac-sha256 self-secret
         (string->utf8
           (string-append nonce-b ":" name-a ":"
                          (number->string protocol-version) ":"
-                         bootid-a)))))
+                         bootid-a ":" (bytevector->hex cb))))))
 
   ;; The nth element, or #f when the datum is too short. Used to look at a
   ;; version slot before the shape as a whole has been accepted: the point
@@ -6547,7 +6624,14 @@
                                   (proof-d nonce (cadr d) (list-ref d 5)
                                            (list-ref d 6)
                                            (symbol->string self-name)
-                                           self-boot-id)))
+                                           self-boot-id
+                                           ;; ACCEPTOR SIDE: the binding is this node's OWN leaf, not
+                                           ;; the peer's -- RFC 5929 tls-server-end-point binds to the
+                                           ;; server's certificate, and a mesh client presents none.
+                                           ;; Wired to the listener context when transport selection
+                                           ;; lands; plaintext until then, which is what every link is
+                                           ;; today.
+                                           (acceptor-binding))))
               (raise 'auth))
             (let ((peer (string->symbol (cadr d))) (nonce-b (cadddr d)))
               ;; RELEASED HERE, BEFORE THE INSTALL DECISION, and that is
@@ -6597,7 +6681,8 @@
                     (if (write-frame! c
                           (list 'welcome (symbol->string self-name)
                                 (proof-a nonce-b (symbol->string self-name)
-                                         self-boot-id)))
+                                         self-boot-id
+                                         (acceptor-binding))))
                         (run-link c peer peer-boot-id buf)
                         (remove-peer! peer c))
                     (tcp-close! c)))))))))        ; lost the tie-break
@@ -6699,7 +6784,9 @@
       (let ((gen (authorised-connect! peer host port parent)))
         (unless gen (raise 'unauthorised))
         (set! dial-gen gen))
-      (receive (after handshake-timeout-ms (raise 'timeout))
+      (receive (after handshake-timeout-ms
+                 (begin (report-dial-failure! peer "no answer before the handshake deadline")
+                        (raise 'timeout)))
         (`#(tcp-connected ,c)
           (guard (e ((eq? e 'stop) (tcp-close! c) (raise 'stop))
                     ((eq? e dial-gen-exhausted) (tcp-close! c) (raise e))
@@ -6720,7 +6807,15 @@
                     ((bad-version? e) (tcp-close! c)
                                       (report-version-mismatch! peer e)
                                       #f)
-                    (#t (tcp-close! c) #f))
+                    ;; THE CATCH-ALL WAS THE THIRD SILENT PATH: a frame that
+                    ;; never arrived, a handshake refused mid-flight, a TLS
+                    ;; peer meeting a plaintext one -- all of them ended here
+                    ;; and said nothing. Close first, then speak, for the
+                    ;; reason set out above.
+                    (#t (tcp-close! c)
+                        (report-dial-failure! peer
+                          (string-append "handshake: " (format "~a" e)))
+                        #f))
             (tcp-read-start! c)
             (let* ((buf (make-inbuf))
                    (dpair (call-with-values
@@ -6772,7 +6867,8 @@
                   (list 'hello (symbol->string self-name)
                         (proof-d (cadr d) (symbol->string self-name)
                                  self-boot-id gen
-                                 (symbol->string peer) bootid-a)
+                                 (symbol->string peer) bootid-a
+                                 (dialer-binding c))
                         nonce-b protocol-version self-boot-id gen))
                 (let-values (((d2 d2text) (read-frame c buf handshake-timeout-ms
                                                       handshake-max-frame)))
@@ -6798,14 +6894,19 @@
                                (string=? (cadr d2) (symbol->string peer))
                                (proof=? (caddr d2)
                                         (proof-a nonce-b (symbol->string peer)
-                                                 bootid-a)))
+                                                 bootid-a
+                                                 (dialer-binding c))))
                     (raise 'auth))
                   (if (installed?
                         (install-peer! peer c self-name bootid-a gen parent))
                       (let ((up (now-ms)))
                         (- (run-link c peer bootid-a buf) up))
                       (begin (tcp-close! c) 0)))))))
-        (`#(tcp-connect-failed ,e) #f)
+        (`#(tcp-connect-failed ,e)
+          ;; the reason was discarded here; it is the only word the dialer gets
+          ;; about a transport that refused it
+          (report-dial-failure! peer (string-append "connect: " (format "~a" e)))
+          #f)
         (`#(node-stop) (raise 'stop)))))
 
   ;; ---- reconnect backoff ------------------------------------------------
@@ -7397,7 +7498,16 @@
                    (hashtable-set! peers-auth peer
                      (vector (auth-endpoint r) (auth-parent r) (auth-child r)
                              gen #t))
-                   (tcp-connect! host port self)
+                   ;; TRANSPORT FOLLOWS THIS NODE'S OWN CONFIGURATION, not the
+                   ;; peer's: the switch is node-wide and lockstep, so a node
+                   ;; with a mesh context dials TLS at every peer or at none.
+                   ;; There is deliberately no fallback -- a dialer that retried
+                   ;; in plaintext after a TLS refusal would downgrade itself on
+                   ;; exactly the failure that ought to stop it.
+                   (if self-mesh-client-context
+                       (tcp-connect-tls! host port self
+                                         self-mesh-client-context host)
+                       (tcp-connect! host port self))
                    gen)))))))
 
   (define (attempt! peer host port)
@@ -7488,7 +7598,87 @@
   ;; Set this node's identity and shared secret; with a port, also
   ;; accept peers -- on 127.0.0.1 unless a host is given (the dist port
   ;; must never face the public internet).
-  (define (node-start! name secret . rest)
+  ;; ---- node-start! options -------------------------------------------
+  ;;
+  ;; AN OPTIONS ALIST IS PEELED FROM THE END, AT MOST ONE. The existing call
+  ;; forms are (name secret), (name secret port) and (name secret port host),
+  ;; where port is a number and host a string -- so a trailing PROPER LIST OF
+  ;; PAIRS is unambiguous against every one of them. '() peels as "no options",
+  ;; which is the same thing said explicitly.
+  (define (options-alist? x)
+    (and (list? x) (for-all pair? x)))
+
+  ;; -> (values positional-args options)
+  (define (peel-options rest)
+    (if (and (pair? rest)
+             (options-alist? (car (reverse rest))))
+        (let ((r (reverse rest)))
+          (values (reverse (cdr r)) (car r)))
+        (values rest '())))
+
+  (define (opt-ref opts k) (let ((p (assq k opts))) (and p (cdr p))))
+
+  ;; Every key this node understands. An unknown key is REFUSED rather than
+  ;; ignored: a misspelled tls-cert that is silently dropped starts a plaintext
+  ;; node that the operator believes is encrypted, and nothing later says so.
+  (define node-option-keys '(tls-cert tls-key tls-ca))
+
+  (define (check-node-options! opts)
+    (unless (options-alist? opts)
+      (assertion-violation 'node-start!
+        "options must be an association list" opts))
+    (for-each
+      (lambda (p)
+        (unless (memq (car p) node-option-keys)
+          (assertion-violation 'node-start!
+            "unknown option key" (car p))))
+      opts)
+    (let ((cert (opt-ref opts 'tls-cert))
+          (key  (opt-ref opts 'tls-key))
+          (ca   (opt-ref opts 'tls-ca)))
+      ;; TOGETHER OR NEITHER, and refused at startup rather than at the first
+      ;; connection. Half a TLS configuration is a node that would either serve
+      ;; plaintext while its operator believes otherwise, or fail on the first
+      ;; peer -- both of which are found far from this call.
+      (when (and cert (not key))
+        (assertion-violation 'node-start! "tls-cert given without tls-key" cert))
+      (when (and key (not cert))
+        (assertion-violation 'node-start! "tls-key given without tls-cert" key))
+      ;; A CA WITH NO CERTIFICATE HAS NOTHING TO VERIFY FOR. It would read as
+      ;; "this node checks its peers", which a plaintext node cannot do.
+      (when (and ca (not cert))
+        (assertion-violation 'node-start!
+          "tls-ca needs tls-cert and tls-key" ca))
+      (for-each
+        (lambda (n v)
+          (when (and v (not (string? v)))
+            (assertion-violation 'node-start! "option must be a path string" n)))
+        '(tls-cert tls-key tls-ca) (list cert key ca))))
+
+  ;; A GUARDRAIL, NOT ENTROPY, and the wording says so. Padding a short secret
+  ;; to 32 bytes does not make it stronger -- "password" NUL-padded yields the
+  ;; same HMAC key it always did -- so this warns and does not refuse. The
+  ;; length is reported; the secret never is.
+  (define (warn-weak-secret! secret)
+    (let* ((n (string-length secret))
+           (hex? (let loop ((i 0))
+                   (cond ((= i n) (> n 0))
+                         ((let ((c (char-downcase (string-ref secret i))))
+                            (or (char<=? #\0 c #\9) (char<=? #\a c #\f)))
+                          (loop (+ i 1)))
+                         (else #f)))))
+      (when (or (< n 32) (not hex?))
+        (display "igropyr node: WARNING -- the cluster secret should be 32 random bytes from a CSPRNG, given as 64 hex characters"
+                 (console-error-port))
+        (newline (console-error-port))
+        (display (string-append "  (this one is " (number->string n)
+                                " characters"
+                                (if hex? "" ", and not hex")
+                                ")")
+                 (console-error-port))
+        (newline (console-error-port)))))
+
+  (define (node-start! name secret . rest0)
     (unless (and (symbol? name) (string? secret))
       (assertion-violation 'node-start! "want (name-symbol secret-string)" name))
     ;; A NAME CANNOT CONTAIN `~`, and the refusal belongs here rather
@@ -7529,27 +7719,120 @@
     (when (< (string-length secret) 8)
       (assertion-violation 'node-start!
         "secret must be at least 8 characters" (string-length secret)))
+    ;; PEELED AND CHECKED BEFORE ANYTHING IS PUBLISHED. Every refusal above
+    ;; and below this point happens with self-name still #f, so a rejected
+    ;; start leaves the process exactly as it found it.
+    (let-values (((rest opts) (peel-options rest0)))
+    (check-node-options! opts)
+    (unless (or (null? rest)
+                (and (pair? rest) (number? (car rest))
+                     (or (null? (cdr rest))
+                         (and (pair? (cdr rest)) (string? (cadr rest))
+                              (null? (cddr rest))))))
+      (assertion-violation 'node-start!
+        "want (name secret [port [host]] [options])" rest))
+    (warn-weak-secret! secret)
     (when self-name
       (assertion-violation 'node-start! "node already started" self-name))
-    (set! self-name name)
-    (set! self-secret (string->utf8 secret))
-    ;; ONCE PER BOOT, HERE, AND NOWHERE ELSE. Minting it per connection
-    ;; would not merely weaken the identity it carries -- the acceptor
-    ;; states this value in the challenge and hashes the same value into
-    ;; the proof it then verifies, so a second spelling would make this
-    ;; node fail to authenticate a peer that answered it correctly.
-    (set! self-boot-id (random-hex 8))
-    ;; The registrar starts with the node, not with the first dial: its
-    ;; mailbox is the order in which permission to dial changes, and an
-    ;; order that only begins once somebody dials is not one.
-    ;; THE REGISTRAR IS NOT SPAWNED HERE ANY MORE. The warden starts
-    ;; it, and registrar-start assigns `registrar` itself. Nothing waits
-    ;; for that to happen: a command sent before the first incarnation is
-    ;; running goes into the queue and is executed when it starts, which
-    ;; is the same path a command sent during a restart takes.
-    ;; The warden starts with the node and is marked critical: it is the
-    ;; root the reaper's recoverability hangs from, so its own death is
-    ;; not something to survive quietly.
+    ;; ---- staged startup (mesh TLS) ------------------------------------
+    ;;
+    ;; NOTHING IS PUBLISHED UNTIL EVERYTHING THAT CAN FAIL CHEAPLY HAS. The
+    ;; contexts come first because loading a certificate is the step most
+    ;; likely to fail on a fresh deployment, and failing it while self-name is
+    ;; still #f costs nothing to undo.
+    ;;
+    ;; AND THE BIND IS LAST, which is what makes the unwind short: no step
+    ;; follows it, so a bind failure has only to undo what came before. An
+    ;; earlier draft bound first and retained the listener handle so it could
+    ;; be stopped; this order removes that obligation instead of discharging
+    ;; it.
+    (let ((secret-bytes (string->utf8 secret))
+          (boot-id (random-hex 8))
+          (port (and (pair? rest) (car rest)))
+          (host (if (and (pair? rest) (pair? (cdr rest)))
+                    (cadr rest)
+                    "127.0.0.1"))
+          (cert (opt-ref opts 'tls-cert))
+          (key (opt-ref opts 'tls-key))
+          (ca (opt-ref opts 'tls-ca))
+          (lctx #f) (cctx #f) (published? #f)
+          ;; TWO FLAGS, BECAUSE THEY BECOME TRUE AT DIFFERENT MOMENTS. spawn
+          ;; succeeds before critical! is even called, so one flag set after
+          ;; both would leave a live warden unkilled if critical! raised --
+          ;; while the global reference to it was cleared anyway, which is how
+          ;; a process becomes unreachable and immortal at the same time.
+          (warden-spawned? #f) (warden-up? #f))
+      ;; Undoes exactly what happened, in reverse, each step guarded on its own
+      ;; flag: one cleanup that assumes the common case is what turns a failure
+      ;; in the middle into either a leak or a double free. M12 is a
+      ;; FINAL-STATE contract, so this restores rather than merely avoiding
+      ;; publication.
+      (define (unwind!)
+        ;; THE CRITICAL MARK COMES OFF FIRST, and only if it went on: killing a
+        ;; process still marked critical is the very event that mark exists to
+        ;; escalate.
+        (when warden-up?
+          (guard (e2 (#t (void))) (uncritical! reaper-warden)))
+        ;; THE CHILDREN DO NOT DIE WITH THE WARDEN. It starts them with a bare
+        ;; spawn and a monitor, not a link, so killing it removes the watcher
+        ;; and nothing else: reaper, dispatcher and registrar would keep their
+        ;; registered names and their work, and a later successful start would
+        ;; add a second set beside them.
+        ;;
+        ;; They are reached the way each one is reachable at all -- two by the
+        ;; names they register, the registrar only through the variable it
+        ;; assigns itself to. A dead process is unregistered automatically, so
+        ;; the names go with them.
+        (when warden-spawned?
+          (guard (e2 (#t (void)))
+            (when (process-alive? reaper-warden)
+              (kill reaper-warden 'node-start-failed)))
+          (for-each
+            (lambda (p)
+              (guard (e2 (#t (void)))
+                (when (and p (process-alive? p)) (kill p 'node-start-failed))))
+            (list (whereis reaper-name)
+                  (whereis dispatcher-name)
+                  registrar))
+          ;; the registrar publishes itself through this variable and through
+          ;; no name, so nothing else would ever clear it
+          (set! registrar #f))
+        (when published?
+          (set! self-name #f)
+          (set! self-secret #f)
+          (set! self-boot-id #f)
+          (set! self-tls-context #f)
+          (set! self-mesh-client-context #f))
+        (set! reaper-warden #f)
+        ;; the contexts go back last: the warden's children may still be
+        ;; unwinding above, and nothing they do touches a context
+        (when cctx (guard (e2 (#t (void))) (tls-context-retire! cctx)))
+        (when lctx (guard (e2 (#t (void))) (tls-context-retire! lctx))))
+      (guard (e (#t (unwind!) (raise e)))
+        ;; (1) contexts -- both or neither, and before any publication
+        (when cert
+          (set! lctx (tls-listen-context! cert key))
+          (set! cctx (tls-mesh-client-context! ca))
+          ;; A LISTENER WHOSE OWN LEAF YIELDS NO BINDING CANNOT SERVE A MESH:
+          ;; every dialer would have to refuse it, so refusing at startup is
+          ;; the same verdict delivered where it can still be acted on.
+          (unless (tls-context-cb-hash lctx)
+            (assertion-violation 'node-start!
+              "channel binding unavailable for this certificate" cert))
+          ;; ONLY A TLS NODE INSTALLS THE WATCHER HOOK. A plaintext node never
+          ;; accepts or dials a TLS connection, so installing it there would
+          ;; add a dependency it never uses -- and (igropyr tls-watch) is what
+          ;; drags in the parts of the TLS stack a plaintext deployment is
+          ;; entitled not to load.
+          (tls-watch-install!))
+        ;; (2) publish identity
+        (set! self-name name)
+        (set! self-secret secret-bytes)
+        (set! self-boot-id boot-id)
+        (set! self-tls-context lctx)
+        (set! self-mesh-client-context cctx)
+        (set! published? #t)
+        ;; (3) the warden, critical
     (set! reaper-warden
       (spawn (lambda ()
                (warden-loop
@@ -7566,20 +7849,24 @@
                        ;; worth doing: the work survives the incarnation.
                        (vector 'registrar registrar-start
                                "no new peer can be authorised to dial"))))))
-    (critical! reaper-warden 'node-warden)
-    (when (pair? rest)
-      (let ((port (car rest))
-            (host (if (pair? (cdr rest)) (cadr rest) "127.0.0.1")))
-        (tcp-listen! host port 128
-          (lambda (c)
-            ;; libuv callback context: spawn + own + read-start only,
-            ;; or -- over the pre-auth ceiling -- close and do none of it
-            (let ((pid (lease-admit! 'preauth max-preauth-conns
-                         (lambda (s) (acceptor c s)))))
-              (if pid
-                  (begin (conn-set-owner! c pid) (tcp-read-start! c))
-                  (tcp-close! c)))))))
-    name)
+        (set! warden-spawned? #t)
+        (critical! reaper-warden 'node-warden)
+        (set! warden-up? #t)
+        ;; (4) bind LAST
+        (when port
+          (let ((on-accept
+                  (lambda (c)
+                    ;; libuv callback context: spawn + own + read-start only,
+                    ;; or -- over the pre-auth ceiling -- close and do none of it
+                    (let ((pid (lease-admit! 'preauth max-preauth-conns
+                                 (lambda (s) (acceptor c s)))))
+                      (if pid
+                          (begin (conn-set-owner! c pid) (tcp-read-start! c))
+                          (tcp-close! c))))))
+            (if lctx
+                (tcp-listen-tls! host port 128 on-accept lctx)
+                (tcp-listen! host port 128 on-accept))))
+        name))))
 
   ;; Dial a peer (and keep dialing whenever the link is down).
   ;;

@@ -149,10 +149,12 @@
 (define (v4-hmac msg)
   (bytevector->hex (hmac-sha256 (string->utf8 secret) (string->utf8 msg))))
 (define (v4-proof-d nonce-a name-d bootid-d dialgen name-a bootid-a)
-  (v4-hmac (string-append nonce-a ":" name-d ":4:" bootid-d ":"
-                          dialgen ":" name-a ":" bootid-a)))
+  ;; protocol 5: the version field is 5 and the preimage ends with the
+  ;; channel binding, empty on a plaintext link (a trailing ":" and nothing)
+  (v4-hmac (string-append nonce-a ":" name-d ":5:" bootid-d ":"
+                          dialgen ":" name-a ":" bootid-a ":")))
 (define (v4-proof-a nonce-b name-a bootid-a)
-  (v4-hmac (string-append nonce-b ":" name-a ":4:" bootid-a)))
+  (v4-hmac (string-append nonce-b ":" name-a ":5:" bootid-a ":")))
 (define (hex16? s)
   (and (string? s) (= (string-length s) 16)
        (let ok ((i 0))
@@ -167,7 +169,7 @@
       (tcp-read-start! c)
       (let ((d (read-frame-or-closed label)))
         (unless (and (pair? d) (= (length d) 4) (eq? (car d) 'challenge)
-                     (string? (cadr d)) (eqv? (caddr d) 4)
+                     (string? (cadr d)) (eqv? (caddr d) 5)
                      (string? (cadddr d)))
           (fail! label 'challenge-shape d))
         (let* ((nonce-a (cadr d)) (bootid-a (cadddr d))
@@ -176,7 +178,7 @@
                           (list 'hello name-s
                                 (v4-proof-d nonce-a name-s probe-boot-id "1"
                                             wire-name-of-this-node bootid-a)
-                                "feedfeedfeedfeedfeedfeedfeedfeed" 4
+                                "feedfeedfeedfeedfeedfeedfeedfeed" 5
                                 probe-boot-id 1))
                       #f)
           (let ((w (read-frame-or-closed label)))
@@ -653,7 +655,7 @@
                    (send me (vector ref 'challenge-tag)))
                   ((not (string? (cadr d)))
                    (send me (vector ref 'challenge-nonce-not-string)))
-                  ((not (eqv? (caddr d) 4))
+                  ((not (eqv? (caddr d) 5))
                    (send me (vector ref 'challenge-version)))
                   ((not (string? (cadddr d)))
                    (send me (vector ref 'challenge-bootid-not-string)))
@@ -664,7 +666,7 @@
                                                      probe-boot-id "1"
                                                      wire-name-of-this-node
                                                      (cadddr d))
-                                         nb32 4 probe-boot-id 1))
+                                         nb32 5 probe-boot-id 1))
                                #f)
                    (let ((w (read-frame-or-closed "wirepeer-welcome")))
                      (send me (vector ref
@@ -708,10 +710,10 @@
       (bytevector->hex
         (hmac-sha256 (string->utf8 key-string) (string->utf8 msg))))
     (define (msg-d nonce-a name-d bootid-d dialgen name-a bootid-a)
-      (string-append nonce-a ":" name-d ":4:" bootid-d ":" dialgen
-                     ":" name-a ":" bootid-a))
+      (string-append nonce-a ":" name-d ":5:" bootid-d ":" dialgen
+                     ":" name-a ":" bootid-a ":"))
     (define (msg-a nonce-b name-a bootid-a)
-      (string-append nonce-b ":" name-a ":4:" bootid-a))
+      (string-append nonce-b ":" name-a ":5:" bootid-a ":"))
     ;; one v4 probe = dial, read challenge, answer with a caller-built
     ;; hello (possibly tampered), report what came back. `expect` is
     ;; 'good for a welcome with a CORRECT proof-A, 'closed for refusal.
@@ -729,7 +731,7 @@
                      (send me (vector ref (list 'challenge-arity d))))
                     ((not (eq? (car d) 'challenge))
                      (send me (vector ref 'challenge-tag)))
-                    ((not (eqv? (caddr d) 4))
+                    ((not (eqv? (caddr d) 5))
                      (send me (vector ref (list 'challenge-version (caddr d)))))
                     ((not (hex16? (cadddr d)))
                      (send me (vector ref 'challenge-bootid-syntax)))
@@ -757,18 +759,18 @@
               (v4-proof secret
                         (msg-d nonce-a name-d s1-bootid-d dialgen
                                "a" bootid-a))
-              "beadbeadbeadbeadbeadbeadbeadbead" 4 s1-bootid-d
+              "beadbeadbeadbeadbeadbeadbeadbead" 5 s1-bootid-d
               (string->number dialgen))))
     ;; anchor: the design's known-answer vectors, secret "s". If these
     ;; fail the HELPER diverged from the spec, not the library.
     (unless (equal? (v4-proof "s" (msg-d (make-string 32 #\0) "d"
                                          (make-string 16 #\a) "7"
                                          "e" (make-string 16 #\b)))
-                    "6323ff0b8e27276dc0ca365135fa51a4c855343d943ffc703e11df0f726cfbf0")
+                    "1cf6884e463e6950cf1f20e95c88cf6e73ceba552c8cf9c95d7086affbd232e6")
       (fail! "s1-kat-proof-d-helper-diverged"))
     (unless (equal? (v4-proof "s" (msg-a (make-string 32 #\1) "e"
                                          (make-string 16 #\b)))
-                    "0870664de029139ae4ff303314198e4b03b7f5c19874243248b7bf808063fe40")
+                    "53a7e865cb4d86ca53a9fd6eac3427670d5bfbf8daddc328e0d537ff3cd5b750")
       (fail! "s1-kat-proof-a-helper-diverged"))
     ;; ① the specified v4 dialect is accepted end to end (RED today:
     ;;    the challenge is still v3's three elements)
@@ -811,14 +813,14 @@
               (v4-proof secret
                         (msg-d nonce-a "wire4b" s1-bootid-d "7"
                                "a" (make-string 16 #\0))) ; not the real bootid-a
-              "beadbeadbeadbeadbeadbeadbeadbead" 4 s1-bootid-d 7)))
+              "beadbeadbeadbeadbeadbeadbeadbead" 5 s1-bootid-d 7)))
     (v4-probe! "s1-dialgen-altered-after-signing" 'closed
       (lambda (nonce-a bootid-a)
         (list 'hello "wire4c"
               (v4-proof secret
                         (msg-d nonce-a "wire4c" s1-bootid-d "7"
                                "a" bootid-a))
-              "beadbeadbeadbeadbeadbeadbeadbead" 4 s1-bootid-d
+              "beadbeadbeadbeadbeadbeadbeadbead" 5 s1-bootid-d
               8)))                       ; signed 7, sent 8
     ;; ④ dial-gen at 2^64 is a PROTOCOL refusal -- close this link,
     ;;    never the node (§8 item 3d: untrusted input must not become a
@@ -849,7 +851,7 @@
                            ;; the same shape the other fixtures use)
                            (tcp-read-start! c)
                            (tcp-write! c (frame-bytes
-                                           (list 'challenge kat-nonce 4
+                                           (list 'challenge kat-nonce 5
                                                  probe-boot-id))
                                        #f)
                            (let ((d (read-frame-or-closed "s1-gen")))
@@ -936,7 +938,7 @@
                                  (lambda ()
                                    (tcp-read-start! c)
                                    (tcp-write! c (frame-bytes
-                                                   (list 'challenge kat-nonce 4
+                                                   (list 'challenge kat-nonce 5
                                                          probe-boot-id))
                                                #f)
                                    (read-frame-or-closed "s2-orphan")
@@ -976,7 +978,7 @@
                                  (lambda ()
                                    (tcp-read-start! c)
                                    (tcp-write! c (frame-bytes
-                                                   (list 'challenge kat-nonce 4
+                                                   (list 'challenge kat-nonce 5
                                                          probe-boot-id))
                                                #f)
                                    (read-frame-or-closed "cv-probe")
@@ -1422,7 +1424,7 @@
                                                             wire-name-of-this-node
                                                             bootid-a)
                                                 "beadbeadbeadbeadbeadbeadbeadbead"
-                                                4 probe-boot-id gen))
+                                                5 probe-boot-id gen))
                                       #f)
                           (let ((w (read-frame-or-closed label)))
                             (send me (vector ref
@@ -1453,7 +1455,7 @@
                                                             wire-name-of-this-node
                                                             bootid-a)
                                                 "beadbeadbeadbeadbeadbeadbeadbead"
-                                                4 probe-boot-id gen))
+                                                5 probe-boot-id gen))
                                       #f)
                           (let ((w (read-frame-or-closed label)))
                             (send me (vector ref
@@ -1486,7 +1488,7 @@
                                                                        wire-name-of-this-node
                                                                        bootid-a)
                                                            "beadbeadbeadbeadbeadbeadbeadbead"
-                                                           4 probe-boot-id gen))
+                                                           5 probe-boot-id gen))
                                                  #f)
                                      (let ((w (read-frame-or-closed label)))
                                        (send me (vector ref
@@ -1671,7 +1673,7 @@
                                                           wire-name-of-this-node
                                                           bootid-a)
                                               "beadbeadbeadbeadbeadbeadbeadbead"
-                                              4 boot gen))
+                                              5 boot gen))
                                     #f)
                         (let ((w (read-frame-or-closed label)))
                           (if (not (and (list? w) (eq? (car w) 'welcome)))
@@ -1746,7 +1748,7 @@
                                                           wire-name-of-this-node
                                                           bootid-a)
                                               "beadbeadbeadbeadbeadbeadbeadbead"
-                                              4 boot gen))
+                                              5 boot gen))
                                     #f)
                         (let ((w (read-frame-or-closed label)))
                           (if (not (and (list? w) (eq? (car w) 'welcome)))
@@ -1796,7 +1798,7 @@
                                                           wire-name-of-this-node
                                                           bootid-a)
                                               "beadbeadbeadbeadbeadbeadbeadbead"
-                                              4 boot gen))
+                                              5 boot gen))
                                     #f)
                         (let ((w (read-frame-or-closed label)))
                           (if (not (and (list? w) (eq? (car w) 'welcome)))
@@ -1863,7 +1865,7 @@
                                                           wire-name-of-this-node
                                                           bootid-a)
                                               "beadbeadbeadbeadbeadbeadbeadbead"
-                                              4 boot gen))
+                                              5 boot gen))
                                     #f)
                         (let ((w (read-frame-or-closed label)))
                           (if (not (and (list? w) (eq? (car w) 'welcome)))
@@ -2424,7 +2426,7 @@
                                                    ;; v4 shape, so the version gate
                                                    ;; cannot refuse it first: what is
                                                    ;; on trial is the nonce alphabet
-                                                   (list 'challenge colon-nonce 4
+                                                   (list 'challenge colon-nonce 5
                                                          probe-boot-id))
                                                   ((upper-nonce)
                                                    ;; 32 hex digits, but UPPERCASE.
@@ -2452,8 +2454,8 @@
                                                    ;; else to say the margin shrank.
                                                    (list 'challenge
                                                          "0123456789ABCDEF0123456789ABCDEF"
-                                                         4 probe-boot-id))
-                                                  (else (list 'challenge 123 4
+                                                         5 probe-boot-id))
+                                                  (else (list 'challenge 123 5
                                                               probe-boot-id))))
                                             #f)
                                 (await-close!))
@@ -2467,7 +2469,7 @@
                                 ;; still anchors the formula itself), and a
                                 ;; dial-gen that is a non-negative integer.
                                 (tcp-write! c (frame-bytes
-                                                (list 'challenge kat-nonce 4
+                                                (list 'challenge kat-nonce 5
                                                       probe-boot-id))
                                             #f)
                                 (let ((d (read-frame-or-closed "kat-hello")))
@@ -2492,7 +2494,7 @@
                                            'hello-proof-off-spec)
                                           ((not (string? (cadddr d)))
                                            'hello-nonce-b)
-                                          ((not (eqv? (car (cddddr d)) 4))
+                                          ((not (eqv? (car (cddddr d)) 5))
                                            'hello-version)
                                           (else 'good))))))
                                ((unbound-welcome)
@@ -2510,7 +2512,7 @@
                                 ;; refused before that and the cell would
                                 ;; never reach what it exists to check.
                                 (tcp-write! c (frame-bytes
-                                                (list 'challenge kat-nonce 4
+                                                (list 'challenge kat-nonce 5
                                                       probe-boot-id))
                                             #f)
                                 (let ((d (read-frame-or-closed

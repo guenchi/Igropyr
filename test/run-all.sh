@@ -505,6 +505,17 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/t
 # The mesh client context (verify-none or a private CA) must not change how the
 # https client verifies; both construction orders. Needs the openssl CLI.
 "$scheme_bin" --script test/tls-mesh-isolation.sc
+# A plaintext node never opens OpenSSL: a by-hand protocol-5 handshake with the
+# empty binding, the foreign-symbol probe before and after, then a positive
+# control in the same process. Its own process on purpose.
+"$scheme_bin" --script test/node-plain-no-ssl.sc
+# The distribution link over TLS, acceptor side: startup refusals publish
+# nothing, a channel-bound protocol-5 handshake driven by hand with an
+# independent proof, wrong/empty bindings refused, a v4 hello refused.
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh.sc
+# A TLS node against a plaintext peer, both directions: fail closed, bounded,
+# no plaintext fallback, the failure category reported.
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-mixed.sc
 #      Race cells on the TLS write gate: writers parked by inject-barrier!
 #      at named boundaries in tcp.sc, the competing operation run meanwhile.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-race.sc

@@ -225,8 +225,14 @@
   ;;                                            ;    'timeout, or 'closed (eof/close_notify/error)
   ;;   (raw-tls-peer-cb-hash s)                 ; -> bytevector or #f
   ;;   (raw-tls-close! s)
+  ;; closed? = the PEER ended the stream (close_notify / eof / error);
+  ;; released? = this side retired the session and closed the socket. They
+  ;; are different facts: a peer-closed session still holds an SSL object
+  ;; and an open handle until raw-tls-close! runs, and its connection can
+  ;; still deliver #(tcp-eof) into the caller's mailbox -- where a later
+  ;; raw-tls-open would mistake it for its own handshake ending.
   (define-record-type raw-tls-session
-    (fields conn sess (mutable pending) (mutable closed?)))
+    (fields conn sess (mutable pending) (mutable closed?) (mutable released?)))
   (define (raw-tls-open host port sni timeout-ms)
     (ensure-ctx!)
     (let ((deadline (+ (now-ms) timeout-ms)))
@@ -254,7 +260,7 @@
                            (flush!)
                            (make-raw-tls-session c sess
                                                  (if (and out (> (bytevector-length out) 0)) (list out) '())
-                                                 (and eof? #t))))
+                                                 (and eof? #t) #f)))
                         ((eq? verdict 'want-read)
                          (receive (after (remaining) (fail "handshake timeout"))
                            (`#(tcp-data ,bv)
@@ -264,7 +270,7 @@
                            (`#(tcp-error ,e) (fail "tcp error during handshake"))))
                         (else (fail (or payload "handshake failed")))))))))))))
   (define (raw-tls-send! s bytes)
-    (unless (raw-tls-session-closed? s)
+    (unless (or (raw-tls-session-closed? s) (raw-tls-session-released? s))
       (let ((sess (raw-tls-session-sess s)) (c (raw-tls-session-conn s)))
         (tcp-write! c (tls-session-encrypt! sess bytes) #f)
         (let ((out (tls-session-drain! sess))) (when out (tcp-write! c out #f))))))
@@ -291,8 +297,12 @@
             (`#(tcp-eof) (raw-tls-session-closed?-set! s #t) 'closed)
             (`#(tcp-error ,e) (raw-tls-session-closed?-set! s #t) 'closed))))))
   (define (raw-tls-peer-cb-hash s) (tls-session-peer-cb-hash (raw-tls-session-sess s)))
+  ;; ALWAYS retire and close, whether or not the peer closed first: the
+  ;; SSL object and the handle are ours to release, and the socket must be
+  ;; closed so no late #(tcp-eof) from it reaches the caller's mailbox.
   (define (raw-tls-close! s)
-    (unless (raw-tls-session-closed? s)
+    (unless (raw-tls-session-released? s)
+      (raw-tls-session-released?-set! s #t)
       (raw-tls-session-closed?-set! s #t)
       (tls-session-retire! (raw-tls-session-sess s) "raw session closed")
       (tcp-close! (raw-tls-session-conn s))))
