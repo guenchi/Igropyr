@@ -208,7 +208,7 @@
           submission-failure? node-install-rule-order node-orphan-count
           monitor-node/token demonitor-node/token
           $registrar-seed-gen! $registrar-pid $registrar-queue-length
-          $registrar-peer-gen)
+          $registrar-peer-gen $node-link-pid)
   ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
   ;; the note in libuv.sc; test/inject-isolation.ss is what measures it.
   (import (chezscheme) (igropyr buffer)
@@ -3200,9 +3200,14 @@
              (console-error-port))
     (newline (console-error-port)))
 
+  ;; INJECTION POINT 'dialer-binding-hash -- OWNING REGION: none. Wraps the
+  ;; READ, not the refusal, so an armed #f travels the same path a genuinely
+  ;; absent binding travels and the cell asserts on this node's own reaction
+  ;; rather than on a substitute for it.
   (define (dialer-binding c)
     (if self-mesh-client-context
-        (or (tls-conn-peer-cb-hash c) (raise 'auth))
+        (or (inject-override! 'dialer-binding-hash (tls-conn-peer-cb-hash c))
+            (raise 'auth))
         plaintext-binding))
 
   (define (acceptor-binding)
@@ -3211,7 +3216,10 @@
         ;; binding, so this cannot be #f today. Kept because that refusal and
         ;; this read are far apart, and a later way to install a context must
         ;; not slip past silently.
-        (or (tls-context-cb-hash self-tls-context) (raise 'auth))
+        ;; INJECTION POINT 'acceptor-binding-hash -- see dialer-binding.
+        (or (inject-override! 'acceptor-binding-hash
+                              (tls-context-cb-hash self-tls-context))
+            (raise 'auth))
         plaintext-binding))
 
   (define (proof-d nonce-a name-d bootid-d dialgen name-a bootid-a cb)
@@ -7222,7 +7230,22 @@
      ;; not yet advanced, otherwise the generation. Those three are
      ;; different states and this reports them as three different values.
      (define ($registrar-peer-gen peer)
-       (atomically (hashtable-ref dial-gens peer #f))))
+       (atomically (hashtable-ref dial-gens peer #f)))
+     ;; THE LINK PROCESS OF A PEER, so a cell can kill it or watch it. The
+     ;; link is reachable from outside only through this: a cell holds a peer
+     ;; NAME, and the pid lives in a table this file does not export.
+     ;;
+     ;; peer-entry, NOT live-entry: live-entry additionally requires the
+     ;; connection to be 'open, and the states worth testing here are the ones
+     ;; where it is not -- a link killed while it holds the write gate, a close
+     ;; with frames still queued. A seam that reports #f exactly when the
+     ;; connection leaves 'open cannot observe either.
+     ;;
+     ;; -> #f when there is no entry for that peer. That is a real state, not
+     ;; an error: it is what a cell sees before the first handshake completes
+     ;; and after the entry is removed.
+     (define ($node-link-pid peer)
+       (let ((e (peer-entry peer))) (and e (entry-link e)))))
     (else
      (define ($registrar-pid)
        (assertion-violation '$registrar-pid
@@ -7232,6 +7255,10 @@
          "test seam: this artifact was expanded without IGROPYR_INJECT=on"))
      (define ($registrar-peer-gen peer)
        (assertion-violation '$registrar-peer-gen
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"
+         peer))
+     (define ($node-link-pid peer)
+       (assertion-violation '$node-link-pid
          "test seam: this artifact was expanded without IGROPYR_INJECT=on"
          peer))))
 

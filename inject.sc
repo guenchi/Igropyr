@@ -317,6 +317,20 @@
               (assertion-violation '$inject-arm!
                 "this point supplies a handshake verdict symbol (done, want-read, gone, or a failure symbol)"
                 value)))
+           ;; #f IS THE ONLY VALUE THAT DOES ANYTHING, which is the mirror
+           ;; of the flag points above. Both callers read the result as
+           ;; (or <this> (raise 'auth)), so any true value takes the same
+           ;; branch the unarmed read takes -- arming with a bytevector
+           ;; would look like a live arm and test nothing about the
+           ;; refusal. What it WOULD do is hand a cell a forged binding
+           ;; and a proof computed over it, which is a different claim
+           ;; than "a missing binding is refused" and deserves its own
+           ;; point rather than a widened clause here.
+           ((dialer-binding-hash acceptor-binding-hash)
+            (unless (eq? value #f)
+              (assertion-violation '$inject-arm!
+                "this point forces a missing binding: it takes #f (a true value is indistinguishable from unarmed)"
+                value)))
            ;; A WHITELIST, AND THE DEFAULT IS REFUSAL. It read (void)
            ;; before -- an unlisted return point armed with whatever it
            ;; was given, so the one kind of mistake this table exists to

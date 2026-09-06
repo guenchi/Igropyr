@@ -516,6 +516,17 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/t
 # A TLS node against a plaintext peer, both directions: fail closed, bounded,
 # no plaintext fallback, the failure category reported.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-mixed.sc
+# The dialer side against a controllable TLS server: the welcome's proof-a is
+# checked against the binding the dialer saw (wrong/empty refused, correct
+# accepted); and mode A with tls-ca (CA-signed + right name connects, unsigned
+# or wrong-name fails before any hello). Needs the openssl CLI.
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-dial.sc
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-dial-ca.sc
+# An unavailable channel binding refuses on either side (override points).
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-binding-seams.sc
+# Two TLS nodes in two processes through a recording relay: TLS records only,
+# both directions, link confirmed both ways. Spawns test/tls-node-child.sc.
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-pair.sc
 #      Race cells on the TLS write gate: writers parked by inject-barrier!
 #      at named boundaries in tcp.sc, the competing operation run meanwhile.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-race.sc

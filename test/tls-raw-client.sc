@@ -18,7 +18,7 @@
 
 (library (test tls-raw-client)
   (export raw-tls-exchange raw-tls-send-and-drop raw-tls-two-requests raw-tls-collect
-          raw-tls-open raw-tls-send! raw-tls-recv! raw-tls-peer-cb-hash raw-tls-close!
+          raw-tls-open raw-tls-send! raw-tls-recv! raw-tls-peer-cb-hash raw-tls-close! raw-tls-closed-by
           raw-tls-stall-then-collect raw-tls-slow-collect)
   (import (chezscheme)
           (igropyr actor)
@@ -232,7 +232,7 @@
   ;; still deliver #(tcp-eof) into the caller's mailbox -- where a later
   ;; raw-tls-open would mistake it for its own handshake ending.
   (define-record-type raw-tls-session
-    (fields conn sess (mutable pending) (mutable closed?) (mutable released?)))
+    (fields conn sess (mutable pending) (mutable closed?) (mutable released?) (mutable closed-by)))
   (define (raw-tls-open host port sni timeout-ms)
     (ensure-ctx!)
     (let ((deadline (+ (now-ms) timeout-ms)))
@@ -260,7 +260,7 @@
                            (flush!)
                            (make-raw-tls-session c sess
                                                  (if (and out (> (bytevector-length out) 0)) (list out) '())
-                                                 (and eof? #t) #f)))
+                                                 (and eof? #t) #f (and eof? 'close-notify))))
                         ((eq? verdict 'want-read)
                          (receive (after (remaining) (fail "handshake timeout"))
                            (`#(tcp-data ,bv)
@@ -289,13 +289,15 @@
             (`#(tcp-data ,bv)
               (let-values (((out eof?) (tls-session-decrypt! sess bv)))
                 (flush!)
-                (when eof? (raw-tls-session-closed?-set! s #t))
+                (when eof? (raw-tls-session-closed?-set! s #t) (raw-tls-session-closed-by-set! s 'close-notify))
                 (cond
                   ((and out (> (bytevector-length out) 0)) out)
                   (eof? 'closed)
                   (else (raw-tls-recv! s timeout-ms)))))
-            (`#(tcp-eof) (raw-tls-session-closed?-set! s #t) 'closed)
-            (`#(tcp-error ,e) (raw-tls-session-closed?-set! s #t) 'closed))))))
+            (`#(tcp-eof) (raw-tls-session-closed?-set! s #t) (unless (raw-tls-session-closed-by s) (raw-tls-session-closed-by-set! s 'transport)) 'closed)
+            (`#(tcp-error ,e) (raw-tls-session-closed?-set! s #t) (unless (raw-tls-session-closed-by s) (raw-tls-session-closed-by-set! s 'transport)) 'closed))))))
+  ;; -> 'close-notify | 'transport | #f (still open): how the peer ended the stream
+  (define (raw-tls-closed-by s) (raw-tls-session-closed-by s))
   (define (raw-tls-peer-cb-hash s) (tls-session-peer-cb-hash (raw-tls-session-sess s)))
   ;; ALWAYS retire and close, whether or not the peer closed first: the
   ;; SSL object and the handle are ours to release, and the socket must be
