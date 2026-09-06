@@ -56,6 +56,19 @@ channel binding.
   https client context so that a mesh's trust policy cannot become the https
   client's.
 
+### Fixed
+
+- **tls-watch**: a connection whose owner was also the holder of its write gate
+  never retired if that owner died abnormally. The two mechanisms that should
+  have ended it each waited on the other: the owner sweep's clean close waits
+  for the gate holder to finish, and the holder was the dead process, while
+  link propagation killed the watcher that would otherwise have noticed. The
+  watcher now traps its link exits and retires the connection on the same
+  criterion it applies to a `DOWN`. Reachable on the WebSocket path, where the
+  session process owns the connection and holds the gate across a send.
+- **tests**: a cell pins a WebSocket upgrade end to end on an HTTPS listener
+  (wss), through the handshake, an echoed frame and the close.
+
 ---
 
 ## 1.5.2 — 2026-09-04
@@ -122,6 +135,12 @@ surface is `(igropyr tcp)` and everything above it.
   gets a watcher process that owns the write gate and the connection's timers.
   A write gate serialises whole aggregates, so two writers cannot interleave
   their records.
+
+  **A WebSocket upgrade on an HTTPS listener runs over TLS (wss) with no
+  option to set.** The upgrade is not a separate transport: the codec belongs
+  to the connection, so the handshake and every frame after it are encrypted
+  and decrypted by the same session, and a route written for `ws://` serves
+  `wss://` unchanged by being listened for with `tls-cert` and `tls-key`.
 - **node**: **dead letters.** An event that fails delivery three times is
   quarantined instead of taking the node down; `node-dead-letters`,
   `node-dead-letter-stats` and `node-redeliver-dead-letter!` read and replay
@@ -186,8 +205,7 @@ surface is `(igropyr tcp)` and everything above it.
   and now covers the LibreSSL versions that have not been measured.
 - **tests**: a cell pins the order of a replacement's node-down/node-up pair and
   the head-only dispatch behind `quarantine!`'s head assertion; it goes red
-  under a peek-last mutation. Another pins a WebSocket upgrade end to end on an
-  HTTPS listener (wss), through the handshake, an echoed frame and the close.
+  under a peek-last mutation.
 
 ---
 
