@@ -2,8 +2,8 @@
 
 ## 1.6.0 — 2026-09-06
 
-Distribution links can run over TLS, and both handshake proofs now carry a
-channel binding.
+*8 commits.* Distribution links can run over TLS, and both handshake proofs now
+carry a channel binding.
 
 ### Breaking
 
