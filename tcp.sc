@@ -33,7 +33,8 @@
     fs-mkdir-async! fs-open-async! fs-rename-async! fs-req-block-count
     fs-write-async!
     listener-backlog-effective listener-open? listener-token tcp-close!
-    tcp-connect! tcp-listen! tcp-listen-tls! tcp-read-start!
+    tcp-connect! tcp-connect-tls! tcp-listen! tcp-listen-tls!
+    tcp-read-start!
     tcp-read-stop! tcp-stop-listen! tcp-write! tcp-write-foreign!
     tcp-writev! tcp-writev-raw!
     uv-accept-failure-counts uv-owner-died!
@@ -42,7 +43,7 @@
     uv-set-tls-watcher-spawner!
     ;; the watcher's interface to a connection's shared state
     tls-gate-grant-next! tls-gate-waiters-length tls-conn-holder
-    tls-conn-shutdown?
+    tls-conn-peer-cb-hash tls-conn-shutdown?
     tls-conn-holder-monitor tls-conn-set-holder-monitor!
     tls-open-gate-and-drain! tls-watcher-exited! tls-inject-ciphertext!
     ;; knobs
@@ -179,7 +180,12 @@
       (mutable effect-depths conn-tls-effect-depths conn-tls-set-effect-depths!)
       ;; carries a terminalised aggregate's callback OUT of the retirement
       ;; region, so user code runs outside it
-      (mutable abort-cb conn-tls-abort-cb conn-tls-set-abort-cb!))
+      (mutable abort-cb conn-tls-abort-cb conn-tls-set-abort-cb!)
+      ;; The dial's completion record, or #f on a server-side record: nothing
+      ;; dialled an accepted connection, so it has no attempt to conclude.
+      ;; Reached from here so that a retirement -- the only path that still has
+      ;; the connection in hand -- can fail the attempt it belongs to.
+      (mutable connect-d conn-tls-connect-d conn-tls-set-connect-d!))
     (nongenerative)
     (sealed #t))
 
@@ -777,7 +783,8 @@
                 ;; registering it for a dead pid.
                 ((connect)
                  (let ((e (hashtable-ref connect-table key #f)))
-                   (when (and e (eq? (cdr e) owner)) (set-cdr! e #f))))
+                   (when (and e (eq? (vector-ref e 1) owner))
+                     (vector-set! e 1 #f))))
                 ;; DNS has no handle to close. Suppress its eventual delivery
                 ;; while RETAINING the request entry so the callback still
                 ;; frees it. Do NOT "simplify" this into a hashtable-delete!:
@@ -1419,17 +1426,34 @@
           ;;
           ;; #f owner means uv-owner-died! already emptied that owner's
           ;; list, so there is nothing left to remove.
-          (when (and entry (cdr entry))
-            (unindex-owner! (cdr entry) 'connect req))
+          (when (and entry (vector-ref entry 1))
+            (unindex-owner! (vector-ref entry 1) 'connect req))
           (foreign-free req)
           (when entry
-            (let ((handle (car entry)) (owner (cdr entry)))
+            ;; D IS RETAINED BEFORE THE ENTRY GOES. The request is freed just
+            ;; above and the entry is already out of the table, so whatever this
+            ;; callback still needs must be held in a local first.
+            (let ((handle (vector-ref entry 0))
+                  (owner (vector-ref entry 1))
+                  (d (vector-ref entry 2))
+                  (ctx (vector-ref entry 3))
+                  (sni (vector-ref entry 4)))
               (cond
                 ((< status 0)
                  (uv-close handle on-close-entry)
-                 (when owner (deliver owner (vector 'tcp-connect-failed status))))
+                 ;; A TLS dial answers through D, so this failure and any later one
+                 ;; cannot both be delivered; a plaintext dial has no D and answers
+                 ;; directly, exactly as before.
+                 (if d
+                     (complete-once! d (vector 'tcp-connect-failed status))
+                     (when owner
+                       (deliver owner (vector 'tcp-connect-failed status)))))
                 ((not owner)
-                 ;; The owner died while connect was in flight.
+                 ;; The owner died while connect was in flight. The handle closes and
+                 ;; TLS is never initialised. D is still marked failed so no later
+                 ;; path finds the attempt pending; there is nobody to deliver to, and
+                 ;; complete-once! drops the message while keeping the transition.
+                 (when d (complete-once! d (vector 'tcp-connect-failed 'owner-gone)))
                  (uv-close handle on-close-entry))
                 (else
                  (let ((c (make-conn handle owner 'open #f #f #f #f)))
@@ -1439,7 +1463,12 @@
                      (index-owner! owner 'conn handle)
                      (uv-tcp-nodelay handle 1)
                      (hashtable-set! conn-table handle c))
-                   (deliver owner (vector 'tcp-connected c)))))))))
+                   ;; A TLS dial is NOT connected yet: the handshake has not run. Its
+                   ;; owner hears nothing until establishment, and the initialiser
+                   ;; below owns every failure in between.
+                   (if ctx
+                       (tls-client-init! c d ctx sni)
+                       (deliver owner (vector 'tcp-connected c))))))))))
       (void* int)
       void))
 
@@ -2715,7 +2744,50 @@
   ;; Outbound TCP connection. The owner process later receives
   ;; #(tcp-connected ,conn) or #(tcp-connect-failed ,errno). Call
   ;; tcp-read-start! on the conn after the connected message arrives.
-  (define (tcp-connect! host port owner)
+  ;; ---- connect completion record (D) ----------------------------------
+  ;;
+  ;; ONE ATTEMPT GETS EXACTLY ONE ANSWER, and D is what makes that checkable
+  ;; rather than agreed. A TLS dial reaches its conclusion from several places
+  ;; -- establishment, a failure before the TLS record is attached, and a
+  ;; retirement after it -- and each would otherwise be free to deliver its own
+  ;; #(tcp-connected) or #(tcp-connect-failed). Two answers to one dial is worse
+  ;; than none: the caller acts on the first, and the second arrives against
+  ;; state built from it.
+  ;;
+  ;; The record is created at submission, held by the request entry, kept by the
+  ;; connect callback as that entry is freed, and referenced from the TLS record
+  ;; once one exists. A server-side TLS record carries #f: nothing dialled it,
+  ;; so there is no completion to report.
+  (define-record-type (connect-d make-connect-d connect-d?)
+    (fields (immutable recipient connect-d-recipient)
+            (mutable state connect-d-state connect-d-set-state!))
+    (nongenerative)
+    (sealed #t))
+
+  ;; -> #t if THIS call is the one that concluded the attempt.
+  ;;
+  ;; THE TEST AND THE TRANSITION ARE ONE STEP, and the delivery sits inside it.
+  ;; Split, two concluding paths both read 'pending and both deliver. deliver is
+  ;; a send and does not yield, so the region costs nothing and closes the window
+  ;; completely.
+  ;;
+  ;; A dead recipient is not a failure to report: the answer is dropped, as any
+  ;; message to a dead process is. What matters is that the attempt is marked
+  ;; concluded either way, so no later path can find it pending and answer again.
+  (define (complete-once! d msg)
+    (and d
+         (with-interrupts-disabled
+           (and (eq? (connect-d-state d) 'pending)
+                (begin
+                  (connect-d-set-state!
+                    d (if (eq? (vector-ref msg 0) 'tcp-connected)
+                          'connected
+                          'failed))
+                  (let ((o (connect-d-recipient d)))
+                    (when o (deliver o msg)))
+                  #t)))))
+
+  (define (connect-submit! host port owner d ctx sni)
     ;; The address buffer is a process-wide singleton and the allocations
     ;; below are preemption points: another green process starting its own
     ;; connect (or a listener binding) would overwrite the address we just
@@ -2759,7 +2831,11 @@
                  ;; cell reads the two counts after the loop has run.
                  (inject-fault! 'connect-oom)
                  (set! req (foreign-alloc connect-req-size))
-                 (hashtable-set! connect-table req (cons h owner))
+                 ;; THREE SLOTS, and the third is #f for a plaintext dial: that
+                 ;; path answers once, from the callback, and has no other
+                 ;; place it could answer from.
+                 (hashtable-set! connect-table req
+                                 (vector h owner d ctx sni))
                  (index-owner! owner 'connect req)
                  (set! indexed? #t)
                  ;; INJECTION POINT 'tcp-connect-refused -- OWNING GUARD:
@@ -2773,8 +2849,33 @@
                    (uv-tcp-connect req h sockaddr-buf on-connect-entry)))))
         (when (< r 0)
           (release!)
-          (error 'tcp-connect! (uv-strerror r)))
+          (error (if ctx 'tcp-connect-tls! 'tcp-connect!) (uv-strerror r)))
         #t)))))
+
+  ;; The plaintext dial, unchanged in behaviour: no completion record and no
+  ;; TLS context, so the connect callback answers it directly and once.
+  (define (tcp-connect! host port owner)
+    (connect-submit! host port owner #f #f #f))
+
+  ;; The TLS dial. Two things differ from the plaintext face, and both follow
+  ;; from the handshake sitting between the TCP connect and anything the owner
+  ;; can do with the connection:
+  ;;
+  ;; THE OWNER IS NOT TOLD AT TCP CONNECT. #(tcp-connected c) arrives only once
+  ;; TLS is established, because a connection whose handshake has not run
+  ;; cannot carry a byte the owner writes on it.
+  ;;
+  ;; THE ANSWER GOES THROUGH A COMPLETION RECORD. Between submission and
+  ;; establishment the attempt can end at the TCP layer, in the initialiser, in
+  ;; the handshake, or by the owner dying -- four places, each of which would
+  ;; otherwise answer for itself. D makes exactly one of them the answer.
+  ;;
+  ;; sni is the name sent in the ClientHello, and the name verified against the
+  ;; peer certificate when the context verifies at all; #f sends none.
+  (define (tcp-connect-tls! host port owner ctx sni)
+    (connect-submit! host port owner
+                     (make-connect-d owner 'pending)
+                     ctx sni))
 
   (define uv-tcp-getpeername
     (foreign-procedure "uv_tcp_getpeername" (void* void* void*) int))
@@ -3271,6 +3372,95 @@
   ;; every step that can raise -- session construction allocates and reads the
   ;; OpenSSL queue -- sits inside a guard that converts a raise into a local
   ;; close. Interrupt exclusion is no substitute: it has no rollback.
+  ;; Bring up the TLS client role on a connection whose TCP connect has just
+  ;; completed. Runs inside the connect callback.
+  ;;
+  ;; THE RECORD IS ATTACHED BEFORE THE TIMER EXISTS, and the order is the point.
+  ;; tls-timer-new! can fail, and its failure has to be cleaned up by the
+  ;; retirement path -- which only exists once conn-tls is set. Attaching second
+  ;; would leave a session owned by nobody at exactly the moment something went
+  ;; wrong.
+  ;;
+  ;; EVERY EXIT HERE CONCLUDES THE ATTEMPT. This procedure is the only thing
+  ;; between a completed TCP connect and an established TLS session, so a
+  ;; failure it swallows is an owner waiting forever for a message never sent.
+  (define (tls-client-init! c d ctx sni)
+    ;; BOTH OF THESE ARE VISIBLE TO THE GUARD, which is why they are bound out
+    ;; here. The session used to be bound inside the guarded body, so a raise
+    ;; between creating it and attaching it left the handler unable to name the
+    ;; thing it had to free: the session simply leaked.
+    ;;
+    ;; ATTACHMENT IS TRACKED EXPLICITLY rather than read back from (conn-tls c).
+    ;; That field is also what a concurrent retirement clears, so a handler
+    ;; reading it could see #f for a record that WAS attached, and then free a
+    ;; session the retirement already owns.
+    (let ((sess #f) (attached? #f))
+      (guard (e (#t (note-swallowed! 'tls-client-init e)
+                    (guard (e2 (#t (note-swallowed! 'tls-client-init-cleanup e2)))
+                      (if attached?
+                          ;; retirement owns the session and the timer, and it
+                          ;; fails D as it detaches
+                          (conn-tls-retire! c 'pre-publication e)
+                          (begin
+                            ;; nothing attached: this frame still owns both the
+                            ;; session and the answer
+                            (note-retire-reason! 'pre-publication e)
+                            (when sess (tls-session-retire! sess e))
+                            (complete-once! d (vector 'tcp-connect-failed 'tls-init-raised))
+                            (tcp-close-raw! c))))
+                    #f))
+        (set! sess (tls-session-new! ctx))
+        (let ((why (tls-session-configure-client! sess sni)))
+          (if why
+              (begin
+                ;; the session is ours and nothing else can reach it yet
+                (tls-session-retire! sess why)
+                (note-retire-reason! 'client-configure why)
+                (complete-once! d (vector 'tcp-connect-failed 'tls-configure-failed))
+                (tcp-close-raw! c)
+                #f)
+              (let ((t (make-conn-tls
+                         sess
+                         #f          ; listener -- absence of one IS the client role
+                         #f          ; established?
+                         #f          ; eof?
+                         #f          ; eof-sent?
+                         #t          ; gated? -- nothing is delivered before the
+                                     ;           watcher opens the gate
+                         '()         ; inbound
+                         #f #f '()   ; holder, holder-monitor, waiters
+                         #f #f       ; closed?, closing?
+                         #f #f       ; finishing?, shutdown? (E9)
+                         #f          ; aggregate
+                         #f          ; timer
+                         (let ((i next-timer-id))
+                           (set! next-timer-id (fx+ i 1)) i)
+                         #f          ; timer-armed?
+                         #f          ; watcher
+                         0 0 0 0     ; bio-held raw-queued charged refunded
+                         #f          ; slot? -- a dial takes no handshake slot
+                         #f #f #f    ; gate-opened-ms, retire-path, reason
+                         #f          ; effect-depths
+                         #f          ; abort-cb
+                         d)))        ; connect-d -- this dial's one answer
+                (conn-set-tls! c t)
+                (set! attached? #t)
+                (let ((tm (tls-timer-new! c tls-handshake-ms)))
+                  (if (not tm)
+                      (begin
+                        (conn-tls-retire! c 'timer-failed 'tls-timer-failed)
+                        #f)
+                      (begin
+                        (conn-tls-set-timer! t tm)
+                        ;; Same fatality as the accept side, and here it must also conclude
+                        ;; the attempt: retirement fails D.
+                        (unless (tcp-read-start! c)
+                          (conn-tls-retire! c 'read-start-failed 'tls-read-start-failed))
+                        ;; The ClientHello: the dialer speaks first, so without
+                        ;; this pump nothing is ever sent and both ends wait.
+                        (tls-pump! c t)
+                        #t)))))))))
+
   (define (tls-accept! c v ctx)
     ;; A FAILURE HERE IS AN ABORT, NOT A CLEAN CLOSE. Calling tcp-close!
     ;; was wrong in a way a cell caught: by this point conn-set-tls! has run,
@@ -3338,7 +3528,8 @@
                              #t          ; slot? -- taken above
                              #f #f #f    ; gate-opened-ms, retire-path, reason
                              #f          ; effect-depths
-                             #f)))       ; abort-cb
+                             #f          ; abort-cb
+                             #f)))       ; connect-d -- nothing dialled this
                     ;; INSTALLED BEFORE THE CONN IS PUBLISHED (X2). Until
                     ;; conn-table has this handle nothing else in the process
                     ;; can reach the session, so a failure from here on is
@@ -3354,7 +3545,13 @@
                             (conn-tls-set-timer! t tm)
                             ;; the handshake is driven by the read callback, so
                             ;; reading has to start before there is an owner
-                            (tcp-read-start! c)
+                            ;;
+                            ;; A REFUSED READ-START IS FATAL, and its return was ignored. Without
+                            ;; a read there is no callback, so the handshake never advances and
+                            ;; nothing times it out on this side: the connection sits
+                            ;; established-never, holding a session and a timer.
+                            (unless (tcp-read-start! c)
+                              (conn-tls-retire! c 'read-start-failed 'tls-read-start-failed))
                             (tls-pump! c t)
                             #t)))))))))))
 
@@ -3407,7 +3604,12 @@
          ;; shut put the EOF in front of plaintext that was still buffered.
          (if (conn-tls-eof? t)
              (tls-deliver-eof-once! c t)
-             (let ((o (conn-owner c)))
+             ;; BEFORE ESTABLISHMENT THIS IS NOT AN OWNER ERROR. A dial is answered
+             ;; only at establishment, so the owner has not been told this
+             ;; connection exists and #(tcp-error ...) would arrive about something
+             ;; it never heard of. Retirement concludes the attempt through D
+             ;; instead, which is the message it is actually waiting for.
+             (let ((o (and (conn-tls-established? t) (conn-owner c))))
                (when o (deliver o (vector 'tcp-error 'tls-truncated-eof)))
                (conn-tls-retire! c 'truncated-eof 'tls-truncated-eof))))
         (else (note-read-stage! 'err) (conn-tls-retire! c 'read-error nread)))))
@@ -3431,9 +3633,31 @@
                             (if forced (values forced #f) (values v p))))))
             ;; classify BEFORE draining, then send whatever the step produced
             ;; -- including the alert that explains a failure
-            (let ((out (tls-session-drain! (conn-tls-session t))))
-              (when out (tcp-writev-raw! c (list out) #f)))
-            (case verdict
+            ;; A REFUSED HANDSHAKE WRITE IS FATAL, and its return was ignored.
+            ;; The flight this drains is what the peer is waiting for; if it
+            ;; never reaches the socket the handshake stalls until a timer ends
+            ;; it, and on the dial side the attempt would never be concluded at
+            ;; all. Retirement is the honest answer and carries D with it.
+            ;; THE COMPLETION IS NOT #f, and it was. A queued handshake write that
+            ;; fails ASYNCHRONOUSLY reports through on-done and nowhere else, so #f
+            ;; meant a flight that never reached the peer retired nothing and
+            ;; concluded no attempt.
+            (let ((wrote?
+                    (let ((out (tls-session-drain! (conn-tls-session t))))
+                      (or (not out)
+                          (tcp-writev-raw! c (list out)
+                            (lambda (status)
+                              (when (fx< status 0)
+                                (conn-tls-retire! c 'handshake-write-failed
+                                                  'tls-handshake-write-failed))))))))
+              ;; AND A SYNCHRONOUS FAILURE STOPS THE PUMP. Falling through to the
+              ;; verdict after the write failed meant a 'done step built a watcher on
+              ;; a connection this frame had just retired, and delivered
+              ;; #(tcp-connected) for a dial that had already failed.
+              (if (not wrote?)
+                  (conn-tls-retire! c 'handshake-write-failed
+                                    'tls-handshake-write-failed)
+                  (case verdict
               ((done)
                (tls-established! c t)
                ;; DECRYPT IMMEDIATELY, AND THIS LINE IS THE WHOLE OF X3/H13.
@@ -3449,7 +3673,15 @@
                ;;
                ;; The gate is still closed at this point (Z12), so what comes
                ;; out is buffered and the watcher delivers it in order.
-               (tls-read-plaintext! c t))
+               ;;
+               ;; ESTABLISHMENT CAN RETIRE THIS CONNECTION, so the record is re-read
+               ;; rather than reused. tls-established! retires on a listener that went
+               ;; away during the handshake, and on the dial side if the watcher cannot
+               ;; be spawned -- both leave conn-tls detached while t still names the
+               ;; record we were handed. Decrypting into a retired session is a read
+               ;; through a pointer its owner has already given back.
+               (when (eq? (conn-tls c) t)
+                 (tls-read-plaintext! c t)))
               ((want-read) (void))                 ; wait for more ciphertext
               ((gone) (conn-tls-retire! c 'session-gone 'tls-conn-closed))
               ;; want-write IS AN ERROR HERE (W3), not a state to wait in:
@@ -3457,7 +3689,7 @@
               ;; something this code does not model.
               (else
                 (conn-tls-retire! c 'handshake-failed
-                                  (or payload 'tls-handshake-failed))))))))
+                                  (or payload 'tls-handshake-failed))))))))))
 
   ;; ESTABLISHMENT ORDER (Z12). The callback may not yield, and a spawned
   ;; process only runs after it returns, so this installs the owner, asks for
@@ -3468,9 +3700,38 @@
   (define (tls-established! c t)
     (conn-tls-set-established! t #t)
     (tls-timer-stop! t)                      ; stopped, NOT freed (Z2/Y3)
+    ;; A dialled connection never took a handshake slot, so this is a no-op for
+    ;; it: conn-slot-release! reads the field and does nothing when it is #f.
+    ;; That is why the client role needs no branch here and never touches
+    ;; handshaking-count -- the existing shape already gives it.
     (conn-slot-release! c)
-    ;; revalidate the incarnation: the listener row can go during a handshake
-    (let ((v (conn-tls-listener t)))
+    (if (not (conn-tls-listener t))
+        ;; ---- client role ------------------------------------------------
+        ;;
+        ;; FORKED BEFORE THE INCARNATION CHECK, and it has to be. That check
+        ;; asks whether this connection's listener row is still in the listener
+        ;; table; a dialled connection has no listener at all, so it would fail
+        ;; the test and retire every successful dial with 'listener-gone. The
+        ;; absence of a listener IS the client role.
+        ;;
+        ;; THE WATCHER EXISTS BEFORE THE ATTEMPT IS ANSWERED. The owner acts on
+        ;; #(tcp-connected c) immediately -- writing on it is the normal first
+        ;; move -- and a write needs the gate, which is the watcher's to grant.
+        ;; Announcing the connection first would hand the owner a connection
+        ;; whose gate nobody is there to give it.
+        (begin
+          (unless uv-tls-watcher-spawner
+            (assertion-violation 'tls-established!
+              "a TLS dial needs (igropyr tls-watch) imported: it installs the watcher spawner hook"))
+          (conn-tls-set-watcher! t (uv-tls-watcher-spawner c))
+          (bump-watchers! 1)
+          (note-watcher! (conn-tls-watcher t))
+          ;; Same callback frame, after the watcher is registered. The attempt
+          ;; is concluded exactly once -- here, or on a failure path, never both.
+          (complete-once! (conn-tls-connect-d t) (vector 'tcp-connected c)))
+        ;; ---- listener role ----------------------------------------------
+        ;; revalidate the incarnation: the listener row can go during a handshake
+        (let ((v (conn-tls-listener t)))
       (if (not (and v (eq? v (hashtable-ref listener-table
                                             (listener-handle-of v) #f))))
           (conn-tls-retire! c 'listener-gone 'tls-listener-stopped)
@@ -3491,7 +3752,7 @@
             ;; "the owner was installed" would be reading more than it says.
             ;; It had no call site at all until now, so any earlier reading of
             ;; it was structurally 0 and meant nothing.
-            (bump-accept-completion!)))))
+            (bump-accept-completion!))))))
 
   ;; EOF goes to the owner at most once, and only once the gate is open --
   ;; before that it stays recorded and the watcher delivers it after the
@@ -3544,6 +3805,19 @@
                  (and t
                       (begin
                         (conn-set-tls! c #f)          ; <- the gate
+                        ;; THE ATTEMPT IS CONCLUDED IN THE SAME EXCLUSION THAT DETACHES
+                        ;; (mesh TLS). A dial that fails after its TLS record is attached ends
+                        ;; HERE and nowhere else -- timer failure, a refused read-start, a
+                        ;; handshake alert, a listener going away, an owner DOWN. Without this
+                        ;; line every one of those left the dialer waiting for a message that
+                        ;; no remaining path would send.
+                        ;;
+                        ;; Claimed with the detach so a second retirement cannot re-answer:
+                        ;; whoever wins this exclusion owns the connection, and complete-once!
+                        ;; is itself once-only, so a dial already answered by establishment is
+                        ;; left alone.
+                        (complete-once! (conn-tls-connect-d t)
+                                        (vector 'tcp-connect-failed (cons path reason)))
                         ;; INJECTION POINT 'ret-gate-closed -- OWNING REGION:
                         ;; the with-interrupts-disabled this cond sits in.
                         ;; Placed where the state is DETACHED but not yet
@@ -3853,6 +4127,15 @@
   ;; death would uv_close the handle and cancel the very bytes the drain
   ;; exists to deliver. A detached conn answers #f -- there is nothing left
   ;; to drain.
+  ;; The peer certificate's channel-binding digest, or #f when the connection
+  ;; has no TLS record, no peer certificate, or a signature algorithm with no
+  ;; usable mapping. A caller that needs a binding must read #f as "no binding
+  ;; available" and refuse -- never as an empty one, which would let two
+  ;; different situations produce the same proof.
+  (define (tls-conn-peer-cb-hash c)
+    (let ((t (conn-tls c)))
+      (and t (tls-session-peer-cb-hash (conn-tls-session t)))))
+
   (define (tls-conn-shutdown? c)
     (let ((t (conn-tls c))) (and t (conn-tls-shutdown? t) #t)))
 
@@ -4245,10 +4528,20 @@
   ;; is on the same field retirement detaches, so a conn already retired takes
   ;; the plain path -- which is what retirement itself relies on when it calls
   ;; this after detaching.
+  ;; A CLOSE BEFORE ESTABLISHMENT IS A HARD RETIRE, not a clean one. The clean
+  ;; path exists to flush queued application ciphertext and send a close_notify;
+  ;; before the handshake completes there is neither, and the drain machinery
+  ;; would instead hold the connection open under a bound while nobody is
+  ;; waiting for anything. On a dial it matters twice: the owner's own teardown
+  ;; reaches here, and a clean close would leave the attempt unconcluded for as
+  ;; long as that bound lasts.
   (define (tcp-close! c)
-    (if (conn-tls c)
-        (tls-conn-close-clean! c)
-        (tcp-close-raw! c)))
+    (let ((t (conn-tls c)))
+      (cond
+        ((not t) (tcp-close-raw! c))
+        ((not (conn-tls-established? t))
+         (conn-tls-retire! c 'closed-before-established 'tls-closed-early))
+        (else (tls-conn-close-clean! c)))))
 
   ;; uv_close CANCELS EVERY QUEUED WRITE ON THE HANDLE, so reaching this from
   ;; a clean close before the drain finished is how E9's truncation happened.

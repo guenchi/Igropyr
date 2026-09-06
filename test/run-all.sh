@@ -497,6 +497,11 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/t
 # WebSocket upgrade on an HTTPS listener (wss): the frames ride the connection's
 # TLS codec; asserted from the wire by the raw TLS driver. Needs the openssl CLI.
 "$scheme_bin" --script test/tls-ws.sc
+# The connection layer's TLS client role against a controllable TLS server
+# (test/tls-raw-server.sc): connected only after establishment, one failure
+# before it, nothing left behind by a dialer that dies mid-handshake. Needs
+# the openssl CLI; instrumented for the live counters.
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-connect.sc
 #      Race cells on the TLS write gate: writers parked by inject-barrier!
 #      at named boundaries in tcp.sc, the competing operation run meanwhile.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-race.sc

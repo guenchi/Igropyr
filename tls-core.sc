@@ -49,6 +49,7 @@
           client-ctx ensure-ctx! tls-listen-context! tls-context-retire!
           tls-context? tls-live-context-count
           tls-context-renegotiation-refused?
+          tls-mesh-client-context! tls-context-cb-hash
           )
   ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- the same
   ;; arrangement libuv.sc documents. Its macros expand to the guarded
@@ -136,6 +137,19 @@
   (define-ffi SSL_CTX_set_verify (foreign-procedure "SSL_CTX_set_verify" (void* int void*) void))
   (define-ffi SSL_CTX_set_default_verify_paths
     (foreign-procedure "SSL_CTX_set_default_verify_paths" (void*) int))
+  ;; The second path (a hashed CA DIRECTORY) is always NULL here, so it is
+  ;; declared as a pointer rather than a string: Chez's string type has no
+  ;; representation for NULL, and a mesh trusts exactly one file.
+  (define-ffi SSL_CTX_load_verify_locations
+    (foreign-procedure "SSL_CTX_load_verify_locations"
+                       (void* string void*) int))
+  ;; BORROWED, NOT OWNED. This returns the context's own leaf -- the FIRST
+  ;; certificate of the chain file -- without taking a reference, so the result
+  ;; must never be freed. Its opposite number, SSL_get_peer_certificate, does
+  ;; take one. The two look identical at a call site and differ in whether a
+  ;; free is a correctness requirement or a double free.
+  (define-ffi SSL_CTX_get0_certificate
+    (foreign-procedure "SSL_CTX_get0_certificate" (void*) void*))
 
   (define-ffi SSL_new           (foreign-procedure "SSL_new" (void*) void*))
   (define-ffi SSL_free          (foreign-procedure "SSL_free" (void*) void))
@@ -666,6 +680,12 @@
             (cond
               ((unbox dead))
               ((not ssl) "tls: session has been retired")
+              ;; #f MEANS NO NAME TO CHECK, and it must be handled before anything
+              ;; reads the string. A mesh dial with no SNI verifies the chain (when
+              ;; the context verifies at all) and no hostname -- there is no name to
+              ;; check it against. Falling through raised inside string-length, which
+              ;; a caller would report as a configure error, never as "no SNI asked".
+              ((not host) #f)
               ((ip-literal? host)
                (and (zero? (X509_VERIFY_PARAM_set1_ip_asc
                              (SSL_get0_param ssl) host))
@@ -1065,32 +1085,52 @@
   ;; Scoped: several of these push on failure (no peer certificate, an
   ;; unknown signature OID), and this runs once at the end of a handshake
   ;; whose entries nobody is going to read.
+  ;; The RFC 5929 tls-server-end-point digest of one certificate: the hash the
+  ;; certificate's own signature uses, with md5 and sha1 promoted to sha256 as
+  ;; the RFC requires. #f when the algorithm has no usable mapping.
+  ;;
+  ;; IT DOES NOT FREE x, AND THAT IS WHY IT TAKES ONE RATHER THAN FETCHING IT.
+  ;; The two callers hold references of OPPOSITE OWNERSHIP:
+  ;; SSL_get_peer_certificate returns a reference the caller must give back,
+  ;; and SSL_CTX_get0_certificate returns a borrowed one that must never be
+  ;; freed. A helper that freed would be correct for the first and a double
+  ;; free for the second, and nothing at either call site would show which. So
+  ;; freeing stays with whoever obtained the reference, and each call site says
+  ;; below which kind it holds.
+  (define (x509-cb-digest x)
+    (let ((dignid-bv (make-bytevector 4 0))
+          (pknid-bv (make-bytevector 4 0)))
+      (and (not (zero? (OBJ_find_sigid_algs (X509_get_signature_nid x)
+                                            dignid-bv pknid-bv)))
+           (let* ((dignid (bytevector-s32-native-ref dignid-bv 0))
+                  (md (if (or (= dignid NID-md5) (= dignid NID-sha1))
+                          (EVP_sha256)
+                          (let ((sn (OBJ_nid2sn dignid)))
+                            (if sn (EVP_get_digestbyname sn) 0)))))
+             (and (not (zero? md))
+                  (let ((buf (make-bytevector 64 0))
+                        (lenbv (make-bytevector 4 0)))
+                    (and (= (X509_digest x md buf lenbv) 1)
+                         (let* ((n (bytevector-u32-native-ref lenbv 0))
+                                (out (make-bytevector n)))
+                           (bytevector-copy! buf 0 out 0 n)
+                           out))))))))
+
+  ;; OWNED REFERENCE. SSL_get_peer_certificate takes one on our behalf, so this
+  ;; procedure frees on every exit -- and now on exactly ONE exit, because the
+  ;; digest rule moved out. It used to free at three separate returns.
   (define (peer-cb-hash dead ssl)
    (with-openssl-scope
     (let ((x (if (unbox dead) 0 (SSL_get-peer-cert ssl))))
       (if (zero? x)
           #f
-          (let ((dignid-bv (make-bytevector 4 0))
-                (pknid-bv (make-bytevector 4 0)))
-            (if (zero? (OBJ_find_sigid_algs (X509_get_signature_nid x)
-                                            dignid-bv pknid-bv))
-                (begin (X509_free x) #f)
-                (let* ((dignid (bytevector-s32-native-ref dignid-bv 0))
-                       (md (if (or (= dignid NID-md5) (= dignid NID-sha1))
-                               (EVP_sha256)
-                               (let ((sn (OBJ_nid2sn dignid)))
-                                 (if sn (EVP_get_digestbyname sn) 0)))))
-                  (if (zero? md)
-                      (begin (X509_free x) #f)
-                      (let ((buf (make-bytevector 64 0))
-                            (lenbv (make-bytevector 4 0)))
-                        (let ((r (X509_digest x md buf lenbv)))
-                          (X509_free x)
-                          (and (= r 1)
-                               (let* ((n (bytevector-u32-native-ref lenbv 0))
-                                      (out (make-bytevector n)))
-                                 (bytevector-copy! buf 0 out 0 n)
-                                 out))))))))))))
+          ;; THE FREE SURVIVES A RAISE. x509-cb-digest allocates, so it can raise,
+          ;; and a plain sequence would then skip the free and leak an X509 per
+          ;; failed read -- silently, since nothing counts them.
+          (let ((h (guard (e (#t (X509_free x) (raise e)))
+                     (x509-cb-digest x))))
+            (X509_free x)
+            h)))))
 
   ;; ---- contexts ----------------------------------------------------------
   ;;
@@ -1110,7 +1150,11 @@
     ;; listener? is carried ON THE CONTEXT rather than decided by each caller:
     ;; both kinds share one discard path and one retirement, and the only
     ;; place the difference is known for certain is where it was made.
-    (fields (mutable ptr) reneg-refused? listener?)
+    ;; cb-hash is the leaf's channel-binding digest, computed ONCE at
+     ;; construction from the context's own certificate. Recomputing it later
+     ;; would read whatever certificate the context holds then, which is a
+     ;; different question from "what did this context present".
+    (fields (mutable ptr) reneg-refused? listener? cb-hash)
     (nongenerative)
     (sealed #t))
 
@@ -1205,7 +1249,10 @@
                                   ;; the client context deliberately does NOT
                                   ;; refuse renegotiation: the read path carries
                                   ;; a server-initiated one (see (igropyr tls)).
-                                  (set! ctx (make-tls-context c #f #f))
+                                  ;; no certificate of its own: a client
+                                  ;; context presents nothing, so there is no
+                                  ;; leaf to bind to.
+                                  (set! ctx (make-tls-context c #f #f #f))
                                   #f)))))))))))
       (when err (die err))))
 
@@ -1433,7 +1480,88 @@
                                                 #t))))
                                (when refuse?
                                  (SSL_CTX_set_options c SSL_OP_NO_RENEGOTIATION))
-                               (cons #f (make-tls-context c refuse? #t)))))))))))))
+                               ;; BORROWED: SSL_CTX_get0_certificate does not
+                               ;; take a reference, so nothing here frees it.
+                               ;; Computed now, while the chain that was just
+                               ;; loaded is certainly the one this context will
+                               ;; present.
+                               (let* ((leaf (SSL_CTX_get0_certificate c))
+                                      (cbh (and (not (zero? leaf))
+                                                (x509-cb-digest leaf))))
+                                 (cons #f (make-tls-context c refuse? #t cbh))))))))))))))
+      (when (car r) (die (car r)))
+      (cdr r)))
+
+  ;; ---- mesh client context ------------------------------------------------
+  ;;
+  ;; THE MESH DIALER DOES NOT SHARE THE https CLIENT SINGLETON, and that is the
+  ;; point of a separate constructor. The singleton is process-wide, verifies
+  ;; against the system trust store, and is deliberately never retired; a mesh
+  ;; may trust one private CA or none at all, and its context must go away with
+  ;; the node that built it. Sharing one would make a node's trust policy the
+  ;; https client's policy too -- silently, and in whichever direction the last
+  ;; caller set it.
+  ;;
+  ;; ca-file #f  -- VERIFY_NONE. The channel-bound shared-secret proof is what
+  ;;                authenticates the peer; the certificate only has to supply
+  ;;                a binding. An untrusted certificate is not a downgrade here
+  ;;                because the proof cannot be produced without the secret.
+  ;; ca-file str -- VERIFY_PEER against that file ALONE. No system store is
+  ;;                added: for a mesh, the private CA is the whole trust root,
+  ;;                and falling back to the public roots would silently widen it.
+  (define (tls-mesh-client-context! ca-file)
+    (ensure-loaded!)
+    ;; Checked before anything is allocated, for the reason the listener
+    ;; constructor gives: the useful outcome is a tls-error naming the argument
+    ;; rather than a Chez FFI type error from inside a loading call.
+    (unless (or (not ca-file) (string? ca-file))
+      (die "tls: mesh CA path must be a string or #f"))
+    (let ((r (with-openssl-scope
+               (let ((c (SSL_CTX_new (TLS_client_method))))
+                 (if (zero? c)
+                     (cons (tls-reason "tls: SSL_CTX_new failed") #f)
+                     (begin
+                       ;; Counted at allocation, and only the total: this is
+                       ;; not a listener context, so live-listener-contexts
+                       ;; must not move or the listener seam stops answering
+                       ;; only about listeners.
+                       (with-interrupts-disabled
+                         (set! live-contexts (fx+ live-contexts 1)))
+                       ;; The guard opens before the posture calls, not after:
+                       ;; they are lazily bound, so a library missing one of
+                       ;; them raises while resolving the symbol, which is
+                       ;; exactly the class this exists for.
+                       (guard (e (#t (discard-context! c #f) (raise e)))
+                         (let ((bad
+                                 (cond
+                                   ((zero? (SSL_CTX_ctrl
+                                             c SSL_CTRL_SET_MIN_PROTO_VERSION
+                                             TLS1_2_VERSION 0))
+                                    (tls-reason "tls: could not require TLS >= 1.2"))
+                                   ((and ca-file
+                                         (zero? (SSL_CTX_load_verify_locations
+                                                  c ca-file 0)))
+                                    (file-reason "tls: cannot load mesh CA"
+                                                 ca-file))
+                                   (else #f))))
+                           (if bad
+                               (begin (discard-context! c #f) (cons bad #f))
+                               (let ((refuse?
+                                       (let ((v (OpenSSL_version_num)))
+                                         (and (>= v #x10101000)
+                                              (not (= v #x20000000))
+                                              (and (foreign-entry?
+                                                     "SSL_CTX_set_options")
+                                                   #t)))))
+                                 (SSL_CTX_set_verify
+                                   c (if ca-file SSL_VERIFY_PEER 0) 0)
+                                 (when refuse?
+                                   (SSL_CTX_set_options
+                                     c SSL_OP_NO_RENEGOTIATION))
+                                 ;; A client context presents no certificate of
+                                 ;; its own, so it has no leaf and no binding.
+                                 (cons #f
+                                   (make-tls-context c refuse? #f #f))))))))))))
       (when (car r) (die (car r)))
       (cdr r)))
 

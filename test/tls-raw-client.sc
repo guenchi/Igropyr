@@ -18,6 +18,7 @@
 
 (library (test tls-raw-client)
   (export raw-tls-exchange raw-tls-send-and-drop raw-tls-two-requests raw-tls-collect
+          raw-tls-open raw-tls-send! raw-tls-recv! raw-tls-peer-cb-hash raw-tls-close!
           raw-tls-stall-then-collect raw-tls-slow-collect)
   (import (chezscheme)
           (igropyr actor)
@@ -26,7 +27,7 @@
                 ensure-ctx! client-ctx tls-session-new! tls-session-retire!
                 tls-session-configure-client! tls-session-handshake-step!
                 tls-session-drain! tls-session-feed! tls-session-encrypt!
-                tls-session-decrypt!))
+                tls-session-decrypt! tls-session-peer-cb-hash))
 
   (define (bv-append a b)
     (let ((r (make-bytevector (+ (bytevector-length a) (bytevector-length b)))))
@@ -208,4 +209,97 @@
                                (if ferr (finish (make-bytevector 0) #f (cdr ferr)) (handshake))))
                            (`#(tcp-eof) (finish (make-bytevector 0) #f "closed during handshake"))
                            (`#(tcp-error ,e) (finish (make-bytevector 0) #f "tcp error during handshake"))))
-                        (else (finish (make-bytevector 0) #f (or payload "handshake failed"))))))))))))))))
+                        (else (finish (make-bytevector 0) #f (or payload "handshake failed")))))))))))))))
+  ;; ---- Interactive session -------------------------------------------------
+  ;; The exchanges above are one-shot: request bytes in, everything until eof
+  ;; out. A handshake that goes challenge -> hello -> welcome needs the caller
+  ;; in the loop: connect and complete TLS, then send and receive under the
+  ;; caller's control, keep the connection open between steps, tell a timeout
+  ;; from a closure, and expose the certificate the server presented (its RFC
+  ;; 5929 hash) so a test can compute channel-bound proofs independently.
+  ;; All of it runs in the calling process, like establish!: reads arrive as
+  ;; #(tcp-data ...) messages and are decrypted here.
+  ;;   (raw-tls-open host port sni timeout-ms) -> session or (cons 'failed why)
+  ;;   (raw-tls-send! s bytes)                  ; plaintext in, ciphertext out
+  ;;   (raw-tls-recv! s timeout-ms)             ; -> plaintext bytevector (maybe empty),
+  ;;                                            ;    'timeout, or 'closed (eof/close_notify/error)
+  ;;   (raw-tls-peer-cb-hash s)                 ; -> bytevector or #f
+  ;;   (raw-tls-close! s)
+  (define-record-type raw-tls-session
+    (fields conn sess (mutable pending) (mutable closed?)))
+  (define (raw-tls-open host port sni timeout-ms)
+    (ensure-ctx!)
+    (let ((deadline (+ (now-ms) timeout-ms)))
+      (define (remaining) (max 1 (- deadline (now-ms))))
+      (tcp-connect! host port self)
+      (receive (after (remaining) (cons 'failed "connect timeout"))
+        (`#(tcp-connect-failed ,e) (cons 'failed "connect failed"))
+        (`#(tcp-connected ,c)
+          (tcp-read-start! c)
+          (let ((sess (tls-session-new! (client-ctx))))
+            (define (fail why) (tls-session-retire! sess "raw session failed") (tcp-close! c) (cons 'failed why))
+            (define (flush!) (let ((out (tls-session-drain! sess))) (when out (tcp-write! c out #f))))
+            (let ((err (tls-session-configure-client! sess sni)))
+              (if err
+                  (fail err)
+                  (let handshake ()
+                    (let-values (((verdict payload) (tls-session-handshake-step! sess)))
+                      (flush!)
+                      (cond
+                        ((eq? verdict 'gone) (fail payload))
+                        ((eq? verdict 'done)
+                         ;; records coalesced with the server's last flight are in the
+                         ;; read BIO already; take them now (see the server fixture)
+                         (let-values (((out eof?) (tls-session-decrypt! sess (make-bytevector 0))))
+                           (flush!)
+                           (make-raw-tls-session c sess
+                                                 (if (and out (> (bytevector-length out) 0)) (list out) '())
+                                                 (and eof? #t))))
+                        ((eq? verdict 'want-read)
+                         (receive (after (remaining) (fail "handshake timeout"))
+                           (`#(tcp-data ,bv)
+                             (let ((werr (tls-session-feed! sess bv)))
+                               (if werr (fail (cdr werr)) (handshake))))
+                           (`#(tcp-eof) (fail "closed during handshake"))
+                           (`#(tcp-error ,e) (fail "tcp error during handshake"))))
+                        (else (fail (or payload "handshake failed")))))))))))))
+  (define (raw-tls-send! s bytes)
+    (unless (raw-tls-session-closed? s)
+      (let ((sess (raw-tls-session-sess s)) (c (raw-tls-session-conn s)))
+        (tcp-write! c (tls-session-encrypt! sess bytes) #f)
+        (let ((out (tls-session-drain! sess))) (when out (tcp-write! c out #f))))))
+  ;; -> plaintext received within timeout-ms (possibly several records joined),
+  ;; 'timeout when nothing arrived, 'closed once the peer closed (close_notify,
+  ;; eof or error). Bytes decrypted after a close are still returned first.
+  (define (raw-tls-recv! s timeout-ms)
+    (cond
+      ((pair? (raw-tls-session-pending s))
+       (let ((p (raw-tls-session-pending s))) (raw-tls-session-pending-set! s '()) (bv-append-all p)))
+      ((raw-tls-session-closed? s) 'closed)
+      (else
+        (let ((sess (raw-tls-session-sess s)) (c (raw-tls-session-conn s)))
+          (define (flush!) (let ((out (tls-session-drain! sess))) (when out (tcp-write! c out #f))))
+          (receive (after timeout-ms 'timeout)
+            (`#(tcp-data ,bv)
+              (let-values (((out eof?) (tls-session-decrypt! sess bv)))
+                (flush!)
+                (when eof? (raw-tls-session-closed?-set! s #t))
+                (cond
+                  ((and out (> (bytevector-length out) 0)) out)
+                  (eof? 'closed)
+                  (else (raw-tls-recv! s timeout-ms)))))
+            (`#(tcp-eof) (raw-tls-session-closed?-set! s #t) 'closed)
+            (`#(tcp-error ,e) (raw-tls-session-closed?-set! s #t) 'closed))))))
+  (define (raw-tls-peer-cb-hash s) (tls-session-peer-cb-hash (raw-tls-session-sess s)))
+  (define (raw-tls-close! s)
+    (unless (raw-tls-session-closed? s)
+      (raw-tls-session-closed?-set! s #t)
+      (tls-session-retire! (raw-tls-session-sess s) "raw session closed")
+      (tcp-close! (raw-tls-session-conn s))))
+  (define (bv-append-all l)
+    (let* ((n (apply + (map bytevector-length l))) (out (make-bytevector n)))
+      (let loop ((l l) (at 0))
+        (if (null? l) out
+            (begin (bytevector-copy! (car l) 0 out at (bytevector-length (car l)))
+                   (loop (cdr l) (+ at (bytevector-length (car l)))))))))
+)
