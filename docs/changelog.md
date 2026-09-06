@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.6.0 — (unreleased)
+
+Distribution links can run over TLS, and both handshake proofs now carry a
+channel binding.
+
+### Breaking
+
+- **Protocol version 5. Every node in a mesh must be upgraded together.** A
+  version-5 node and a version-4 node refuse each other in both directions, so
+  a half-upgraded mesh is partitioned rather than degraded. No upgrade order
+  helps; this is a stop-the-mesh step, not a rolling one.
+
+  The change is in the handshake proofs: both now hash a channel binding into
+  their preimage (RFC 5929 `tls-server-end-point`, and an empty binding on a
+  plaintext link). **It applies whether or not you configure TLS** — a
+  plaintext 1.6 mesh is still version 5 and still cannot talk to 1.5.
+
+### Added
+
+- **node**: distribution links can run over TLS. `node-start!` takes a trailing
+  options alist: `tls-cert` and `tls-key` (both together or neither) turn a
+  node into one that serves and dials TLS, and `tls-ca` — only alongside them —
+  verifies peer certificates against that file alone rather than the system
+  trust store. The switch is node-wide and lockstep, defaults to plaintext, and
+  has no per-peer setting and no plaintext fallback.
+
+  **Identity remains the shared secret.** The certificate supplies a channel,
+  and the binding hashed into both proofs names **that certificate**, so a
+  relay presenting its own certificate cannot forward a handshake. It does not
+  bind a proof to one connection — the nonces do that — and it does not stop
+  someone holding the acceptor's own key from relaying, which is what `tls-ca`
+  and a private CA are for. An unverified certificate is not a downgrade; it
+  means you are relying on the secret alone, as a plaintext mesh already does.
+
+- **node**: an unknown `node-start!` option key is refused rather than ignored,
+  so a misspelled `tls-cert` cannot start a plaintext node its operator
+  believes is encrypted.
+- **node**: a startup warning when the cluster secret is shorter than 32
+  characters or is not hexadecimal. It warns and does not refuse — padding a
+  weak secret adds no entropy, and refusing would break every deployment whose
+  secret predates the advice. The recommendation is 32 random bytes from a
+  CSPRNG, written as 64 hex characters.
+- **node**: startup is staged and binds last, and any failure after the first
+  publication unwinds what it published — identity, the warden and its
+  children, and both TLS contexts.
+- **node**: a dial that fails now says so, by category, on stderr. Three paths
+  were previously silent, including the one that matters most in a
+  mixed-transport mesh where one side is TLS and the other is not.
+- **tcp**: `tcp-connect-tls!` dials a TLS connection, answering the caller only
+  once the handshake completes. `tls-conn-peer-cb-hash` reads the peer
+  certificate's channel binding.
+- **tls-core**: `tls-mesh-client-context!` builds a dialling context that
+  verifies against one CA file or against nothing, separate from the process's
+  https client context so that a mesh's trust policy cannot become the https
+  client's.
+
+---
+
 ## 1.5.2 — 2026-09-04
 
 *142 commits.* Wire protocol v4 and the accounting behind hosted monitors; then

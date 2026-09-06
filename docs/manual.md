@@ -1069,12 +1069,20 @@ these.
    processes times machines under that assumption, not a thousand-node
    substrate.
 
-   **Trusted includes the link.** The shared secret authenticates peers; it
-   does not encrypt the connection, and the distribution protocol has no
-   TLS. A mesh spanning machines therefore *must* run on a private network.
-   What that costs at configuration time is under [What the cluster has to
-   look like](#what-the-cluster-has-to-look-like); what it means for
-   exposure is under [Security](#security).
+   **Trusted includes the link, and configuring TLS narrows that rather
+   than removing it.** The shared secret is what authenticates a peer; a
+   certificate never is. Since 1.6 the distribution links can run over TLS
+   (`tls-cert`/`tls-key` on `node-start!`), and the two cases differ:
+
+   - **Without TLS** the protocol authenticates but does not encrypt, so a
+     mesh spanning machines *must* run on a private network.
+   - **With TLS** the traffic is encrypted and the private network becomes
+     defence in depth — still advised, because the dist port remains full
+     control of the node whatever protects the bytes.
+
+   What either costs at configuration time is under [What the cluster has to
+   look like](#what-the-cluster-has-to-look-like); what it means for exposure
+   is under [Security](#security).
 
 ### Lineage: ChezErlang
 
@@ -2447,6 +2455,14 @@ roles are separate — dedicated entry nodes in front of dedicated owners —
 upgrading the front rank first does close it completely. Which shape your
 deployment has decides whether the order is a fix or a mitigation.
 
+**1.5 to 1.6 is a different kind of step: there is no window, because there is
+no interoperation.** 1.6 speaks protocol version 5, which carries the channel
+binding in both handshake proofs; a version-5 node and a version-4 node refuse
+each other in both directions. No ordering helps, and a half-upgraded mesh is
+partitioned rather than degraded — which is the loud failure, not the quiet
+one. Upgrade every node in one window, and note that this is orthogonal to
+TLS: version 5 applies whether or not you configure certificates.
+
 **Separately, and not fixed by upgrade order:** a node already deployed
 under a name containing `~` is mis-routing *today*. The id parser has
 always split at the first one, so every clustered id that node minted
@@ -2491,6 +2507,53 @@ reach it. Nothing reports a misconfiguration — the first symptom is that
 every cross-machine forward times out, which reads exactly like a peer
 that is down. Pass the address the other nodes will dial (`"0.0.0.0"`, or
 the interface the private network is on).
+
+**Distribution links can run over TLS (1.6).** Pass a certificate and key as
+a trailing options alist; both together or neither:
+
+```scheme
+(node-start! 'a "…secret…" 4100 "0.0.0.0"
+             '((tls-cert . "/etc/igropyr/node.pem")
+               (tls-key  . "/etc/igropyr/node.key")
+               (tls-ca   . "/etc/igropyr/mesh-ca.pem")))
+```
+
+- `tls-cert`, `tls-key` — serving and dialling both use TLS. Giving one
+  without the other is refused at startup.
+- `tls-ca` — optional, and only alongside the other two: peers' certificates
+  are verified against **this file alone**, not the system trust store. Omit
+  it and certificates are accepted unverified.
+- An **unknown key is refused**, not ignored: a misspelled `tls-crt` that was
+  silently dropped would start a plaintext node whose operator believes it is
+  encrypted.
+
+The switch is **node-wide and lockstep**. A node with a certificate dials TLS
+at every peer and accepts only TLS; a node without one is plaintext exactly as
+before. There is no per-peer setting and no fallback — a dialer that retried in
+plaintext after a TLS refusal would downgrade itself on precisely the failure
+that should stop it.
+
+**What the certificate is for, and what it is not.** Identity is still the
+shared secret: the handshake proof is an HMAC only a holder of the secret can
+produce. The certificate supplies a *channel*, and RFC 5929
+`tls-server-end-point` hashes **that certificate** into both proofs — so a
+relay that terminates TLS with a certificate of its own cannot forward a
+handshake, because the two sides would bind to different certificates and
+neither proof would verify. Replay across connections is prevented separately,
+by the nonces. An untrusted certificate is not a downgrade; it means you are
+relying on the secret alone, as you already were without TLS. `tls-ca` is what
+adds certificate verification on top.
+
+**The private key is security-critical**, and more so than the phrase usually
+implies here: the binding names the certificate, not the connection, so
+**someone holding the acceptor's certificate and key can sit in the middle of
+that node's links and forward both proofs without knowing the shared secret** —
+each leg binds to the same certificate, so both proofs verify. That is what
+`tls-ca` plus a private CA is for, and why the key is worth protecting as
+carefully as the secret. **Generate the shared secret from a CSPRNG** — 32 random bytes written as
+64 hex characters. `node-start!` warns on stderr when the secret is shorter than
+32 characters or is not hex; it does not refuse, because padding a weak secret
+adds no entropy and refusing would break every existing deployment.
 
 **The node name is part of every id that node mints**, which makes it a
 durable identifier rather than a label — and it may not contain `~`,
@@ -4712,10 +4775,13 @@ in both directions, and the dial side says so on stderr on every attempt
 — the accept side stays silent, because it is the side strangers can
 reach.
 
-But the dist port is **full control of the node** — anyone
-on it can message any registered process, including supervisors. It
-binds 127.0.0.1 by default, and there is no TLS: across machines, keep
-it on a private network (WireGuard, VPC). Never expose it publicly.
+But the dist port is **full control of the node** — anyone on it can message
+any registered process, including supervisors. It binds 127.0.0.1 by default.
+Since 1.6 the links can be encrypted (`tls-cert`/`tls-key` on `node-start!`),
+but that changes what an eavesdropper learns, **not** what someone who reaches
+the port can do: the proof is what refuses them, and a node with no
+certificate has no encryption at all. Across machines, keep it on a private
+network (WireGuard, VPC) either way. Never expose it publicly.
 
 ### What this is for
 
