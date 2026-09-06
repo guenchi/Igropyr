@@ -3816,8 +3816,21 @@
                         ;; whoever wins this exclusion owns the connection, and complete-once!
                         ;; is itself once-only, so a dial already answered by establishment is
                         ;; left alone.
-                        (complete-once! (conn-tls-connect-d t)
-                                        (vector 'tcp-connect-failed (cons path reason)))
+                        ;; GUARDED, BECAUSE NOTHING AFTER IT MAY BE SKIPPED. Non-yielding does
+                        ;; not mean non-raising: building the message or delivering it can raise,
+                        ;; and every release below -- the reason, the depths, closed?, the slot,
+                        ;; the session, the timer, the handle -- would then be skipped. Worse,
+                        ;; the caller's own handler would retry the retirement, find conn-tls
+                        ;; already #f, and do nothing: the connection would be orphaned with no
+                        ;; path left that could free it.
+                        ;;
+                        ;; Losing the notification is the cheaper failure. If the raise came
+                        ;; after the transition, D is already 'failed and the attempt IS
+                        ;; concluded -- only the message went missing, and the dialer still
+                        ;; learns through its own monitor. A leaked session has no second route.
+                        (guard (e2 (#t (note-swallowed! 'retire-complete e2)))
+                          (complete-once! (conn-tls-connect-d t)
+                                          (vector 'tcp-connect-failed (cons path reason))))
                         ;; INJECTION POINT 'ret-gate-closed -- OWNING REGION:
                         ;; the with-interrupts-disabled this cond sits in.
                         ;; Placed where the state is DETACHED but not yet

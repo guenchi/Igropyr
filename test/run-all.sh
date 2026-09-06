@@ -502,6 +502,9 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/t
 # before it, nothing left behind by a dialer that dies mid-handshake. Needs
 # the openssl CLI; instrumented for the live counters.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-connect.sc
+# The mesh client context (verify-none or a private CA) must not change how the
+# https client verifies; both construction orders. Needs the openssl CLI.
+"$scheme_bin" --script test/tls-mesh-isolation.sc
 #      Race cells on the TLS write gate: writers parked by inject-barrier!
 #      at named boundaries in tcp.sc, the competing operation run meanwhile.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-race.sc
