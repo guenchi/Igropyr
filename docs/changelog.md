@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.6.0 — (unreleased)
+## 1.6.0 — 2026-09-06
 
 Distribution links can run over TLS, and both handshake proofs now carry a
 channel binding.
