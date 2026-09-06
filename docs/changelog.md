@@ -19,6 +19,14 @@ channel binding.
 
 ### Added
 
+- **http, websocket**: WebSocket over TLS (`wss://`) is supported and now
+  verified end to end. A WebSocket upgrade on an HTTPS listener is `wss`:
+  the TLS codec belongs to the connection, so the upgrade request, the 101
+  and every frame after it are encrypted by the same session, and a route
+  written for `ws://` is served as `wss://` by listening with `tls-cert` and
+  `tls-key` -- no option to set. The behaviour shipped with 1.5.2's HTTPS
+  server; the cell that pins it (`test/tls-ws.sc`) is new in this release.
+
 - **node**: distribution links can run over TLS. `node-start!` takes a trailing
   options alist: `tls-cert` and `tls-key` (both together or neither) turn a
   node into one that serves and dials TLS, and `tls-ca` — only alongside them —
