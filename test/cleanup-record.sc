@@ -1,0 +1,280 @@
+#!chezscheme
+;; B' cleanup records -- ownership cells on a plaintext node (design v4 §6).
+;; The far end is test/plain-peer.sc (a hand-made plaintext peer b). One node
+;; process a; every cell ends with b removed and the node back to baseline.
+;;
+;;   N1a removal first: a killed link's record fails the pending call and the
+;;       remote monitor exactly once; a later same-name install works on its own.
+;;   N1b replacement first (the batch 1 M22 intent): the reaper is parked before
+;;       removing the dead entry; a NEW incarnation of b installs (I6); the old
+;;       call fails once; the monitor lifetime is INHERITED (same mons object,
+;;       and the monitor is cleaned only when the replacement is removed).
+;;   N2  two watches survive a same-incarnation replacement; one delivers an
+;;       mdown through the replacement, the other is failed once on removal.
+;;   N5  admission: a call selected before the entry was removed is refused at
+;;       the arming fence (counted, no slot); a monitor selected before a
+;;       same-incarnation replacement is ARMED (lifetime inherited) and then
+;;       fails on submission over the closed old conn (existing semantics).
+;;   N6  the F7(a) race: a removal parked right after publishing its record; a
+;;       same-name replacement registers a monitor and a call; on resume the old
+;;       record sweeps only its own chain nodes.
+;;   N14 the monitor-lifetime fence: selected under E1, E1 removed, b reinstalled
+;;       fresh (new mons), arming refused before any slot or submission.
+(import (chezscheme) (igropyr actor) (igropyr node)
+        (only (igropyr libuv) now-ms)
+        (igropyr inject-control)
+        (test plain-peer))
+(define fails 0)
+(define (check label ok . info)
+  (if ok (begin (display "  ok  ") (display label) (newline))
+      (begin (set! fails (+ fails 1)) (display "FAIL  ") (display label)
+             (for-each (lambda (x) (display " ") (write x)) info) (newline))))
+(define (within? ms thunk)
+  (let ((deadline (+ (now-ms) ms)))
+    (let loop () (cond ((thunk) #t) ((> (now-ms) deadline) #f) (else (sleep-ms 20) (loop))))))
+(define port 18710)
+(define secret "cleanup-record-secret-0123456789abcdef")
+(define BOOT-X "feedfacefeedface")
+(define BOOT-Y "0123456701234567")
+(define (stat key) (let ((p (assq key (node-monitor-stats)))) (and p (cdr p))))
+;; arm a barrier and wait for its park -> (parked . pid) | 'timeout | 'skipped ; the ticket is returned too
+(define (park! point occ ms) (let ((t (inject-arm-barrier! point occ 60000))) (cons t (inject-barrier-wait t point ms))))
+(define (resume! pt) (let ((t (car pt)) (w (cdr pt))) (when (pair? w) (send (cdr w) (vector 'inject-resume t)))))
+(define (cleanup! pt point) (guard (e (#t (void))) (inject-release! (car pt))) (guard (e (#t (void))) (inject-barrier-cleanup! (car pt) point 2000)))
+(define (open-b boot gen) (plain-peer-open "127.0.0.1" port "b" boot gen secret 6000))
+(define (expect-up! label ms) (receive (after ms (check label #f 'no-node-up)) (`#(node-up b) (check label #t))))
+(define (expect-down! label ms) (receive (after ms (check label #f 'no-node-down)) (`#(node-down b) (check label #t))))
+(define (quiet-down! label ms) (receive (after ms (check label #t)) (`#(node-down b) (check label #f 'extra-node-down))))
+;; a call that the peer does not answer (no auto-reply): stays pending until swept
+(define (spawn-caller! tag main) (spawn (lambda () (send main (vector 'call-outcome tag (guard (e (#t e)) (rcall 'b 'svc (list 'q tag) 20000)))))))
+(define (call-outcome! label tag ms pred)
+  (receive (after ms (check label #f 'no-outcome))
+    (`#(call-outcome ,@tag ,r) (check label (pred r) r))))
+(define (noconnection? r) (and (vector? r) (eq? (vector-ref r 0) 'rcall-error) (eq? (vector-ref r 1) 'noconnection)))
+(define (remote-down! label name ms pred)
+  (receive (after ms (check label #f 'no-remote-down))
+    (`#(remote-down b ,@name ,reason) (check label (pred reason) reason))))
+(define (quiet-remote-down! label name ms)
+  (receive (after ms (check label #t)) (`#(remote-down b ,@name ,reason) (check label #f (list 'extra reason)))))
+
+(start-scheduler
+  (lambda ()
+    (define main self)
+    (register 'main self)
+    (node-start! 'a secret port "127.0.0.1")               ; plaintext node
+    (monitor-node 'b)
+    (let ((rbase (stat 'rmonitors)))
+
+      ;; ---- N1a: removal first -------------------------------------------------
+      (let ((b1 (open-b BOOT-X 1)))
+        (check "N1a: b installed" (not (pair? b1)) b1)
+        (expect-up! "N1a: node-up b" 3000)
+        (let ((caller (spawn-caller! 'r1 main))
+              (m1 (monitor-remote 'b 'svc1)))
+          (check "N1a: the peer received the call frame" (and (plain-peer-wait-frame b1 (lambda (d) (and (pair? d) (eq? (car d) 'call))) 3000) #t))
+          (check "N1a: the peer received the mon frame" (and (plain-peer-wait-frame b1 (lambda (d) (and (pair? d) (eq? (car d) 'mon))) 3000) #t))
+          (let ((link1 ($node-link-pid 'b)))
+            (kill link1 'n1a-kill)
+            (expect-down! "N1a: node-down b (record executed by the reaper)" 6000)
+            (call-outcome! "N1a: the pending call failed once with noconnection" 'r1 6000 noconnection?)
+            (remote-down! "N1a: the remote monitor fired DOWN noconnection once" 'svc1 6000 (lambda (r) (eq? r 'noconnection)))
+            (quiet-remote-down! "N1a: no second remote-down" 'svc1 500)
+            (check "N1a: the record finished (no cleanup records left)" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records))
+            (check "N1a: rmonitors back to base" (eqv? (stat 'rmonitors) rbase) (stat 'rmonitors) rbase))
+          (plain-peer-close! b1)))
+      ;; a later same-name install works on its own
+      (let ((b2 (open-b BOOT-Y 1)))
+        (check "N1a: a fresh b installs after the removal" (not (pair? b2)) b2)
+        (expect-up! "N1a: node-up b (fresh)" 3000)
+        (plain-peer-auto-reply! b2 (lambda (m) (list 'ans m)))
+        (let ((r (guard (e (#t e)) (rcall 'b 'svc '(hello) 5000))))
+          (check "N1a: the fresh b answers a call" (equal? r '(ans (hello))) r))
+        (plain-peer-close! b2)
+        (expect-down! "N1a: node-down after the fresh b closed" 6000))
+
+      ;; ---- N1b / N10: replacement wins first --------------------------------
+      (let ((b1 (open-b BOOT-X 1)))
+        (check "N1b: b installed (incarnation 1)" (not (pair? b1)) b1)
+        (expect-up! "N1b: node-up b" 3000)
+        (let ((caller (spawn-caller! 'r2 main))
+              (m1 (monitor-remote 'b 'svc1))
+              (mons-id ($node-entry-mons-id 'b))
+              (link1 ($node-link-pid 'b)))
+          (plain-peer-wait-frame b1 (lambda (d) (and (pair? d) (eq? (car d) 'mon))) 3000)
+          (let ((prm (park! 'link-reaper-before-remove 1 8000)))
+            (kill link1 'n1b-kill)
+            (check "N1b: the reaper parked before removing the dead entry" (pair? (cdr prm)) (cdr prm))
+            ;; a NEW incarnation of b installs while the old entry is still present (I6)
+            (let ((b2 (open-b BOOT-Y 1)))
+              (check "N1b: the replacement installed" (not (pair? b2)) b2)
+              (expect-down! "N1b: node-down for the old incarnation" 6000)
+              (expect-up! "N1b: node-up for the replacement" 6000)
+              (check "N1b: the entry now holds a different live link" (let ((l ($node-link-pid 'b))) (and l (not (eq? l link1)) (process-alive? l))))
+              (check "N1b: the monitor lifetime is inherited (same mons object)" (eqv? ($node-entry-mons-id 'b) mons-id) (list mons-id ($node-entry-mons-id 'b)))
+              (call-outcome! "N1b: the old pending call failed once with noconnection" 'r2 6000 noconnection?)
+              (quiet-remote-down! "N1b: the inherited monitor was NOT failed by the replacement" 'svc1 800)
+              ;; the replacement's own work
+              (plain-peer-auto-reply! b2 (lambda (m) (list 'ans2 m)))
+              (let ((r (guard (e (#t e)) (rcall 'b 'svc '(hi) 5000))))
+                (check "N1b: the replacement answers a call" (equal? r '(ans2 (hi))) r))
+              ;; resume the reaper: its remove-peer! for the old conn is a no-op
+              (let ((pst (park! 'link-reaper-reclaimed-stale 1 100)))     ; armed, not yet hit
+                (resume! prm)
+                (let ((ws (inject-barrier-wait (car pst) 'link-reaper-reclaimed-stale 8000)))
+                  (check "N1b: the reaper's removal found the entry not its own (stale)" (pair? ws) ws)
+                  (when (pair? ws) (send (cdr ws) (vector 'inject-resume (car pst))))
+                  (cleanup! pst 'link-reaper-reclaimed-stale)))
+              (cleanup! prm 'link-reaper-before-remove)
+              (quiet-down! "N1b: no extra node-down after the reaper's no-op" 800)
+              ;; the inherited monitor is cleaned only when the REPLACEMENT is removed
+              (plain-peer-close! b2)
+              (expect-down! "N1b: node-down when the replacement closes" 6000)
+              (remote-down! "N1b: the inherited monitor fired DOWN noconnection once, at the removal" 'svc1 6000 (lambda (r) (eq? r 'noconnection)))
+              (quiet-remote-down! "N1b: no second remote-down" 'svc1 500)))
+          (plain-peer-close! b1)
+          (check "N1b: records finished" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records))))
+
+      ;; ---- N2: two watches across a same-incarnation replacement -------------
+      (let ((b1 (open-b BOOT-X 1)))
+        (check "N2: b installed (C1)" (not (pair? b1)) b1)
+        (expect-up! "N2: node-up b" 3000)
+        (let ((w1 (monitor-remote 'b 'w1)) (w2 (monitor-remote 'b 'w2)))
+          (let ((f1 (plain-peer-wait-frame b1 (lambda (d) (and (pair? d) (eq? (car d) 'mon) (eq? (cadr d) 'w1))) 3000)))
+            (check "N2: the peer received both mon frames" (and f1 (plain-peer-wait-frame b1 (lambda (d) (and (pair? d) (eq? (car d) 'mon) (eq? (cadr d) 'w2))) 3000) #t))
+            ;; same incarnation, higher generation: rule I8a replaces the open C1 with C2
+            (let ((b2 (open-b BOOT-X 2)))
+              (check "N2: the same-incarnation replacement installed (C2)" (not (pair? b2)) b2)
+              (expect-down! "N2: node-down (C1)" 6000)
+              (expect-up! "N2: node-up (C2)" 6000)
+              (quiet-remote-down! "N2: neither watch was failed by the replacement" 'w1 500)
+              ;; W1 delivers through the replacement (the mdown arrives on C2)
+              (plain-peer-send! b2 (list 'mdown (caddr f1) 'gone))
+              (remote-down! "N2: W1 delivered its mdown through the replacement" 'w1 5000 (lambda (r) (eq? r 'gone)))
+              ;; kill C2's link: a real removal; W2 is failed exactly once, W1 not again
+              (kill ($node-link-pid 'b) 'n2-kill)
+              (expect-down! "N2: node-down (C2 removed)" 6000)
+              (remote-down! "N2: W2 fired DOWN noconnection once at the removal" 'w2 6000 (lambda (r) (eq? r 'noconnection)))
+              (quiet-remote-down! "N2: W1 not failed again" 'w1 500)
+              (plain-peer-close! b2)))
+          (plain-peer-close! b1)
+          (check "N2: records finished" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records))))
+
+      ;; ---- N5: admission fences ----------------------------------------------
+      ;; (a) a call selected before the entry is removed: refused at the arming fence
+      (let ((b1 (open-b BOOT-X 1)))
+        (check "N5a: b installed" (not (pair? b1)) b1)
+        (expect-up! "N5a: node-up b" 3000)
+        (let* ((prm (park! 'rcall-before-arm 1 100))            ; armed before the caller runs
+               (caller (spawn-caller! 'r5 main))
+               (w (inject-barrier-wait (car prm) 'rcall-before-arm 5000)))
+          (check "N5a: the caller parked between selection and arming" (pair? w) w)
+          (kill ($node-link-pid 'b) 'n5a-kill)
+          (expect-down! "N5a: node-down (entry removed while the caller is parked)" 6000)
+          (let ((pref (park! 'admission-refused-stale-conn 1 100)))
+            (when (pair? w) (send (cdr w) (vector 'inject-resume (car prm))))
+            (let ((wr (inject-barrier-wait (car pref) 'admission-refused-stale-conn 5000)))
+              (check "N5a: the arming fence refused the stale selection (counted before any slot)" (pair? wr) wr)
+              (when (pair? wr) (send (cdr wr) (vector 'inject-resume (car pref))))
+              (cleanup! pref 'admission-refused-stale-conn)))
+          (call-outcome! "N5a: the caller got noconnection from the fence" 'r5 6000 noconnection?)
+          (check "N5a: the peer never received a call frame" (not (plain-peer-wait-frame b1 (lambda (d) (and (pair? d) (eq? (car d) 'call))) 500)))
+          (cleanup! prm 'rcall-before-arm))
+        (plain-peer-close! b1)
+        (check "N5a: records finished" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records)))
+      ;; (b) a monitor selected before a same-incarnation replacement: ARMED (lifetime inherited),
+      ;;     then the submission on the closed old conn fails and the existing undo answers noconnection
+      (let ((b1 (open-b BOOT-X 1)))
+        (check "N5b: b installed (C1)" (not (pair? b1)) b1)
+        (expect-up! "N5b: node-up b" 3000)
+        (let* ((prm (park! 'mon-before-arm 1 100))
+               (mon-caller (spawn (lambda () (send main (vector 'mon-outcome (monitor-remote 'b 'svc5))))))
+               (w (inject-barrier-wait (car prm) 'mon-before-arm 5000)))
+          (check "N5b: the monitor caller parked between selection and arming" (pair? w) w)
+          (let ((b2 (open-b BOOT-X 2)))
+            (check "N5b: same-incarnation replacement installed" (not (pair? b2)) b2)
+            (expect-down! "N5b: node-down (C1)" 6000) (expect-up! "N5b: node-up (C2)" 6000)
+            (let ((pref (park! 'admission-refused-stale-lifetime 1 100)))
+              (when (pair? w) (send (cdr w) (vector 'inject-resume (car prm))))
+              (check "N5b: the lifetime fence did NOT refuse (inherited lifetime)"
+                     (eq? (inject-barrier-wait (car pref) 'admission-refused-stale-lifetime 1500) 'timeout))
+              (cleanup! pref 'admission-refused-stale-lifetime))
+            (receive (after 6000 (check "N5b: the monitor call returned" #f 'timeout)) (`#(mon-outcome ,m) (check "N5b: the monitor call returned" #t)))
+            (remote-down! "N5b: the submission on the closed old conn failed -> remote-down noconnection (existing undo)" 'svc5 6000 (lambda (r) (eq? r 'noconnection)))
+            (check "N5b: the replacement never received that mon frame" (not (plain-peer-wait-frame b2 (lambda (d) (and (pair? d) (eq? (car d) 'mon) (eq? (cadr d) 'svc5))) 500)))
+            (kill ($node-link-pid 'b) 'n5b-kill)
+            (expect-down! "N5b: node-down (C2 removed)" 6000)
+            (plain-peer-close! b2))
+          (cleanup! prm 'mon-before-arm))
+        (plain-peer-close! b1)
+        (check "N5b: records finished" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records)))
+
+      ;; ---- N6: the F7(a) race -------------------------------------------------
+      (let ((b1 (open-b BOOT-X 1)))
+        (check "N6: b installed" (not (pair? b1)) b1)
+        (expect-up! "N6: node-up b" 3000)
+        (let ((old-caller (spawn-caller! 'r6old main))
+              (m-old (monitor-remote 'b 'old)))
+          (plain-peer-wait-frame b1 (lambda (d) (and (pair? d) (eq? (car d) 'mon))) 3000)
+          ;; the removal (run by the reaper on the kill) parks right after publishing its record
+          (let ((ppub (park! 'cleanup-after-publish 1 100)))
+            (kill ($node-link-pid 'b) 'n6-kill)
+            (check "N6: the removal parked after publishing its record (entry already gone)"
+                   (and (pair? (inject-barrier-wait (car ppub) 'cleanup-after-publish 8000)) (not ($node-link-pid 'b))))
+            (expect-down! "N6: node-down (enqueued in the transaction)" 6000)
+            ;; a same-name replacement installs and registers its own monitor and call
+            (let ((b2 (open-b BOOT-Y 1)))
+              (check "N6: the replacement installed while the old record is parked" (not (pair? b2)) b2)
+              (expect-up! "N6: node-up (replacement)" 6000)
+              (let ((new-caller (spawn-caller! 'r6new main))
+                    (m-new (monitor-remote 'b 'new)))
+                (let ((fcall (plain-peer-wait-frame b2 (lambda (d) (and (pair? d) (eq? (car d) 'call))) 3000)))
+                  (check "N6: the replacement received the new call frame" (and fcall #t))
+                  (check "N6: the replacement received the new mon frame" (and (plain-peer-wait-frame b2 (lambda (d) (and (pair? d) (eq? (car d) 'mon) (eq? (cadr d) 'new))) 3000) #t))
+                  ;; resume the old record: it sweeps only its own chain nodes
+                  (resume! ppub)
+                  (call-outcome! "N6: the OLD call failed once with noconnection" 'r6old 6000 noconnection?)
+                  (remote-down! "N6: the OLD monitor fired DOWN noconnection once" 'old 6000 (lambda (r) (eq? r 'noconnection)))
+                  (quiet-remote-down! "N6: the NEW monitor was not touched by the old record" 'new 800)
+                  ;; the new call is still pending: the replacement answers it now
+                  (when fcall (plain-peer-send! b2 (list 'reply (caddr fcall) (list 'ok 'late-answer))))
+                  (call-outcome! "N6: the NEW call was answered by the replacement (not swept)" 'r6new 6000 (lambda (r) (eq? r 'late-answer)))
+                  (cleanup! ppub 'cleanup-after-publish)
+                  (plain-peer-close! b2)
+                  (expect-down! "N6: node-down (replacement closed)" 6000)
+                  (remote-down! "N6: the NEW monitor is failed only now" 'new 6000 (lambda (r) (eq? r 'noconnection)))))))
+          (plain-peer-close! b1)
+          (check "N6: records finished" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records))))
+
+      ;; ---- N14: the monitor-lifetime fence --------------------------------------
+      (let ((b1 (open-b BOOT-X 1)))
+        (check "N14: b installed (E1)" (not (pair? b1)) b1)
+        (expect-up! "N14: node-up b" 3000)
+        (let* ((prm (park! 'mon-before-arm 1 100))
+               (mon-caller (spawn (lambda () (send main (vector 'mon-outcome (monitor-remote 'b 'svc14))))))
+               (w (inject-barrier-wait (car prm) 'mon-before-arm 5000)))
+          (check "N14: the monitor caller parked after selecting E1" (pair? w) w)
+          (kill ($node-link-pid 'b) 'n14-kill)
+          (expect-down! "N14: E1 removed" 6000)
+          (let ((b2 (open-b BOOT-Y 1)))
+            (check "N14: b reinstalled fresh (E2, new lifetime)" (not (pair? b2)) b2)
+            (expect-up! "N14: node-up (E2)" 6000)
+            (let ((pref (park! 'admission-refused-stale-lifetime 1 100)))
+              (when (pair? w) (send (cdr w) (vector 'inject-resume (car prm))))
+              (let ((wr (inject-barrier-wait (car pref) 'admission-refused-stale-lifetime 5000)))
+                (check "N14: the lifetime fence refused the arming before any slot or submission" (pair? wr) wr)
+                (when (pair? wr) (send (cdr wr) (vector 'inject-resume (car pref))))
+                (cleanup! pref 'admission-refused-stale-lifetime)))
+            (receive (after 6000 (void)) (`#(mon-outcome ,m) (void)))
+            (remote-down! "N14: the caller was answered remote-down noconnection" 'svc14 6000 (lambda (r) (eq? r 'noconnection)))
+            (check "N14: E2 never received a mon frame" (not (plain-peer-wait-frame b2 (lambda (d) (and (pair? d) (eq? (car d) 'mon))) 500)))
+            (check "N14: rmonitors unchanged" (eqv? (stat 'rmonitors) rbase) (stat 'rmonitors) rbase)
+            (plain-peer-close! b2)
+            (expect-down! "N14: node-down (E2 closed)" 6000))
+          (cleanup! prm 'mon-before-arm))
+        (plain-peer-close! b1)
+        (check "N14: records finished" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records)))
+
+      (check "baseline: rmonitors" (eqv? (stat 'rmonitors) rbase) (stat 'rmonitors) rbase))
+    (if (zero? fails)
+        (begin (display "ALL CLEANUP-RECORD TESTS PASSED\n") (exit 0))
+        (begin (display "CLEANUP-RECORD VERDICT: ") (display fails) (display " failed case(s)\n") (exit 1)))))

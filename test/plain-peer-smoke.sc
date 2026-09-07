@@ -1,0 +1,36 @@
+#!chezscheme
+;; Smoke for the plain-peer fixture against a plaintext node: handshake, an
+;; answered call, a remote monitor's mon frame, an mdown pushed by the peer,
+;; a clean close. Not a B' cell; it proves the fixture before the cells use it.
+(import (chezscheme) (igropyr actor) (igropyr node) (only (igropyr libuv) now-ms)
+        (test plain-peer))
+(define fails 0)
+(define (check label ok . info)
+  (if ok (begin (display "  ok  ") (display label) (newline))
+      (begin (set! fails (+ fails 1)) (display "FAIL  ") (display label)
+             (for-each (lambda (x) (display " ") (write x)) info) (newline))))
+(define port 18700)
+(define secret "plain-peer-smoke-secret-0123456789abcdef")
+(start-scheduler
+  (lambda ()
+    (register 'main self)
+    (node-start! 'a secret port "127.0.0.1")
+    (monitor-node 'b)
+    (let ((p (plain-peer-open "127.0.0.1" port "b" "feedfacefeedface" 1 secret 5000)))
+      (check "S: peer handshake as b" (not (pair? p)) p)
+      (unless (pair? p)
+        (receive (after 3000 (check "S: node-up b" #f 'timeout)) (`#(node-up b) (check "S: node-up b" #t)))
+        (plain-peer-auto-reply! p (lambda (msg) (list 'echo msg)))
+        (let ((r (guard (e (#t (list 'raised e))) (rcall 'b 'svc '(ping 1) 5000))))
+          (check "S: a call to b is answered by the peer" (equal? r '(echo (ping 1))) r))
+        (let ((mref (monitor-remote 'b 'svc)))
+          (let ((f (plain-peer-wait-frame p (lambda (d) (and (pair? d) (eq? (car d) 'mon))) 3000)))
+            (check "S: the peer received the mon frame" (and f (eq? (cadr f) 'svc)) f)
+            (when f
+              (plain-peer-send! p (list 'mdown (caddr f) 'killed))
+              (receive (after 3000 (check "S: remote-down from the peer's mdown" #f 'timeout))
+                (`#(remote-down b svc ,reason) (check "S: remote-down from the peer's mdown" (eq? reason 'killed) reason))))))
+        (plain-peer-close! p)
+        (receive (after 5000 (check "S: node-down after the peer closed" #f 'timeout)) (`#(node-down b) (check "S: node-down after the peer closed" #t)))))
+    (if (zero? fails) (begin (display "ALL PLAIN-PEER-SMOKE TESTS PASSED\n") (exit 0))
+        (begin (display "PLAIN-PEER-SMOKE VERDICT: ") (display fails) (display " failed case(s)\n") (exit 1)))))
