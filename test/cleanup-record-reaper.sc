@@ -75,7 +75,9 @@
           (plain-peer-wait-frame b1 (lambda (d) (and (pair? d) (eq? (car d) 'call))) 3000)
           ;; hold the ORIGINAL reaper first (it would act on the publish hint at once)
           (let* ((tr (arm! 'link-reaper-loop-entry 1))
-                 (wr (wait! tr 'link-reaper-loop-entry 5000))
+                 ;; with a 60 s scan the reaper sits in its receive: nudge it with a harmless
+                 ;; hint so it re-enters the loop and parks at loop-entry
+                 (wr (begin (send (reaper) (vector 'cleanup-published)) (wait! tr 'link-reaper-loop-entry 5000)))
                  (t (arm! 'cleanup-before-round 1)) (link ($node-link-pid 'b)))
             (check "N7a: the original reaper is held" (pair? wr) (show wr))
             (plain-peer-close! b1)                         ; primary = the link's guard
