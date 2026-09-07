@@ -8,6 +8,7 @@
 ;;; it. The peer is the interactive raw TLS client, which completes the mesh
 ;;; handshake by hand. Requires IGROPYR_INJECT=on and the openssl CLI.
 (import (chezscheme) (igropyr actor) (igropyr node)
+        (only (igropyr node) rcall monitor-remote)
         (only (igropyr libuv) now-ms)
         (igropyr inject-control)
         (only (igropyr tls-core) tls-live-session-count)
@@ -43,13 +44,16 @@
           (read (open-input-string (substring acc (+ nl 1) (+ nl 1 len))))
           (let ((r (raw-tls-recv! s ms))) (if (bytevector? r) (loop (string-append acc (utf8->string r))) r))))))
 ;; complete the mesh handshake as peer "b" over an open session -> #t on welcome
-(define (join! s)
+(define (hello! s boot-id)
   (let ((d (read-frame s 4000)))
     (and (pair? d) (eq? (car d) 'challenge)
          (let* ((nonce-a (cadr d)) (bootid-a (cadddr d)) (cb (raw-tls-peer-cb-hash s)))
-           (raw-tls-send! s (frame-bytes (list 'hello "b" (v5-proof-d secret nonce-a "b" probe-boot-id 1 "a" bootid-a cb)
-                                              "feedfeedfeedfeedfeedfeedfeedfeed" 5 probe-boot-id 1)))
-           (let ((w (read-frame s 4000))) (and (pair? w) (eq? (car w) 'welcome)))))))
+           (raw-tls-send! s (frame-bytes (list 'hello "b" (v5-proof-d secret nonce-a "b" boot-id 1 "a" bootid-a cb)
+                                              "feedfeedfeedfeedfeedfeedfeedfeed" 5 boot-id 1)))
+           #t))))
+(define (welcome? s) (let ((w (read-frame s 4000))) (and (pair? w) (eq? (car w) 'welcome))))
+(define (join! s) (and (hello! s probe-boot-id) (welcome? s)))
+(define (join-as! s boot-id) (and (hello! s boot-id) (welcome? s)))
 ;; count bytes arriving on the session until it ends or `ms` of silence
 (define (drain-bytes! s ms)
   (let loop ((total 0))
@@ -85,37 +89,76 @@
           (raw-tls-close! s)
           (check "M17: baseline" (within? 8000 (lambda () (equal? (list (tls-live-session-count) (tls-live-watcher-count)) base))) (list (tls-live-session-count) (tls-live-watcher-count)) base)))
 
-      ;; ---- M16: the link process holds the gate mid-frame and is killed.
-      ;; No barrier here: the link writes from inside a non-preemptible region,
-      ;; so 'agg-chunk-boundary is skipped for it. Instead the PEER STOPS READING:
-      ;; a 4 MB frame cannot complete against a stalled peer, so the link is the
-      ;; gate holder for as long as we like. Killing it then exercises E10 on the
-      ;; dist path: the connection must retire, the peer's stream must end once
-      ;; it reads again, node-down must arrive, and nothing may remain.
-      (let ((s (raw-tls-open "127.0.0.1" port "localhost" 5000)))
+      ;; ---- M16: an installed link process dies by kill (no guard runs) and the
+      ;; node must reclaim its peer entry without help from the link itself.
+      ;; The link is parked at the top of its receive loop (an actor boundary,
+      ;; so the barrier parks rather than skips) and killed there. Expected:
+      ;; the entry leaves the RAW table (node-peers only projects on the conn
+      ;; state and would hide a stale entry), node-down reaches the watcher, a
+      ;; remote monitor on b fires DOWN noconnection, a call pending on b fails
+      ;; fast rather than by its own timeout, the peer's stream ends, and the
+      ;; TLS session and watcher counts return to baseline.
+      ;; arm the barrier FIRST: the link parks at its very first loop entry
+      ;; (right after run-link, before it blocks reading), so an idle peer that
+      ;; sends nothing still leaves the link parkable and killable.
+      (let ((t-link (inject-arm-barrier! 'link-loop-entry 1 30000))
+            (s (raw-tls-open "127.0.0.1" port "localhost" 5000)))
         (check "M16: TLS session with the node" (not (pair? s)) s)
         (unless (pair? s)
           (check "M16: mesh handshake as b" (join! s))
           (receive (after 3000 (check "M16: node-up b" #f 'timeout)) (`#(node-up b) (check "M16: node-up b" #t)))
-          (let ((link ($node-link-pid 'b)))
-            (check "M16: the link process is known" (and link (process-alive? link)) link)
-            (when link
-              (rsend 'b 'sink big)                        ; the LINK writes a 4 MB frame; we do not read
-              (sleep-ms 400)                              ; long past what the socket buffers absorb
-              (check "M16: premise -- the link is still alive and mid-frame (peer stalled)" (process-alive? link))
-              (kill link 'm16-link-killed-holding-gate)
+          (let* ((w (inject-barrier-wait t-link 'link-loop-entry 5000))
+                 (link (and (pair? w) (cdr w)))
+                 (main self)
+                 (caller (spawn (lambda ()
+                                  ;; a call the raw peer never answers: its own timeout is 20 s, so a
+                                  ;; reply within a few seconds can only be the failure sweep. It
+                                  ;; announces that it is about to submit so the cell can confirm the
+                                  ;; call is IN FLIGHT (submitted, no reply yet) before the kill.
+                                  (send main (vector 'rcall-submitting))
+                                  (send main (vector 'rcall-outcome
+                                                     (guard (e (#t e)) (rcall 'b 'nobody 'ping 20000))))))))
+            (check "M16: the link parked at its loop entry" (and link (process-alive? link) (eq? link ($node-link-pid 'b))) (and (pair? w) (process-id (cdr w))))
+            (let ((kill-ms #f) (mref #f))
+              (receive (after 3000 (check "M16: the caller reached its rcall" #f 'no-submit))
+                (`#(rcall-submitting) (check "M16: the caller reached its rcall" #t)))
+              (sleep-ms 300)   ; rcall submits synchronously, then blocks in its receive
+              ;; premise: the call is IN FLIGHT. The node writes the call frame to the
+              ;; peer's socket regardless of the (parked) link, so reading it off s
+              ;; proves the call was submitted while the link was up. Read it BEFORE
+              ;; monitor-remote so the 'call frame is not coalesced with a 'mon frame
+              ;; (read-frame keeps no leftover bytes across calls).
+              (let ((f (read-frame s 3000)))
+                (check "M16: the call frame reached the peer (the pending call was submitted)"
+                       (and (pair? f) (eq? (car f) 'call)) f))
+              (set! mref (monitor-remote 'b 'nobody))
+              (check "M16: premise -- no reply before the kill (the call is still pending)"
+                     (receive (after 0 #t) (`#(rcall-outcome ,r) #f)))
+              (check "M16: premise -- the link is alive and parked" (process-alive? link))
+              (set! kill-ms (now-ms))
+              (kill link 'm16-link-killed)
               (check "M16: the link is dead" (within? 3000 (lambda () (not (process-alive? link)))))
-              ;; the raw table, not the node-peers projection (live-entry hides an
-              ;; entry whose conn is no longer open): a dead link pid here is a
-              ;; stale entry that nobody will ever remove
-              (check "M16: the peer entry is gone from the raw table within 5 s"
-                     (within? 5000 (lambda () (not ($node-link-pid 'b))))
+              (check "M16: the peer entry is gone from the raw table within 2 s"
+                     (within? 2000 (lambda () (not ($node-link-pid 'b))))
                      (let ((l ($node-link-pid 'b))) (and l (list 'stale-link-pid (process-id l) (process-alive? l)))))
-              (receive (after 8000 (check "M16: node-down b after the link died" #f 'timeout)) (`#(node-down b) (check "M16: node-down b after the link died" #t)))
+              (receive (after 5000 (check "M16: node-down b after the link died" #f 'timeout))
+                (`#(node-down b) (check "M16: node-down b after the link died" #t)))
+              (receive (after 5000 (check "M16: the remote monitor fired DOWN noconnection" #f 'timeout))
+                (`#(remote-down b nobody ,reason) (check "M16: the remote monitor fired DOWN noconnection" (eq? reason 'noconnection) reason)))
+              (let ((t0 kill-ms))
+                (receive (after 8000 (check "M16: the pending call failed fast" #f 'timeout))
+                  (`#(rcall-outcome ,r)
+                    (check "M16: the pending call failed with noconnection, from the kill, not its own 20 s timeout"
+                           (and (vector? r) (eq? (vector-ref r 0) 'rcall-error) (eq? (vector-ref r 1) 'noconnection) (< (- (now-ms) t0) 8000))
+                           r (- (now-ms) t0)))))
               (let ((r (drain-bytes! s 4000)))
-                (check "M16: the peer's stream ended (the connection was retired, not left hanging)" (eq? (cdr r) 'closed) r))))
+                (check "M16: the peer's stream ended (the connection was retired, not left hanging)" (eq? (cdr r) 'closed) r)))
+            (guard (e (#t (void))) (inject-release! t-link))
+            (guard (e (#t (void))) (inject-barrier-cleanup! t-link 'link-loop-entry 31000)))
           (raw-tls-close! s)
-          (check "M16: sessions and watchers back to baseline" (within? 8000 (lambda () (equal? (list (tls-live-session-count) (tls-live-watcher-count)) base))) (list (tls-live-session-count) (tls-live-watcher-count)) base))))
+          (check "M16: sessions and watchers back to baseline" (within? 8000 (lambda () (equal? (list (tls-live-session-count) (tls-live-watcher-count)) base))) (list (tls-live-session-count) (tls-live-watcher-count)) base)))
+
+      )
 
     (if (zero? fails)
         (begin (display "ALL TLS-MESH-LINK TESTS PASSED\n") (exit 0))

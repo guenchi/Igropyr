@@ -128,6 +128,13 @@
       (immutable listener conn-tls-listener)    ; listener incarnation, or #f
       ;; inbound plaintext decrypted before the owner could receive it
       (mutable established? conn-tls-established? conn-tls-set-established!)
+      ;; THE OWNER HAS BEEN TOLD THIS CONNECTION EXISTS. Distinct from
+      ;; established?: a dial is established a moment before its answer is
+      ;; delivered, and a terminal notification sent in that gap would name a
+      ;; connection the owner has never heard of. Set in the same callback
+      ;; frame as the publication itself, on both roles.
+      (mutable owner-published? conn-tls-owner-published?
+               conn-tls-set-owner-published!)
       (mutable eof? conn-tls-eof? conn-tls-set-eof!)
       ;; 'seen' AND 'delivered' ARE TWO FACTS. eof? alone meant a
       ;; close_notify followed by a FIN delivered two EOFs, and a FIN
@@ -530,10 +537,13 @@
   ;; the watcher are. It is legal to park here precisely because the writer is
   ;; a green process: the identity assertion above has already refused any
   ;; caller running inside a libuv callback frame.
-  ;; HOW THIS LAYER ASKS WHETHER A PROCESS IS ALIVE. Only the watcher-count
-  ;; seam uses it, to prune pids whose process died without running an exit.
-  ;; Installed by (igropyr tls-watch) beside the other four; with no hook
-  ;; installed the seam simply does not prune.
+  ;; HOW THIS LAYER ASKS WHETHER A PROCESS IS ALIVE. Two callers, and the
+  ;; second is not introspection: the watcher-count seam prunes pids whose
+  ;; process died without running an exit, and the retirement's terminal
+  ;; notification asks so it can stay silent when the owner is already gone.
+  ;; Installed by (igropyr tls-watch) beside the other four. With no hook
+  ;; installed the seam simply does not prune, and the notification defaults to
+  ;; sending -- a reader parked forever is the worse failure of the two.
   (define uv-alive? #f)
   (define (uv-set-alive?! proc) (set! uv-alive? proc))
 
@@ -3423,6 +3433,7 @@
                          sess
                          #f          ; listener -- absence of one IS the client role
                          #f          ; established?
+                         #f          ; owner-published?
                          #f          ; eof?
                          #f          ; eof-sent?
                          #t          ; gated? -- nothing is delivered before the
@@ -3511,6 +3522,7 @@
                   (let ((t (make-conn-tls
                              sess v
                              #f          ; established?
+                             #f          ; owner-published?
                              #f          ; eof?
                              #f          ; eof-sent?
                              #t          ; gated? -- Z12: nothing is delivered
@@ -3609,9 +3621,13 @@
              ;; connection exists and #(tcp-error ...) would arrive about something
              ;; it never heard of. Retirement concludes the attempt through D
              ;; instead, which is the message it is actually waiting for.
-             (let ((o (and (conn-tls-established? t) (conn-owner c))))
-               (when o (deliver o (vector 'tcp-error 'tls-truncated-eof)))
-               (conn-tls-retire! c 'truncated-eof 'tls-truncated-eof))))
+             ;; THE NOTIFICATION IS NO LONGER SENT HERE. It is claimed with
+             ;; the retirement instead, in the one exclusion that decides who
+             ;; owns the connection -- so this path cannot notify an owner that
+             ;; a competing retirement has already answered, and the
+             ;; pre-publication test it used to make by hand is now the
+             ;; eligibility rule every path shares.
+             (conn-tls-retire! c 'truncated-eof 'tls-truncated-eof)))
         (else (note-read-stage! 'err) (conn-tls-retire! c 'read-error nread)))))
 
   ;; Not established: step, drain to the raw sink, stop when OpenSSL wants
@@ -3728,6 +3744,13 @@
           (note-watcher! (conn-tls-watcher t))
           ;; Same callback frame, after the watcher is registered. The attempt
           ;; is concluded exactly once -- here, or on a failure path, never both.
+          ;;
+          ;; PUBLISHED BEFORE THE ANSWER, IN THIS FRAME. From the next line on
+          ;; the owner knows the connection, so a retirement is entitled to
+          ;; send it a terminal error; setting this after the answer would
+          ;; leave a window in which the owner holds a connection that a
+          ;; retirement believes it has never seen.
+          (conn-tls-set-owner-published! t #t)
           (complete-once! (conn-tls-connect-d t) (vector 'tcp-connected c)))
         ;; ---- listener role ----------------------------------------------
         ;; revalidate the incarnation: the listener row can go during a handshake
@@ -3737,6 +3760,10 @@
           (conn-tls-retire! c 'listener-gone 'tls-listener-stopped)
           (begin
             ((vector-ref v 1) c)             ; the delayed on-accept: owner in
+            ;; on-accept is what hands this connection to an owner, so from
+            ;; here it is published -- same frame, for the reason on the dial
+            ;; side.
+            (conn-tls-set-owner-published! t #t)
             (unless uv-tls-watcher-spawner
               (assertion-violation 'tls-accept!
                 "a TLS listener needs (igropyr tls-watch) imported: it installs the watcher spawner hook"))
@@ -3831,6 +3858,50 @@
                         (guard (e2 (#t (note-swallowed! 'retire-complete e2)))
                           (complete-once! (conn-tls-connect-d t)
                                           (vector 'tcp-connect-failed (cons path reason))))
+                        ;; THE TERMINAL NOTIFICATION IS CLAIMED WITH THE
+                        ;; RETIREMENT, in the same exclusion that decides who
+                        ;; owns this connection. Sent from the losing paths
+                        ;; instead, two competing retirements could each tell
+                        ;; the owner, or the one that lost the detach could
+                        ;; tell it after the winner had already finished.
+                        ;; Whoever wins this exclusion is the only process
+                        ;; entitled to speak, so the send belongs here.
+                        ;;
+                        ;; The recipient is read INSIDE the region, with the
+                        ;; decision: reading it afterwards would let the owner
+                        ;; change between deciding to notify and notifying.
+                        ;;
+                        ;; deliver is send -- insert and schedule, no yield --
+                        ;; so it is legal with interrupts disabled and in every
+                        ;; frame that can win here (read callback, write
+                        ;; completion, timer, actor).
+                        ;;
+                        ;; SILENT PATHS, and why each is silent: the owner
+                        ;; either does not exist yet (no-owner,
+                        ;; closed-before-established, pre-publication), never
+                        ;; will (listener-gone), or asked for this itself and
+                        ;; is not to be told its own close was an error
+                        ;; (closing?). A dead owner is silent because nothing
+                        ;; reads its mailbox. Anything else notifies: a path
+                        ;; added later is more safely noisy than silent, since
+                        ;; the failure it prevents is a reader parked forever.
+                        ;;
+                        ;; GUARDED SEPARATELY from the answer above, and for
+                        ;; the same reason: this runs in winner frames that
+                        ;; have no outer guard, and nothing below it may be
+                        ;; skipped. Losing the message costs a wake-up; losing
+                        ;; the releases below leaks the connection.
+                        (guard (e2 (#t (note-swallowed! 'retire-notify e2)))
+                          (let ((o (conn-owner c)))
+                            (when (and (conn-tls-owner-published? t)
+                                       (not (conn-tls-closing? t))
+                                       (not (memq path '(listener-gone
+                                                         no-owner
+                                                         closed-before-established
+                                                         pre-publication)))
+                                       o
+                                       (or (not uv-alive?) (uv-alive? o)))
+                              (deliver o (vector 'tcp-error reason)))))
                         ;; INJECTION POINT 'ret-gate-closed -- OWNING REGION:
                         ;; the with-interrupts-disabled this cond sits in.
                         ;; Placed where the state is DETACHED but not yet

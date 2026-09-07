@@ -42,10 +42,13 @@
   (define observer #f)
   (define (tls-watcher-observer-set! pid) (set! observer pid))
 
-  ;; THE DECREMENT IS GATED, because the exit paths NEST. A DOWN branch
-  ;; decrements and then raises to leave the loop -- and that raise is caught
-  ;; by the guard, which decrements again. The live count went to -1 in the
-  ;; second end-to-end run for exactly that reason. One flag, checked and set
+  ;; THE DECREMENT IS GATED, because the exit paths still NEST on the failure
+  ;; road. A terminal branch now decrements and RETURNS, so an ordinary ending
+  ;; passes through here once; but the guard decrements too, and it still runs
+  ;; whenever the watcher's own code raises -- including a raise out of the
+  ;; retirement a terminal branch performs before returning. The live count went
+  ;; to -1 in the second end-to-end run for exactly that overlap. One flag,
+  ;; checked and set
   ;; in the same step, so "the watcher ended" is counted once however many
   ;; layers it leaves through.
   (define (make-exit-once c)
@@ -109,6 +112,12 @@
         ;; not on the connection because demonitor needs the monitor object
         ;; itself, and only this process ever holds one.
         (let loop ((hm #f))
+          ;; INJECTION POINT 'tls-watcher-loop-entry -- OWNING REGION: none,
+          ;; ordinary process context, OUTSIDE the receive. Interrupt state:
+          ;; injection ON -- depth 0, parks; OFF -- (void). Parks the watcher
+          ;; between iterations, with the gate in whatever state the last one
+          ;; left it, which is where a cell can hold it while the owner acts.
+          (inject-barrier! 'tls-watcher-loop-entry)
           (let ((next
                   (receive (after tls-watcher-idle-ms 'idle)
                     ;; a lost ping costs latency only: every wake re-reads the
@@ -125,7 +134,7 @@
                     (`#(tls-gate-released)
                       (when hm (demonitor hm))
                       'released)
-                    (`#(tls-retire) (exited!) (raise 'tls-watcher-done))
+                    (`#(tls-retire) (exited!) 'done)
                     ;; A DOWN IS ONLY OURS IF IT NAMES THE CURRENT HOLDER OR
                     ;; THE OWNER. A former holder that dies later still
                     ;; produces one, and acting on it would retire a healthy
@@ -147,12 +156,12 @@
                         ((eq? pid (tls-conn-holder c))
                          (exited!)
                          (conn-tls-retire! c 'down reason)
-                         (raise 'tls-watcher-done))
+                         'done)
                         ((and (eq? pid (conn-owner c))
                               (not (tls-conn-shutdown? c)))
                          (exited!)
                          (conn-tls-retire! c 'down reason)
-                         (raise 'tls-watcher-done))
+                         'done)
                         (else 'stale)))
                     ;; AN EXIT IS THE SAME EVENT ARRIVING BY THE OTHER ROAD
                     ;; (E10), so it is judged by exactly the same test. When
@@ -175,23 +184,39 @@
                         ((eq? pid (tls-conn-holder c))
                          (exited!)
                          (conn-tls-retire! c 'down reason)
-                         (raise 'tls-watcher-done))
+                         'done)
                         ((and (eq? pid (conn-owner c))
                               (not (tls-conn-shutdown? c)))
                          (exited!)
                          (conn-tls-retire! c 'down reason)
-                         (raise 'tls-watcher-done))
+                         'done)
                         (else 'stale))))))
-            ;; grant the gate to whoever is next; the grant announces itself
-            ;; through the same message the uncontended path uses
-            (let ((granted (tls-gate-grant-next! c)))
-              (when granted
-                (let ((p (car granted)))
-                  (tls-conn-set-holder-monitor! c p)
-                  (send p (vector 'tls-gate-held)))))
-            (loop (if (and (pair? next) (eq? (car next) 'granted))
-                      (cdr next)
-                      hm))))))))
+            ;; A TERMINAL BRANCH RETURNS; IT NO LONGER RAISES. The raise was
+            ;; read by this process's own guard, which retired the connection a
+            ;; second time under 'watcher-raise and then re-raised -- so the
+            ;; watcher ENDED ABNORMALLY on its ordinary path, and the link it
+            ;; holds cascaded that into the owner. An owner running arbitrary
+            ;; code (a WebSocket session, say) was killed by its own connection
+            ;; shutting down normally. Ending by returning makes the exit
+            ;; normal, and a normal exit kills nobody; a trapping owner still
+            ;; sees #(EXIT w normal), since links are symmetric.
+            ;;
+            ;; The guard above is untouched and still covers the watcher's OWN
+            ;; errors: this changes how the loop finishes, not what happens
+            ;; when it fails.
+            (if (eq? next 'done)
+                (void)
+                (begin
+                  ;; grant the gate to whoever is next; the grant announces
+                  ;; itself through the same message the uncontended path uses
+                  (let ((granted (tls-gate-grant-next! c)))
+                    (when granted
+                      (let ((p (car granted)))
+                        (tls-conn-set-holder-monitor! c p)
+                        (send p (vector 'tls-gate-held)))))
+                  (loop (if (and (pair? next) (eq? (car next) 'granted))
+                            (cdr next)
+                            hm))))))))))
 
   (define (spawn-watcher c)
     (let ((p (spawn (lambda () (watcher-body c)))))

@@ -18,11 +18,13 @@
 ;;;   (raw-tls-server-release! server)          ; let held flights go
 ;;;   (raw-tls-server-cb-hash server)           ; -> the listen context's leaf hash
 ;;;   (raw-tls-session-send! s bytes) (raw-tls-session-recv! s ms) (raw-tls-session-close! s)
+;;;   (raw-tls-session-send-raw! s bytes)       ; bytes on the wire as they are, no TLS framing
+;;;   close! performs a TLS shutdown first (close_notify on the wire), then closes the socket
 ;;;   (raw-tls-server-stop! server)
 (library (test tls-raw-server)
   (export raw-tls-server-start raw-tls-server-accept raw-tls-server-release! raw-tls-server-abort!
           raw-tls-server-cb-hash raw-tls-server-stop!
-          raw-tls-session-send! raw-tls-session-recv! raw-tls-session-close!)
+          raw-tls-session-send! raw-tls-session-send-raw! raw-tls-session-recv! raw-tls-session-close!)
   (import (chezscheme) (igropyr actor)
           (only (igropyr libuv) now-ms)
           (only (igropyr tcp) tcp-listen! tcp-stop-listen! tcp-read-start! tcp-write! tcp-close!
@@ -31,7 +33,7 @@
                 tls-listen-context! tls-context-retire! tls-session-new! tls-session-retire!
                 tls-session-configure-server! tls-session-handshake-step!
                 tls-session-drain! tls-session-feed! tls-session-encrypt!
-                tls-session-decrypt! tls-context-cb-hash))
+                tls-session-decrypt! tls-context-cb-hash tls-session-shutdown!))
 
   (define-record-type server (fields ctx listener main (mutable hold?) (mutable held)))
   ;; a session lives in the process that accepted it; the test talks to it by message
@@ -102,6 +104,11 @@
         (`#(send ,bytes)
           (unless closed? (tcp-write! c (tls-session-encrypt! sess bytes) #f) (flush!))
           (loop pending closed?))
+        (`#(send-raw ,bytes)
+          ;; straight onto the socket: a malformed record, a truncated header,
+          ;; anything the peer's TLS must reject or wait on
+          (tcp-write! c bytes #f)
+          (loop pending closed?))
         (`#(recv ,who ,ms)
           (cond
             ((pair? pending) (send who (vector 'recvd (bv-append-all pending))) (loop '() closed?))
@@ -124,6 +131,9 @@
         (`#(tcp-eof) (loop pending #t))
         (`#(tcp-error ,e) (loop pending #t))
         (`#(close)
+          ;; an authenticated close: close_notify goes out before the socket
+          ;; closes, so the peer sees tcp-eof, not a cut
+          (guard (e (#t (void))) (tls-session-shutdown! sess) (flush!))
           (tls-session-retire! sess "raw server closed")
           (tcp-close! c)))))
 
@@ -150,6 +160,7 @@
     (tls-context-retire! (server-ctx srv)))
 
   (define (raw-tls-session-send! s bytes) (send (session-pid s) (vector 'send bytes)))
+  (define (raw-tls-session-send-raw! s bytes) (send (session-pid s) (vector 'send-raw bytes)))
   (define (raw-tls-session-recv! s ms)
     (send (session-pid s) (vector 'recv self ms))
     (receive (`#(recvd ,x) x)))

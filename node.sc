@@ -208,7 +208,8 @@
           submission-failure? node-install-rule-order node-orphan-count
           monitor-node/token demonitor-node/token
           $registrar-seed-gen! $registrar-pid $registrar-queue-length
-          $registrar-peer-gen $node-link-pid)
+          $registrar-peer-gen $node-link-pid
+          set-link-reaper-scan-ms!)
   ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
   ;; the note in libuv.sc; test/inject-isolation.ss is what measures it.
   (import (chezscheme) (igropyr buffer)
@@ -542,6 +543,22 @@
   (meta define registrar-seam-mode
     (let ((v (getenv "IGROPYR_INJECT")))
       (if (and v (string=? v "on")) 'on 'off)))
+
+  ;; COMPILED OUT ENTIRELY WITHOUT INJECTION, and that is the whole reason it
+  ;; is a procedure pair rather than a bare expression at the call site. The
+  ;; barriers inside would vanish on their own, but the `receive` around them
+  ;; would NOT: left in a production build it would consume a straggler DOWN
+  ;; from the caller's mailbox, which is a live message this library has no
+  ;; business eating. What it reports is whether settle! did its job -- a
+  ;; straggler still queued after settle! means it did not.
+  (meta-cond
+    ((eq? registrar-seam-mode 'on)
+     (define (observe-attempt-settled! child)
+       (if (receive (after 0 #f) (`#(DOWN ,@child ,_) #t))
+           (inject-barrier! 'attempt-settled-straggler)
+           (inject-barrier! 'attempt-settled-clean))))
+    (else
+     (define (observe-attempt-settled! child) (void))))
 
   ;; THE OFF FORM REFUSES RATHER THAN DOING NOTHING. A silent no-op
   ;; would let a cell that forgot IGROPYR_INJECT=on run green while
@@ -5174,7 +5191,13 @@
         (drop-hosted-monitors! root)       ; free monitors this peer parked here
         (fail-monitors-for! name)          ; DOWN(noconnection) for watchers
         (fail-pending-for! name)           ; nothing will answer these now
-        (dispatch-wake!))))
+        (dispatch-wake!))
+      ;; RETURNED EXPLICITLY. The value used to fall out of whichever form
+      ;; happened to end the body -- an accident, not a contract. The link
+      ;; reaper depends on it to tell "I removed this entry" from "somebody
+      ;; else had already replaced it", which is how a conn-keyed sweep stays
+      ;; idempotent against a peer that reconnected in the meantime.
+      mine?))
 
   ;; Calls waiting on a peer that just went: no reply can arrive for them,
   ;; so the entry would sit here until its caller's own timeout removed it
@@ -5198,6 +5221,106 @@
         (lambda (p)
           (send (cdr p) (vector 'rcall-reply (car p) (list 'error 'noconnection))))
         doomed)))
+
+  ;; ---- the link reaper ------------------------------------------------------
+  ;;
+  ;; A LINK PROCESS THAT DIES WITHOUT UNWINDING LEAVES ITS PEER ENTRY BEHIND.
+  ;; The entry is removed on the paths a link takes when it ends of its own
+  ;; accord, and on none of the paths where it is killed -- so a killed link
+  ;; left the node believing a peer was still up, with a connection nothing
+  ;; owned and no node-down for anyone watching. Nothing swept them.
+  ;;
+  ;; This process is that sweeper, and it is a warden child so that killing IT
+  ;; is not the same class of hole. It learns about links two ways, and needs
+  ;; both: a hint from the link itself (prompt, but a link killed before it
+  ;; sends one is missed) and a periodic rescan of the peers table (slower, but
+  ;; it cannot be outrun by a death). The hint is the common case; the scan is
+  ;; what makes the guarantee unconditional.
+  (define link-reaper-name 'igropyr-node-link-reaper)
+
+  ;; READ ONCE, AT THE REAPER'S (RE)START. A running reaper does not
+  ;; reconfigure: the deadline arithmetic below reads this into a local at
+  ;; entry, so a change takes effect at the next incarnation. Callers that
+  ;; need a different period set it before node-start!.
+  (define link-reaper-scan-ms 1000)
+  (define (set-link-reaper-scan-ms! ms)
+    (unless (and (integer? ms) (exact? ms) (> ms 0))
+      (assertion-violation 'set-link-reaper-scan-ms!
+        "want a positive exact integer number of milliseconds" ms))
+    (set! link-reaper-scan-ms ms))
+
+  (define (link-reaper-loop)
+    ;; SCOPED TO THIS INCARNATION, for the reason reaper-loop gives at length:
+    ;; a replacement inheriting its predecessor's index would find every pid
+    ;; already listed, establish no monitors, and sweep nothing while looking
+    ;; complete.
+    (let ((watched (make-eq-hashtable))
+          ;; the period this incarnation runs at, fixed at entry
+          (scan-ms link-reaper-scan-ms))
+      ;; THE MAPPING IS RECORDED BEFORE THE MONITOR. monitor on an already-dead
+      ;; pid delivers DOWN immediately, and a DOWN arriving before the row
+      ;; exists would find nothing to reclaim and drop the entry for good.
+      (define (enrol! name c pid)
+        (unless (hashtable-ref watched pid #f)
+          (hashtable-set! watched pid (cons name c))
+          (monitor pid)))
+      ;; A SNAPSHOT, taken under exclusion and walked outside it: enrolling
+      ;; touches the mailbox and must not run inside the region.
+      (define (rescan!)
+        (let-values (((names entries) (atomically (hashtable-entries peers))))
+          (let loop ((i 0))
+            (when (fx< i (vector-length names))
+              (let* ((e (vector-ref entries i))
+                     (l (entry-link e)))
+                (when (and l (not (hashtable-ref watched l #f)))
+                  (enrol! (vector-ref names i) (entry-conn e) l)))
+              (loop (fx+ i 1))))))
+      ;; CONN-KEYED, so a peer that has already been replaced is not removed a
+      ;; second time: remove-peer! compares the entry's conn against the one
+      ;; this row was enrolled with, and answers #f when they differ. The two
+      ;; outcomes are separate points because they are separate claims -- "this
+      ;; reaper reclaimed a stale entry" and "there was nothing left to do".
+      (define (reclaim! pid)
+        (let ((row (hashtable-ref watched pid #f)))
+          (when row
+            (hashtable-delete! watched pid)
+            (inject-barrier! 'link-reaper-before-remove)
+            (let ((mine? (remove-peer! (car row) (cdr row))))
+              (if mine?
+                  (inject-barrier! 'link-reaper-reclaimed-mine)
+                  (inject-barrier! 'link-reaper-reclaimed-stale))))))
+      ;; INJECTION POINT 'warden-child-before-register -- see reaper-loop.
+      (inject-barrier! 'warden-child-before-register)
+      (register link-reaper-name self)
+      (rescan!)
+      ;; AN ABSOLUTE DEADLINE, AND THE NEXT ONE IS SET FROM THE SCAN'S
+      ;; COMPLETION. A period measured from the scan's START lets a scan that
+      ;; overruns its period leave no time for the mailbox at all, so hints and
+      ;; DOWNs would starve behind back-to-back scans; measured from
+      ;; completion, the worst case is one period plus one scan.
+      ;;
+      ;; remaining IS READ ONCE and used for both the test and the timeout: two
+      ;; readings can straddle the deadline and hand `after` a negative value,
+      ;; which is rejected.
+      ;;
+      ;; A MESSAGE DOES NOT RENEW THE DEADLINE -- the loop continues on the same
+      ;; next-scan -- so a steady trickle of hints cannot postpone the scan
+      ;; indefinitely.
+      (let loop ((next-scan (+ (now-ms) scan-ms)))
+        ;; INJECTION POINT 'link-reaper-loop-entry -- OWNING REGION: none,
+        ;; outside the receive. Interrupt state: ON -- depth 0, parks; OFF --
+        ;; (void).
+        (inject-barrier! 'link-reaper-loop-entry)
+        (let ((remaining (- next-scan (now-ms))))
+          (if (<= remaining 0)
+              (begin
+                (rescan!)
+                (inject-barrier! 'link-reaper-rescanned)
+                (loop (+ (now-ms) scan-ms)))
+              (receive (after remaining (loop next-scan))
+                (`#(watch-link ,name ,c ,pid) (enrol! name c pid) (loop next-scan))
+                (`#(DOWN ,pid ,reason) (reclaim! pid) (loop next-scan))
+                (`#(node-stop) (void))))))))
 
   ;; ---- the link: one process per live connection ---------------------------
 
@@ -6452,6 +6575,11 @@
         mrefs entries)))
 
   (define (link-loop c peer boot-id buf last-seen)
+    ;; INJECTION POINT 'link-loop-entry -- OWNING REGION: none, outside the
+    ;; receive. Interrupt state: ON -- depth 0, parks; OFF -- (void). Parks the
+    ;; link between iterations, which is where a cell can kill it and observe
+    ;; what its entry does afterwards.
+    (inject-barrier! 'link-loop-entry)
     (let drain ()
       ;; EVERY WAKE-UP IS A CHECK ON THE OUTBOUND CEILING, and it is the
       ;; only check that does not depend on this node writing something. A
@@ -6746,13 +6874,27 @@
               (let ((peer-boot-id (list-ref d 5)))
                 (if (installed? (install-peer! peer c peer peer-boot-id
                                                (list-ref d 6) #f))
-                    (if (write-frame! c
-                          (list 'welcome (symbol->string self-name)
-                                (proof-a nonce-b (symbol->string self-name)
-                                         self-boot-id
-                                         (acceptor-binding))))
-                        (run-link c peer peer-boot-id buf)
-                        (remove-peer! peer c))
+                    (begin
+                      ;; INJECTION POINT 'link-enrol-before-hint -- OWNING
+                      ;; REGION: none; this is outside the install
+                      ;; transaction, at an actor boundary. Parks the link
+                      ;; with its entry installed and the reaper not yet
+                      ;; told, which is the window the periodic rescan
+                      ;; exists to cover.
+                      (inject-barrier! 'link-enrol-before-hint)
+                      ;; A HINT, NOT A REGISTRATION. Losing it costs latency
+                      ;; only: the reaper's rescan finds this entry anyway.
+                      ;; It is sent from the link process because self is
+                      ;; the pid that has to be watched.
+                      (let ((r (whereis link-reaper-name)))
+                        (when r (send r (vector 'watch-link peer c self))))
+                      (if (write-frame! c
+                            (list 'welcome (symbol->string self-name)
+                                  (proof-a nonce-b (symbol->string self-name)
+                                           self-boot-id
+                                           (acceptor-binding))))
+                          (run-link c peer peer-boot-id buf)
+                          (remove-peer! peer c)))
                     (tcp-close! c)))))))))        ; lost the tie-break
 
   ;; ---- dial side --------------------------------------------------------------
@@ -6967,8 +7109,14 @@
                     (raise 'auth))
                   (if (installed?
                         (install-peer! peer c self-name bootid-a gen parent))
-                      (let ((up (now-ms)))
-                        (- (run-link c peer bootid-a buf) up))
+                      (begin
+                        ;; INJECTION POINT 'link-enrol-before-hint -- see the
+                        ;; accept side.
+                        (inject-barrier! 'link-enrol-before-hint)
+                        (let ((r (whereis link-reaper-name)))
+                          (when r (send r (vector 'watch-link peer c self))))
+                        (let ((up (now-ms)))
+                          (- (run-link c peer bootid-a buf) up)))
                       (begin (tcp-close! c) 0)))))))
         (`#(tcp-connect-failed ,e)
           ;; the reason was discarded here; it is the only word the dialer gets
@@ -7629,16 +7777,52 @@
                                      (cons 'up (dial! peer host port parent)))))
                              (when (process-alive? parent)
                                (send parent (vector ref (car outcome)
-                                                    (cdr outcome))))))))) 
-      (receive
-        (`#(,@ref up ,up) up)
-        (`#(,@ref fatal ,e) (raise e))
-        ;; A node-stop reaching the connector while an attempt is in
-        ;; flight has to reach the attempt too: it owns the socket, and
-        ;; the connector cannot close what it does not hold.
-        (`#(node-stop)
-          (when (process-alive? child) (send child (vector 'node-stop)))
-          (raise 'stop)))))
+                                                    (cdr outcome))))
+                             ;; INJECTION POINT 'attempt-child-after-result --
+                             ;; OWNING REGION: none. Parks the child with its
+                             ;; result already sent and its exit not yet taken.
+                             ;; What that exercises is SETTLEMENT, not the DOWN
+                             ;; clause: the result is already in the parent's
+                             ;; mailbox and wins, so the death arrives as a
+                             ;; straggler DOWN behind it -- which is exactly
+                             ;; what settle! has to flush. The DOWN clause is
+                             ;; for a child that dies having sent nothing.
+                             (inject-barrier! 'attempt-child-after-result))))))
+      ;; INJECTION POINT 'attempt-before-monitor -- OWNING REGION: none. Parks
+      ;; the parent between the spawn returning and the monitor, the window in
+      ;; which a child can die unwatched.
+      (inject-barrier! 'attempt-before-monitor)
+      ;; MONITORED, SO A DEAD CHILD IS AN ANSWER. Without this the receive
+      ;; below had no clause that could fire when the child died without
+      ;; sending -- killed, or raising somewhere its own guard does not cover
+      ;; -- and this process waited for a message nobody was left to send.
+      (let ((m (monitor child)))
+        ;; DEMONITOR, THEN TAKE THE STRAGGLER. demonitor stops future DOWNs but
+        ;; does not unsend one already queued, and leaving it in the mailbox
+        ;; would hand a stale #(DOWN ...) to whatever this process receives
+        ;; next. The after-0 makes it a poll, not a wait, and the pattern is
+        ;; bound to THIS child so it cannot eat an unrelated DOWN.
+        (define (settle!)
+          (demonitor m)
+          (receive (after 0 (void)) (`#(DOWN ,@child ,_) (void))))
+        ;; INJECTION POINT 'attempt-before-result-receive -- OWNING REGION:
+        ;; none. Parks the parent with the monitor in place and the receive not
+        ;; yet entered.
+        (inject-barrier! 'attempt-before-result-receive)
+        (receive
+          (`#(,@ref up ,up) (settle!) (observe-attempt-settled! child) up)
+          (`#(,@ref fatal ,e) (settle!) (observe-attempt-settled! child) (raise e))
+          ;; THE CHILD DIED WITHOUT ANSWERING. #f is the same "this attempt
+          ;; produced nothing" the caller already handles for an ordinary
+          ;; failure, so the connector retries on its own schedule rather than
+          ;; stalling forever on a process that no longer exists.
+          (`#(DOWN ,@child ,reason) #f)
+          ;; A node-stop reaching the connector while an attempt is in
+          ;; flight has to reach the attempt too: it owns the socket, and
+          ;; the connector cannot close what it does not hold.
+          (`#(node-stop)
+            (when (process-alive? child) (send child (vector 'node-stop)))
+            (raise 'stop))))))
 
   (define (connector peer host port)
     (guard (e ((eq? e dial-gen-exhausted) (void))  ; reported already; stop
@@ -7882,7 +8066,7 @@
           ;; BY PID, NOT BY NAME. A child registers its name inside its own body,
           ;; so one that is spawned but not yet scheduled has no name to look up --
           ;; and a startup failing before bind lands in exactly that window, with
-          ;; all three children queued behind the starter. Killing only what could
+          ;; every one of the children queued behind the starter. Killing only what
           ;; be found by name left the rest running unsupervised, and the registrar
           ;; then wrote itself back into the variable this unwind had just cleared.
           (for-each
@@ -7946,7 +8130,13 @@
                        ;; dial. The queue is what makes restarting it
                        ;; worth doing: the work survives the incarnation.
                        (vector 'registrar registrar-start
-                               "no new peer can be authorised to dial"))))))
+                               "no new peer can be authorised to dial")
+                       ;; SUPERVISED FOR THE SAME REASON AS THE OTHERS: it is
+                       ;; the only process that reclaims a peer entry whose
+                       ;; link died without unwinding, so its own death is
+                       ;; silent and permanent unless something restarts it.
+                       (vector 'link-reaper link-reaper-loop
+                               "peer entries of dead links are no longer reclaimed"))))))
         (set! warden-spawned? #t)
         (critical! reaper-warden 'node-warden)
         (set! warden-up? #t)
@@ -7954,7 +8144,7 @@
         ;; is ordinary process context. Interrupt state: injection ON -- depth
         ;; 0, parks; injection OFF -- (void).
         ;;
-        ;; The starter parks here with the warden and its three children
+        ;; The starter parks here with the warden and its children
         ;; SPAWNED BUT NOT YET SCHEDULED, which is the only window in which a
         ;; child exists and has not registered its name. Releasing the children
         ;; and then failing the bind is what separates an unwind that reaches

@@ -527,6 +527,18 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/t
 # Two TLS nodes in two processes through a recording relay: TLS records only,
 # both directions, link confirmed both ways. Spawns test/tls-node-child.sc.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-pair.sc
+# Batch 1 (link lifecycle after a kill): A (watcher returns normally), A'
+#      (terminal tcp-error to a published owner), C (attempt! monitors its
+#      child), B-lite (a warden-supervised link reaper reclaims dead links).
+#      The kill cells run one per node process (an in-process raw client
+#      reopened after an in-process kill hits a loopback artifact, not a bug).
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-owner-after-close.sc
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-owner-notify.sc
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-attempt.sc
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-link.sc
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reaper.sc
+IGROPYR_SCHEME="$scheme_bin" IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reaper-restart.sc
+IGROPYR_SCHEME="$scheme_bin" IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reconnect.sc
 #      Race cells on the TLS write gate: writers parked by inject-barrier!
 #      at named boundaries in tcp.sc, the competing operation run meanwhile.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-race.sc

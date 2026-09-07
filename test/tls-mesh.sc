@@ -105,17 +105,17 @@
         (let* ((k (inject-barrier-wait t-kid 'warden-child-before-register 5000))
                (kid (and (pair? k) (cdr k))))
           (check "M12b: one child parked before registering (exists, nameless)" (and kid (process-alive? kid)) k)
-          (sleep-ms 200)                           ; the other two register normally
-          (check "M12b: premise -- the parked child is not registered under any of the three names"
-                 (and kid (not (memq kid (list (whereis 'igropyr-node-reaper) (whereis 'igropyr-node-dispatcher) (whereis 'igropyr-node-registrar))))))
+          (sleep-ms 200)                           ; the other three register normally
+          (check "M12b: premise -- the parked child is not registered under any of the four names"
+                 (and kid (not (memq kid (list (whereis 'igropyr-node-reaper) (whereis 'igropyr-node-dispatcher) (whereis 'igropyr-node-registrar) (whereis 'igropyr-node-link-reaper))))))
           ;; resume the parked starter (by message; release! is for a row whose victim is gone) -- the bind now fails
           (when (pair? w) (send starter (vector 'inject-resume t-start)))
           (receive (after 8000 (check "M12b: the start returned" #f 'timeout))
             (`#(start-result ,r) (check "M12b: the bind on a taken port failed the start" (and (pair? r) (eq? (car r) 'raised)) r)))
           (check "M12b: the rollback killed the parked, nameless child by reference" (and kid (within? 3000 (lambda () (not (process-alive? kid))))) (and kid (process-alive? kid)))
           (check "M12b: no warden after the rollback" (within? 2000 (lambda () (not (whereis 'igropyr-node-warden)))))
-          (check "M12b: nothing registered after the rollback (reaper/dispatcher/registrar)"
-                 (within? 2000 (lambda () (and (not (whereis 'igropyr-node-reaper)) (not (whereis 'igropyr-node-dispatcher)) (not (whereis 'igropyr-node-registrar))))))
+          (check "M12b: nothing registered after the rollback (reaper/dispatcher/registrar/link-reaper)"
+                 (within? 2000 (lambda () (and (not (whereis 'igropyr-node-reaper)) (not (whereis 'igropyr-node-dispatcher)) (not (whereis 'igropyr-node-registrar)) (not (whereis 'igropyr-node-link-reaper))))))
           ;; the child died parked: release its row, then clean up both points
           (guard (e (#t (void))) (inject-release! t-kid))
           (guard (e (#t (void))) (inject-barrier-cleanup! t-kid 'warden-child-before-register 31000)))
