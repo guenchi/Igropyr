@@ -1,5 +1,5 @@
 ;; Fine-grained reactivity: signals, effects, batching.
-;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+;; Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 (library (web reactive)
   (export signal signal-ref signal-set! signal-update!
           effect dispose-effect! root batch untracked)

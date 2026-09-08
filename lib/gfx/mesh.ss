@@ -23,7 +23,7 @@
 ;; it with w=0), u_light (unit vector TOWARD the light), u_color,
 ;; u_ambient.  Compose or replace them freely; they are just data.
 ;;
-;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+;; Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 (library (gfx mesh)
   (export mesh? mesh-verts mesh-indices mesh-uvs
           mesh-optimize! mesh-remap! mesh-acmr

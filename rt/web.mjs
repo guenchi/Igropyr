@@ -1,6 +1,6 @@
 // Browser loader for compiled Goeteia modules, main thread: full DOM
 // access through the js bridge.
-// Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+// Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 
 import { makeJsBridge, callMain, jsBridgeStubs } from './jsbridge.mjs';
 

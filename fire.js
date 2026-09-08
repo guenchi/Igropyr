@@ -2,7 +2,7 @@
 // site/fire.ss + its libraries client-side, then the fresh module runs
 // against a real WebGL bridge. No precompiled binary is shipped — the
 // site's fire is literally compiled by Goeteia in your browser.
-// Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+// Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 import { makeJsBridge, jsBridgeStubs } from './rt/jsbridge.mjs';
 
 // prelude + the libraries fire.ss imports, then fire.ss itself. The

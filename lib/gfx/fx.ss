@@ -26,7 +26,7 @@
 ;; Every float that reaches the command encoder is coerced here --
 ;; %mem-f32-set! traps on fixnums, so user code may pass either.
 ;;
-;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+;; Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 (library (gfx fx)
   (export fx-init! fx-slot! fx-alloc! fx-buffer! fx-texture!
           fx-texture-array!

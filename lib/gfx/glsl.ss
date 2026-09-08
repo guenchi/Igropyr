@@ -37,7 +37,7 @@
 ;;   (+ - * /) are infix, (- x) negates; (< > <= >= ==) compare;
 ;;   anything else (vec4 sin dot mix ...) is a call.
 ;;
-;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+;; Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 (library (gfx glsl)
   (export glsl->string glsl-attributes glsl-uniforms glsl-varyings
           glsl300-vs->string glsl300-fs->string)

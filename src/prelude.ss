@@ -1,6 +1,6 @@
 ;; goeteia prelude: the runtime library, written in goeteia's own
 ;; Scheme and compiled into every module.
-;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+;; Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 
 (define (newline . p)
   (if (null? p) ($wb 10) ($write-byte-port (car p) 10)))

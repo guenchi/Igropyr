@@ -1,5 +1,5 @@
 ;; DOM sugar over (web js).
-;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+;; Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 (library (web dom)
   (export window document body
           get-element-by-id query-selector create-element make-text

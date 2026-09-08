@@ -30,7 +30,7 @@
 ;;       (@media "(max-width: 42em)"
 ;;         (".nav" (gap (em 1))))))
 ;;
-;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+;; Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 (library (web css)
   (export css->string num->css palette->root)
   (import (rnrs))

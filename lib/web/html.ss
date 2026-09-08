@@ -14,7 +14,7 @@
 ;; tag; script/style emit raw text; boolean attributes are #t (present)
 ;; or #f (omitted).
 ;;
-;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+;; Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 (library (web html)
   (export sxml->html html->document html-escape raw raw?)
   (import (rnrs))

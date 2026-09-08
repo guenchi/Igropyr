@@ -13,7 +13,7 @@
 ;; buffer).  Constructors coerce their arguments; the operations
 ;; assume flonums -- they are the per-frame hot path.
 ;;
-;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+;; Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 (library (gfx mat)
   (export flsin flcos fltan
           v3 v3-x v3-y v3-z

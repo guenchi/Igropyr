@@ -1,5 +1,5 @@
 ;; JavaScript interop for Goeteia.
-;; Copyright (c) 2026 guenchi. MIT license; see LICENSE.
+;; Copyright (c) 2026 guenchi. Apache License 2.0; see LICENSE.
 (library (web js)
   (export js-ref? js-global js-undefined js-eq? js-truthy?
           js-get js-set! js-call js-method js-new js-index
