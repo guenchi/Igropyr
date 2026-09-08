@@ -22,7 +22,7 @@
     "type": "git",
     "url": "git+https://github.com/guenchi/Igropyr.git"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "author": "guenchi",
   "scripts": {
     "start": "CHEZSCHEMELIBDIRS=.. CHEZSCHEMELIBEXTS=.chezscheme.sls::.chezscheme.so:.ss::.so:.sls::.so:.scm::.so:.sch::.so:.sc::.so scheme --script test/run-otp.sc",

@@ -1643,4 +1643,6 @@ HTTP framing/query behavior, and boot-failure propagation. The older echo and
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+Copyright 2018-2026 guenchi
