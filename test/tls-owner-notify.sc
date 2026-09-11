@@ -16,11 +16,16 @@
 ;;           tcp-connect-failed
 ;;   O8  competing causes: garbage-then-close (the read winner is observed
 ;;       before the owner closes) -> exactly one; close-then-garbage -> zero
+;;   O4/O1b (batch 1 residual) a second process holding the write gate dies:
+;;       the watcher retires the connection, the live owner receives exactly
+;;       one tcp-error (A' on holder death), and survives the watcher's exit
 (import (chezscheme) (igropyr actor) (igropyr tcp)
         (only (igropyr tls-core) tls-mesh-client-context! tls-live-session-count)
         (only (igropyr tcp) tls-last-retire-reason)
         (only (igropyr tls-watch) tls-watch-install!)
         (only (igropyr libuv) now-ms)
+        (only (igropyr tcp) tls-live-watcher-count)
+        (igropyr inject-control)
         (test tls-raw-server))
 (define fails 0)
 (define (check label ok . info)
@@ -58,6 +63,11 @@
                    (`#(tcp-eof) (send main (vector 'owner-msg self 'tcp-eof #f)) (loop c))
                    (`#(tcp-error ,e) (send main (vector 'owner-msg self 'tcp-error e)) (loop c))
                    (`#(do-close) (when c (tcp-close! c)) (send main (vector 'owner-msg self 'closed-by-owner #f)) (loop c))
+                   ;; O4: a SECOND process takes the write gate on this connection
+                   (`#(do-spawn-writer ,payload)
+                     (let ((w (spawn (lambda () (tcp-writev! c (list payload) (lambda (st) (send main (vector 'writer-done st))))))))
+                       (send main (vector 'owner-msg self 'writer w)))
+                     (loop c))
                    (`#(do-exit) (void)))))))
     ;; next forwarded message tag from owner o (with its payload), or 'timeout
     (define (next-msg o ms)
@@ -162,6 +172,33 @@
 
     (check "baseline: no TLS session left behind"
            (within? 8000 (lambda () (= (tls-live-session-count) base))) (tls-live-session-count) base)
+    ;; ---- O4 / O1b: the gate holder (a second process) dies while the owner lives
+    (let* ((srv (raw-tls-server-start "127.0.0.1" port (in-dir "good.pem") (in-dir "good.key")))
+           (wbase (tls-live-watcher-count))
+           (os (established! "O4" srv)) (o (car os)) (s (cdr os))
+           (t (inject-arm-barrier! 'tls-after-held 1 30000)))
+      (send o (vector 'do-spawn-writer (make-bytevector (* 4 1024 1024) 65)))
+      (let ((m (expect! "O4: the owner spawned the writer" o 3000 'writer)))
+        (let* ((p (and (pair? m) (cadr m)))
+               (w (inject-barrier-wait t 'tls-after-held 5000)))
+          (check "O4: the writer parked holding the gate" (and (pair? w) (eq? (cdr w) p)) (and (pair? w) (process-id (cdr w))))
+          (cond
+            ((pair? w)
+             (kill p 'o4-holder-kill)
+             (check "O4: the holder is dead" (within? 3000 (lambda () (not (process-alive? p)))))
+             (let ((e (expect! "O4: the live owner received a tcp-error (A' on holder death)" o 5000 'tcp-error)))
+               (check "O4: ...naming the holder's death" (and (pair? e) (let ((r (cadr e))) (and (pair? r) (eq? (cdr r) 'o4-holder-kill)))) e))
+             (check "O4: the retirement path is the holder's death" (eq? (retire-path) 'down) (tls-last-retire-reason))
+             (quiet! "O4: exactly one tcp-error, no eof, nothing else" o 800)
+             (check "O1b: the non-trapping owner survived the watcher's exit (exited normal, not raised)" (process-alive? o))
+             (check "O1b: the watcher is gone" (within? 4000 (lambda () (eqv? (tls-live-watcher-count) wbase))) (tls-live-watcher-count) wbase)
+             (guard (e (#t (void))) (inject-release! t)))
+            (else (inject-barrier-cleanup! t 'tls-after-held 31000)))))
+      (guard (e (#t (void))) (raw-tls-session-close! s))
+      (send o (vector 'do-exit))
+      (raw-tls-server-stop! srv)
+      (check "O4: sessions back to baseline" (within? 5000 (lambda () (= (tls-live-session-count) base))) (tls-live-session-count) base))
+
     (if (zero? fails)
         (begin (display "ALL TLS-OWNER-NOTIFY TESTS PASSED\n") (exit 0))
         (begin (display "TLS-OWNER-NOTIFY VERDICT: ") (display fails) (display " failed case(s)\n") (exit 1)))))

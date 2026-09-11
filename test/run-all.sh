@@ -538,6 +538,7 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/t
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-link.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reaper.sc
 IGROPYR_SCHEME="$scheme_bin" IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reaper-restart.sc
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reaper-starve.sc
 IGROPYR_SCHEME="$scheme_bin" IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reconnect.sc
 # Batch 2 (cleanup records for peer removal and replacement): collections hung
 #      on the peer entry, an intrusive record chain, notify-then-retire obligations,
