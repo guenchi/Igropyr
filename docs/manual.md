@@ -25,21 +25,24 @@ This manual covers the architecture, design patterns, and implementation details
 19. [Async File Reads](#async-file-reads)
 20. [Durable Writes](#durable-writes)
 21. [Durable Writes Without Blocking](#durable-writes-without-blocking)
-22. [JSON and gzip](#json-and-gzip)
-23. [S-Expression RPC](#s-expression-rpc)
-24. [Distribution](#distribution)
-25. [Vector Scoring](#vector-scoring)
-26. [Embedded JavaScript](#embedded-javascript)
-27. [Cached SSR](#cached-ssr)
-28. [Object Storage and AWS](#object-storage-and-aws)
-29. [Password Hashing](#password-hashing)
-30. [Running and Building](#running-and-building)
-31. [Testing](#testing)
-32. [Development Contracts](#development-contracts)
-33. [Code Style](#code-style)
-34. [Common Pitfalls](#common-pitfalls)
-35. [Appendix: Performance Tips](#appendix-performance-tips)
-36. [Further Reading](#further-reading)
+22. [Child Processes](#child-processes)
+23. [JSON and gzip](#json-and-gzip)
+24. [HTML and CSS](#html-and-css)
+25. [S-Expression RPC](#s-expression-rpc)
+26. [Distribution](#distribution)
+27. [Vector Scoring](#vector-scoring)
+28. [Embedded JavaScript](#embedded-javascript)
+29. [Cached SSR](#cached-ssr)
+30. [Object Storage and AWS](#object-storage-and-aws)
+31. [Password Hashing](#password-hashing)
+32. [Numbers from Outside the Process](#numbers-from-outside-the-process)
+33. [Running and Building](#running-and-building)
+34. [Testing](#testing)
+35. [Development Contracts](#development-contracts)
+36. [Code Style](#code-style)
+37. [Common Pitfalls](#common-pitfalls)
+38. [Appendix: Performance Tips](#appendix-performance-tips)
+39. [Further Reading](#further-reading)
 
 ---
 
@@ -433,7 +436,8 @@ The Express layer provides a familiar web framework API. Most applications use E
 (import (chezscheme)
         (igropyr actor)
         (igropyr http)
-        (igropyr express))
+        (igropyr express)
+        (igropyr util))
 
 (define app (create-app))
 
@@ -748,19 +752,48 @@ keying on `X-Forwarded-For` (see [Rate Limiter](#rate-limiter)), and a cookie
 set on the HTTPS side is not on the same origin as a plaintext internal hop
 (see [Cookie options](#cookie-options-and-the-one-that-cannot-be-a-constant)).
 
-On startup, `app-listen` prints one line naming the contract level baked
-into the build:
+#### Startup output
+
+The framework announces a listening server on **stderr**, not on the
+application's stdout:
 
 ```
-igropyr contracts: off
+igropyr listening on http://0.0.0.0:8080 backlog 8192 (effective 4096)
 ```
 
-It reads `full` or `off` — the value of `(contract-level)` at compile
-time (see [Development Contracts](#development-contracts)). Treat it as a
-build canary: a production process should log `off`, and seeing `full`
-there means a debug `.so` slipped into the deployment. If a mixed build
-disagrees between libraries, this line reports only what the entry point
-was compiled with.
+A process may be holding stdout for a protocol, a pipe, or a log format of
+its own, and a library writing there corrupts a stream it does not own. The
+same reasoning applies to `PANIC:`, which the scheduler writes on the console
+error port and flushes before it exits.
+
+Where that line goes is the application's to decide. `http-notice!` installs
+a procedure of one string; the default writes on the **console** error port
+(not `current-error-port`, which an application may have rebound to collect
+its own diagnostics) and flushes:
+
+```scheme
+(http-notice! (lambda (s) (log-info s)))   ; send it to your logger
+(http-notice! (lambda (s) #f))             ; silence it
+```
+
+It is a plain setter and not a parameter, deliberately: the scheduler shares
+parameter values across green processes — it saves and clears winders across
+a yield and restores them without running their swaps — so `parameterize`
+could not promise the per-process isolation that the shape of a parameter
+advertises. The hook is process-global and set once, like the write and
+request timeouts. A non-procedure, or a procedure that cannot take one
+argument, is refused by the setter rather than at the call site, where the
+guard around the announcement would have turned the mistake into silence.
+
+**Announcing is not part of listening.** The call is guarded: a hook that
+raises does not cost you the server.
+
+Versions before 1.7.0 wrote the listening line on the current output port and
+printed a second line, `igropyr contracts: LEVEL`, beside it. That line is
+gone — it reported an expansion-time constant, so it said `off` for every
+compiled build whatever the environment held. `(contract-level)` is still
+exported for anyone who wants to ask (see
+[Development Contracts](#development-contracts)).
 
 ### Using the HTTP Core Directly
 
@@ -1287,13 +1320,18 @@ For known error cases, catch exceptions and respond appropriately:
 ```scheme
 (app-get app "/divide/:a/:b"
   (lambda (req res)
-    (let ((a (string->number (req-param req "a")))
-          (b (string->number (req-param req "b"))))
-      (guard (e ((and (number? e) (zero? e))
-                 (set-status! res 400)
-                 (send-json! res (list (cons "error" "division by zero")))))
-        (if (zero? b) (raise 0) #f)
-        (send-json! res (list (cons "result" (/ a b))))))))
+    ;; digits->exact and not string->number: a path segment is text from
+    ;; outside the process (see Numbers from Outside the Process)
+    (let ((a (digits->exact (req-param req "a") 9))
+          (b (digits->exact (req-param req "b") 9)))
+      (if (not (and a b))
+          (begin (set-status! res 400)
+                 (send-json! res (list (cons "error" "want two integers"))))
+          (guard (e ((and (number? e) (zero? e))
+                     (set-status! res 400)
+                     (send-json! res (list (cons "error" "division by zero")))))
+            (if (zero? b) (raise 0) #f)
+            (send-json! res (list (cons "result" (/ a b)))))))))
 ```
 
 ---
@@ -4256,6 +4294,146 @@ it must be set **before the process starts**, not from inside it.
 
 ---
 
+## Child Processes
+
+`(igropyr tcp)` can start an external program and talk to it over pipes
+without blocking the scheduler. The child's stdin, stdout and stderr are
+libuv pipes owned by this process, so reading the child's output is the same
+non-blocking machinery as reading a socket, and a slow reader applies real
+backpressure to the child rather than buffering it.
+
+```scheme
+(import (chezscheme) (igropyr actor) (igropyr tcp))
+
+(start-scheduler
+  (lambda ()
+    (let ((p (proc-spawn! "/usr/bin/wc" '("wc" "-l"))))
+      (if (not (proc? p))
+          (display (cdr p))
+          (begin
+            (proc-write! p (string->utf8 "a\nb\nc\n"))
+            (proc-stdin-close! p)
+            ;; drain until BOTH the stream ended and the child exited:
+            ;; the two arrive in either order
+            (let loop ((out "") (eof? #f) (code #f))
+              (if (and eof? code)
+                  (begin (proc-close! p) (display out))
+                  (receive (after 5000 (display "timeout"))
+                    (`#(proc-data ,@p stdout ,bv)
+                      (loop (string-append out (utf8->string bv)) eof? code))
+                    (`#(proc-eof ,@p stdout) (loop out #t code))
+                    (`#(proc-exit ,@p ,status ,signal)
+                      (loop out eof? status))))))))))
+```
+
+### API
+
+- `(proc-spawn! file argv opt ...)` → `proc` | `(failed . reason)` — start
+  `file` with `argv`, which **includes `argv[0]`**. An empty `argv` is a
+  caller error and raises. `reason` is a symbol for a refusal this library
+  made — `proc-limit`, `owner-dead`, `layout` — and a libuv error string for
+  one the operating system made
+- `(proc-write! p bv [on-done])` → `#t` | `#f` — queue bytes to the child's
+  stdin. `#f` means refused (no stdin pipe, closing, or past the cap) and
+  **a refusal never calls `on-done`**; an acceptance always settles it, with
+  the completion status, whether the write succeeds, fails (EPIPE once the
+  child has closed its end) or is cancelled
+- `(proc-stdin-close! p)` → `#t` | `#f` — half-close the child's stdin, so
+  it reads EOF *after* the last byte of every write that completed
+- `(proc-read-start! p stream)` / `(proc-read-stop! p stream)` — resume or
+  pause reading `'stdout` or `'stderr`
+- `(proc-kill! p signum)` → `#t` | `#f` — signal the child; `#f` when there
+  is no child left to signal. Pipe state is irrelevant: a child whose pipes
+  this process already closed is still a running child
+- `(proc-kill-all! signum)` → the number of children signalled
+- `(proc-close! p)` → void — close whichever pipes are still open.
+  Idempotent, and **it does not kill**: the child keeps running and stays
+  eligible for `proc-kill!` and for the owner-death signal
+- `(proc? x)`, `(proc-state p)` → `running` | `exited` | `closed`
+- `(proc-pid p)` — the child's pid, and `#f` from the exit callback onward,
+  because a pid is reusable from that instant and holding it would be
+  holding something that now names somebody else's process
+- `(proc-exit p)` → `#f` | `(code . signal)`, `(proc-owner p)`,
+  `(proc-queued p)` — accepted minus settled stdin bytes, not bytes accepted
+- `(proc-stdin p)`, `(proc-stdout p)`, `(proc-stderr p)` — the pipe
+  connection, or `#f` once that pipe has closed
+- `(proc-count)`, `(proc-stats)`, `(pipe-conn-count)`, `(socket-conn-count)`
+- `(set-max-procs! n)` — the ceiling on live rows (default 256);
+  `(set-proc-stdin-cap! n)` — the per-child stdin queue cap (default 16 MiB)
+
+### Options
+
+The options are an alist, accepted either loose or wrapped — `(proc-spawn!
+f a '(cwd . "/tmp") '(stdout . ignore))` and `(proc-spawn! f a '((cwd .
+"/tmp") (stdout . ignore)))` name the same thing.
+
+| Key | Value | Default |
+| --- | --- | --- |
+| `cwd` | a string | inherit |
+| `env` | a list of `"K=V"` strings | inherit |
+| `stdin` / `stdout` / `stderr` | `pipe`, `inherit` or `ignore` | `pipe` |
+| `owner` | a pid | the calling process |
+| `kill-on-owner-death` | `#t` / `#f` | `#t` (SIGTERM) |
+
+An unknown stdio mode raises rather than being ignored.
+
+### Messages
+
+The owner receives, in callback context:
+
+```scheme
+#(proc-data ,proc ,stream ,bytevector)   ; stream is 'stdout or 'stderr
+#(proc-eof ,proc ,stream)
+#(proc-error ,proc ,stream ,errno)       ; a negative libuv errno
+#(proc-exit ,proc ,status ,signal)
+```
+
+**Reads on `stdout` and `stderr` start automatically** when the child is
+spawned; `proc-read-stop!` is how you pause one. Stopping the read closes the
+kernel's window and **the child blocks in its write** — that is real
+backpressure, which a slow mailbox consumer is not: the read callback drains
+into the mailbox regardless of how fast anything receives from it.
+
+### Lifetime
+
+A `proc` is `running`, then `exited`, then `closed`. `closed` is a
+conjunction over four independent things — the process handle and the three
+pipes, which close in any order — and the row retires when the last of them
+goes. So a `proc` stays readable between the exit and the last close: the
+exit status is there to be read, and `proc-stats` will still count the row.
+
+The owner matters twice. `owner` is the process that receives the messages,
+and it is also who the child is tied to: when the owner dies, a child spawned
+with `kill-on-owner-death` (the default) is sent SIGTERM — a signal, not a
+close of its handle, so libuv still reaps it through the exit callback as it
+would any other exit. A spawn whose named owner is already dead is refused
+with `owner-dead` rather than producing a child nobody will ever hear from.
+
+`proc-spawn!` does everything else without blocking, with one exception worth
+knowing: **`uv_spawn` itself is synchronous.** libuv's unix spawn path reads
+the child's exec-error pipe with no timeout, so process *creation* is
+"milliseconds, typically" rather than bounded. That is a property of that one
+call; no other operation in this facility waits on the child at all.
+
+### Accounting
+
+`(proc-stats)` answers an alist read inside one interrupts-disabled region,
+so the numbers describe one instant rather than eight separate ones:
+
+```scheme
+((procs . 2) (running . 1) (exited-unclosed . 1) (pipes . 4)
+ (queued-bytes . 0) (shutdown-pending . 0)
+ (shutdown-requests-live . 0) (shutdown-immediate-errors . 0))
+```
+
+`pipe-conn-count` and `socket-conn-count` split the connection table, so an
+HTTP server's connection count is not inflated by a child's pipes.
+`write-blocks-live-count` and `write-table-size` are TCP-wide rather than
+per-child: a write block belongs to a connection, so a program with no
+children still has write blocks to account for.
+
+---
+
 ## JSON and gzip
 
 Igropyr includes a complete JSON parser/serializer and gzip compression support.
@@ -4426,6 +4604,92 @@ You can also manually compress:
 
 ---
 
+## HTML and CSS
+
+Two small, pure libraries for producing markup and stylesheets from Scheme
+data. Neither touches libuv or the scheduler, so they work in a handler, in a
+worker, or in a build script that writes files.
+
+### `(igropyr html)`
+
+```scheme
+(import (rnrs) (igropyr html))
+
+(html->document
+  `(html (@ (lang "en"))
+     (head (title "Hi") (style ,(raw "body{margin:0}")))
+     (body (h1 "Hello") (p "n = " 42))))
+```
+
+- `(sxml->html node)` → string — render one node
+- `(html->document node)` → string — the same, with `<!DOCTYPE html>` in
+  front and a trailing newline
+- `(html-escape s)` → string — escape a string as element text
+- `(raw s)` → node, `(raw? x)` → boolean — a verbatim node, emitted unescaped
+
+A node is a string (emitted as escaped text), a number, a `(raw "literal")`,
+or `(tag (@ (attr val) ...) child ...)` with the attribute list optional.
+Void elements (`br`, `img`, `input`, `meta`, `link`, …) emit no closing tag;
+`script` and `style` emit their children unescaped; a boolean attribute is
+written by `#t` and omitted by `#f`.
+
+**The two escape tables differ on purpose.** Element text escapes `&`, `<`
+and `>`; an attribute value escapes `&`, `"` and `<`. A quote cannot end an
+attribute value that never contains one, and a `>` inside an attribute cannot
+close a tag, so each context escapes what can hurt it and leaves the rest
+alone.
+
+The `@` in the attribute marker is why `html.sc` begins with `#!chezscheme`:
+a library is read in `#!r6rs` mode by default, where `@` is not a readable
+symbol. The directive only widens the reader.
+
+### `(igropyr css)`
+
+```scheme
+(import (rnrs) (igropyr css))
+
+(css->string
+  `(,(palette->root '((bg "#f2f4fa") (ink "#12141c")))
+    (body (margin 0) (background (var bg)) (color (var ink)))
+    (".nav a" (color (var ink)) (font-size (em 0 92)))
+    (@media "(max-width: 42em)"
+      (".nav" (gap (em 1))))))
+```
+
+- `(css->string rules)` → string — render a rule list
+- `(palette->root palette)` → rule — turn `((name value) ...)` into a
+  `:root` rule of `--name` custom properties
+- `(num->css n)` → string — one scalar: an exact integer or a string
+
+A stylesheet is a list of rules and a rule is `(selector (prop value ...)
+...)`. A selector is a symbol for an element name, or a string for anything
+carrying `.`, `#`, `:`, `>` or a space. `@media`, `@keyframes` and `@supports`
+nest rules inside them.
+
+**There are no floats anywhere, and that is about exactness rather than
+taste**: a printed flonum is not guaranteed to be the number that was
+written. Unit forms take a whole part, an optional fraction *written with its
+own digits*, and an optional minimum width so a leading zero can be recovered
+— the reader has already dropped it from the literal by the time the library
+sees it:
+
+```scheme
+(em 1)     ; "1em"        (px 13)    ; "13px"      (pct 50)   ; "50%"
+(em 0 92)  ; "0.92em"     (em 3 4)   ; "3.4em"     (em 3 4 2) ; "3.04em"
+(dec 1 60) ; "1.6"        (var ink)  ; "var(--ink)"
+(calc (pct 100) "-" (em 2))          ; "calc(100% - 2em)"
+(rgba 16 20 42 (dec 0 6))            ; "rgba(16,20,42,0.6)"
+(A B ...)  ; "A B ..."    ; a space-joined compound value
+```
+
+Operands are checked rather than taken on trust: `(em 1 5 2 9)` raises
+instead of rendering as though the `9` had never been written. `css.sc`
+begins with `#!chezscheme` for the same reason
+`html.sc` does — `@media` and its siblings are not readable symbols in
+`#!r6rs` mode.
+
+---
+
 ## S-Expression RPC
 
 When both ends of the wire speak Scheme, there is no codec to design:
@@ -4520,7 +4784,9 @@ They aren't tied to any one endpoint — any route can serve
 
 (app-get app "/users/:id"
   (lambda (req res)
-    (let ((u (assv (string->number (req-param req "id")) users)))
+    ;; digits->exact: see Numbers from Outside the Process
+    (let* ((id (digits->exact (req-param req "id") 9))
+           (u (and id (assv id users))))
       (if u
           (send-sexpr! res (list 'user (cons 'id (car u)) (cons 'name (cdr u))))
           (begin (set-status! res 404)
@@ -5594,6 +5860,105 @@ libcrypto.
 
 ---
 
+## Numbers from Outside the Process
+
+**Check the shape of external text before converting it, never after.**
+Chez's `string->number` reads the whole numeric syntax, including the
+exactness prefix, so twelve characters can ask it for an unbounded amount of
+work:
+
+```scheme
+(string->number "#e1e99999999")   ; builds the exact integer 10^99999999
+```
+
+It allocates until the machine gives up and never returns. Any code that
+converts text from outside the process and bounds the result *afterwards* is
+a one-line denial of service, because the line that would have rejected the
+value is never reached:
+
+```scheme
+;; WRONG: the guard is downstream of the hang
+(let ((n (string->number (req-header req 'x-count))))
+  (and n (< n 1000) n))
+```
+
+**A radix argument does not help**, because the text carries its own prefixes
+and they win. `(string->number "#e1e99999999" 10)` hangs exactly as the
+one-argument call does, and at radix 16 the same attack is spelled
+`(string->number "#e#d1e99999999" 16)` — `#d` switches the reading back to
+decimal and `#e` asks for it exactly. Neither does a length bound help,
+unless it is short enough that no exponent fits — two characters is such a
+bound, 65536 is not.
+
+### The four suppliers
+
+`(igropyr util)` exports the shape checks the library itself uses. Each takes
+a maximum length, answers `#f` for anything it will not convert, and hands on
+to `string->number` only text that is already nothing but digits:
+
+- `(digits->exact s max-len)` — 1 to `max-len` ASCII digits and nothing else:
+  no sign, no `#`, no `.`, no exponent, no whitespace
+- `(signed-digits->exact s max-len)` — the same with an optional single
+  leading `-`, for wire formats that use `-1` as a sentinel. `max-len` bounds
+  the **digits**; the sign is not counted
+- `(hex-digits->exact s max-len)` — 1 to `max-len` ASCII hex digits, either
+  case, read in base 16
+- `(decimal-fraction->number s max-len)` — digits with at most one `.` and at
+  least one digit, answering an exact rational. It is exact by construction:
+  the checked text is read with an exactness prefix the procedure supplies
+  itself, which is safe precisely because no exponent survived the check
+
+```scheme
+(digits->exact "032768" 10)             ; 32768   -- leading zeros keep their value
+(digits->exact "1e5" 10)                ; #f
+(digits->exact "#e1024" 10)             ; #f
+(digits->exact "-1" 10)                 ; #f      -- use signed-digits->exact
+(digits->exact "12345678901" 10)        ; #f      -- eleven digits, max is ten
+(hex-digits->exact "00ff" 16)           ; 255
+(hex-digits->exact "0x10" 16)           ; #f      -- 0x is not a hex digit
+(decimal-fraction->number "0.5" 8)      ; 1/2
+(decimal-fraction->number ".5" 8)       ; 1/2
+(decimal-fraction->number "1." 8)       ; 1
+(decimal-fraction->number "1.2.3" 8)    ; #f
+```
+
+Two rules are worth stating because they are decisions rather than
+accidents. **Leading zeros keep their decimal value** — `"032768"` is 32768,
+not an octal 13624 and not a refusal: stored fields and wire formats pad, and
+a guard that changed the value of text the system already accepts would be a
+compatibility break wearing a security hat. And **a leading or trailing point
+is accepted** by `decimal-fraction->number`: neither is well formed in the
+header grammar it serves, but refusing them would make the guard invent a
+stricter syntax than the thing it protects, which is two changes reported as
+one.
+
+### Where the library applies them
+
+Every place the framework converts text it did not produce goes through a
+supplier first, with a length chosen from what the format can actually hold:
+
+| Site | Supplier | Max |
+| --- | --- | --- |
+| kdf cost fields (scrypt `N` `r` `p`, pbkdf2 iterations, argon2id `t` `m` `p`) | `digits->exact` | 10 |
+| ports in a URL or an S3 endpoint | `digits->exact` | 5 |
+| HTTP status code | `digits->exact` | 3 |
+| chunked transfer sizes | `hex-digits->exact` | 16 |
+| `q=` in `Accept-Encoding` | `decimal-fraction->number` | 8 |
+| cluster registration port | `digits->exact` | 5 |
+| redis `TIME`, RESP lengths, SCRAM iterations, command-tag counts, S3 numerals | `digits->exact` / `signed-digits->exact` | 20 |
+
+Later bound checks are unchanged — a supplier answers `#f` exactly where the
+conversion used to, so every call site keeps the branch it already had.
+
+**The same rule applies to your own code.** Request bodies, headers, query
+parameters, database columns and anything a peer sent are all outside text.
+Two places in the framework carry the hazard in a form worth recognising: a
+*symbol* is outside text too once something calls `string->symbol` on it (the
+s-expression writer had to be reordered for that reason), and so is an XML
+numeric character reference.
+
+---
+
 ## Running and Building
 
 ### Environment Variables
@@ -5916,8 +6281,10 @@ dependency** on the library.
   protocol, or nongenerative clause — records needing those use the plain
   form).
 - `(contract-level)` — expands to the literal `'full` or `'off` baked at
-  the expansion site. `app-listen` prints it at startup; assert it at the
-  top of a test suite.
+  the expansion site. Assert it at the top of a test suite. Nothing prints
+  it: until 1.7.0 `app-listen` announced it at startup, which could not
+  answer the question it looked like it answered (see
+  [Startup output](#startup-output)).
 
 A violation raises `&assertion` naming the procedure, the argument/field,
 and the expected predicate, with the offending value as the irritant:
@@ -5939,8 +6306,13 @@ time** — not at run time:
 
 The level is baked into each compiled `.so` at that `.so`'s compile time.
 **After changing the flag, do a CLEAN rebuild** — otherwise different
-libraries disagree, and only `app-listen`'s startup line tells you what
-the entry point was compiled with.
+libraries disagree and nothing announces it. **Ask the artefact, not the
+environment.** The variable says what the next compilation will do, not what
+the `.so` on disk already did; the only reliable reading is behavioural — call
+a checked procedure with a value its contract refuses and see whether you get
+an assertion violation. Code running from source reads the environment of that
+process (`IGROPYR_CONTRACTS` as the process actually inherited it), which is a
+different question with a different answer.
 
 ### Boundary Contracts in the Built-in Libraries
 

@@ -1,5 +1,221 @@
 # Changelog
 
+## 1.7.0 — 2026-09-11
+
+*51 commits.* Child processes with libuv-owned pipes, two rendering helper
+libraries, the framework's own lines off the application's stdout, and a shape
+check in front of every `string->number` that reads text from outside the
+process.
+
+### API
+
+Two new libraries, both pure — no libuv, no scheduler, usable at build time as
+well as in a handler. `(igropyr html)`: `sxml->html`, `html->document`,
+`html-escape`, `raw`, `raw?`. `(igropyr css)`: `css->string`, `num->css`,
+`palette->root`.
+
+`(igropyr tcp)` gains the child process facility — `proc-spawn!`, `proc?`,
+`proc-write!`, `proc-stdin-close!`, `proc-read-start!`, `proc-read-stop!`,
+`proc-kill!`, `proc-kill-all!`, `proc-close!`; the accessors `proc-state`,
+`proc-pid`, `proc-exit`, `proc-owner`, `proc-handle`, `proc-queued`,
+`proc-stdin`, `proc-stdout`, `proc-stderr`; the readings `proc-count`,
+`proc-stats`, `pipe-conn-count`, `socket-conn-count`,
+`write-blocks-live-count`, `write-table-size`; and the two limits
+`set-max-procs!` and `set-proc-stdin-cap!`.
+
+`(igropyr http)` gains `http-notice!` and `http-server?`. `(igropyr util)`
+gains `digits->exact`, `signed-digits->exact`, `hex-digits->exact` and
+`decimal-fraction->number`. `(igropyr node)` gains `set-link-reaper-scan-ms!`,
+and `node-monitor-stats` gains the keys `cleanup-records` and
+`cleanup-obligations`.
+**Curated: 41 added, none removed.**
+
+`(igropyr libuv)` and `(igropyr platform)` also export 30 further raw
+bindings, constants and struct offsets that the spawn path needs —
+`uv-spawn`, `uv-process-kill`, `uv-process-get-pid`, `uv-pipe-init`,
+`uv-shutdown`, `uv-kill`, `UV-PROCESS`, `UV-NAMED-PIPE`, `UV-CREATE-PIPE`,
+the `uv-po-*` and `uv-sc-*` offsets and their kin. As with the 1.5.2 split
+these are the **low-level face of the binding layer and are not stable API**;
+the stable surface is `(igropyr tcp)` and everything above it.
+
+Not API, and named so that a reader can tell: `$proc-table-ref`,
+`$proc-last-spawned-pid`, `proc-handles-freed`, `proc-exit-no-row-handles`
+(`(igropyr tcp)`), `$node-link-pid`, `$node-entry-mons-id`,
+`$node-stale-chain-node!` (`(igropyr node)`) and `$xml-unescape`
+(`(igropyr s3)`) are test seams. Every one of them but the last exists only
+in a build with `IGROPYR_INJECT=on` and raises otherwise.
+
+### Breaking
+
+- **The licence changes from MIT to the Apache License 2.0.** `LICENSE`
+  carries the Apache text with the copyright holder named in the appendix
+  notice, and the SPDX identifier in `package.json` and the README section
+  follow it.
+
+  This applies to releases made from this version onward. **Copies already
+  distributed under the MIT terms keep those terms**, and published packages
+  that declare MIT are unaffected — nothing is withdrawn retroactively.
+
+- **The framework no longer writes on the application's stdout.** A process
+  may be holding stdout for a protocol, a pipe, or a log format of its own,
+  and a library writing there corrupts a stream it does not own: the
+  application cannot even tell which lines were its own. Three lines moved or
+  went away.
+
+  `igropyr listening on http://HOST:PORT backlog N (effective M)` — **the
+  text is unchanged and it now goes to stderr**, through a hook rather than
+  onto whatever port happens to be current.
+
+  `igropyr contracts: LEVEL` — **removed**. It reported a constant: the
+  compiled framework is built with contracts off, so it said `off` whatever
+  the environment held, and run from source it echoed back the environment
+  variable of the person who had just set it. `(contract-level)` is still
+  exported for anyone who wants to ask.
+
+  `PANIC: ...` — now written on the console error port and flushed before the
+  exit, for the same reason.
+
+  **Migration.** A script that greps the startup banner out of stdout reads
+  stderr instead, or redirects both (`2>&1`). An application that wants the
+  line somewhere else of its own sets the hook before it listens:
+
+  ```scheme
+  (http-notice! (lambda (s) (log-info s)))   ; send it to your logger
+  (http-notice! (lambda (s) #f))             ; silence it
+  ```
+
+  The hook is **a plain setter and not a parameter**, and deliberately: this
+  scheduler shares parameter values across green processes, so `parameterize`
+  could not promise the isolation the shape of a parameter advertises. It is
+  process-global and set once, like the write and request timeouts. A
+  non-procedure, or a procedure that cannot take one argument, is refused at
+  the setter rather than at the call site.
+
+  A build that parsed `igropyr contracts:` to decide whether a deployment was
+  a debug build has to measure the artefact instead — contracts are an
+  expansion-time constant per compiled library, which is what made that line
+  unable to answer the question.
+
+### Added
+
+- **tcp**: a child process facility. `proc-spawn!` starts a program without
+  blocking the scheduler and answers a `proc`, or `(failed . reason)` where
+  the reason is a symbol for a refusal this library made (`proc-limit`,
+  `owner-dead`, `layout`) and a libuv error string for one the operating
+  system made. `argv` includes `argv[0]`; the options alist takes `cwd`,
+  `env` (a list of `"K=V"`; absent means inherit), `stdin`, `stdout` and
+  `stderr` (each `pipe`, `inherit` or `ignore`), `owner` (a pid, default the
+  caller) and `kill-on-owner-death` (default `#t`, SIGTERM).
+
+  The owner receives `#(proc-data ,p ,stream ,bv)`, `#(proc-eof ,p ,stream)`,
+  `#(proc-error ,p ,stream ,errno)` and `#(proc-exit ,p ,status ,signal)`.
+  `proc-write!` queues to the child's stdin against a per-process cap and
+  answers `#f` rather than growing without bound; `proc-stdin-close!` is a
+  `uv_shutdown` and not a close, so the child sees EOF **after** the last
+  byte of every write that completed. `proc-read-stop!` is real
+  backpressure — the kernel window closes and the child blocks in its write —
+  which a slow mailbox consumer is not.
+
+  `proc-close!` closes whichever pipes are still open; it is idempotent and
+  **does not kill**. The row retires only when the process handle and all
+  three pipes have closed, so a `proc` remains readable between the exit and
+  the last close. `proc-stats` answers eight numbers from one
+  interrupts-disabled region, so they describe one instant rather than eight.
+
+- **html, css**: two helper libraries for generating markup and stylesheets.
+  An HTML node is a string (escaped as text), a number, a `(raw "literal")`,
+  or `(tag (@ (attr val) ...) child ...)`; void elements emit no closing tag,
+  `script` and `style` emit their children unescaped, and a boolean attribute
+  is present (`#t`) or omitted (`#f`). Text escapes `&`, `<`, `>` and an
+  attribute value escapes `&`, `"`, `<` — each context escapes what can hurt
+  it.
+
+  A stylesheet is a list of rules, a rule is `(selector (prop value ...)
+  ...)`, and **there are no floats anywhere**: a printed flonum is not
+  guaranteed to be the number that was written, so unit forms take a whole
+  part, an optional fraction written with its own digits, and an optional
+  minimum width — `(em 1)`, `(em 0 92)`, `(em 3 4 2)` are `1em`, `0.92em`,
+  `3.04em`. `dec`, `var`, `calc`, `rgb`, `rgba`, space-joined compound
+  values, `@media`, `@keyframes` and `@supports` are supported.
+
+- **util**: four suppliers that constrain the shape of external text before
+  it is converted — `digits->exact`, `signed-digits->exact`,
+  `hex-digits->exact`, `decimal-fraction->number`. Each takes a maximum
+  length, answers `#f` for anything it will not convert, and keeps the
+  decimal value of leading zeros (`"032768"` is 32768). See **Fixed** for
+  why they exist.
+
+- **node**: a warden-supervised link reaper monitors each peer entry's link
+  process and reclaims the entry when it dies, and a peer entry's pending
+  calls and remote monitors now hang on collections owned by the entry.
+  Removing or replacing an entry moves those collections onto a cleanup
+  record published in the same transaction; the record's obligations —
+  `noconnection` to each pending call, remote-down and owner-stop for each
+  monitor, `demon-local` for each hosted agent, close the old connection,
+  stop the old link — are discharged notify-then-retire, at most 64 per
+  round, by whichever executor reaches the record first. `node-monitor-stats`
+  reports `cleanup-records` and `cleanup-obligations`, and
+  `set-link-reaper-scan-ms!` sets the rescan period before `node-start!`.
+
+  **The wire protocol is unchanged at version 5**, so unlike 1.6.0 this is
+  not a stop-the-mesh upgrade.
+
+### Fixed
+
+- **Twelve characters of text could take the process down.** Chez's
+  `string->number` honours an exactness prefix, so `#e1e99999999` asks it to
+  build the exact integer 10^99999999: it allocates without bound and never
+  returns. Every site that converted text from outside the process and
+  bounded the result **afterwards** was a one-line denial of service, because
+  the line that would have rejected the value is never reached. A radix
+  argument does not help, because the text carries its own prefixes and they
+  win: `(string->number "#e1e99999999" 10)` hangs, and at radix 16 the same
+  attack is written `(string->number "#e#d1e99999999" 16)`.
+
+  Every such site now checks the shape first, through the new suppliers:
+  the seven kdf cost fields (scrypt `N`, `r`, `p`; pbkdf2 iterations;
+  argon2id `t`, `m`, `p` — ten digits each), URL and endpoint ports (five),
+  the HTTP status code (three), chunked transfer sizes (sixteen hex digits),
+  the `q=` value in `Accept-Encoding`, cluster registration ports and the
+  redis `TIME` reply, the three RESP length lines, SCRAM iterations,
+  PostgreSQL command-tag counts, S3 control numerals and the sample
+  application's request body. Later bound checks are unchanged, and a refused
+  shape answers exactly as `#f` already did.
+
+- **sexpr**: serialising a symbol could never return. `wire-symbol?` asked
+  `string->number` before walking the name, so a symbol named
+  `#e1e99999999` hung the writer — and a symbol is whatever the process
+  turned into one, the reader not being its only supplier. The conversion is
+  now the last conjunct, where it can only ever see letters, digits and the
+  punctuation the walk admits, none of which is `#`.
+
+- **s3**: an XML numeric character reference did work quadratic in its digit
+  count (2892 ms for 200000 digits), because it accumulated every digit into
+  an exact integer and compared with the code point ceiling only at the `;`.
+  The ceiling is checked per digit. It is a bound on the **value** and not on
+  the digit count, so a reference written with leading zeros still reads.
+
+- **tls-watch, node, tcp**: a mesh link's peer entry is reclaimed when its
+  process dies. A TLS connection's watcher used to leave every path by
+  raising, which the runtime cascades into a non-trapping linked owner — so
+  an application that closed its own TLS connection and kept running was
+  killed a moment later. Separately, a link process killed outright left its
+  peer entry in the table with a dead pid: no node-down, no monitor or
+  pending-call failure, and a reconnecting same-name peer judged against the
+  stale entry.
+
+- **http**: a notice hook that raises no longer loses the listener.
+  Announcing is not part of listening, so the call is guarded and
+  `http-listen` returns its server either way; previously a raise there left
+  the listener registered behind a server nobody received.
+
+- **actor**: a panic whose output port raises is still a panic. Rendering and
+  flushing are guarded separately and `(exit 70)` sits outside both guards,
+  so a failing console port can no longer turn the death into an ordinary
+  exception with the process still running.
+
+---
+
 ## 1.6.0 — 2026-09-06
 
 *8 commits.* Distribution links can run over TLS, and both handshake proofs now
