@@ -68,7 +68,8 @@
     tls-conn-timer-id tls-last-retire-reason tls-listener-context-id
     tls-timer-free-path tls-conn-in-table? tls-eof-deliveries
     tls-swallowed-errors tls-read-trace
-    proc-handles-freed proc-exit-no-row-handles $proc-table-ref)
+    proc-handles-freed proc-exit-no-row-handles $proc-table-ref
+    $proc-last-spawned-pid)
 
   ;; (igropyr libuv) IS BELOW THIS FILE and (igropyr tls-core) beside it; both
   ;; import neither this library nor each other's consumers, so there is no
@@ -481,6 +482,19 @@
      (define (note-proc-exit-no-row! h)
        (set! proc-exit-no-row (append proc-exit-no-row (list h))))
      (define (proc-exit-no-row-handles) proc-exit-no-row)
+     ;; THE PID OF THE LAST CHILD THIS PROCESS ACTUALLY STARTED, recorded
+     ;; even when the caller is handed a failure. The orphan paths are the
+     ;; reason: uv_spawn reports an error, the caller never sees a proc, and
+     ;; yet a real child is running -- so a cell asking "was it killed, is it
+     ;; a zombie, is it gone" has no pid to ask about. Grepping ps for the
+     ;; command line answers a different question and answers it badly (a
+     ;; zombie's arguments are gone on some hosts, and an unrelated process
+     ;; can match). Set only where a child provably exists, never from
+     ;; uv_process_get_pid on a failed spawn, which reads uninitialised
+     ;; memory.
+     (define proc-last-pid #f)
+     (define (note-spawned-pid! pid) (set! proc-last-pid pid))
+     (define ($proc-last-spawned-pid) proc-last-pid)
      ;; IDENTITY, NOT FIELDS. A retained row is proved to be the SAME record
      ;; by (eq? ($proc-table-ref addr) p); reading its fields would pass just
      ;; as well against a later child's row that happens to look alike.
@@ -540,6 +554,8 @@
      (define-absent-seam tls-conn-timer-id)
      (define (note-proc-handle-freed! h) (void))
      (define (note-proc-exit-no-row! h) (void))
+     (define (note-spawned-pid! pid) (void))
+     (define-absent-seam $proc-last-spawned-pid)
      (define-absent-seam proc-handles-freed)
      (define-absent-seam proc-exit-no-row-handles)
      (define-absent-seam $proc-table-ref)
@@ -837,6 +853,25 @@
   ;; uv_shutdown_t, for the half-close of a child's stdin. Read from libuv at
   ;; load time exactly as write-req-size and the others are.
   (define shutdown-req-size (uv-req-size UV-SHUTDOWN))
+
+  ;; ---- shutdown requests: one allocator, one release -----------------------
+  ;;
+  ;; SAME CONSTRUCTION AS THE WRITE BLOCKS ABOVE, and for the same reason: one
+  ;; request is allocated in a single place and released in three (the
+  ;; pre-submission guard, the negative-submission branch, and the callback),
+  ;; and a list of release sites is the shape that lets one be missed. The
+  ;; counter is what makes the balance observable at a baseline instead of
+  ;; inferred -- shutdown-table alone cannot show it, because a request that
+  ;; was allocated and never registered is not in the table and a request the
+  ;; callback has just freed has already left it.
+  (define shutdown-reqs-live 0)
+  (define (alloc-shutdown-req!)
+    (let ((r (foreign-alloc shutdown-req-size)))
+      (set! shutdown-reqs-live (fx+ shutdown-reqs-live 1))
+      r))
+  (define (free-shutdown-req! req)
+    (set! shutdown-reqs-live (fx- shutdown-reqs-live 1))
+    (foreign-free req))
 
   ;; delivery hook: (deliver owner-pid msg); installed by (igropyr actor)
   (define deliver (lambda (owner msg) (void)))
@@ -1444,7 +1479,7 @@
       (lambda (req status)
         (let ((c (hashtable-ref shutdown-table req #f)))
           (hashtable-delete! shutdown-table req)
-          (foreign-free req)
+          (free-shutdown-req! req)
           ;; callback context: an escaping raise would unwind into C
           (guard (e (#t (note-swallowed! 'proc-shutdown-cb e)))
             (when c (tcp-close-raw! c)))))
@@ -3585,6 +3620,26 @@
       ;; alert would be written AFTER a TLS endpoint said it was done, which
       ;; the peer is entitled to treat as a protocol violation rather than
       ;; as data. The sealing entry below is the one writer that passes.
+      ;;
+      ;; TEST SEAM 'write-before-region -- OWNING REGION: NONE on the path
+      ;; that matters, which is the whole point of putting it HERE. The
+      ;; block exists and is filled, and the state has not yet been re-read,
+      ;; so a victim parked on this line holds a block whose connection can
+      ;; be closed underneath it. Resuming it then drives the in-region
+      ;; rejection below -- the release site that nothing else can reach,
+      ;; because every ordinary caller tests the state before allocating.
+      ;;
+      ;; WHETHER IT PARKS DEPENDS ON HOW THE WRITE ARRIVED, and a cell has
+      ;; to know which of the three it is getting. Measured, not reasoned:
+      ;;   - a payload too big for the scratch buffer arrives at depth 1 and
+      ;;     PARKS -- the only path that gives a cell the window;
+      ;;   - a payload that fits the scratch reaches this procedure only when
+      ;;     uv_try_write refused or wrote a prefix, and then it arrives from
+      ;;     inside uv-scratch-lease's region and counts a SKIP;
+      ;;   - a small write that succeeds outright NEVER REACHES HERE AT ALL,
+      ;;     so the point is not hit and the row stays `armed`.
+      ;; node.sc's writes inside `atomically` are in the skipping class.
+      (inject-barrier! 'write-before-region)
       (with-interrupts-disabled
         (if (or (not (eq? (conn-state c) 'open)) (conn-raw-sealed? c))
             (begin
@@ -5443,6 +5498,15 @@
         (assertion-violation 'proc-spawn! "file must be a string" file))
       (unless (and (list? argv) (for-all string? argv))
         (assertion-violation 'proc-spawn! "argv must be a list of strings" argv))
+      ;; AN EMPTY argv IS REFUSED HERE rather than marshalled. It passes the
+      ;; test above, and what it produces is args[0] == NULL, which execvp is
+      ;; not defined for: the failure would happen in the child, after the
+      ;; fork, as whatever that platform does with a null program name. argv
+      ;; carries argv[0] by this facility's contract, so its absence is a
+      ;; caller error and says so at the only point that can still name the
+      ;; caller.
+      (when (null? argv)
+        (assertion-violation 'proc-spawn! "argv must include argv[0]" argv))
       (when (and cwd (not (string? cwd)))
         (assertion-violation 'proc-spawn! "cwd must be a string" cwd))
       (when (and env (not (and (list? env) (for-all string? env))))
@@ -5767,6 +5831,7 @@
                                (begin
                                  (set! released? #t)
                                  (set! child-pid (uv-process-get-pid ph))
+                                 (note-spawned-pid! child-pid)
                                  (uv-process-kill ph 9)
                                  ;; INJECTION POINT 'proc-orphan-publish
                                  ;; (fault) -- OWNING GUARD: the one on the
@@ -5808,6 +5873,7 @@
                                        (cons 'failed (uv-strerror r)))))))
                           (else
                            (set! child-pid (uv-process-get-pid ph))
+                           (note-spawned-pid! child-pid)
                            (set! p (make-proc ph owner #f #f #f child-pid #f
                                               'running #t 0 kill?))
                            ;; the conns exist but are UNPUBLISHED: nothing can
@@ -5990,12 +6056,12 @@
               ;; way out or nothing would ever finish it.
               (guard (e (#t (when req
                               (hashtable-delete! shutdown-table req)
-                              (foreign-free req)
+                              (free-shutdown-req! req)
                               (set! req #f))
                             (tcp-close! in)
                             (raise e)))
                 (conn-set-raw-sealed! in #t)
-                (set! req (foreign-alloc shutdown-req-size))
+                (set! req (alloc-shutdown-req!))
                 ;; INJECTION POINT 'proc-shutdown-register (fault) -- OWNING
                 ;; GUARD: the one above, while the request exists and nothing
                 ;; else knows about it. That is the only window in which the
@@ -6011,7 +6077,7 @@
                   (if (< r 0)
                       (begin
                         (hashtable-delete! shutdown-table req)
-                        (foreign-free req)
+                        (free-shutdown-req! req)
                         (set! req #f)
                         (set! shutdown-immediate-errors
                               (fx+ shutdown-immediate-errors 1))
@@ -6090,6 +6156,7 @@
                     (cons 'pipes pipe-conns-live)
                     (cons 'queued-bytes queued)
                     (cons 'shutdown-pending (hashtable-size shutdown-table))
+                    (cons 'shutdown-requests-live shutdown-reqs-live)
                     (cons 'shutdown-immediate-errors shutdown-immediate-errors))
               (let ((p (vector-ref ps i)))
                 (loop (fx+ i 1)
