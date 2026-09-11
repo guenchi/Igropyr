@@ -265,8 +265,8 @@
            ;; uv_accept declining an announced connection joins them:
            ;; same errno domain, and its caller reads only "negative
            ;; means refused".
-           ((uv-write-neg getaddrinfo-refused tcp-connect-refused
-             accept-refused)
+           ((uv-write-neg uv-write-sealing-neg getaddrinfo-refused
+             tcp-connect-refused accept-refused)
             (unless (and (fixnum? value) (fx< value 0) (fx>= value -4095))
               (assertion-violation '$inject-arm!
                 "this point needs an exact libuv error code in [-4095,-1]"
@@ -295,12 +295,16 @@
               (assertion-violation '$inject-arm!
                 "this point needs a libuv error code in [-4095,-1]"
                 value)))
-           ;; Read by `unless`, so the ONLY value that does anything is a
-           ;; true one -- #f is exactly what the unarmed point already
-           ;; yields, and arming with it would suppress nothing while
-           ;; looking like a live arm. #t rather than any truthy object
-           ;; because neither caller inspects it further.
-           ((tls-owner-close-skip tls-ping-suppress)
+           ;; Three points whose value is read only for its truth: the
+           ;; first two by `unless`, the third as the test of an `if`. A
+           ;; true one is the only value that does anything -- for the
+           ;; first two #f is exactly what the unarmed point yields, and
+           ;; for the third #f would force a SEALED connection to be
+           ;; treated as open, which is a different perturbation from the
+           ;; one that point exists for and deserves its own name rather
+           ;; than a widened clause here. #t rather than any truthy
+           ;; object because no caller inspects it further.
+           ((tls-owner-close-skip tls-ping-suppress tls-sealing-reject)
             (unless (eq? value #t)
               (assertion-violation '$inject-arm!
                 "this point is read as a flag: it takes #t (#f is indistinguishable from unarmed)"

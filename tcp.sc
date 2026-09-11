@@ -793,10 +793,13 @@
   ;; free last and unconditional. unindex-owner! allocates (remp), so a raise
   ;; there must not be able to keep the handle block alive forever.
   ;;
-  ;; THE FREE IS THE ONE PLACE A PROCESS HANDLE BLOCK IS RELEASED once a row
-  ;; has named it, which is what makes the freed-address log a complete record
-  ;; of that rule (the no-row close path below is the other, and it releases a
-  ;; block no row ever named).
+  ;; THREE SITES RELEASE A PROCESS HANDLE BLOCK AND ALL THREE ARE COUNTED
+  ;; AND LOGGED, which is what makes the freed-address log a complete record
+  ;; rather than a partial one: this retirement; the no-row close path, for a
+  ;; block no row ever named; and proc-spawn!'s pre-spawn release, for a block
+  ;; libuv never saw. Only this one can name an address a row has used, so
+  ;; only this one can report the rule being broken -- but a log missing the
+  ;; other two would answer "not freed" for reasons it could not distinguish.
   (define (retire-proc-row! p)
     (let ((h (proc-handle p)))
       (hashtable-delete! proc-table h)
@@ -3605,7 +3608,14 @@
   ;; asynchronous one from the completion callback cannot both take effect.
   (define (enqueue-write-sealing! c t block buf-ptr on-done)
     (with-interrupts-disabled
-      (if (or (not (eq? (conn-state c) 'open)) (conn-raw-sealed? c))
+      ;; INJECTION POINT 'tls-sealing-reject -- an OVERRIDE on the rejection
+      ;; TEST, not on a call: the test is evaluated and its answer replaced,
+      ;; so an armed cell reaches the release below on a connection that is
+      ;; genuinely open. It needs a seam because this entry is private -- the
+      ;; close-notify path is its only caller and a second close is suppressed
+      ;; by finishing? -- so no ordinary write can make this branch run.
+      (if (inject-override! 'tls-sealing-reject
+            (or (not (eq? (conn-state c) 'open)) (conn-raw-sealed? c)))
           (begin
             (inject-barrier! 'write-block-released-sealing-reject)
             (free-write-block! block)
@@ -5285,11 +5295,17 @@
                   ;; queued behind an unknown amount of application data; if
                   ;; no timer can be armed, nothing would ever end the wait,
                   ;; so the close happens now instead.
-                  ;; INJECTION POINT 'tls-timer-rearm-fail -- an override on the
-                  ;; rearm result, so a cell can reach the release below without
-                  ;; breaking a timer for real.
-                  (if (not (inject-override! 'tls-timer-rearm-fail
-                             (tls-timer-rearm! t tls-shutdown-ms)))
+                  ;; NO POINT OF ITS OWN HERE, DELIBERATELY. The seam that
+                  ;; drives this branch is 'tls-timer-rearm-fail, and it
+                  ;; already sits inside tls-timer-rearm! on the uv_timer_start
+                  ;; it wraps: armed with a negative code that call answers -1,
+                  ;; tls-timer-rearm! answers #f, and this test takes the
+                  ;; failure arm. A second wrapper around the BOOLEAN here
+                  ;; would share that one name across two different value
+                  ;; domains -- the same arming would be read as an errno in
+                  ;; one place and as a flag in the other, and whichever site
+                  ;; consumed the occurrence first would decide which.
+                  (if (not (tls-timer-rearm! t tls-shutdown-ms))
                       (begin
                         (inject-barrier! 'write-block-released-timer-fail)
                         (free-write-block! blk)
@@ -5373,12 +5389,15 @@
   ;; what it buys is that no callback can observe a half-built proc: the exit,
   ;; read and close callbacks run only inside uv-poll!, which runs only in the
   ;; event-loop process, which cannot be scheduled while this one holds the
-  ;; region. Nothing inside yields, polls or calls an application hook.
+  ;; region. Nothing inside yields or polls, and the one hook it calls --
+  ;; uv-alive?, for the admission re-check -- is a predicate that does
+  ;; neither.
   ;;
-  ;; THE ONE SYNCHRONOUS WINDOW IN THIS FACILITY IS uv_spawn ITSELF. On the
-  ;; Unix path the parent reads the exec-error pipe with no timeout, so
+  ;; THE ONE SYNCHRONOUS WINDOW IN THIS FACILITY IS uv_spawn ITSELF. libuv's
+  ;; unix spawn path reads the child's exec-error pipe with no timeout, so
   ;; process CREATION is "milliseconds, typically" rather than bounded. That
-  ;; is a documented property of this call and of nothing else here.
+  ;; is a property of this one call and of nothing else here: no other
+  ;; operation in this facility waits on the child at all.
   (define (proc-spawn! file argv . opts)
     (let* ((o (proc-opt-alist opts))
            (cwd (proc-opt o 'cwd #f))
@@ -5446,6 +5465,13 @@
             ;; and the release paths act on the flags rather than on a guess
             ;; about how far the sequence got. That is what keeps a failure in
             ;; the middle from being either a leak or a double free.
+            ;;
+            ;; ONE RESIDUAL, NAMED RATHER THAN PAPERED OVER: the cons below
+            ;; runs after its foreign-alloc, so a raise between the two loses
+            ;; that one block. Closing it would need the allocation and the
+            ;; record to be one operation, which foreign-alloc does not offer;
+            ;; it is the same gap listener-backlog-effective states for its
+            ;; three buffers, and it is bounded by one allocation.
             (define (alloc! n)
               (let ((b (foreign-alloc n)))
                 (set! blocks (cons b blocks))
@@ -5525,7 +5551,14 @@
               (free-blocks!)
               ;; NEVER INITIALISED: libuv has not seen this block, so it is
               ;; freed directly rather than closed.
-              (when ph (foreign-free ph) (set! ph #f))
+              ;; COUNTED POINT 'proc-handle-freed -- the third and last site
+              ;; that releases a process handle block, counted and logged
+              ;; like the other two so the log is complete.
+              (when ph
+                (inject-barrier! 'proc-handle-freed)
+                (note-proc-handle-freed! ph)
+                (foreign-free ph)
+                (set! ph #f))
               (close-pipe-handles!))
             (define (release-spawned-inactive!)
               (set! released? #t)
@@ -5549,8 +5582,11 @@
                 (proc-set-stderr! p #f))
               (close-pipe-handles!)
               (if row?
-                  ;; the row is there: rewrite it in place, which is pointer
-                  ;; writes and cannot fail
+                  ;; the row is there: rewriting it is pointer writes and
+                  ;; cannot fail. The owner entry may still be missing --
+                  ;; publishing a row and indexing its owner are two
+                  ;; allocating steps -- and recovering it is the one step
+                  ;; here that can raise, which is why it is guarded.
                   (begin (proc-set-child! p 'orphan) (recover-owner-entry!))
                   ;; no row: publish one now from the record's current flags.
                   ;; A raise at the row insertion leaves the no-row state, and
