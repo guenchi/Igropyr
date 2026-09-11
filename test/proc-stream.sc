@@ -234,7 +234,7 @@
         (check "P20: second -> #f" (not (proc-stdin-close! p)))
         (check "P20: cat exits at EOF" (equal? (wait-exit p 3000) '(0 . 0)))
         (collect p 'stdout 1000) (collect p 'stderr 1000)
-        (check "P20: no shutdown request pending" (eqv? (stat 'shutdown-pending) 0) (stat 'shutdown-pending))
+        (check "P20: no shutdown request pending and none live (allocated = freed)" (and (eqv? (stat 'shutdown-pending) 0) (eqv? (stat 'shutdown-requests-live) 0)) (stat 'shutdown-pending) (stat 'shutdown-requests-live))
         (back-to-base! "P20: counts back" b0 3000))
       (let ((p (spawn-sh "exec sleep 5")))
         (proc-close! p)
@@ -248,8 +248,8 @@
         (check "P20 cancel: a shutdown request is pending" (eqv? (stat 'shutdown-pending) 1) (stat 'shutdown-pending))
         (let ((pending (- accepted (length statuses))))
           (proc-close! p)
-          (check "P20 cancel: the request was cancelled and freed (pending 0), the backlog settled ECANCELED, queued 0"
-                 (within? 3000 (lambda () (and (eqv? (stat 'shutdown-pending) 0) (eqv? (proc-queued p) 0) (= (length statuses) accepted)))) (list (stat 'shutdown-pending) (proc-queued p) statuses))
+          (check "P20 cancel: the request was cancelled and freed (pending 0, live 0), the backlog settled ECANCELED, queued 0"
+                 (within? 3000 (lambda () (and (eqv? (stat 'shutdown-pending) 0) (eqv? (stat 'shutdown-requests-live) 0) (eqv? (proc-queued p) 0) (= (length statuses) accepted)))) (list (stat 'shutdown-pending) (stat 'shutdown-requests-live) (proc-queued p) statuses))
           (check "P20 cancel: the cancelled writes are named operation canceled" (= pending (length (filter ecanceled? statuses))) (map (lambda (s) (if (< s 0) (uv-strerror s) s)) statuses) pending))
         (proc-kill! p 9) (wait-exit p 3000)
         (back-to-base! "P20 cancel: counts back" b0 3000))

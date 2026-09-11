@@ -62,15 +62,21 @@
              (send main (vector 'owned p))
              (let loop () (receive (m (send main m) (loop))))))))
 (define (owned! main cmd) (let ((o (owned-spawn! main cmd))) (receive (after 3000 (cons o #f)) (`#(owned ,p) (cons o p)))))
-;; the last spawned child's pid (test seam), for an orphan the caller never sees
+;; the last spawned child's pid (test seam), for an orphan the caller never sees.
+;; kill -0 answers "exists" (a zombie included) or ESRCH; only when it exists is ps
+;; consulted for the state, and a ps that then fails or says nothing is a PROBE
+;; FAILURE, which the cell reports, not a reaping
 (define (child-state pid)
-  (let* ((f "/tmp/igropyr-ps-state.txt")
-         (r (system (string-append "ps -o stat= -p " (number->string pid) " > " f " 2>/dev/null"))))
-    (let ((t (guard (e (#t "")) (call-with-input-file f get-string-all))))
-      (cond ((not (eqv? r 0)) 'gone)
-            ((= (string-length t) 0) 'gone)
-            ((char=? (string-ref t 0) #\Z) 'zombie)
-            (else 'live)))))
+  (let ((exists (system (string-append "kill -0 " (number->string pid) " 2>/dev/null"))))
+    (if (not (eqv? exists 0))
+        'gone
+        (let* ((f "/tmp/igropyr-ps-state.txt")
+               (r (system (string-append "ps -o stat= -p " (number->string pid) " > " f " 2>/dev/null")))
+               (t (guard (e (#t (eof-object))) (call-with-input-file f get-string-all))))
+          (cond ((not (eqv? r 0)) 'probe-failed)
+                ((or (eof-object? t) (= (string-length t) 0)) 'probe-failed)
+                ((char=? (string-ref t 0) #\Z) 'zombie)
+                (else 'live))))))
 (define (reaped? pid) (eq? (child-state pid) 'gone))
 (define (count! point) (inject-arm-barrier! point 1000000 60000))
 (define (hits point) (or (inject-hits point) 0))
@@ -323,9 +329,11 @@
       (inject-disarm!)
 
       ;; ---- P30: write-block ownership, plaintext ----------------------------------------------------
-      (let ((p (spawn-sh "exec sleep 5")) (w0 (write-blocks-live-count)) (t0 (write-table-size))
-            (rf (count! 'write-block-released-register-fail)))
-        (check "P30 pipe: premise -- saturated (1 MiB queued)" (and (proc-write! p (make-bytevector 1048576 8)) (> (proc-queued p) 0)) (proc-queued p))
+      ;; the child sleeps first (so the 1 MiB queues and the fault hits the queued path),
+      ;; then becomes cat: the following write must complete with status 0 and be echoed
+      (let ((p (spawn-sh "sleep 0.7; exec cat")) (w0 (write-blocks-live-count)) (t0 (write-table-size))
+            (rf (count! 'write-block-released-register-fail)) (payload (make-bytevector 1048576 8)))
+        (check "P30 pipe: premise -- saturated (1 MiB queued)" (and (proc-write! p payload) (> (proc-queued p) 0)) (proc-queued p))
         (let ((q0 (proc-queued p)) (w1 (write-blocks-live-count)) (t1 (write-table-size)))
           (inject-arm-fault! 'write-register-oom 1)
           (let ((r (guard (e (#t 'raised)) (proc-write! p (make-bytevector 65536 9)))))
@@ -335,11 +343,14 @@
             (check "P30 pipe: queued refunded to the backlog's charge" (eqv? (proc-queued p) q0) (list (proc-queued p) q0))))
         (uncount! rf)
         (inject-disarm!)
-        (let ((st #f))
-          (check "P30 pipe: the wrapper is still usable: a following write is accepted" (proc-write! p (make-bytevector 16 1) (lambda (s) (set! st s))))
-          (proc-close! p)
-          (check "P30 pipe: ...and settles (cancelled by the close, status negative) with queued 0" (within? 3000 (lambda () (and st (< st 0) (eqv? (proc-queued p) 0)))) st (proc-queued p)))
-        (proc-kill! p 9) (wait-exit p 3000) (drain! 300)
+        (let ((st #f) (marker (string->utf8 "tail-marker")))
+          (check "P30 pipe: the wrapper is still usable: a following write is accepted" (proc-write! p marker (lambda (s) (set! st s))))
+          (check "P30 pipe: ...and completes with status 0 once the child reads, queued 0" (within? 8000 (lambda () (and (eqv? st 0) (eqv? (proc-queued p) 0)))) st (proc-queued p))
+          (check "P30 pipe: stdin closes cleanly" (proc-stdin-close! p))
+          (let ((echo (collect p 'stdout 15000)) (expect (cat (list payload marker))))
+            (check "P30 pipe: the child echoed the 1 MiB and the marker exactly (nothing lost around the fault)" (equal? echo expect) (if (bytevector? echo) (bytevector-length echo) echo)))
+          (check "P30 pipe: exit 0" (equal? (wait-exit p 5000) '(0 . 0))))
+        (collect p 'stderr 1000) (drain! 300)
         (check "P30 pipe: live blocks and table back after the close" (within? 2000 (lambda () (and (eqv? (write-blocks-live-count) w0) (eqv? (write-table-size) t0)))) (list (write-blocks-live-count) (write-table-size)))
         (back-to-base! "P30 pipe: counts back" b0 3000))
       ;; the same on an ordinary TCP connection: registration fault, state rejection, negative submission
