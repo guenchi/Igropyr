@@ -11,7 +11,7 @@
 ;;   P24  the failed-spawn queue repair (F13): (a) the real error: path via a bogus stdio
 ;;        stream, (b) the simulated queue removal on an active orphan; the neighbours are
 ;;        closed and replaced BEFORE the loop runs the failed handle's close
-;;   P25  the process handle block is retained until the row retires (per-address free log)
+;;   P25  the process handle block is retained until the row retires (per-address free log: proc-handles-freed)
 ;;   P27  rollback faults: second pipe init skipped, read-start negative, publish fault,
 ;;        index fault (row kept), recover-index fault (row kept, unindexed once), rollback
 ;;        unindex fault, orphan publish fault (re-raised; no-row path; no zombie)
@@ -163,18 +163,18 @@
         (check "P25: A exited" (equal? (wait-exit a 3000) '(0 . 0)))
         (check "P25: A's process handle closed (exited-unclosed 1), row still open (stdout read-stopped)"
                (within? 2000 (lambda () (and (eq? (proc-state a) 'exited) (eqv? (stat 'exited-unclosed) 1)))) (list (proc-state a) (stat 'exited-unclosed)))
-        (check "P25: A's block is not in the freed-address log" (not (memv (proc-handle a) ($proc-freed-handles))))
+        (check "P25: A's block is not in the freed-address log" (not (memv (proc-handle a) (proc-handles-freed))))
         (let ((later (let loop ((i 0) (acc '())) (if (= i 100) acc (loop (+ i 1) (cons (spawn-sh "true") acc))))))
           (let ((exits (map (lambda (p) (wait-exit p 5000)) later)))
             (check "P25: 100 later children each exited 0 for their own proc" (for-all (lambda (e) (equal? e '(0 . 0))) exits) (length (filter (lambda (e) (not (equal? e '(0 . 0)))) exits))))
           (drain! 500)
           (check "P25: the later children closed" (within? 5000 (lambda () (eqv? (proc-count) (+ (list-ref b0 3) 1)))) (proc-count)))
         (check "P25: proc-table[handle A] is still A (identity)" (eq? ($proc-table-ref (proc-handle a)) a))
-        (check "P25: A's block still not freed while its row lives" (not (memv (proc-handle a) ($proc-freed-handles))))
+        (check "P25: A's block still not freed while its row lives" (not (memv (proc-handle a) (proc-handles-freed))))
         (proc-read-start! a 'stdout)
         (check "P25: A's data and EOF after read-start" (equal? (collect a 'stdout 3000) (string->utf8 "x\n")))
         (collect a 'stderr 2000)
-        (check "P25: A closed and its block freed exactly once" (within? 3000 (lambda () (and (eq? (proc-state a) 'closed) (= 1 (length (filter (lambda (x) (eqv? x (proc-handle a))) ($proc-freed-handles))))))) (list (proc-state a)))
+        (check "P25: A closed and its block freed exactly once" (within? 3000 (lambda () (and (eq? (proc-state a) 'closed) (= 1 (length (filter (lambda (x) (eqv? x (proc-handle a))) (proc-handles-freed))))))) (list (proc-state a)))
         (back-to-base! "P25: counts back" b0 3000))
 
       ;; ---- P27: rollback faults ------------------------------------------------------------
