@@ -55,6 +55,14 @@
 (t "hex: max-len + 1 refused" (hex-digits->exact "1ffffffffffffffff" 16) #f)
 (t "hex: the exponent form is refused even though e is a hex digit (# is not)" (hex-digits->exact "#e1e9" 16) #f)
 (t "hex: #x prefix refused" (hex-digits->exact "#x10" 16) #f)
+;; the radix 16 SPELLING of the attack: at this radix `e` is a digit, so
+;; "#e1e99999999" is an ordinary hex integer (131425999257, 50 ms) and `#e` on
+;; an already-exact integer does nothing. The hanging spelling has to carry
+;; `#d` to switch the reading back to decimal -- either prefix order -- which
+;; the shape check refuses because `#` is not a hex digit
+(t "hex: the decimal-prefix attack is refused (#e#d)" (hex-digits->exact "#e#d1e99999999" 16) #f)
+(t "hex: the same with the prefixes the other way round" (hex-digits->exact "#d#e1e99999999" 16) #f)
+(t "hex: a legal numeral of that length still reads" (hex-digits->exact "1e99999999" 16) 131425999257)
 (t "hex: g refused" (hex-digits->exact "1g" 16) #f)
 (t "hex: empty refused" (hex-digits->exact "" 16) #f)
 (t "hex: a sign refused" (hex-digits->exact "-1" 16) #f)

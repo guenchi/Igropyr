@@ -6174,10 +6174,12 @@
       (for-each (lambda (c) (when c (tcp-close! c))) cs)
       (void)))
 
-  ;; ONE REGION, so the seven numbers describe one instant rather than seven.
-  ;; An alist rather than a tuple: the design named five quantities and two
-  ;; more are read by the shutdown cells, and a key can be added later without
-  ;; moving anything a reader already names.
+  ;; ONE REGION, so the eight numbers describe one instant rather than eight.
+  ;; An alist rather than a tuple: the design named five quantities, the
+  ;; shutdown cells read three more, and a key can be added later without
+  ;; moving anything a reader already names -- which is what happened, and is
+  ;; why a count written into this comment goes stale. Read the list, not this
+  ;; sentence.
   ;;
   ;; It walks proc-table, which allocates -- acceptable here because this is a
   ;; diagnostic call bounded by max-procs. socket-conn-count is the one that
