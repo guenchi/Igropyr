@@ -1,0 +1,78 @@
+#!chezscheme
+;; Numeric text guards (igropyr util): text from outside the process reaches
+;; string->number only after its SHAPE is constrained -- ASCII digits (or hex
+;; digits, or one optional leading minus, or a bounded decimal fraction) and a
+;; bounded length. Without that, (string->number "#e1e99999999") never returns.
+;; Every check here is pure.
+(import (chezscheme) (igropyr util))
+(define fails 0)
+(define (check label ok . info)
+  (if ok (begin (display "  ok  ") (display label) (newline))
+      (begin (set! fails (+ fails 1)) (display "FAIL  ") (display label)
+             (for-each (lambda (x) (display " ") (write x)) info) (newline))))
+(define (t label got want) (check label (equal? got want) got want))
+
+;; ---- digits->exact -------------------------------------------------------------
+(t "digits: plain" (digits->exact "32768" 10) 32768)
+(t "digits: leading zeros keep their value" (digits->exact "032768" 10) 32768)
+(t "digits: a single zero" (digits->exact "0" 10) 0)
+(t "digits: exactly max-len accepted" (digits->exact "1234567890" 10) 1234567890)
+(t "digits: max-len + 1 refused" (digits->exact "12345678901" 10) #f)
+(t "digits: the exponent form is refused before any conversion" (digits->exact "#e1e99999999" 10) #f)
+(t "digits: a radix prefix is refused" (digits->exact "#x10" 10) #f)
+(t "digits: 1e5 is refused" (digits->exact "1e5" 10) #f)
+(t "digits: a plus sign is refused" (digits->exact "+1" 10) #f)
+(t "digits: a minus sign is refused" (digits->exact "-1" 10) #f)
+(t "digits: leading space refused" (digits->exact " 1" 10) #f)
+(t "digits: trailing space refused" (digits->exact "1 " 10) #f)
+(t "digits: empty refused" (digits->exact "" 10) #f)
+(t "digits: a dot refused" (digits->exact "1.5" 10) #f)
+(t "digits: non-ASCII digits refused" (digits->exact "\x661;" 10) #f)
+(t "digits: a non-string is refused" (digits->exact 'x 10) #f)
+(t "digits: the result is an exact integer" (let ((n (digits->exact "42" 10))) (and (integer? n) (exact? n))) #t)
+;; ---- signed-digits->exact -------------------------------------------------------
+(t "signed: -1 accepted" (signed-digits->exact "-1" 20) -1)
+(t "signed: 0 accepted" (signed-digits->exact "0" 20) 0)
+(t "signed: unsigned digits accepted" (signed-digits->exact "123" 20) 123)
+(t "signed: a lone minus refused" (signed-digits->exact "-" 20) #f)
+(t "signed: two minuses refused" (signed-digits->exact "--1" 20) #f)
+(t "signed: a plus refused" (signed-digits->exact "+1" 20) #f)
+(t "signed: max-len counts the sign" (signed-digits->exact "-123456789012345678901" 21) -123456789012345678901)
+(t "signed: max-len + 1 refused" (signed-digits->exact "-1234567890123456789012" 21) #f)
+(t "signed: the exponent form is refused" (signed-digits->exact "-#e1e99999999" 20) #f)
+(t "signed: the exponent form is refused (no sign)" (signed-digits->exact "#e1e99999999" 20) #f)
+;; ---- hex-digits->exact ----------------------------------------------------------
+(t "hex: lower case" (hex-digits->exact "ff" 16) 255)
+(t "hex: upper case" (hex-digits->exact "FF" 16) 255)
+(t "hex: mixed" (hex-digits->exact "1aB" 16) 427)
+(t "hex: zero" (hex-digits->exact "0" 16) 0)
+(t "hex: exactly max-len accepted" (hex-digits->exact "ffffffffffffffff" 16) 18446744073709551615)
+(t "hex: max-len + 1 refused" (hex-digits->exact "1ffffffffffffffff" 16) #f)
+(t "hex: the exponent form is refused even though e is a hex digit (# is not)" (hex-digits->exact "#e1e9" 16) #f)
+(t "hex: #x prefix refused" (hex-digits->exact "#x10" 16) #f)
+(t "hex: g refused" (hex-digits->exact "1g" 16) #f)
+(t "hex: empty refused" (hex-digits->exact "" 16) #f)
+(t "hex: a sign refused" (hex-digits->exact "-1" 16) #f)
+;; ---- decimal-fraction->number ----------------------------------------------------
+(t "fraction: 0" (decimal-fraction->number "0" 8) 0)
+(t "fraction: 1" (decimal-fraction->number "1" 8) 1)
+(t "fraction: 0.5" (decimal-fraction->number "0.5" 8) 1/2)
+(t "fraction: 1.000" (decimal-fraction->number "1.000" 8) 1)
+(t "fraction: the result is exact" (exact? (decimal-fraction->number "0.5" 8)) #t)
+(t "fraction: 1e5 refused" (decimal-fraction->number "1e5" 8) #f)
+(t "fraction: the exponent form refused" (decimal-fraction->number "#e1e99999999" 8) #f)
+(t "fraction: two dots refused" (decimal-fraction->number "1.2.3" 8) #f)
+(t "fraction: a lone dot refused" (decimal-fraction->number "." 8) #f)
+(t "fraction: empty refused" (decimal-fraction->number "" 8) #f)
+(t "fraction: a sign refused" (decimal-fraction->number "-0.5" 8) #f)
+(t "fraction: max-len + 1 refused" (decimal-fraction->number "0.1234567" 8) #f)
+(t "fraction: exactly max-len accepted" (decimal-fraction->number "0.123456" 8) 123456/1000000)
+;; the two edge spellings are pinned to the supplier's stated rule (a digit on each
+;; side of the dot is not required by CSS/HTTP q-values: "1." and ".5" are refused,
+;; matching http's precedent of digits-only tokens)
+(t "fraction: trailing dot refused" (decimal-fraction->number "1." 8) #f)
+(t "fraction: leading dot refused" (decimal-fraction->number ".5" 8) #f)
+
+(if (zero? fails)
+    (begin (display "ALL NUMBER-GUARDS TESTS PASSED\n") (exit 0))
+    (begin (display "NUMBER-GUARDS VERDICT: ") (display fails) (display " failed case(s)\n") (exit 1)))
