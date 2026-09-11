@@ -5741,20 +5741,37 @@
                                  ;; path closes and frees it; it is never
                                  ;; closed here, because closing an active
                                  ;; process handle leaves the child unreaped.
-                                 (guard (e2 (#t (void)))
-                                   (let ((op (make-proc ph owner #f #f #f
-                                                        child-pid #f 'orphan
-                                                        #t 0 kill?)))
-                                     (inject-fault! 'proc-orphan-publish)
-                                     (hashtable-set! proc-table ph op)
-                                     (set! p op)
-                                     (set! row? #t)
-                                     (index-owner! owner 'proc ph)
-                                     (set! idx? #t)))
-                                 ;; libuv closed only the descriptors it
-                                 ;; opened; these handles are ours
-                                 (close-pipe-handles!)
-                                 (cons 'failed (uv-strerror r)))))
+                                 ;;
+                                 ;; THE CONDITION IS HELD, NOT SWALLOWED, and
+                                 ;; re-raised below. The caller has to learn
+                                 ;; that its spawn ended in an allocation
+                                 ;; failure and not merely in the libuv error
+                                 ;; uv_spawn reported: those are two different
+                                 ;; events and only one of them says the
+                                 ;; process is out of memory. The guard exists
+                                 ;; solely so the pipe handles below are still
+                                 ;; released on the way out -- an escape
+                                 ;; straight to the region's guard would skip
+                                 ;; them, and that guard cannot close them
+                                 ;; either, because this branch has already
+                                 ;; marked the release done.
+                                 (let ((pub-err #f))
+                                   (guard (e2 (#t (set! pub-err e2)))
+                                     (let ((op (make-proc ph owner #f #f #f
+                                                          child-pid #f 'orphan
+                                                          #t 0 kill?)))
+                                       (inject-fault! 'proc-orphan-publish)
+                                       (hashtable-set! proc-table ph op)
+                                       (set! p op)
+                                       (set! row? #t)
+                                       (index-owner! owner 'proc ph)
+                                       (set! idx? #t)))
+                                   ;; libuv closed only the descriptors it
+                                   ;; opened; these handles are ours
+                                   (close-pipe-handles!)
+                                   (if pub-err
+                                       (raise pub-err)
+                                       (cons 'failed (uv-strerror r)))))))
                           (else
                            (set! child-pid (uv-process-get-pid ph))
                            (set! p (make-proc ph owner #f #f #f child-pid #f
