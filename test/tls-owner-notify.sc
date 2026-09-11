@@ -175,6 +175,9 @@
     ;; ---- O4 / O1b: the gate holder (a second process) dies while the owner lives
     (let* ((srv (raw-tls-server-start "127.0.0.1" port (in-dir "good.pem") (in-dir "good.key")))
            (wbase (tls-live-watcher-count))
+           ;; a stale report from the earlier hold server (its abort's raw-server-failed
+           ;; arrives after O6a stopped waiting) must not be taken for this accept
+           (_drain (let drain () (receive (after 0 (void)) (`#(raw-server-failed ,why) (drain)) (`#(raw-server-session ,s0) (raw-tls-session-close! s0) (drain)))))
            (os (established! "O4" srv)) (o (car os)) (s (cdr os))
            (t (inject-arm-barrier! 'tls-after-held 1 30000)))
       (send o (vector 'do-spawn-writer (make-bytevector (* 4 1024 1024) 65)))
@@ -187,7 +190,7 @@
              (kill p 'o4-holder-kill)
              (check "O4: the holder is dead" (within? 3000 (lambda () (not (process-alive? p)))))
              (let ((e (expect! "O4: the live owner received a tcp-error (A' on holder death)" o 5000 'tcp-error)))
-               (check "O4: ...naming the holder's death" (and (pair? e) (let ((r (cadr e))) (and (pair? r) (eq? (cdr r) 'o4-holder-kill)))) e))
+               (check "O4: ...naming the holder's death" (and (pair? e) (eq? (cadr e) 'o4-holder-kill)) e))
              (check "O4: the retirement path is the holder's death" (eq? (retire-path) 'down) (tls-last-retire-reason))
              (quiet! "O4: exactly one tcp-error, no eof, nothing else" o 800)
              (check "O1b: the non-trapping owner survived the watcher's exit (exited normal, not raised)" (process-alive? o))
