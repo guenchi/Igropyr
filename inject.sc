@@ -331,6 +331,32 @@
               (assertion-violation '$inject-arm!
                 "this point forces a missing binding: it takes #f (a true value is indistinguishable from unarmed)"
                 value)))
+           ;; The four child-process points whose callers ask only
+           ;; (< result 0): a pipe init, a spawn, a read start and a
+           ;; stdin shutdown. Same reading as the timer points above --
+           ;; a non-negative value is indistinguishable from not arming
+           ;; at all -- and the same libuv error range, because for
+           ;; three of them the value also reaches the caller through
+           ;; uv-strerror or (failed . reason).
+           ((proc-uv-spawn-result proc-alloc-pipe-fail
+             proc-read-start-result proc-uv-shutdown-result)
+            (unless (and (fixnum? value) (fx< value 0) (fx>= value -4095))
+              (assertion-violation '$inject-arm!
+                "this point needs a libuv error code in [-4095,-1]"
+                value)))
+           ;; Three flags, read by `when`: #t is the only value that
+           ;; does anything, and #f is exactly what the unarmed point
+           ;; already yields. None of the three callers inspects the
+           ;; value further -- one rewrites a stdio container, one
+           ;; performs a queue removal, one settles a write a second
+           ;; time -- so anything richer than #t would be a value no
+           ;; caller can read.
+           ((proc-stdio-bogus-stream proc-simulate-queue-removal
+             proc-write-settle-twice)
+            (unless (eq? value #t)
+              (assertion-violation '$inject-arm!
+                "this point is read as a flag: it takes #t (#f is indistinguishable from unarmed)"
+                value)))
            ;; A WHITELIST, AND THE DEFAULT IS REFUSAL. It read (void)
            ;; before -- an unlisted return point armed with whatever it
            ;; was given, so the one kind of mistake this table exists to
