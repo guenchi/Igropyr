@@ -78,20 +78,21 @@
   (lambda ()
     (define main self)
     (register 'main self)
-    (let ((b0 (base)) (no-row (count! 'proc-exit-cb-no-row)) (freed (count! 'proc-handle-freed))
-          (linked (count! 'proc-f13-linked)) (relinked (count! 'proc-f13-relinked))
-          (unindexed (count! 'proc-orphan-unindexed)))
+    ;; inject-disarm! between cells clears every armed row, counted points included, so
+    ;; each cell arms the points it reads and reads them before its disarm
+    (let ((b0 (base)))
 
       ;; ---- P15: exactly one exit for the returned proc ----------------------------------
-      (let ((p (spawn-sh "true")))
+      (let ((p (begin (count! 'proc-exit-cb-no-row) (spawn-sh "true"))))
         (check "P15: the exit is for the returned proc" (equal? (wait-exit p 3000) '(0 . 0)))
         (receive (after 500 (check "P15: exactly one exit" #t)) (`#(proc-exit ,@p ,c ,s) (check "P15: exactly one exit" #f (list c s))))
         (check "P15: the no-row path was never taken" (eqv? (hits 'proc-exit-cb-no-row) 0) (hits 'proc-exit-cb-no-row))
         (drain! 300)
         (back-to-base! "P15: counts back" b0 3000))
+      (inject-disarm!)
 
       ;; ---- P18: the orphan path ---------------------------------------------------------------
-      (let ((h0 (hits 'proc-exit-cb-no-row)))
+      (let ((h0 (begin (count! 'proc-exit-cb-no-row) 0)))
         (inject-arm-return! 'proc-uv-spawn-result -1 1)
         (let* ((r (spawn-sh "exec sleep 7118"))
                (rows (proc-count)))
@@ -132,7 +133,7 @@
       (inject-disarm!)
 
       ;; ---- P24: the F13 repair with neighbours ---------------------------------------------------
-      (let ((lk0 (hits 'proc-f13-linked)) (rl0 (hits 'proc-f13-relinked)))
+      (let ((lk0 (begin (count! 'proc-f13-linked) 0)) (rl0 (begin (count! 'proc-f13-relinked) 0)))
         (inject-arm-return! 'proc-stdio-bogus-stream #t 1)
         (let ((r (with-neighbours (lambda () (spawn-sh "true")))))
           (check "P24a: a non-pipe stdio stream fails uv_spawn before any fork (EINVAL)" (failed? r) r)
@@ -144,7 +145,7 @@
                  (if mac? (= lk 1) (= rl 1)) (list lk rl)))
         (back-to-base! "P24a: no crash, handles and counts exact after neighbour churn" b0 3000))
       (inject-disarm!)
-      (let ((rl0 (hits 'proc-f13-relinked)))
+      (let ((rl0 (begin (count! 'proc-f13-relinked) 0)))
         (inject-arm-return! 'proc-uv-spawn-result -1 1)
         (inject-arm-return! 'proc-simulate-queue-removal #t 1)
         (let ((r (with-neighbours (lambda () (spawn-sh "exec sleep 7124")))))
@@ -157,24 +158,31 @@
       (inject-disarm!)
 
       ;; ---- P25: the handle block is retained until the row retires --------------------------
-      (let ((a (spawn-sh "read x; echo x; exit 0")))
+      (let* ((log0 (proc-handles-freed))
+             (freed-since (lambda () (let ((now (proc-handles-freed)))
+                                       ;; the log grows at one end; take whichever end is new
+                                       (let ((k (- (length now) (length log0))))
+                                         (cond ((<= k 0) '())
+                                               ((equal? (list-tail now k) log0) (list-head now k))
+                                               (else (list-tail now (length log0))))))))
+             (a (spawn-sh "read x; echo x; exit 0")))
         (proc-read-stop! a 'stdout)
         (proc-write! a (string->utf8 "go\n"))
         (check "P25: A exited" (equal? (wait-exit a 3000) '(0 . 0)))
         (check "P25: A's process handle closed (exited-unclosed 1), row still open (stdout read-stopped)"
                (within? 2000 (lambda () (and (eq? (proc-state a) 'exited) (eqv? (stat 'exited-unclosed) 1)))) (list (proc-state a) (stat 'exited-unclosed)))
-        (check "P25: A's block is not in the freed-address log" (not (memv (proc-handle a) (proc-handles-freed))))
+        (check "P25: A's block is not among the addresses freed since A was allocated" (not (memv (proc-handle a) (freed-since))))
         (let ((later (let loop ((i 0) (acc '())) (if (= i 100) acc (loop (+ i 1) (cons (spawn-sh "true") acc))))))
           (let ((exits (map (lambda (p) (wait-exit p 5000)) later)))
             (check "P25: 100 later children each exited 0 for their own proc" (for-all (lambda (e) (equal? e '(0 . 0))) exits) (length (filter (lambda (e) (not (equal? e '(0 . 0)))) exits))))
           (drain! 500)
           (check "P25: the later children closed" (within? 5000 (lambda () (eqv? (proc-count) (+ (list-ref b0 3) 1)))) (proc-count)))
         (check "P25: proc-table[handle A] is still A (identity)" (eq? ($proc-table-ref (proc-handle a)) a))
-        (check "P25: A's block still not freed while its row lives" (not (memv (proc-handle a) (proc-handles-freed))))
+        (check "P25: A's block still not freed while its row lives (100 later blocks were)" (and (not (memv (proc-handle a) (freed-since))) (>= (length (freed-since)) 100)) (length (freed-since)))
         (proc-read-start! a 'stdout)
         (check "P25: A's data and EOF after read-start" (equal? (collect a 'stdout 3000) (string->utf8 "x\n")))
         (collect a 'stderr 2000)
-        (check "P25: A closed and its block freed exactly once" (within? 3000 (lambda () (and (eq? (proc-state a) 'closed) (= 1 (length (filter (lambda (x) (eqv? x (proc-handle a))) (proc-handles-freed))))))) (list (proc-state a)))
+        (check "P25: A closed and its block freed exactly once" (within? 3000 (lambda () (and (eq? (proc-state a) 'closed) (= 1 (length (filter (lambda (x) (eqv? x (proc-handle a))) (freed-since))))))) (list (proc-state a)))
         (back-to-base! "P25: counts back" b0 3000))
 
       ;; ---- P27: rollback faults ------------------------------------------------------------
@@ -204,7 +212,7 @@
       (inject-disarm!)
       (inject-arm-fault! 'proc-recover-index-fail 1)
       (inject-arm-fault! 'proc-publish-index-fail 1)
-      (let ((u0 (hits 'proc-orphan-unindexed)) (r (guard (e (#t 'raised)) (spawn-sh "exec sleep 7129"))))
+      (let ((u0 (begin (count! 'proc-orphan-unindexed) 0)) (r (guard (e (#t 'raised)) (spawn-sh "exec sleep 7129"))))
         (check "P27 recover: the condition reaches the caller" (eq? r 'raised) r)
         (check "P27 recover: both faults fired once" (and (eqv? (hits 'proc-recover-index-fail) 1) (eqv? (hits 'proc-publish-index-fail) 1)))
         (check "P27 recover: the row was kept (proc-count) without its owner entry (counted once)" (and (eqv? (proc-count) (+ (list-ref b0 3) 1)) (eqv? (hits 'proc-orphan-unindexed) (+ u0 1))) (list (proc-count) (hits 'proc-orphan-unindexed)))
@@ -224,7 +232,7 @@
         (set! expected-leak (+ expected-leak 1))
         (drain! 300))
       (inject-disarm!)
-      (let ((h0 (hits 'proc-exit-cb-no-row)))
+      (let ((h0 (begin (count! 'proc-exit-cb-no-row) 0)))
         (inject-arm-fault! 'proc-orphan-publish 1)
         (inject-arm-return! 'proc-uv-spawn-result -1 1)
         (let ((r (guard (e (#t 'raised)) (spawn-sh "exec sleep 7131"))))
@@ -318,7 +326,6 @@
         (check "P30 tcp: live blocks and table back" (within? 3000 (lambda () (and (eqv? (write-blocks-live-count) w0) (eqv? (write-table-size) t0)))) (list (write-blocks-live-count) (write-table-size)))
         (back-to-base! "P30 tcp: counts back" b0 5000))
 
-      (uncount! no-row) (uncount! freed) (uncount! linked) (uncount! relinked) (uncount! unindexed)
       (check "baseline: counts (three deliberate index leaks carried as the expected offset)" (equal? (base) b0) (base) b0))
     (if (zero? fails)
         (begin (display "ALL PROC-FAULTS TESTS PASSED\n") (exit 0))
