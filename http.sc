@@ -43,7 +43,10 @@
 (library (igropyr http)
   (export http-listen http-swap! http-set-ws!
           http-stats http-stats-json http-shutdown! http-write-timeout!
-          http-request-deadline!
+          http-request-deadline! http-notice!
+          ;; the predicate for what http-listen answers with, so a caller
+          ;; can tell a server from anything else it may be holding
+          http-server?
           ;; A CONTROL CAPABILITY, and named as one here rather than
           ;; described as introspection, which is what an earlier version of
           ;; this comment called it. A live pid is authority, not a
@@ -179,6 +182,53 @@
       (assertion-violation 'http-request-deadline!
         "deadline must be a positive exact integer (ms)" ms))
     (set! request-deadline-ms ms))
+
+  ;; WHERE THE FRAMEWORK'S OWN LINES GO, and the default is not the
+  ;; application's stdout. A process may be holding stdout for a protocol,
+  ;; a pipe, or a log format of its own, and a library that writes there is
+  ;; corrupting a stream it does not own -- the application cannot even tell
+  ;; which lines were its own. One procedure of one string; an application
+  ;; redirects the framework with (http-notice! (lambda (s) ...)) and
+  ;; silences it with (http-notice! (lambda (s) #f)).
+  ;;
+  ;; THE DEFAULT WRITES ON console-error-port, NOT current-error-port. The
+  ;; current one is a parameter an application may have rebound to collect
+  ;; its OWN diagnostics; the framework's notice is not that application's
+  ;; output and should not land in its buffer. It is flushed on the way out,
+  ;; because the line most worth having is the one before a crash.
+  ;;
+  ;; A SETTER AND NOT A PARAMETER, AND THAT IS A MEASURED CHOICE. A
+  ;; parameter would advertise per-binding isolation that this runtime
+  ;; cannot keep: the scheduler saves and clears winders across a yield and
+  ;; restores them without running their swaps, so a parameter's value is
+  ;; shared by every green process on the thread. Measured: process A,
+  ;; inside its OWN parameterize, preempted while B parameterizes the same
+  ;; thing, reads B's value afterwards. An API whose shape promises
+  ;; something the implementation does not do is worse than the plain
+  ;; version, because the promise is what people build on.
+  ;;
+  ;; So it is process-global and set once, like the two timeouts above.
+  (define notice
+    (lambda (s)
+      (let ((p (console-error-port)))
+        (display s p)
+        (flush-output-port p))))
+
+  ;; THE ARITY IS CHECKED HERE, WHERE THE CALLER IS STILL ON THE STACK. A
+  ;; hook that cannot take one argument raises when the notice is sent, and
+  ;; that call is inside the guard at the listening site -- so the raise
+  ;; would be swallowed, the announcement would vanish, and nothing would
+  ;; name the line that installed it. The guard is right (announcing is not
+  ;; part of listening), which is exactly why the mistake has to be refused
+  ;; before it gets there. procedure-arity-mask covers the shapes that
+  ;; matter: a fixed one-argument procedure and a rest-argument or
+  ;; case-lambda that admits one are accepted, a nullary or strictly
+  ;; two-argument one is not.
+  (define (http-notice! f)
+    (unless (and (procedure? f) (logbit? 1 (procedure-arity-mask f)))
+      (assertion-violation 'http-notice!
+        "want a procedure of one string" f))
+    (set! notice f))
 
   ;; ---- bytevector helpers ------------------------------------------------
 
@@ -2318,12 +2368,26 @@
       ;; value is absent, not only an unsupported platform -- and it is
       ;; printed instead of a zero, and instead of the request repeated
       ;; as though it had been confirmed.
-      (display (string-append "igropyr listening on http://" host ":"
-                              (number->string port)
-                              " backlog " (number->string backlog)
-                              " (effective "
-                              (let ((e (http-server-backlog-effective srv)))
-                                (if e (number->string e) "unavailable"))
-                              ")\n"))
+      ;; THROUGH THE HOOK, NOT ONTO WHATEVER PORT IS CURRENT. The text is
+      ;; unchanged; where it lands is the application's to decide.
+      ;;
+      ;; GUARDED, BECAUSE ANNOUNCING IS NOT PART OF LISTENING. The hook is
+      ;; application code now, and a raise from it used to leave this
+      ;; procedure without returning srv while the listener stayed
+      ;; registered and the worker pool stayed alive -- the caller saw a
+      ;; failed start-up and the port stayed occupied. Measured: a hook that
+      ;; raises, then a second listen on the same port, "address already in
+      ;; use". A broken notification sink is the application's own bug and
+      ;; it is the application that will see it; it must not be able to cost
+      ;; this process a port.
+      (guard (e (#t (void)))
+        (notice
+         (string-append "igropyr listening on http://" host ":"
+                        (number->string port)
+                        " backlog " (number->string backlog)
+                        " (effective "
+                        (let ((e (http-server-backlog-effective srv)))
+                          (if e (number->string e) "unavailable"))
+                        ")\n")))
       srv))
 ))

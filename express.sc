@@ -1438,10 +1438,18 @@
   ;; handler later. Route/middleware mutations on the app are live
   ;; anyway (app->handler reads the app on every request).
   ;; Rest args, so plain define ((igropyr checked) is fixed-arity only).
-  ;; The contracts line is the mixed-build canary: it reports the level
-  ;; baked into THIS module at compile time (see checked.sc).
+  ;;
+  ;; NOTHING IS PRINTED HERE. This used to announce the contract level as a
+  ;; mixed-build canary -- the level baked into THIS module at compile time.
+  ;; It could not serve as one: a canary has to be able to differ from what
+  ;; the reader already knows, and this one reports a constant. The compiled
+  ;; framework is built with contracts off, so it said `off` whatever the
+  ;; environment held; run from source it echoed the environment variable
+  ;; back at the person who had just set it. Either way it was a line on
+  ;; every application's console saying nothing, and on stdout, which is not
+  ;; this library's to write on. (contract-level) is still there for anyone
+  ;; who wants to ask.
   (define (app-listen a port . opts)
-    (printf "igropyr contracts: ~a\n" (contract-level))
     (let ((srv (apply http-listen port (app->handler a) opts)))
       (http-set-ws! srv (ws-resolver a))
       srv))

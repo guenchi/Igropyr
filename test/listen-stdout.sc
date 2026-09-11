@@ -108,9 +108,14 @@
                      "(app-listen app 0)")))
   (check "setter: a non-procedure is refused by the setter itself, a procedure is then accepted" (and (eqv? r 0) (equal? (slurp err) "refused")) r (slurp err)))
 (let ((r (run-child! "(http-notice! (lambda (s) (error 'hook \"the application's hook raised\")))"
-                     "(let ((srv (app-listen app 0))) (display (if (http-server? srv) \"server-returned\n\" \"no-server\n\") (console-error-port)))")))
-  (check "a hook that raises: app-listen still returns the server (announcing is not part of listening)" (equal? (slurp err) "server-returned\n") r (slurp err))
+                     "(let ((srv (app-listen app 0))) (display (if (http-server? srv) \"server-returned\" \"no-server\") (console-error-port)))")))
+  (check "a hook that raises: app-listen still returns the server (announcing is not part of listening)" (equal? (slurp err) "server-returned") r (slurp err))
   (check "a hook that raises: nothing on stdout either" (equal? (slurp out) "") (slurp out)))
+;; the setter refuses a procedure that cannot take one argument (the error
+;; would otherwise surface far away, inside the guarded call, as silence)
+(let ((r (run-child! "(define (try f) (guard (e (#t (if (and (assertion-violation? e) (who-condition? e) (eq? (condition-who e) 'http-notice!)) \"R\" \"O\"))) (http-notice! f) \"A\")) (display (string-append (try (lambda () #f)) (try (lambda (a b) #f)) (try (lambda args #f)) (try (case-lambda (() #f) ((x) #f))) (try display)) (console-error-port))"
+                     "(void)")))
+  (check "setter: zero-arity and two-arity procedures are refused, variadic / case-lambda / display accepted" (equal? (slurp err) "RRAAA") r (slurp err)))
 ;; ---- a terminal: nothing kept back for the TTY case ---------------------------------
 ;; `script` gives the child a pty on both platforms (macOS: script -q file cmd;
 ;; FreeBSD: same). A line printed only when stdout is a terminal would hide from

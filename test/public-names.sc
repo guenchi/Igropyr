@@ -149,6 +149,7 @@
               http-listen http-swap! http-set-ws! http-stats
               http-stats-json http-shutdown! http-write-timeout!
               http-request-deadline! http-server-sup
+              http-notice! http-server?
               http-server-pool-alive? http-server-ready?
               http-server-backlog http-server-backlog-effective
               request? res? req-method

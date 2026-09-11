@@ -289,13 +289,44 @@
   ;; explaining why it will not end the same way. "This one obviously
   ;; cannot raise" is the sentence that was already there.
 
+  ;; ON THE CONSOLE ERROR PORT, NOT THE APPLICATION'S STDOUT. A process may
+  ;; be holding stdout for a protocol or a pipe, and the last thing it needs
+  ;; from a dying runtime is a line of ours in the middle of its stream.
+  ;; console-error-port rather than current-error-port for the reason
+  ;; (igropyr http)'s notice hook gives: the current one is a parameter an
+  ;; application may have rebound for its own diagnostics.
+  ;;
+  ;; FLUSHED BEFORE THE EXIT, and that is the whole point of naming the port
+  ;; in a local: exit is not obliged to drain a port nobody has flushed, and
+  ;; a panic whose text never left the buffer is a process that died without
+  ;; saying why.
+  ;; DESCRIBING THE PANIC MUST NOT BE ABLE TO PREVENT ENDING IT, and it
+  ;; could: every write here can raise -- a port rebound to something
+  ;; unwritable, a record whose printer fails, a closed sink -- and
+  ;; with-interrupts-disabled masks interrupts, not exceptions. A raise
+  ;; anywhere above the exit used to skip it, leaving the process ALIVE
+  ;; with a panic half-printed or not printed at all; whoever caught the
+  ;; exception then carried on as though nothing had ended. Measured: with
+  ;; the console error port bound to a port that refuses writes, the whole
+  ;; boot failure came back as an ordinary exception and the process ran on.
+  ;;
+  ;; So the exit sits outside every guard, and the rendering and the flush
+  ;; are guarded SEPARATELY: a failure halfway through the text still gets
+  ;; whatever reached the buffer pushed out. Nothing here can recover the
+  ;; text from an unusable sink, and a sink that BLOCKS still blocks -- that
+  ;; is a property of the port, not something this can guard against.
   (define (panic what reason)
     (with-interrupts-disabled
-      (display "PANIC: ") (display what) (display " ")
-      (if (condition? reason)
-          (display-condition reason (current-output-port))
-          (write reason))
-      (newline)
+      (let ((p (guard (e (#t #f)) (console-error-port))))
+        (when p
+          (guard (e (#t (void)))
+            (display "PANIC: " p) (display what p) (display " " p)
+            (if (condition? reason)
+                (display-condition reason p)
+                (write reason p))
+            (newline p))
+          (guard (e (#t (void)))
+            (flush-output-port p))))
       (exit 70)))
 
   ;; ---- run queue ------------------------------------------------------
