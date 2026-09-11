@@ -86,6 +86,14 @@
     ;; because a dependency has changed") -- node/express/dpool would be
     ;; silently re-expanded from source on every start
     "igropyr/sexpr.sc"
+    ;; The two renderers depend on nothing in this list and nothing in
+    ;; this list depends on them: a consumer that wants a page or a
+    ;; stylesheet imports them, and everything else is unaffected. They
+    ;; are compiled for the reason sexpr is -- a source-only library
+    ;; takes a fresh UID per process, and anything compiled against it
+    ;; would reload on every start.
+    "igropyr/html.sc"
+    "igropyr/css.sc"
     "igropyr/otp.sc"
     "igropyr/websocket.sc"
     "igropyr/ws-client.sc"
