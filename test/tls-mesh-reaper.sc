@@ -125,6 +125,50 @@
         (guard (e (#t (void))) (inject-barrier-cleanup! t-scan 'link-reaper-rescanned 31000))
         (check "M20: sessions and watchers back to baseline" (within? 8000 (lambda () (equal? (list (tls-live-session-count) (tls-live-watcher-count)) base))) (list (tls-live-session-count) (tls-live-watcher-count)) base))
 
+      ;; ---- M20s (batch 1 residual): the same enrolment loss, but the reaper is fed
+      ;; a hint every 100 ms during the wait. The scan deadline is absolute (4.3):
+      ;; a steady trickle of messages must not postpone the rescan. A reaper that
+      ;; renewed its deadline on every message would never scan while the hints
+      ;; keep coming, and b's dead link would never be reclaimed.
+      (let ((t-scan (inject-arm-barrier! 'link-reaper-rescanned 1 30000)))
+        (let ((w (inject-barrier-wait t-scan 'link-reaper-rescanned 5000)))
+          (check "M20s: the reaper parked after a rescan (no b installed)" (pair? w) w)
+          (let ((t-hint (inject-arm-barrier! 'link-enrol-before-hint 1 30000))
+                (s (raw-tls-open "127.0.0.1" port "localhost" 5000)))
+            (check "M20s: TLS session with the node" (not (pair? s)) s)
+            (unless (pair? s)
+              (check "M20s: hello sent as b" (hello! s probe-boot-id))
+              (let ((h (inject-barrier-wait t-hint 'link-enrol-before-hint 5000)))
+                (check "M20s: b's link parked between install and its hint" (pair? h) h)
+                (let ((link (and (pair? h) (cdr h))))
+                  (when link (kill link 'm20s-killed-before-hint))
+                  (check "M20s: the link is dead" (and link (within? 2000 (lambda () (not (process-alive? link))))))
+                  (guard (e (#t (void))) (inject-release! t-hint))
+                  (sleep-ms 300)
+                  (check "M20s: premise -- with the reaper parked nothing reclaimed the entry" (eq? ($node-link-pid 'b) link))
+                  ;; the trickle: a hint every 100 ms until the entry is gone
+                  (let* ((reaper (and (pair? w) (cdr w)))
+                         (hints 0)
+                         (hinter (spawn (lambda ()
+                                          (let loop ()
+                                            (when ($node-link-pid 'b)
+                                              (send reaper (vector 'cleanup-published))
+                                              (set! hints (+ hints 1))
+                                              (sleep-ms 100)
+                                              (loop))))))
+                         (t0 (now-ms)))
+                    (when (pair? w) (send (cdr w) (vector 'inject-resume t-scan)))
+                    (check "M20s: the periodic rescan reclaimed the entry within 2 x scan period despite the trickle"
+                           (within? 2500 (lambda () (not ($node-link-pid 'b)))) (- (now-ms) t0) hints)
+                    (check "M20s: premise -- the trickle was real (hints arrived during the wait)" (>= hints 5) hints)
+                    (display "  [M20s] reclaimed after ms ") (display (- (now-ms) t0)) (display " with hints ") (display hints) (newline)
+                    (kill hinter 'done))
+                  (receive (after 3000 (check "M20s: node-down b" #f 'timeout)) (`#(node-down b) (check "M20s: node-down b" #t)))))
+              (raw-tls-close! s))
+            (guard (e (#t (void))) (inject-barrier-cleanup! t-hint 'link-enrol-before-hint 31000))))
+        (guard (e (#t (void))) (inject-barrier-cleanup! t-scan 'link-reaper-rescanned 31000))
+        (check "M20s: sessions and watchers back to baseline" (within? 8000 (lambda () (equal? (list (tls-live-session-count) (tls-live-watcher-count)) base))) (list (tls-live-session-count) (tls-live-watcher-count)) base))
+
       )
 
     (if (zero? fails)
