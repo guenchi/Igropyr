@@ -19,13 +19,16 @@
 (t "&#X41; is A" (u "&#X41;") "A")
 (t "leading zeros keep their value" (u "&#000065;") "A")
 (t "many leading zeros keep their value (the bound is on the value, not the digit count)" (u (string-append "&#" (make-string 40 #\0) "65;")) "A")
+(t "hex with many leading zeros keeps its value (a digit-count cap on the hex branch alone would fail here)" (u (string-append "&#x" (make-string 40 #\0) "41;")) "A")
 (t "the last code point" (u "&#1114111;") (string (integer->char #x10FFFF)))
 (t "one past the ceiling is copied literally" (u "&#1114112;") "&#1114112;")
 (t "a surrogate is copied literally" (u "&#xD800;") "&#xD800;")
 (t "no digits: copied literally" (u "&#;") "&#;")
 (t "named entities still work" (u "a&amp;b&lt;c&gt;d&quot;e&apos;f") "a&b<c>d\"e'f")
 (t "an unterminated reference is copied literally" (u "&#65") "&#65")
-;; the red proof: 400000 nines. Quadratic accumulation takes seconds (2.9 s for
+;; the red proof: 400000 nines. The time is read after the call returns: the
+;; quadratic loop terminates (about 12 s here), so no watchdog is needed; a
+;; later regression into a true hang would show as the suite's own timeout Quadratic accumulation takes seconds (2.9 s for
 ;; 200000 on the reference machine); the bounded loop answers in tens of ms
 (let* ((s (string-append "&#" (make-string 400000 #\9) ";"))
        (t0 (now-ms)) (r (u s)) (ms (- (now-ms) t0)))
