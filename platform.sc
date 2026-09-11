@@ -11,7 +11,17 @@
           uv-stat-size-offset
           uv-stat-mtime-sec-offset uv-stat-mtime-nsec-offset
           uv-stat-ctime-sec-offset uv-stat-ctime-nsec-offset
-          uv-dirent-size uv-dirent-name-offset)
+          uv-dirent-size uv-dirent-name-offset
+          ;; child processes
+          uv-process-options-size
+          uv-po-exit-cb-offset uv-po-file-offset uv-po-args-offset
+          uv-po-env-offset uv-po-cwd-offset uv-po-flags-offset
+          uv-po-stdio-count-offset uv-po-stdio-offset
+          uv-po-uid-offset uv-po-gid-offset
+          uv-stdio-container-size uv-sc-flags-offset uv-sc-data-offset
+          UV-IGNORE UV-CREATE-PIPE UV-INHERIT-FD
+          UV-READABLE-PIPE UV-WRITABLE-PIPE
+          uv-handle-queue-next-offset uv-handle-queue-prev-offset)
   (import (chezscheme) (igropyr util))
 
   (define machine-name (symbol->string (machine-type)))
@@ -162,4 +172,64 @@
   ;; libuv.sc), so no offset is given for it.
   (define uv-dirent-size 16)
   (define uv-dirent-name-offset 0)
+
+  ;; ---- child processes (uv_process_options_t / uv_stdio_container_t) ------
+  ;;
+  ;; PUBLIC ABI, AND IDENTICAL ON EVERY LP64 HOST WE SUPPORT. These are not
+  ;; internal libuv structures: uv.h declares both, so a version bump cannot
+  ;; move a field without breaking every compiled consumer at the same time.
+  ;; That is why there is no `case platform-os` here and no self-check -- the
+  ;; layout is part of the contract the header publishes.
+  ;;
+  ;;   uv_process_options_t: exit_cb @0, file @8, args @16, env @24, cwd @32,
+  ;;                         flags @40 (unsigned), stdio_count @44 (int),
+  ;;                         stdio @48, uid @56, gid @60; size 64.
+  ;;
+  ;; flags and stdio_count share the eight bytes at 40 as two 32-bit fields,
+  ;; which is why stdio is at 48 and not 52.
+  (define uv-process-options-size     64)
+  (define uv-po-exit-cb-offset         0)
+  (define uv-po-file-offset            8)
+  (define uv-po-args-offset           16)
+  (define uv-po-env-offset            24)
+  (define uv-po-cwd-offset            32)
+  (define uv-po-flags-offset          40)
+  (define uv-po-stdio-count-offset    44)
+  (define uv-po-stdio-offset          48)
+  (define uv-po-uid-offset            56)
+  (define uv-po-gid-offset            60)
+
+  ;;   uv_stdio_container_t: flags @0 (int, padded), data @8; size 16.
+  (define uv-stdio-container-size     16)
+  (define uv-sc-flags-offset           0)
+  (define uv-sc-data-offset            8)
+
+  ;; uv_stdio_flags. UV_NONBLOCK_PIPE (#x40) is deliberately absent: it
+  ;; describes the CHILD's end of the pipe, and the Unix spawn path already
+  ;; makes the parent's end non-blocking on its own.
+  (define UV-IGNORE                    0)
+  (define UV-CREATE-PIPE               1)
+  (define UV-INHERIT-FD                2)
+  (define UV-READABLE-PIPE          #x10)
+  (define UV-WRITABLE-PIPE          #x20)
+
+  ;; ---- uv_handle_t's queue node ------------------------------------------
+  ;;
+  ;; UNLIKE EVERYTHING ABOVE, THIS IS INTERNAL LAYOUT. uv.h's UV_HANDLE_FIELDS
+  ;; puts data @0, loop @8, type @16, close_cb @24 and handle_queue @32, so the
+  ;; two pointers of that queue node are at 32 and 40. No public API exposes
+  ;; them.
+  ;;
+  ;; They exist for ONE repair and no other use: libuv 1.52.0's uv_spawn
+  ;; removes a failed process handle from the loop's handle queue without
+  ;; re-initialising the node, and uv__finish_close later removes it again --
+  ;; a second removal writing through whatever neighbours the node held at the
+  ;; first. The caller re-initialises the node so that second removal is a
+  ;; no-op.
+  ;;
+  ;; BECAUSE THIS IS INTERNAL, THE CALLER SELF-CHECKS IT BEFORE RELYING ON IT
+  ;; and refuses the whole facility if the check fails. A wrong offset here
+  ;; does not raise; it writes a pointer into the middle of another structure.
+  (define uv-handle-queue-next-offset 32)
+  (define uv-handle-queue-prev-offset 40)
 )

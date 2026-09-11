@@ -9,8 +9,9 @@
 ;;; TLS codec -- is (igropyr tcp), one layer up.
 ;;;
 ;;; NEVER IMPORT (igropyr tcp) OR (igropyr tls-core) HERE. This library is
-;;; below both; (igropyr libuv) is a façade above them that re-exports the
-;;; public API name for name, so existing consumers see no change at all.
+;;; below both. An earlier arrangement put a facade above them re-exporting
+;;; the public API name for name; that is gone, and consumers import the layer
+;;; they actually use.
 ;;;
 ;;; THE SHARED BUFFERS ARE HANDED OUT AS LEASES, NOT AS POINTERS. Their
 ;;; whole safety argument is "packed and used inside one interrupt-disabled
@@ -46,6 +47,9 @@
     uv-tcp-bind uv-tcp-nodelay uv-listen uv-accept
     uv-read-start uv-read-stop uv-write uv-try-write
     uv-close uv-is-closing uv-is-active
+    uv-spawn uv-process-kill uv-kill uv-process-get-pid
+    uv-pipe-init uv-shutdown
+    UV-PROCESS UV-NAMED-PIPE UV-SHUTDOWN
     uv-timer-init uv-timer-start uv-timer-stop
     memcpy-from-c memcpy-to-c memcpy-cc
     c-open c-openat c-close uv-fileno c-getsockopt)
@@ -76,6 +80,10 @@
   (define UV-RUN-NOWAIT 2)
   (define UV-RUN-ONCE 1)
   (define UV-TCP 12)
+  ;; uv_handle_type / uv_req_type codes, for uv_handle_size and uv_req_size
+  (define UV-NAMED-PIPE 7)
+  (define UV-PROCESS 10)
+  (define UV-SHUTDOWN 4)
   (define UV-TIMER 13)
   (define UV-WRITE 3)
   (define UV-EOF -4095)
@@ -89,6 +97,27 @@
   (define uv-req-size    (foreign-procedure "uv_req_size" (int) size_t))
   (define uv-ip4-addr    (foreign-procedure "uv_ip4_addr" (string int void*) int))
   (define uv-tcp-init    (foreign-procedure "uv_tcp_init" (void* void*) int))
+  ;; ---- child processes -----------------------------------------------------
+  ;;
+  ;; uv_spawn's options block is consumed synchronously: the strings, the two
+  ;; pointer arrays, the options block and the stdio containers may all be
+  ;; freed as soon as it returns. Only the handles and the callback code
+  ;; objects are retained.
+  (define uv-spawn       (foreign-procedure "uv_spawn" (void* void* void*) int))
+  ;; second argument is the SIGNAL number; 0 tests for existence
+  (define uv-process-kill (foreign-procedure "uv_process_kill" (void* int) int))
+  ;; by pid rather than by handle, for where no handle is held
+  (define uv-kill        (foreign-procedure "uv_kill" (int int) int))
+  ;; DIAGNOSTICS ONLY. The field it reads is assigned only on the success path,
+  ;; so after a failed spawn it returns whatever was in the allocation. "Did a
+  ;; child start" is uv_is_active, not this.
+  (define uv-process-get-pid
+    (foreign-procedure "uv_process_get_pid" (void*) int))
+  (define uv-pipe-init   (foreign-procedure "uv_pipe_init" (void* void* int) int))
+  ;; A NEGATIVE RETURN MEANS NO CALLBACK FOLLOWS -- a repeated shutdown answers
+  ;; UV_ENOTCONN -- so a caller that waits for the callback anyway waits
+  ;; forever.
+  (define uv-shutdown    (foreign-procedure "uv_shutdown" (void* void* void*) int))
   (define uv-tcp-connect (foreign-procedure "uv_tcp_connect" (void* void* void* void*) int))
   (define uv-getaddrinfo (foreign-procedure "uv_getaddrinfo" (void* void* void* string void* void*) int))
   (define uv-freeaddrinfo (foreign-procedure "uv_freeaddrinfo" (void*) void))
