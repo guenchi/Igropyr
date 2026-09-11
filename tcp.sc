@@ -1235,6 +1235,21 @@
                 ;; TLS conn, so this sits second only to keep the TLS clause
                 ;; first for the reason given above.
                 ((conn-tag c)
+                 ;; THE DELIVERY IS GUARDED HERE AND NOT IN THE ARM BELOW, and
+                 ;; the asymmetry is deliberate. Both arms allocate -- the
+                 ;; bytevector, the message vector, and the mailbox cell inside
+                 ;; deliver -- and for a plain TCP conn a raise there unwinds
+                 ;; into C, which is the accepted, pre-existing and TCP-wide
+                 ;; residual this file already states. A PIPE HAS A SECOND
+                 ;; CASUALTY the plaintext arm does not: the tcp-close! below
+                 ;; is the only thing that releases this pipe, clears the
+                 ;; proc's field for this stream and lets the row retire, and
+                 ;; a raise on the way to it would skip all three. So the
+                 ;; notification is contained and the release is not.
+                 ;;
+                 ;; Losing the message is the cheaper failure: the owner still
+                 ;; learns the stream ended, because the close and the child's
+                 ;; exit are both still coming.
                  (let* ((tag (conn-tag c))
                         (p (car tag))
                         (stream (cdr tag))
@@ -1242,21 +1257,24 @@
                    (cond
                      ((> nread 0)
                       (when owner
-                        (let ((bv (make-bytevector nread)))
-                          (memcpy-from-c bv (foreign-ref 'void* buf 0) nread)
-                          (deliver owner (vector 'proc-data p stream bv)))))
+                        (guard (e (#t (note-swallowed! 'proc-read-deliver e)))
+                          (let ((bv (make-bytevector nread)))
+                            (memcpy-from-c bv (foreign-ref 'void* buf 0) nread)
+                            (deliver owner (vector 'proc-data p stream bv))))))
                      ;; spurious wakeup; ignore
                      ((= nread 0) (void))
                      (else
                       ;; NOTIFY, THEN RELEASE. The message names a conn the
                       ;; owner may still hold, and tcp-close! only schedules,
                       ;; so the order costs nothing and keeps the owner's view
-                      ;; ahead of the teardown.
+                      ;; ahead of the teardown. The close runs whether or not
+                      ;; the notification got through.
                       (when owner
-                        (deliver owner
-                          (if (= nread UV-EOF)
-                              (vector 'proc-eof p stream)
-                              (vector 'proc-error p stream nread))))
+                        (guard (e (#t (note-swallowed! 'proc-read-deliver e)))
+                          (deliver owner
+                            (if (= nread UV-EOF)
+                                (vector 'proc-eof p stream)
+                                (vector 'proc-error p stream nread)))))
                       (tcp-close! c)))))
                 ;; the plaintext path, unchanged: still owner-gated
                 ((conn-owner c)
