@@ -4318,10 +4318,34 @@
                     (let ((out (tls-session-drain! (conn-tls-session t))))
                       (or (not out)
                           (tcp-writev-raw! c (list out)
-                            (lambda (status)
-                              (when (fx< status 0)
-                                (conn-tls-retire! c 'handshake-write-failed
-                                                  'tls-handshake-write-failed))))))))
+                            ;; INJECTION POINT 'tls-handshake-write-status --
+                            ;; OWNING REGION: whichever this completion runs in,
+                            ;; and it is a RETURN point either way, so it never
+                            ;; parks. It wraps a VARIABLE, not a call: the rule
+                            ;; that inject-return! must only skip a call which
+                            ;; did nothing else is vacuous here, because reading
+                            ;; an argument does nothing at all. The real write
+                            ;; stands; only the verdict this completion is given
+                            ;; is forced.
+                            ;;
+                            ;; IT COVERS BOTH ARRIVALS, AND THAT IS DELIBERATE.
+                            ;; tcp-writev-raw! calls this lambda inline when
+                            ;; uv_try_write takes the whole flight (3833) and
+                            ;; from the loop's write callback when the flight
+                            ;; queues. An inline forced negative would retire
+                            ;; BEFORE tls-established! runs, which is a
+                            ;; different failure from the one this point exists
+                            ;; for -- so the caller that wants the late one
+                            ;; forces the flight onto the queued path with
+                            ;; 'try-write-eagain (3829) rather than this
+                            ;; library growing a branch to tell the two apart.
+                            (lambda (status0)
+                              (let ((status (inject-return!
+                                              'tls-handshake-write-status
+                                              status0)))
+                                (when (fx< status 0)
+                                  (conn-tls-retire! c 'handshake-write-failed
+                                                    'tls-handshake-write-failed)))))))))
               ;; AND A SYNCHRONOUS FAILURE STOPS THE PUMP. Falling through to the
               ;; verdict after the write failed meant a 'done step built a watcher on
               ;; a connection this frame had just retired, and delivered

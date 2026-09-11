@@ -281,7 +281,7 @@
            ;; same errno domain, and its caller reads only "negative
            ;; means refused".
            ((uv-write-neg uv-write-sealing-neg getaddrinfo-refused
-             tcp-connect-refused accept-refused)
+             tcp-connect-refused accept-refused tls-handshake-write-status)
             (unless (and (fixnum? value) (fx< value 0) (fx>= value -4095))
               (assertion-violation '$inject-arm!
                 "this point needs an exact libuv error code in [-4095,-1]"
