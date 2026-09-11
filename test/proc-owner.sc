@@ -1,0 +1,98 @@
+#!chezscheme
+;; Child processes -- owner death cells (proc-spawn design v3 §5 P6, P16b; v4 P14 owner variant).
+;;   P6    the owner dies: SIGTERM by default, pipes closed, counts back; with
+;;         kill-on-owner-death #f the child survives and another process can still kill it
+;;   P14o  proc-close! while running, then the owner dies: SIGTERM is still sent
+;;   P16b  the explicit owner dies between the caller's admission and the region: refused
+(import (chezscheme) (igropyr actor) (igropyr tcp)
+        (only (igropyr libuv) now-ms uv-live-handle-count)
+        (igropyr inject-control))
+(define fails 0)
+(define (check label ok . info)
+  (if ok (begin (display "  ok  ") (display label) (newline))
+      (begin (set! fails (+ fails 1)) (display "FAIL  ") (display label)
+             (for-each (lambda (x) (display " ") (write x)) info) (newline))))
+(define (within? ms thunk)
+  (let ((deadline (+ (now-ms) ms)))
+    (let loop () (cond ((thunk) #t) ((> (now-ms) deadline) #f) (else (sleep-ms 20) (loop))))))
+(define (arm! point occ) (inject-arm-barrier! point occ 60000))
+(define (wait! t point ms) (inject-barrier-wait t point ms))
+(define (resume! t w) (when (pair? w) (send (cdr w) (vector 'inject-resume t))))
+(define (cleanup! t point) (guard (e (#t (void))) (inject-release! t)) (guard (e (#t (void))) (inject-barrier-cleanup! t point 2000)))
+(define (show w) (if (and (pair? w) (not (symbol? (cdr w)))) (list (car w) (process-id (cdr w))) w))
+(define (spawn-sh cmd . opts) (apply proc-spawn! "/bin/sh" (list "sh" "-c" cmd) opts))
+(define (wait-exit p ms) (receive (after ms 'timeout) (`#(proc-exit ,@p ,code ,signal) (cons code signal))))
+(define (base) (list (uv-live-handle-count) (conn-count) (pipe-conn-count) (proc-count) (uv-owner-index-count)))
+(define (back-to-base! label b ms) (check label (within? ms (lambda () (equal? (base) b))) (base) b))
+;; a process that spawns a child as its own owner and hands the proc to main
+(define (owner-process! main cmd . opts)
+  (spawn (lambda ()
+           (let ((p (apply spawn-sh cmd opts)))
+             (send main (vector 'owned p))
+             (let loop () (receive (m (loop))))))))
+(define (pid-alive? pid) (eqv? 0 (system (string-append "kill -0 " (number->string pid) " 2>/dev/null"))))
+
+(start-scheduler
+  (lambda ()
+    (define main self)
+    (register 'main self)
+    (let ((b0 (base)))
+
+      ;; ---- P6: owner death, default SIGTERM ------------------------------------------
+      (let ((owner (owner-process! main "exec sleep 100")))
+        (receive (after 3000 (check "P6: owned proc received" #f 'timeout))
+          (`#(owned ,p)
+            (check "P6: spawned by the owner" (proc? p) p)
+            (let ((pid (proc-pid p)))
+              (check "P6: premise -- the OS child is alive" (and pid (pid-alive? pid)) pid)
+              (kill owner 'p6-owner-dies)
+              (check "P6: the child is gone within 1 s (SIGTERM on owner death)" (within? 1000 (lambda () (not (pid-alive? pid)))))
+              (check "P6: the proc left running state" (within? 2000 (lambda () (not (eq? (proc-state p) 'running)))) (proc-state p))
+              (check "P6: pipes closed by the owner-death traversal" (within? 2000 (lambda () (and (not (proc-stdin p)) (not (proc-stdout p)) (not (proc-stderr p))))))
+              (check "P6: closed" (within? 3000 (lambda () (eq? (proc-state p) 'closed))) (proc-state p))
+              (back-to-base! "P6: counts back" b0 3000)))))
+
+      ;; ---- P6 variant: kill-on-owner-death #f -------------------------------------------
+      (let ((owner (owner-process! main "exec sleep 100" '(kill-on-owner-death . #f))))
+        (receive (after 3000 (check "P6b: owned proc received" #f 'timeout))
+          (`#(owned ,p)
+            (let ((pid (proc-pid p)))
+              (kill owner 'p6b-owner-dies)
+              (sleep-ms 1000)
+              (check "P6b: the child is still running 1 s after the owner died" (and (pid-alive? pid) (eq? (proc-state p) 'running)) (list (pid-alive? pid) (proc-state p)))
+              (check "P6b: pipes were closed anyway" (within? 2000 (lambda () (and (not (proc-stdin p)) (not (proc-stdout p)) (not (proc-stderr p))))))
+              (check "P6b: another process can still kill it" (proc-kill! p 9))
+              (check "P6b: the child is gone" (within? 2000 (lambda () (not (pid-alive? pid)))))
+              (check "P6b: closed" (within? 3000 (lambda () (eq? (proc-state p) 'closed))) (proc-state p))
+              (back-to-base! "P6b: counts back" b0 3000)))))
+
+      ;; ---- P14o: proc-close! while running, then owner death -----------------------------
+      (let ((owner (owner-process! main "exec sleep 100")))
+        (receive (after 3000 (check "P14o: owned proc received" #f 'timeout))
+          (`#(owned ,p)
+            (let ((pid (proc-pid p)))
+              (proc-close! p)
+              (check "P14o: pipes gone, child running" (within? 2000 (lambda () (and (not (proc-stdout p)) (eq? (proc-state p) 'running)))))
+              (kill owner 'p14o-owner-dies)
+              (check "P14o: SIGTERM still sent on owner death after proc-close!" (within? 1000 (lambda () (not (pid-alive? pid)))))
+              (check "P14o: closed" (within? 3000 (lambda () (eq? (proc-state p) 'closed))) (proc-state p))
+              (back-to-base! "P14o: counts back" b0 3000)))))
+
+      ;; ---- P16b: the explicit owner dies between admission and the region ------------------
+      (let* ((owner (spawn (lambda () (let loop () (receive (m (loop)))))))
+             (t (arm! 'proc-spawn-admission 1))
+             (spawner (spawn (lambda () (send main (vector 'spawned (spawn-sh "true" (cons 'owner owner))))))))
+        (let ((w (wait! t 'proc-spawn-admission 5000)))
+          (check "P16b: the spawner parked before the region" (and (pair? w) (eq? (cdr w) spawner)) (show w))
+          (kill owner 'p16b-owner-dies)
+          (check "P16b: premise -- the owner is dead" (within? 1000 (lambda () (not (process-alive? owner)))))
+          (resume! t w)
+          (receive (after 5000 (check "P16b: the spawn returned" #f 'timeout))
+            (`#(spawned ,r) (check "P16b: refused with owner-dead by the in-region recheck" (equal? r '(failed . owner-dead)) r)))
+          (cleanup! t 'proc-spawn-admission)
+          (check "P16b: nothing allocated" (equal? (base) b0) (base) b0)))
+
+      (check "baseline: counts" (equal? (base) b0) (base) b0))
+    (if (zero? fails)
+        (begin (display "ALL PROC-OWNER TESTS PASSED\n") (exit 0))
+        (begin (display "PROC-OWNER VERDICT: ") (display fails) (display " failed case(s)\n") (exit 1)))))
