@@ -77,7 +77,11 @@
             uv-read-stop uv-scratch-lease uv-sockaddr-lease uv-strerror
             uv-tcp-bind uv-tcp-connect uv-tcp-init uv-tcp-nodelay
             uv-timer-init uv-timer-start uv-timer-stop uv-try-write uv-write
-            uv-write-scratch-size write-req-size)
+            uv-write-scratch-size write-req-size
+            uv-handle-size uv-req-size
+            uv-spawn uv-process-kill uv-kill uv-process-get-pid
+            uv-pipe-init uv-shutdown
+            UV-PROCESS UV-NAMED-PIPE UV-SHUTDOWN)
           (igropyr tls-core))
 
   ;; connection record; one per accepted TCP client
@@ -108,7 +112,17 @@
       ;; this handle again, and that has to remain true after retirement has
       ;; detached conn-tls -- a flag on the TLS record would become
       ;; unreachable at exactly the moment the last writes are still landing.
-      (mutable raw-sealed? conn-raw-sealed? conn-set-raw-sealed!)))
+      (mutable raw-sealed? conn-raw-sealed? conn-set-raw-sealed!)
+      ;; WHAT THIS CONN IS, when it is not a socket. #f for every TCP
+      ;; connection; for a child process's pipe it is (proc . stream), which is
+      ;; what lets the shared read callback address the owner in the shape that
+      ;; owner expects.
+      ;;
+      ;; It is also the discriminator for "the library owns this conn's
+      ;; lifetime, not the application": a tagged conn refuses conn-on-close!
+      ;; and conn-set-owner!, because its cleanup closure and its owner are part
+      ;; of the proc's bookkeeping.
+      (mutable tag conn-tag conn-set-tag!)))
 
   ;; ---- TLS state of one connection ---------------------------------------
   ;;
@@ -498,6 +512,34 @@
   ;;   into freed memory -- the classic crash under high concurrency.
   (define conn-table (make-eqv-hashtable))
   (define write-table (make-eqv-hashtable))
+
+  ;; ---- write blocks: one allocator, one release ----------------------------
+  ;;
+  ;; A write block is the single [uv_write_t][uv_buf_t][payload] allocation a
+  ;; queued write needs. Two producers make one -- the plaintext writer and the
+  ;; TLS close-notify path -- and seven places can release one, which is why
+  ;; this is a pair of helpers rather than a list of call sites: enumerating
+  ;; release sites is how the TLS ones came to be missed.
+  ;;
+  ;; EVERY BLOCK IS ALLOCATED HERE AND RELEASED HERE. A raw foreign-alloc or
+  ;; foreign-free of a write block anywhere else is a defect, and the counter
+  ;; is what makes one visible: it is exported in the stats, so a test can
+  ;; assert allocation balance at a baseline rather than infer it.
+  ;;
+  ;; INVARIANT: write-blocks-live = (hashtable-size write-table) + blocks
+  ;; allocated but not yet registered. The second term is non-zero only
+  ;; transiently, inside a writer's own region, so the two numbers agree at
+  ;; every baseline.
+  (define write-blocks-live 0)
+  (define (alloc-write-block! size)
+    (let ((b (foreign-alloc size)))
+      (set! write-blocks-live (fx+ write-blocks-live 1))
+      b))
+  (define (free-write-block! block)
+    (set! write-blocks-live (fx- write-blocks-live 1))
+    (foreign-free block))
+  (define (write-blocks-live-count) write-blocks-live)
+  (define (write-table-size) (hashtable-size write-table))
   ;; pending outbound connects: req address -> (handle . owner-pid)
   (define connect-table (make-eqv-hashtable))
   ;; pending DNS lookups: getaddrinfo req address -> owner-pid
@@ -505,6 +547,137 @@
   ;; pending async file reads: fs req address -> fs-op record
   (define fs-table (make-eqv-hashtable))
   (define (conn-count) (hashtable-size conn-table))
+
+  ;; ---- child processes -----------------------------------------------------
+  ;;
+  ;; CHILD LIFETIME AND PIPE CLOSURE ARE SEPARATE FACTS, and conflating them is
+  ;; what a single `state` field would do. `child` says whether there is a
+  ;; process left to signal; the three pipe fields say what is still open in
+  ;; libuv. A child can exit while a grandchild holds its stdout, and a pipe can
+  ;; close while the child runs on.
+  ;;
+  ;; The exported (proc-state p) derives the three names a caller wants:
+  ;; `running` while child = running; `exited` once it has exited but the handle
+  ;; or a pipe is still open; `closed` when the handle is closed and every pipe
+  ;; field is #f. `closed` has exactly one meaning -- nothing of this proc
+  ;; remains in libuv -- which is what makes it safe to retire the row on it.
+  (define-record-type (proc make-proc proc?)
+    (fields
+      ;; THE ALLOCATION IS RETAINED UNTIL THE ROW RETIRES. The process close
+      ;; callback marks handle-alive? #f and does NOT free: the row is keyed on
+      ;; this address, and freeing early would let a later spawn be handed the
+      ;; same address while a row still named it. libuv holds no reference to a
+      ;; closed handle, so keeping the block costs its size and nothing else.
+      (immutable handle proc-handle)
+      (immutable owner proc-owner)
+      (mutable stdin proc-stdin proc-set-stdin!)     ; conn | #f once closed
+      (mutable stdout proc-stdout proc-set-stdout!)
+      (mutable stderr proc-stderr proc-set-stderr!)
+      ;; #f once the exit callback has run: the pid is reusable from that
+      ;; instant, so holding it would be holding something that now names
+      ;; somebody else's process.
+      (mutable pid proc-pid proc-set-pid!)
+      (mutable exit proc-exit proc-set-exit!)        ; #f | (code . signal)
+      (mutable child proc-child proc-set-child!)     ; running | exited | orphan
+      (mutable handle-alive? proc-handle-alive? proc-set-handle-alive!)
+      ;; accepted minus settled stdin bytes -- not "accepted total"
+      (mutable queued proc-queued proc-set-queued!)
+      (mutable kill-on-owner-death? proc-kill-on-owner-death?
+               proc-set-kill-on-owner-death!)))
+
+  ;; keyed on the handle ADDRESS, which is why the block above is retained
+  (define proc-table (make-eqv-hashtable))
+  ;; pending stdin shutdowns: uv_shutdown_t address -> the pipe conn
+  (define shutdown-table (make-eqv-hashtable))
+  (define (proc-count) (hashtable-size proc-table))
+
+  ;; HOW MANY CONNS ARE PIPES, MAINTAINED RATHER THAN COUNTED. Walking
+  ;; conn-table for this would allocate two vectors proportional to the
+  ;; connection count INSIDE the region below -- on the call an http server
+  ;; makes to publish its connection count. The counter is maintained at the
+  ;; two places a tagged conn enters and leaves the table, the same
+  ;; construction the write-block counter uses.
+  (define pipe-conns-live 0)
+  (define (note-pipe-conn! d) (set! pipe-conns-live (fx+ pipe-conns-live d)))
+  (define (pipe-conn-count) pipe-conns-live)
+
+  ;; ONE REGION FOR BOTH READINGS. Taken separately, a conn closing between them
+  ;; makes the subtraction report a count no instant ever had.
+  (define (socket-conn-count)
+    (with-interrupts-disabled
+      (fx- (hashtable-size conn-table) pipe-conns-live)))
+
+  (define max-procs 256)
+  (define (set-max-procs! n)
+    (unless (and (fixnum? n) (fx> n 0))
+      (assertion-violation 'set-max-procs! "want a positive fixnum" n))
+    (set! max-procs n))
+  (define proc-stdin-cap (* 16 1024 1024))
+  (define (set-proc-stdin-cap! n)
+    (unless (and (fixnum? n) (fx> n 0))
+      (assertion-violation 'set-proc-stdin-cap! "want a positive fixnum" n))
+    (set! proc-stdin-cap n))
+  (define shutdown-immediate-errors 0)
+
+  ;; ---- the F13 repair, and the check that licenses it ----------------------
+  ;;
+  ;; libuv 1.52.0's uv_spawn removes a failed process handle from the loop's
+  ;; handle queue and does NOT re-initialise the node; uv__finish_close later
+  ;; removes it again. A queue removal writes q->prev->next and q->next->prev,
+  ;; so the second one writes through whatever neighbours the node held at the
+  ;; first -- harmless only while those two are unchanged, and corrupting the
+  ;; loop's handle list or touching freed memory as soon as any handle is
+  ;; created or closed in between. 1.50.0 does not remove at all, so the repair
+  ;; must be version-agnostic: it asks the node whether it is still linked
+  ;; rather than asking libuv what version it is.
+  ;;
+  ;; THE SELF-CHECK RUNS ONCE AND GATES THE WHOLE FACILITY. These offsets are
+  ;; internal layout, and a wrong one does not raise -- it writes a pointer into
+  ;; the middle of another structure. So before the first spawn we build a
+  ;; handle whose queue node must be self-consistent and verify it; if it is
+  ;; not, every spawn is refused. Refusing a feature is recoverable; a bad
+  ;; write is not.
+  (define layout-checked #f)          ; #f not yet run | ok | bad
+  (define (handle-queue-linked? h)
+    ;; h.handle_queue.prev->next == &h.handle_queue
+    (let ((node (+ h uv-handle-queue-next-offset))
+          (prev (foreign-ref 'void* (+ h uv-handle-queue-prev-offset) 0)))
+      (and (not (= prev 0))
+           (= (foreign-ref 'void* prev 0) node))))
+  (define (handle-queue-self-link! h)
+    (let ((node (+ h uv-handle-queue-next-offset)))
+      (foreign-set! 'void* (+ h uv-handle-queue-next-offset) 0 node)
+      (foreign-set! 'void* (+ h uv-handle-queue-prev-offset) 0 node)))
+
+  ;; -> #t when the layout is as declared. Uses a pipe handle because
+  ;; uv_pipe_init needs no descriptor and links the handle like any other.
+  (define (check-handle-layout!)
+    (or (eq? layout-checked 'ok)
+        (and (not (eq? layout-checked 'bad))
+             ;; THE LOOP HAS TO EXIST FIRST, and this is not defensive
+             ;; decoration: uv-loop is 0 until the scheduler runs uv-init!, and
+             ;; uv_pipe_init on a null loop is a segfault, not an error return.
+             ;; A check whose failure mode is memory corruption must fail
+             ;; CLOSED when it cannot run at all -- refusing the facility is
+             ;; recoverable, crashing is not.
+             (not (= (uv-loop-handle) 0))
+             (let ((h (foreign-alloc (uv-handle-size UV-NAMED-PIPE))))
+               (let ((r (uv-pipe-init (uv-loop-handle) h 0)))
+                 (cond
+                   ((< r 0) (foreign-free h) (set! layout-checked 'bad) #f)
+                   (else
+                     (let ((ok? (handle-queue-linked? h)))
+                       (set! layout-checked (if ok? 'ok 'bad))
+                       ;; closed rather than freed: libuv has seen it
+                       (uv-close h on-close-entry)
+                       ok?))))))))
+
+  ;; Applied to EVERY negative uv_spawn result, before anything else touches
+  ;; the handle: both pointers are still valid at this instant because no other
+  ;; handle operation has run since uv_spawn returned.
+  (define (repair-spawn-queue! h)
+    (unless (handle-queue-linked? h)
+      (handle-queue-self-link! h)))
 
   ;; delivery hook: (deliver owner-pid msg); installed by (igropyr actor)
   (define deliver (lambda (owner msg) (void)))
@@ -695,7 +868,15 @@
   ;; then finds no entry and skips the resource, and the entry that arrives
   ;; afterwards names a process already gone -- nothing will ever reclaim
   ;; it. Same family as the enqueue-write! and conn-on-close! windows.
+  ;; A TAGGED CONN REFUSES THIS. A pipe belongs to its proc: the proc record
+  ;; names the owner, the owner index entry was written with that owner, and
+  ;; the owner-death traversal reaches the pipe through it. Re-pointing the
+  ;; conn alone would leave all three disagreeing, and the disagreement is
+  ;; silent -- so it is refused rather than reconciled.
   (define (conn-set-owner! c owner)
+    (when (conn-tag c)
+      (assertion-violation 'conn-set-owner!
+        "a child process pipe cannot change owner" (conn-tag c)))
     (with-interrupts-disabled
       (conn-set-owner-field! c owner)
       (index-owner! owner 'conn (conn-handle c))))
@@ -876,14 +1057,26 @@
       void))
 
   ;; close_cb: the single place where handle memory is freed.
+  ;; ORDERED SO THAT NOTHING ALLOCATING PRECEDES SOMETHING UNCONDITIONAL.
+  ;; unindex-owner! allocates, and it ran first and unguarded: a raise there
+  ;; skipped the state change, the cleanup hook and the free, so one
+  ;; allocation failure leaked a handle and left a conn that never finished
+  ;; closing. The pointer writes now happen first, the fallible step is
+  ;; guarded and counted, and the free is last and unconditional. Additive
+  ;; for TCP: the same steps, in an order that survives a failure in any one.
   (define on-close-code
     (foreign-callable
       (lambda (handle)
         (let ((c (hashtable-ref conn-table handle #f)))
           (hashtable-delete! conn-table handle)
           (when c
-            (unindex-owner! (conn-owner c) 'conn handle)
+            (when (conn-tag c) (note-pipe-conn! -1))
             (conn-set-state! c 'closed)
+            ;; COUNTED POINT 'conn-close-unindex -- unarmed: silent. A raise here
+            ;; is swallowed: the owner index keeps a stale entry, which the
+            ;; owner-death traversal tolerates, and everything below still runs.
+            (guard (e (#t (inject-barrier! 'conn-close-unindex)))
+              (unindex-owner! (conn-owner c) 'conn handle))
             (let ((clean (conn-cleanup c)))
               (when clean
                 (conn-set-cleanup! c #f)
@@ -900,7 +1093,7 @@
       (lambda (req status)
         (let ((done (hashtable-ref write-table req #f)))
           (hashtable-delete! write-table req)
-          (foreign-free req)
+          (free-write-block! req)
           (when done (done status))))
       (void* int)
       void))
@@ -1000,7 +1193,7 @@
                     (set! accept-refused-count
                           (bump-saturating accept-refused-count))
                     (uv-close client on-close-entry))
-                (let ((c (make-conn client #f 'open #f #f #f #f))
+                (let ((c (make-conn client #f 'open #f #f #f #f #f))
                       ;; #(token on-accept handshaking tls-ctx handle)
                       (v (hashtable-ref listener-table server #f)))
                   (uv-tcp-nodelay client 1)
@@ -1466,7 +1659,7 @@
                  (when d (complete-once! d (vector 'tcp-connect-failed 'owner-gone)))
                  (uv-close handle on-close-entry))
                 (else
-                 (let ((c (make-conn handle owner 'open #f #f #f #f)))
+                 (let ((c (make-conn handle owner 'open #f #f #f #f #f)))
                    ;; index and table together: an owner dying between them
                    ;; is told about a conn that teardown cannot find
                    (with-interrupts-disabled
@@ -2999,7 +3192,7 @@
     ;; allocation this stands in for is in the same place, so the
     ;; injection reproduces the real failure rather than a tidier one.
     (inject-fault! 'writev-oom)
-    (let* ((block (foreign-alloc (+ write-req-size buf-t-size len)))
+    (let* ((block (alloc-write-block! (+ write-req-size buf-t-size len)))
            (buf-ptr (+ block write-req-size))
            (data-ptr (+ buf-ptr buf-t-size)))
       (fill-data! data-ptr)
@@ -3033,12 +3226,22 @@
       (with-interrupts-disabled
         (if (or (not (eq? (conn-state c) 'open)) (conn-raw-sealed? c))
             (begin
-              (foreign-free block)
+              ;; COUNTED POINT: unarmed it is silent.
+              (inject-barrier! 'write-block-released-plain-reject)
+              (free-write-block! block)
               (when on-done (on-done -1))
               #f)
             (begin
-              (hashtable-set! write-table block
-                (or on-done (lambda (status) (void))))
+              ;; GUARDED, BECAUSE THE BLOCK HAS NO OWNER UNTIL THIS SUCCEEDS.
+              ;; hashtable-set! allocates; a raise here left the block allocated with
+              ;; nothing that knew about it -- not even a counter, which is why the
+              ;; leak had no observable at all.
+              (guard (e (#t (inject-barrier! 'write-block-released-register-fail)
+                            (free-write-block! block)
+                            (raise e)))
+                (inject-fault! 'write-register-oom)
+                (hashtable-set! write-table block
+                  (or on-done (lambda (status) (void)))))
               ;; INJECTION POINT (E1, negative errno). It wraps the RAW
               ;; FFI call and nothing else, which is what inject-return!
               ;; requires: when armed the call is SKIPPED, so the block is
@@ -3050,7 +3253,8 @@
                 (if (< r 0)
                     (begin
                       (hashtable-delete! write-table block)
-                      (foreign-free block)
+                      (inject-barrier! 'write-block-released-plain-neg)
+                      (free-write-block! block)
                       (when on-done (on-done r))
                       #f)
                     #t)))))))
@@ -3074,7 +3278,8 @@
     (with-interrupts-disabled
       (if (or (not (eq? (conn-state c) 'open)) (conn-raw-sealed? c))
           (begin
-            (foreign-free block)
+            (inject-barrier! 'write-block-released-sealing-reject)
+            (free-write-block! block)
             (when on-done (on-done -1))
             #f)
           (begin
@@ -3084,13 +3289,26 @@
             ;; state no reader has a rule for.
             (conn-tls-set-shutdown! t #t)
             (conn-set-raw-sealed! c #t)
-            (hashtable-set! write-table block
-              (or on-done (lambda (status) (void))))
-            (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
+            ;; GUARDED FOR THE REASON THE PLAINTEXT REGISTRATION IS, with one
+            ;; addition: the caller relinquished this block before calling, so its
+            ;; own `block` is already #f and a raise reaching that outer guard finds
+            ;; nothing to release. No double free.
+            (guard (e (#t (inject-barrier! 'write-block-released-register-fail)
+                          (free-write-block! block)
+                          (raise e)))
+              (inject-fault! 'write-register-oom)
+              (hashtable-set! write-table block
+                (or on-done (lambda (status) (void)))))
+            ;; INJECTION POINT 'uv-write-sealing-neg -- the sealing twin of
+            ;; 'uv-write-neg: it wraps the RAW submission, so an injected negative
+            ;; skips the call and the release below is the real one.
+            (let ((r (inject-return! 'uv-write-sealing-neg
+                       (uv-write block (conn-handle c) buf-ptr 1 on-write-entry))))
               (if (< r 0)
                   (begin
                     (hashtable-delete! write-table block)
-                    (foreign-free block)
+                    (inject-barrier! 'write-block-released-sealing-neg)
+                    (free-write-block! block)
                     (when on-done (on-done r))
                     #f)
                   #t))))))
@@ -4583,6 +4801,15 @@
   ;; The thunk runs in libuv callback context: it must not yield, park,
   ;; or raise (a raise here would unwind into C; it is swallowed).
   (define (conn-on-close! c thunk)
+    ;; A TAGGED CONN REFUSES THIS TOO. There is ONE cleanup slot, and on a
+    ;; pipe the library already owns it: the closure clears the proc's field
+    ;; for that stream and retires the row when the proc is fully closed.
+    ;; Overwriting it would not fail loudly -- the proc would simply never
+    ;; reach `closed` and its row would sit in the table for the life of the
+    ;; VM.
+    (when (conn-tag c)
+      (assertion-violation 'conn-on-close!
+        "a child process pipe owns its cleanup hook" (conn-tag c)))
     ;; The state test and the store must be ONE operation. Between them the
     ;; close completion can run, and then the thunk is filed on a conn that
     ;; will never close again -- so it never runs at all, which for the TLS
@@ -4699,7 +4926,9 @@
       ;; caller is a release path or a close request: nobody above wants the
       ;; condition, so it is recorded as a retirement reason and swallowed.
       (let ((block #f))
-        (guard (e (#t (when block (foreign-free block))
+        (guard (e (#t (when block
+                        (inject-barrier! 'write-block-released-closenotify-guard)
+                        (free-write-block! block))
                       (conn-tls-retire! c 'clean-close 'tls-shutdown-raised)))
           (bump-ssl-op!)
           (tls-session-shutdown! (conn-tls-session t))
@@ -4711,10 +4940,15 @@
                 ;; is the whole close.
                 (conn-tls-retire! c 'clean-close 'tls-closed)
                 (let* ((len (bytevector-length out))
-                       (blk (foreign-alloc (+ write-req-size buf-t-size len)))
+                       (blk (alloc-write-block! (+ write-req-size buf-t-size len)))
                        (buf-ptr (+ blk write-req-size))
                        (data-ptr (+ buf-ptr buf-t-size)))
                   (set! block blk)          ; the guard owns it until published
+                  ;; INJECTION POINT 'tls-closenotify-owned-fault -- OWNING GUARD:
+                  ;; the one above, while it still owns the block. Between the fill
+                  ;; and the ownership transfer is the only window in which that
+                  ;; guard has anything to release.
+                  (inject-fault! 'tls-closenotify-owned-fault)
                   (memcpy-to-c data-ptr out len)
                   (foreign-set! 'void* buf-ptr 0 data-ptr)
                   (foreign-set! 'unsigned-64 buf-ptr 8 len)
@@ -4722,9 +4956,14 @@
                   ;; queued behind an unknown amount of application data; if
                   ;; no timer can be armed, nothing would ever end the wait,
                   ;; so the close happens now instead.
-                  (if (not (tls-timer-rearm! t tls-shutdown-ms))
+                  ;; INJECTION POINT 'tls-timer-rearm-fail -- an override on the
+                  ;; rearm result, so a cell can reach the release below without
+                  ;; breaking a timer for real.
+                  (if (not (inject-override! 'tls-timer-rearm-fail
+                             (tls-timer-rearm! t tls-shutdown-ms)))
                       (begin
-                        (foreign-free blk)
+                        (inject-barrier! 'write-block-released-timer-fail)
+                        (free-write-block! blk)
                         (set! block #f)
                         (conn-tls-retire! c 'clean-close 'tls-shutdown-timer-failed))
                       (begin
