@@ -32,6 +32,7 @@
 ;; (start-scheduler, spawn, receive, ...); express, websocket and the
 ;; other batteries plug in on demand.
 (import (chezscheme)
+        (only (igropyr util) digits->exact)
         (igropyr http)
         (igropyr express)
         (igropyr websocket)
@@ -195,7 +196,9 @@
 (define account (box 1000))
 (app-post app "/transfer"
   (lambda (req res)
-    (let ((amt (or (string->number (utf8->string (req-body req))) 0)))
+    ;; the amount comes straight from the request body: shape first, ten
+    ;; digits being past any balance this holds
+    (let ((amt (or (digits->exact (utf8->string (req-body req)) 10) 0)))
       (if (or (<= amt 0) (> amt (unbox account)))
           (begin (set-status! res 400)
                  (send-json! res (list (cons "error" "bad amount"))))

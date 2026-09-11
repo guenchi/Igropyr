@@ -30,6 +30,7 @@
   (export kdf-pbkdf2-sha256 kdf-scrypt kdf-argon2id kdf-argon2id-available?
           password-hash password-verify)
   (import (chezscheme) (igropyr platform)
+          (only (igropyr util) digits->exact)
           (only (igropyr crypto) base64-encode base64-decode))
 
   ;; ---- libcrypto (loaded explicitly, like (igropyr tls)) ---------------
@@ -277,6 +278,15 @@
   ;; incidental FFI raise downstream.
   (define (pos-fx? x) (and (fixnum? x) (fx> x 0)))
 
+  ;; A COST FIELD IS DIGITS, AND IT IS CHECKED BEFORE IT IS CONVERTED.
+  ;; These come out of the stored password column, so whoever can write a
+  ;; row chooses the text; string->number would read "#e1e99999999" there
+  ;; as a request for 10^99999999 and never return. The ceilings below --
+  ;; scrypt-max-work, pbkdf2-max-iters, the argon2id bounds -- are all
+  ;; checked AFTER the conversion and so are never reached on that input.
+  ;; Ten digits is past every ceiling any of these fields can pass.
+  (define (cost-field->number s) (digits->exact s 10))
+
   (define (password-verify password stored)
     (and (string? password) (string? stored)
          (let ((parts (split-dollar stored)))
@@ -285,9 +295,9 @@
                   (and (fx<= (bytevector-length pw) max-password-bytes)
                    (cond
                     ((and (string=? (car parts) "scrypt") (= (length parts) 6))
-                     (let ((N (string->number (list-ref parts 1)))
-                           (r (string->number (list-ref parts 2)))
-                           (p (string->number (list-ref parts 3)))
+                     (let ((N (cost-field->number (list-ref parts 1)))
+                           (r (cost-field->number (list-ref parts 2)))
+                           (p (cost-field->number (list-ref parts 3)))
                            (salt (b64 (list-ref parts 4)))
                            (dk (b64 (list-ref parts 5))))
                        ;; work ~ N*r*p bounds TIME; scrypt-maxmem only bounds
@@ -301,7 +311,7 @@
                             (guard (e (#t #f))
                               (ct=? dk (kdf-scrypt pw salt N r p dk-len))))))
                     ((and (string=? (car parts) "pbkdf2-sha256") (= (length parts) 4))
-                     (let ((iters (string->number (list-ref parts 1)))
+                     (let ((iters (cost-field->number (list-ref parts 1)))
                            (salt (b64 (list-ref parts 2)))
                            (dk (b64 (list-ref parts 3))))
                        (and (pos-fx? iters) (fx<= iters pbkdf2-max-iters)
@@ -310,9 +320,9 @@
                             (guard (e (#t #f))
                               (ct=? dk (kdf-pbkdf2-sha256 pw salt iters dk-len))))))
                     ((and (string=? (car parts) "argon2id") (= (length parts) 6))
-                     (let ((t (string->number (list-ref parts 1)))
-                           (m (string->number (list-ref parts 2)))
-                           (p (string->number (list-ref parts 3)))
+                     (let ((t (cost-field->number (list-ref parts 1)))
+                           (m (cost-field->number (list-ref parts 2)))
+                           (p (cost-field->number (list-ref parts 3)))
                            (salt (b64 (list-ref parts 4)))
                            (dk (b64 (list-ref parts 5))))
                        ;; m<=256MiB AND t*m<=one fill bound BOTH memory and the

@@ -29,6 +29,7 @@
           start-scheduler spawn send receive self
           sleep-ms kill register whereis process-id)
   (import (chezscheme) (igropyr buffer)
+          (only (igropyr util) digits->exact)
           (igropyr actor) (igropyr websocket)
           (only (igropyr libuv) now-ms uv-strerror)
           (only (igropyr tcp) dns-resolve! tcp-close! tcp-connect! tcp-read-start! tcp-write!)
@@ -63,8 +64,11 @@
              (colon (string-index authority #\: 0)))
         (if colon
             (values (substring authority 0 colon)
-                    (or (string->number (substring authority (+ colon 1)
-                                          (string-length authority)))
+                    ;; the port comes from a caller-supplied URL: shape
+                    ;; first, five digits being the whole port range
+                    (or (digits->exact (substring authority (+ colon 1)
+                                         (string-length authority))
+                                       5)
                         default-port)
                     path)
             (values authority default-port path)))))

@@ -23,6 +23,7 @@
 (library (igropyr redis)
   (export redis-connect redis redis-close! redis-set-limits!)
   (import (chezscheme) (igropyr actor) (igropyr buffer)
+          (only (igropyr util) signed-digits->exact)
           (only (igropyr libuv) check uv-strerror)
           (only (igropyr tcp) conn-state tcp-close! tcp-connect! tcp-read-start! tcp-write!))
 
@@ -249,12 +250,15 @@
                          ((#\-) (accept (vector 'redis-error line) next stack
                                         (+ items 1)))
                          ((#\:)
-                          (let ((n (string->number line)))
+                          ;; a length or count line from the server, which
+                          ;; may legitimately be -1; integer-line? below
+                          ;; still applies to the converted value
+                          (let ((n (signed-digits->exact line 20)))
                             (if (integer-line? n)
                                 (accept n next stack (+ items 1))
                                 (fatal "bad integer reply"))))
                          ((#\$)
-                          (let ((n (string->number line)))
+                          (let ((n (signed-digits->exact line 20)))
                             (cond
                               ((not (integer-line? n)) (fatal "bad bulk length"))
                               ((= n -1) (accept #f next stack (+ items 1)))
@@ -263,7 +267,7 @@
                                (fatal "bulk reply too large"))
                               (else (bulk pos stack next n items)))))
                          ((#\*)
-                          (let ((n (string->number line)))
+                          (let ((n (signed-digits->exact line 20)))
                             (cond
                               ((not (integer-line? n)) (fatal "bad array length"))
                               ((= n -1) (accept #f next stack (+ items 1)))

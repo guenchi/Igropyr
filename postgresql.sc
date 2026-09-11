@@ -92,6 +92,7 @@
           postgresql-execute postgresql-close! postgresql-pool-stats
           postgresql-transaction call-with-postgresql-connection)
   (import (chezscheme) (igropyr actor) (igropyr buffer)
+          (only (igropyr util) digits->exact)
           (only (igropyr libuv) now-ms uv-strerror)
           (only (igropyr tcp) tcp-close! tcp-connect! tcp-read-start! tcp-write!)
           (igropyr connpool)
@@ -494,7 +495,9 @@
                  (a (scram-attrs server-first))
                  (snonce (attr a #\r))
                  (salt-b64 (attr a #\s))
-                 (iters (let ((s (attr a #\i))) (and s (string->number s)))))
+                 ;; the iteration count is the server's text: shape first,
+                 ;; twenty digits being past anything the field can carry
+                 (iters (let ((s (attr a #\i))) (and s (digits->exact s 20)))))
             ;; validate everything before touching it: a missing or bogus
             ;; field is a protocol error, not a raw assertion. The server
             ;; nonce must EXTEND ours (RFC 5802: client nonce + a non-empty
@@ -643,7 +646,8 @@
     (let* ((z (or (find-u8 p 0 0) (bytevector-length p)))
            (tag (utf8->string (bv-sub p 0 z)))
            (toks (split-on tag #\space)))
-      (or (string->number (car (last-pair toks))) 0)))
+      ;; the row count in a command tag, as the server wrote it
+      (or (digits->exact (car (last-pair toks)) 20) 0)))
 
   ;; Read messages through ReadyForQuery ('Z') and build the result. Shared
   ;; by the simple and extended flows: the extended flow's extra messages

@@ -68,6 +68,7 @@
           start-scheduler spawn send receive self
           sleep-ms kill register whereis process-id)
   (import (chezscheme) (igropyr buffer) (igropyr actor)
+          (only (igropyr util) digits->exact hex-digits->exact)
           (only (igropyr libuv) check now-ms uv-strerror)
           (only (igropyr tcp) dns-resolve! tcp-close! tcp-connect! tcp-read-start! tcp-read-stop! tcp-write!))
 
@@ -164,8 +165,12 @@
              (dport (if tls? default-tls-port default-port)))
         (if colon
             (values (substring authority 0 colon)
-                    (or (string->number (substring authority (+ colon 1)
-                                                   (string-length authority)))
+                    ;; the authority's port is text from a caller-supplied
+                    ;; URL: shape-checked before conversion, five digits
+                    ;; being the whole of the port range
+                    (or (digits->exact (substring authority (+ colon 1)
+                                                  (string-length authority))
+                                       5)
                         dport)
                     path tls?)
             (values authority dport path tls?)))))
@@ -276,9 +281,12 @@
            (sp1 (string-index s #\space 0)))
       (and sp1
            (let ((sp2 (string-index s #\space (+ sp1 1))))
-             (string->number
+             ;; the status code is the server's text; three digits is
+             ;; every code the protocol defines
+             (digits->exact
                (if sp2 (substring s (+ sp1 1) sp2)
-                   (substring s (+ sp1 1) (string-length s))))))))
+                   (substring s (+ sp1 1) (string-length s)))
+               3)))))
 
   ;; the version token of a status line: "HTTP/1.1 200 OK" -> "HTTP/1.1"
   (define (parse-http-version bv end)
@@ -395,7 +403,13 @@
           ((fx>= (fx+ i 1) n) #f)
           ((and (fx= (bytevector-u8-ref bv (fx+ base i)) 13)
                 (fx= (bytevector-u8-ref bv (fx+ base (fx+ i 1))) 10))
-           (let ((size (string->number
+           ;; THE LINE-LENGTH BOUND ABOVE IS NOT THE GUARD. A radix
+           ;; argument does not stop string->number honouring an
+           ;; exactness prefix, so a short well-formed-looking line can
+           ;; still ask for an unbounded integer; the digits are checked
+           ;; here instead. Sixteen hex digits is past any chunk size a
+           ;; 64-bit length can hold.
+           (let ((size (hex-digits->exact
                          (let ((line (utf8->string (inbuf-sub buf pos i))))
                            (let ((semi (string-index line #\; 0)))
                              (if semi (substring line 0 semi) line)))

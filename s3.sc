@@ -87,10 +87,13 @@
                       (cond ((= i (string-length authority)) #f)
                             ((char=? (string-ref authority i) #\:) i)
                             (else (loop (+ i 1))))))
+             ;; the endpoint's port is configuration text: shape first,
+             ;; five digits being the whole port range
              (port (and colon
-                        (string->number
+                        (digits->exact
                           (substring authority (+ colon 1)
-                                     (string-length authority))))))
+                                     (string-length authority))
+                          5))))
         (when (and colon (not (and (integer? port) (exact? port) (> port 0))))
           (assertion-violation 'make-s3 "bad endpoint port" ep))
         (values ep

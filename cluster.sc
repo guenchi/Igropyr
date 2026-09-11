@@ -120,7 +120,9 @@
       (and (= (length parts) 3)
            (valid-node-name? (car parts))
            (valid-host? (cadr parts))
-           (let ((port (string->number (caddr parts))))
+           ;; a peer's registration text: shape first, five digits being
+           ;; the whole port range; valid-port? below still applies
+           (let ((port (digits->exact (caddr parts) 5)))
              (and port (valid-port? port)
                   (list (string->symbol (car parts)) (cadr parts) port))))))
 
@@ -130,8 +132,10 @@
   (define (redis-now-ms conn)
     (let ((r (redis conn "TIME")))
       (if (and (list? r) (>= (length r) 2))
-          (+ (* 1000 (or (string->number (car r)) 0))
-             (fxdiv (or (string->number (cadr r)) 0) 1000))
+          ;; the server's own clock, as two decimal fields of its reply:
+          ;; twenty digits is past any epoch these will carry
+          (+ (* 1000 (or (digits->exact (car r) 20) 0))
+             (fxdiv (or (digits->exact (cadr r) 20) 0) 1000))
           ;; A server that does not answer TIME (a proxy, an old build) is a
           ;; deployment fact worth naming rather than silently falling back
           ;; to a clock that is wrong across hosts.

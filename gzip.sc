@@ -8,7 +8,8 @@
 
 (library (igropyr gzip)
   (export gzip-compress gzip-acceptable?)
-  (import (chezscheme) (igropyr platform))
+  (import (chezscheme) (igropyr platform)
+          (only (igropyr util) decimal-fraction->number))
 
   (define libc-loaded
     (begin
@@ -624,7 +625,11 @@
                                   (else (scan (+ i 1)))))))
              (if (and eq-pos
                       (string-ci=? (trim s body-start eq-pos) "q")
-                      (let ((v (string->number (trim s (+ eq-pos 1) semi))))
+                      ;; the q value is the client's text: digits with at
+                      ;; most one point, eight characters being past any
+                      ;; quality the grammar allows
+                      (let ((v (decimal-fraction->number
+                                 (trim s (+ eq-pos 1) semi) 8)))
                         (and v (zero? v))))
                  #t
                  (param semi))))))

@@ -18,6 +18,7 @@
 (library (igropyr s3-control)
   (export make-s3-control s3-control-create-job s3-control-describe-job s3-control-error?)
   (import (chezscheme)
+          (only (igropyr util) digits->exact)
           (only (igropyr sigv4) sigv4-sign-headers sha256-hex sigv4-uri-encode)
           (only (igropyr aws) endpoint->host xml-first)
           (only (igropyr http-client) http-request response-status response-body))
@@ -105,7 +106,9 @@
                    (or (xml-first xml "Message")
                        (if (> (string-length xml) 200) (substring xml 0 200) xml)))))))
 
-  (define (num s) (or (and s (string->number s)) 0))
+  ;; a number out of the service's XML: shape first, twenty digits being
+  ;; past any count or byte total these fields carry
+  (define (num s) (or (and s (digits->exact s 20)) 0))
 
   ;; DescribeJob: GET /v20180820/jobs/{id}. -> the status + progress alist.
   (define (s3-control-describe-job c job-id)
