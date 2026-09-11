@@ -155,8 +155,10 @@
           (check "P12 inline: accepted, completed inline (status 0) and zero charge on return" (and ok (eqv? got 0) (eqv? (proc-queued p) 0)) (list ok got (proc-queued p))))
         (finish! p)
         (back-to-base! "P12 inline: counts back" b0 3000))
-      ;; submission raise on the QUEUED path: the pipe is saturated first so the write cannot
-      ;; complete through uv_try_write and reaches the allocation the fault stands in for
+      (set-proc-stdin-cap! (* 16 MiB))
+      ;; submission raise on the QUEUED path: the pipe is saturated first (1 MiB, past the
+      ;; socket buffer) so the write cannot complete through uv_try_write and reaches the
+      ;; allocation the fault stands in for
       (let ((p (spawn-sh "exec sleep 5")))
         (check "P12 raise: premise -- the pipe is saturated (1 MiB queued)" (and (proc-write! p (make-bytevector MiB 2)) (> (proc-queued p) 0)) (proc-queued p))
         (let ((q0 (proc-queued p)) (tw (count! 'proc-write-settled-twice)))
@@ -173,7 +175,7 @@
       ;; settlement collision: the seam makes the library settle a completion twice
       (let ((p (spawn-sh "exec cat")) (got '()))
         (let ((tw (count! 'proc-write-settled-twice)))
-          (inject-arm-fault! 'proc-write-settle-twice 1)
+          (inject-arm-return! 'proc-write-settle-twice #t 1)
           (check "P12 collision: accepted" (proc-write! p (string->utf8 "abc\n") (lambda (s) (set! got (cons s got)))))
           (check "P12 collision: the second settlement was refused (counted once), the user's on-done ran once, queued 0"
                  (within? 2000 (lambda () (and (eqv? (hits 'proc-write-settled-twice) 1) (= (length got) 1) (eqv? (proc-queued p) 0)))) (list (hits 'proc-write-settled-twice) got (proc-queued p)))

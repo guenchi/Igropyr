@@ -69,10 +69,14 @@
 (define c-dup (foreign-procedure "dup" (int) int))
 (define c-dup2 (foreign-procedure "dup2" (int int) int))
 (define c-close (foreign-procedure "close" (int) int))
-(define c-open3 (foreign-procedure "open" (string int int) int))
+;; open(2) is variadic, so the mode cannot be passed through a fixed-arity foreign
+;; procedure; the file is created by Chez first and opened here without a mode
+;; (O_WRONLY|O_TRUNC = #x401)
+(define c-open2 (foreign-procedure "open" (string int) int))
 (define (with-stdout-to-file f thunk)
   (flush-output-port (current-output-port))
-  (let* ((saved (c-dup 1)) (fd (c-open3 f #x601 #o644)))
+  (call-with-port (open-file-output-port f (file-options no-fail)) (lambda (o) (void)))
+  (let* ((saved (c-dup 1)) (fd (c-open2 f #x401)))
     (c-dup2 fd 1) (c-close fd)
     (let ((r (thunk)))
       (flush-output-port (current-output-port))
@@ -138,7 +142,7 @@
         (back-to-base! "P8 inherit: counts back" b0 3000))
       (let ((p (spawn-sh "echo dropped; exit 4" '(stdout . ignore))))
         (check "P8 ignore: no stdout conn" (and (proc? p) (not (proc-stdout p))))
-        (check "P8 ignore: exit 4" (equal? (wait-exit p 3000) '(0 . 4)))
+        (check "P8 ignore: exit 4" (equal? (wait-exit p 3000) '(4 . 0)))
         (check "P8 ignore: stderr EOF" (equal? (collect p 'stderr 3000) (make-bytevector 0)))
         (quiet! "P8 ignore: nothing from stdout" 300)
         (back-to-base! "P8 ignore: counts back" b0 3000))
@@ -219,10 +223,12 @@
           (check "P16: nothing allocated" (equal? (base) b0) (base) b0)))
 
       ;; ---- P22: counts sampled during pipe churn ---------------------------------------
-      (let* ((l (tcp-listen! "127.0.0.1" port 16 (lambda (c) (void))))
+      (let* ((srv #f)
+             (l (tcp-listen! "127.0.0.1" port 16 (lambda (c) (set! srv c))))
              (sock (begin (tcp-connect! "127.0.0.1" port main)
                           (receive (after 3000 #f) (`#(tcp-connected ,c) c)))))
-        (check "P22: premise -- a real socket pair is open" (and sock (>= (- (conn-count) (list-ref b0 1)) 2)) (conn-count))
+        ;; the accepted side appears a few ms after the client's tcp-connected
+        (check "P22: premise -- a real socket pair is open (both rows)" (and sock (within? 3000 (lambda () (and srv (>= (- (conn-count) (list-ref b0 1)) 2))))) (conn-count))
         (let ((spawner (spawn (lambda ()
                                 (let loop ((i 0) (ps '()))
                                   (if (< i 50)
@@ -246,7 +252,7 @@
           (check "P22: counts back while the spawner (the owner) is still alive" (within? 8000 (lambda () (equal? (list-ref (base) 2) (list-ref b0 2)) )) (base))
           (check "P22: procs and owner index back with the owner alive" (within? 8000 (lambda () (and (eqv? (proc-count) (list-ref b0 3)) (eqv? (uv-owner-index-count) (+ (list-ref b0 4) 2))))) (base) b0)
           (kill spawner 'done)
-          (tcp-close! sock) (tcp-stop-listen! l)
+          (tcp-close! sock) (when srv (tcp-close! srv)) (tcp-stop-listen! l)
           (back-to-base! "P22: counts back" b0 5000)))
 
       ;; ---- P23: pipe conns refuse owner transfer and hook replacement --------------------

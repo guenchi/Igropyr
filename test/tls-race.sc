@@ -633,6 +633,7 @@
         ;; and the close-notify guard is reached through its seam; the cell asserts the
         ;; retire reason, the release point hit exactly once, and the write-block
         ;; counter and table back where they were.
+        (http-swap! srv holding-handler)
         (let ((p30-tls
                 (lambda (label arm! reason point)
                   (let* ((ch (open-held-conn! 'plain)) (c (car ch))
