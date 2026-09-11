@@ -545,6 +545,10 @@ IGROPYR_SCHEME="$scheme_bin" IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' 
 #      admission fences, executor liveness, reaper recovery. Plaintext peers from
 #      test/plain-peer.sc; one TLS smoke.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/plain-peer-smoke.sc
+# Helper renderers: SXML -> HTML and rule lists -> CSS (pure; expectations
+#      pinned from the notation's reference cases)
+"$scheme_bin" --script test/html.sc
+"$scheme_bin" --script test/css.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/cleanup-record.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/cleanup-record-exec.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/cleanup-record-reaper.sc

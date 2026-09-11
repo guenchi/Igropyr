@@ -19,6 +19,7 @@
         (igropyr redis) (igropyr connpool) (igropyr mysql) (igropyr postgresql)
         (igropyr durable) (igropyr durable-async)
         (igropyr qjspool)
-        (igropyr node) (igropyr dpool) (igropyr cluster))
+        (igropyr node) (igropyr dpool) (igropyr cluster)
+        (igropyr html) (igropyr css))
 (display "ALL LIBRARIES IMPORTED\n")
 

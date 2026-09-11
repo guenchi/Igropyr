@@ -1,0 +1,60 @@
+#!chezscheme
+;; (igropyr html): SXML -> HTML string. Pure, so every expectation is a pinned
+;; string; the pins come from the notation's reference test file, so a
+;; transcription that drifts from the reference goes red here.
+(import (chezscheme) (igropyr html))
+(define fails 0)
+(define (check label ok . info)
+  (if ok (begin (display "  ok  ") (display label) (newline))
+      (begin (set! fails (+ fails 1)) (display "FAIL  ") (display label)
+             (for-each (lambda (x) (display " ") (write x)) info) (newline))))
+(define (t label got want) (check label (equal? got want) got want))
+(define (raises? thunk) (guard (e (#t #t)) (thunk) #f))
+
+;; ---- the reference cases, pinned ------------------------------------------
+(t "text escaping and an attribute" (sxml->html '(div (@ (class "a")) "x < y & z"))
+   "<div class=\"a\">x &lt; y &amp; z</div>")
+(t "attribute-value escaping: quotes and ampersand" (sxml->html '(a (@ (href "?a=1&b=\"2\"")) "go"))
+   "<a href=\"?a=1&amp;b=&quot;2&quot;\">go</a>")
+(t "void element: no closing tag" (sxml->html '(img (@ (src "a.png") (alt "b"))))
+   "<img src=\"a.png\" alt=\"b\">")
+(t "boolean attributes: #t present, #f omitted" (sxml->html '(input (@ (type "checkbox") (checked #t) (disabled #f))))
+   "<input type=\"checkbox\" checked>")
+(t "numbers as text, mixed children" (sxml->html '(p "n = " 42)) "<p>n = 42</p>")
+(t "nested" (sxml->html '(ul (li "a") (li "b"))) "<ul><li>a</li><li>b</li></ul>")
+(t "raw-text element (style) is not escaped" (sxml->html '(style "body > p { color: red }"))
+   "<style>body > p { color: red }</style>")
+(t "raw-text element (script) is not escaped" (sxml->html '(script "if (a < b && c) {}"))
+   "<script>if (a < b && c) {}</script>")
+(t "a raw node injects literal markup" (sxml->html (list 'div (raw "<b>x</b>")))
+   "<div><b>x</b></div>")
+(t "a raw node inside a raw-text element emits its literal" (sxml->html (list 'style (raw "a>b{x:1}")))
+   "<style>a>b{x:1}</style>")
+(t "element with no attributes and no children" (sxml->html '(br)) "<br>")
+(t "html-escape standalone" (html-escape "a<b>&c") "a&lt;b&gt;&amp;c")
+(t "full document" (html->document '(html (@ (lang "en")) (body (h1 "Hi"))))
+   "<!DOCTYPE html>\n<html lang=\"en\"><body><h1>Hi</h1></body></html>\n")
+
+;; ---- beyond the reference file ---------------------------------------------
+(t "a symbol child renders as its name" (sxml->html '(span sym)) "<span>sym</span>")
+(t "a symbol attribute value renders as its name" (sxml->html '(div (@ (class cls)))) "<div class=\"cls\"></div>")
+(t "a numeric attribute value" (sxml->html '(td (@ (colspan 2)) "x")) "<td colspan=\"2\">x</td>")
+(t "> is escaped in text" (sxml->html '(p "a > b")) "<p>a &gt; b</p>")
+(t "> is NOT escaped in an attribute value (attribute specials differ from text specials)"
+   (sxml->html '(div (@ (title "a > b")))) "<div title=\"a > b\"></div>")
+(t "a top-level raw node" (sxml->html (raw "<!-- c -->")) "<!-- c -->")
+(t "an empty list child renders nothing" (sxml->html '(p () "x")) "<p>x</p>")
+(t "every void tag closes itself" (sxml->html '(div (area) (base) (br) (col) (embed) (hr) (img) (input) (link) (meta) (param) (source) (track) (wbr)))
+   "<div><area><base><br><col><embed><hr><img><input><link><meta><param><source><track><wbr></div>")
+(t "raw? recognises only raw nodes" (list (raw? (raw "x")) (raw? '(div)) (raw? "x")) '(#t #f #f))
+(t "attributes must come first: a later (@ ...) is an element named @" (sxml->html '(div "x" (@ (a "1"))))
+   "<div>x<@ a=\"1\"></@></div>")
+(check "an unrenderable node raises" (raises? (lambda () (sxml->html '(div #t)))))
+(check "an unrenderable text value in a raw-text element raises" (raises? (lambda () (sxml->html '(style (b "x"))))))
+(t "deep nesting with mixed escaping"
+   (sxml->html '(html (head (title "T&C")) (body (@ (class "x")) (p "1 < 2") (script "1 < 2"))))
+   "<html><head><title>T&amp;C</title></head><body class=\"x\"><p>1 &lt; 2</p><script>1 < 2</script></body></html>")
+
+(if (zero? fails)
+    (begin (display "ALL HTML TESTS PASSED\n") (exit 0))
+    (begin (display "HTML VERDICT: ") (display fails) (display " failed case(s)\n") (exit 1)))

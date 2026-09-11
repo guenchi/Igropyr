@@ -237,6 +237,10 @@
         (only (igropyr sexpr)
               string->sexpr sexpr->string string->sexpr-extended
               sexpr->string-extended)
+        (only (igropyr html)
+              sxml->html html->document html-escape raw raw?)
+        (only (igropyr css)
+              css->string num->css palette->root)
         (only (igropyr sigv4)
               sigv4-sign-headers sigv4-uri-encode
               sigv4-canonical-query sigv4-canonical-request
