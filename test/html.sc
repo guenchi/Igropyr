@@ -36,7 +36,8 @@
    "<!DOCTYPE html>\n<html lang=\"en\"><body><h1>Hi</h1></body></html>\n")
 
 ;; ---- beyond the reference file ---------------------------------------------
-(t "a symbol child renders as its name" (sxml->html '(span sym)) "<span>sym</span>")
+(check "a symbol child of an ordinary element is refused (only text, numbers, raw and elements are nodes)" (raises? (lambda () (sxml->html '(span sym)))))
+(t "a symbol child of a raw-text element renders as its name" (sxml->html '(script foo)) "<script>foo</script>")
 (t "a symbol attribute value renders as its name" (sxml->html '(div (@ (class cls)))) "<div class=\"cls\"></div>")
 (t "a numeric attribute value" (sxml->html '(td (@ (colspan 2)) "x")) "<td colspan=\"2\">x</td>")
 (t "> is escaped in text" (sxml->html '(p "a > b")) "<p>a &gt; b</p>")
@@ -47,8 +48,8 @@
 (t "every void tag closes itself" (sxml->html '(div (area) (base) (br) (col) (embed) (hr) (img) (input) (link) (meta) (param) (source) (track) (wbr)))
    "<div><area><base><br><col><embed><hr><img><input><link><meta><param><source><track><wbr></div>")
 (t "raw? recognises only raw nodes" (list (raw? (raw "x")) (raw? '(div)) (raw? "x")) '(#t #f #f))
-(t "attributes must come first: a later (@ ...) is an element named @" (sxml->html '(div "x" (@ (a "1"))))
-   "<div>x<@ a=\"1\"></@></div>")
+(t "attributes must come first: a later (@ ...) is an element named @ with its own children" (sxml->html '(div "x" (@ (a "1"))))
+   "<div>x<@><a>1</a></@></div>")
 (check "an unrenderable node raises" (raises? (lambda () (sxml->html '(div #t)))))
 (check "an unrenderable text value in a raw-text element raises" (raises? (lambda () (sxml->html '(style (b "x"))))))
 (t "deep nesting with mixed escaping"
