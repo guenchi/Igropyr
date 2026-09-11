@@ -52,10 +52,6 @@ in a build with `IGROPYR_INJECT=on` and raises otherwise.
   notice, and the SPDX identifier in `package.json` and the README section
   follow it.
 
-  This applies to releases made from this version onward. **Copies already
-  distributed under the MIT terms keep those terms**, and published packages
-  that declare MIT are unaffected — nothing is withdrawn retroactively.
-
 - **The framework no longer writes on the application's stdout.** A process
   may be holding stdout for a protocol, a pipe, or a log format of its own,
   and a library writing there corrupts a stream it does not own: the
