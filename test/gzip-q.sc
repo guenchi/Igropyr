@@ -25,8 +25,10 @@
 ;; witness: the supplier call in gzip.sc replaced by the raw conversion
 (define witness (string-append dir "/witness"))
 (system (string-append "rm -rf " witness " && mkdir -p " witness " && cp " tree "/*.sc " witness "/ && ln -s . " witness "/igropyr"))
+;; the witness bypasses the supplier where it is defined (util.sc in the shadow tree):
+;; a raw conversion takes the name, the guarded body keeps a renamed one
 (define (witness-built?)
-  (eqv? 0 (exit-code (system (string-append "grep -q 'decimal-fraction->number' " witness "/gzip.sc && sed -i.bak 's/(decimal-fraction->number \\(.*\\) [0-9]*)/(string->number \\1)/' " witness "/gzip.sc && ! grep -q 'decimal-fraction->number' " witness "/gzip.sc")))))
+  (eqv? 0 (exit-code (system (string-append "grep -q '(define (decimal-fraction->number s max-len)' " witness "/util.sc && sed -i.bak 's/(define (decimal-fraction->number s max-len)/(define (decimal-fraction->number s max-len) (string->number s)) (define (decimal-fraction->number-guarded s max-len)/' " witness "/util.sc && grep -q 'decimal-fraction->number-guarded' " witness "/util.sc")))))
 (check "witness: the supplier call was found and replaced by the raw conversion" (witness-built?))
 (let ((r (exit-code (run-child! witness poison 5))))
   (check "witness: without the guard the poisoned q= hangs the child (timeout exit 124)" (eqv? r 124) r (child-output)))
