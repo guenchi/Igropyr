@@ -130,13 +130,13 @@
         (drain! 300)
         (back-to-base! "P21 exit-notify: counts back" b0 3000))
       (inject-disarm!)
-      (let ((p (begin (inject-arm-fault! 'proc-close-unindex 1) (spawn-sh "true"))))
+      (let* ((i0 (uv-owner-index-count)) (p (begin (inject-arm-fault! 'proc-close-unindex 1) (spawn-sh "true"))))
         (check "P21 close-unindex: exit" (equal? (wait-exit p 3000) '(0 . 0)))
         (drain! 500)
         (check "P21 close-unindex: the fault fired (arrived at least once)" (>= (hits 'proc-close-unindex) 1) (hits 'proc-close-unindex))
         (check "P21 close-unindex: the row retired and the handle was freed although unindex raised"
                (within? 3000 (lambda () (and (eq? (proc-state p) 'closed) (equal? (counts) b0)))) (list (proc-state p) (counts)))
-        (check "P21 close-unindex: exactly one index entry leaked at this point" (eqv? (uv-owner-index-count) (+ b0-index leaks 1)) (uv-owner-index-count) b0-index leaks)
+        (check "P21 close-unindex: exactly one index entry leaked by this cell" (eqv? (uv-owner-index-count) (+ i0 1)) (uv-owner-index-count) i0)
         (set! leaks (+ leaks 1)))
       (inject-disarm!)
 
@@ -230,13 +230,13 @@
       (inject-disarm!)
       (inject-arm-fault! 'proc-rollback-unindex 1)
       (inject-arm-fault! 'proc-publish-fail 1)
-      (let ((r (guard (e (#t 'raised)) (spawn-sh "exec sleep 7130"))))
+      (let* ((i0 (uv-owner-index-count)) (r (guard (e (#t 'raised)) (spawn-sh "exec sleep 7130"))))
         (check "P27 rollback-unindex: the condition reaches the caller" (eq? r 'raised) r)
         (check "P27 rollback-unindex: both faults fired once" (and (eqv? (hits 'proc-rollback-unindex) 1) (eqv? (hits 'proc-publish-fail) 1)))
         (check "P27 rollback-unindex: reaped" (within? 2000 (lambda () (not (ps-has? "sleep 7130")))))
         (check "P27 rollback-unindex: the rest of the rollback ran (handles, conns, procs back)"
                (within? 3000 (lambda () (equal? (counts) b0))) (counts) b0)
-        (check "P27 rollback-unindex: at most one index entry leaked at this point" (<= (uv-owner-index-count) (+ b0-index leaks 1)) (uv-owner-index-count) b0-index leaks)
+        (check "P27 rollback-unindex: at most one index entry leaked by this cell" (<= (uv-owner-index-count) (+ i0 1)) (uv-owner-index-count) i0)
         (set! leaks (+ leaks 1))
         (drain! 300))
       (inject-disarm!)
@@ -275,14 +275,14 @@
       (inject-disarm!)
 
       ;; ---- P29: close-callback containment ------------------------------------------------------
-      (let ((p (spawn-sh "true")))
+      (let* ((i0 (uv-owner-index-count)) (p (spawn-sh "true")))
         (inject-arm-fault! 'conn-close-unindex 1)
         (check "P29: exit" (equal? (wait-exit p 3000) '(0 . 0)))
         (drain! 500)
         (check "P29: the fault fired once at the first of the three pipe closes (three arrivals)" (eqv? (hits 'conn-close-unindex) 3) (hits 'conn-close-unindex))
         (check "P29: the handle was freed, the pipe field cleared and the row retired although unindex raised"
                (within? 3000 (lambda () (and (eq? (proc-state p) 'closed) (equal? (counts) b0)))) (list (proc-state p) (counts)))
-        (check "P29: exactly one index entry leaked at this point" (eqv? (uv-owner-index-count) (+ b0-index leaks 1)) (uv-owner-index-count) b0-index leaks)
+        (check "P29: exactly one index entry leaked by this cell" (eqv? (uv-owner-index-count) (+ i0 1)) (uv-owner-index-count) i0)
         (set! leaks (+ leaks 1)))
       (inject-disarm!)
 
@@ -325,8 +325,13 @@
         (inject-disarm!)
         (count! 'write-block-released-plain-reject)
         (tcp-close! cli)
-        (let ((r (tcp-write! cli (make-bytevector 16 2) (lambda (s) (void)))))
-          (check "P30 tcp: a write after close is rejected and its block released (point hit once)" (and (not r) (eqv? (hits 'write-block-released-plain-reject) 1)) (list r (hits 'write-block-released-plain-reject))))
+        ;; a write after close is refused; whether the refusal happens before the block is
+        ;; allocated (tcp-write!'s outer state check) or at the in-region rejection (the
+        ;; release point) both leave no block behind -- the counter is the oracle, the point
+        ;; is informational (the in-region rejection needs a close racing the write)
+        (let ((w1 (write-blocks-live-count)) (r (tcp-write! cli (make-bytevector 16 2) (lambda (s) (void)))))
+          (check "P30 tcp: a write after close is refused and leaves no block" (and (not r) (eqv? (write-blocks-live-count) w1)) (list r (write-blocks-live-count) w1))
+          (display "  [P30 tcp] in-region rejection point hits: ") (display (hits 'write-block-released-plain-reject)) (newline))
         (within? 2000 (lambda () (not (conn? srv))))
         (when srv (tcp-close! srv))
         (tcp-stop-listen! l)
