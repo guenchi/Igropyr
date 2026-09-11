@@ -34,6 +34,17 @@
   (check "the reason is still printed with it" (contains? (slurp err) "deliberate boot failure") (slurp err))
   (check "and it was flushed before exit (the capture is not empty after a hard exit)" (> (string-length (slurp err)) 0) (slurp err)))
 
+;; the port itself may be broken: a panic whose console port raises must still
+;; exit 70 instead of turning the death into an ordinary exception that leaves
+;; the process alive
+(let ((f (string-append dir "/bad-port.sc")))
+  (call-with-output-file f
+    (lambda (o) (display "(import (chezscheme) (igropyr actor))\n(let ((p (open-output-string))) (close-port p) (console-error-port p))\n(start-scheduler (lambda () (error 'boot-test \"deliberate boot failure\")))\n" o)) 'truncate)
+  (let ((r (exit-code (system (string-append "cd " tree " && IGROPYR_CONTRACTS=full CHEZSCHEMELIBDIRS=. CHEZSCHEMELIBEXTS='.sc::.no-obj' timeout 30 "
+                                             scheme-bin " --script " f " > " out " 2> " err)))))
+    (check "a console port that raises on write: the panic still exits 70" (eqv? r 70) r (slurp err))
+    (check "...and stdout stays empty" (equal? (slurp out) "") (slurp out))))
+
 (if (zero? fails)
     (begin (display "ALL PANIC-STDERR TESTS PASSED\n") (exit 0))
     (begin (display "PANIC-STDERR VERDICT: ") (display fails) (display " failed case(s)\n") (exit 1)))

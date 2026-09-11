@@ -3,9 +3,12 @@
 ;; contracts line and http-listen its "listening on" line with plain display,
 ;; i.e. on the current output port: an application that keeps stdout for a
 ;; protocol or a pipe got two framework lines injected into it at start-up.
-;; The listening line goes through the http-notice hook, which defaults to the
-;; console error port (flushed) and which an application can replace; the
-;; contracts line is removed. A child chez listens on a free port and exits;
+;; The listening line goes through the notice hook (set once with http-notice!;
+;; a plain setter, not a parameter: the scheduler shares parameter values
+;; across green processes, so parameterize could not promise isolation),
+;; which defaults to the console error port (flushed) and which an application
+;; can replace; the contracts line is removed. Announcing is not part of
+;; listening: a hook that raises does not lose the listener. A child chez listens on a free port and exits;
 ;; its stdout and stderr are captured separately. The child copies its own
 ;; stderr capture while it is still alive (before exit could flush anything),
 ;; so the flush is observed and not assumed.
@@ -77,12 +80,12 @@
   (check "console error port: the child listened" (eqv? r 0) r (slurp err))
   (check "console error port: the line is on process stderr and the rebound current-error-port stayed empty" (listening-line? (slurp err)) (slurp err)))
 ;; ---- twin: the hook replaced -> silence on both ports ------------------------------
-(let ((r (run-child! "(http-notice (lambda (s) #f))" "(app-listen app 0)")))
+(let ((r (run-child! "(http-notice! (lambda (s) #f))" "(app-listen app 0)")))
   (check "twin: with the hook replaced the child still listens and exits" (eqv? r 0) r (slurp err))
   (check "twin: stdout empty" (equal? (slurp out) "") (slurp out))
   (check "twin: stderr empty too (the line went to the hook)" (equal? (slurp err) "") (slurp err)))
 ;; ---- twin: the application's hook decides, and is called once with the line ---------
-(let ((r (run-child! "(define seen 0) (http-notice (lambda (s) (set! seen (+ seen 1)) (display (string-append \"[app] \" s) (current-output-port))))"
+(let ((r (run-child! "(define seen 0) (http-notice! (lambda (s) (set! seen (+ seen 1)) (display (string-append \"[app] \" s) (current-output-port))))"
                      "(app-listen app 0) (display (string-append \"seen=\" (number->string seen) \"\\n\") (current-output-port))")))
   (check "twin: the child listened and exited" (eqv? r 0) r (slurp err))
   (check "twin: the hook put the unchanged line on stdout and was called exactly once"
@@ -94,10 +97,20 @@
                        (string=? (substring rest (+ k 1) (string-length rest)) "seen=1\n")))))
          (slurp out))
   (check "twin: nothing on stderr then" (equal? (slurp err) "") (slurp err)))
-;; ---- parameter semantics: dynamic binding is restored ----------------------------
-(let ((r (run-child! "(define default-hook (http-notice))"
-                     "(parameterize ((http-notice (lambda (s) #f))) (app-listen app 0)) (display (if (eq? (http-notice) default-hook) \"restored\\n\" \"NOT-RESTORED\\n\") (console-error-port))")))
-  (check "parameter: the hook can be bound with parameterize and is restored after" (equal? (slurp err) "restored\n") r (slurp err)))
+;; ---- the setter: last one wins, a non-procedure is refused, a raising hook
+;; does not lose the listener ------------------------------------------------------
+(let ((r (run-child! "(http-notice! (lambda (s) (display \"first\" (console-error-port)))) (http-notice! (lambda (s) (display \"second\" (console-error-port))))"
+                     "(app-listen app 0)")))
+  (check "setter: the last hook set is the one called" (equal? (slurp err) "second") r (slurp err)))
+;; the refusal must be the setter's own (who = http-notice!), and the setter
+;; must still accept a procedure afterwards: an unbound name would also raise
+(let ((r (run-child! "(define refused (guard (e (#t (if (and (assertion-violation? e) (who-condition? e) (eq? (condition-who e) 'http-notice!)) \"refused\" \"other\"))) (http-notice! 42) \"accepted\")) (http-notice! (lambda (s) #f)) (display refused (console-error-port))"
+                     "(app-listen app 0)")))
+  (check "setter: a non-procedure is refused by the setter itself, a procedure is then accepted" (and (eqv? r 0) (equal? (slurp err) "refused")) r (slurp err)))
+(let ((r (run-child! "(http-notice! (lambda (s) (error 'hook \"the application's hook raised\")))"
+                     "(let ((srv (app-listen app 0))) (display (if (http-server? srv) \"server-returned\n\" \"no-server\n\") (console-error-port)))")))
+  (check "a hook that raises: app-listen still returns the server (announcing is not part of listening)" (equal? (slurp err) "server-returned\n") r (slurp err))
+  (check "a hook that raises: nothing on stdout either" (equal? (slurp out) "") (slurp out)))
 ;; ---- a terminal: nothing kept back for the TTY case ---------------------------------
 ;; `script` gives the child a pty on both platforms (macOS: script -q file cmd;
 ;; FreeBSD: same). A line printed only when stdout is a terminal would hide from
