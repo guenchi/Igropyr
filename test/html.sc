@@ -10,6 +10,10 @@
              (for-each (lambda (x) (display " ") (write x)) info) (newline))))
 (define (t label got want) (check label (equal? got want) got want))
 (define (raises? thunk) (guard (e (#t #t)) (thunk) #f))
+;; the refusal must be the renderer's own (who = sxml->html) with its stated message
+(define (refused-by? who msg thunk)
+  (guard (e (#t (and (who-condition? e) (eq? (condition-who e) who) (message-condition? e) (string=? (condition-message e) msg))))
+    (thunk) #f))
 
 ;; ---- the reference cases, pinned ------------------------------------------
 (t "text escaping and an attribute" (sxml->html '(div (@ (class "a")) "x < y & z"))
@@ -36,7 +40,7 @@
    "<!DOCTYPE html>\n<html lang=\"en\"><body><h1>Hi</h1></body></html>\n")
 
 ;; ---- beyond the reference file ---------------------------------------------
-(check "a symbol child of an ordinary element is refused (only text, numbers, raw and elements are nodes)" (raises? (lambda () (sxml->html '(span sym)))))
+(check "a symbol child of an ordinary element is refused as a bad node (only text, numbers, raw and elements are nodes)" (refused-by? 'sxml->html "bad node" (lambda () (sxml->html '(span sym)))))
 (t "a symbol child of a raw-text element renders as its name" (sxml->html '(script foo)) "<script>foo</script>")
 (t "a symbol attribute value renders as its name" (sxml->html '(div (@ (class cls)))) "<div class=\"cls\"></div>")
 (t "a numeric attribute value" (sxml->html '(td (@ (colspan 2)) "x")) "<td colspan=\"2\">x</td>")
@@ -50,8 +54,13 @@
 (t "raw? recognises only raw nodes" (list (raw? (raw "x")) (raw? '(div)) (raw? "x")) '(#t #f #f))
 (t "attributes must come first: a later (@ ...) is an element named @ with its own children" (sxml->html '(div "x" (@ (a "1"))))
    "<div>x<@><a>1</a></@></div>")
-(check "an unrenderable node raises" (raises? (lambda () (sxml->html '(div #t)))))
-(check "an unrenderable text value in a raw-text element raises" (raises? (lambda () (sxml->html '(style (b "x"))))))
+(check "an unrenderable node is refused by sxml->html as a bad node" (refused-by? 'sxml->html "bad node" (lambda () (sxml->html '(div #t)))))
+(check "an unrenderable text value in a raw-text element is refused as not renderable as text" (refused-by? 'sxml->html "cannot render as text" (lambda () (sxml->html '(style (b "x"))))))
+(check "an unrenderable attribute value is refused as not renderable as text" (refused-by? 'sxml->html "cannot render as text" (lambda () (sxml->html '(div (@ (x (1))))))))
+(t "< is escaped in an attribute value" (sxml->html '(div (@ (title "a<b")))) "<div title=\"a&lt;b\"></div>")
+(t "a raw node inside script emits its literal" (sxml->html (list 'script (raw "if(a<b)"))) "<script>if(a<b)</script>")
+(t "a number child of a raw-text element renders as text" (sxml->html '(style 42)) "<style>42</style>")
+(t "a void element suppresses its children" (sxml->html '(br "x")) "<br>")
 (t "deep nesting with mixed escaping"
    (sxml->html '(html (head (title "T&C")) (body (@ (class "x")) (p "1 < 2") (script "1 < 2"))))
    "<html><head><title>T&amp;C</title></head><body class=\"x\"><p>1 &lt; 2</p><script>1 < 2</script></body></html>")

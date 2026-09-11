@@ -14,6 +14,9 @@
 (define (t label got want) (check label (equal? got want) got want))
 (define (r v) (css->string v))
 (define (bad? label v) (check label (guard (e (#t #t)) (r v) #f) v))
+;; a refusal must be the renderer's own (who = css) with its stated message
+(define (refused? label msg v)
+  (check label (guard (e (#t (and (who-condition? e) (eq? (condition-who e) 'css) (message-condition? e) (string=? (condition-message e) msg)))) (r v) #f) v))
 
 ;; ---- whole values ----------------------------------------------------------
 (t "em whole" (r '((x (a (em 1))))) "x{a:1em;}")
@@ -48,16 +51,19 @@
 (t "negative whole with a padded fraction" (r '((x (a (em -3 4 2))))) "x{a:-3.04em;}")
 (t "a width of zero says the same as leaving it out" (r '((x (a (em 3 4 0))))) "x{a:3.4em;}")
 ;; ---- operands are checked, not trusted --------------------------------------
-(bad? "no operand" '((x (a (em)))))
-(bad? "four operands (the fourth used to be dropped silently)" '((x (a (em 1 2 3 4)))))
-(bad? "a ratio is not a digit string" '((x (a (em 1 1/2)))))
-(bad? "a string fraction" '((x (a (em 1 "5")))))
-(bad? "a float width" '((x (a (em 1 5 2.0)))))
-(bad? "a negative width" '((x (a (em 1 5 -1)))))
-(bad? "a negative fraction (would have rendered 0.-5)" '((x (a (em 0 -5)))))
-(bad? "a float scalar" '((x (a 1.5))))
-(bad? "a bad selector" '((1 (a 1))))
-(bad? "a bad value" '((x (a #t))))
+(refused? "no operand" "unit form needs an argument" '((x (a (em)))))
+(refused? "four operands (the fourth used to be dropped silently)" "a unit form takes at most a whole, a fraction and a width" '((x (a (em 1 2 3 4)))))
+(refused? "a ratio is not a digit string" "a unit fraction is an exact non-negative integer; the sign belongs to the whole part" '((x (a (em 1 1/2)))))
+(refused? "a string fraction" "a unit fraction is an exact non-negative integer; the sign belongs to the whole part" '((x (a (em 1 "5")))))
+(refused? "an inexact fraction" "a unit fraction is an exact non-negative integer; the sign belongs to the whole part" '((x (a (em 1 5.0)))))
+(refused? "a float width" "a unit width is an exact non-negative integer" '((x (a (em 1 5 2.0)))))
+(refused? "a rational width" "a unit width is an exact non-negative integer" '((x (a (em 1 5 1/2)))))
+(refused? "a negative width" "a unit width is an exact non-negative integer" '((x (a (em 1 5 -1)))))
+(refused? "a negative fraction (would have rendered 0.-5)" "a unit fraction is an exact non-negative integer; the sign belongs to the whole part" '((x (a (em 0 -5)))))
+(refused? "a float scalar" "use an exact integer, a unit form, or a string" '((x (a 1.5))))
+(refused? "an integer-valued inexact scalar" "use an exact integer, a unit form, or a string" '((x (a 2.0))))
+(refused? "a bad selector" "bad selector" '((1 (a 1))))
+(refused? "a bad value" "bad value" '((x (a #t))))
 ;; ---- every unit ------------------------------------------------------------
 (for-each
   (lambda (u suf)
@@ -75,8 +81,9 @@
 ;; ---- variables, selectors, compound values, calc, colours ---------------------
 (t "custom properties on :root" (r '((:root (--bg "#f2f4fa") (--lapis "#1550c4")))) ":root{--bg:#f2f4fa;--lapis:#1550c4;}")
 (t "string selector, var(), em fraction" (r '((".nav a" (color (var dim)) (font-size (em 0 92))))) ".nav a{color:var(--dim);font-size:0.92em;}")
-(t "compound value and a multi-value declaration" (r '((.box (border (px 1) solid (var line)) (padding (em 1 10) (em 1 20)))))
+(t "a multi-value declaration" (r '((.box (border (px 1) solid (var line)) (padding (em 1 10) (em 1 20)))))
    ".box{border:1px solid var(--line);padding:1.1em 1.2em;}")
+(t "a COMPOUND value (one nested list joined by spaces)" (r '((x (border ((px 1) solid (var line)))))) "x{border:1px solid var(--line);}")
 (t "calc and rgba" (r '((.x (width (calc (pct 100) - (em 2))) (box-shadow 0 (px 1) (px 3) (rgba 16 20 42 (dec 0 6 2))))))
    ".x{width:calc(100% - 2em);box-shadow:0 1px 3px rgba(16,20,42,0.06);}")
 (t "rgb" (r '((x (color (rgb 1 2 3))))) "x{color:rgb(1,2,3);}")
@@ -87,6 +94,8 @@
    "@media (max-width: 42em){.nav-links{gap:1em;font-size:0.88em;}}")
 (t "@keyframes nesting" (r '((@keyframes spin (from (transform "rotate(0)")) (to (transform "rotate(360deg)")))))
    "@keyframes spin{from{transform:rotate(0);}to{transform:rotate(360deg);}}")
+(t "@keyframes with a string name and a percentage selector" (r '((@keyframes "fade-in" ("50%" (opacity (dec 0 5))))))
+   "@keyframes fade-in{50%{opacity:0.5;}}")
 (t "@supports nesting" (r '((@supports "(display: grid)" (.g (display grid)))))
    "@supports (display: grid){.g{display:grid;}}")
 ;; ---- composition, palette, num->css -------------------------------------------
