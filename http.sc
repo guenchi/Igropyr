@@ -95,7 +95,7 @@
   (import (chezscheme) (igropyr buffer)
           (igropyr actor) (igropyr otp)
           (only (igropyr libuv) check now-ms)
-          (only (igropyr tcp) conn-count conn-owner conn-peer-ip conn-set-owner! conn-state file-stream-chunk-ptr listener-backlog-effective listener-open? listener-token tcp-close! tcp-listen! tcp-listen-tls! tcp-read-start! tcp-stop-listen! tcp-write! tcp-write-foreign! tcp-writev!)
+          (only (igropyr tcp) conn-owner conn-peer-ip conn-set-owner! conn-state file-stream-chunk-ptr listener-backlog-effective listener-open? listener-token socket-conn-count tcp-close! tcp-listen! tcp-listen-tls! tcp-read-start! tcp-stop-listen! tcp-write! tcp-write-foreign! tcp-writev!)
           (igropyr websocket)
           (only (igropyr tls-core) tls-listen-context! tls-context-retire!)
           (only (igropyr tls-watch) tls-watch-install!))
@@ -1991,7 +1991,14 @@
   ;; worker pool's idle/busy/pending counters
   (define (http-stats srv)
     (append
-      (list (cons 'connections (conn-count))
+      ;; SOCKETS, NOT ROWS. conn-count is every conn-table row, and a node
+      ;; running child processes has a row per pipe in there too; reporting
+      ;; those as HTTP connections would make a server look busy in
+      ;; proportion to how many children it had started. socket-conn-count
+      ;; subtracts the pipes inside one region, so the number describes one
+      ;; instant. Still a node-wide TCP count with closing rows included,
+      ;; exactly as before.
+      (list (cons 'connections (socket-conn-count))
             (cons 'requests task-counter)
             (cons 'uptime-ms (- (now-ms) (http-server-started srv))))
       (pool-stats (http-server-sup srv))))

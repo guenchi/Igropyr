@@ -28,7 +28,8 @@
   ;; test/inject-isolation.ss measures for every unit in library-units.
   (import (chezscheme) (igropyr inject)
           (only (igropyr libuv) now-ms uv-init! uv-poll!)
-          (only (igropyr tcp) uv-owner-died! uv-set-deliver! uv-set-self!))
+          (only (igropyr tcp) uv-owner-died! uv-set-alive?! uv-set-deliver!
+                              uv-set-self!))
 
   (define process-default-ticks 100000)
 
@@ -977,6 +978,15 @@
     ;; die. It reads exactly like (uv-set-deliver! send) one line up, and that
     ;; is the trap: `send` is a procedure and `self` is not.
     (uv-set-self! (lambda () self))
+    ;; WITHOUT THIS A PLAIN NODE HAS NO LIVENESS TEST AT ALL. (igropyr tcp)
+    ;; asks in three places -- proc-spawn!'s admission re-check, the terminal
+    ;; notification a retiring TLS connection sends its owner, and the
+    ;; watcher-count seam's pruning -- and with no hook installed it answers
+    ;; "alive" for every pid, dead ones included. The only installer used to
+    ;; be (igropyr tls-watch), so a node that never initialised TLS had no
+    ;; answer at all. Same procedure tls-watch installs: the two installs are
+    ;; the same assignment and either order is fine.
+    (uv-set-alive?! process-alive?)
     (set! *self* (@make-process #f))
     (timer-interrupt-handler
       (lambda () (yield 'run 0)))

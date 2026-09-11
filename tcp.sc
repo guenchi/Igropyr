@@ -41,6 +41,18 @@
     uv-owner-index-count uv-set-alive?! uv-set-deliver! uv-set-gate-wait!
     uv-set-self!
     uv-set-tls-watcher-spawner!
+    ;; write-block accounting, TCP-wide: a write block belongs to a
+    ;; connection, not to a child process, so these are their own two
+    ;; readings rather than entries in proc-stats -- a program with no
+    ;; children still has write blocks to account for.
+    write-blocks-live-count write-table-size
+    ;; child processes
+    proc? proc-spawn! proc-write! proc-stdin-close!
+    proc-read-start! proc-read-stop! proc-kill! proc-kill-all! proc-close!
+    proc-state proc-queued proc-pid proc-exit proc-owner proc-handle
+    proc-stdin proc-stdout proc-stderr
+    proc-count pipe-conn-count socket-conn-count proc-stats
+    set-max-procs! set-proc-stdin-cap!
     ;; the watcher's interface to a connection's shared state
     tls-gate-grant-next! tls-gate-waiters-length tls-conn-holder
     tls-conn-peer-cb-hash tls-conn-shutdown?
@@ -55,7 +67,8 @@
     tls-retire-effect-depths tls-raw-blocks tls-conn-charge tls-conn-totals
     tls-conn-timer-id tls-last-retire-reason tls-listener-context-id
     tls-timer-free-path tls-conn-in-table? tls-eof-deliveries
-    tls-swallowed-errors tls-read-trace)
+    tls-swallowed-errors tls-read-trace
+    proc-handles-freed proc-exit-no-row-handles $proc-table-ref)
 
   ;; (igropyr libuv) IS BELOW THIS FILE and (igropyr tls-core) beside it; both
   ;; import neither this library nor each other's consumers, so there is no
@@ -448,6 +461,30 @@
      ;; handle so a cell can ask about a connection it no longer holds.
      (define (tls-conn-in-table? h)
        (and (hashtable-ref conn-table h #f) #t))
+     ;; ---- child-process seams ---------------------------------------------
+     ;;
+     ;; THREE OF THESE ANSWER WITH ADDRESSES, NOT COUNTS, and that is the
+     ;; whole point. The rule under test is "the process handle block is not
+     ;; freed while a row still names its address", and a count of frees
+     ;; cannot tell a premature free of THIS handle from a timely free of
+     ;; some other child's. The address is what makes the two readings
+     ;; different, so the address is what is recorded.
+     (define proc-freed-handles '())
+     (define (note-proc-handle-freed! h)
+       (set! proc-freed-handles (append proc-freed-handles (list h))))
+     (define (proc-handles-freed) proc-freed-handles)
+     ;; The exit callback's no-row path, by address. A hit count alone says
+     ;; "some handle exited with no row"; a cell driving a publication gap
+     ;; has to know it was the handle it parked, and not a leftover from an
+     ;; earlier child in the same run.
+     (define proc-exit-no-row '())
+     (define (note-proc-exit-no-row! h)
+       (set! proc-exit-no-row (append proc-exit-no-row (list h))))
+     (define (proc-exit-no-row-handles) proc-exit-no-row)
+     ;; IDENTITY, NOT FIELDS. A retained row is proved to be the SAME record
+     ;; by (eq? ($proc-table-ref addr) p); reading its fields would pass just
+     ;; as well against a later child's row that happens to look alike.
+     (define ($proc-table-ref h) (hashtable-ref proc-table h #f))
      (define (tls-retire-effect-depths t)
        (let ((v (and t (conn-tls-effect-depths t))))
          (and v (vector->list v)))))
@@ -501,6 +538,11 @@
      (define-absent-seam tls-conn-charge)
      (define-absent-seam tls-conn-totals)
      (define-absent-seam tls-conn-timer-id)
+     (define (note-proc-handle-freed! h) (void))
+     (define (note-proc-exit-no-row! h) (void))
+     (define-absent-seam proc-handles-freed)
+     (define-absent-seam proc-exit-no-row-handles)
+     (define-absent-seam $proc-table-ref)
      (define-absent-seam tls-retire-effect-depths)))
 
   ;; GC roots (the "keep-live" story):
@@ -649,6 +691,19 @@
       (foreign-set! 'void* (+ h uv-handle-queue-next-offset) 0 node)
       (foreign-set! 'void* (+ h uv-handle-queue-prev-offset) 0 node)))
 
+  ;; THE REMOVAL ITSELF, AND IT EXISTS FOR ONE TEST AND NOTHING ELSE. This is
+  ;; uv__queue_remove's body: q->prev->next = q->next; q->next->prev = q->prev.
+  ;; The library never performs a removal of its own -- libuv owns that list --
+  ;; and the only call is under an injection point that is #f unless a cell
+  ;; arms it. It is here so the F13 repair's relink branch can be reached on a
+  ;; host whose libuv does not produce that state (1.50.0), where the branch
+  ;; would otherwise be untested code that only FreeBSD ever runs.
+  (define (handle-queue-remove! h)
+    (let ((next (foreign-ref 'void* (+ h uv-handle-queue-next-offset) 0))
+          (prev (foreign-ref 'void* (+ h uv-handle-queue-prev-offset) 0)))
+      (foreign-set! 'void* prev 0 next)
+      (foreign-set! 'void* (+ next 8) 0 prev)))
+
   ;; -> #t when the layout is as declared. Uses a pipe handle because
   ;; uv_pipe_init needs no descriptor and links the handle like any other.
   (define (check-handle-layout!)
@@ -676,8 +731,102 @@
   ;; the handle: both pointers are still valid at this instant because no other
   ;; handle operation has run since uv_spawn returned.
   (define (repair-spawn-queue! h)
-    (unless (handle-queue-linked? h)
-      (handle-queue-self-link! h)))
+    ;; TEST SEAM 'proc-simulate-queue-removal -- OWNING REGION: proc-spawn!'s,
+    ;; so this runs with interrupts already off. When armed it performs the
+    ;; removal 1.52.0's error: path performs; unarmed the override answers #f
+    ;; and no pointer is written.
+    (when (inject-override! 'proc-simulate-queue-removal #f)
+      (handle-queue-remove! h))
+    (if (handle-queue-linked? h)
+        ;; COUNTED POINT 'proc-f13-linked -- unarmed: silent; armed it records
+        ;; a skip rather than parking, because the caller's region is open.
+        ;; This is 1.50.0's shape: the node is still in the loop's list, so
+        ;; uv__finish_close will remove it exactly once.
+        (inject-barrier! 'proc-f13-linked)
+        (begin
+          ;; COUNTED POINT 'proc-f13-relinked -- same region, same skip. This
+          ;; is 1.52.0's shape: the node was removed and not re-initialised,
+          ;; so without the self-link below the close path's removal would
+          ;; write through the neighbours the node held at the first removal.
+          (inject-barrier! 'proc-f13-relinked)
+          (handle-queue-self-link! h))))
+
+  ;; ---- proc lifetime: the derived state, and row retirement ---------------
+  ;;
+  ;; `closed` IS A CONJUNCTION OVER FOUR FIELDS, and it is written once here
+  ;; rather than at each of the places that has to ask. The process handle and
+  ;; the three pipes close independently and in any order, so every one of
+  ;; them is the potential last one; whichever callback makes this answer true
+  ;; is the one that retires the row.
+  (define (proc-closed? p)
+    (and (not (proc-handle-alive? p))
+         (not (proc-stdin p))
+         (not (proc-stdout p))
+         (not (proc-stderr p))))
+
+  ;; running | exited | closed. `orphan` is not reported: it is a fact about
+  ;; how the child was started, not a state a caller can act on, and an orphan
+  ;; that has exited is `exited` like any other.
+  (define (proc-state p)
+    (cond
+      ((proc-closed? p) 'closed)
+      ((eq? (proc-child p) 'running) 'running)
+      (else 'exited)))
+
+  (define (proc-stream-conn p stream)
+    (case stream
+      ((stdin) (proc-stdin p))
+      ((stdout) (proc-stdout p))
+      ((stderr) (proc-stderr p))
+      (else #f)))
+
+  (define (proc-clear-stream! p stream)
+    (case stream
+      ((stdin) (proc-set-stdin! p #f))
+      ((stdout) (proc-set-stdout! p #f))
+      ((stderr) (proc-set-stderr! p #f))
+      (else (void))))
+
+  ;; RUN BY WHICHEVER CLOSE CALLBACK MAKES THE PROC `closed` -- the process
+  ;; one or a pipe's cleanup closure. Same ordering rule as on-close-code:
+  ;; the pointer write first, the allocating step guarded in the middle, the
+  ;; free last and unconditional. unindex-owner! allocates (remp), so a raise
+  ;; there must not be able to keep the handle block alive forever.
+  ;;
+  ;; THE FREE IS THE ONE PLACE A PROCESS HANDLE BLOCK IS RELEASED once a row
+  ;; has named it, which is what makes the freed-address log a complete record
+  ;; of that rule (the no-row close path below is the other, and it releases a
+  ;; block no row ever named).
+  (define (retire-proc-row! p)
+    (let ((h (proc-handle p)))
+      (hashtable-delete! proc-table h)
+      ;; INJECTION POINT 'proc-close-unindex -- OWNING GUARD: the one on this
+      ;; line, which is meant to catch it. The swallow is recorded rather than
+      ;; re-raised: the index keeps one stale entry, which the owner-death
+      ;; traversal re-checks and skips, and everything below still runs.
+      (guard (e (#t (note-swallowed! 'proc-close-unindex e)))
+        (inject-fault! 'proc-close-unindex)
+        (unindex-owner! (proc-owner p) 'proc h))
+      ;; COUNTED POINT 'proc-handle-freed -- unarmed: silent. One hit per
+      ;; process handle block released, here and at the no-row close path;
+      ;; the address log beside it says WHICH block each hit was for.
+      (inject-barrier! 'proc-handle-freed)
+      (note-proc-handle-freed! h)
+      (foreign-free h)))
+
+  ;; The cleanup hook every pipe conn carries. conn-on-close! refuses a tagged
+  ;; conn precisely so that this closure cannot be overwritten: it is the only
+  ;; thing that clears the proc's field for this stream, and without that the
+  ;; proc would never become `closed` and its row would sit in the table for
+  ;; the life of the VM.
+  (define (make-pipe-cleanup p stream)
+    (lambda ()
+      (proc-clear-stream! p stream)
+      (when (proc-closed? p) (retire-proc-row! p))))
+
+  ;; uv_shutdown_t, for the half-close of a child's stdin. Read from libuv at
+  ;; load time exactly as write-req-size and the others are.
+  (define shutdown-req-size (uv-req-size UV-SHUTDOWN))
 
   ;; delivery hook: (deliver owner-pid msg); installed by (igropyr actor)
   (define deliver (lambda (owner msg) (void)))
@@ -992,6 +1141,32 @@
                  (let ((op (hashtable-ref fs-table key #f)))
                    (when (and op (eq? (fs-op-owner op) owner))
                      (file-stream-close! op))))
+                ;; A CHILD PROCESS WHOSE OWNER IS GONE. This branch signals
+                ;; and nothing else: the three pipes are reached by the (conn)
+                ;; branch of this same traversal, from their own index
+                ;; entries, and the row retires when they and the process
+                ;; handle have all closed.
+                ;;
+                ;; SIGTERM, NOT SIGKILL, and not a close of the handle. An
+                ;; active process handle closed before its exit callback
+                ;; deregisters the child and leaves it unreaped; the child is
+                ;; asked to end and libuv reaps it through the exit callback
+                ;; exactly as it would for any other exit.
+                ;;
+                ;; Owner, child and handle are re-checked here because the
+                ;; index is a superset: it can name a proc that has already
+                ;; exited, whose handle has already closed, or -- the entry is
+                ;; left behind on purpose -- one this pid no longer owns. The
+                ;; fourth test is not a re-check but the caller's policy, set
+                ;; at spawn.
+                ((proc)
+                 (let ((p (hashtable-ref proc-table key #f)))
+                   (when (and p
+                              (eq? (proc-owner p) owner)
+                              (proc-kill-on-owner-death? p)
+                              (eq? (proc-child p) 'running)
+                              (proc-handle-alive? p))
+                     (uv-process-kill (proc-handle p) 15))))
                 (else (void)))))
           owned))))
 
@@ -1040,6 +1215,39 @@
                 ;; the owner gate below would drop every handshake byte and
                 ;; the handshake would never advance.
                 (t (note-read-stage! 'tls-branch) (tls-on-read c t nread buf))
+                ;; A CHILD'S PIPE, WHICH IS A SEPARATE CLAUSE AND NOT A SHAPE
+                ;; CHOICE INSIDE THE ONE BELOW. The delivery shape does depend
+                ;; on the tag, but the SELF-CLOSE does not: an EOF on a pipe
+                ;; has to release the handle whether or not there is an owner
+                ;; to tell, and folding this into the owner-gated clause would
+                ;; make a proc with no owner keep its pipe rows -- and so its
+                ;; proc row -- for the life of the VM. A pipe conn is never a
+                ;; TLS conn, so this sits second only to keep the TLS clause
+                ;; first for the reason given above.
+                ((conn-tag c)
+                 (let* ((tag (conn-tag c))
+                        (p (car tag))
+                        (stream (cdr tag))
+                        (owner (conn-owner c)))
+                   (cond
+                     ((> nread 0)
+                      (when owner
+                        (let ((bv (make-bytevector nread)))
+                          (memcpy-from-c bv (foreign-ref 'void* buf 0) nread)
+                          (deliver owner (vector 'proc-data p stream bv)))))
+                     ;; spurious wakeup; ignore
+                     ((= nread 0) (void))
+                     (else
+                      ;; NOTIFY, THEN RELEASE. The message names a conn the
+                      ;; owner may still hold, and tcp-close! only schedules,
+                      ;; so the order costs nothing and keeps the owner's view
+                      ;; ahead of the teardown.
+                      (when owner
+                        (deliver owner
+                          (if (= nread UV-EOF)
+                              (vector 'proc-eof p stream)
+                              (vector 'proc-error p stream nread))))
+                      (tcp-close! c)))))
                 ;; the plaintext path, unchanged: still owner-gated
                 ((conn-owner c)
                  (cond
@@ -1072,10 +1280,15 @@
           (when c
             (when (conn-tag c) (note-pipe-conn! -1))
             (conn-set-state! c 'closed)
-            ;; COUNTED POINT 'conn-close-unindex -- unarmed: silent. A raise here
-            ;; is swallowed: the owner index keeps a stale entry, which the
-            ;; owner-death traversal tolerates, and everything below still runs.
-            (guard (e (#t (inject-barrier! 'conn-close-unindex)))
+            ;; INJECTION POINT 'conn-close-unindex (fault) -- OWNING GUARD:
+            ;; the one on the next line, which is meant to catch it. Nothing
+            ;; else in this file can make unindex-owner! raise, and a guard
+            ;; nothing can drive is a branch no cell can reach. The swallow is
+            ;; recorded rather than re-raised: the owner index keeps a stale
+            ;; entry, which the owner-death traversal re-checks and skips, and
+            ;; the cleanup hook and the free below still run.
+            (guard (e (#t (note-swallowed! 'conn-close-unindex e)))
+              (inject-fault! 'conn-close-unindex)
               (unindex-owner! (conn-owner c) 'conn handle))
             (let ((clean (conn-cleanup c)))
               (when clean
@@ -1095,6 +1308,113 @@
           (hashtable-delete! write-table req)
           (free-write-block! req)
           (when done (done status))))
+      (void* int)
+      void))
+
+  ;; exit_cb: the child has been reaped. INVALIDATE FIRST, NOTIFY SECOND,
+  ;; RELEASE LAST -- the order is the point.
+  ;;
+  ;; Step 2 below allocates nothing and cannot fail, and it is what makes the
+  ;; record safe to read from anywhere afterwards: `pid` stops naming a
+  ;; process the moment one is reaped, because that number is reusable from
+  ;; that instant, and `child` stops saying there is something to signal. If
+  ;; the notification ran first and raised, both would still claim a live
+  ;; child that no longer exists.
+  ;;
+  ;; Step 5 is outside the guard and unconditional. A notification that
+  ;; raised must not be able to leave the process handle registered in the
+  ;; loop for the life of the VM.
+  (define on-process-exit-code
+    (foreign-callable
+      (lambda (handle status signal)
+        (let ((p (hashtable-ref proc-table handle #f)))
+          (if (not p)
+              ;; A MISS IS ONE SHAPE ONLY: an orphan whose row could not be
+              ;; published (proc-spawn!'s rollback says so explicitly). The
+              ;; handle is still registered and still ours to release, so the
+              ;; no-row close path below closes and frees it.
+              ;; COUNTED POINT 'proc-exit-cb-no-row -- unarmed: silent. The
+              ;; address log beside it is what lets a cell say WHICH handle
+              ;; took this path.
+              (begin
+                (inject-barrier! 'proc-exit-cb-no-row)
+                (note-proc-exit-no-row! handle)
+                (uv-close handle on-process-close-entry))
+              (begin
+                ;; (2) unconditional, allocation-free invalidation. An orphan
+                ;; stays an orphan: that field records how the child was
+                ;; started, and the rollback that wrote it still owns the
+                ;; reading that there is nobody to notify.
+                (when (eq? (proc-child p) 'running) (proc-set-child! p 'exited))
+                (proc-set-pid! p #f)
+                ;; (3) guarded, because both the pair and the message
+                ;; allocate. A swallow here loses the notification and
+                ;; nothing else.
+                ;; INJECTION POINT 'proc-exit-notify (fault) -- OWNING
+                ;; GUARD: the one on the line above, which is meant to catch
+                ;; it. It stands for the allocation in either the pair or the
+                ;; message; a swallow loses the notification and leaves the
+                ;; invalidation in step 2 and the close in step 5 intact.
+                (guard (e (#t (note-swallowed! 'proc-exit-notify e)))
+                  (inject-fault! 'proc-exit-notify)
+                  (proc-set-exit! p (cons status signal))
+                  (unless (eq? (proc-child p) 'orphan)
+                    (deliver (proc-owner p) (vector 'proc-exit p status signal))))
+                ;; (4) NO READER REMAINS, so stdin is closed here rather than
+                ;; left for the owner. Writes still queued on it fail through
+                ;; their completions with ECANCELED and are refunded, which is
+                ;; the accounting proc-write! promises.
+                (let ((in (proc-stdin p)))
+                  (when in (tcp-close! in)))
+                ;; (5) unconditional, outside every guard
+                (uv-close handle on-process-close-entry)))))
+      (void* integer-64 int)
+      void))
+
+  ;; close_cb for the process handle, and THE ONE THAT DOES NOT FREE. The row
+  ;; is keyed on this address; freeing here would let a later spawn be handed
+  ;; the same address while a row still named it, and that row's own cleanup
+  ;; would then delete the newcomer's entry. The block is released at row
+  ;; retirement instead -- or here, when no row ever named it.
+  (define on-process-close-code
+    (foreign-callable
+      (lambda (handle)
+        (let ((p (hashtable-ref proc-table handle #f)))
+          (if (not p)
+              ;; the no-row close path: nothing names this block
+              ;; COUNTED POINT 'proc-handle-freed -- the second and last of
+              ;; the two sites that release a process handle block.
+              (begin (inject-barrier! 'proc-handle-freed)
+                     (note-proc-handle-freed! handle)
+                     (foreign-free handle))
+              (begin
+                (proc-set-handle-alive! p #f)
+                (when (proc-closed? p) (retire-proc-row! p))))))
+      (void*)
+      void))
+
+  ;; shutdown_cb for a child's stdin. THE REQUEST IS FREED ON EVERY PATH AND
+  ;; EXACTLY ONCE: look up, delete, free, before anything that could take a
+  ;; different branch.
+  ;;
+  ;; THE STATE TEST IS WHAT REFUSES A CANCELLED REQUEST, not a comparison
+  ;; against UV_ECANCELED. uv_close cancels a queued shutdown and delivers
+  ;; that status, and it is uv_close -- from proc-close!, owner death, or the
+  ;; child's exit -- that produces the only cancellations there are; every one
+  ;; of those set the conn to `closing` before calling it, so "still open" is
+  ;; already false when the cancelled callback arrives. The numeric constant
+  ;; is deliberately not used: UV_ECANCELED is -ECANCELED, and ECANCELED is 85
+  ;; on FreeBSD and 89 on macOS, so a literal would be wrong on one of the two
+  ;; hosts this ships to and there is no binding here that translates it.
+  (define on-shutdown-code
+    (foreign-callable
+      (lambda (req status)
+        (let ((c (hashtable-ref shutdown-table req #f)))
+          (hashtable-delete! shutdown-table req)
+          (foreign-free req)
+          ;; callback context: an escaping raise would unwind into C
+          (guard (e (#t (note-swallowed! 'proc-shutdown-cb e)))
+            (when c (tcp-close-raw! c)))))
       (void* int)
       void))
 
@@ -2056,7 +2376,10 @@
       (lock-object on-fsw-code)
       (lock-object on-tls-timer-code)
       (lock-object on-tls-timer-close-code)
-      ;; ELEVEN, NOT THIRTEEN. on-timer-code and on-walk-code belong to the
+      (lock-object on-process-exit-code)
+      (lock-object on-process-close-code)
+      (lock-object on-shutdown-code)
+      ;; FOURTEEN, NOT SIXTEEN. on-timer-code and on-walk-code belong to the
       ;; loop itself -- its wakeup timer and uv_walk -- and are locked in
       ;; (igropyr libuv), beside the loop. Every code object must be locked in
       ;; whichever library holds it: libuv keeps only a raw entry pointer, so
@@ -2066,7 +2389,8 @@
       (vector on-alloc-code on-read-code on-close-code
               on-write-code on-connection-code on-connect-code
               on-getaddrinfo-code on-fs-code on-fsw-code
-              on-tls-timer-code on-tls-timer-close-code)))
+              on-tls-timer-code on-tls-timer-close-code
+              on-process-exit-code on-process-close-code on-shutdown-code)))
 
   (define on-fsw-entry (foreign-callable-entry-point on-fsw-code))
   (define on-alloc-entry (foreign-callable-entry-point on-alloc-code))
@@ -2080,6 +2404,11 @@
   (define on-tls-timer-entry (foreign-callable-entry-point on-tls-timer-code))
   (define on-tls-timer-close-entry
     (foreign-callable-entry-point on-tls-timer-close-code))
+  (define on-process-exit-entry
+    (foreign-callable-entry-point on-process-exit-code))
+  (define on-process-close-entry
+    (foreign-callable-entry-point on-process-close-code))
+  (define on-shutdown-entry (foreign-callable-entry-point on-shutdown-code))
 
 
 
@@ -4986,4 +5315,698 @@
                         ;; Interrupt state: injection ON -- depth 1, parks;
                         ;; injection OFF -- (void).
                         (inject-barrier! 'tls-after-alert))))))))))
+
+  ;; ---- child processes: the public face ----------------------------------
+
+  ;; OPTIONS ARRIVE IN EITHER SHAPE, and that is Postel rather than sugar.
+  ;; (proc-spawn! f a '(cwd . "/tmp") '(stdout . ignore)) and
+  ;; (proc-spawn! f a '((cwd . "/tmp") (stdout . ignore))) both name the same
+  ;; alist, and a caller holding one already-built list should not have to
+  ;; apply. The two are told apart by the car of the single element: an option
+  ;; is (symbol . value), a wrapped alist is a list whose first element is
+  ;; itself a pair.
+  (define (proc-opt-alist opts)
+    (cond
+      ((null? opts) '())
+      ((and (null? (cdr opts))
+            (let ((x (car opts)))
+              (or (null? x) (and (pair? x) (pair? (car x))))))
+       (car opts))
+      (else opts)))
+
+  (define (proc-opt o name default)
+    (let ((e (assq name o)))
+      (if e (cdr e) default)))
+
+  (define (proc-stdio-mode o name)
+    (let ((m (proc-opt o name 'pipe)))
+      (case m
+        ((pipe inherit ignore) m)
+        (else
+          (assertion-violation 'proc-spawn!
+            "stdio mode must be pipe, inherit or ignore" name m)))))
+
+  (define (proc-stream-name k)
+    (case k ((0) 'stdin) ((1) 'stdout) (else 'stderr)))
+
+  (define (proc-set-stream! p stream c)
+    (case stream
+      ((stdin) (proc-set-stdin! p c))
+      ((stdout) (proc-set-stdout! p c))
+      ((stderr) (proc-set-stderr! p c))
+      (else (void))))
+
+  (define process-handle-size (uv-handle-size UV-PROCESS))
+  (define pipe-handle-size (uv-handle-size UV-NAMED-PIPE))
+
+  ;; Start a child process without blocking the scheduler. Answers the proc,
+  ;; or (failed . reason) where reason is a symbol for a refusal this library
+  ;; made -- proc-limit, owner-dead, layout -- and a libuv error string for
+  ;; one the operating system made.
+  ;;
+  ;; argv INCLUDES argv[0]; opts is the alist above: cwd, env (a list of
+  ;; "K=V"; absent means inherit), stdin/stdout/stderr each pipe | inherit |
+  ;; ignore, owner (a pid, default the caller), kill-on-owner-death (default
+  ;; #t, SIGTERM).
+  ;;
+  ;; ONE INTERRUPT-DISABLED REGION RUNS FROM ADMISSION TO PUBLICATION, and
+  ;; what it buys is that no callback can observe a half-built proc: the exit,
+  ;; read and close callbacks run only inside uv-poll!, which runs only in the
+  ;; event-loop process, which cannot be scheduled while this one holds the
+  ;; region. Nothing inside yields, polls or calls an application hook.
+  ;;
+  ;; THE ONE SYNCHRONOUS WINDOW IN THIS FACILITY IS uv_spawn ITSELF. On the
+  ;; Unix path the parent reads the exec-error pipe with no timeout, so
+  ;; process CREATION is "milliseconds, typically" rather than bounded. That
+  ;; is a documented property of this call and of nothing else here.
+  (define (proc-spawn! file argv . opts)
+    (let* ((o (proc-opt-alist opts))
+           (cwd (proc-opt o 'cwd #f))
+           (env (proc-opt o 'env #f))
+           (owner (proc-opt o 'owner (and uv-self (uv-self))))
+           (kill? (proc-opt o 'kill-on-owner-death #t))
+           (modes (vector (proc-stdio-mode o 'stdin)
+                          (proc-stdio-mode o 'stdout)
+                          (proc-stdio-mode o 'stderr))))
+      ;; VALIDATED OUT HERE, where a raise costs nothing. Inside the region
+      ;; the same raise would have to be unwound past allocated handles.
+      (unless (string? file)
+        (assertion-violation 'proc-spawn! "file must be a string" file))
+      (unless (and (list? argv) (for-all string? argv))
+        (assertion-violation 'proc-spawn! "argv must be a list of strings" argv))
+      (when (and cwd (not (string? cwd)))
+        (assertion-violation 'proc-spawn! "cwd must be a string" cwd))
+      (when (and env (not (and (list? env) (for-all string? env))))
+        (assertion-violation 'proc-spawn! "env must be a list of strings" env))
+      ;; STEP 0, ONCE PER VM: the handle-queue layout self-check. It licenses
+      ;; the only raw pointer write in this facility, and its failure mode is
+      ;; memory corruption rather than an exception, so a facility that cannot
+      ;; verify the layout refuses every spawn instead of guessing.
+      (if (not (check-handle-layout!))
+          (cons 'failed 'layout)
+          (begin
+            ;; TEST SEAM 'proc-spawn-admission -- OWNING REGION: NONE. It sits
+            ;; between the caller's decision to spawn and the region's
+            ;; admission tests, which is the window a cell needs in order to
+            ;; kill the named owner and prove the re-check below is the one
+            ;; that answers. Parks.
+            (inject-barrier! 'proc-spawn-admission)
+            (proc-spawn-region file argv cwd env owner kill? modes)))))
+
+  (define (proc-spawn-region file argv cwd env owner kill? modes)
+    (with-interrupts-disabled
+      (cond
+        ;; ADMISSION COUNTS ROWS, and a row lives until the proc is `closed`,
+        ;; so the cap counts procs that still hold descriptors -- which is the
+        ;; resource it exists to bound.
+        ((fx>= (proc-count) max-procs) (cons 'failed 'proc-limit))
+        ;; RE-CHECKED HERE, INSIDE THE REGION. A check before it leaves a
+        ;; window in which the owner dies between the test and publication,
+        ;; and what is published is then a proc nothing will ever reclaim.
+        ((and owner uv-alive? (not (uv-alive? owner))) (cons 'failed 'owner-dead))
+        (else
+          ;; blocks: marshalled memory, consumed by uv_spawn.
+          ;; ph: the process handle block.
+          ;; spawned?: uv_spawn has returned, so libuv has seen ph.
+          ;; released?: a release path has already run.
+          (let ((blocks '())
+                (ph #f)
+                (spawned? #f)
+                (released? #f)
+                (child-pid #f)
+                (pipe-h (vector #f #f #f))
+                (pipe-inited? (vector #f #f #f))
+                (pipe-conn (vector #f #f #f))
+                (pipe-row? (vector #f #f #f))
+                (pipe-idx? (vector #f #f #f))
+                (p #f)
+                (row? #f)
+                (idx? #f))
+            ;; EVERY RESOURCE CARRIES ITS OWN FLAG, set the instant it exists,
+            ;; and the release paths act on the flags rather than on a guess
+            ;; about how far the sequence got. That is what keeps a failure in
+            ;; the middle from being either a leak or a double free.
+            (define (alloc! n)
+              (let ((b (foreign-alloc n)))
+                (set! blocks (cons b blocks))
+                b))
+            (define (free-blocks!)
+              (for-each foreign-free blocks)
+              (set! blocks '()))
+            (define (cstr s)
+              (let* ((bv (string->utf8 s))
+                     (n (bytevector-length bv))
+                     (b (alloc! (+ n 1))))
+                (memcpy-to-c b bv n)
+                (foreign-set! 'unsigned-8 b n 0)
+                b))
+            ;; a NULL-terminated char**, as execvp wants it
+            (define (cstr-array strs)
+              (let ((a (alloc! (* 8 (+ (length strs) 1)))))
+                (let loop ((xs strs) (i 0))
+                  (if (null? xs)
+                      (foreign-set! 'void* a (* 8 i) 0)
+                      (begin
+                        (foreign-set! 'void* a (* 8 i) (cstr (car xs)))
+                        (loop (cdr xs) (+ i 1)))))
+                a))
+            ;; initialised -> uv_close, and the handle is freed by its close
+            ;; callback; allocated-only -> foreign-free, because libuv has
+            ;; never seen it and a close would be a close of nothing.
+            (define (close-pipe-handles!)
+              (let loop ((k 0))
+                (when (fx< k 3)
+                  (let ((h (vector-ref pipe-h k)))
+                    (when h
+                      (if (vector-ref pipe-inited? k)
+                          (uv-close h on-close-entry)
+                          (foreign-free h))
+                      (vector-set! pipe-h k #f)
+                      (vector-set! pipe-inited? k #f)))
+                  (loop (fx+ k 1)))))
+            (define (unpublish-pipes!)
+              (let loop ((k 0))
+                (when (fx< k 3)
+                  (let ((c (vector-ref pipe-conn k)))
+                    (when c
+                      (when (vector-ref pipe-row? k)
+                        (hashtable-delete! conn-table (conn-handle c))
+                        (note-pipe-conn! -1)
+                        (vector-set! pipe-row? k #f))
+                      (when (vector-ref pipe-idx? k)
+                        ;; INJECTION POINT 'proc-rollback-unindex (fault) --
+                        ;; OWNING GUARD: the one on the next line. Each step of
+                        ;; the rollback is guarded separately so that a raise
+                        ;; in this allocating one cannot stop the steps after
+                        ;; it; the cost is one stale index entry, which the
+                        ;; owner-death traversal re-checks and skips.
+                        (guard (e2 (#t (note-swallowed! 'proc-rollback-unindex e2)))
+                          (inject-fault! 'proc-rollback-unindex)
+                          (unindex-owner! owner 'conn (conn-handle c)))
+                        (vector-set! pipe-idx? k #f))))
+                  (loop (fx+ k 1)))))
+            ;; The owner entry for a proc row that exists without one. Keeping
+            ;; the ROW is what matters: an orphan with a row is in admission
+            ;; accounting and its exit callback finds it. Only the owner-death
+            ;; traversal cannot reach it, and an orphan has no pipes and a
+            ;; SIGKILL already sent, so nothing depends on that reach.
+            (define (recover-owner-entry!)
+              (unless idx?
+                ;; COUNTED POINT 'proc-orphan-unindexed -- unarmed: silent;
+                ;; armed it records a skip, the caller's region being open.
+                ;; INJECTION POINT 'proc-recover-index-fail (fault) is what
+                ;; drives it.
+                (guard (e2 (#t (inject-barrier! 'proc-orphan-unindexed)))
+                  (inject-fault! 'proc-recover-index-fail)
+                  (index-owner! owner 'proc ph)
+                  (set! idx? #t))))
+            (define (release-pre-spawn!)
+              (set! released? #t)
+              (free-blocks!)
+              ;; NEVER INITIALISED: libuv has not seen this block, so it is
+              ;; freed directly rather than closed.
+              (when ph (foreign-free ph) (set! ph #f))
+              (close-pipe-handles!))
+            (define (release-spawned-inactive!)
+              (set! released? #t)
+              (free-blocks!)
+              (repair-spawn-queue! ph)
+              (close-pipe-handles!)
+              (uv-close ph on-process-close-entry)
+              (set! ph #f))
+            ;; THE CHILD IS RUNNING, so the order is fixed: kill first (no
+            ;; allocation, cannot raise), then take the pipes apart, then make
+            ;; sure the child is still accounted for by a row. An active
+            ;; process handle is never uv_closed here: closing it would
+            ;; deregister the process and leave the child unreaped.
+            (define (rollback-active!)
+              (set! released? #t)
+              (uv-process-kill ph 9)
+              (unpublish-pipes!)
+              (when p
+                (proc-set-stdin! p #f)
+                (proc-set-stdout! p #f)
+                (proc-set-stderr! p #f))
+              (close-pipe-handles!)
+              (if row?
+                  ;; the row is there: rewrite it in place, which is pointer
+                  ;; writes and cannot fail
+                  (begin (proc-set-child! p 'orphan) (recover-owner-entry!))
+                  ;; no row: publish one now from the record's current flags.
+                  ;; A raise at the row insertion leaves the no-row state, and
+                  ;; the exit callback's no-row path closes and frees the
+                  ;; handle -- the child already has its SIGKILL.
+                  (begin
+                    (guard (e2 (#t (void)))
+                      (unless p
+                        (set! p (make-proc ph owner #f #f #f child-pid #f
+                                           'orphan #t 0 kill?)))
+                      (proc-set-child! p 'orphan)
+                      (hashtable-set! proc-table ph p)
+                      (set! row? #t))
+                    (when row? (recover-owner-entry!)))))
+            (define (release-on-raise!)
+              (unless released?
+                (cond
+                  ((not spawned?) (release-pre-spawn!))
+                  ((not (= 0 (uv-is-active ph))) (rollback-active!))
+                  (else (release-spawned-inactive!)))))
+            (guard (e (#t (release-on-raise!) (raise e)))
+              ;; (2) allocate and initialise, setting each flag as its
+              ;; resource appears.
+              (set! ph (foreign-alloc process-handle-size))
+              (let ((pipe-err
+                      (let loop ((k 0))
+                        (cond
+                          ((fx>= k 3) 0)
+                          ((not (eq? (vector-ref modes k) 'pipe)) (loop (fx+ k 1)))
+                          (else
+                            (let ((h (foreign-alloc pipe-handle-size)))
+                              (vector-set! pipe-h k h)
+                              ;; INJECTION POINT 'proc-alloc-pipe-fail -- a
+                              ;; RETURN, not an override: the call is skipped
+                              ;; entirely, so the handle really is
+                              ;; allocated-only and the direct foreign-free in
+                              ;; close-pipe-handles! is the correct release.
+                              ;; An override would leave a handle libuv had
+                              ;; seen being freed as though it had not.
+                              (let ((r (inject-return! 'proc-alloc-pipe-fail
+                                         (uv-pipe-init (uv-loop-handle) h 0))))
+                                (if (< r 0)
+                                    r
+                                    (begin
+                                      (vector-set! pipe-inited? k #t)
+                                      (loop (fx+ k 1)))))))))))
+                (if (< pipe-err 0)
+                    (begin (release-pre-spawn!)
+                           (cons 'failed (uv-strerror pipe-err)))
+                    (let ((ob (alloc! uv-process-options-size))
+                          (sa (alloc! (* 3 uv-stdio-container-size))))
+                      (foreign-set! 'void* ob uv-po-exit-cb-offset
+                                    on-process-exit-entry)
+                      (foreign-set! 'void* ob uv-po-file-offset (cstr file))
+                      (foreign-set! 'void* ob uv-po-args-offset (cstr-array argv))
+                      (foreign-set! 'void* ob uv-po-env-offset
+                                    (if env (cstr-array env) 0))
+                      (foreign-set! 'void* ob uv-po-cwd-offset
+                                    (if cwd (cstr cwd) 0))
+                      ;; EVERY FIELD IS WRITTEN, including the two that are
+                      ;; zero: foreign-alloc does not clear, and uid/gid are
+                      ;; read whenever the corresponding flag is set.
+                      (foreign-set! 'unsigned-32 ob uv-po-flags-offset 0)
+                      (foreign-set! 'int ob uv-po-stdio-count-offset 3)
+                      (foreign-set! 'void* ob uv-po-stdio-offset sa)
+                      (foreign-set! 'unsigned-32 ob uv-po-uid-offset 0)
+                      (foreign-set! 'unsigned-32 ob uv-po-gid-offset 0)
+                      ;; THE PIPE FLAGS DESCRIBE THE CHILD'S END. The child
+                      ;; READS its stdin and WRITES its stdout and stderr, so
+                      ;; the readable/writable pair is the other way round
+                      ;; from this process's view of the same descriptors.
+                      (let loop ((k 0))
+                        (when (fx< k 3)
+                          (let ((off (* k uv-stdio-container-size)))
+                            (case (vector-ref modes k)
+                              ((pipe)
+                               (foreign-set! 'int sa (+ off uv-sc-flags-offset)
+                                 (if (fx= k 0)
+                                     (fxlogor UV-CREATE-PIPE UV-READABLE-PIPE)
+                                     (fxlogor UV-CREATE-PIPE UV-WRITABLE-PIPE)))
+                               (foreign-set! 'void* sa (+ off uv-sc-data-offset)
+                                             (vector-ref pipe-h k)))
+                              ((inherit)
+                               (foreign-set! 'int sa (+ off uv-sc-flags-offset)
+                                             UV-INHERIT-FD)
+                               (foreign-set! 'void* sa (+ off uv-sc-data-offset) 0)
+                               (foreign-set! 'int sa (+ off uv-sc-data-offset) k))
+                              (else
+                               (foreign-set! 'int sa (+ off uv-sc-flags-offset)
+                                             UV-IGNORE)
+                               (foreign-set! 'void* sa (+ off uv-sc-data-offset) 0))))
+                          (loop (fx+ k 1))))
+                      ;; TEST SEAM 'proc-stdio-bogus-stream -- when armed, the
+                      ;; first container asked for as a pipe is described as
+                      ;; an inherited descriptor -1 instead. uv_spawn's stdio
+                      ;; loop answers UV_EINVAL for that and takes its error:
+                      ;; label BEFORE any fork, which is the real path the F13
+                      ;; repair exists for and the only one reachable without
+                      ;; starting a child. Unarmed the override answers #f and
+                      ;; nothing is rewritten.
+                      (when (inject-override! 'proc-stdio-bogus-stream #f)
+                        (let loop ((k 0))
+                          (when (fx< k 3)
+                            (if (eq? (vector-ref modes k) 'pipe)
+                                (let ((off (* k uv-stdio-container-size)))
+                                  (foreign-set! 'int sa (+ off uv-sc-flags-offset)
+                                                UV-INHERIT-FD)
+                                  (foreign-set! 'void* sa (+ off uv-sc-data-offset) 0)
+                                  (foreign-set! 'int sa (+ off uv-sc-data-offset) -1))
+                                (loop (fx+ k 1))))))
+                      ;; (3) the spawn itself.
+                      ;; INJECTION POINT 'proc-uv-spawn-result -- an OVERRIDE,
+                      ;; because the cell it serves needs the real call to run
+                      ;; and really start a child, and only then to be told it
+                      ;; failed. That is the orphan shape: r < 0 with an active
+                      ;; handle.
+                      (let ((r (inject-override! 'proc-uv-spawn-result
+                                 (uv-spawn (uv-loop-handle) ph ob))))
+                        (set! spawned? #t)
+                        ;; (4) the marshalled memory is consumed synchronously
+                        (free-blocks!)
+                        (cond
+                          ((< r 0)
+                           ;; (5) THE F13 REPAIR RUNS ON EVERY NEGATIVE RESULT
+                           ;; AND BEFORE ANYTHING ELSE TOUCHES THE HANDLE: both
+                           ;; queue pointers are still valid at this instant,
+                           ;; because no other handle operation has run since
+                           ;; uv_spawn returned and the region excludes
+                           ;; callbacks.
+                           (repair-spawn-queue! ph)
+                           (if (= 0 (uv-is-active ph))
+                               ;; the ordinary failure (a missing binary, a
+                               ;; rejected stdio container): no child exists
+                               (begin
+                                 (set! released? #t)
+                                 (close-pipe-handles!)
+                                 (uv-close ph on-process-close-entry)
+                                 (set! ph #f)
+                                 (cons 'failed (uv-strerror r)))
+                               ;; THE ORPHAN: the child is running although
+                               ;; uv_spawn reports failure, because a parent
+                               ;; stream failed to open after the fork. Kill
+                               ;; first, then account for it.
+                               (begin
+                                 (set! released? #t)
+                                 (set! child-pid (uv-process-get-pid ph))
+                                 (uv-process-kill ph 9)
+                                 ;; INJECTION POINT 'proc-orphan-publish
+                                 ;; (fault) -- OWNING GUARD: the one on the
+                                 ;; next line. Without a row the handle stays
+                                 ;; registered and the exit callback's no-row
+                                 ;; path closes and frees it; it is never
+                                 ;; closed here, because closing an active
+                                 ;; process handle leaves the child unreaped.
+                                 (guard (e2 (#t (void)))
+                                   (let ((op (make-proc ph owner #f #f #f
+                                                        child-pid #f 'orphan
+                                                        #t 0 kill?)))
+                                     (inject-fault! 'proc-orphan-publish)
+                                     (hashtable-set! proc-table ph op)
+                                     (set! p op)
+                                     (set! row? #t)
+                                     (index-owner! owner 'proc ph)
+                                     (set! idx? #t)))
+                                 ;; libuv closed only the descriptors it
+                                 ;; opened; these handles are ours
+                                 (close-pipe-handles!)
+                                 (cons 'failed (uv-strerror r)))))
+                          (else
+                           (set! child-pid (uv-process-get-pid ph))
+                           (set! p (make-proc ph owner #f #f #f child-pid #f
+                                              'running #t 0 kill?))
+                           ;; the conns exist but are UNPUBLISHED: nothing can
+                           ;; reach them yet, which is why the tag and the
+                           ;; cleanup closure can be installed directly here
+                           ;; rather than through the refusing setters.
+                           (let loop ((k 0))
+                             (when (fx< k 3)
+                               (when (vector-ref pipe-inited? k)
+                                 (let ((c (make-conn (vector-ref pipe-h k) owner
+                                                     'open #f #f #f #f #f))
+                                       (nm (proc-stream-name k)))
+                                   (conn-set-tag! c (cons p nm))
+                                   (conn-set-cleanup! c (make-pipe-cleanup p nm))
+                                   (vector-set! pipe-conn k c)
+                                   (proc-set-stream! p nm c)))
+                               (loop (fx+ k 1))))
+                           ;; stdin is ours to write, never to read, so only
+                           ;; the two output pipes are started
+                           (let ((rr (let loop ((k 1))
+                                       (if (fx>= k 3)
+                                           0
+                                           (let ((c (vector-ref pipe-conn k)))
+                                             (if (not c)
+                                                 (loop (fx+ k 1))
+                                                 ;; INJECTION POINT
+                                                 ;; 'proc-read-start-result --
+                                                 ;; an OVERRIDE: the read
+                                                 ;; really starts and the
+                                                 ;; rollback really has to
+                                                 ;; stop it, which uv_close on
+                                                 ;; the handle does.
+                                                 (let ((n (inject-override!
+                                                            'proc-read-start-result
+                                                            (uv-read-start
+                                                              (conn-handle c)
+                                                              on-alloc-entry
+                                                              on-read-entry))))
+                                                   (if (< n 0)
+                                                       n
+                                                       (loop (fx+ k 1))))))))))
+                             (if (< rr 0)
+                                 (begin
+                                   (rollback-active!)
+                                   (cons 'failed (uv-strerror rr)))
+                                 (begin
+                                   ;; PUBLISH IN A FIXED ORDER. Order matters
+                                   ;; only to the rollback -- no callback can
+                                   ;; run inside this region -- but the
+                                   ;; rollback reads these flags, so each one
+                                   ;; is set immediately after its step.
+                                   (hashtable-set! proc-table ph p)
+                                   (set! row? #t)
+                                   ;; INJECTION POINT 'proc-publish-index-fail
+                                   ;; (fault) -- OWNING GUARD: the one around
+                                   ;; the whole region. It produces the state
+                                   ;; the rollback keys on: row present, owner
+                                   ;; entry absent.
+                                   (inject-fault! 'proc-publish-index-fail)
+                                   (index-owner! owner 'proc ph)
+                                   (set! idx? #t)
+                                   (let loop ((k 0) (n 0))
+                                     (if (fx>= k 3)
+                                         (void)
+                                         (let ((c (vector-ref pipe-conn k)))
+                                           (if (not c)
+                                               (loop (fx+ k 1) n)
+                                               (begin
+                                                 (hashtable-set! conn-table
+                                                   (conn-handle c) c)
+                                                 (note-pipe-conn! 1)
+                                                 (vector-set! pipe-row? k #t)
+                                                 (index-owner! owner 'conn
+                                                   (conn-handle c))
+                                                 (vector-set! pipe-idx? k #t)
+                                                 ;; INJECTION POINT
+                                                 ;; 'proc-publish-fail (fault)
+                                                 ;; -- OWNING GUARD: the
+                                                 ;; region's. Fired after the
+                                                 ;; proc row and exactly one
+                                                 ;; conn row, which is the
+                                                 ;; partially-published state
+                                                 ;; the rollback has to undo.
+                                                 (when (fx= n 0)
+                                                   (inject-fault! 'proc-publish-fail))
+                                                 (loop (fx+ k 1) (fx+ n 1)))))))
+                                   p)))))))))))))))
+
+  ;; ---- writing a child's stdin -------------------------------------------
+
+  ;; -> #t once the bytes are accepted, #f when they are refused. The two
+  ;; answers differ in exactly one observable: a refusal never calls on-done,
+  ;; while an acceptance always settles, whether the write completes, fails
+  ;; (EPIPE when the child has closed its end) or is cancelled.
+  ;;
+  ;; on-done RUNS IN CALLBACK CONTEXT AND MUST NOT YIELD OR PARK. It is
+  ;; invoked inline inside this region when the write completes at once, and
+  ;; from the loop's write callback otherwise; the guard around it contains a
+  ;; raise, not a scheduler yield. Same contract tcp-write! carries, enforced
+  ;; the same way -- by agreement, not by a check.
+  ;;
+  ;; THE CHARGE, THE SUBMISSION AND THE EXCEPTION REFUND ARE ONE REGION. A
+  ;; kill takes effect only at a safe point with interrupts enabled, and
+  ;; inside the region there is none, so a writer killed after proc-write!
+  ;; returned cannot leave a charge nobody will settle.
+  (define (proc-write! p bv . on-done)
+    (let* ((done (if (null? on-done) #f (car on-done)))
+           (len (bytevector-length bv))
+           (settled? #f))
+      ;; BUILT BEFORE THE CHARGE, because it is what discharges it: a closure
+      ;; that did not exist yet could not be reached by a failure between the
+      ;; two.
+      (define (settle! status)
+        (let ((first?
+                (with-interrupts-disabled
+                  (if settled?
+                      #f
+                      (begin
+                        (set! settled? #t)
+                        (proc-set-queued! p (fx- (proc-queued p) len))
+                        #t)))))
+          (if (not first?)
+              ;; COUNTED POINT 'proc-write-settled-twice -- unarmed: silent.
+              ;; A second settlement is absorbed rather than refused: the flag
+              ;; is what makes "exactly once" hold, and the count is what
+              ;; makes a collision visible instead of silent.
+              (inject-barrier! 'proc-write-settled-twice)
+              ;; the raise path settles too, but its caller gets the condition
+              ;; rather than a completion, so no on-done is owed
+              (when (and done (not (eq? status 'raised)))
+                (guard (e (#t (note-swallowed! 'proc-write-done e)))
+                  (done status))))))
+      (define (complete! status)
+        (settle! status)
+        ;; TEST SEAM 'proc-write-settle-twice -- when armed the library
+        ;; settles a second time on purpose, which is the collision the flag
+        ;; above exists to absorb. Without the flag this is a double refund
+        ;; and `queued` goes negative.
+        (when (inject-override! 'proc-write-settle-twice #f)
+          (settle! status)))
+      (with-interrupts-disabled
+        (let ((in (proc-stdin p)))
+          (cond
+            ((not (and in
+                       (eq? (conn-state in) 'open)
+                       (not (conn-raw-sealed? in))))
+             #f)
+            ((fx> (fx+ (proc-queued p) len) proc-stdin-cap) #f)
+            (else
+              (proc-set-queued! p (fx+ (proc-queued p) len))
+              ;; tcp-write! can raise before it has taken the write -- the
+              ;; foreign-alloc of the write block is inside it -- and in that
+              ;; case nothing else will ever settle this charge.
+              (guard (e (#t (settle! 'raised) (raise e)))
+                (tcp-write! in bv complete!))
+              #t))))))
+
+  ;; Half-close a child's stdin, so the child reads EOF after the last byte of
+  ;; every write that completed. -> #t when a close is under way, #f when
+  ;; there is nothing to close (no stdin pipe, already closing, already
+  ;; half-closed).
+  ;;
+  ;; NOT tcp-close!. Closing the handle cancels every queued write on it, so a
+  ;; child that was still being fed would see a truncated stream; uv_shutdown
+  ;; drains what is queued first and only then shuts the write side down.
+  ;;
+  ;; A NEGATIVE SUBMISSION MEANS NO CALLBACK FOLLOWS, so that branch resolves
+  ;; the stream here rather than waiting for one.
+  (define (proc-stdin-close! p)
+    (with-interrupts-disabled
+      (let ((in (proc-stdin p)))
+        (if (not (and in
+                      (eq? (conn-state in) 'open)
+                      (not (conn-raw-sealed? in))))
+            #f
+            (let ((req #f))
+              ;; ONE GUARD OVER THE WHOLE PRE-SUBMISSION SEQUENCE. Both the
+              ;; allocation and the table write can raise, and either leaves
+              ;; the seal already set -- so the pipe has to be closed on the
+              ;; way out or nothing would ever finish it.
+              (guard (e (#t (when req
+                              (hashtable-delete! shutdown-table req)
+                              (foreign-free req)
+                              (set! req #f))
+                            (tcp-close! in)
+                            (raise e)))
+                (conn-set-raw-sealed! in #t)
+                (set! req (foreign-alloc shutdown-req-size))
+                ;; INJECTION POINT 'proc-shutdown-register (fault) -- OWNING
+                ;; GUARD: the one above, while the request exists and nothing
+                ;; else knows about it. That is the only window in which the
+                ;; handler has a request to free.
+                (inject-fault! 'proc-shutdown-register)
+                (hashtable-set! shutdown-table req in)
+                ;; INJECTION POINT 'proc-uv-shutdown-result -- a RETURN, not
+                ;; an override: the call is skipped, so no request is ever
+                ;; stored on the stream and freeing it below is correct. An
+                ;; override would free a request libuv still owned.
+                (let ((r (inject-return! 'proc-uv-shutdown-result
+                           (uv-shutdown req (conn-handle in) on-shutdown-entry))))
+                  (if (< r 0)
+                      (begin
+                        (hashtable-delete! shutdown-table req)
+                        (foreign-free req)
+                        (set! req #f)
+                        (set! shutdown-immediate-errors
+                              (fx+ shutdown-immediate-errors 1))
+                        (tcp-close! in)
+                        #t)
+                      (begin
+                        ;; owned by the table from here: the guard must not
+                        ;; free it if anything after this raises
+                        (set! req #f)
+                        #t)))))))))
+
+  ;; ---- reading, signalling, closing --------------------------------------
+
+  ;; REAL BACKPRESSURE, which a slow mailbox consumer is not: stopping the
+  ;; read closes the kernel's window and the CHILD blocks in its write. The
+  ;; read callback drains into the mailbox regardless of how fast anything
+  ;; receives from it.
+  (define (proc-read-stop! p stream)
+    (let ((c (proc-stream-conn p stream)))
+      (and c (begin (tcp-read-stop! c) #t))))
+
+  (define (proc-read-start! p stream)
+    (let ((c (proc-stream-conn p stream)))
+      (and c (tcp-read-start! c))))
+
+  ;; -> #t when a signal was sent, #f when there is no child left to signal.
+  ;; PIPE STATE IS IRRELEVANT HERE: a child whose pipes this process already
+  ;; closed is still a running child.
+  (define (proc-kill! p signum)
+    (with-interrupts-disabled
+      (if (and (eq? (proc-child p) 'running) (proc-handle-alive? p))
+          (begin (uv-process-kill (proc-handle p) signum) #t)
+          #f)))
+
+  ;; -> the number of children signalled.
+  (define (proc-kill-all! signum)
+    (with-interrupts-disabled
+      (let ((ps (hashtable-values proc-table)))
+        (let loop ((i 0) (n 0))
+          (if (fx>= i (vector-length ps))
+              n
+              (let ((p (vector-ref ps i)))
+                (if (and (eq? (proc-child p) 'running) (proc-handle-alive? p))
+                    (begin (uv-process-kill (proc-handle p) signum)
+                           (loop (fx+ i 1) (fx+ n 1)))
+                    (loop (fx+ i 1) n))))))))
+
+  ;; Close whichever pipes are still open. IDEMPOTENT, AND IT DOES NOT KILL:
+  ;; the child keeps running and stays eligible for proc-kill! and for the
+  ;; owner-death signal. Queued stdin writes fail through their completions
+  ;; and are refunded; a pending stdin shutdown is cancelled. The row retires
+  ;; once the process handle has closed too, which is after the exit.
+  (define (proc-close! p)
+    (let ((cs (with-interrupts-disabled
+                (list (proc-stdin p) (proc-stdout p) (proc-stderr p)))))
+      (for-each (lambda (c) (when c (tcp-close! c))) cs)
+      (void)))
+
+  ;; ONE REGION, so the seven numbers describe one instant rather than seven.
+  ;; An alist rather than a tuple: the design named five quantities and two
+  ;; more are read by the shutdown cells, and a key can be added later without
+  ;; moving anything a reader already names.
+  ;;
+  ;; It walks proc-table, which allocates -- acceptable here because this is a
+  ;; diagnostic call bounded by max-procs. socket-conn-count is the one that
+  ;; may not walk, being on an http server's stats path, which is why the pipe
+  ;; count it subtracts is maintained instead.
+  (define (proc-stats)
+    (with-interrupts-disabled
+      (let ((ps (hashtable-values proc-table)))
+        (let loop ((i 0) (running 0) (exited 0) (queued 0))
+          (if (fx>= i (vector-length ps))
+              (list (cons 'procs (hashtable-size proc-table))
+                    (cons 'running running)
+                    (cons 'exited-unclosed exited)
+                    (cons 'pipes pipe-conns-live)
+                    (cons 'queued-bytes queued)
+                    (cons 'shutdown-pending (hashtable-size shutdown-table))
+                    (cons 'shutdown-immediate-errors shutdown-immediate-errors))
+              (let ((p (vector-ref ps i)))
+                (loop (fx+ i 1)
+                      (if (eq? (proc-child p) 'running) (fx+ running 1) running)
+                      (if (eq? (proc-child p) 'exited) (fx+ exited 1) exited)
+                      (fx+ queued (proc-queued p)))))))))
   )
