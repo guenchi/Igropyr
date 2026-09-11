@@ -22,7 +22,7 @@
            ", " (b "code hot-swaps") ", " (b "faults speak a protocol") ", and "
            (b "continuations drive conversations") ".")
         (p (@ (class "sub"))
-           "Pure Chez Scheme · Erlang-style actors · libuv event loop · MIT")
+           "Pure Chez Scheme · Erlang-style actors · libuv event loop · Apache 2.0")
         (div (@ (class "cta"))
           (a (@ (class "btn primary") (href "https://github.com/guenchi/Igropyr"))
              "Get the code")
