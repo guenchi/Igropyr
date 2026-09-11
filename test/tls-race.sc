@@ -628,6 +628,37 @@
                   (inject-barrier-cleanup! t 'z14-empty-open 31000)))
           (check "Z14: resources back to baseline" (settled-to? base 6000) (snap) base)))
 
+        ;; ---- P30-TLS: write-block ownership on the close-notify path (child-process
+        ;; design v7/v8 §4.3, §5). Each private release site inside the sealing writer
+        ;; and the close-notify guard is reached through its seam; the cell asserts the
+        ;; retire reason, the release point hit exactly once, and the write-block
+        ;; counter and table back where they were.
+        (let ((p30-tls
+                (lambda (label arm! reason point)
+                  (let* ((ch (open-held-conn! 'plain)) (c (car ch))
+                         (w0 (write-blocks-live-count)) (t0 (write-table-size))
+                         (h0 (or (inject-hits point) 0)))
+                    (check (string-append label ": a live TLS connection") c)
+                    (arm!)
+                    (tcp-close! c)
+                    (check (string-append label ": retired with the expected reason") (within? 5000 (lambda () (equal? (retire-reason) reason))) (retire-reason))
+                    (check (string-append label ": the release point was hit exactly once") (within? 2000 (lambda () (eqv? (or (inject-hits point) 0) (+ h0 1)))) (inject-hits point) h0)
+                    (check (string-append label ": live write blocks and the table back") (within? 3000 (lambda () (and (eqv? (write-blocks-live-count) w0) (eqv? (write-table-size) t0)))) (list (write-blocks-live-count) w0 (write-table-size) t0))
+                    (client-result 10000)
+                    (inject-disarm!)
+                    (send (cdr ch) (vector 'release))
+                    (check (string-append label ": resources back to baseline") (settled-to? base 8000) (snap) base)))))
+          (p30-tls "P30-TLS sealing-reject" (lambda () (inject-arm-return! 'tls-sealing-reject #t 1))
+                   '(clean-close tls-close-notify-failed . -1) 'write-block-released-sealing-reject)
+          (p30-tls "P30-TLS sealing-neg" (lambda () (inject-arm-return! 'uv-write-sealing-neg -1 1))
+                   '(clean-close tls-close-notify-failed . -1) 'write-block-released-sealing-neg)
+          (p30-tls "P30-TLS owned-block guard" (lambda () (inject-arm-fault! 'tls-closenotify-owned-fault 1))
+                   '(clean-close . tls-shutdown-raised) 'write-block-released-closenotify-guard)
+          (p30-tls "P30-TLS timer-rearm-fail (initial arm)" (lambda () (inject-arm-return! 'tls-timer-rearm-fail -1 1))
+                   '(clean-close . tls-shutdown-timer-failed) 'write-block-released-timer-fail)
+          (p30-tls "P30-TLS sealing registration fault" (lambda () (inject-arm-fault! 'write-register-oom 1))
+                   '(clean-close . tls-shutdown-raised) 'write-block-released-register-fail))
+
         (inject-disarm!)
         (if (zero? failures)
             (begin (display "ALL TLS-RACE TESTS PASSED\n") (exit 0))
