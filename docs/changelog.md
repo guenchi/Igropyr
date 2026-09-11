@@ -47,11 +47,6 @@ in a build with `IGROPYR_INJECT=on` and raises otherwise.
 
 ### Breaking
 
-- **The licence changes from MIT to the Apache License 2.0.** `LICENSE`
-  carries the Apache text with the copyright holder named in the appendix
-  notice, and the SPDX identifier in `package.json` and the README section
-  follow it.
-
 - **The framework no longer writes on the application's stdout.** A process
   may be holding stdout for a protocol, a pipe, or a log format of its own,
   and a library writing there corrupts a stream it does not own: the
