@@ -641,6 +641,7 @@
                          ;; counted points count only while a row is armed: a never-firing barrier
                          (tp (inject-arm-barrier! point 1000000 60000)))
                     (check (string-append label ": a live TLS connection") c)
+                    (check (string-append label ": quiescent -- no live write blocks, empty table (v8 zero baseline)") (and (eqv? w0 0) (eqv? t0 0)) w0 t0)
                     (arm!)
                     (tcp-close! c)
                     (check (string-append label ": retired with the expected reason") (within? 5000 (lambda () (equal? (retire-reason) reason))) (retire-reason))

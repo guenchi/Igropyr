@@ -131,12 +131,21 @@
       (set-proc-stdin-cap! (* 256 1024))
       (let ((p (spawn-sh "exec sleep 5")) (chunk (make-bytevector 65536 1)) (accepted 0) (settled 0) (neg 0) (refused 0))
         (define (done st) (set! settled (+ settled 65536)) (when (< st 0) (set! neg (+ neg 1))))
+        (define boundary-ok #t)
         (let loop ((n 0))
           (when (< n 40)
-            (if (proc-write! p chunk done)
-                (begin (set! accepted (+ accepted 65536)) (loop (+ n 1)))
-                (set! refused (+ refused 1)))))
+            (let ((outstanding (- accepted settled)))
+              (if (proc-write! p chunk done)
+                  (begin
+                    ;; accepted only while outstanding + len fits the configured cap
+                    (unless (<= (+ outstanding 65536) (* 256 1024)) (set! boundary-ok #f))
+                    (set! accepted (+ accepted 65536)) (loop (+ n 1)))
+                  (begin
+                    ;; refused exactly when it would not fit
+                    (unless (> (+ outstanding 65536) (* 256 1024)) (set! boundary-ok #f))
+                    (set! refused (+ refused 1)))))))
         (check "P12: a write was refused at the cap" (= refused 1) refused accepted)
+        (check "P12: every acceptance fit the configured cap and the refusal was the first that did not" boundary-ok accepted settled)
         (check "P12: outstanding = accepted - settled <= cap, and queued reports exactly that" (and (<= (- accepted settled) (* 256 1024)) (eqv? (proc-queued p) (- accepted settled))) (list (proc-queued p) accepted settled))
         (sleep-ms 100)
         (check "P12: still charged after 100 ms (the kernel is saturated, the charge is real)" (and (> (proc-queued p) 0) (eqv? (proc-queued p) (- accepted settled))) (list (proc-queued p) accepted settled))
@@ -185,8 +194,10 @@
         (back-to-base! "P12 collision: counts back" b0 3000))
       ;; cancellation
       (let ((p (spawn-sh "exec sleep 5")) (statuses '()) (accepted 0))
-        (let loop ((n 0)) (when (and (< n 3) (proc-write! p (make-bytevector 65536 4) (lambda (s) (set! statuses (cons s statuses))))) (set! accepted (+ accepted 1)) (loop (+ n 1))))
-        (check "P12 cancel: a backlog is outstanding" (> (proc-queued p) 0) (proc-queued p))
+        ;; saturate until a backlog persists (socketpair buffers differ between hosts)
+        (let loop ((n 0)) (when (and (< n 64) (proc-write! p (make-bytevector 65536 4) (lambda (s) (set! statuses (cons s statuses))))) (set! accepted (+ accepted 1)) (sleep-ms 10) (when (or (< n 3) (eqv? (proc-queued p) 0)) (loop (+ n 1)))))
+        (sleep-ms 50)
+        (check "P12 cancel: a persistent backlog is outstanding" (> (proc-queued p) 0) (proc-queued p))
         (let ((pending (- accepted (length statuses))))
           (proc-close! p)
           (check "P12 cancel: exactly the pending writes settled, each with ECANCELED, and queued is 0"
@@ -209,7 +220,10 @@
         (check "P19 queued: 1 MiB accepted before the child closes stdin" (proc-write! p (pattern MiB) (lambda (s) (set! st s))))
         (check "P19 queued: premise -- the write is outstanding (charged) before the close" (> (proc-queued p) 0) (proc-queued p))
         (check "P19 queued: the child then closed its stdin" (equal? (read-line-of p 'stdout 3000) "closed"))
-        (check "P19 queued: the remainder fails through on-done (EPIPE)" (within? 5000 (lambda () (epipe? st))) (and st (< st 0) (uv-strerror st)))
+        ;; macOS fails the queued remainder with EPIPE when the child closes its stdin;
+        ;; FreeBSD leaves it queued until the child's exit closes the pipe, which cancels it
+        ;; (ECANCELED): either way the remainder is failed through on-done, never delivered
+        (check "P19 queued: the remainder fails through on-done (EPIPE, or ECANCELED once the exit closes the pipe)" (within? 5000 (lambda () (or (epipe? st) (ecanceled? st)))) (and st (< st 0) (uv-strerror st)))
         (check "P19 queued: queued refunded" (eqv? (proc-queued p) 0) (proc-queued p))
         (wait-exit p 4000) (collect p 'stdout 1000) (collect p 'stderr 1000)
         (back-to-base! "P19 queued: counts back" b0 3000))
@@ -228,8 +242,9 @@
         (proc-kill! p 9) (wait-exit p 3000)
         (back-to-base! "P20 closed: counts back" b0 3000))
       (let ((p (spawn-sh "exec sleep 5")) (statuses '()) (accepted 0))
-        (let loop ((n 0)) (when (and (< n 4) (proc-write! p (make-bytevector 65536 4) (lambda (s) (set! statuses (cons s statuses))))) (set! accepted (+ accepted 1)) (loop (+ n 1))))
-        (check "P20 cancel: backlog then proc-stdin-close! -> #t" (and (> (proc-queued p) 0) (proc-stdin-close! p)) (proc-queued p))
+        (let loop ((n 0)) (when (and (< n 64) (proc-write! p (make-bytevector 65536 4) (lambda (s) (set! statuses (cons s statuses))))) (set! accepted (+ accepted 1)) (sleep-ms 10) (when (or (< n 3) (eqv? (proc-queued p) 0)) (loop (+ n 1)))))
+        (sleep-ms 50)
+        (check "P20 cancel: persistent backlog then proc-stdin-close! -> #t" (and (> (proc-queued p) 0) (proc-stdin-close! p)) (proc-queued p))
         (check "P20 cancel: a shutdown request is pending" (eqv? (stat 'shutdown-pending) 1) (stat 'shutdown-pending))
         (let ((pending (- accepted (length statuses))))
           (proc-close! p)
