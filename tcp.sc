@@ -810,12 +810,19 @@
       (guard (e (#t (note-swallowed! 'proc-close-unindex e)))
         (inject-fault! 'proc-close-unindex)
         (unindex-owner! (proc-owner p) 'proc h))
+      ;; THE FREE COMES BEFORE THE INSTRUMENTATION, and that order is the
+      ;; point: note-proc-handle-freed! APPENDS in an injected build, so it
+      ;; allocates, so it can raise -- and an obligation placed after
+      ;; something that can raise is an obligation that can be skipped. The
+      ;; address is an integer and is never dereferenced, so recording it
+      ;; after the block is gone is exactly as true as recording it before.
       ;; COUNTED POINT 'proc-handle-freed -- unarmed: silent. One hit per
-      ;; process handle block released, here and at the no-row close path;
-      ;; the address log beside it says WHICH block each hit was for.
+      ;; process handle block released, here, at the no-row close path and at
+      ;; proc-spawn!'s pre-spawn release; the address log beside it says WHICH
+      ;; block each hit was for.
+      (foreign-free h)
       (inject-barrier! 'proc-handle-freed)
-      (note-proc-handle-freed! h)
-      (foreign-free h)))
+      (note-proc-handle-freed! h)))
 
   ;; The cleanup hook every pipe conn carries. conn-on-close! refuses a tagged
   ;; conn precisely so that this closure cannot be overwritten: it is the only
@@ -1339,10 +1346,15 @@
               ;; COUNTED POINT 'proc-exit-cb-no-row -- unarmed: silent. The
               ;; address log beside it is what lets a cell say WHICH handle
               ;; took this path.
+              ;; THE CLOSE IS THE OBLIGATION AND GOES FIRST. The log below
+              ;; allocates in an injected build; behind it, a raise would
+              ;; leave this handle registered in the loop for the life of the
+              ;; VM. uv_close only schedules, so the address is still a
+              ;; perfectly good thing to record afterwards.
               (begin
+                (uv-close handle on-process-close-entry)
                 (inject-barrier! 'proc-exit-cb-no-row)
-                (note-proc-exit-no-row! handle)
-                (uv-close handle on-process-close-entry))
+                (note-proc-exit-no-row! handle))
               (begin
                 ;; (2) unconditional, allocation-free invalidation. An orphan
                 ;; stays an orphan: that field records how the child was
@@ -1384,12 +1396,12 @@
       (lambda (handle)
         (let ((p (hashtable-ref proc-table handle #f)))
           (if (not p)
-              ;; the no-row close path: nothing names this block
-              ;; COUNTED POINT 'proc-handle-freed -- the second and last of
-              ;; the two sites that release a process handle block.
-              (begin (inject-barrier! 'proc-handle-freed)
-                     (note-proc-handle-freed! handle)
-                     (foreign-free handle))
+              ;; the no-row close path: nothing names this block.
+              ;; COUNTED POINT 'proc-handle-freed -- free first, instrument
+              ;; second, for the reason given at retire-proc-row!.
+              (begin (foreign-free handle)
+                     (inject-barrier! 'proc-handle-freed)
+                     (note-proc-handle-freed! handle))
               (begin
                 (proc-set-handle-alive! p #f)
                 (when (proc-closed? p) (retire-proc-row! p))))))
@@ -5551,15 +5563,19 @@
               (free-blocks!)
               ;; NEVER INITIALISED: libuv has not seen this block, so it is
               ;; freed directly rather than closed.
-              ;; COUNTED POINT 'proc-handle-freed -- the third and last site
-              ;; that releases a process handle block, counted and logged
-              ;; like the other two so the log is complete.
-              (when ph
-                (inject-barrier! 'proc-handle-freed)
-                (note-proc-handle-freed! ph)
-                (foreign-free ph)
-                (set! ph #f))
-              (close-pipe-handles!))
+              ;;
+              ;; EVERY RELEASE FIRST, INSTRUMENTATION LAST. The log allocates
+              ;; in an injected build, and released? is already set, so a
+              ;; raise in the middle of this procedure is not retried by the
+              ;; guard -- it would strand this block AND every pipe handle
+              ;; below it. COUNTED POINT 'proc-handle-freed: the third of the
+              ;; three sites that release a process handle block.
+              (let ((freed ph))
+                (when ph (foreign-free ph) (set! ph #f))
+                (close-pipe-handles!)
+                (when freed
+                  (inject-barrier! 'proc-handle-freed)
+                  (note-proc-handle-freed! freed))))
             (define (release-spawned-inactive!)
               (set! released? #t)
               (free-blocks!)
