@@ -208,8 +208,8 @@
           submission-failure? node-install-rule-order node-orphan-count
           monitor-node/token demonitor-node/token
           $registrar-seed-gen! $registrar-pid $registrar-queue-length
-          $registrar-peer-gen $node-link-pid
-          set-link-reaper-scan-ms!)
+          $registrar-peer-gen $node-link-pid $node-entry-mons-id
+          $node-stale-chain-node! set-link-reaper-scan-ms!)
   ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
   ;; the note in libuv.sc; test/inject-isolation.ss is what measures it.
   (import (chezscheme) (igropyr buffer)
@@ -659,6 +659,190 @@
   (define caller-agents (make-eqv-hashtable))
   (define owner-agents (make-eqv-hashtable))
   (define callee-agents (make-hashtable equal-hash equal?))
+
+  ;; ---- intrusive chains for cleanup ---------------------------------------
+  ;;
+  ;; THE SLOTS ARE THE CHAIN NODES. A monitor or pending-call slot is already a
+  ;; vector filed under a key; giving it prev/next links and its own key makes
+  ;; the set of "things this connection still owes an answer to" walkable in
+  ;; O(1) per item, WITHOUT allocating anything at the moment the connection
+  ;; dies. That is the whole point: the removal transaction runs with
+  ;; interrupts disabled, and a walk that had to build a list there would be
+  ;; both unbounded and allocating in the one place neither is allowed.
+  ;;
+  ;; A collection is #(head count). The count is a fixnum maintained with
+  ;; fx+/fx-, bounded by the number of live slots, so it never allocates
+  ;; either.
+  ;;
+  ;; LOCAL MONITOR SLOTS STAY THREE FIELDS. They are not owned by any
+  ;; connection and are never chained, so every shared helper tests the length
+  ;; before touching a link field rather than assuming the long layout.
+  (define (make-collection) (vector #f 0))
+  (define (collection-head col)  (vector-ref col 0))
+  (define (collection-count col) (vector-ref col 1))
+
+  ;; slot layouts:
+  ;;   rmonitors[mref] = #(caller node name owner prev next mref)
+  ;;   pending[ref]    = #(caller node owner prev next ref)
+  ;; the owner field is the collection the slot belongs to, so a slot can be
+  ;; unlinked knowing only itself.
+  (define (slot-chained? v) (fx> (vector-length v) 3))
+  (define (rmon-slot-owner v)     (vector-ref v 3))
+  (define (rmon-slot-prev v)      (vector-ref v 4))
+  (define (rmon-slot-next v)      (vector-ref v 5))
+  (define (rmon-slot-key v)       (vector-ref v 6))
+  (define (rmon-slot-owner-set! v x) (vector-set! v 3 x))
+  (define (rmon-slot-prev-set! v x)  (vector-set! v 4 x))
+  (define (rmon-slot-next-set! v x)  (vector-set! v 5 x))
+  (define (pend-slot-owner v)     (vector-ref v 2))
+  (define (pend-slot-prev v)      (vector-ref v 3))
+  (define (pend-slot-next v)      (vector-ref v 4))
+  (define (pend-slot-key v)       (vector-ref v 5))
+  (define (pend-slot-owner-set! v x) (vector-set! v 2 x))
+  (define (pend-slot-prev-set! v x)  (vector-set! v 3 x))
+  (define (pend-slot-next-set! v x)  (vector-set! v 4 x))
+
+  ;; The two layouts differ only in where the links sit, so the helpers take
+  ;; the accessors rather than branching on length at every step.
+  (define (chain-link! col v owner-set! prev-set! next-set!)
+    (let ((h (collection-head col)))
+      (owner-set! v col)
+      (prev-set! v #f)
+      (next-set! v h)
+      ;; the old head's PREV now points back at v -- prev-set! applied to h,
+      ;; not to v
+      (when h (prev-set! h v))
+      (vector-set! col 0 v)
+      (vector-set! col 1 (fx+ (collection-count col) 1))))
+
+  ;; MEMBERSHIP-CHECKED AND IDEMPOTENT, like mon-unlink-global!. Two executors
+  ;; can both decide a slot is finished; only the first changes anything, and
+  ;; the second must not decrement the count for a node that is already out.
+  (define (chain-unlink! v get-owner get-prev get-next
+                         owner-set! prev-set! next-set!)
+    (let ((col (get-owner v)))
+      ;; MEMBERSHIP, NOT MERELY "HAS AN OWNER". A node carrying an owner but
+      ;; sitting in no chain -- both links #f and not the head -- is not on the
+      ;; collection, and decrementing for it drives the count negative: an
+      ;; empty collection can be taken to -1 that way. The count is what
+      ;; node-monitor-stats reports; completion is decided by crec-finished?,
+      ;; which reads the collection HEADS and the control flags, not this
+      ;; number. A wrong count therefore misreports without stalling a record,
+      ;; which is worse to debug, not better.
+      (when (and col
+                 (or (get-prev v) (get-next v) (eq? (collection-head col) v)))
+        (let ((p (get-prev v)) (n (get-next v)))
+          (if p (next-set! p n) (when (eq? (collection-head col) v)
+                                  (vector-set! col 0 n)))
+          (when n (prev-set! n p))
+          (prev-set! v #f)
+          (next-set! v #f)
+          (owner-set! v #f)
+          (vector-set! col 1 (fx- (collection-count col) 1))))))
+
+  (define (rmon-link! col v)
+    (chain-link! col v rmon-slot-owner-set! rmon-slot-prev-set!
+                 rmon-slot-next-set!))
+  (define (rmon-unlink! v)
+    (when (slot-chained? v)
+      (chain-unlink! v rmon-slot-owner rmon-slot-prev rmon-slot-next
+                     rmon-slot-owner-set! rmon-slot-prev-set!
+                     rmon-slot-next-set!)))
+  (define (pend-link! col v)
+    (chain-link! col v pend-slot-owner-set! pend-slot-prev-set!
+                 pend-slot-next-set!))
+  (define (pend-unlink! v)
+    (chain-unlink! v pend-slot-owner pend-slot-prev pend-slot-next
+                   pend-slot-owner-set! pend-slot-prev-set!
+                   pend-slot-next-set!))
+
+  ;; ---- the cleanup record --------------------------------------------------
+  ;;
+  ;; WHAT A DEAD CONNECTION STILL OWES, held somewhere that survives the death
+  ;; of whoever was going to pay it. The obligations used to be discharged by
+  ;; the removing process directly, after its transaction: if that process was
+  ;; killed in between, nothing else knew anybody was owed anything. A waiting
+  ;; rcall still ends at its own timeout; a watcher has no such bound, so for
+  ;; monitors the wait really was unbounded.
+  ;;
+  ;; INTRUSIVE, so publishing costs no allocation at the moment of death: the
+  ;; record is built BEFORE the region and linked with pointer writes inside
+  ;; it.
+  ;;   #(kind name old-conn old-link mons pends hosted-root close? stop?
+  ;;     gprev gnext)
+  (define (make-crec kind name conn link close? stop?)
+    (vector kind name conn link #f #f #f close? stop? #f #f))
+  (define (crec-kind r)        (vector-ref r 0))
+  (define (crec-name r)        (vector-ref r 1))
+  (define (crec-conn r)        (vector-ref r 2))
+  (define (crec-link r)        (vector-ref r 3))
+  (define (crec-mons r)        (vector-ref r 4))
+  (define (crec-pends r)       (vector-ref r 5))
+  (define (crec-hosted-root r) (vector-ref r 6))
+  (define (crec-close? r)      (vector-ref r 7))
+  (define (crec-stop? r)       (vector-ref r 8))
+  ;; DELETE AND UNLINK ARE ONE ACT. What a slot left linked costs depends on
+  ;; WHOSE collection it sits on, and only one of the two recovers: on a
+  ;; detached collection a cleanup record walks it once more and retires it as
+  ;; stale; on a LIVE entry's collection nothing ever walks it, because a
+  ;; record is made only when the connection ends, so the slot and its caller
+  ;; are held for the life of that collection. A slot unlinked but left in the
+  ;; table is the other way round: the row still answers a matching reply, so
+  ;; it permits a second answer. Deleting the row is what prevents that;
+  ;; unlinking prevents collection-based discovery. Neither substitutes for
+  ;; the other, which is why they are one act.
+  ;;
+  ;; NOT EVERY COMPLETION COMES THROUGH HERE, and the others do not all share
+  ;; one shape. The reply-delivery path notifies and retires in a single
+  ;; region. The write-failure undo takes the row in a region and then raises
+  ;; OUTSIDE it, because the caller it answers is itself and the answer travels
+  ;; through the stack, not the mailbox. This helper is for the paths that hold
+  ;; only the ref.
+  (define (pend-retire! ref)
+    (let ((v (hashtable-ref pending ref #f)))
+      (when v
+        (hashtable-delete! pending ref)
+        (pend-unlink! v))))
+
+  (define (crec-conn-set! r x)        (vector-set! r 2 x))
+  (define (crec-link-set! r x)        (vector-set! r 3 x))
+  (define (crec-mons-set! r x)        (vector-set! r 4 x))
+  (define (crec-pends-set! r x)       (vector-set! r 5 x))
+  (define (crec-hosted-root-set! r x) (vector-set! r 6 x))
+  (define (crec-close?-set! r x)      (vector-set! r 7 x))
+  (define (crec-stop?-set! r x)       (vector-set! r 8 x))
+  (define (crec-gprev r)       (vector-ref r 9))
+  (define (crec-gnext r)       (vector-ref r 10))
+  (define (crec-gprev-set! r x) (vector-set! r 9 x))
+  (define (crec-gnext-set! r x) (vector-set! r 10 x))
+
+  (define cleanup-chain #f)
+  ;; small identities for the mons objects, so a seam can report "same
+  ;; lifetime" as a comparable value rather than an address
+  (define mons-ids (make-eq-hashtable))
+  (define next-mons-id 1)
+  ;; how many obligations one round retires, so a single record cannot hold the
+  ;; executor for an unbounded stretch
+  (define cleanup-round-max 64)
+
+  (define (crec-link! r)
+    (crec-gprev-set! r #f)
+    (crec-gnext-set! r cleanup-chain)
+    (when cleanup-chain (crec-gprev-set! cleanup-chain r))
+    (set! cleanup-chain r))
+
+  ;; IDENTITY-GUARDED BEFORE MOVING THE HEAD, exactly as mon-unlink-global!
+  ;; does: two executors may both observe the record finished, and only the
+  ;; first unlink may change the chain.
+  (define (crec-linked? r)
+    (or (crec-gprev r) (crec-gnext r) (eq? cleanup-chain r)))
+
+  (define (crec-unlink! r)
+    (let ((n (crec-gnext r)) (p (crec-gprev r)))
+      (if p (crec-gnext-set! p n) (when (eq? cleanup-chain r) (set! cleanup-chain n)))
+      (when n (crec-gprev-set! n p))
+      (crec-gnext-set! r #f)
+      (crec-gprev-set! r #f)))
   ;; THIS IS A COUNTER, NOT A GENSYM, and code elsewhere depends on the
   ;; difference. Within one run of this process it does not repeat, so
   ;; anything filed under an mref can be found again by that mref alone.
@@ -680,9 +864,9 @@
   ;; case this counter creates and leaves the other alone.
   ;;
   ;; Anyone replacing this with something that survives a restart, or
-  ;; removing either call to drop-hosted-monitors! -- the unconditional
-  ;; one in remove-peer!, or the new-incarnation-only one in the
-  ;; replacement branch -- is removing that protection and not this
+  ;; removing the hosted obligation from either cleanup record -- the
+  ;; unconditional one in remove-peer!, or the new-incarnation-only capture in
+  ;; the replacement branch -- is removing that protection and not this
   ;; counter, which will look untouched.
   (define mref-counter 0)
   (define (next-mref!)
@@ -1892,14 +2076,25 @@
   ;; choice: the replacement sequence's atomic region swaps peers[name]
   ;; in place precisely so the name never goes absent, and a mutable
   ;; entry would let a reader see a half-updated one instead.
-  (define (make-entry conn link dialer boot-id gen head)
-    (vector conn link dialer boot-id gen head))
+  (define (make-entry conn link dialer boot-id gen head mons pends)
+    (vector conn link dialer boot-id gen head mons pends))
   (define (entry-conn e)    (vector-ref e 0))
   (define (entry-link e)    (vector-ref e 1))   ; the link process
   (define (entry-dialer e)  (vector-ref e 2))   ; who dialled, for tie-break
   (define (entry-boot-id e) (vector-ref e 3))   ; the peer's boot id, or #f
   (define (entry-gen e)     (vector-ref e 4))   ; its dial generation, or #f
   (define (entry-head e)    (vector-ref e 5))   ; topology queue head slot
+  ;; THE MONITOR LIFETIME, AND ITS IDENTITY IS THE POINT. A replacement
+  ;; inherits the SAME object, because a watch armed on the old connection
+  ;; must survive onto the new one; a removal takes it into the cleanup
+  ;; record, which ends the lifetime. So "is this the same mons object I
+  ;; selected under" is exactly the question an arming caller has to ask,
+  ;; and the presence of an entry is not that question.
+  (define (entry-mons e)    (vector-ref e 6))
+  ;; PER CONNECTION, not per peer: a pending call cannot outlive the
+  ;; connection it was submitted on, so every entry gets a fresh one and both
+  ;; replacement and removal take the old one into the record.
+  (define (entry-pends e)   (vector-ref e 7))
 
   ;; ---- the per-peer topology queue ------------------------------------
   ;;
@@ -2161,6 +2356,26 @@
             ;; therefore no observable at all. Reporting the cache beside
             ;; the walk is what makes a drift between them a fact somebody
             ;; can assert rather than infer from behaviour.
+            ;; HOW MANY RECORDS ARE OPEN, AND HOW MANY SLOT OBLIGATIONS THEY HOLD. A
+            ;; record that never reaches zero is the failure this subsystem can have,
+            ;; and without a reading it would look exactly like a healthy node.
+            ;;
+            ;; The obligation count is PENDING AND MONITOR SLOTS ONLY. Hosted work and
+            ;; the two control flags are obligations too and are not counted here, so a
+            ;; record awaiting only its close reads as one record with zero
+            ;; obligations.
+            (cons 'cleanup-records
+                  (let loop ((r cleanup-chain) (n 0))
+                    (if r (loop (crec-gnext r) (fx+ n 1)) n)))
+            (cons 'cleanup-obligations
+                  (let loop ((r cleanup-chain) (n 0))
+                    (if (not r)
+                        n
+                        (loop (crec-gnext r)
+                              (fx+ n (fx+ (let ((m (crec-mons r)))
+                                            (if m (collection-count m) 0))
+                                          (let ((p (crec-pends r)))
+                                            (if p (collection-count p) 0))))))))
             (cons 'serving-slots leases-serving)
             (cons 'serving-slots-walked (lease-chain-length 'serving))
             (cons 'preauth-slots leases-preauth)
@@ -3945,6 +4160,13 @@
                ;; costs one small object on a path that runs once per
                ;; connection -- the same trade the spares above make.
                (root (make-agent-rec #f #f #f #f #f))
+               ;; (R0) THE REPLACEMENT'S RECORD, out here with the other
+               ;; pre-allocations: publishing it inside the region must cost
+               ;; pointer writes only. It carries both control obligations --
+               ;; the old connection's close and the old link's stop -- which
+               ;; this path used to perform itself, one inside the region and
+               ;; one after it.
+               (crec (make-crec 'replacement name #f #f #t #t))
                (cut #f)
                (old #f)
                (decision
@@ -4044,7 +4266,9 @@
                         ;; for another.
                         (let* ((oh (orphan-find name))
                                (h (or oh (car spare)))
-                               (ne (make-entry c self dialer boot-id gen h)))
+                               (ne (make-entry c self dialer boot-id gen h
+                                               (make-collection)
+                                               (make-collection))))
                           (hashtable-set! peers name ne)
                           (qhead-enqueue! h (caddr spare) cut)   ; an install is an `up`
                           (when oh (orphan-detach! name)))
@@ -4102,42 +4326,68 @@
                         (set! old e)
                         (set! cut (hashtable-ref watchers name '()))
                         (let* ((h (entry-head e))
-                               (ne (make-entry c self dialer boot-id gen h)))
+                               ;; MONS IS INHERITED, PENDS IS NEW. The watches carry over to
+                               ;; the new connection; the calls submitted on the old one
+                               ;; cannot, and their collection goes to the cleanup record.
+                               (ne (make-entry c self dialer boot-id gen h
+                                               (entry-mons e)
+                                               (make-collection))))
                           ;; two numbers, one turn -- see next-event-seq!
                           (qhead-enqueue! h (cadr spare) cut)
                           (qhead-enqueue! h (caddr spare) cut)
                           (hashtable-set! peers name ne))
-                        (tcp-close! (entry-conn e))
-                        ;; CAPTURE THE HOSTED CHAIN HERE, IN THE SAME
-                        ;; TRANSACTION THAT PUBLISHED THE NEW ENTRY. It
-                        ;; used to happen later, in a region of its own,
-                        ;; and the gap between the two was a window: a
-                        ;; new incarnation arming in it filed its agent
-                        ;; under the head this sweep was about to take,
-                        ;; and the sweep carried the new run's monitor
-                        ;; away with the old run's.
-                        ;; Publishing and capturing being one step is
-                        ;; what closes it -- any arm at all is now either
-                        ;; before the capture (and belongs to the old run)
-                        ;; or after it, under a head this walk cannot
-                        ;; reach. C5 stops being a property the splice
-                        ;; happened to buy and becomes one the transaction
-                        ;; guarantees.
-                        ;;
-                        ;; LAST IN THE REGION, and that is not tidiness.
-                        ;; Everything above can still raise; if one of
-                        ;; them did after mon-heads had been cleared, the
-                        ;; chain would be off the table with nobody
-                        ;; holding it. Placed here, a failure earlier
-                        ;; leaves mon-heads untouched.
-                        ;; Pointer writes only -- mon-splice-peer! does an
-                        ;; eq-hashtable lookup and delete, neither of
-                        ;; which can grow a table.
-                        (when (new-incarnation? e r)
-                          (let ((h (mon-splice-peer! name)))
-                            (when h
-                              (agent-pnext-set! root h)
-                              (agent-pprev-set! h root))))
+                        ;; THE RECORD IS PUBLISHED BEFORE THE CLOSE, and the
+                        ;; order is the point. tcp-close! on a TLS connection
+                        ;; builds and delivers refusals to parked writers, so it
+                        ;; allocates and can raise; performed before publication
+                        ;; a raise here would unwind with the old connection's
+                        ;; pending calls belonging to nobody. Published first,
+                        ;; the same raise leaves a record whose close? is still
+                        ;; owed, and the reaper redoes it -- the close is
+                        ;; idempotent.
+                        (crec-conn-set! crec (entry-conn e))
+                        (crec-link-set! crec (entry-link e))
+                        (crec-pends-set! crec (entry-pends e))
+                        (crec-hosted-root-set! crec root)
+                        (crec-link! crec)
+                          ;; THE HOSTED CHAIN IS CAPTURED BEFORE THE CLOSE, and the order
+                          ;; is the whole of what the record is worth here. The close
+                          ;; delivers refusals to parked writers, so it allocates and can
+                          ;; raise; with the splice after it, a raise left the agents under
+                          ;; mon-heads while the published record carried an EMPTY root --
+                          ;; so the redo closed and stopped and finished, and nobody ever
+                          ;; sent those agents demon-local. Captured first, the same raise
+                          ;; leaves a record that still owes them.
+                          (when (new-incarnation? e r)
+                            (let ((h (mon-splice-peer! name)))
+                              (when h
+                                (agent-pnext-set! root h)
+                                (agent-pprev-set! h root))))
+                          ;; the close stays in the region, as it always has, but now with a
+                          ;; record behind it that already holds everything it owes
+                          (tcp-close! (entry-conn e))
+                          ;; WHY THE CAPTURE IS IN THIS TRANSACTION AT ALL. It used to happen
+                          ;; later, in a region of its own, and the gap between the two was a
+                          ;; window: a new incarnation arming in it filed its agent under the
+                          ;; head this sweep was about to take, and the sweep carried the new
+                          ;; run's monitor away with the old run's. Publishing and capturing
+                          ;; being one step is what closes it -- any arm at all is now either
+                          ;; before the capture (and belongs to the old run) or after it,
+                          ;; under a head this walk cannot reach. C5 stops being a property
+                          ;; the splice happened to buy and becomes one the transaction
+                          ;; guarantees.
+                          ;;
+                          ;; IT IS NO LONGER LAST IN THE REGION, and the reason it used to be
+                          ;; has been answered a different way. The old argument was that
+                          ;; everything above can raise, so clearing mon-heads early risked
+                          ;; leaving the chain off the table with nobody holding it. The
+                          ;; record is now that holder: it is published before the capture,
+                          ;; so a raise after mon-heads is cleared leaves the chain owned by
+                          ;; a record that still owes it. What must NOT move is the relation
+                          ;; to the close below -- see the paragraph above it.
+                          ;;
+                          ;; Pointer writes only -- mon-splice-peer! does an eq-hashtable
+                          ;; lookup and delete, neither of which can grow a table.
                         'replaced)
                        (else d)))))) 
           (case decision
@@ -4172,11 +4422,11 @@
              ;; one has to survive. Only state tied to the CONNECTION
              ;; goes.
              ;;
-             ;;   - fail-monitors-for! would tell every watcher that a
+             ;;   - taking the monitor collection would tell every watcher that a
              ;;     peer which is reachable right now has become
              ;;     unreachable -- a lie, once per watcher, and one they
              ;;     would act on.
-             ;;   - drop-hosted-monitors! would tear down the OTHER HALF
+             ;;   - taking the hosted chain would tear down the OTHER HALF
              ;;     of those same watches: the agents this node hosts for
              ;;     the peer. The watcher keeps its rmonitors entry and
              ;;     nothing re-arms it, so the watch would go on existing
@@ -4235,7 +4485,7 @@
              ;; whoever adds it.
              ;;
              ;; AND THE RESOURCE ARGUMENT DOES NOT SURVIVE EITHER.
-             ;; What drop-hosted-monitors! is for is a peer that
+             ;; What the hosted obligation is for is a peer that
              ;; connects, parks monitors and DROPS, over and over; that
              ;; path is remove-peer! and still calls it. Here the same
              ;; fact that makes the loss real -- nothing re-arms -- is
@@ -4253,34 +4503,42 @@
              ;; a hosted watch belongs to the connection it was armed on
              ;; or to the peer. Until that is decided, this path does
              ;; what it did before generations existed.
-             ;; THE WALK GOES FIRST, AND THE ORDER IS LOAD-BEARING.
-             ;; After the region, root is the only thing that can lead a
-             ;; SWEEP to the captured chain: the records are still on the
-             ;; global chain and still in callee-agents -- which is how
-             ;; the reaper collects one whose agent happens to die -- but
-             ;; nothing else will ever send them demon-local. stop-link!
-             ;; sends, and a send allocates: a raise there unwinds past
-             ;; root and leaves those agents running with no path that
-             ;; ends them.
+             ;; THE ORDER IS NO LONGER LOAD-BEARING HERE, and this
+             ;; paragraph used to argue that it was. It said root was the
+             ;; only thing that could lead a sweep to the captured chain,
+             ;; so a raise out of stop-link! would unwind past it and leave
+             ;; those agents running with nothing to end them. Both halves
+             ;; are now false: the chain hangs off a PUBLISHED record, and
+             ;; the stop is an obligation on that record rather than a call
+             ;; made here. A raise leaves the record holding both.
              ;;
-             ;; AND A KILL BETWEEN THE REGION AND HERE DOES THE SAME.
-             ;; Interrupts are back on the moment the region ends, and a
-             ;; killed process's continuation is dropped, so this
-             ;; ordering shortens the exposure and does not remove it.
-             ;; Recorded rather than repaired: making the handoff
-             ;; kill-safe means the captured chain has to live somewhere
-             ;; other than a stack slot, which is a lifetime-management
-             ;; surface wider than the window it would close. The same
-             ;; hazard existed at the exit of the old splice
-             ;; transaction.
+             ;; A KILL BETWEEN THE REGION AND HERE NO LONGER LOSES THE
+             ;; CHAIN, and this paragraph used to say the opposite. The
+             ;; captured chain now lives on the published cleanup record,
+             ;; not in a stack slot: the record is reachable from a global
+             ;; root, so a process killed here leaves the hosted agents
+             ;; owed by something the link reaper will find. The
+             ;; lifetime-management surface this note weighed against the
+             ;; window is exactly what the record is.
              ;; Unconditional: for a same-incarnation replacement the
              ;; region captured nothing, root is empty, and this is a
              ;; no-op. The condition that used to be here now lives at
              ;; the capture, where it belongs -- deciding what to take is
              ;; the transaction's business, not the walker's.
-             (drop-hosted-monitors! root)
-             (stop-link! (entry-conn old) (entry-link old) 'replaced)
-             (fail-pending-for! name)
+             ;; ONE EXECUTOR REPLACES THE THREE SWEEPS. The hosted walk, the old
+             ;; link's stop and the old connection's pending calls are all
+             ;; obligations on the record now, discharged notify-first, so this
+             ;; process dying part way leaves them for the reaper instead of
+             ;; losing them. close? finds the in-region close already done and
+             ;; retires on an idempotent redo.
+             ;;
+             ;; The MONITOR collection is deliberately not here: a replacement
+             ;; keeps the peer's watches, and the new entry inherited the same
+             ;; mons object. Only what belonged to the CONNECTION goes.
+             (inject-barrier! 'cleanup-before-hint)
+             (let ((lr (whereis link-reaper-name)))
+               (when lr (send lr (vector 'cleanup-published))))
+             (execute-cleanup! crec 'unbounded)
              (dispatch-wake!)
              'replaced)
             ((installed) (dispatch-wake!) 'installed)
@@ -5113,31 +5371,238 @@
   ;; a happy-path cell that sweeps many monitors and checks they are all
   ;; stopped; it guards this loop against ordinary mistakes and is not
   ;; coverage of the race. Do not read its green as though it were.
-  (define (drop-hosted-monitors! root)
-    ;; (R0): the one allocation, and it is out here where a failure has
-    ;; changed nothing.
-    ;; ROOT ARRIVES CAPTURED. The caller took this peer's chain off
-    ;; mon-heads and hung it under root inside its OWN atomic transaction,
-    ;; the same one that published the new entry or removed the old one.
-    ;; This function does not read mon-heads and must not: doing the
-    ;; capture here would put it in a second transaction, and between the
-    ;; two a new incarnation could file an arm under a head this walk
-    ;; would then take away.
-    ;; A root with nothing under it is the ordinary case for a
-    ;; same-incarnation replacement; the walk is then a no-op.
-    (let loop ()
-      (let ((r #f))
-        (atomically
-          (set! r (agent-pnext root))
-          (when r
-            (let ((n (agent-pnext r)))
-              (agent-pnext-set! root n)
-              (when n (agent-pprev-set! n root))
-              (agent-pnext-set! r #f)
-              (agent-pprev-set! r #f))))
-        (when r
-          (send (agent-pid r) (vector 'demon-local))
-          (loop)))))
+  ;; ---- discharging a cleanup record ---------------------------------------
+  ;;
+  ;; NOTIFY FIRST, RETIRE AFTER, ONE OBLIGATION PER REGION. `send` allocates a
+  ;; message, so it is the only step here that can raise; running it before any
+  ;; mutation means a raise leaves the obligation exactly as it was and a retry
+  ;; re-does it, while the mutations that follow a successful send cannot fail.
+  ;; The reverse order -- delete the slot, then send -- is what the old paths
+  ;; did, and it loses the notification outright when the sender dies in
+  ;; between: the slot is gone, so nothing remembers anybody was owed an
+  ;; answer.
+  ;;
+  ;; TWO EXECUTORS ON ONE RECORD CANNOT BOTH NOTIFY. Each obligation is taken
+  ;; from the head of its collection inside the region that discharges it, so
+  ;; the second executor finds it already unlinked.
+  ;;
+      ;; A STALE SLOT IS RETIRED SILENTLY. Stale means the key no longer holds
+      ;; THIS object.
+      ;;
+      ;; THIS IS DEFENSIVE VALIDATION, NOT A RACE FIX, and two earlier versions
+      ;; of this note invented a mechanism to justify it. The ordinary paths do
+      ;; not produce the state: each deletes the row and unlinks the slot in one
+      ;; region, so a completed call leaves no node here to find. Refs are minted
+      ;; by this node's counter and never repeat in one VM, and a later arming
+      ;; gets a fresh one. What reaches this branch today is the
+      ;; $node-stale-chain-node! fixture, which removes a row and leaves the node
+      ;; so the branch can be exercised at all.
+  (define (cleanup-step-pend! col)
+    (atomically
+      (let ((slot (collection-head col)))
+        (and slot
+             (let ((ref (pend-slot-key slot)))
+               ;; THE OUTCOME IS RETURNED, NOT ANNOUNCED HERE. The
+               ;; observation point for a stale retirement has to sit at an
+               ;; actor boundary -- fired inside this region it would be
+               ;; recorded as skipped and could never park a cell -- so the
+               ;; caller raises it outside.
+               (if (not (eq? (hashtable-ref pending ref #f) slot))
+                   (begin (pend-unlink! slot) 'stale)
+                   (begin
+                     (inject-fault! 'cleanup-send-reply)
+                     (send (vector-ref slot 0)
+                           (vector 'rcall-reply ref (list 'error 'noconnection)))
+                     (hashtable-delete! pending ref)
+                     (pend-unlink! slot)
+                     'done)))))))
+
+  ;; TWO INDEPENDENTLY DURABLE STEPS, and the split is what makes a raise
+  ;; between them harmless. Step 1 stops the owner agent and drops its row;
+  ;; step 2 tells the watcher. If step 2 raises after step 1 succeeded, the
+  ;; owner-agents row is already gone and the slot is still linked, so the
+  ;; retry finds no agent (skipping step 1, no second owner-stop) and re-sends
+  ;; step 2. Neither a replayed stop nor a lost remote-down.
+  (define (cleanup-step-mon! r col)
+    (atomically
+      (let ((slot (collection-head col)))
+        (and slot
+             (let ((mref (rmon-slot-key slot)))
+               ;; outcome returned for the same reason as the pending step
+               (if (not (eq? (hashtable-ref rmonitors mref #f) slot))
+                   (begin (rmon-unlink! slot) 'stale)
+                   (begin
+                     (let ((a (hashtable-ref owner-agents mref #f)))
+                       (when a
+                         (inject-fault! 'cleanup-send-owner-stop)
+                         (send a (vector 'owner-stop))
+                         (hashtable-delete! owner-agents mref)))
+                     (inject-fault! 'cleanup-send-remote-down)
+                     (send (vector-ref slot 0)
+                           (vector 'remote-down (vector-ref slot 1)
+                                   (vector-ref slot 2) 'noconnection))
+                     (hashtable-delete! rmonitors mref)
+                     (rmon-unlink! slot)
+                     'done)))))))
+
+      ;; THE SEND IS INSIDE THE REGION THAT UNLINKS. The walk this replaced did
+      ;; the opposite -- unlink under exclusion, send outside -- and a kill or a
+      ;; raising send between the two lost that notification there as well; an
+      ;; earlier version of this note called that arrangement safe, which it was
+      ;; not. Sending first is what makes the two steps inseparable.
+  ;;
+  ;; This touches neither the global monitor chain nor active-monitors: the
+  ;; permit comes back through the agent reaper's identity-checked
+  ;; retire-agent-of-pid!, exactly as it does today.
+  (define (cleanup-step-hosted! root)
+    (atomically
+      (let ((a (agent-pnext root)))
+        (and a
+             (begin
+               (send (agent-pid a) (vector 'demon-local))
+               (let ((n (agent-pnext a)))
+                 (agent-pnext-set! root n)
+                 (when n (agent-pprev-set! n root))
+                 (agent-pnext-set! a #f)
+                 (agent-pprev-set! a #f))
+               #t)))))
+
+  (define (crec-finished? r)
+    (and (let ((m (crec-mons r)))  (or (not m) (not (collection-head m))))
+         (let ((p (crec-pends r))) (or (not p) (not (collection-head p))))
+         (let ((h (crec-hosted-root r))) (or (not h) (not (agent-pnext h))))
+         (not (crec-close? r))
+         (not (crec-stop? r))))
+
+  ;; `rounds` is a count, or 'unbounded. The link reaper's DOWN handler passes
+  ;; 1 so that one dead link cannot hold the reaper while its record is worked
+  ;; off; the rescan comes back for the rest. The transaction's own caller
+  ;; passes 'unbounded, because it has nothing else to do and finishing here is
+  ;; the fast path.
+  ;;
+  ;; -> whether the record is finished.
+  (define (execute-cleanup! r rounds)
+    (inject-barrier! 'cleanup-after-publish)
+    (let loop ((left rounds))
+      (inject-barrier! 'cleanup-before-round)
+      ;; AT MOST K PER ROUND, AND K COUNTS EVERY OBLIGATION, CONTROL ONES
+      ;; INCLUDED. Budgeting only the collection steps and doing close and stop
+      ;; unconditionally made a round worth K+2, and the two left out are the ones
+      ;; that enter the tls/uv layer.
+      ;;
+      ;; What K bounds is the work ONE ROUND does. It is not the interval before
+      ;; this process can be preempted -- each obligation leaves its own region,
+      ;; so preemption is already possible after the first -- and it is not a
+      ;; bound on the whole call: `rounds` may ask for several. The reaper's
+      ;; bounded callers pass 1.
+      ;; EVERY OBLIGATION RUNS UNDER A GUARD, AND A RAISE ENDS THE ROUND.
+      ;; The durability argument said a raise leaves the obligation intact for
+      ;; a retry -- true, and useless on its own, because it says nothing
+      ;; about anyone being left to retry it. Unguarded, an obligation that
+      ;; raised took the executor with it; when the executor was the link
+      ;; reaper the warden restarted it into the same record, five times, and
+      ;; then gave up and brought the node down. Safety was proved and
+      ;; liveness was not, which is the shape of the whole failure.
+      ;;
+      ;; THE ROUND ENDS RATHER THAN MOVING ON. Skipping to the next
+      ;; obligation would put a permanently failing one straight back at the
+      ;; head of its collection on the following pass -- an executor that no
+      ;; longer dies but never progresses either, which under 'unbounded is a
+      ;; livelock rather than a crash. Ending the round leaves the record
+      ;; linked and unfinished for a later visit.
+      ;;
+      ;; WHAT THIS BUYS IS NOT PROGRESS ON A PERMANENTLY FAILING OBLIGATION.
+      ;; That one stays owed indefinitely either way; what changes is that the
+      ;; executor survives and each invocation terminates, instead of the
+      ;; executor dying and its supervisor giving up. Nor is "a period later" a
+      ;; guarantee: a hint or a competing executor can arrive sooner, a busy
+      ;; chain later.
+      ;;
+      ;; The obligation is NOT retired here: no flag is cleared and nothing is
+      ;; unlinked on this path. That is not the same as the next visit finding
+      ;; an identical state -- a monitor step that sent owner-stop and then
+      ;; raised on remote-down has already dropped the owner-agents row, which
+      ;; is exactly the two-step durability the retry depends on.
+      ;; ONE DECISION DRIVES BOTH THE BARRIER AND THE EFFECT. Two separate tests
+      ;; -- one for the barrier, one inside the selection -- could disagree: a
+      ;; slot removed between them let a control effect run with no barrier, and a
+      ;; flag cleared between them fired a barrier for a branch never chosen.
+      ;; Binding the kind once removes both.
+      ;;
+      ;; IT DOES NOT MAKE THE BARRIER MEAN THE EFFECT HAPPENED. Another executor
+      ;; can clear the flag after this one selected 'close, and the branch then
+      ;; returns #f having done nothing. The barrier marks a selected ATTEMPT --
+      ;; what a cell can park on -- not a completion.
+      ;;
+      ;; The kind names a KIND, not a slot. Each step re-reads its own head under
+      ;; exclusion, so another executor taking that head moves this one on to the
+      ;; next slot of the same kind; only an emptied collection, or a control flag
+      ;; already cleared, yields #f and ends the round.
+      (let ((next-kind
+              (lambda (r)
+                (cond ((let ((p (crec-pends r))) (and p (collection-head p))) 'pend)
+                      ((let ((m (crec-mons r))) (and m (collection-head m))) 'mon)
+                      ((let ((h (crec-hosted-root r))) (and h (agent-pnext h))) 'hosted)
+                      ((crec-close? r) 'close)
+                      ((crec-stop? r) 'stop)
+                      (else #f)))))
+      (let ((raised? #f))
+        (let round ((k cleanup-round-max))
+          (when (fx> k 0)
+            (let ((kind (next-kind r)))
+              ;; OUTSIDE THE GUARD. Fired inside it, a parker that raises would be
+              ;; swallowed as if the control effect had failed: the executor would
+              ;; report an obligation failure it never attempted. Instrumentation
+              ;; must not be able to masquerade as the thing it instruments.
+              (when (memq kind '(close stop))
+                (inject-barrier! 'cleanup-before-control))
+              (let ((did (guard (e (#t (set! raised? #t)
+                                       ;; unarmed this records nothing; it is here
+                                       ;; so a cell can park on the failure
+                                       (inject-barrier! 'cleanup-obligation-raised)
+                                       #f))
+                           (case kind
+                             ((pend) (cleanup-step-pend! (crec-pends r)))
+                             ((mon) (cleanup-step-mon! r (crec-mons r)))
+                             ((hosted) (cleanup-step-hosted! (crec-hosted-root r)))
+                             ;; THE EXECUTOR PERFORMS THESE OUTSIDE EVERY REGION --
+                             ;; a statement about here, not a prohibition: the
+                             ;; replacement transaction closes the old connection
+                             ;; INSIDE its own region on purpose, as the design
+                             ;; requires. This executor has no reason to hold
+                             ;; exclusion across a call into the tls/uv layer, and
+                             ;; both calls can raise, which is why the guard covers
+                             ;; them too. Both effects are idempotent, so an
+                             ;; executor that dies between the effect and retiring
+                             ;; the flag costs one harmless redo.
+                             ((close)
+                              (and (crec-close? r)
+                                   (begin (tcp-close! (crec-conn r))
+                                          (atomically (crec-close?-set! r #f))
+                                          'done)))
+                             ((stop)
+                              (and (crec-stop? r)
+                                   (begin (stop-link! (crec-conn r) (crec-link r) 'replaced)
+                                          (atomically (crec-stop?-set! r #f))
+                                          'done)))
+                       (else #f)))))
+                         ;; OUTSIDE THE STEP'S REGION, so it is a real actor boundary a cell
+                         ;; can park on rather than a hit recorded as skipped.
+                         (when (eq? did 'stale) (inject-barrier! 'cleanup-stale-retired))
+                         (when did (round (fx- k 1)))))))
+        (if raised?
+            ;; unfinished, whatever `rounds` said: the record stays on the chain
+            ;; and the next rescan comes back to it
+                #f
+            (let ((done?
+                    (atomically
+                      (and (crec-finished? r)
+                           (begin (when (crec-linked? r) (crec-unlink! r)) #t)))))
+              (cond
+                (done? (inject-barrier! 'cleanup-record-finished) #t)
+                ((eq? left 'unbounded) (loop 'unbounded))
+                ((fx> left 1) (loop (fx- left 1)))
+                (else #f))))))))
 
   ;; A REAL DEATH, and the queue has to outlive the entry it hangs on.
   ;; The entry goes in the same region that queues this peer's own
@@ -5146,10 +5611,28 @@
   ;; about. The head therefore moves to the orphan chain, and onto the
   ;; ready chain in the same region, so the dispatcher finds it with no
   ;; entry to reach it through; it leaves both chains when it empties.
-  (define (remove-peer! name c)
+  ;; `rounds` says how much of the record this caller works off before
+  ;; returning: 'unbounded for a link guard or the accept judge, which have
+  ;; nothing else to do, and 1 for the link reaper, which must not let one
+  ;; dead link hold it while a large record is discharged. Whatever is left
+  ;; stays on the chain for the rescan.
+  (define remove-peer!
+    (case-lambda
+      ((name c) (remove-peer!/rounds name c 'unbounded))
+      ((name c rounds) (remove-peer!/rounds name c rounds))))
+
+  (define (remove-peer!/rounds name c rounds)
     (let* ((node (make-qnode (make-event 'node-down name) #f '() 0))  ; (R0): outside
            ;; (R0) The sweep's anchor, as on the replacement path.
            (root (make-agent-rec #f #f #f #f #f))
+           ;; (R0) AND THE RECORD, BUILT OUT HERE FOR THE SAME REASON. It has
+           ;; to exist before the region so that publishing it inside costs
+           ;; nothing but pointer writes: an allocation after the entry is
+           ;; deleted could raise, and the obligations would then have no
+           ;; owner at all. close? is this path's old (tcp-close! c), which is
+           ;; now an obligation rather than something this process does on its
+           ;; own account.
+           (crec (make-crec 'removal name c #f #t #f))
            (cut #f)
            (mine?
              (atomically
@@ -5185,13 +5668,48 @@
                           (when h
                             (agent-pnext-set! root h)
                             (agent-pprev-set! h root)))
+                        ;; THE OBLIGATIONS MOVE ONTO THE RECORD, AND THE RECORD
+                        ;; GOES ON THE CHAIN -- pointer writes only, in the same
+                        ;; transaction that deleted the entry. From here the set
+                        ;; of people owed an answer is reachable from a global
+                        ;; root, so this process dying next costs nothing but
+                        ;; latency: the link reaper finds the record and pays
+                        ;; them.
+                        ;;
+                        ;; Taking the collections OFF the entry is what makes
+                        ;; the transfer exclusive. A slot can be linked into a
+                        ;; live entry's collection or into a record's, never
+                        ;; both, so no obligation is discharged twice and none
+                        ;; is dropped between the two.
+                        (crec-mons-set! crec (entry-mons e))
+                        (crec-pends-set! crec (entry-pends e))
+                        (crec-hosted-root-set! crec root)
+                        (crec-link! crec)
                         #t))))))
-      (tcp-close! c)
+      ;; NOTHING IS DONE TO THE CONNECTION IN THE REGION. The close used to
+      ;; happen here unconditionally, before the mine? test, and it entered the
+      ;; tls layer from a caller that might not own this connection at all. It
+      ;; is now the record's close? obligation, performed by whoever executes
+      ;; the record and idempotent if performed twice.
       (when mine?
-        (drop-hosted-monitors! root)       ; free monitors this peer parked here
-        (fail-monitors-for! name)          ; DOWN(noconnection) for watchers
-        (fail-pending-for! name)           ; nothing will answer these now
+        ;; INJECTION POINT 'cleanup-before-hint -- OWNING REGION: none, the
+        ;; actor boundary between publishing the record and telling the reaper
+        ;; it exists. A cell parks here to prove the reaper finds the record
+        ;; without the hint.
+        (inject-barrier! 'cleanup-before-hint)
+        (let ((lr (whereis link-reaper-name)))
+          (when lr (send lr (vector 'cleanup-published))))
+        ;; UNBOUNDED unless the caller says otherwise: it has nothing else to
+        ;; do and finishing here is the fast path. A death part way leaves the
+        ;; rest on the chain.
+        (execute-cleanup! crec rounds)
         (dispatch-wake!))
+      ;; A LOSING CALLER STILL CLOSES. It did not remove this entry, so it
+      ;; publishes no record of its own; a replacement may already have
+      ;; published one covering exactly this connection, in which case the
+      ;; close happens twice and is idempotent. Skipping it on the strength of
+      ;; a record that may not exist is the failure worth avoiding.
+      (unless mine? (tcp-close! c))
       ;; RETURNED EXPLICITLY. The value used to fall out of whichever form
       ;; happened to end the body -- an accident, not a contract. The link
       ;; reaper depends on it to tell "I removed this entry" from "somebody
@@ -5207,21 +5725,6 @@
   ;; timeout for an answer that cannot come; the caller sees the same
   ;; rcall-error it would have seen, only sooner. The message is harmless
   ;; to a caller that has already moved on, whose ref can never match again.
-  (define (fail-pending-for! name)
-    (let ((doomed
-            (atomically
-              (let ((ks (hashtable-keys pending)) (acc '()))
-                (do ((i 0 (fx+ i 1))) ((fx= i (vector-length ks)) acc)
-                  (let* ((ref (vector-ref ks i))
-                         (slot (hashtable-ref pending ref #f)))
-                    (when (and slot (eq? (vector-ref slot 1) name))
-                      (hashtable-delete! pending ref)
-                      (set! acc (cons (cons ref (vector-ref slot 0)) acc)))))))))
-      (for-each
-        (lambda (p)
-          (send (cdr p) (vector 'rcall-reply (car p) (list 'error 'noconnection))))
-        doomed)))
-
   ;; ---- the link reaper ------------------------------------------------------
   ;;
   ;; A LINK PROCESS THAT DIES WITHOUT UNWINDING LEAVES ITS PEER ENTRY BEHIND.
@@ -5266,6 +5769,23 @@
           (monitor pid)))
       ;; A SNAPSHOT, taken under exclusion and walked outside it: enrolling
       ;; touches the mailbox and must not run inside the region.
+      ;; A FINITE SNAPSHOT, TAKEN UNDER EXCLUSION AND WALKED OUTSIDE IT. No
+      ;; cursor is kept on the live chain: a record can be retired by its own
+      ;; executor while this walk is in progress, and a cursor into it would
+      ;; then be following pointers out of a detached node.
+      ;;
+      ;; Each element is re-checked for membership before it is worked on, so a
+      ;; record finished in the meantime is skipped rather than re-executed.
+      (define (rescan-cleanup!)
+        (let ((rs (atomically
+                    (let loop ((r cleanup-chain) (acc '()))
+                      (if r (loop (crec-gnext r) (cons r acc)) acc)))))
+          (for-each
+            (lambda (r)
+              (when (atomically (crec-linked? r))
+                (inject-barrier! 'link-reaper-before-cleanup-round)
+                (execute-cleanup! r 1)))
+            rs)))
       (define (rescan!)
         (let-values (((names entries) (atomically (hashtable-entries peers))))
           (let loop ((i 0))
@@ -5285,7 +5805,10 @@
           (when row
             (hashtable-delete! watched pid)
             (inject-barrier! 'link-reaper-before-remove)
-            (let ((mine? (remove-peer! (car row) (cdr row))))
+            ;; ONE ROUND. The rest of the record is left on the chain and
+            ;; finished by the rescan below, so a peer that parked a large
+            ;; number of watches cannot hold the reaper while they are paid.
+            (let ((mine? (remove-peer! (car row) (cdr row) 1)))
               (if mine?
                   (inject-barrier! 'link-reaper-reclaimed-mine)
                   (inject-barrier! 'link-reaper-reclaimed-stale))))))
@@ -5293,6 +5816,18 @@
       (inject-barrier! 'warden-child-before-register)
       (register link-reaper-name self)
       (rescan!)
+      ;; AND THE CLEANUP CHAIN, BEFORE THE FIRST DEADLINE. The scan above enrols
+      ;; LINKS; it does not execute records, and a record is detached from the
+      ;; peers table by construction -- for a removal the peer is gone, for a
+      ;; replacement the peer is present but the record belongs to the connection
+      ;; it replaced. Either way that scan does not reach it.
+      ;;
+      ;; What this call removes is a DEPENDENCE, not a fixed delay: without it a
+      ;; restarted reaper reaches an existing record only if a publisher happens
+      ;; to send a hint afterwards, or another executor happens to discharge it,
+      ;; or the next periodic scan comes round. With it, none of those has to
+      ;; happen.
+      (rescan-cleanup!)
       ;; AN ABSOLUTE DEADLINE, AND THE NEXT ONE IS SET FROM THE SCAN'S
       ;; COMPLETION. A period measured from the scan's START lets a scan that
       ;; overruns its period leave no time for the mailbox at all, so hints and
@@ -5315,10 +5850,16 @@
           (if (<= remaining 0)
               (begin
                 (rescan!)
+                (rescan-cleanup!)
                 (inject-barrier! 'link-reaper-rescanned)
                 (loop (+ (now-ms) scan-ms)))
               (receive (after remaining (loop next-scan))
                 (`#(watch-link ,name ,c ,pid) (enrol! name c pid) (loop next-scan))
+                ;; A HINT ONLY: it says a record was published, so the chain is
+                ;; worth a look before the next deadline. Losing it costs
+                ;; latency, never correctness -- the periodic rescan finds
+                ;; every record regardless.
+                (`#(cleanup-published) (rescan-cleanup!) (loop next-scan))
                 (`#(DOWN ,pid ,reason) (reclaim! pid) (loop next-scan))
                 (`#(node-stop) (void))))))))
 
@@ -5470,12 +6011,16 @@
          ;; global table forever, pinning a dead PCB and a node name. A ref
          ;; is answered at most once, so removing it as the reply is routed
          ;; is correct for a live caller too: it has the message by then.
-         (let ((slot (atomically
-                       (let ((v (hashtable-ref pending ref #f)))
-                         (when v (hashtable-delete! pending ref))
-                         v))))
-           (when (and slot (eq? (vector-ref slot 1) peer))
-             (send (vector-ref slot 0) (vector 'rcall-reply ref result))))))
+         ;; ONE REGION, SEND FIRST, RETIRE AFTER -- the same discipline the
+         ;; cleanup executor uses, and for the same reason: this process can
+         ;; die between taking the slot and delivering the reply, and the slot
+         ;; is the only record that anybody was owed one.
+         (atomically
+           (let ((slot (hashtable-ref pending ref #f)))
+             (when (and slot (eq? (vector-ref slot 1) peer))
+               (send (vector-ref slot 0) (vector 'rcall-reply ref result))
+               (hashtable-delete! pending ref)
+               (pend-unlink! slot))))))
       ;; (mon ,name ,mref) -> watch our local reg-name for the peer at the
       ;; far end of this link. The watcher node is `peer` (the identity
       ;; the handshake authenticated), NOT a field in the frame: a node
@@ -5877,7 +6422,7 @@
        ;; frame is dispatched, and a superseded link still serves what it
        ;; has buffered. Keyed on the connection, this dropped a notice
        ;; from the peer we are still talking to -- and the replacement
-       ;; path deliberately does not run fail-monitors-for!, so nothing
+       ;; path deliberately does not end the monitor lifetime, so nothing
        ;; else ever reported that death. The watch stayed armed forever.
        ;;
        ;; Unlike its mirror, this one IS atomic: the test and the lookup
@@ -6016,7 +6561,7 @@
   ;; follows. A link that cannot carry its own control traffic is not
   ;; serving anyone, and dropping it is what turns an unbounded wait into
   ;; the answer the far end already knows how to produce -- its own
-  ;; fail-monitors-for! synthesizes noconnection for every watch that
+  ;; the cleanup record synthesizes noconnection for every watch that
   ;; crossed the link.
   ;;
   ;; TAKES AN ALREADY-MATERIALIZED FRAME, not a datum. That is what
@@ -6317,7 +6862,7 @@
   ;; here can carry the DOWN any further; and the watcher has no timeout
   ;; of its own, so a lost frame would leave it waiting on an answer that
   ;; is not coming. Taking the link down instead hands the far end a
-  ;; question it already knows how to answer: its own fail-monitors-for!
+  ;; question it already knows how to answer: its own removal record
   ;; synthesizes noconnection for every watch that crossed that link,
   ;; this one included. The demon frame in remove-target-watch! is the
   ;; same case and takes the same route. See link-write/critical for the
@@ -6330,7 +6875,7 @@
   ;; A CONNECTION-KEYED GATE WAS TRIED HERE AND REMOVED. It carried
   ;; the connection the agent was armed on and wrote only while that
   ;; connection was still current. The argument for dropping the notice
-  ;; otherwise was that the watcher's own fail-monitors-for! had already
+  ;; otherwise was that the watcher's own removal record had already
   ;; told the far side -- TRUE ON THE DEATH PATH AND FALSE ON THE
   ;; REPLACEMENT PATH, where that sweep deliberately does not run. On a
   ;; replacement the gate was therefore not narrow but total: the
@@ -6431,14 +6976,6 @@
                 (demonitor m)
                 (void)))))))
 
-  (define (stop-owner-agent! mref)
-    (let ((agent (atomically
-                   (let ((a (hashtable-ref owner-agents mref #f)))
-                     (when a (hashtable-delete! owner-agents mref))
-                     a))))
-      (when (and agent (process-alive? agent))
-        (send agent (vector 'owner-stop)))))
-
   (define (remove-target-watch! mref entry)
     (let ((node (vector-ref entry 1)))
       (if (eq? node self-name)
@@ -6462,10 +6999,14 @@
     (let ((m (monitor caller)))
       (receive
         (`#(DOWN ,@caller ,_)
-          (atomically (hashtable-delete! owner-agents mref))
+          ;; one region: the agent's own row and the slot go together, and the
+          ;; slot leaves its collection with them
           (let ((entry (atomically
+                         (hashtable-delete! owner-agents mref)
                          (let ((e (hashtable-ref rmonitors mref #f)))
-                           (when e (hashtable-delete! rmonitors mref))
+                           (when e
+                             (hashtable-delete! rmonitors mref)
+                             (rmon-unlink! e))
                            e))))
             (when entry (remove-target-watch! mref entry))))
         (`#(owner-stop) (demonitor m)))))
@@ -6500,7 +7041,24 @@
   ;; cannot grow a table, and killing a process nothing is watching yet
   ;; sends nothing -- see undo-install-of-pid! for why that is a structural fact
   ;; here and not a claim about timing.
+  ;; THIS ONE IS NOT NOTIFY-THEN-RETIRE, AND DOES NOT NEED TO BE. The other
+  ;; retirement paths SEND the owner agent a message, so they must send before
+  ;; dropping the row or a death in between strands it. This path KILLS, and a
+  ;; killed process needs nobody to come back for it, so order cannot strand
+  ;; anything here. What the code below does owe is the UNLINK, and this is
+  ;; NOT tidiness -- an earlier version of this note called it that, which is
+  ;; wrong in the direction that invites someone to drop it.
+  ;;
+  ;; The collection this slot sits on belongs to a LIVE entry, not to a
+  ;; cleanup record, and nothing sweeps a live entry's collection: a record is
+  ;; what walks one, and a record is made only when the connection ends. A
+  ;; slot left linked here therefore stays for the life of the monitor
+  ;; lifetime, holding its caller with it, and repeated failed armings
+  ;; accumulate without bound. The stale-retirement argument that covers a
+  ;; detached collection does not reach this one.
   (define (undo-remote-arm! mref oa sa)          ; caller holds the region
+    (let ((slot (hashtable-ref rmonitors mref #f)))
+      (when slot (rmon-unlink! slot)))
     (hashtable-delete! rmonitors mref)
     (hashtable-delete! owner-agents mref)
     (hashtable-delete! caller-agents mref)
@@ -6524,27 +7082,62 @@
   ;; about the bookkeeping. Every reading this node has is local, which
   ;; means a residue that lands on the peer looks, from here, exactly
   ;; like nothing happening.
-  (define (arm-rmonitor! mref node name)
+  ;; ADMISSION IS ON THE LIFETIME OBJECT, NOT ON PRESENCE. Between selecting
+  ;; the entry and arming here, the peer can be removed and a fresh one
+  ;; installed: presence would accept that, and the watch would be filed on
+  ;; the NEW peer's collection while the caller believes it is watching the
+  ;; one it selected.
+  ;;
+  ;; DO NOT WEAKEN THIS TO A PRESENCE TEST ON THE STRENGTH OF THE WRITE
+  ;; FAILING. An earlier version of this note said the submission to the old
+  ;; connection would fail and the undo would deliver a noconnection, so the
+  ;; caller was answered either way. That holds only once the old connection
+  ;; has actually closed, and a removal DEFERS its close: it publishes the
+  ;; record first and discharges close? afterwards. In between, the old
+  ;; connection is still open and the write can succeed -- leaving a watch
+  ;; armed on one peer's collection and submitted over another's connection,
+  ;; answered by nobody.
+  ;;
+  ;; `mons` is inherited across a REPLACEMENT and replaced by a removal,
+  ;; which is exactly the distinction wanted: a replacement admits, a
+  ;; removal-then-reinstall refuses.
+  ;;
+  ;; -> #t armed, #f refused (no slot written, nothing spawned). The caller
+  ;; answers a refusal, outside this region.
+  (define (arm-rmonitor! mref node name mons0)
     (atomically
-      (let ((caller self) (oa #f))
-        (guard (e (#t (undo-remote-arm! mref oa #f) (raise e)))
-          (hashtable-set! rmonitors mref (vector caller node name))
-          (set! oa (spawn (lambda () (owner-mon-agent caller mref))))
-          (hashtable-set! owner-agents mref oa)))))
+      (let ((e2 (hashtable-ref peers node #f)))
+        (and e2 (eq? (entry-mons e2) mons0)
+             (let ((caller self) (oa #f))
+               (guard (e (#t (undo-remote-arm! mref oa #f) (raise e)))
+                 (let ((slot (vector caller node name mons0 #f #f mref)))
+                   (hashtable-set! rmonitors mref slot)
+                   (rmon-link! mons0 slot))
+                 (set! oa (spawn (lambda () (owner-mon-agent caller mref))))
+                 (hashtable-set! owner-agents mref oa)
+                 #t))))))
 
   ;; watcher side: deliver #(remote-down node name reason) to the caller
   ;; that installed mref, once. Used for both a target-side mdown and a
   ;; link drop (which synthesizes 'noconnection).
+  ;; ONE REGION, SEND FIRST, RETIRE AFTER. This took the slot in one region,
+  ;; stopped the owner agent in a second and sent in a third; a death anywhere
+  ;; between them lost the DOWN with the only record of it owing already gone.
+  ;; The owner agent is told before its row goes, for the reason
+  ;; demonitor-remote gives.
   (define (fire-remote-down! mref reason)
-    (let ((entry (atomically
-                   (let ((e (hashtable-ref rmonitors mref #f)))
-                     (when e (hashtable-delete! rmonitors mref))
-                     e))))
-      (when entry
-        (stop-owner-agent! mref)
-        (send (vector-ref entry 0)
-              (vector 'remote-down (vector-ref entry 1) (vector-ref entry 2)
-                      reason)))))
+    (atomically
+      (let ((entry (hashtable-ref rmonitors mref #f)))
+        (when entry
+          (let ((a (hashtable-ref owner-agents mref #f)))
+            (when (and a (process-alive? a))
+              (send a (vector 'owner-stop))))
+          (hashtable-delete! owner-agents mref)
+          (send (vector-ref entry 0)
+                (vector 'remote-down (vector-ref entry 1) (vector-ref entry 2)
+                        reason))
+          (hashtable-delete! rmonitors mref)
+          (rmon-unlink! entry)))))
 
   ;; self-watch agent: same contract, but the target is local, so the
   ;; DOWN is delivered straight to the caller (no link involved).
@@ -6566,14 +7159,6 @@
   ;; every rmonitor watching a node whose link just dropped gets a
   ;; synthesized noconnection (the target may be alive or dead -- across
   ;; a broken link they're indistinguishable, as in Erlang)
-  (define (fail-monitors-for! node)
-    (let-values (((mrefs entries) (atomically (hashtable-entries rmonitors))))
-      (vector-for-each
-        (lambda (mref e)
-          (when (eq? (vector-ref e 1) node)
-            (fire-remote-down! mref 'noconnection)))
-        mrefs entries)))
-
   (define (link-loop c peer boot-id buf last-seen)
     ;; INJECTION POINT 'link-loop-entry -- OWNING REGION: none, outside the
     ;; receive. Interrupt state: ON -- depth 0, parks; OFF -- (void). Parks the
@@ -7393,7 +7978,37 @@
      ;; an error: it is what a cell sees before the first handshake completes
      ;; and after the entry is removed.
      (define ($node-link-pid peer)
-       (let ((e (peer-entry peer))) (and e (entry-link e)))))
+       (let ((e (peer-entry peer))) (and e (entry-link e))))
+     ;; THE IDENTITY OF THE MONITOR LIFETIME, as a value a cell can compare
+     ;; across a transition. A replacement must hand the SAME object to the new
+     ;; entry and a removal must end it; neither fact is visible from outside
+     ;; without this, since the object is not exported and its contents say
+     ;; nothing about which one it is.
+     (define ($node-entry-mons-id peer)
+       (atomically
+         (let ((e (peer-entry peer)))
+           (and e
+                (let ((cell (eq-hashtable-cell mons-ids (entry-mons e) #f)))
+                  (or (cdr cell)
+                      (let ((n next-mons-id))
+                        (set! next-mons-id (fx+ n 1))
+                        (set-cdr! cell n)
+                        n)))))))
+     ;; LEAVE A CHAIN NODE WHOSE TABLE ROW IS GONE -- the state the executor
+     ;; calls stale and retires silently. It cannot be produced by using the
+     ;; library: every ordinary path deletes the row and unlinks the slot in
+     ;; one region, so a cell that wants to reach the stale branch has to be
+     ;; handed one.
+     ;;
+     ;; -> #t when a slot was taken, #f when the peer had none.
+     (define ($node-stale-chain-node! peer)
+       (atomically
+         (let ((e (peer-entry peer)))
+           (and e
+                (let ((slot (collection-head (entry-pends e))))
+                  (and slot
+                       (begin (hashtable-delete! pending (pend-slot-key slot))
+                              #t))))))))
     (else
      (define ($registrar-pid)
        (assertion-violation '$registrar-pid
@@ -7407,6 +8022,14 @@
          peer))
      (define ($node-link-pid peer)
        (assertion-violation '$node-link-pid
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"
+         peer))
+     (define ($node-entry-mons-id peer)
+       (assertion-violation '$node-entry-mons-id
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"
+         peer))
+     (define ($node-stale-chain-node! peer)
+       (assertion-violation '$node-stale-chain-node!
          "test seam: this artifact was expanded without IGROPYR_INJECT=on"
          peer))))
 
@@ -8393,26 +9016,65 @@
               (let* ((ref (next-rcall-ref!))
                      (segs (frame-segments
                              (list 'call reg-name ref msg timeout))))
-                (atomically (hashtable-set! pending ref (vector self node)))
+                ;; INJECTION POINT 'rcall-before-arm -- OWNING REGION: none,
+                ;; the actor boundary between selecting the entry and writing
+                ;; the slot against it.
+                (inject-barrier! 'rcall-before-arm)
+                ;; ADMISSION, RE-READ INSIDE THE ARMING REGION. The entry was
+                ;; selected outside; by here the connection can have been
+                ;; replaced or removed, and a slot written against the new one
+                ;; would be filed on the NEW connection's collection: the record
+                ;; this call's connection leaves behind does not own it, so this
+                ;; call is not answered when that connection ends. (The new
+                ;; entry's own removal would walk it later, which is a different
+                ;; call's lifetime, not this one's.) Identity of the CONNECTION
+                ;; is the test -- a
+                ;; replacement ends this call's connection even though the peer
+                ;; survives, so unlike a monitor it may not carry over.
+                ;;
+                ;; Refused means nothing written and nothing submitted, so the
+                ;; caller is answered the same way a peer with no link at all
+                ;; is answered.
+                (unless (atomically
+                          (let ((e2 (hashtable-ref peers node #f)))
+                            (and e2 (eq? (entry-conn e2) (entry-conn e))
+                                 (let ((slot (vector self node (entry-pends e2)
+                                                     #f #f ref)))
+                                   (hashtable-set! pending ref slot)
+                                   (pend-link! (entry-pends e2) slot)
+                                   #t))))
+                  (inject-barrier! 'admission-refused-stale-conn)
+                  (raise (vector 'rcall-error 'noconnection node)))
                 ;; A REFUSED SUBMISSION IS ANSWERED AS NO LINK. Nothing
                 ;; went out, so nothing will ever reply; waiting out the
                 ;; caller's whole timeout for an answer that cannot come
                 ;; is the hang this layer exists to avoid, and the reason
                 ;; is the one the no-link branch below already uses.
                 ;;
-                ;; ONLY IF THIS PROCESS STILL OWNS THE ENTRY. Between
-                ;; publishing and here, the link can drop and
-                ;; fail-pending-for! can remove the entry and deliver its
-                ;; own rcall-reply. Raising then would leave that message
-                ;; in this mailbox with no receive left to match it --
-                ;; the orphan this ordering was rebuilt to prevent. If
-                ;; the entry is already gone, someone else has TAKEN ON
-                ;; answering -- taken the entry atomically, and sends
-                ;; after -- so fall through and let the receive collect
-                ;; it. Taken on, not done: if that path then fails, no
-                ;; answer arrives from either side and this call waits
-                ;; out its timeout, which is the outcome it has anyway
-                ;; when a reply is lost.
+                ;; ONLY IF THIS SLOT IS STILL HERE. Between publishing and
+                ;; here the link can drop; a removal moves this connection's
+                ;; COLLECTION onto a cleanup record, and that record's
+                ;; executor answers from there. Raising unconditionally would
+                ;; leave that reply in this mailbox with no receive left to
+                ;; match it -- the orphan this ordering was rebuilt to
+                ;; prevent.
+                ;;
+                ;; PUBLISHING A RECORD DOES NOT REMOVE THE ROW, which is why the
+                ;; test is on the slot and not on the entry. The collection changes
+                ;; owner atomically; the row stays until somebody discharges it, so
+                ;; in between this process can still find its own row and take it
+                ;; here.
+                ;;
+                ;; THE TWO WINNERS ARE NOT SYMMETRIC, and an earlier version of this
+                ;; note said they were. A cleanup executor notifies AND retires in
+                ;; one region, because the process it answers is somebody else. This
+                ;; path answers ITSELF: it takes the row under exclusion and then
+                ;; raises outside the region, which is the right shape for a caller
+                ;; delivering its own answer through the stack rather than the
+                ;; mailbox -- but it is not the notify-then-retire ordering, and
+                ;; calling it that hid the difference. What both share is that the
+                ;; row is taken exactly once, so the loser finds nothing and stays
+                ;; quiet.
                 (let-values (((ok failure)
                               (write-body! (entry-conn e) segs)))
                   ;; BOTH FAILURES ANSWER THE SAME. A caller that has
@@ -8424,14 +9086,16 @@
                   (unless ok
                     (when (atomically
                             (let ((v (hashtable-ref pending ref #f)))
-                              (when v (hashtable-delete! pending ref))
+                              (when v
+                                (hashtable-delete! pending ref)
+                                (pend-unlink! v))
                               (and v #t)))
                       (raise (vector 'rcall-error 'noconnection node)))))
                 (receive (after timeout
-                            (atomically (hashtable-delete! pending ref))
+                            (atomically (pend-retire! ref))
                             (raise (vector 'rcall-error 'timeout reg-name)))
                   (`#(rcall-reply ,@ref ,result)
-                    (atomically (hashtable-delete! pending ref))
+                    (atomically (pend-retire! ref))
                     ;; a well-formed reply is (ok ,v) or (error ,reason);
                     ;; anything else is a broken peer, not a hang
                     (cond
@@ -8519,6 +9183,14 @@
          (atomically
            (let ((caller self) (oa #f) (sa #f))
              (guard (e (#t (undo-remote-arm! mref oa sa) (raise e)))
+               ;; LOCAL TARGET: THREE FIELDS, AND THE LENGTH IS THE SIGNAL.
+               ;; No peer entry is involved, so this slot belongs to no
+               ;; connection and is never chained. Giving it the long layout
+               ;; would make slot-chained? true for it and destroy the one
+               ;; cheap test that tells a chained slot from an unchained one --
+               ;; the guard would still be written, and would no longer guard
+               ;; anything. Nothing reads a key out of a local slot: every path
+               ;; that retires one already holds its mref.
                (hashtable-set! rmonitors mref (vector caller node name))
                (set! oa (spawn (lambda () (owner-mon-agent caller mref))))
                (hashtable-set! owner-agents mref oa)
@@ -8573,26 +9245,51 @@
               ;; outcome this API promises cannot happen. Disarm, then
               ;; deliver the DOWN this caller is owed.
               ;;
-              ;; ONLY IF THIS PROCESS STILL OWNS THE ENTRY -- if the link
-              ;; dropped in between, fail-monitors-for! has taken the
-              ;; entry and is on its way to delivering a noconnection of
-              ;; its own, and a second one would be a DOWN for a watch
-              ;; that has already ended. Taken, not necessarily
-              ;; delivered: the atomic step transfers who answers, not
-              ;; the answer itself.
+              ;; ONLY IF THIS SLOT IS STILL HERE -- if the link dropped in
+              ;; between, a removal moved this connection's collection onto a
+              ;; cleanup record, and that record's executor delivers the
+              ;; noconnection. A second one would be a DOWN for a watch that
+              ;; has already ended.
+              ;;
+              ;; The record does not take the ROW when it is published, only
+              ;; the collection; the row goes when an executor discharges it,
+              ;; and by then that executor has already sent, in the same
+              ;; region. So finding no row here does not mean the answer is
+              ;; merely owed by somebody else -- it means it was delivered.
               (let ((segs (frame-segments (list 'mon name mref))))
-                (arm-rmonitor! mref node name)
+                ;; INJECTION POINT 'mon-before-arm -- OWNING REGION: none, an
+                ;; actor boundary between selecting the entry and arming
+                ;; against it. That gap is what admission exists to police.
+                (inject-barrier! 'mon-before-arm)
+                (if (not (arm-rmonitor! mref node name (entry-mons e)))
+                    ;; REFUSED: the peer this watch was selected against is
+                    ;; gone -- removed, with or without something else since
+                    ;; installed under the name. No
+                    ;; slot was written and nothing was spawned, so the whole
+                    ;; answer is the DOWN this caller is owed.
+                    (begin
+                      (inject-barrier! 'admission-refused-stale-lifetime)
+                      (send self (vector 'remote-down node name 'noconnection)))
                 (let-values (((ok failure)
                               (write-body! (entry-conn e) segs)))
                  (unless ok
+                  ;; ONE REGION, SEND FIRST. Same rule as demonitor-remote: the
+                  ;; owner agent is told before its row goes, so a caller that
+                  ;; dies here cannot leave it running unreferenced. The slot
+                  ;; is unlinked with the row it belongs to.
                   (let ((entry (atomically
                                  (let ((x (hashtable-ref rmonitors mref #f)))
-                                   (when x (hashtable-delete! rmonitors mref))
+                                   (when x
+                                     (let ((a (hashtable-ref owner-agents mref #f)))
+                                       (when (and a (process-alive? a))
+                                         (send a (vector 'owner-stop))))
+                                     (hashtable-delete! owner-agents mref)
+                                     (hashtable-delete! rmonitors mref)
+                                     (rmon-unlink! x))
                                    x))))
                     (when entry
-                      (stop-owner-agent! mref)
                       (send self (vector 'remote-down node name
-                                         'noconnection)))))))))
+                                         'noconnection))))))))))
         (else
          ;; no link at all: report immediately, nothing to install
          (send self (vector 'remote-down node name 'noconnection))))
@@ -8600,14 +9297,31 @@
 
   ;; Cancel a monitor-remote. No further remote-down for it will arrive
   ;; (a DOWN already in flight may still be delivered, as in Erlang).
+  ;; ONE REGION, SEND FIRST, RETIRE AFTER. This used to take the slot in one
+  ;; region and stop the owner agent in a second: a canceller that died
+  ;; between them left the agent running with its row already gone, so nothing
+  ;; knew to stop it THROUGH THIS PATH. Not forever, and an earlier version of
+  ;; this note overstated it -- the agent monitors the original caller, so
+  ;; that caller's death still reaches its DOWN branch and ends it. What the
+  ;; gap cost was an agent outliving the watch it serves for as long as the
+  ;; caller lives, which is unbounded in the case that matters: a long-lived
+  ;; caller cancelling many watches. Taking the slot and telling the agent in
+  ;; the same region, send first, closes it.
+  ;;
+  ;; remove-target-watch!'s outbound `demon` frame stays OUTSIDE: it is a link
+  ;; write, not a local obligation, and it can block.
   (define (demonitor-remote mref)
     (let ((entry (atomically
                    (let ((e (hashtable-ref rmonitors mref #f)))
-                     (when e (hashtable-delete! rmonitors mref))
+                     (when e
+                       (let ((a (hashtable-ref owner-agents mref #f)))
+                         (when (and a (process-alive? a))
+                           (send a (vector 'owner-stop))))
+                       (hashtable-delete! owner-agents mref)
+                       (hashtable-delete! rmonitors mref)
+                       (rmon-unlink! e))
                      e))))
-      (when entry
-        (stop-owner-agent! mref)
-        (remove-target-watch! mref entry)))
+      (when entry (remove-target-watch! mref entry)))
     (void))
 
   ;; ---- load-time structural checks ------------------------------------

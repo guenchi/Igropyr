@@ -12,12 +12,20 @@
 ;;;   (plain-peer-close! peer)             ; close the socket (the node sees tcp-eof)
 ;;;   (plain-peer-alive? peer)
 ;;;   (plain-peer-closed? peer)           -> #t once the node closed the socket (tcp-eof/error seen)
+;;;   (plain-peer-count peer pred)        -> how many received frames satisfy pred (not drained)
 ;;;
 ;;; The peer keeps leftover bytes across reads: two frames coalesced in one
 ;;; tcp-data are both parsed.
+;;;
+;;; A QUERY THAT GETS NO ANSWER IS A FIXTURE FAILURE, NOT AN EMPTY RESULT. An
+;;; earlier version answered a query timeout with '() / #f, so a fixture that
+;;; had died made every "the peer never received X" assertion pass. Each query
+;;; carries a fresh tag and only its own answer is accepted, so a late answer
+;;; to an earlier query cannot be mistaken for this one's.
 (library (test plain-peer)
   (export plain-peer-open plain-peer-frames plain-peer-wait-frame plain-peer-send!
-          plain-peer-auto-reply! plain-peer-close! plain-peer-alive? plain-peer-pid plain-peer-closed?)
+          plain-peer-auto-reply! plain-peer-close! plain-peer-alive? plain-peer-pid plain-peer-closed?
+          plain-peer-count)
   (import (chezscheme) (igropyr actor)
           (only (igropyr tcp) tcp-connect! tcp-read-start! tcp-write! tcp-close!)
           (only (igropyr libuv) now-ms)
@@ -103,29 +111,33 @@
             (loop (append (reverse frames) got) rest auto closed?)))
         (`#(tcp-eof) (loop got acc auto #t))
         (`#(tcp-error ,e) (loop got acc auto #t))
-        (`#(frames ,who) (send who (vector 'frames (reverse got))) (loop '() acc auto closed?))
-        (`#(peek ,who) (send who (vector 'frames (reverse got))) (loop got acc auto closed?))
-        (`#(closed? ,who) (send who (vector 'closed closed?)) (loop got acc auto closed?))
+        (`#(frames ,who ,tag) (send who (vector 'answer tag (reverse got))) (loop '() acc auto closed?))
+        (`#(peek ,who ,tag) (send who (vector 'answer tag (reverse got))) (loop got acc auto closed?))
+        (`#(closed? ,who ,tag) (send who (vector 'answer tag closed?)) (loop got acc auto closed?))
         (`#(send-frame ,datum) (unless closed? (tcp-write! c (frame-bytes datum) #f)) (loop got acc auto closed?))
         (`#(auto-reply ,thunk) (loop got acc thunk closed?))
         (`#(close) (tcp-close! c)))))
 
-  (define (plain-peer-frames p)
-    (send (peer-pid p) (vector 'frames self))
-    (receive (after 2000 '()) (`#(frames ,fs) fs)))
+  ;; one query at a time per asking process; the tag pins the answer to it
+  (define query-seq 0)
+  (define (query! p op)
+    (set! query-seq (+ query-seq 1))
+    (let ((tag query-seq))
+      (send (peer-pid p) (vector op self tag))
+      (receive (after 2000 (error 'plain-peer "fixture unresponsive" op (process-id (peer-pid p))))
+        (`#(answer ,@tag ,v) v))))
+  (define (plain-peer-frames p) (query! p 'frames))
   (define (plain-peer-wait-frame p pred ms)
     (let ((deadline (+ (now-ms) ms)))
       (let loop ()
-        (send (peer-pid p) (vector 'peek self))
-        (let ((fs (receive (after 2000 '()) (`#(frames ,fs) fs))))
+        (let ((fs (query! p 'peek)))
           (cond ((find pred fs) => (lambda (f) f))
                 ((> (now-ms) deadline) #f)
                 (else (sleep-ms 30) (loop)))))))
+  (define (plain-peer-count p pred) (length (filter pred (query! p 'peek))))
   (define (plain-peer-send! p datum) (send (peer-pid p) (vector 'send-frame datum)))
   (define (plain-peer-auto-reply! p thunk) (send (peer-pid p) (vector 'auto-reply thunk)))
   (define (plain-peer-close! p) (send (peer-pid p) (vector 'close)))
   (define (plain-peer-alive? p) (process-alive? (peer-pid p)))
-  (define (plain-peer-closed? p)
-    (send (peer-pid p) (vector 'closed? self))
-    (receive (after 2000 #f) (`#(closed ,c) c)))
+  (define (plain-peer-closed? p) (query! p 'closed?))
 )

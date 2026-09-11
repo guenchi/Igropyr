@@ -14,7 +14,9 @@
 ;;   N5  admission: a call selected before the entry was removed is refused at
 ;;       the arming fence (counted, no slot); a monitor selected before a
 ;;       same-incarnation replacement is ARMED (lifetime inherited) and then
-;;       fails on submission over the closed old conn (existing semantics).
+;;       fails on submission over the closed old conn (existing semantics);
+;;       a call selected before a same-incarnation replacement is refused --
+;;       the entry is present but holds another connection (conn identity).
 ;;   N6  the F7(a) race: a removal parked right after publishing its record; a
 ;;       same-name replacement registers a monitor and a call; on resume the old
 ;;       record sweeps only its own chain nodes.
@@ -53,7 +55,15 @@
            (let ((m (monitor-remote 'b name)))
              (send main (vector 'mon-outcome m))
              (let loop () (receive (`#(remote-down ,node ,nm ,reason) (send main (vector 'remote-down node nm reason)) (loop))))))))
-(define (spawn-caller! tag main) (spawn (lambda () (send main (vector 'call-outcome tag (guard (e (#t e)) (rcall 'b 'svc (list 'q tag) 20000)))))))
+;; callers report once and then stay alive forwarding any later message as #(stray tag m)
+(define live-callers '())
+(define (spawn-caller! tag main)
+  (let ((p (spawn (lambda ()
+                    (send main (vector 'call-outcome tag (guard (e (#t e)) (rcall 'b 'svc (list 'q tag) 20000))))
+                    (let fwd () (receive (m (send main (vector 'stray tag m)) (fwd))))))))
+    (set! live-callers (cons p live-callers))
+    p))
+(define (end-callers!) (for-each (lambda (p) (kill p 'cell-done)) live-callers) (set! live-callers '()))
 (define (call-outcome! label tag ms pred)
   (receive (after ms (check label #f 'no-outcome))
     (`#(call-outcome ,@tag ,r) (check label (pred r) r))))
@@ -62,7 +72,9 @@
   (receive (after ms (check label #f 'no-remote-down))
     (`#(remote-down b ,@name ,reason) (check label (pred reason) reason))))
 (define (quiet-remote-down! label name ms)
-  (receive (after ms (check label #t)) (`#(remote-down b ,@name ,reason) (check label #f (list 'extra reason)))))
+  (receive (after ms (check label #t))
+    (`#(remote-down b ,@name ,reason) (check label #f (list 'extra reason)))
+    (`#(stray ,tag ,m) (check label #f (list 'stray tag m)))))
 
 (start-scheduler
   (lambda ()
@@ -80,12 +92,17 @@
               (m1 (monitor-remote 'b 'svc1)))
           (check "N1a: the peer received the call frame" (and (plain-peer-wait-frame b1 (lambda (d) (and (pair? d) (eq? (car d) 'call))) 3000) #t))
           (check "N1a: the peer received the mon frame" (and (plain-peer-wait-frame b1 (lambda (d) (and (pair? d) (eq? (car d) 'mon))) 3000) #t))
-          (let ((link1 ($node-link-pid 'b)))
+          (let ((link1 ($node-link-pid 'b)) (r0 (whereis 'igropyr-node-link-reaper)) (tf (arm! 'cleanup-record-finished 1)))
             (kill link1 'n1a-kill)
             (expect-down! "N1a: node-down b (record executed by the reaper)" 6000)
             (call-outcome! "N1a: the pending call failed once with noconnection" 'r1 6000 noconnection?)
             (remote-down! "N1a: the remote monitor fired DOWN noconnection once" 'svc1 6000 (lambda (r) (eq? r 'noconnection)))
             (quiet-remote-down! "N1a: no second remote-down" 'svc1 500)
+            ;; the executor reports completion AFTER the notifications (notify, retire, then finished)
+            (let ((wf (wait! tf 'cleanup-record-finished 5000)))
+              (check "N1a: the executor (the reaper) reported the record finished after the notifications" (and (pair? wf) (eq? (cdr wf) r0)) (show wf))
+              (resume! tf wf)
+              (cleanup! tf 'cleanup-record-finished))
             (check "N1a: the record finished (no cleanup records left)" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records))
             (check "N1a: rmonitors back to base" (eqv? (stat 'rmonitors) rbase) (stat 'rmonitors) rbase))
           (plain-peer-close! b1)))
@@ -215,6 +232,37 @@
         (plain-peer-close! b1)
         (check "N5b: records finished" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records)))
 
+      ;; (c) a call selected before a same-incarnation REPLACEMENT: the entry is
+      ;;     present but holds a different connection. The fence tests CONN
+      ;;     IDENTITY, not entry presence: a fence that only tested presence would
+      ;;     file the slot on the new connection's collection and submit on the
+      ;;     closed old one -- the caller still gets noconnection from the
+      ;;     submission undo, so the refusal POINT is the discriminator here.
+      (let ((b1 (open-b BOOT-X 1)))
+        (check "N5c: b installed (C1)" (not (pair? b1)) b1)
+        (expect-up! "N5c: node-up b" 3000)
+        (let* ((t-arm (arm! 'rcall-before-arm 1))
+               (caller (spawn-caller! 'r5c main))
+               (w (wait! t-arm 'rcall-before-arm 5000)))
+          (check "N5c: the caller parked between selection and arming" (pair? w) (show w))
+          (let ((b2 (open-b BOOT-X 2)))
+            (check "N5c: same-incarnation replacement installed (C2)" (not (pair? b2)) b2)
+            (expect-down! "N5c: node-down (C1)" 6000) (expect-up! "N5c: node-up (C2)" 6000)
+            (let ((t-ref (arm! 'admission-refused-stale-conn 1)))
+              (resume! t-arm w)
+              (let ((wr (wait! t-ref 'admission-refused-stale-conn 5000)))
+                (check "N5c: the arming fence refused the selection made under C1 (conn identity, before any slot)" (pair? wr) (show wr))
+                (resume! t-ref wr)
+                (cleanup! t-ref 'admission-refused-stale-conn)))
+            (call-outcome! "N5c: the caller got noconnection from the fence" 'r5c 6000 noconnection?)
+            (check "N5c: C2 never received a call frame" (not (plain-peer-wait-frame b2 (lambda (d) (and (pair? d) (eq? (car d) 'call))) 500)))
+            (kill ($node-link-pid 'b) 'n5c-kill)
+            (expect-down! "N5c: node-down (C2 removed)" 6000)
+            (plain-peer-close! b2))
+          (cleanup! t-arm 'rcall-before-arm))
+        (plain-peer-close! b1)
+        (check "N5c: records finished" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records)))
+
       ;; ---- N6: the F7(a) race -------------------------------------------------
       (let ((b1 (open-b BOOT-X 1)))
         (check "N6: b installed" (not (pair? b1)) b1)
@@ -281,6 +329,8 @@
         (plain-peer-close! b1)
         (check "N14: records finished" (within? 5000 (lambda () (eqv? (stat 'cleanup-records) 0))) (stat 'cleanup-records)))
 
+      (receive (after 500 (check "baseline: no stray replies reached any caller" #t)) (`#(stray ,tag ,m) (check "baseline: no stray replies reached any caller" #f (list tag m))))
+      (end-callers!)
       (check "baseline: rmonitors" (eqv? (stat 'rmonitors) rbase) (stat 'rmonitors) rbase))
     (if (zero? fails)
         (begin (display "ALL CLEANUP-RECORD TESTS PASSED\n") (exit 0))
