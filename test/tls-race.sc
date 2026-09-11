@@ -391,6 +391,52 @@
           (check "Z6a: resources back to baseline" (settled-to? base 4000) (snap) base))
 
 
+        ;; ---- O1c (batch 1 residual, construction per codex 01a08e82): a STALE holder
+        ;; DOWN. P takes the gate with a tiny write and parks; the watcher's monitor on
+        ;; P is witnessed through process-monitor-count; the watcher is parked at its
+        ;; loop entry (its idle wake); P is resumed and REPORTS AFTER tcp-writev!
+        ;; RETURNS -- the gate release runs in the writer, without the watcher -- and
+        ;; then waits alive; P is killed before the watcher resumes, so the watcher's
+        ;; mailbox holds the release first and P's DOWN after it (demonitor does not
+        ;; flush queued messages): the DOWN names a former holder, the watcher stays,
+        ;; the connection stays open, only the owner's close retires it.
+        (let* ((ch (open-held-conn! 'plain)) (c (car ch)) (owner (cdr ch))
+               (t (inject-arm-barrier! 'tls-after-held 1 30000))
+               (p (spawn (lambda ()
+                           (tcp-writev! c (list (make-bytevector 16 79)) (lambda (st) (send main-pid (vector 'done 'p st))))
+                           (send main-pid (vector 'returned 'p))
+                           (receive (`#(go-die) 'ok)))))
+               (w (inject-barrier-wait t 'tls-after-held 5000)))
+          (check "O1c: P parked holding the gate" (and (pair? w) (eq? (cdr w) p)) (desc w))
+          (cond
+            ((pair? w)
+             (check "O1c: premise -- the watcher monitors P (P's monitor count rose)" (within? 3000 (lambda () (>= (process-monitor-count p) 1))) (process-monitor-count p))
+             (let* ((tw (inject-arm-barrier! 'tls-watcher-loop-entry 1 30000))
+                    (ww (inject-barrier-wait tw 'tls-watcher-loop-entry 8000)))
+               (check "O1c: the watcher parked at its loop entry while P holds" (pair? ww) (desc ww))
+               (cond
+                 ((pair? ww)
+                  (inject-barrier-drain! (cdr w) t 5000)
+                  (guard (e (#t (void))) (inject-release! t))
+                  (check "O1c: tcp-writev! returned in P (the release is queued to the parked watcher)" (eq? 'yes (receive (after 5000 'no) (`#(returned p) 'yes))))
+                  (kill p 'o1c-stale-kill)
+                  (check "O1c: P is dead (its DOWN is queued after the release)" (dead-within? p 3000))
+                  (let ((watchers (tls-live-watcher-count)))
+                    (inject-barrier-drain! (cdr ww) tw 5000)
+                    (guard (e (#t (void))) (inject-release! tw))
+                    (sleep-ms 500)
+                    (check "O1c: the watcher stayed (stale DOWN, not terminal): watcher count unchanged" (eqv? (tls-live-watcher-count) watchers) (tls-live-watcher-count) watchers)
+                    (check "O1c: the connection is still open: a later write succeeds" (begin (spawn-writer! c 'q small-q) (eqv? (writer-outcome 'q 5000) 0)))
+                    (receive (after 300 (check "O1c: no tcp-error reached the owner" #t))
+                      (`#(owner-error ,@owner ,r) (check "O1c: no tcp-error reached the owner" #f r)))))
+                 (else (inject-barrier-cleanup! tw 'tls-watcher-loop-entry 31000) (inject-barrier-cleanup! t 'tls-after-held 31000)))))
+            (else (inject-barrier-cleanup! t 'tls-after-held 31000)))
+          (receive (after 0 (void)) (`#(done p ,st) (void)))
+          (tcp-close! c)
+          (client-result 20000)
+          (send (cdr ch) (vector 'release))
+          (check "O1c: retired by the owner's close; resources back to baseline" (settled-to? base 6000) (snap) base))
+
         ;; ---- E10: the OWNER holds the write gate and dies abnormally.
         ;; The holder is monitored by the watcher, the owner is linked to it.
         ;; When the same process is both, its death reaches the watcher as a

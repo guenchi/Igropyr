@@ -213,7 +213,9 @@
            (_drain (let drain () (receive (after 0 (void)) (`#(raw-server-failed ,why) (drain)) (`#(raw-server-session ,s0) (raw-tls-session-close! s0) (drain))))))
       ;; calibration
       (inject-arm-return! 'try-write-eagain 0 #f)
-      (let ((tcount (inject-arm-barrier! 'tls-handshake-write-status 1000000 60000)))
+      ;; the point is an inject-return! site: a never-delivering RETURN arm counts its
+      ;; hits (a barrier arm would not: the kind check precedes the hit count)
+      (let ((tcount (inject-arm-return! 'tls-handshake-write-status -1 1000000)))
         (let* ((os (established! "O5 calibration" srv)) (o (car os)) (s (cdr os)))
           (guard (e (#t (void))) (raw-tls-session-close! s))
           (send o (vector 'do-exit))
