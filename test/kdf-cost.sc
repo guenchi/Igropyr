@@ -4,7 +4,7 @@
 ;; so a stored hash carrying that text hung the whole process at the next login.
 ;; The verification runs in a CHILD chez under `timeout`: a hang is exit 124,
 ;; the guarded library answers #f and exits 0. The WITNESS runs first: the same
-;; child against a copy of kdf.sc with the guard replaced by the raw conversion
+;; child against a copy of kdf.sc with the guard (seven cost fields) replaced by the raw conversion
 ;; must hang (124) -- that proves the stimulus reaches the conversion, so the
 ;; green that follows is the guard's and not the fixture's.
 (import (chezscheme) (igropyr kdf) (only (igropyr libuv) now-ms))
@@ -52,6 +52,15 @@
   (check "poisoned pbkdf2 iters: #f, no hang" (and (eqv? r 0) (equal? (child-output) "#f\n")) r (child-output)))
 (let ((r (exit-code (run-child! tree "argon2id$1$#e1e99999999$1$AA==$AA==" 5))))
   (check "poisoned argon2id m: #f, no hang" (and (eqv? r 0) (equal? (child-output) "#f\n")) r (child-output)))
+;; all seven cost fields, not only the first of each family
+(for-each
+  (lambda (label stored)
+    (let ((r (exit-code (run-child! tree stored 5))))
+      (check label (and (eqv? r 0) (equal? (child-output) "#f\n")) r (child-output))))
+  '("poisoned scrypt r: #f, no hang" "poisoned scrypt p: #f, no hang"
+    "poisoned argon2id t: #f, no hang" "poisoned argon2id p: #f, no hang")
+  '("scrypt$1024$#e1e99999999$1$AA==$AA==" "scrypt$1024$8$#e1e99999999$AA==$AA=="
+    "argon2id$#e1e99999999$1$1$AA==$AA==" "argon2id$1$1$#e1e99999999$AA==$AA=="))
 
 ;; ---- twins: a real hash still verifies; a leading zero keeps its value; junk refused --
 (let* ((s (password-hash "hunter2" 'scrypt '((N . 1024))))
@@ -65,7 +74,10 @@
   (check "twin: N with a trailing letter is refused" (not (password-verify "hunter2" (with-n "1024x"))))
   (check "twin: N in exponent notation is refused" (not (password-verify "hunter2" (with-n "1e3"))))
   (check "twin: N with a radix prefix is refused" (not (password-verify "hunter2" (with-n "#e1024"))))
-  (check "twin: an eleven-digit N is refused before any arithmetic" (not (password-verify "hunter2" (with-n "10000000000"))))
+  ;; the three twins above and this one pin the answer, not the guard: they are
+  ;; refused by the raw conversion or the later ceiling as well. The "#e1024"
+  ;; twin is the one the raw conversion accepts, so it alone discriminates here
+  (check "twin: an eleven-digit N is refused" (not (password-verify "hunter2" (with-n "10000000000"))))
   (check "twin: the wrong password is still refused" (not (password-verify "wrong" s))))
 
 (if (zero? fails)
