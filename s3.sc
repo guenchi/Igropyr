@@ -41,7 +41,11 @@
 (library (igropyr s3)
   (export make-s3 s3?
           s3-put! s3-get s3-head s3-copy! s3-delete! s3-delete-prefix! s3-list
-          s3-restore!)
+          s3-restore!
+          ;; TEST SEAM. The XML unescaper is reached from outside only
+          ;; through a live listing, and the cell that bounds its work needs
+          ;; to feed it directly. The $ marks it as not part of the API.
+          $xml-unescape)
   (import (chezscheme) (igropyr util) (igropyr crypto) (igropyr sigv4)
           (igropyr http-client))
 
@@ -335,8 +339,22 @@
                        (and any (< v #x110000)
                             (not (and (>= v #xD800) (<= v #xDFFF)))
                             (begin (put-char p (integer->char v)) (+ j 1))))
-                      ((digit c) => (lambda (d) (loop (+ j 1) (+ (* v radix) d) #t)))
+                      ;; THE CEILING IS CHECKED PER DIGIT, NOT AT THE ';'.
+                      ;; Accumulating first and comparing once made the work
+                      ;; superlinear in the digit count -- every digit widens
+                      ;; a bignum nobody will use, and server XML reaches
+                      ;; here. A value at or past the ceiling can only grow,
+                      ;; so stopping now gives the same answer (#f: the text
+                      ;; is copied literally) sooner. It is a bound on the
+                      ;; VALUE and not on the digit count, so a reference
+                      ;; written with leading zeros still reads.
+                      ((digit c) => (lambda (d)
+                                      (let ((v2 (+ (* v radix) d)))
+                                        (and (< v2 #x110000)
+                                             (loop (+ j 1) v2 #t)))))
                       (else #f))))))))
+
+  (define ($xml-unescape s) (xml-unescape s))
 
   (define (xml-unescape s)
     (let-values (((p get) (open-string-output-port)))

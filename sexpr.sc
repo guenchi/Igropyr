@@ -397,7 +397,6 @@
            ;; back as "token too long" at the far end, so it is refused
            ;; here for the same reason the numeric shapes are.
            (<= m default-max-token)
-           (not (string->number s))
            ;; the reader's numeric-shape?, kept identical to it
            (not (let ((c (string-ref s 0)))
                   (or (char<=? #\0 c #\9)
@@ -411,4 +410,18 @@
                             (char<=? #\0 c #\9)
                             (memv c '(#\- #\+ #\* #\/ #\< #\> #\= #\? #\! #\.
                                       #\_ #\% #\& #\^ #\~ #\: #\@))))
-                      (lp (+ i 1)))))))))
+                      (lp (+ i 1)))))
+           ;; LAST, AND THE ORDER IS THE GUARD. string->number reads the
+           ;; whole numeric syntax, so an exactness prefix asks it to build
+           ;; the number it names: this conjunct standing FIRST meant that
+           ;; serialising the symbol `#e1e99999999` never returned, and a
+           ;; symbol is whatever this process turned into one -- the reader
+           ;; is not the only supplier of them.
+           ;;
+           ;; It stays, because it is still the only thing that refuses a
+           ;; name the walk admits and the reader would read back as a
+           ;; number (`+i` is the example). After the walk it can only ever
+           ;; see letters, digits and the punctuation listed above -- `#` is
+           ;; not among them -- so no prefix reaches it, and no exponent
+           ;; without one is exact.
+           (not (string->number s))))))
