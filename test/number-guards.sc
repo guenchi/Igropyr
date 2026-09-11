@@ -67,11 +67,12 @@
 (t "fraction: a sign refused" (decimal-fraction->number "-0.5" 8) #f)
 (t "fraction: max-len + 1 refused" (decimal-fraction->number "0.1234567" 8) #f)
 (t "fraction: exactly max-len accepted" (decimal-fraction->number "0.123456" 8) 123456/1000000)
-;; the two edge spellings are pinned to the supplier's stated rule (a digit on each
-;; side of the dot is not required by CSS/HTTP q-values: "1." and ".5" are refused,
-;; matching http's precedent of digits-only tokens)
-(t "fraction: trailing dot refused" (decimal-fraction->number "1." 8) #f)
-(t "fraction: leading dot refused" (decimal-fraction->number ".5" 8) #f)
+;; the two edge spellings follow the supplier's stated rule: at least one digit, at
+;; most one dot, the dot may lead or trail. The guard constrains SHAPE against the
+;; unbounded conversion; it does not tighten the q= grammar on the way (that would
+;; be a second change reported as one)
+(t "fraction: trailing dot accepted (1.)" (decimal-fraction->number "1." 8) 1)
+(t "fraction: leading dot accepted (.5)" (decimal-fraction->number ".5" 8) 1/2)
 
 (if (zero? fails)
     (begin (display "ALL NUMBER-GUARDS TESTS PASSED\n") (exit 0))

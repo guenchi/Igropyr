@@ -549,6 +549,12 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/p
 #      pinned from the notation's reference cases)
 "$scheme_bin" --script test/html.sc
 "$scheme_bin" --script test/css.sc
+# Numeric text guards: text from outside the process is shape-checked before
+#      string->number (an exact 10^N literal never returns); the kdf and gzip cells run
+#      a child under timeout, witness first
+"$scheme_bin" --script test/number-guards.sc
+IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/kdf-cost.sc
+IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/gzip-q.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/cleanup-record.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/cleanup-record-exec.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/cleanup-record-reaper.sc
