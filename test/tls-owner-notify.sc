@@ -202,6 +202,52 @@
       (raw-tls-server-stop! srv)
       (check "O4: sessions back to baseline" (within? 5000 (lambda () (= (tls-live-session-count) base))) (tls-live-session-count) base))
 
+    ;; ---- O5 (batch 1 residual): the FINAL handshake flight's queued write fails
+    ;; after publication. Every write in both dials is forced onto the queued path
+    ;; ('try-write-eagain on every hit), so no completion is inline; the calibration
+    ;; dial counts the dial side's flight completions N, and the fault dial forces a
+    ;; negative status at occurrence N: the owner must see tcp-connected FIRST
+    ;; (publication happened) and then exactly one tcp-error naming
+    ;; tls-handshake-write-failed, never tcp-connect-failed.
+    (let* ((srv (raw-tls-server-start "127.0.0.1" port (in-dir "good.pem") (in-dir "good.key")))
+           (_drain (let drain () (receive (after 0 (void)) (`#(raw-server-failed ,why) (drain)) (`#(raw-server-session ,s0) (raw-tls-session-close! s0) (drain))))))
+      ;; calibration
+      (inject-arm-return! 'try-write-eagain 0 #f)
+      (let ((tcount (inject-arm-barrier! 'tls-handshake-write-status 1000000 60000)))
+        (let* ((os (established! "O5 calibration" srv)) (o (car os)) (s (cdr os)))
+          (guard (e (#t (void))) (raw-tls-session-close! s))
+          (send o (vector 'do-exit))
+          (check "O5 calibration: session settled" (within? 5000 (lambda () (= (tls-live-session-count) base))) (tls-live-session-count))
+          (let ((n (or (inject-hits 'tls-handshake-write-status) 0)))
+            (check "O5 calibration: the dial side completed at least one handshake flight through the seam" (>= n 1) n)
+            (guard (e (#t (void))) (inject-release! tcount))
+            ;; fault dial: the final flight's completion fails
+            (inject-arm-return! 'tls-handshake-write-status -1 n)
+            (let* ((o (spawn-owner! port))
+                   (s (raw-tls-server-accept srv 5000)))
+              (check "O5: raw server session" (not (or (pair? s) (symbol? s))) s)
+              (expect! "O5: the owner was published first (tcp-connected)" o 5000 'tcp-connected)
+              (let ((e (expect! "O5: then exactly one tcp-error (A' after publication)" o 5000 'tcp-error)))
+                (check "O5: ...naming the failed handshake write" (and (pair? e) (eq? (cadr e) 'tls-handshake-write-failed)) e))
+              (check "O5: the status injection was delivered exactly once" (eqv? (inject-delivered 'tls-handshake-write-status) 1) (inject-delivered 'tls-handshake-write-status))
+              (check "O5: the retirement path is the handshake write failure" (eq? (retire-path) 'handshake-write-failed) (tls-last-retire-reason))
+              (quiet! "O5: nothing else (no tcp-connect-failed, no second error)" o 800)
+              (check "O5: the owner is alive" (process-alive? o))
+              (guard (e (#t (void))) (raw-tls-session-close! s))
+              (send o (vector 'do-exit))
+              (check "O5: sessions back to baseline" (within? 5000 (lambda () (= (tls-live-session-count) base))) (tls-live-session-count) base)
+              ;; polarity control: a MIDDLE flight failing is a pre-publication failure
+              (when (> n 1)
+                (inject-arm-return! 'tls-handshake-write-status -1 (- n 1))
+                (let* ((o2 (spawn-owner! port)) (s2 (raw-tls-server-accept srv 5000)))
+                  (expect! "O5 control: a middle flight's failure is tcp-connect-failed, never tcp-connected" o2 6000 'tcp-connect-failed)
+                  (quiet! "O5 control: nothing else" o2 500)
+                  (guard (e (#t (void))) (when (not (or (pair? s2) (symbol? s2))) (raw-tls-session-close! s2)))
+                  (send o2 (vector 'do-exit))))))))
+      (inject-disarm!)
+      (raw-tls-server-stop! srv)
+      (check "O5: sessions back to baseline" (within? 5000 (lambda () (= (tls-live-session-count) base))) (tls-live-session-count) base))
+
     (if (zero? fails)
         (begin (display "ALL TLS-OWNER-NOTIFY TESTS PASSED\n") (exit 0))
         (begin (display "TLS-OWNER-NOTIFY VERDICT: ") (display fails) (display " failed case(s)\n") (exit 1)))))
