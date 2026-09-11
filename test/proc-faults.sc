@@ -200,9 +200,11 @@
         (proc-read-stop! a 'stdout)
         (proc-write! a (string->utf8 "go\n"))
         (check "P25: A exited" (equal? (wait-exit a 3000) '(0 . 0)))
-        ;; the process close callback ran: of A's four handles only stdout and stderr remain
-        (check "P25: A's process handle closed (live handles = base + 2: the two output pipes), row still open (stdout read-stopped)"
-               (within? 2000 (lambda () (and (eq? (proc-state a) 'exited) (eqv? (stat 'exited-unclosed) 1) (eqv? (uv-live-handle-count) (+ (list-ref b0 0) 2))))) (list (proc-state a) (stat 'exited-unclosed) (uv-live-handle-count) (list-ref b0 0)))
+        ;; the process close callback ran: of A's four handles only the read-stopped stdout
+        ;; remains (stdin was closed by the exit, stderr reached EOF and closed itself);
+        ;; base + 2 would mean the process handle is still open
+        (check "P25: A's process handle closed (live handles = base + 1: the read-stopped stdout only), row still open"
+               (within? 2000 (lambda () (and (eq? (proc-state a) 'exited) (eqv? (stat 'exited-unclosed) 1) (eqv? (uv-live-handle-count) (+ (list-ref b0 0) 1))))) (list (proc-state a) (stat 'exited-unclosed) (uv-live-handle-count) (list-ref b0 0)))
         (check "P25: A's block is not among the addresses freed since A was allocated" (not (memv (proc-handle a) (freed-since))))
         (let ((later (let loop ((i 0) (acc '())) (if (= i 100) acc (loop (+ i 1) (cons (spawn-sh "true") acc))))))
           (let ((exits (map (lambda (p) (wait-exit p 5000)) later)))

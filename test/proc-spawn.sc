@@ -82,7 +82,8 @@
       (flush-output-port (current-output-port))
       (c-dup2 saved 1) (c-close saved)
       r)))
-(define (file-text f) (guard (e (#t (list 'unreadable f))) (call-with-input-file f get-string-all)))
+;; get-string-all answers the eof object for an empty file: that is ""
+(define (file-text f) (guard (e (#t (list 'unreadable f))) (let ((t (call-with-input-file f get-string-all))) (if (eof-object? t) "" t))))
 (define port 18800)
 
 (start-scheduler
