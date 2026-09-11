@@ -1,22 +1,26 @@
 #!chezscheme
-;; Child processes -- lifecycle cells (proc-spawn design v3 §5, v4-v8 deltas).
+;; Child processes -- lifecycle cells (proc-spawn design v3 §5, v4-v8 deltas;
+;; codex coverage pre-review 01a08dfe folded).
 ;;   P4a  SIGTERM on sleep -> exit (0 . 15)
 ;;   P4b  a child that ignores TERM after exec: TERM does nothing, KILL -> signal 9
 ;;   P5   spawn failure (ENOENT): synchronous (failed . ...), every count back
-;;   P8   stdout/stderr tagged separately; 'inherit and 'ignore modes
-;;   P9   100 concurrent children under max-procs 128; P9b the limit refuses a third
-;;   P10  coexistence with Chez `system` (libc wait does not reap our children)
+;;   P8   stdout/stderr tagged separately; 'inherit (our stdout redirected to a file
+;;        around the spawn, the file is the oracle) and 'ignore
+;;   P9   100 children admitted at once (gated on stdin) under max-procs 128; P9b the limit
+;;   P10  coexistence with Chez `system`: libc's wait does not reap our child, and system's
+;;        own child still has our stdout (file oracle)
 ;;   P11  env and cwd exact
-;;   P13  stdout EOF while the child still runs, then stderr data, then the exit
+;;   P13  stdout EOF while the child is held on stdin, then stderr data, then the exit
 ;;   P14  proc-close! before and after exit is idempotent and leaves kill eligible
 ;;   P16  a dead explicit owner is refused before anything is allocated
 ;;   P17  (this whole file runs without TLS: the liveness hook comes from actor)
-;;   P22  socket-conn-count sampled during pipe churn: never negative, never above conn-count
+;;   P22  socket-conn-count sampled during pipe churn with two real sockets open:
+;;        never below 2, never above conn-count; the spawner outlives the baseline check
 ;;   P23  pipe conns cannot change owner or replace their close hook
 ;; Every cell ends with the five counts back to their cell-start values while
 ;; the owner (this process) is alive.
 (import (chezscheme) (igropyr actor) (igropyr tcp)
-        (only (igropyr libuv) now-ms uv-live-handle-count)
+        (only (igropyr libuv) now-ms uv-live-handle-count uv-strerror)
         (igropyr inject-control))
 (define fails 0)
 (define (check label ok . info)
@@ -44,6 +48,14 @@
         (`#(proc-data ,@p ,@stream ,bv) (loop (cons bv acc)))
         (`#(proc-eof ,@p ,@stream) (cat (reverse acc)))))))
 (define (text p stream ms) (let ((r (collect p stream ms))) (if (bytevector? r) (utf8->string r) r)))
+;; a stream until the accumulated text holds a newline -> the line; reads may split lines
+(define (read-line-of p stream ms)
+  (let ((deadline (+ (now-ms) ms)))
+    (let loop ((acc ""))
+      (let ((i (let scan ((k 0)) (cond ((= k (string-length acc)) #f) ((char=? (string-ref acc k) #\newline) k) (else (scan (+ k 1)))))))
+        (if i (substring acc 0 i)
+            (receive (after (max 1 (- deadline (now-ms))) (cons 'timeout acc))
+              (`#(proc-data ,@p ,@stream ,bv) (loop (string-append acc (utf8->string bv))))))))))
 (define (base) (list (uv-live-handle-count) (conn-count) (pipe-conn-count) (proc-count) (uv-owner-index-count)))
 (define (back-to-base! label b ms) (check label (within? ms (lambda () (equal? (base) b))) (base) b))
 (define (quiet! label ms)
@@ -52,7 +64,21 @@
     (`#(proc-eof ,p ,s) (check label #f (list 'eof s)))
     (`#(proc-error ,p ,s ,n) (check label #f (list 'error s n)))
     (`#(proc-exit ,p ,c ,sg) (check label #f (list 'exit c sg)))))
-(define (stat p key) (let ((a (assq key (proc-stats)))) (and a (cdr a))))
+;; our own stdout redirected to a file around a thunk: the file is what an
+;; inherited descriptor 1 wrote to (dup/dup2 through libc; O_WRONLY|O_CREAT|O_TRUNC)
+(define c-dup (foreign-procedure "dup" (int) int))
+(define c-dup2 (foreign-procedure "dup2" (int int) int))
+(define c-close (foreign-procedure "close" (int) int))
+(define c-open3 (foreign-procedure "open" (string int int) int))
+(define (with-stdout-to-file f thunk)
+  (flush-output-port (current-output-port))
+  (let* ((saved (c-dup 1)) (fd (c-open3 f #x601 #o644)))
+    (c-dup2 fd 1) (c-close fd)
+    (let ((r (thunk)))
+      (flush-output-port (current-output-port))
+      (c-dup2 saved 1) (c-close saved)
+      r)))
+(define (file-text f) (guard (e (#t (list 'unreadable f))) (call-with-input-file f get-string-all)))
 (define port 18800)
 
 (start-scheduler
@@ -72,14 +98,13 @@
         (check "P4a: stderr EOF" (equal? (collect p 'stderr 3000) (make-bytevector 0)))
         (check "P4a: pid cleared, state not running" (and (not (proc-pid p)) (not (eq? (proc-state p) 'running))) (list (proc-pid p) (proc-state p)))
         (check "P4a: proc-kill! after exit -> #f" (not (proc-kill! p 15)))
-        (check "P4a: closed once every pipe reached EOF" (within? 3000 (lambda () (eq? (proc-state p) 'closed))) (proc-state p))
+        (check "P4a: closed once every pipe reached EOF (stdin closed by the exit)" (within? 3000 (lambda () (eq? (proc-state p) 'closed))) (proc-state p))
         (back-to-base! "P4a: counts back to base" b0 3000))
 
       ;; ---- P4b: TERM ignored after exec, KILL works --------------------------------
       (let ((p (spawn-sh "trap \"\" TERM; echo ready; exec sleep 100")))
         (check "P4b: spawned" (proc? p) p)
-        (receive (after 3000 (check "P4b: the child reported ready" #f 'timeout))
-          (`#(proc-data ,@p stdout ,bv) (check "P4b: the child reported ready" (equal? (utf8->string bv) "ready\n") bv)))
+        (check "P4b: the child reported ready" (equal? (read-line-of p 'stdout 3000) "ready"))
         (check "P4b: TERM accepted for sending" (proc-kill! p 15))
         (check "P4b: ...but the child is still running 500 ms later" (and (eq? (wait-exit p 500) 'timeout) (eq? (proc-state p) 'running)) (proc-state p))
         (check "P4b: KILL -> #t" (proc-kill! p 9))
@@ -99,14 +124,17 @@
         (check "P8: stderr tagged" (equal? (text p 'stderr 3000) "err\n"))
         (check "P8: exit 0" (equal? (wait-exit p 3000) '(0 . 0)))
         (back-to-base! "P8: counts back" b0 3000))
-      (let ((p (spawn-sh "echo P8-inherit-marker-on-our-stdout; echo P8-inherit-marker-on-our-stderr 1>&2"
-                         '(stdout . inherit) '(stderr . inherit))))
+      (let* ((f "/tmp/igropyr-p8-inherit.txt")
+             (p (with-stdout-to-file f
+                  (lambda ()
+                    (let ((p (spawn-sh "echo inherited-marker" '(stdout . inherit))))
+                      (when (proc? p) (wait-exit p 3000))
+                      p)))))
         (check "P8 inherit: spawned" (proc? p) p)
-        (check "P8 inherit: no stdout/stderr conns" (and (proc? p) (not (proc-stdout p)) (not (proc-stderr p))))
-        (check "P8 inherit: exit 0" (equal? (wait-exit p 3000) '(0 . 0)))
-        (quiet! "P8 inherit: nothing tagged arrives (the markers went to our own descriptors, see the log)" 300)
-        (check "P8 inherit: only stdin was a pipe" (eqv? (- (list-ref (base) 2) (list-ref b0 2)) (if (proc-stdin p) 1 0)))
-        (proc-close! p)
+        (check "P8 inherit: no stdout conn" (and (proc? p) (not (proc-stdout p))))
+        (check "P8 inherit: the child wrote through OUR descriptor 1 (the redirected file holds the marker)" (equal? (file-text f) "inherited-marker\n") (file-text f))
+        (quiet! "P8 inherit: nothing tagged for stdout arrives" 300)
+        (when (proc? p) (collect p 'stderr 2000))
         (back-to-base! "P8 inherit: counts back" b0 3000))
       (let ((p (spawn-sh "echo dropped; exit 4" '(stdout . ignore))))
         (check "P8 ignore: no stdout conn" (and (proc? p) (not (proc-stdout p))))
@@ -117,24 +145,26 @@
 
       ;; ---- P9: 100 concurrent children; P9b: the limit ---------------------------------
       (set-max-procs! 128)
-      (let ((ps (let loop ((i 0) (acc '())) (if (= i 100) acc (loop (+ i 1) (cons (spawn-sh "sleep 0.1; exit 7") acc))))))
+      (let ((ps (let loop ((i 0) (acc '())) (if (= i 100) acc (loop (+ i 1) (cons (spawn-sh "read x; exit 7") acc))))))
         (check "P9: 100 spawned" (for-all proc? ps) (length (filter (lambda (p) (not (proc? p))) ps)))
-        (check "P9: proc-count = 100 above base" (eqv? (proc-count) (+ (list-ref b0 3) 100)) (proc-count))
+        (check "P9: proc-count = 100 above base while all are held on stdin" (eqv? (proc-count) (+ (list-ref b0 3) 100)) (proc-count))
+        (check "P9: pipe-conn-count = 300 above base" (eqv? (pipe-conn-count) (+ (list-ref b0 2) 300)) (pipe-conn-count))
+        (for-each (lambda (p) (proc-write! p (string->utf8 "go\n"))) ps)
         (let ((exits (let loop ((n 0) (seen '()))
                        (if (= n 100) seen
                            (receive (after 10000 seen)
                              (`#(proc-exit ,p ,c ,s) (loop (+ n 1) (cons (list p c s) seen))))))))
           (check "P9: 100 exits with code 7" (and (= (length exits) 100) (for-all (lambda (e) (equal? (cdr e) '(7 0))) exits)) (length exits))
-          (check "P9: one exit per proc" (= 100 (length (let dedup ((l (map car exits)) (seen '())) (cond ((null? l) seen) ((memq (car l) seen) (dedup (cdr l) seen)) (else (dedup (cdr l) (cons (car l) seen)))))))))
-        ;; drain the EOFs (the pipes close themselves at EOF)
+          (check "P9: one exit per proc, each a spawned one" (and (= 100 (length (let dedup ((l (map car exits)) (seen '())) (cond ((null? l) seen) ((memq (car l) seen) (dedup (cdr l) seen)) (else (dedup (cdr l) (cons (car l) seen)))))))
+                                                                  (for-all (lambda (e) (memq (car e) ps)) exits))))
         (let drain () (receive (after 500 (void)) (`#(proc-eof ,p ,s) (drain)) (`#(proc-data ,p ,s ,bv) (drain))))
-        (back-to-base! "P9: every count and the owner index back while the owner is alive" b0 8000))
+        (back-to-base! "P9: every count and the owner index back while the owner is alive (pipes self-closed at EOF)" b0 8000))
       (set-max-procs! 2)
       (let ((a (spawn-sh "exec sleep 100")) (b (spawn-sh "exec sleep 100")))
         (check "P9b: two admitted" (and (proc? a) (proc? b)))
         (let ((c (spawn-sh "exec sleep 100")))
           (check "P9b: the third is refused with proc-limit" (equal? c '(failed . proc-limit)) c)
-          (check "P9b: nothing allocated for the refused one" (eqv? (proc-count) (+ (list-ref b0 3) 2)) (proc-count)))
+          (check "P9b: nothing allocated for the refused one" (equal? (base) (list (list-ref (base) 0) (+ (list-ref b0 1) 6) (+ (list-ref b0 2) 6) (+ (list-ref b0 3) 2) (+ (list-ref b0 4) 8))) (base) b0))
         (proc-kill! a 9) (proc-kill! b 9)
         (wait-exit a 3000) (wait-exit b 3000)
         (collect a 'stdout 2000) (collect a 'stderr 2000) (collect b 'stdout 2000) (collect b 'stderr 2000)
@@ -143,15 +173,14 @@
 
       ;; ---- P10: coexistence with `system` -------------------------------------------
       (let ((p (spawn-sh "sleep 0.1; exit 5")))
-        (let ((r (system "sleep 0.3")))
-          (check "P10: system returned 0 (libc did not reap our child; ECHILD would have shown)" (eqv? r 0) r))
-        (check "P10: the uv child reports 5 after polling resumed" (equal? (wait-exit p 3000) '(5 . 0)))
+        (let* ((t0 (now-ms)) (r (system "sleep 0.3")) (t1 (now-ms)))
+          (check "P10: system blocked for its 0.3 s and returned 0 (libc did not reap our child)" (and (eqv? r 0) (>= (- t1 t0) 250)) r (- t1 t0))
+          (let ((e (wait-exit p 3000)) (t2 (now-ms)))
+            (check "P10: the uv child's exit (5) was already pending when polling resumed" (and (equal? e '(5 . 0)) (< (- t2 t1) 150)) e (- t2 t1))))
         (collect p 'stdout 2000) (collect p 'stderr 2000)
         (let ((f "/tmp/igropyr-p10-system.txt"))
-          (system (string-append "rm -f " f))
-          (system (string-append "echo from-system >> " f))
-          (check "P10: system's own child still has its stdio (wrote the file)"
-                 (guard (e (#t #f)) (equal? (call-with-input-file f get-line) "from-system"))))
+          (with-stdout-to-file f (lambda () (system "echo from-system")))
+          (check "P10: system's own child still had our descriptor 1 (not marked close-on-exec)" (equal? (file-text f) "from-system\n") (file-text f)))
         (back-to-base! "P10: counts back" b0 3000))
 
       ;; ---- P11: env and cwd --------------------------------------------------------
@@ -161,12 +190,13 @@
         (back-to-base! "P11: counts back" b0 3000))
 
       ;; ---- P13: stdout EOF while running --------------------------------------------
-      (let ((p (spawn-sh "exec 1>&-; sleep 0.5; echo err 1>&2; exit 2")))
+      (let ((p (spawn-sh "exec 1>&-; read x; echo err 1>&2; exit 2")))
         (receive (after 3000 (check "P13: first message is stdout EOF" #f 'timeout))
-          (`#(proc-eof ,@p stdout) (check "P13: first message is stdout EOF, while the child still runs" (eq? (proc-state p) 'running) (proc-state p)))
+          (`#(proc-eof ,@p stdout) (check "P13: stdout EOF arrives while the child is held on stdin (running)" (eq? (proc-state p) 'running) (proc-state p)))
           (`#(proc-data ,@p ,s ,bv) (check "P13: first message is stdout EOF" #f (list 'data s)))
           (`#(proc-exit ,@p ,c ,s) (check "P13: first message is stdout EOF" #f (list 'exit c s))))
-        (check "P13: proc-stdout cleared once its close ran" (within? 2000 (lambda () (not (proc-stdout p)))))
+        (check "P13: proc-stdout cleared once its close ran, child still running" (within? 2000 (lambda () (and (not (proc-stdout p)) (eq? (proc-state p) 'running)))))
+        (proc-write! p (string->utf8 "go\n"))
         (check "P13: stderr data after the stdout EOF" (equal? (text p 'stderr 3000) "err\n"))
         (check "P13: exit 2" (equal? (wait-exit p 3000) '(2 . 0)))
         (back-to-base! "P13: counts back" b0 3000))
@@ -189,22 +219,35 @@
           (check "P16: nothing allocated" (equal? (base) b0) (base) b0)))
 
       ;; ---- P22: counts sampled during pipe churn ---------------------------------------
-      (let ((spawner (spawn (lambda ()
-                              (let loop ((i 0) (ps '()))
-                                (if (< i 50)
-                                    (loop (+ i 1) (cons (spawn-sh "true") ps))
-                                    (begin
-                                      (for-each (lambda (p) (when (proc? p) (wait-exit p 5000) (collect p 'stdout 2000) (collect p 'stderr 2000))) ps)
-                                      (send main (vector 'churn-done (length (filter proc? ps)))))))))))
-        (let sample ((n 0) (bad 0))
-          (if (< n 1000)
-              (let ((s (socket-conn-count)) (c (conn-count)))
-                (sample (+ n 1) (if (or (< s 0) (> s c)) (+ bad 1) bad)))
-              (check "P22: 1000 samples, none negative, none above conn-count" (= bad 0) bad)))
-        (receive (after 15000 (check "P22: the churn finished" #f 'timeout))
-          (`#(churn-done ,n) (check "P22: the churn finished (50 children)" (= n 50) n)))
-        (check "P22: spawner exited" (within? 3000 (lambda () (not (process-alive? spawner)))))
-        (back-to-base! "P22: counts back (the spawner's procs closed with it)" b0 8000))
+      (let* ((l (tcp-listen! "127.0.0.1" port 16 (lambda (c) (void))))
+             (sock (begin (tcp-connect! "127.0.0.1" port main)
+                          (receive (after 3000 #f) (`#(tcp-connected ,c) c)))))
+        (check "P22: premise -- a real socket pair is open" (and sock (>= (- (conn-count) (list-ref b0 1)) 2)) (conn-count))
+        (let ((spawner (spawn (lambda ()
+                                (let loop ((i 0) (ps '()))
+                                  (if (< i 50)
+                                      (loop (+ i 1) (cons (spawn-sh "true") ps))
+                                      (begin
+                                        (for-each (lambda (p) (when (proc? p) (wait-exit p 5000) (collect p 'stdout 2000) (collect p 'stderr 2000))) ps)
+                                        (send main (vector 'churn-done (length (filter proc? ps))))
+                                        (let hold () (receive (m (hold))))))))))
+              (samples 0) (bad 0) (max-pipes 0) (done #f))
+          (let sample ()
+            (unless done
+              (let ((s (socket-conn-count)) (c (conn-count)) (pc (pipe-conn-count)))
+                (set! samples (+ samples 1))
+                (when (> pc max-pipes) (set! max-pipes pc))
+                (when (or (< s 2) (> s c)) (set! bad (+ bad 1))))
+              (receive (after 0 (sample))
+                (`#(churn-done ,n) (set! done n)))))
+          (check "P22: the churn finished (50 children)" (eqv? done 50) done)
+          (check "P22: samples never below the two sockets, never above conn-count" (and (>= samples 100) (= bad 0)) samples bad)
+          (check "P22: the sampler overlapped the churn (pipes were open during sampling)" (> max-pipes (list-ref b0 2)) max-pipes)
+          (check "P22: counts back while the spawner (the owner) is still alive" (within? 8000 (lambda () (equal? (list-ref (base) 2) (list-ref b0 2)) )) (base))
+          (check "P22: procs and owner index back with the owner alive" (within? 8000 (lambda () (and (eqv? (proc-count) (list-ref b0 3)) (eqv? (uv-owner-index-count) (+ (list-ref b0 4) 2))))) (base) b0)
+          (kill spawner 'done)
+          (tcp-close! sock) (tcp-stop-listen! l)
+          (back-to-base! "P22: counts back" b0 5000)))
 
       ;; ---- P23: pipe conns refuse owner transfer and hook replacement --------------------
       (let ((p (spawn-sh "exec sleep 100")))

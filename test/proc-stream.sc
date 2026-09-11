@@ -1,17 +1,19 @@
 #!chezscheme
 ;; Child processes -- streaming, backpressure and stdin accounting cells
-;; (proc-spawn design v3 §5 with the v4-v8 corrections).
+;; (proc-spawn design v3 §5 with the v4-v8 corrections; codex pre-review 01a08dfe folded).
 ;;   P1   exit before the final data: read-stopped stdout keeps the bytes in the kernel;
-;;        nothing is delivered until read-start; then exact bytes and EOF
+;;        nothing is delivered until read-start; then the exact bytes (all zero) and EOF
 ;;   P2   stdin closed with writes queued: every completed byte reaches the child (cat echo exact)
 ;;   P3   read end closed first: the child terminates (SIGPIPE or its own exit), no hang
-;;   P7   heartbeat during a 2 s child; a read-stopped 8 MiB writer stays blocked, then exact
-;;   P12  stdin cap accounting: queued = accepted - settled; kill, inline, raise, cancel paths
-;;   P19  SIGPIPE-free write failures: immediate and queued-before-close
+;;   P7   heartbeat during a 2 s child; a read-stopped 8 MiB writer (gated on stdin) stays
+;;        blocked, then the exact bytes
+;;   P12  stdin cap accounting: outstanding = accepted - settled at every checkpoint; kill,
+;;        inline, raise (queued path), cancel paths; the settle-twice collision seam
+;;   P19  write failures on a closed read end: immediate (EPIPE) and queued-before-close
 ;;   P20  shutdown variants: repeated, on a closed pipe, cancelled by proc-close!
 ;;   P26  a writer that is not the owner is killed right after proc-write!: the charge settles
 (import (chezscheme) (igropyr actor) (igropyr tcp)
-        (only (igropyr libuv) now-ms uv-live-handle-count)
+        (only (igropyr libuv) now-ms uv-live-handle-count uv-strerror)
         (igropyr inject-control))
 (define fails 0)
 (define (check label ok . info)
@@ -36,6 +38,13 @@
       (receive (after (max 1 (- deadline (now-ms))) (cons 'partial (cat (reverse acc))))
         (`#(proc-data ,@p ,@stream ,bv) (loop (cons bv acc)))
         (`#(proc-eof ,@p ,@stream) (cat (reverse acc)))))))
+(define (read-line-of p stream ms)
+  (let ((deadline (+ (now-ms) ms)))
+    (let loop ((acc ""))
+      (let ((i (let scan ((k 0)) (cond ((= k (string-length acc)) #f) ((char=? (string-ref acc k) #\newline) k) (else (scan (+ k 1)))))))
+        (if i (substring acc 0 i)
+            (receive (after (max 1 (- deadline (now-ms))) (cons 'timeout acc))
+              (`#(proc-data ,@p ,@stream ,bv) (loop (string-append acc (utf8->string bv))))))))))
 (define (base) (list (uv-live-handle-count) (conn-count) (pipe-conn-count) (proc-count) (uv-owner-index-count)))
 (define (back-to-base! label b ms) (check label (within? ms (lambda () (equal? (base) b))) (base) b))
 (define (no-data! label p stream ms)
@@ -45,6 +54,14 @@
 (define (pattern n) (let ((bv (make-bytevector n))) (let loop ((i 0)) (when (< i n) (bytevector-u8-set! bv i (fxand (* i 7) 255)) (loop (+ i 1)))) bv))
 (define (stat key) (let ((a (assq key (proc-stats)))) (and a (cdr a))))
 (define (finish! p) (guard (e (#t (void))) (proc-kill! p 9)) (wait-exit p 3000) (proc-close! p) (collect p 'stdout 1000) (collect p 'stderr 1000))
+;; libuv status codes named through uv_strerror, so the expectation is platform-neutral
+(define (status-named? st name) (and (integer? st) (< st 0) (equal? (uv-strerror st) name)))
+(define (epipe? st) (status-named? st "broken pipe"))
+(define (ecanceled? st) (status-named? st "operation canceled"))
+;; counted points count only while a row is armed: a barrier that never fires
+(define (count! point) (inject-arm-barrier! point 1000000 60000))
+(define (hits point) (or (inject-hits point) 0))
+(define (uncount! t) (guard (e (#t (void))) (inject-release! t)))
 (define MiB 1048576)
 
 (start-scheduler
@@ -57,13 +74,13 @@
       (let ((p (spawn-sh "read x; head -c 2048 /dev/zero; exit 3")))
         (check "P1: spawned" (proc? p) p)
         (proc-read-stop! p 'stdout)
-        (check "P1: the handshake byte was accepted" (proc-write! p (string->utf8 "go\n")))
+        (check "P1: the handshake line was accepted" (proc-write! p (string->utf8 "go\n")))
         (check "P1: exit 3 while stdout is read-stopped" (equal? (wait-exit p 5000) '(3 . 0)))
         (check "P1: nothing was delivered before read-start (mailbox empty of stdout)"
                (receive (after 0 #t) (`#(proc-data ,@p stdout ,bv) #f) (`#(proc-eof ,@p stdout) #f)))
         (proc-read-start! p 'stdout)
         (let ((out (collect p 'stdout 3000)))
-          (check "P1: exactly 2048 bytes after read-start, then EOF" (and (bytevector? out) (= (bytevector-length out) 2048)) (if (bytevector? out) (bytevector-length out) out)))
+          (check "P1: exactly 2048 zero bytes after read-start, then EOF" (equal? out (make-bytevector 2048 0)) (if (bytevector? out) (bytevector-length out) out)))
         (collect p 'stderr 2000)
         (back-to-base! "P1: counts back" b0 3000))
 
@@ -98,74 +115,99 @@
         (kill ticker 'done)
         (check "P7: >= 150 heartbeats during the child (scheduler never blocked)" (>= beats 150) beats)
         (collect p 'stdout 1000) (collect p 'stderr 1000))
-      (let ((p (spawn-sh "head -c 8388608 /dev/zero; exit 0")))
+      (let ((p (spawn-sh "read x; head -c 8388608 /dev/zero; exit 0")))
         (proc-read-stop! p 'stdout)
+        (proc-write! p (string->utf8 "go\n"))
         (no-data! "P7: nothing delivered while stopped (1 s)" p 'stdout 1000)
-        (check "P7: the child is still blocked in its write (no exit while stopped)" (and (eq? (wait-exit p 100) 'timeout) (eq? (proc-state p) 'running)) (proc-state p))
+        (check "P7: the child is blocked in its write (no exit while stopped: the backlog is real)" (and (eq? (wait-exit p 100) 'timeout) (eq? (proc-state p) 'running)) (proc-state p))
         (proc-read-start! p 'stdout)
         (let ((out (collect p 'stdout 20000)))
-          (check "P7: exact 8 MiB after resume" (and (bytevector? out) (= (bytevector-length out) 8388608)) (if (bytevector? out) (bytevector-length out) out)))
+          (check "P7: the exact 8 MiB of zeros after resume" (equal? out (make-bytevector 8388608 0)) (if (bytevector? out) (bytevector-length out) out)))
         (check "P7: exit 0" (equal? (wait-exit p 5000) '(0 . 0)))
         (collect p 'stderr 1000)
         (back-to-base! "P7: counts back" b0 3000))
 
       ;; ---- P12: stdin accounting --------------------------------------------------------
       (set-proc-stdin-cap! (* 256 1024))
-      (let ((p (spawn-sh "exec sleep 5")) (chunk (make-bytevector 65536 1)) (settled 0) (errors 0) (accepted 0))
-        (define (done status) (set! settled (+ settled 65536)) (when (< status 0) (set! errors (+ errors 1))))
+      (let ((p (spawn-sh "exec sleep 5")) (chunk (make-bytevector 65536 1)) (accepted 0) (settled 0) (neg 0) (refused 0))
+        (define (done st) (set! settled (+ settled 65536)) (when (< st 0) (set! neg (+ neg 1))))
         (let loop ((n 0))
-          (when (and (< n 10) (proc-write! p chunk done))
-            (set! accepted (+ accepted 65536))
-            (loop (+ n 1))))
-        (check "P12: the cap refused a write (accepted <= cap)" (<= accepted (* 256 1024)) accepted)
-        (check "P12: queued = accepted - settled" (eqv? (proc-queued p) (- accepted settled)) (list (proc-queued p) accepted settled))
+          (when (< n 40)
+            (if (proc-write! p chunk done)
+                (begin (set! accepted (+ accepted 65536)) (loop (+ n 1)))
+                (set! refused (+ refused 1)))))
+        (check "P12: a write was refused at the cap" (= refused 1) refused accepted)
+        (check "P12: outstanding = accepted - settled <= cap, and queued reports exactly that" (and (<= (- accepted settled) (* 256 1024)) (eqv? (proc-queued p) (- accepted settled))) (list (proc-queued p) accepted settled))
         (sleep-ms 100)
         (check "P12: still charged after 100 ms (the kernel is saturated, the charge is real)" (and (> (proc-queued p) 0) (eqv? (proc-queued p) (- accepted settled))) (list (proc-queued p) accepted settled))
-        (proc-kill! p 9)
-        (check "P12: exit" (equal? (wait-exit p 3000) '(0 . 9)))
-        (check "P12: every pending write settled with an error and queued reached 0"
-               (within? 3000 (lambda () (and (eqv? (proc-queued p) 0) (= settled accepted)))) (list (proc-queued p) settled accepted errors))
-        (check "P12: the settled writes that were still pending reported an error" (> errors 0) errors)
+        (let ((pending (div (- accepted settled) 65536)))
+          (proc-kill! p 9)
+          (check "P12: exit" (equal? (wait-exit p 3000) '(0 . 9)))
+          (check "P12: every write settled exactly once and queued reached 0"
+                 (within? 3000 (lambda () (and (eqv? (proc-queued p) 0) (= settled accepted)))) (list (proc-queued p) settled accepted))
+          (check "P12: exactly the writes pending at the kill reported an error" (= neg pending) neg pending))
         (collect p 'stdout 1000) (collect p 'stderr 1000)
         (back-to-base! "P12: counts back" b0 3000))
-      ;; inline completion
+      ;; inline completion: a small write to a reading child settles before proc-write! returns
       (let ((p (spawn-sh "exec cat")) (got #f))
-        (check "P12 inline: small write accepted" (proc-write! p (string->utf8 "hi\n") (lambda (s) (set! got s))))
-        (check "P12 inline: completion ran and queued is 0" (within? 2000 (lambda () (and got (eqv? (proc-queued p) 0)))) (list got (proc-queued p)))
+        (sleep-ms 100)
+        (let ((ok (proc-write! p (string->utf8 "hi\n") (lambda (s) (set! got s)))))
+          (check "P12 inline: accepted, completed inline (status 0) and zero charge on return" (and ok (eqv? got 0) (eqv? (proc-queued p) 0)) (list ok got (proc-queued p))))
         (finish! p)
         (back-to-base! "P12 inline: counts back" b0 3000))
-      ;; submission raise
+      ;; submission raise on the QUEUED path: the pipe is saturated first so the write cannot
+      ;; complete through uv_try_write and reaches the allocation the fault stands in for
       (let ((p (spawn-sh "exec sleep 5")))
-        (inject-arm-fault! 'writev-oom 1)
-        (let ((r (guard (e (#t 'raised)) (proc-write! p (make-bytevector 65536 2)))))
-          (check "P12 raise: the allocation failure reaches the caller" (eq? r 'raised) r)
-          (check "P12 raise: the charge was refunded (queued 0)" (eqv? (proc-queued p) 0) (proc-queued p))
-          (check "P12 raise: the settle-twice point was not hit" (eqv? (or (inject-hits 'proc-write-settled-twice) 0) 0)))
+        (check "P12 raise: premise -- the pipe is saturated (1 MiB queued)" (and (proc-write! p (make-bytevector MiB 2)) (> (proc-queued p) 0)) (proc-queued p))
+        (let ((q0 (proc-queued p)) (tw (count! 'proc-write-settled-twice)))
+          (inject-arm-fault! 'writev-oom 1)
+          (let ((r (guard (e (#t 'raised)) (proc-write! p (make-bytevector 65536 3)))))
+            (check "P12 raise: the allocation failure reaches the caller" (eq? r 'raised) r)
+            (check "P12 raise: the fault fired exactly once" (eqv? (hits 'writev-oom) 1) (hits 'writev-oom))
+            (check "P12 raise: the charge was refunded (queued back to the saturated backlog)" (eqv? (proc-queued p) q0) (list (proc-queued p) q0))
+            (check "P12 raise: no second settlement" (eqv? (hits 'proc-write-settled-twice) 0) (hits 'proc-write-settled-twice)))
+          (uncount! tw))
+        (inject-disarm!)
         (finish! p)
         (back-to-base! "P12 raise: counts back" b0 3000))
+      ;; settlement collision: the seam makes the library settle a completion twice
+      (let ((p (spawn-sh "exec cat")) (got '()))
+        (let ((tw (count! 'proc-write-settled-twice)))
+          (inject-arm-fault! 'proc-write-settle-twice 1)
+          (check "P12 collision: accepted" (proc-write! p (string->utf8 "abc\n") (lambda (s) (set! got (cons s got)))))
+          (check "P12 collision: the second settlement was refused (counted once), the user's on-done ran once, queued 0"
+                 (within? 2000 (lambda () (and (eqv? (hits 'proc-write-settled-twice) 1) (= (length got) 1) (eqv? (proc-queued p) 0)))) (list (hits 'proc-write-settled-twice) got (proc-queued p)))
+          (uncount! tw))
+        (inject-disarm!)
+        (finish! p)
+        (back-to-base! "P12 collision: counts back" b0 3000))
       ;; cancellation
-      (let ((p (spawn-sh "exec sleep 5")) (statuses '()))
-        (let loop ((n 0)) (when (and (< n 3) (proc-write! p (make-bytevector 65536 3) (lambda (s) (set! statuses (cons s statuses))))) (loop (+ n 1))))
+      (let ((p (spawn-sh "exec sleep 5")) (statuses '()) (accepted 0))
+        (let loop ((n 0)) (when (and (< n 3) (proc-write! p (make-bytevector 65536 4) (lambda (s) (set! statuses (cons s statuses))))) (set! accepted (+ accepted 1)) (loop (+ n 1))))
         (check "P12 cancel: a backlog is outstanding" (> (proc-queued p) 0) (proc-queued p))
-        (proc-close! p)
-        (check "P12 cancel: the backlog settled with errors (ECANCELED) and queued is 0"
-               (within? 3000 (lambda () (and (eqv? (proc-queued p) 0) (= (length statuses) 3) (for-all (lambda (s) (< s 0)) statuses)))) (list (proc-queued p) statuses))
+        (let ((pending (- accepted (length statuses))))
+          (proc-close! p)
+          (check "P12 cancel: exactly the pending writes settled, each with ECANCELED, and queued is 0"
+                 (within? 3000 (lambda () (and (eqv? (proc-queued p) 0) (= (length statuses) accepted)))) (list (proc-queued p) statuses accepted))
+          (check "P12 cancel: the cancelled ones are named operation canceled" (= pending (length (filter ecanceled? statuses))) (map (lambda (s) (if (< s 0) (uv-strerror s) s)) statuses) pending))
         (proc-kill! p 9) (wait-exit p 3000)
         (back-to-base! "P12 cancel: counts back" b0 3000))
       (set-proc-stdin-cap! (* 16 MiB))
 
       ;; ---- P19: writes to a closed read end ----------------------------------------------
       (let ((p (spawn-sh "exec 0<&-; echo closed; sleep 1")) (st #f))
-        (receive (after 3000 (check "P19: the child closed its stdin" #f 'timeout)) (`#(proc-data ,@p stdout ,bv) (check "P19: the child closed its stdin" (equal? (utf8->string bv) "closed\n"))))
+        (check "P19: the child closed its stdin" (equal? (read-line-of p 'stdout 3000) "closed"))
         (check "P19: the write is accepted for submission" (proc-write! p (string->utf8 "x") (lambda (s) (set! st s))))
-        (check "P19: it fails through on-done (EPIPE, no signal), the parent is alive" (within? 3000 (lambda () (and st (< st 0)))) st)
+        (check "P19: it fails through on-done with EPIPE (no signal), the parent is alive" (within? 3000 (lambda () (epipe? st))) (and st (< st 0) (uv-strerror st)))
         (check "P19: queued refunded" (eqv? (proc-queued p) 0) (proc-queued p))
         (check "P19: exit 0 after its sleep" (equal? (wait-exit p 4000) '(0 . 0)))
         (collect p 'stdout 1000) (collect p 'stderr 1000)
         (back-to-base! "P19: counts back" b0 3000))
       (let ((p (spawn-sh "sleep 0.3; exec 0<&-; echo closed; sleep 1")) (st #f))
         (check "P19 queued: 1 MiB accepted before the child closes stdin" (proc-write! p (pattern MiB) (lambda (s) (set! st s))))
-        (check "P19 queued: the remainder fails through on-done" (within? 5000 (lambda () (and st (< st 0)))) st)
+        (check "P19 queued: premise -- the write is outstanding (charged) before the close" (> (proc-queued p) 0) (proc-queued p))
+        (check "P19 queued: the child then closed its stdin" (equal? (read-line-of p 'stdout 3000) "closed"))
+        (check "P19 queued: the remainder fails through on-done (EPIPE)" (within? 5000 (lambda () (epipe? st))) (and st (< st 0) (uv-strerror st)))
         (check "P19 queued: queued refunded" (eqv? (proc-queued p) 0) (proc-queued p))
         (wait-exit p 4000) (collect p 'stdout 1000) (collect p 'stderr 1000)
         (back-to-base! "P19 queued: counts back" b0 3000))
@@ -183,13 +225,15 @@
         (check "P20 closed: proc-stdin-close! on a closed pipe -> #f" (within? 2000 (lambda () (and (not (proc-stdin p)) (not (proc-stdin-close! p))))))
         (proc-kill! p 9) (wait-exit p 3000)
         (back-to-base! "P20 closed: counts back" b0 3000))
-      (let ((p (spawn-sh "exec sleep 5")))
-        (let loop ((n 0)) (when (and (< n 4) (proc-write! p (make-bytevector 65536 4))) (loop (+ n 1))))
+      (let ((p (spawn-sh "exec sleep 5")) (statuses '()) (accepted 0))
+        (let loop ((n 0)) (when (and (< n 4) (proc-write! p (make-bytevector 65536 4) (lambda (s) (set! statuses (cons s statuses))))) (set! accepted (+ accepted 1)) (loop (+ n 1))))
         (check "P20 cancel: backlog then proc-stdin-close! -> #t" (and (> (proc-queued p) 0) (proc-stdin-close! p)) (proc-queued p))
         (check "P20 cancel: a shutdown request is pending" (eqv? (stat 'shutdown-pending) 1) (stat 'shutdown-pending))
-        (proc-close! p)
-        (check "P20 cancel: the request was cancelled and freed (pending 0), queued 0"
-               (within? 3000 (lambda () (and (eqv? (stat 'shutdown-pending) 0) (eqv? (proc-queued p) 0)))) (list (stat 'shutdown-pending) (proc-queued p)))
+        (let ((pending (- accepted (length statuses))))
+          (proc-close! p)
+          (check "P20 cancel: the request was cancelled and freed (pending 0), the backlog settled ECANCELED, queued 0"
+                 (within? 3000 (lambda () (and (eqv? (stat 'shutdown-pending) 0) (eqv? (proc-queued p) 0) (= (length statuses) accepted)))) (list (stat 'shutdown-pending) (proc-queued p) statuses))
+          (check "P20 cancel: the cancelled writes are named operation canceled" (= pending (length (filter ecanceled? statuses))) (map (lambda (s) (if (< s 0) (uv-strerror s) s)) statuses) pending))
         (proc-kill! p 9) (wait-exit p 3000)
         (back-to-base! "P20 cancel: counts back" b0 3000))
 
