@@ -45,7 +45,14 @@
 ;; are NOT numbers and stay symbols
 (for-each (lambda (t) (check (string-append "strict refuses " t " (a numeral in Chez's eyes, unwritable here)") (eq? (strict t) 'REFUSED) (strict t)))
           '("." "-.5" ".5" "+1/2" ".5e2" "-NaN.0" "+I"))
-(check "strict refuses the bare dot inside a list too" (eq? (verdict string->sexpr ". a") 'REFUSED) (verdict string->sexpr ". a"))
+;; NOT through the wrapper: "(x " + ". a" + ")" is "(x . a)", which is the
+;; DOTTED PAIR syntax and must keep working. The rows below say what was
+;; meant -- a dot where a datum is expected is refused, a dot between two
+;; data is a pair
+(check "a dot where a datum is expected is refused" (eq? (guard (e (#t 'REFUSED)) (string->sexpr "(. a)")) 'REFUSED))
+(check "a bare dot is refused" (eq? (guard (e (#t 'REFUSED)) (string->sexpr ".")) 'REFUSED))
+(check "a dotted pair still reads" (equal? (guard (e (#t 'REFUSED)) (string->sexpr "(x . a)")) '(x . a))
+       (guard (e (#t 'REFUSED)) (string->sexpr "(x . a)")))
 (for-each (lambda (t) (check (string-append "strict: " t " stays a symbol (not a complete numeral)") (eq? (strict t) (sym t)) (strict t)))
           '("+1a" "+1/0" ".5i" ".a" "-a"))
 
@@ -64,8 +71,18 @@
 (let ((v (guard (e (#t 'REFUSED)) (string->sexpr-extended "(quote -inf.0)"))))
   (check "extended: -inf.0 after the symbol quote is still the number" (and (pair? v) (pair? (cdr v)) (flonum? (cadr v)) (= (cadr v) -inf.0)) v))
 ;; the spellings are exact: case and sign matter
-(for-each (lambda (t) (check (string-append "extended refuses the near-miss " t) (eq? (ext t) 'REFUSED) (ext t)))
-          '("+NaN.0" "+Inf.0" "-Nan.0" "+nan.00" "+inf" "inf.0"))
+;; the three spellings are exact, and the boundary is NOT "how close it looks":
+;; +NaN.0, +Inf.0 and -Nan.0 are refused because CHEZ READS THEM AS NUMBERS, so
+;; the writer refuses those names and the reader must too. +nan.00, +inf and
+;; inf.0 are not numbers to Chez, the writer writes them, and refusing them
+;; would build the mirror image of the asymmetry this batch removes: writable
+;; and not receivable. The first version of this list had all six, and also
+;; had inf.0 in the "still a symbol" list below -- two rows of one file
+;; asserting opposite things about one token
+(for-each (lambda (t) (check (string-append "extended refuses " t " (Chez reads it as a number, so the writer refuses the name)") (eq? (ext t) 'REFUSED) (ext t)))
+          '("+NaN.0" "+Inf.0" "-Nan.0" "-NAN.0"))
+(for-each (lambda (t) (check (string-append "extended: " t " stays a symbol (the writer can write it)") (eq? (ext t) (sym t)) (ext t)))
+          '("+nan.00" "+inf" "inf.0" "nan.0" "+inf.00"))
 ;; ...and nothing else becomes a number
 (for-each (lambda (t) (check (string-append "extended refuses " t) (eq? (ext t) 'REFUSED) (ext t)))
           '("-nan.0" "1.5" "1e3" "+15" "+i" "+1" "+5"))
@@ -117,6 +134,26 @@
 (check "golden read-plus-five now refuses" (eq? (ext "+5") 'REFUSED) (ext "+5"))
 (check "golden read-dot-alone now refuses" (eq? (verdict string->sexpr-extended ".") 'REFUSED))
 (check "golden read-symbol-dot now refuses" (eq? (guard (e (#t 'REFUSED)) (string->sexpr-extended "(. a)")) 'REFUSED))
+
+;; ---- THE RULING AS ONE INVARIANT ------------------------------------------------
+;; Everything above is an instance of this: in the strict profile a bare token
+;; reads as a symbol EXACTLY WHEN the writer can write that symbol. Derived
+;; from the writer at run time rather than from a list someone kept in their
+;; head -- the near-miss list above got three of six wrong precisely because
+;; it was such a list, and a self-contradicting one
+(define (writer-takes? name) (guard (e (#t #f)) (sexpr->string (list 'x (sym name))) #t))
+(for-each
+  (lambda (name)
+    ;; NOT (symbol? r): the refusal marker is the symbol REFUSED, so every
+;; refusal counted as "read back as a symbol". Accepted means it read back
+    ;; as EXACTLY this name
+    (let* ((w (writer-takes? name)) (r (strict name)) (accepted (eq? r (sym name))))
+      (check (string-append "reader and writer agree on " name
+                            (if w " (writable, so readable)" " (unwritable, so refused)"))
+             (eq? w accepted) 'writer w 'reader r)))
+  '("+nan.0" "+inf.0" "-inf.0" "-nan.0" "+15" "+i" "+1/2" "-.5" ".5" ".5e2" "+I" "-NaN.0"
+    "+nan.00" "+inf" "inf.0" "nan.0" "+" "-" "..." "+a" "-a" "a+b" "abc" "a->b" "set!"
+    "+1a" "+1/0" ".5i" ".a" "x+15" "*-+<=>?!._%&^~:@"))
 
 (if (zero? fails)
     (begin (display "ALL SEXPR-PLUS-TOKENS TESTS PASSED\n") (exit 0))
