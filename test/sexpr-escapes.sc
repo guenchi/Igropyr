@@ -19,7 +19,15 @@
   (if ok (begin (display "  ok  ") (display label) (newline))
       (begin (set! fails (+ fails 1)) (display "FAIL  ") (display label)
              (for-each (lambda (x) (display " ") (write x)) info) (newline))))
-(define (read1 text) (guard (e (#t 'REFUSED)) (string->sexpr text)))
+;; A refusal must be THIS READER'S refusal. Turning every raised object into
+;; REFUSED would let an out-of-bounds access or an integer->char assertion
+;; satisfy a malformed-escape row, and the rows that claim "refused" would
+;; then also pass on a crash. The documented shape is #(sexpr-error msg pos).
+(define (read1 text)
+  (guard (e (#t (if (and (vector? e) (fx>= (vector-length e) 2) (eq? (vector-ref e 0) 'sexpr-error))
+                    'REFUSED
+                    (vector 'UNEXPECTED-EXCEPTION e))))
+    (string->sexpr text)))
 ;; a row: the text `(ok <datum>)` must read as the list (ok <want>)
 (define (accepts label text want)
   (let ((got (read1 (string-append "(ok " text ")"))))
@@ -28,6 +36,12 @@
   (let ((got (read1 (string-append "(ok " text ")"))))
     (check label (eq? got 'REFUSED) got text)))
 (define (q s) (string-append "\"" s "\""))
+;; the rows above wrap their text in "(ok ...)", which supplies a closing
+;; paren; an input that ENDS in an unfinished escape must be submitted whole,
+;; or the parser meets ")" where the cell means it to meet end of input
+(define (refuses-raw label text)
+  (let ((got (read1 text)))
+    (check label (eq? got 'REFUSED) got text)))
 (define (ch n) (string (integer->char n)))
 
 ;; ---- the five escapes that were refused ------------------------------------
@@ -64,12 +78,23 @@
 (refuses "no digits" (q "\\x;"))
 (refuses "no terminator" (q "\\x41"))
 (refuses "a non-hex digit" (q "\\xG1;"))
-(refuses "seven digits is past the bound" (q "\\x0010FFFF;"))
+;; the DIGIT COUNT bound, isolated from the value: both of these decode to A,
+;; so only the number of digits can separate them. The previous spelling of
+;; this row used \x0010FFFF; -- EIGHT digits, which an implementation allowing
+;; seven would have passed
+(accepts "six digits, all leading zeros" (q "\\x000041;") "A")
+(refuses "seven digits is past the bound, though the value is A" (q "\\x0000041;"))
 (refuses "past the last code point" (q "\\x110000;"))
 (refuses "a surrogate" (q "\\xD800;"))
 (refuses "the top of the surrogate block" (q "\\xDFFF;"))
 (refuses "an unknown escape letter is still unknown" (q "a\\qb"))
-(refuses "a dangling backslash" "\"a\\")
+(refuses-raw "input ends inside a string after a backslash" "(ok \"a\\")
+(refuses-raw "input ends after \\x" "(ok \"a\\x")
+(refuses-raw "input ends inside the hex digits" "(ok \"a\\x41")
+(refuses-raw "input ends inside a symbol's escape" "(ok a\\x41")
+(refuses-raw "input ends after a symbol's backslash" "(ok a\\")
+;; the vendored fixture's own dangling input, passed through unchanged
+(refuses-raw "the vendored read-dangling-escape input verbatim" "\"a\\")
 ;; ---- the astral row: a Chez string holds CODE POINTS, not bytes -----------------
 ;; a table lifted from an implementation whose strings hold UTF-8 bytes would
 ;; expect four here; this row is where that transplant shows
@@ -78,22 +103,30 @@
          (and (pair? got) (string? (cadr got)) (= (string-length (cadr got)) 1)
               (= (char->integer (string-ref (cadr got) 0)) #x1F600))
          got))
-;; ---- bounded WHILE consumed, not after -------------------------------------------
-;; 100000 hex digits: refused by the length bound, and the whole parse answers
-;; within a second. This is a BOUND witness, not a hang witness -- an escape
-;; that accumulated its digits before looking at the value would build an
-;; enormous integer first.
-;; NOTE ON THIS ROW'S EVIDENCE: before the widening it passes for a reason it
-;; does not name -- \x is not an escape at all yet, so the text is refused at
-;; the first character. It only discriminates once \x<hex>; is accepted, which
-;; is the state it exists for. Do not read its green on the old tree as cover.
-(let* ((huge (string-append "(ok \"\\x" (make-string 100000 #\9) ";\")"))
+;; ---- the digit run does not become an integer before it is bounded ------------
+;; What this row pins, exactly: that the run is NOT accumulated into an exact
+;; integer over its whole length. Measured on this machine, string->number on
+;; a hex run of 300000 nines takes 7949 ms (100000 takes 898 -- the cost is
+;; quadratic), so an implementation that converts first and checks afterwards
+;; cannot come back inside the bound below.
+;; What it does NOT pin, and neither does anything else here: whether the
+;; reader stops CONSUMING characters early. A reader that scans the whole run
+;; and then refuses does linear work in its input, which is proportional and
+;; not the amplifier this batch is about; separating "stopped scanning" from
+;; "scanned then refused" needs a work budget around the scanner, recorded as
+;; a residual rather than pretended here.
+;; A value-based early exit (stop once the accumulated value passes the code
+;; point ceiling) also answers fast and is legitimate; the DIGIT COUNT rule is
+;; pinned separately by the six/seven-digit pair above, where the value is A
+;; either way.
+(let* ((huge (string-append "(ok \"\\x" (make-string 300000 #\9) ";\")"))
        (t0 (real-time))
        (got (read1 huge))
        (ms (- (real-time) t0)))
-  (check "100000 hex digits are refused" (eq? got 'REFUSED) got)
-  (check "...and the parse answers within a second (the run is bounded while consumed)"
+  (check "300000 hex digits are refused" (eq? got 'REFUSED) got)
+  (check "...within a second, so the run was never converted whole (it would take ~8 s)"
          (< ms 1000) ms))
+
 ;; ---- symbols: the escape DISAMBIGUATES a name, it does not EXTEND the set ----------
 (accepts "a symbol may carry a hex escape" "a\\x41;b" 'aAb)
 (accepts "a symbol escape at the start" "\\x41;bc" 'Abc)
@@ -106,6 +139,87 @@
 ;; side wider than the write side
 (refuses "a decoded name the WRITER could not write: the symbol 1" "\\x31;")
 (refuses "the same for a numeric-shaped name spelled partly with escapes" "\\x31;23")
+;; ---- ADDITIVITY: a name the reader accepts today must still be accepted -----------
+;; The gap this pins is exactly the leading-plus family: +15, +i and +nan.0 read
+;; as symbols here and sexpr->string then refuses them, because the reader's
+;; numeric-shape? looks only for a leading digit or '-' plus a digit while
+;; wire-symbol? asks string->number. That is PRE-EXISTING and out of scope; what
+;; matters here is that the new rule reaches decoded ESCAPED names only. An
+;; implementation that ran wire-symbol? over every token would narrow the format
+;; and still pass every other row in this file.
+;; The reader admits some bare tokens wire-symbol? refuses -- +i is one, and
+;; it is accepted here today while sexpr->string raises on it. So the new rule
+;; must be applied to a DECODED ESCAPED name only, never to every token: an
+;; implementation that ran wire-symbol? over all tokens would pass every other
+;; row in this file and silently narrow the format.
+(accepts "bare +i is still accepted (it was before this change)" "+i" (string->symbol "+i"))
+(accepts "bare +15 is still accepted" "+15" (string->symbol "+15"))
+(accepts "bare +nan.0 is still accepted" "+nan.0" (string->symbol "+nan.0"))
+(accepts "bare + and - are symbols and are writable" "+" (string->symbol "+"))
+(refuses "but the same name spelled with an escape is refused" "\\x2B;i")
+(refuses "and so is a partly escaped spelling of it" "+\\x69;")
+
+;; ---- why the R6RS objection to refusing \x31; does not apply ----------------------
+;; The objection is that an inline hex escape is identifier syntax in R6RS, so
+;; \x31; ought to be the symbol 1. These rows record the premise that answers
+;; it: this reader was never an R6RS reader, its symbol set was already
+;; narrower than R6RS's before any escape existed, so one escape is not being
+;; held to a standard the surrounding grammar implements. If a later change
+;; makes these three read, the ruling has to be re-argued rather than inherited.
+(refuses "a$b is a legal R6RS identifier and this reader refuses it" "a$b")
+(refuses "a#b likewise" "a#b")
+(refuses "|a b| likewise" "|a b|")
+(accepts "while a->b and set! read, as they always did" "a->b" (string->symbol "a->b"))
+
+;; ---- the escape and the token length bound ----------------------------------------
+;; default-max-token is 65536 and bounds the DECODED name, not the source text:
+;; 65531 letters plus one six-character escape is 65532 characters decoded and
+;; 65537 on the wire. The bound is unchanged by this batch; these rows say which
+;; length it counts, so a future reading of "length" cannot drift unnoticed.
+(let* ((n 65531)
+       (body (make-string n #\a)))
+  (accepts "a decoded name just inside the bound, with an escape at its end"
+           (string-append body "\\x41;")
+           (string->symbol (string-append body "A")))
+  (refuses "a decoded name past the bound"
+           (string-append (make-string 65536 #\a) "\\x41;")))
+;; strings are explicitly NOT under the token cap (sexpr.sc says so); a long
+;; string, raw or escaped, still reads
+(let ((n 70000))
+  (accepts "a string longer than the token cap still reads, raw"
+           (q (make-string n #\a)) (make-string n #\a))
+  (accepts "...and with an escape in it"
+           (string-append (q (string-append (make-string n #\a) "\\x41;")))
+           (string-append (make-string n #\a) "A")))
+
+;; ---- decoded characters are VALUES, not syntax ---------------------------------------
+;; \x22; is a quote and \x5C; a backslash: if the decoded character were fed
+;; back through the tokenizer, these would end the string or start an escape
+(accepts "a hex-decoded quote does not end the string" (q "a\\x22;b") "a\"b")
+(accepts "a hex-decoded backslash does not start an escape" (q "a\\x5C;nb")
+         (string-append "a\\" "nb"))
+(accepts "a hex-decoded backslash before a real escape" (q "\\x5C;\\n")
+         (string-append "\\" (ch 10)))
+;; the same for symbols: a decoded dot or plus is part of the NAME
+(accepts "a symbol with a decoded dot" "a\\x2E;b" (string->symbol "a.b"))
+(refuses "a decoded name that is just a dot" "\\x2E;")
+(refuses "a decoded name that is a complex numeral" "\\x2B;\\x69;")
+
+;; ---- the code point boundaries on both sides of the surrogate block ---------------------
+(accepts "the scalar just below the surrogates" (q "\\xD7FF;") (ch #xD7FF))
+(accepts "the scalar just above the surrogates" (q "\\xE000;") (ch #xE000))
+(refuses "a surrogate in the middle of the block" (q "\\xDC00;"))
+(accepts "the last scalar below the astral planes" (q "\\xFFFF;") (ch #xFFFF))
+
+;; ---- the extended entry point reads the same escapes ------------------------------------
+;; string->sexpr-extended is a second door into the same grammar; a widening
+;; applied at one door only is a drift between two entry points of one library
+(let ((got (guard (e (#t 'REFUSED)) (string->sexpr-extended (string-append "(ok " (q "a\\fb") ")")))))
+  (check "the extended reader takes the new escapes too"
+         (equal? got (list 'ok (string-append "a" (ch 12) "b"))) got))
+(let ((got (guard (e (#t 'REFUSED)) (string->sexpr-extended (string-append "(ok " (q "\\x41;") ")")))))
+  (check "the extended reader takes \\x<hex>; too" (equal? got '(ok "A")) got))
+
 ;; ---- the pair is still closed: read, write, read again ------------------------------
 (for-each
   (lambda (label text)
