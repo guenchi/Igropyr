@@ -53,6 +53,24 @@
 (check "a bare dot is refused" (eq? (guard (e (#t 'REFUSED)) (string->sexpr ".")) 'REFUSED))
 (check "a dotted pair still reads" (equal? (guard (e (#t 'REFUSED)) (string->sexpr "(x . a)")) '(x . a))
        (guard (e (#t 'REFUSED)) (string->sexpr "(x . a)")))
+;; A SHAPE THAT IS NOT A BARE TOKEN and changes side with this batch: the first
+;; dot is eaten by the list parser as the pair marker, the SECOND goes through
+;; parse-atom, so (x . .) used to build a pair whose cdr is the symbol "." --
+;; a pair the writer refuses to write. It is refused now, which is the
+;; invariant applied in a position the single-token corpus never reaches
+(check "(x . .) is refused: its cdr would be a symbol the writer cannot write"
+       (eq? (guard (e (#t 'REFUSED)) (string->sexpr "(x . .)")) 'REFUSED)
+       (guard (e (#t 'REFUSED)) (string->sexpr "(x . .)")))
+(check "(a b . .) likewise" (eq? (guard (e (#t 'REFUSED)) (string->sexpr "(a b . .)")) 'REFUSED))
+(check "and the writer does refuse that pair"
+       (guard (e (#t #t)) (sexpr->string (cons 'x (string->symbol "."))) #f))
+;; THE TOKEN CAP BOUNDS THE CHANGE. A name past the cap was refused before and
+;; is refused now, by the cap and not by this rule, so it does NOT change side:
+;; the rule's domain is tokens within the cap. The pair below is the boundary
+(check "a +-and-zeros name inside the cap changes side (refused now)"
+       (eq? (verdict string->sexpr (string-append "+" (make-string 65535 #\0))) 'REFUSED))
+(check "one past the cap was already refused, by the cap"
+       (eq? (verdict string->sexpr (string-append "+" (make-string 65536 #\0))) 'REFUSED))
 (for-each (lambda (t) (check (string-append "strict: " t " stays a symbol (not a complete numeral)") (eq? (strict t) (sym t)) (strict t)))
           '("+1a" "+1/0" ".5i" ".a" "-a"))
 
