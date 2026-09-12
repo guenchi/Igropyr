@@ -172,17 +172,29 @@
 (accepts "while a->b and set! read, as they always did" "a->b" (string->symbol "a->b"))
 
 ;; ---- the escape and the token length bound ----------------------------------------
-;; default-max-token is 65536 and bounds the DECODED name, not the source text:
-;; 65531 letters plus one six-character escape is 65532 characters decoded and
-;; 65537 on the wire. The bound is unchanged by this batch; these rows say which
-;; length it counts, so a future reading of "length" cannot drift unnoticed.
-(let* ((n 65531)
-       (body (make-string n #\a)))
-  (accepts "a decoded name just inside the bound, with an escape at its end"
-           (string-append body "\\x41;")
-           (string->symbol (string-append body "A")))
-  (refuses "a decoded name past the bound"
-           (string-append (make-string 65536 #\a) "\\x41;")))
+;; default-max-token is 65536 and it bounds the RAW span, not the decoded name.
+;; Measured, because the first version of these rows asserted the opposite and
+;; neither of them could tell: 65531 letters plus "\\x41;" is 65536 raw and 65532
+;; decoded and is ACCEPTED, while 65532 letters plus the same escape is 65537 raw
+;; and 65533 decoded and is REFUSED -- so the count that matters is the one on
+;; the wire. That is the right bound: it limits the work before any of it is
+;; done, and decoding only ever shortens.
+(let ((esc "\\x41;"))
+  (accepts "raw length exactly at the cap, with an escape at its end"
+           (string-append (make-string 65531 #\a) esc)
+           (string->symbol (string-append (make-string 65531 #\a) "A")))
+  ;; THE ROW THAT SEPARATES THE TWO READINGS: decoded is inside the cap, raw is
+  ;; one past it, and a cap on the decoded name would accept this
+  (refuses "raw length one past the cap, though the DECODED name is inside it"
+           (string-append (make-string 65532 #\a) esc))
+  (refuses "raw length well past the cap"
+           (string-append (make-string 65536 #\a) esc))
+  (accepts "a bare name exactly at the cap" (make-string 65536 #\a)
+           (string->symbol (make-string 65536 #\a)))
+  (refuses "a bare name one past it" (make-string 65537 #\a)))
+;; the escape's span is hex digits and a ';', none of which is a delimiter, so a
+;; token may end at the semicolon and the next datum still parses
+(accepts "a symbol whose last character is the escape's semicolon" "a\\x41;" (string->symbol "aA"))
 ;; strings are explicitly NOT under the token cap (sexpr.sc says so); a long
 ;; string, raw or escaped, still reads
 (let ((n 70000))

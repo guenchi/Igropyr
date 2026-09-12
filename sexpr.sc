@@ -44,14 +44,32 @@
 ;;; test/sexpr-vectors.json names (igropyr sexpr) as the authority and
 ;;; the commit it was generated from, and the other side is regenerated
 ;;; against it. Two independent implementations agreeing is a different
-;;; claim and is not the one being made. Strings
-;;; escape only \" and \\ on the wire -- a literal newline inside a
-;;; string is legal; \n \t \r are also accepted when reading.
+;;; claim and is not the one being made.
+;;;
+;;; THE WRITER AND THE READER ARE DELIBERATELY NOT THE SAME WIDTH, and
+;;; the direction matters. The writer escapes two characters and no
+;;; others -- the double quote and the backslash. Every control
+;;; character goes out as a raw byte, which is legal in
+;;; this grammar and loses nothing -- our own write/read pair is closed.
+;;; The reader is wider because it also has to accept what OTHER writers
+;;; of this format emit: a conforming R6RS `write` renders a form feed
+;;; as \f, and refusing that made text produced by any other Scheme
+;;; unreadable here. So reading accepts \a \b \t \n \v \f \r \" \\
+;;; and \x<hex>;, and raw control characters as before.
+;;;
+;;; Symbols accept \x<hex>; too, and the DECODED name must still be one
+;;; this library's writer could have produced (wire-symbol?). An escape
+;;; disambiguates a name; it does not extend the set of names this
+;;; format has.
 
 (library (igropyr sexpr)
   (export string->sexpr sexpr->string
           string->sexpr-extended sexpr->string-extended)
-  (import (chezscheme) (only (igropyr crypto) base64-encode base64-decode))
+  (import (chezscheme) (only (igropyr crypto) base64-encode base64-decode)
+          ;; hex-digits->exact: the tree's one supplier for "text from
+          ;; outside, converted only after its shape is checked". The
+          ;; escape below is external text by definition.
+          (only (igropyr util) hex-digits->exact))
 
   (define default-max-depth 64)
   ;; Cap on a single atom token (symbol or number). Bounds two costs an
@@ -112,6 +130,52 @@
               (else
                (let-values (((v j) (parse-value i (+ depth 1))))
                  (loop j (cons v acc))))))))
+      ;; ---- escapes -----------------------------------------------------
+      ;;
+      ;; \x<hex>; IS THE ONLY VARIABLE-LENGTH FORM IN THIS GRAMMAR. Every
+      ;; other escape is two characters, and the loops below used to
+      ;; advance by that constant; each caller is now handed back the
+      ;; index to continue from instead.
+      (define max-hex-digits 6)
+      ;; THE DIGIT RUN IS BOUNDED WHILE IT IS SCANNED, NOT AFTER IT.
+      ;; At most max-hex-digits + 1 positions are examined, so a hundred
+      ;; thousand hex digits cost a constant HERE rather than a full scan
+      ;; and then a refusal. That is the shape this tree removed
+      ;; everywhere else on 2026-09-11: bounded-looking input asking for
+      ;; unbounded work, with the check that would have stopped it placed
+      ;; after the work rather than before.
+      ;;
+      ;; "HERE" IS THE WHOLE OF THE CLAIM, and the rest of the token path
+      ;; is not constant: parse-atom scans to a delimiter before it
+      ;; applies the token cap, so an over-long token costs one pass over
+      ;; its characters whether or not it contains an escape (measured:
+      ;; 16 MB of token, 33 ms with an escape and 35 ms without -- the
+      ;; escape adds nothing, the scan is the cost). That pass is
+      ;; proportional to input the sender already had to transmit and is
+      ;; bounded upstream by the frame and body size limits; it predates
+      ;; escapes entirely.
+      (define (hex-escape-end i)
+        (let lp ((j i))
+          (and (< j n)
+               (<= (- j i) max-hex-digits)
+               (if (char=? (string-ref s j) #\;) j (lp (+ j 1))))))
+      ;; i is the index of the first character after the "x", so the
+      ;; backslash that opened the escape is at i - 2 and that is the
+      ;; position a failure reports.
+      ;; -> (values char index-after-the-semicolon)
+      (define (read-hex-escape i what)
+        (let ((j (hex-escape-end i)))
+          (unless j (sfail what (- i 2)))
+          ;; The text handed to the supplier is at most max-hex-digits
+          ;; characters long, and the supplier is what decides whether it
+          ;; is hex at all: no conversion here ever sees text whose shape
+          ;; was not checked first.
+          (let ((v (hex-digits->exact (substring s i j) max-hex-digits)))
+            (unless (and v
+                         (< v #x110000)
+                         (not (and (>= v #xD800) (<= v #xDFFF))))
+              (sfail what (- i 2)))
+            (values (integer->char v) (+ j 1)))))
       (define (parse-string i)
         (let loop ((i i) (acc '()))
           (when (>= i n) (sfail "unterminated string" i))
@@ -122,13 +186,24 @@
               ((char=? c #\\)
                (when (>= (+ i 1) n) (sfail "dangling escape" i))
                (let ((e (string-ref s (+ i 1))))
-                 (loop (+ i 2)
-                       (cons (case e
-                               ((#\n) #\newline) ((#\t) #\tab)
-                               ((#\r) #\return)
-                               ((#\" #\\) e)
-                               (else (sfail "bad string escape" i)))
-                             acc))))
+                 ;; LOWERCASE x ONLY. R6RS spells the escape itself in
+                 ;; lower case and lets only the DIGITS vary in case, so
+                 ;; \X is not something a conforming writer emits and
+                 ;; accepting it would widen the format past its source.
+                 (if (char=? e #\x)
+                     (let-values (((ch j)
+                                   (read-hex-escape (+ i 2)
+                                                    "bad string escape")))
+                       (loop j (cons ch acc)))
+                     (loop (+ i 2)
+                           (cons (case e
+                                   ((#\a) #\alarm) ((#\b) #\backspace)
+                                   ((#\t) #\tab)   ((#\n) #\newline)
+                                   ((#\v) #\vtab)  ((#\f) #\page)
+                                   ((#\r) #\return)
+                                   ((#\" #\\) e)
+                                   (else (sfail "bad string escape" i)))
+                                 acc)))))
               (else (loop (+ i 1) (cons c acc)))))))
       (define (parse-hash i depth)
         (when (>= i n) (sfail "dangling #" i))
@@ -247,19 +322,82 @@
                  (or (char<=? #\0 c #\9)
                      (and (char=? c #\-) (> m 1)
                           (char<=? #\0 (string-ref tok 1) #\9)))))))
+      ;; Asked before anything else, because an escaped token is a symbol
+      ;; by construction: no number in this grammar has an escape form,
+      ;; and the character walk below answers "is this character legal in
+      ;; a name", which a backslash is not.
+      (define (token-escaped? i j)
+        (let lp ((k i))
+          (and (< k j)
+               (or (char=? (string-ref s k) #\\) (lp (+ k 1))))))
+      ;; An escape's span is hex digits and a ';', none of which is a
+      ;; delimiter, so a well-formed escape cannot reach past j; a
+      ;; malformed one is refused by read-hex-escape rather than by a
+      ;; second bound here.
+      (define (decode-token i j)
+        (let-values (((p get) (open-string-output-port)))
+          (let lp ((k i))
+            (cond
+              ((>= k j) (get))
+              ((char=? (string-ref s k) #\\)
+               (unless (and (< (+ k 1) j)
+                            (char=? (string-ref s (+ k 1)) #\x))
+                 (sfail "bad token escape" k))
+               (let-values (((ch m)
+                             (read-hex-escape (+ k 2) "bad token escape")))
+                 (write-char ch p)
+                 (lp m)))
+              (else (write-char (string-ref s k) p) (lp (+ k 1)))))))
       ;; No decimal flonum text on the wire in EITHER mode: a flonum
       ;; crosses only as #f8"<base64>" (extended), so a numeric-shaped
       ;; token carrying '.' or an exponent is always a bad number.
       (define (parse-atom i)
         (let ((j (let lp ((j i))
                    (if (or (>= j n) (delim? (string-ref s j))) j (lp (+ j 1))))))
+          ;; The cap is applied to the RAW span, before decoding: it
+          ;; bounds the work, and decoding only ever shortens.
           (when (> (- j i) default-max-token) (sfail "token too long" i))
-          (let ((tok (substring s i j)))
-            (cond
-              ((token->number tok) => (lambda (v) (values v j)))
-              ((numeric-shape? tok) (sfail "bad number" i))
-              ((valid-symbol? tok) (values (string->symbol tok) j))
-              (else (sfail "bad token" i))))))
+          (if (token-escaped? i j)
+              ;; HELD TO wire-symbol?, WHICH IS THE WRITER'S OWN SET, and
+              ;; that is the ruling this form turns on. R6RS treats an
+              ;; inline hex escape as identifier syntax, so \x31; is the
+              ;; symbol |1| there. This format's symbol set is not
+              ;; R6RS's: the writer REFUSES |1| because its name has
+              ;; numeric shape, and accepting a name we cannot write back
+              ;; would make the read side wider than the write side -- a
+              ;; value you can receive and cannot echo. An escape
+              ;; disambiguates a name; it does not extend the set.
+              ;;
+              ;; The order inside wire-symbol? is load-bearing here: it
+              ;; walks the characters BEFORE it asks string->number, and a
+              ;; decoded name is arbitrary text -- this decoder is a new
+              ;; supplier of exactly that. The walk admits no '#', so no
+              ;; exactness prefix can reach the conversion.
+              ;;
+              ;; THIS IS THE READER'S FIRST CALLER OF wire-symbol?, whose
+              ;; last conjunct is a full numeric conversion, and it is
+              ;; worth stating what that costs and what it does not.
+              ;; Measured at 60000 characters: a bare `+<digits>` name is
+              ;; a symbol in 0 ms because the plain path never converts
+              ;; it, while the same name spelled `\x2b;<digits>` costs
+              ;; 279 ms here. The CEILING is not new -- a bare numeral of
+              ;; the same length is 283 ms today, which is what accepting
+              ;; big integers costs and is bounded by the token cap --
+              ;; but this is a second route to it, and the two spellings
+              ;; of one name are not equally cheap. Recorded rather than
+              ;; smoothed over: narrowing it means changing which
+              ;; predicate an escaped name is held to, which is a
+              ;; decision about the format and not about this loop.
+              (let ((name (decode-token i j)))
+                (if (wire-symbol? name)
+                    (values (string->symbol name) j)
+                    (sfail "bad token" i)))
+              (let ((tok (substring s i j)))
+                (cond
+                  ((token->number tok) => (lambda (v) (values v j)))
+                  ((numeric-shape? tok) (sfail "bad number" i))
+                  ((valid-symbol? tok) (values (string->symbol tok) j))
+                  (else (sfail "bad token" i)))))))
       (let-values (((v i) (parse-value 0 0)))
         (unless (= (skip i) n) (sfail "trailing data after datum" i))
         v)))
@@ -364,10 +502,15 @@
   ;; and treats "." as the improper-list marker. So a symbol whose name
   ;; reads back as a number (|12|, |1.5|) or as the dot would return
   ;; from the wire as a DIFFERENT datum -- an integer instead of a
-  ;; symbol, or an improper pair instead of a 3-element list. There is
-  ;; no escaped symbol form in this grammar, so such symbols are
-  ;; refused by the writer (the whole point of the whitelist) rather
-  ;; than silently corrupted in transit.
+  ;; symbol, or an improper pair instead of a 3-element list. So such
+  ;; symbols are refused by the writer (the whole point of the
+  ;; whitelist) rather than silently corrupted in transit.
+  ;;
+  ;; THE READER NOW HAS AN ESCAPED SYMBOL FORM AND THAT DOES NOT CHANGE
+  ;; THIS. \x<hex>; lets a sender disambiguate a name, and the reader
+  ;; holds the DECODED name to this very predicate -- so |12| is no more
+  ;; receivable than it is writable, and this whitelist is still the one
+  ;; description of the format's symbol set rather than one of two.
   ;;
   ;; THE QUESTION IS WHAT THE READER WILL DO WITH THE NAME, NOT WHAT
   ;; CHEZ THINKS OF IT. string->number alone was the wrong judge, and
