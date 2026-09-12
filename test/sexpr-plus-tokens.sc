@@ -40,22 +40,47 @@
 (for-each (lambda (t) (check (string-append "strict: " t " is still a symbol") (eq? (strict t) (sym t)) (strict t)))
           '("+" "-" "..." "+a" "a+b" "a->b" "set!" "*-+<=>?!._%&^~:@"))
 (check "strict: a plus inside a name is fine" (eq? (strict "x+15") (sym "x+15")) (strict "x+15"))
+;; the rest of the refusal set: the bare dot, and dot- or sign-leading tokens
+;; that Chez reads as numbers. Complete-token recognition: +1a, +1/0, .5i, ...
+;; are NOT numbers and stay symbols
+(for-each (lambda (t) (check (string-append "strict refuses " t " (a numeral in Chez's eyes, unwritable here)") (eq? (strict t) 'REFUSED) (strict t)))
+          '("." "-.5" ".5" "+1/2" ".5e2" "-NaN.0" "+I"))
+(check "strict refuses the bare dot inside a list too" (eq? (verdict string->sexpr ". a") 'REFUSED) (verdict string->sexpr ". a"))
+(for-each (lambda (t) (check (string-append "strict: " t " stays a symbol (not a complete numeral)") (eq? (strict t) (sym t)) (strict t)))
+          '("+1a" "+1/0" ".5i" ".a" "-a"))
 
 ;; ---- EXTENDED: the three spellings read as flonums ----------------------------------
 (let ((v (ext "+nan.0")))
   (check "extended: +nan.0 is a NaN flonum" (and (flonum? v) (nan? v)) v))
 (check "extended: +inf.0 is +inf.0" (and (flonum? (ext "+inf.0")) (= (ext "+inf.0") +inf.0)) (ext "+inf.0"))
 (check "extended: -inf.0 is -inf.0" (and (flonum? (ext "-inf.0")) (= (ext "-inf.0") -inf.0)) (ext "-inf.0"))
+;; nested positions go through the same atom parser: a vector element, a pair
+;; tail, and after the symbol quote (which is only a symbol in this grammar).
+;; NaN is asserted with nan?, never with =
+(let ((v (guard (e (#t 'REFUSED)) (string->sexpr-extended "#(+nan.0)"))))
+  (check "extended: +nan.0 inside a vector is a NaN" (and (vector? v) (= (vector-length v) 1) (flonum? (vector-ref v 0)) (nan? (vector-ref v 0))) v))
+(let ((v (guard (e (#t 'REFUSED)) (string->sexpr-extended "(a . +inf.0)"))))
+  (check "extended: +inf.0 as a pair tail" (and (pair? v) (flonum? (cdr v)) (= (cdr v) +inf.0)) v))
+(let ((v (guard (e (#t 'REFUSED)) (string->sexpr-extended "(quote -inf.0)"))))
+  (check "extended: -inf.0 after the symbol quote is still the number" (and (pair? v) (pair? (cdr v)) (flonum? (cadr v)) (= (cadr v) -inf.0)) v))
+;; the spellings are exact: case and sign matter
+(for-each (lambda (t) (check (string-append "extended refuses the near-miss " t) (eq? (ext t) 'REFUSED) (ext t)))
+          '("+NaN.0" "+Inf.0" "-Nan.0" "+nan.00" "+inf" "inf.0"))
 ;; ...and nothing else becomes a number
 (for-each (lambda (t) (check (string-append "extended refuses " t) (eq? (ext t) 'REFUSED) (ext t)))
           '("-nan.0" "1.5" "1e3" "+15" "+i" "+1" "+5"))
 (for-each (lambda (t) (check (string-append "extended: " t " is still a symbol") (eq? (ext t) (sym t)) (ext t)))
           '("+" "+a" "a+b" "nan.0" "inf.0"))
 ;; the writer keeps its own spelling: read the conforming one, write ours, read again
-(let* ((v (ext "+inf.0")) (w (sexpr->string-extended (list 'x v))))
-  (check "extended round trip: +inf.0 -> #f8 -> +inf.0" (and (string? w) (= (ext (substring w 3 (- (string-length w) 1))) +inf.0)) w))
-(let* ((v (ext "+nan.0")) (w (sexpr->string-extended (list 'x v))))
-  (check "extended round trip: NaN -> #f8 -> NaN" (and (string? w) (nan? (ext (substring w 3 (- (string-length w) 1))))) w))
+;; the write is guarded: on the old tree the value is a SYMBOL the writer
+;; refuses, and a row may be red there but must not take the file down
+(define (write-ext v) (guard (e (#t 'WRITE-REFUSED)) (sexpr->string-extended (list 'x v))))
+(let* ((v (ext "+inf.0")) (w (write-ext v)))
+  (check "extended round trip: +inf.0 -> #f8 -> +inf.0"
+         (and (string? w) (let ((back (ext (substring w 3 (- (string-length w) 1))))) (and (flonum? back) (= back +inf.0)))) w))
+(let* ((v (ext "+nan.0")) (w (write-ext v)))
+  (check "extended round trip: NaN -> #f8 -> NaN"
+         (and (string? w) (let ((back (ext (substring w 3 (- (string-length w) 1))))) (and (flonum? back) (nan? back)))) w))
 (check "extended: the writer still emits #f8, never +inf.0"
        (let ((w (sexpr->string-extended (list 'x +inf.0)))) (and (string? w) (not (string=? w "(x +inf.0)")) (string=? (substring w 0 7) "(x #f8\"")))
        (sexpr->string-extended (list 'x +inf.0)))
@@ -66,19 +91,32 @@
 ;; the first character hex-escaped; a name is a name however it is spelled
 (define (escaped-first t)
   (string-append "\\x" (number->string (char->integer (string-ref t 0)) 16) ";" (substring t 1 (string-length t))))
+;; in STRICT, for every candidate name: one verdict however it is spelled
 (for-each
   (lambda (t)
     (let ((a (strict t)) (b (strict (escaped-first t))))
-      (check (string-append "bare and escaped agree on " t) (equal? a b) a b (escaped-first t))))
-  '("+15" "+i" "+nan.0" "+a" "abc" "a->b" "+" "..."))
+      (check (string-append "strict: bare and escaped agree on " t) (equal? a b) a b (escaped-first t))))
+  '("+15" "+i" "+nan.0" "-.5" "." "+a" "abc" "a->b" "+" "..."))
+;; in EXTENDED the three literals are the one exemption: bare +nan.0 is a
+;; flonum and an escape can only ever spell a SYMBOL, so \x2b;nan.0 stays
+;; refused. Everything else agrees
+(for-each
+  (lambda (t)
+    (let ((a (ext t)) (b (ext (escaped-first t))))
+      (check (string-append "extended: bare and escaped agree on " t) (equal? a b) a b (escaped-first t))))
+  '("+15" "+i" "-nan.0" "-.5" "." "+a" "abc" "+"))
+(check "extended: the escaped spelling of +nan.0 is refused (it can only name a symbol)" (eq? (ext (escaped-first "+nan.0")) 'REFUSED) (ext (escaped-first "+nan.0")))
 
 ;; ---- the two vendored rows that move ---------------------------------------------------
-;; read-plus-int (+1) and read-plus-five (+5) were generated from the hole and
-;; recorded as accepted; they are refused now. test/sexpr-fixture-read.sc
+;; read-plus-int (+1), read-plus-five (+5), read-dot-alone (.) and read-symbol-dot
+;; ((. a)) were generated from the hole and recorded as accepted; they are
+;; refused now. test/sexpr-fixture-read.sc
 ;; names them on its exception list -- a row moving sides has to be named in
 ;; both places
 (check "golden read-plus-int now refuses" (eq? (ext "+1") 'REFUSED) (ext "+1"))
 (check "golden read-plus-five now refuses" (eq? (ext "+5") 'REFUSED) (ext "+5"))
+(check "golden read-dot-alone now refuses" (eq? (verdict string->sexpr-extended ".") 'REFUSED))
+(check "golden read-symbol-dot now refuses" (eq? (guard (e (#t 'REFUSED)) (string->sexpr-extended "(. a)")) 'REFUSED))
 
 (if (zero? fails)
     (begin (display "ALL SEXPR-PLUS-TOKENS TESTS PASSED\n") (exit 0))

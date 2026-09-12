@@ -152,11 +152,18 @@
 ;; must be applied to a DECODED ESCAPED name only, never to every token: an
 ;; implementation that ran wire-symbol? over all tokens would pass every other
 ;; row in this file and silently narrow the format.
-(accepts "bare +i is still accepted (it was before this change)" "+i" (string->symbol "+i"))
-(accepts "bare +15 is still accepted" "+15" (string->symbol "+15"))
-(accepts "bare +nan.0 is still accepted" "+nan.0" (string->symbol "+nan.0"))
+;; 2026-09-12, SAME DAY, OVERTURNED BY A RULING: the three rows below used to
+;; assert that bare +i, +15 and +nan.0 STAY accepted, because the escape batch
+;; promised additivity. The leading-plus ruling (see test/sexpr-plus-tokens.sc)
+;; then made the bare path hold names to wire-symbol? too, so a conforming
+;; writer's +nan.0 stops reading as a symbol. These rows now assert the ruled
+;; behaviour, and the reason the escape batch's rule survives is unchanged:
+;; it reaches decoded ESCAPED names, and now bare names as well
+(refuses "bare +i is refused (ruling 2026-09-12; it was accepted before)" "+i")
+(refuses "bare +15 is refused (same ruling)" "+15")
+(refuses "bare +nan.0 is refused in the strict profile (same ruling)" "+nan.0")
 (accepts "bare + and - are symbols and are writable" "+" (string->symbol "+"))
-(refuses "but the same name spelled with an escape is refused" "\\x2B;i")
+(refuses "and the same name spelled with an escape is refused too: one verdict" "\\x2B;i")
 (refuses "and so is a partly escaped spelling of it" "+\\x69;")
 
 ;; ---- why the R6RS objection to refusing \x31; does not apply ----------------------

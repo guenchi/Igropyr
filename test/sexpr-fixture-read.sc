@@ -98,8 +98,10 @@
 
 ;; rows whose FILE verdict is known to be stale, by name, with the reason
 (define known-moved
-  '(("read-plus-int"  . "2026-09-12 ruling: a leading + on a digit is refused; generated from the hole")
-    ("read-plus-five" . "2026-09-12 ruling: a leading + on a digit is refused; generated from the hole")))
+  '(("read-plus-int"   . "2026-09-12 ruling: a bare name the writer cannot write is refused (+1); generated from the hole")
+    ("read-plus-five"  . "2026-09-12 ruling: same (+5)")
+    ("read-symbol-dot" . "2026-09-12 ruling: same -- the bare dot is a name the writer refuses ((. a))")
+    ("read-dot-alone"  . "2026-09-12 ruling: same (.)")))
 
 (define (reads? bv)
   (guard (e (#t (if (and (vector? e) (fx>= (vector-length e) 2) (eq? (vector-ref e 0) 'sexpr-error)) 'REFUSED (vector 'UNEXPECTED e))))
