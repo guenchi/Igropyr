@@ -557,6 +557,8 @@ IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script tes
 IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/gzip-q.sc
 IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-poison.sc
 IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-escapes.sc
+IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-plus-tokens.sc
+IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-fixture-read.sc
 IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/s3-xml-ref.sc
 IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/listen-stdout.sc
 IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/panic-stderr.sc
