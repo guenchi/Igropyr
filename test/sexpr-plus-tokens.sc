@@ -173,6 +173,16 @@
     "+nan.00" "+inf" "inf.0" "nan.0" "+" "-" "..." "+a" "-a" "a+b" "abc" "a->b" "set!"
     "+1a" "+1/0" ".5i" ".a" "x+15" "*-+<=>?!._%&^~:@"))
 
+;; ---- THE TOKEN WHERE LOOKING AND ASKING DISAGREE ----------------------------------
+;; Every other row in this file answers the same under "refuse a leading +" and
+;; under "ask the writer". Only these separate them, and they are the shape a
+;; reader of the prose gets wrong: a consumer of the other implementation
+;; narrowed their own core against a changelog sentence that had flattened the
+;; rule into one about how a token starts. The rows above test the code, which
+;; was right; nothing tested the description.
+(for-each (lambda (t) (check (string-append "a leading + is NOT the rule: " t " is still a symbol") (eq? (strict t) (sym t)) (strict t)))
+          '("+x" "+xyz" "+_" "+." "+-"))
+
 (if (zero? fails)
     (begin (display "ALL SEXPR-PLUS-TOKENS TESTS PASSED\n") (exit 0))
     (begin (display "SEXPR-PLUS-TOKENS VERDICT: ") (display fails) (display " failed case(s)\n") (exit 1)))
