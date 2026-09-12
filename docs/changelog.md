@@ -1,5 +1,72 @@
 # Changelog
 
+## 1.7.1 — 2026-09-12
+
+*11 commits.* The S-expression reader accepts the escapes and the numerals a
+conforming writer emits, and refuses the names this format's writer cannot
+write.
+
+### Fixed
+
+- **A conforming writer's NaN read as a symbol.** `+nan.0`, `+inf.0` and
+  `-inf.0` are what every R6RS writer emits for NaN and the infinities; this
+  reader turned each into a SYMBOL of that name, silently, while `1.5` from
+  the same writer was refused out loud. The shape check behind it caught a
+  leading digit or `-` plus a digit, so a leading `+`, a `-` before a
+  non-digit, and a leading `.` fell through to the symbol path.
+
+  `string->sexpr-extended` now reads exactly `+nan.0`, `+inf.0` and `-inf.0`
+  as flonums. Nothing else becomes a number: not `-nan.0`, which no
+  conforming writer emits, and not `1.5`, because that profile spells a
+  flonum `#f8"..."`, bit-exact by design. `string->sexpr` refuses all three:
+  the strict profile carries no flonum, so there is nothing for them to be.
+
+- **The reader refused escapes any other writer emits.** It took `\n \t \r
+  \" \\` and nothing else, so `(ok "a\fb")` -- what a conforming `write`
+  produces for a string holding a form feed -- was answered with
+  `bad string escape`. Strings now take `\a \b \t \n \v \f \r \" \\`
+  and `\x<hex>;`; symbols take `\x<hex>;`. Nothing was lost before this: the
+  library's own writer emits raw control bytes and its read/write pair was
+  closed. What was refused was text from every OTHER writer of a format this
+  library is the named authority for.
+
+  The hex escape takes a lowercase `x`, one to six digits and a semicolon,
+  and the value must be a code point outside the surrogate block. The digit
+  run is bounded while it is scanned, so a hundred thousand hex digits cost a
+  constant rather than a conversion.
+
+### Breaking
+
+- **A bare token is read as a symbol only if the writer can write that
+  symbol.** The reader holds a would-be symbol to the writer's own predicate,
+  called rather than restated. Measured over the alphabet's 499377 tokens of
+  length one to three plus thirty named long spellings, **287 change side,
+  all from symbol to a refusal, none the other way.** Within the 64 KiB token
+  cap a token changes side exactly when it is the bare `.`, or the host reads
+  it as a number and this reader's shape check does not: `+15`, `+i`,
+  `+1/2`, `-.5`, `.5`, `.5e2`, `+nan.0` and their kin. Past the cap nothing
+  changes, because the cap refused it already. `+`, `-`, `...`, `+a`, `a+b`,
+  `+1a`, `+1/0` and `.5i` are unaffected.
+
+  `(x . .)` changes with them: the first dot is the pair marker and the
+  second is a token, so it used to build a pair whose cdr is the symbol `.`
+  -- a pair the writer refuses.
+
+  **Migration.** Nothing this library ever WROTE is affected: every refused
+  name was already unwritable, which is the point. A sender that hand-built
+  such a name -- most plausibly a leading `+` on a numeral -- gets
+  `bad token` instead of a symbol nobody could echo.
+
+- **Bare and escaped spellings of one name now agree.** They did not: `+15`
+  was a symbol and `\x2B;15` was refused.
+
+### Conformance
+
+The vendored fixture is regenerated against this reader; four of its
+sixty-three read rows change verdict, all accepted to refused, and nothing
+else in it moves. A cell enforces that table for the first time -- the suite
+had been checking only its write-refusal section.
+
 ## 1.7.0 — 2026-09-11
 
 *51 commits.* Child processes with libuv-owned pipes, two rendering helper
