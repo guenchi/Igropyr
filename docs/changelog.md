@@ -46,7 +46,14 @@ write.
   it as a number and this reader's shape check does not: `+15`, `+i`,
   `+1/2`, `-.5`, `.5`, `.5e2`, `+nan.0` and their kin. Past the cap nothing
   changes, because the cap refused it already. `+`, `-`, `...`, `+a`, `a+b`,
-  `+1a`, `+1/0` and `.5i` are unaffected.
+  `+1a`, `+1/0`, `.5i` and **`+x`** are unaffected.
+
+  That last one is the test of whether you have read this right. A leading
+  `+` is not the rule: `+x` keeps its leading `+`, reads as a symbol, and the
+  writer writes it. The rule is the writer's predicate, and the only tokens
+  that move are the ones it refuses. Any restatement of this paragraph as a
+  rule about how a token LOOKS will get `+x` wrong, and `+x` is the only
+  shape where looking and asking disagree.
 
   `(x . .)` changes with them: the first dot is the pair marker and the
   second is a token, so it used to build a pair whose cdr is the symbol `.`
