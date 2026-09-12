@@ -98,10 +98,17 @@
 
 ;; rows whose FILE verdict is known to be stale, by name, with the reason
 (define known-moved
-  '(("read-plus-int"   . "2026-09-12 ruling: a bare name the writer cannot write is refused (+1); generated from the hole")
-    ("read-plus-five"  . "2026-09-12 ruling: same (+5)")
-    ("read-symbol-dot" . "2026-09-12 ruling: same -- the bare dot is a name the writer refuses ((. a))")
-    ("read-dot-alone"  . "2026-09-12 ruling: same (.)")))
+  ;; EMPTY, and that is the finished state. Between 2026-09-12's ruling and the
+  ;; re-vendoring this list named four rows -- read-plus-int, read-plus-five,
+  ;; read-symbol-dot, read-dot-alone -- which the ruling moved from accepted to
+  ;; refused while the vendored file still recorded the old verdict. The other
+  ;; implementation regenerated the fixture against cd020e9 (its commit 6df6d37,
+  ;; golden md5 c40ab42b9cd2ac4b735c9e9e10371bbd), the file now carries the new
+  ;; verdicts, and the list emptied. The mechanism is worth keeping: a listed
+  ;; row must DIFFER from the file, so the cell goes red when a re-vendoring
+  ;; lands and the list has not been struck -- the reminder is the red, not a
+  ;; note someone has to remember to act on.
+  '())
 
 (define (reads? bv)
   (guard (e (#t (if (and (vector? e) (fx>= (vector-length e) 2) (eq? (vector-ref e 0) 'sexpr-error)) 'REFUSED (vector 'UNEXPECTED e))))
