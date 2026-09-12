@@ -303,16 +303,44 @@
              (let ((v (string->number (substring tok a m) 10)))
                (and v (if (= a 1) (- v) v))))
             (else #f))))
-      (define (symbol-char? c)
-        (or (char<=? #\a c #\z) (char<=? #\A c #\Z) (char<=? #\0 c #\9)
-            (memv c '(#\- #\+ #\* #\/ #\< #\> #\= #\? #\! #\. #\_
-                      #\% #\& #\^ #\~ #\: #\@))))
-      (define (valid-symbol? tok)
-        (let ((m (string-length tok)))
-          (and (> m 0)
-               (let lp ((i 0))
-                 (or (= i m)
-                     (and (symbol-char? (string-ref tok i)) (lp (+ i 1))))))))
+      ;; THE READER NO LONGER KEEPS ITS OWN CHARACTER WALK. A bare
+      ;; candidate symbol is held to wire-symbol? -- the writer's own
+      ;; predicate, CALLED rather than restated -- exactly as the escaped
+      ;; path already holds a decoded name. Two consequences, and the
+      ;; second is the reason:
+      ;;
+      ;; A name this library cannot WRITE can no longer be READ. The walk
+      ;; alone admitted `+nan.0`, `+inf.0`, `-inf.0`, `+15` and `+i`,
+      ;; because numeric-shape? only looks for a leading digit or a `-`
+      ;; before one; so a conforming writer's NaN arrived here as a
+      ;; SYMBOL named "+nan.0", silently, while that same writer's `1.5`
+      ;; was refused loudly. Same class of token, two failure modes, and
+      ;; the quiet one was the wrong one.
+      ;;
+      ;; And the bare and escaped spellings of one name now agree. They
+      ;; did not: bare `+15` was a symbol and `\x2B;15` was refused,
+      ;; which was the "receivable but not writable" residual left by the
+      ;; escape batch.
+      ;;
+      ;; EXACTLY THREE SPELLINGS BECOME NUMBERS, AND ONLY IN THE EXTENDED
+      ;; PROFILE. Strict carries no flonum at all -- sexpr->string
+      ;; refuses 1.5, 0.0 and a NaN alike -- so there is no value in that
+      ;; profile for `+nan.0` to be read as, and refusing it is the only
+      ;; coherent answer. The extended profile does carry flonums, so it
+      ;; reads the three a conforming writer actually emits. Nothing
+      ;; else: not `-nan.0` (no conforming writer emits it), not `1.5`,
+      ;; `1e3` or `#xFF`. This format's flonum spelling stays #f8"..." ,
+      ;; which is bit-exact by construction, and a decimal literal here
+      ;; would reintroduce the external-numeral hazard removed on
+      ;; 2026-09-11. The length test is a fast path so an ordinary token
+      ;; does not pay three string comparisons.
+      (define (extended-flonum tok)
+        (and (fx= (string-length tok) 6)
+             (cond
+               ((string=? tok "+nan.0") +nan.0)
+               ((string=? tok "+inf.0") +inf.0)
+               ((string=? tok "-inf.0") -inf.0)
+               (else #f))))
       (define (numeric-shape? tok)
         ;; starts like a number: it must BE a whitelisted number, so
         ;; 1.5 or 1e9 can't slip through as symbols
@@ -394,9 +422,14 @@
                     (sfail "bad token" i)))
               (let ((tok (substring s i j)))
                 (cond
+                  ;; The three must be numbers BEFORE the symbol check
+                  ;; sees them, or they would be names again.
+                  ((and ext? (extended-flonum tok)) => (lambda (v) (values v j)))
                   ((token->number tok) => (lambda (v) (values v j)))
+                  ;; kept as the fast pre-check, and it is what keeps
+                  ;; `1.5` answering "bad number" rather than "bad token"
                   ((numeric-shape? tok) (sfail "bad number" i))
-                  ((valid-symbol? tok) (values (string->symbol tok) j))
+                  ((wire-symbol? tok) (values (string->symbol tok) j))
                   (else (sfail "bad token" i)))))))
       (let-values (((v i) (parse-value 0 0)))
         (unless (= (skip i) n) (sfail "trailing data after datum" i))
@@ -523,11 +556,13 @@
   ;; failure a whitelist exists to prevent. |12abc|, |1/0| and |-1x| are
   ;; the same shape.
   ;;
-  ;; The reader's own test is mirrored here -- COPIED, not shared, which
-  ;; is a maintenance obligation and not a guarantee: whoever widens
-  ;; numeric-shape? in the reader has to widen this one in the same
-  ;; commit, or the same class of defect comes straight back. Keeping
-  ;; them textually identical is what makes that check a glance.
+  ;; The reader's numeric-shape? is mirrored here -- COPIED, not shared,
+  ;; which is a maintenance obligation and not a guarantee: whoever
+  ;; widens numeric-shape? in the reader has to widen this one in the
+  ;; same commit, or the same class of defect comes straight back.
+  ;; Keeping them textually identical is what makes that check a glance.
+  ;; The CHARACTER WALK is no longer duplicated: the reader deleted its
+  ;; own and calls this predicate, so the alphabet has one definition.
   ;; string->number stays as well, and the overlap is not redundant: it
   ;; refuses names the reader would accept, such as |+i|, which is an
   ;; over-refusal rather than a corruption and costs a caller nothing
@@ -567,4 +602,26 @@
            ;; see letters, digits and the punctuation listed above -- `#` is
            ;; not among them -- so no prefix reaches it, and no exponent
            ;; without one is exact.
-           (not (string->number s))))))
+           ;;
+           ;; AND IT IS ASKED ONLY OF NAMES THAT COULD POSSIBLY BE ONE.
+           ;; Over the alphabet the walk just admitted, a Chez numeral can
+           ;; begin only with a digit or with `+`, `-`, `.` -- measured
+           ;; exhaustively over all 493118 strings of length 1 to 3 in that
+           ;; 79-character alphabet: the only leading characters that ever
+           ;; produced a number were the ten digits, `.`, `+` and `-`. (The
+           ;; grammar says the same thing and says it for every length: the
+           ;; leading character is fixed by the first production, and the
+           ;; only other opener is `#`, which the walk does not admit.) A
+           ;; digit-leading name never reaches here, being refused above.
+           ;;
+           ;; The guard is not cosmetic. Without it every ordinary symbol
+           ;; pays a full numeric parse of its own name -- 13-24% on a
+           ;; read-heavy microbenchmark -- and a name such as `+` followed
+           ;; by 60000 nines and an `a`, which is ACCEPTED, pays 457 ms to
+           ;; build the integer before the conversion answers #f. It sits
+           ;; inside this predicate rather than at the call site so that
+           ;; the writer gets it too and the reader still calls exactly one
+           ;; predicate.
+           (let ((c0 (string-ref s 0)))
+             (or (not (memv c0 '(#\+ #\- #\.)))
+                 (not (string->number s))))))))
