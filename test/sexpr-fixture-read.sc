@@ -122,8 +122,24 @@
       (cond
         ((vector? got) (check (string-append "read row " name ": the reader raised something that is not its own error") #f got))
         (listed
-         (check (string-append "read row " name " differs from the file, as listed: " (cdr listed))
-                (not (eq? (eq? got 'ACCEPTED) file-says)) got file-says))
+         ;; A RED HERE IS GOOD NEWS AND MUST SAY SO. This row fails when a
+         ;; listed name has STOPPED differing from the file, i.e. the fixture
+         ;; was re-vendored and caught up -- the deferred question became
+         ;; answerable. A failing assertion looks identical whether it means
+         ;; "something broke" or "the thing you parked is now decidable", and
+         ;; those demand opposite responses: the first says restore the old
+         ;; behaviour, the second says strike this name and keep the new. So
+         ;; the message states which one it is instead of leaving the reader
+         ;; to infer it from a diff of two verdicts
+         (if (eq? (eq? got 'ACCEPTED) file-says)
+             (begin
+               (set! fails (+ fails 1))
+               (display "FAIL  NOT A REGRESSION -- the fixture was re-vendored and now agrees with the reader on ")
+               (display name)
+               (display ".\n      Strike it from known-moved; do NOT change the reader back. Reason it was listed: ")
+               (display (cdr listed)) (newline))
+             (check (string-append "read row " name " still differs from the file, as listed (" (cdr listed) ")")
+                    #t)))
         (else
          (check (string-append "read row " name (if file-says " accepted" " refused"))
                 (eq? (eq? got 'ACCEPTED) file-says) got file-says)))))
