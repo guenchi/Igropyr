@@ -48,6 +48,8 @@
     fs-write-async!
     listener-backlog-effective listener-open? listener-token tcp-close!
     tcp-connect! tcp-connect-tls! tcp-listen! tcp-listen-tls!
+    ;; the unix domain socket pair, beside the TCP one
+    pipe-listen! pipe-connect!
     tcp-read-start!
     tcp-read-stop! tcp-stop-listen! tcp-write! tcp-write-foreign!
     tcp-writev! tcp-writev-raw!
@@ -108,8 +110,9 @@
             uv-write-scratch-size write-req-size
             uv-handle-size uv-req-size
             uv-spawn uv-process-kill uv-kill uv-process-get-pid
-            uv-pipe-init uv-shutdown
-            UV-PROCESS UV-NAMED-PIPE UV-SHUTDOWN)
+            uv-pipe-init uv-pipe-bind uv-pipe-connect uv-handle-get-type
+            uv-shutdown
+            UV-PROCESS UV-NAMED-PIPE UV-SHUTDOWN UV-TCP)
           (igropyr tls-core))
 
   ;; connection record; one per accepted TCP client
@@ -1524,6 +1527,8 @@
   ;; worse, not because it is safe.
   (define accept-error-count 0)
   (define accept-refused-count 0)
+  ;; an accept whose listener row was already gone -- see on-connection-code
+  (define accept-straggler-count 0)
   (define (bump-saturating n)
     (if (fx< n (greatest-fixnum)) (fx+ n 1) n))
   ;; BOTH VALUES ARE READ IN ONE REGION, then the list is built
@@ -1533,11 +1538,66 @@
   ;; existed. Individual fixnums are never torn; it is the PAIR that
   ;; needs the region, and callers comparing deltas are exactly who
   ;; would be misled.
+  ;; THREE CAUSES, KEPT APART. The straggler count was poured into `refused`
+  ;; when this branch was first written, and that is the shape of having
+  ;; computed a fact and then discarded it: a count that cannot separate its
+  ;; two causes is, for the rarer one, not a record at all. Whoever merges
+  ;; them back makes a decision nobody would otherwise notice.
   (define (uv-accept-failure-counts)
-    (let-values (((e r) (with-interrupts-disabled
-                          (values accept-error-count
-                                  accept-refused-count))))
-      (list (cons 'error e) (cons 'refused r))))
+    (let-values (((e r st) (with-interrupts-disabled
+                             (values accept-error-count
+                                     accept-refused-count
+                                     accept-straggler-count))))
+      (list (cons 'error e) (cons 'refused r) (cons 'straggler st))))
+
+  ;; ---- transports ---------------------------------------------------------
+  ;;
+  ;; A LISTENER CARRIES HOW TO MAKE A CLIENT HANDLE; the accept path calls it
+  ;; and stays ignorant of what kind of socket it just accepted. With a flag
+  ;; instead, accept would have to name every transport, so a third one would
+  ;; mean editing accept; with this, accept never changes again, and -- the
+  ;; part that matters more -- both transports share one piece of failure
+  ;; handling rather than two copies that can drift.
+  ;;
+  ;; make-client answers a handle, or #f when it could not make one, having
+  ;; already released whatever it took. It is the factory and not the caller
+  ;; that knows which release is right, because that depends on whether init
+  ;; ran: before init the block is plain memory, after it the loop holds a
+  ;; pointer and it has to leave through uv_close.
+  ;;
+  ;; after-accept! is the setup that can only run once the accepted socket is
+  ;; open. For TCP that is uv_tcp_nodelay, which is declared on uv_tcp_t* and
+  ;; is meaningless on a pipe; for a unix socket there is nothing to do.
+  (define-record-type (transport make-transport transport?)
+    (fields
+      (immutable name transport-name)
+      (immutable make-client transport-make-client)
+      (immutable after-accept transport-after-accept)))
+
+  ;; THE INIT RESULT IS CHECKED HERE, WHERE THE OLD ACCEPT PATH IGNORED IT.
+  ;; An init that failed left an unregistered block that the code then handed
+  ;; to uv_accept; answering #f costs one comparison and removes that.
+  (define (make-client-handle size init!)
+    (let ((h (foreign-alloc size)))
+      (if (< (init! h) 0)
+          (begin (foreign-free h) #f)
+          h)))
+
+  (define tcp-transport
+    (make-transport 'tcp
+      (lambda ()
+        (make-client-handle tcp-handle-size
+          (lambda (h) (uv-tcp-init (uv-loop-handle) h))))
+      (lambda (client) (uv-tcp-nodelay client 1))))
+
+  ;; The 0 is uv_pipe_init's ipc argument: this is a byte stream, not a
+  ;; channel for passing handles between processes.
+  (define pipe-transport
+    (make-transport 'pipe
+      (lambda ()
+        (make-client-handle pipe-handle-size
+          (lambda (h) (uv-pipe-init (uv-loop-handle) h 0))))
+      (lambda (client) (void))))
 
   (define on-connection-code
     (foreign-callable
@@ -1561,8 +1621,82 @@
             ;; connection to hand up at all, which is why the two are
             ;; counted separately.
             (set! accept-error-count (bump-saturating accept-error-count))
-            (let ((client (foreign-alloc tcp-handle-size)))
-              (uv-tcp-init (uv-loop-handle) client)
+            ;; THE LOOKUP COMES FIRST, AND THE ORDER IS PART OF THE DESIGN.
+            ;; The client handle is made by a factory the listener carries,
+            ;; and a factory cannot be fetched from a #f entry -- so the
+            ;; missing-entry case has to be answered before anything is
+            ;; allocated, where it used to be answered after.
+            ;;
+            ;; A MISSING ENTRY MEANS THE LISTENER IS ALREADY CLOSING --
+            ;; AND THAT IS AN ARGUMENT, NOT A READING. Said in full because
+            ;; the branch decides to accept nothing, and a wrong premise
+            ;; here would drop a live connection in silence.
+            ;;
+            ;; The argument: tcp-listen! publishes the row inside the same
+            ;; interrupts-disabled region that runs uv_listen, and
+            ;; tcp-stop-listen! deletes the row and calls uv_close inside
+            ;; one region too, so there is no window where a live listener
+            ;; is absent from the table; and closing a stream discards a
+            ;; descriptor the kernel has already handed up, so there is
+            ;; nothing left to consume.
+            ;;
+            ;; What supports it, and what does not. The discard is read
+            ;; from libuv's uv__stream_close -- in the 1.48.0 source, while
+            ;; the installed library here is 1.50.0 and the deployment
+            ;; target runs 1.52.0, so it is a reading of a NEARBY version
+            ;; and not of the one executing. Two attempts to stage the
+            ;; branch both failed: forty rounds of listen/dial/stop, and a
+            ;; stop issued from inside the accept hook with two dials
+            ;; already queued; the counter stayed at zero through both.
+            ;;
+            ;; It cannot be staged with the injection facility either, and
+            ;; that is a statement about the facility rather than about
+            ;; luck: $inject-barrier reads the interrupt-disable depth and,
+            ;; above one, records `skipped` instead of parking, while this
+            ;; callback runs inside the loop with interrupts already
+            ;; disabled. That mechanism is the whole support for this
+            ;; paragraph; the older remark further down about what may not
+            ;; be added around the accept is NOT cited here, because it is
+            ;; itself under question. An override could force the lookup
+            ;; to answer #f and so exercise the body below, but that
+            ;; presupposes the premise it would be testing; a cell written
+            ;; that way would read as evidence that this path is reachable
+            ;; and guarded, which is the opposite of what is known.
+            (let ((v (hashtable-ref listener-table server #f)))
+             (if (not v)
+              (set! accept-straggler-count
+                    (bump-saturating accept-straggler-count))
+              (let ((client ((transport-make-client (vector-ref v 5)))))
+               (if (not client)
+                ;; THE FACTORY COULD NOT MAKE A HANDLE, and this branch is
+                ;; incomplete in a way worth naming rather than smoothing
+                ;; over. It releases what the factory took and counts the
+                ;; failure, but it does NOT consume the descriptor the
+                ;; kernel has already handed up: uv__server_io stores it
+                ;; before calling this callback and stops polling the
+                ;; listener if it is still there afterwards, so a listener
+                ;; that reaches this branch stops accepting for good.
+                ;;
+                ;; The gap is older than this branch. The outer guard above
+                ;; answers an allocation failure the same way -- record and
+                ;; return, with no accept -- so the stall was already
+                ;; reachable before any of this existed. What is new is a
+                ;; second door into it: the factory can now also answer #f
+                ;; because an init failed.
+                ;;
+                ;; The question for whoever closes it, left as a question
+                ;; because it is a decision and not an oversight: when no
+                ;; client handle can be made, should the listener be closed
+                ;; -- failing loudly, with the table row and any TLS
+                ;; context released as tcp-stop-listen! does -- or should
+                ;; the connection be consumed by a spare handle initialised
+                ;; in advance, so the listener survives? The first is
+                ;; simpler and gives up the listener; the second keeps it
+                ;; but needs storage that cannot be reused until its close
+                ;; callback has run. Both are reachable from inside a
+                ;; foreign callback; what is not permitted here is an
+                ;; exception escaping into C.
+                (set! accept-error-count (bump-saturating accept-error-count))
               ;; INJECTION POINT 'accept-refused -- OWNING GUARD: none in
               ;; this callback, and none may be added: it runs in foreign
               ;; callback context, where an escaping raise unwinds into C.
@@ -1589,32 +1723,29 @@
               ;; timing differs from a real failure -- which closes the
               ;; descriptor inside uv_accept rather than attaching it to a
               ;; handle first -- but nothing persistent is left.
-              (if (< (inject-override! 'accept-refused
-                                       (uv-accept server client)) 0)
-                  (begin
-                    (set! accept-refused-count
-                          (bump-saturating accept-refused-count))
-                    (uv-close client on-close-entry))
-                (let ((c (make-conn client #f 'open #f #f #f #f #f))
-                      ;; #(token on-accept handshaking tls-ctx handle)
-                      (v (hashtable-ref listener-table server #f)))
-                  (uv-tcp-nodelay client 1)
-                  (let ((ctx (incarnation-tls-ctx v)))
-                    (cond
-                      ((not v)
-                       (hashtable-set! conn-table client c)
-                       ;; listener already stopped: refuse the straggler
-                       (tcp-close! c))
-                      ;; THE TLS PATH PUBLISHES ITSELF. X2 requires the
-                      ;; session to be installed in the conn BEFORE the conn
-                      ;; reaches conn-table, so that a failure before
-                      ;; publication is cleaned up by the only code that can
-                      ;; see the session. The insert therefore moves inside
-                      ;; tls-accept! rather than happening here.
-                      (ctx (tls-accept! c v ctx))
-                      (else
-                        (hashtable-set! conn-table client c)
-                        ((vector-ref v 1) c))))))))))
+                (if (< (inject-override! 'accept-refused
+                                         (uv-accept server client)) 0)
+                    (begin
+                      (set! accept-refused-count
+                            (bump-saturating accept-refused-count))
+                      (uv-close client on-close-entry))
+                  ;; #(token on-accept handshaking tls-ctx handle transport)
+                  (let ((c (make-conn client #f 'open #f #f #f #f #f)))
+                    ;; the transport's own post-accept step, which for TCP is
+                    ;; the nodelay that used to stand here unconditionally
+                    ((transport-after-accept (vector-ref v 5)) client)
+                    (let ((ctx (incarnation-tls-ctx v)))
+                      (cond
+                        ;; THE TLS PATH PUBLISHES ITSELF. X2 requires the
+                        ;; session to be installed in the conn BEFORE the conn
+                        ;; reaches conn-table, so that a failure before
+                        ;; publication is cleaned up by the only code that can
+                        ;; see the session. The insert therefore moves inside
+                        ;; tls-accept! rather than happening here.
+                        (ctx (tls-accept! c v ctx))
+                        (else
+                          (hashtable-set! conn-table client c)
+                          ((vector-ref v 1) c)))))))))))))
       (void* int)
       void))
 
@@ -2066,7 +2197,11 @@
                    ;; is told about a conn that teardown cannot find
                    (with-interrupts-disabled
                      (index-owner! owner 'conn handle)
-                     (uv-tcp-nodelay handle 1)
+                     ;; TCP ONLY. This used to run for every completed dial;
+                     ;; uv_tcp_nodelay is declared on uv_tcp_t* and a pipe
+                     ;; dial completes through this same callback.
+                     (when (= (uv-handle-get-type handle) UV-TCP)
+                       (uv-tcp-nodelay handle 1))
                      (hashtable-set! conn-table handle c))
                    ;; A TLS dial is NOT connected yet: the handshake has not run. Its
                    ;; owner hears nothing until establishment, and the initialiser
@@ -2527,6 +2662,118 @@
   ;;     libuv implements, not what we have measured.
   ;; opts: (flags [tls-ctx]). The context is taken HERE rather than patched
   ;; in afterwards -- see the incarnation vector below for why.
+  ;; ---- unix domain sockets ------------------------------------------------
+  ;;
+  ;; THE LIBRARY REFUSES A PATH IT CANNOT PASS THROUGH UNCHANGED, and both
+  ;; halves of that are measured rather than assumed.
+  ;;
+  ;; LENGTH. sun_path is 104 bytes on macOS and on FreeBSD 15 (Linux's 108 is
+  ;; larger, so 104 is the smaller of the two floors we ship on). What happens
+  ;; past it is TRUNCATION, not refusal. Measured on BOTH platforms we ship
+  ;; on, by a standalone probe that calls uv_pipe_bind directly -- macOS with
+  ;; libuv 1.50.0 and FreeBSD 15 with 1.52.0 -- and the two readings are
+  ;; identical line for line: 102, 103 and 104 bytes all bind, while 105 and
+  ;; 106 come back EADDRINUSE because each was cut down to the same 104-byte
+  ;; name the 104-byte bind already held. Five binds leave three sockets, the
+  ;; longest basename being 104 minus the directory, so the two long ones
+  ;; created nothing of their own. A caller reading that errno would be told
+  ;; its address was taken when what happened is that it was handed somebody
+  ;; else's. The probe and both readings are archived beside the design note,
+  ;; under sunpath-probe/.
+  ;;
+  ;; So 103 is a POLICY, not a platform ceiling, and the earlier version of
+  ;; this comment was wrong to say the bind could not succeed past it. Two
+  ;; reasons, both checkable: it is one byte below where truncation starts,
+  ;; which is now a reading on each platform rather than an inference from
+  ;; one; and it leaves room for a terminator whether or not the platform
+  ;; requires one inside the array. Widening it to 104 would be a decision
+  ;; about how close to that edge to run -- with both readings behind it --
+  ;; and not a bug fix.
+  ;;
+  ;; EMBEDDED NUL. The path crosses as a C string, whose length is strlen, so
+  ;; a NUL inside it ends the pathname early: measured, "<dir>/a\x0;b" is 15
+  ;; bytes by this check and binds a socket called "a". The caller would be
+  ;; handed a listener on a path it never named, with nothing reporting the
+  ;; substitution -- the same class of harm as the truncation above and the
+  ;; reason both are refused here rather than in one place.
+  (define sun-path-size 104)
+
+  ;; IT IS A BYTE LIMIT, NOT A CHARACTER LIMIT, and the difference is
+  ;; reachable rather than theoretical: sun_path is an array of bytes and
+  ;; Chez's `string` foreign type converts as string->utf8 plus one
+  ;; terminating zero. Measured on this tree -- a path of 55 characters
+  ;; whose characters are two bytes each is 105 bytes, which a character
+  ;; count admits and the platform then truncates. Counting characters here
+  ;; would leave exactly the failure this check exists to prevent, reached
+  ;; by a caller who did nothing unusual.
+  (define (check-socket-path who path)
+    (unless (string? path)
+      (assertion-violation who "socket path must be a string" path))
+    ;; REFUSED BEFORE THE LENGTH TEST, because a NUL makes the length test
+    ;; ask about the wrong string: the bytes after it are counted here and
+    ;; discarded by strlen on the other side.
+    (when (let lp ((i 0))
+            (and (< i (string-length path))
+                 (or (char=? (string-ref path i) #\nul) (lp (+ i 1)))))
+      (error who
+        (string-append
+          "socket path contains a NUL byte: the path crosses as a C string, "
+          "so everything after the NUL would be dropped and a different "
+          "socket bound -- " path)))
+    (let ((n (bytevector-length (string->utf8 path))))
+      (when (> n (- sun-path-size 1))
+        (error who
+          (string-append
+            "socket path is " (number->string n) " bytes (UTF-8): sun_path is "
+            (number->string sun-path-size)
+            " bytes on this platform and holds the terminating NUL, so "
+            (number->string (- sun-path-size 1)) " is the maximum -- " path)))))
+
+  ;; Listen on a unix domain socket. Answers the listener handle, or raises
+  ;; with the libuv message; the conns it accepts are ordinary conns, and
+  ;; tcp-read-start! / tcp-write! / tcp-close! / conn-on-close! work on them
+  ;; unchanged. Stopped with tcp-stop-listen!, like a TCP listener.
+  ;;
+  ;; A STALE SOCKET FILE IS NOT UNLINKED and EADDRINUSE passes through.
+  ;; Taking over an abandoned socket is the daemon's design question -- it
+  ;; turns on whether the previous owner is really gone -- and a library that
+  ;; answered it silently would make that decision for every caller.
+  ;;
+  ;; NO mode OPTION, and the absence is a decision. uv_pipe_chmod offers only
+  ;; READABLE and WRITABLE, which cannot express 0600, and a bind-then-chmod
+  ;; sequence leaves a window in which the socket exists at the process
+  ;; umask. A caller that needs the socket private creates its directory 0700
+  ;; before the bind, which has no window; offering an option here would
+  ;; advertise a precision uv_pipe_chmod does not have.
+  ;;
+  ;; ONE REGION FROM INIT TO PUBLICATION, for the reason tcp-listen! gets
+  ;; from its address lease: between a successful uv_listen and the row
+  ;; reaching the table the loop may already accept, and the accept path
+  ;; reads that row to learn how to make a client handle.
+  (define (pipe-listen! path backlog on-accept)
+    (check-socket-path 'pipe-listen! path)
+    (with-interrupts-disabled
+      (let ((l (foreign-alloc pipe-handle-size))
+            (inited? #f))
+        ;; WHICH RELEASE IS RIGHT DEPENDS ON HOW FAR THIS GOT, the same
+        ;; distinction tcp-listen! makes: before init the block is plain
+        ;; memory; after it the loop holds a pointer and the block may only
+        ;; be freed by the close callback. A failed bind -- a stale socket
+        ;; file, a path in a directory that does not exist -- is the routine
+        ;; case and lands on the second branch.
+        (guard (e (#t (if inited? (uv-close l on-close-entry) (foreign-free l))
+                      (raise e)))
+          ;; the 0 is uv_pipe_init's ipc flag: a byte stream, not a channel
+          ;; for passing handles between processes
+          (check 'uv-pipe-init (uv-pipe-init (uv-loop-handle) l 0))
+          (set! inited? #t)
+          (check 'uv-pipe-bind (uv-pipe-bind l path))
+          (check 'uv-listen (uv-listen l backlog on-connection-entry))
+          ;; slot 3 is #f: a unix-socket listener carries no TLS context
+          (hashtable-set! listener-table l
+            (vector (list 'listener) on-accept 0 #f l pipe-transport))
+          l))))
+
   (define (tcp-listen! host port backlog on-accept . opts)
     ;; the lease IS the region: it hands the shared address buffer to this
     ;; thunk with interrupts disabled and takes it back on return, so the
@@ -2583,10 +2830,15 @@
         ;; a plain HTTP request reaching the reader on an https port. The
         ;; caller's context therefore arrives as an argument and is in the
         ;; vector the moment anything can see it.
+        ;; SLOT 5 IS APPENDED, not inserted: every reader of this vector
+        ;; indexes a fixed slot, so adding one at the end touches none of
+        ;; them. The whole row is still published complete, in this same
+        ;; region, for the reason stated just above.
         (hashtable-set! listener-table l
           (vector (list 'listener) on-accept 0
                   (if (and (pair? opts) (pair? (cdr opts))) (cadr opts) #f)
-                  l))
+                  l
+                  tcp-transport))
         l)))))
 
   ;; Stop accepting new connections (graceful shutdown step 1);
@@ -3471,6 +3723,64 @@
   (define (tcp-connect! host port owner)
     (connect-submit! host port owner #f #f #f))
 
+  ;; Dial a unix domain socket. Parallel to tcp-connect! in every respect
+  ;; that matters to a caller: it takes an OWNER and no callback, and the
+  ;; completion reaches that owner as #(tcp-connected c) or
+  ;; #(tcp-connect-failed status) from the same connect callback. A dial
+  ;; that took a procedure would not be parallel to it, it would be a
+  ;; second convention for the same event.
+  ;;
+  ;; uv_pipe_connect RETURNS void, WHERE uv_tcp_connect RETURNS int, and the
+  ;; submission path cannot be copied from connect-submit! because of it.
+  ;; There is no synchronous refusal: the request is submitted, it is owned
+  ;; until the completion callback runs, and every failure -- including a
+  ;; path nothing is listening on -- arrives as a negative status there.
+  ;; Testing a return value that does not exist and releasing the request on
+  ;; it would be a double free; not releasing it on a synchronous failure
+  ;; that cannot happen would leak one request per failed dial. Neither is
+  ;; reachable here because the request is simply never released on this
+  ;; side after the call.
+  ;;
+  ;; ONE REGION AROUND THE BOOKKEEPING AND THE SUBMIT. The connect table row
+  ;; and the owner index entry exist before the call, and an owner death
+  ;; swept between them and the submit would free a request libuv is about
+  ;; to be handed.
+  (define (pipe-connect! path owner)
+    (check-socket-path 'pipe-connect! path)
+    (with-interrupts-disabled
+      (let ((h (foreign-alloc pipe-handle-size))
+            (inited? #f)
+            (req #f)
+            (indexed? #f))
+        ;; undoes exactly what happened, never more: the same construction
+        ;; connect-submit!'s release! uses, and for the same reason
+        (define (release!)
+          (when indexed?
+            (unindex-owner! owner 'connect req)
+            (set! indexed? #f))
+          (when req
+            (hashtable-delete! connect-table req)
+            (foreign-free req)
+            (set! req #f))
+          (if inited? (uv-close h on-close-entry) (foreign-free h))
+          (set! inited? #f))
+        (guard (e (#t (release!) (raise e)))
+          (check 'uv-pipe-init (uv-pipe-init (uv-loop-handle) h 0))
+          (set! inited? #t)
+          (set! req (foreign-alloc connect-req-size))
+          ;; #(handle owner d ctx sni) -- the last three are the TLS dial's
+          ;; and are #f here, so the callback takes the plaintext branch and
+          ;; answers the owner directly, exactly once
+          (hashtable-set! connect-table req (vector h owner #f #f #f))
+          (index-owner! owner 'connect req)
+          (set! indexed? #t)
+          ;; LAST INSIDE THE GUARD ON PURPOSE. Everything the call needs is
+          ;; marshalled before it runs, so a raise from the marshalling
+          ;; happens with the request still ours; once the call has run it
+          ;; returns void and cannot raise, and the request is libuv's.
+          (uv-pipe-connect req h path on-connect-entry))
+        #t)))
+
   ;; The TLS dial. Two things differ from the plaintext face, and both follow
   ;; from the handshake sitting between the TCP connect and anything the owner
   ;; can do with the connection:
@@ -3521,9 +3831,29 @@
   ;; The test is for 'open specifically, not for "not closed": a handle
   ;; that has been submitted to uv_close is 'closing, and no FFI call
   ;; should touch it again even though its memory is still there.
+  ;; A CONN IS NOT NECESSARILY A TCP CONN, and this operation is declared on
+  ;; uv_tcp_t*. A unix-socket conn, and a child process's stdio pipe, answer
+  ;; #f here without the call being made: there is no peer address to give
+  ;; and asking a pipe handle for one is a type error the FFI cannot catch.
+  ;; The kind is asked of libuv rather than remembered beside the conn, so
+  ;; the answer cannot drift from the object; the question is inside the
+  ;; region for the same reason the state test is.
+  ;;
+  ;; THERE IS NO CELL BEHIND THIS TEST, and that is the honest state rather
+  ;; than an omission. What it removes is a TYPE hazard, not a behaviour:
+  ;; measured on both trees, a child's stdout conn answered #f before this
+  ;; test existed too, because uv_tcp_getpeername failed on the pipe handle
+  ;; and the check below already turned that into #f. Deleting this line
+  ;; leaves every row of test/pipe-transport.sc green -- measured, by
+  ;; running the suite against exactly that mutant. So the row there which
+  ;; asserts #f for a pipe conn pins the ANSWER, which is a contract, and
+  ;; must not be read as covering this guard. The justification for the
+  ;; guard is the declaration: a uv_tcp_t* operation should not be handed a
+  ;; uv_pipe_t, whatever today's platforms happen to do with it.
   (define (conn-peer-ip c)
     (uv-peername-lease (lambda (peername-buf peername-len)
       (and (eq? (conn-state c) 'open)
+           (= (uv-handle-get-type (conn-handle c)) UV-TCP)
            (begin
              (foreign-set! 'int peername-len 0 128)
              (and (>= (uv-tcp-getpeername (conn-handle c)

@@ -48,7 +48,7 @@
     uv-read-start uv-read-stop uv-write uv-try-write
     uv-close uv-is-closing uv-is-active
     uv-spawn uv-process-kill uv-kill uv-process-get-pid
-    uv-pipe-init uv-shutdown
+    uv-pipe-init uv-pipe-bind uv-pipe-connect uv-handle-get-type uv-shutdown
     UV-PROCESS UV-NAMED-PIPE UV-SHUTDOWN
     uv-timer-init uv-timer-start uv-timer-stop
     memcpy-from-c memcpy-to-c memcpy-cc
@@ -114,6 +114,18 @@
   (define uv-process-get-pid
     (foreign-procedure "uv_process_get_pid" (void*) int))
   (define uv-pipe-init   (foreign-procedure "uv_pipe_init" (void* void* int) int))
+  (define uv-pipe-bind   (foreign-procedure "uv_pipe_bind" (void* string) int))
+  ;; RETURNS void, WHERE uv_tcp_connect RETURNS int (uv.h declares the two
+  ;; differently). A submitted pipe connect request is owned by libuv until
+  ;; the completion callback runs, and a failure is reported only through
+  ;; that callback's status -- there is no synchronous refusal to test for,
+  ;; and freeing the request on one would be a double free.
+  (define uv-pipe-connect
+    (foreign-procedure "uv_pipe_connect" (void* void* string void*) void))
+  ;; Which kind of handle this address holds, asked of libuv rather than
+  ;; remembered beside it: the answer cannot drift from the object.
+  (define uv-handle-get-type
+    (foreign-procedure "uv_handle_get_type" (void*) int))
   ;; A NEGATIVE RETURN MEANS NO CALLBACK FOLLOWS -- a repeated shutdown answers
   ;; UV_ENOTCONN -- so a caller that waits for the callback anyway waits
   ;; forever.
