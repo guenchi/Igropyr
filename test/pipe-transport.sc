@@ -38,6 +38,14 @@
   (if ok (begin (display "  ok  ") (display label) (newline))
       (begin (set! fails (+ fails 1)) (display "FAIL  ") (display label)
              (for-each (lambda (x) (display " ") (write x)) info) (newline))))
+(define (handles-settled)
+  ;; two equal readings in a row: a count taken while an earlier listener is
+  ;; still closing is not a baseline. U8's first version read one during U6/U7's
+  ;; close window and could never get back to it
+  (let poll ((prev (uv-live-handle-count)) (n 0))
+    (sleep-ms 50)
+    (let ((now (uv-live-handle-count)))
+      (cond ((= now prev) now) ((>= n 100) now) (else (poll now (+ n 1)))))))
 (define (within? ms thunk)
   (let ((deadline (+ (now-ms) ms)))
     (let loop () (cond ((thunk) #t) ((> (now-ms) deadline) #f) (else (sleep-ms 20) (loop))))))
@@ -65,11 +73,20 @@
     ;; `self` is a variable bound to this process, not a procedure
     (define main self)
     ;; ---- U1 ------------------------------------------------------------------
+    ;; AN ACCEPTED CONN HAS NO OWNER. make-conn gives owner #f (tcp.sc:1599),
+    ;; so nothing is delivered until conn-set-owner! names a process. The first
+    ;; version of this file started reads without it and then waited for data
+    ;; that could not arrive -- and in U2 that made BOTH transports read #f,
+    ;; so the two answer lists matched and the twin passed while measuring
+    ;; nothing. The rows below therefore also assert that the payload arrived,
+    ;; not only that the two sides agree.
     (let* ((path (p "u1"))
            (got-server '())
            (l (pipe-listen! path 16
                 (lambda (c)
-                  (conn-set-owner! c self)
+                  ;; `main`, not `self`: the accept callback does not run in the
+                  ;; process that is waiting for the data
+                  (conn-set-owner! c main)
                   (tcp-read-start! c)
                   (send main (vector 'accepted c))))))
       (check "U1: the listener exists" (and l #t))
@@ -80,12 +97,12 @@
           (check "U1: the listener accepted" (and srv (conn? srv)) srv)
           (when (and client srv)
             (tcp-read-start! client)
-            (tcp-write! client (bv "ping"))
+            (tcp-write! client (bv "ping") #f)
             (check "U1: the server read what the client wrote"
-                   (equal? (receive (after 5000 #f) (`#(tcp-data ,c ,b) b)) (bv "ping")))
-            (tcp-write! srv (bv "pong"))
+                   (equal? (receive (after 5000 #f) (`#(tcp-data ,b) b)) (bv "ping")))
+            (tcp-write! srv (bv "pong") #f)
             (check "U1: the client read what the server wrote"
-                   (equal? (receive (after 5000 #f) (`#(tcp-data ,c ,b) b)) (bv "pong")))
+                   (equal? (receive (after 5000 #f) (`#(tcp-data ,b) b)) (bv "pong")))
             ;; ---- U3 -----------------------------------------------------------
             (let ((closed #f))
               (conn-on-close! srv (lambda () (set! closed #t)))
@@ -135,7 +152,7 @@
 
     ;; ---- U8 --------------------------------------------------------------------
     (let ((path (p "u8-nobody"))
-          (base (uv-live-handle-count)))
+          (base (handles-settled)))
       (pipe-connect! path self)
       (check "U8: a dial to nothing gives #(tcp-connect-failed status)"
              (receive (after 5000 #f) (`#(tcp-connect-failed ,s) #t)))
@@ -148,7 +165,7 @@
 
     ;; ---- U9 --------------------------------------------------------------------
     (let* ((path (p "u9"))
-           (base (uv-live-handle-count)))
+           (base (handles-settled)))
       (system (string-append "printf x > " path))
       (err-string (lambda () (pipe-listen! path 16 (lambda (c) (void)))))
       (check "U9: a bind that fails after init leaves the live-handle count at baseline"
@@ -194,12 +211,14 @@
             (cond
               ((not (and client srv)) (list 'no-pair))
               (else
+                ;; both ends need an owner before either can be read from
+                (conn-set-owner! client self) (conn-set-owner! srv self)
                 (tcp-read-start! client) (tcp-read-start! srv)
                 (note! (list 'conn? (conn? client) (conn? srv)))
-                (note! (list 'write-returns (and (tcp-write! client (bv "abc")) #t)))
-                (note! (list 'server-read (receive (after 5000 #f) (`#(tcp-data ,c ,b) b))))
-                (note! (list 'write-back (and (tcp-write! srv (bv "de")) #t)))
-                (note! (list 'client-read (receive (after 5000 #f) (`#(tcp-data ,c ,b) b))))
+                (note! (list 'write-returns (and (tcp-write! client (bv "abc") #f) #t)))
+                (note! (list 'server-read (receive (after 5000 #f) (`#(tcp-data ,b) b))))
+                (note! (list 'write-back (and (tcp-write! srv (bv "de") #f) #t)))
+                (note! (list 'client-read (receive (after 5000 #f) (`#(tcp-data ,b) b))))
                 (note! (list 'owner-settable (guard (e (#t #f)) (conn-set-owner! client self) #t)))
                 (note! (list 'on-close-settable (guard (e (#t #f)) (conn-on-close! client (lambda () (void))) #t)))
                 (note! (list 'close-returns (begin (tcp-close! client) (tcp-close! srv) #t)))
@@ -222,6 +241,15 @@
       (let ((a (run-pair tcp-pair "tcp"))
             (b (run-pair pipe-pair "pipe")))
         (check "U2: the TCP pair answered every step" (and (list? a) (> (length a) 1)) a)
+        ;; ANTI-VACUITY, AND IT IS THE POINT OF THE ROW BELOW IT. Two lists of
+        ;; #f are equal. The first version of this twin could not deliver to
+        ;; either side, so both read #f, the lists matched, and the twin passed
+        ;; having measured nothing. Equality is only evidence once each side is
+        ;; known to have carried the payload
+        (check "U2: the TCP side actually carried the bytes"
+               (and (list? a) (member (list 'server-read (bv "abc")) a) #t) a)
+        (check "U2: the pipe side actually carried the bytes"
+               (and (list? b) (member (list 'server-read (bv "abc")) b) #t) b)
         (check "U2: the pipe pair answers every step exactly as the TCP pair does"
                (equal? a b) a b)))
 
