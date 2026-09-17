@@ -33,6 +33,7 @@
 ;; unconditional and U1's round trip still passes, so only the matrix can say).
 (import (chezscheme) (igropyr actor) (igropyr tcp)
         (only (igropyr libuv) now-ms uv-live-handle-count))
+;; uv-accept-failure-counts comes from (igropyr tcp), imported whole above
 (define fails 0)
 (define (check label ok . info)
   (if ok (begin (display "  ok  ") (display label) (newline))
@@ -112,8 +113,19 @@
             (check "U4: the accepted pipe conn is untagged (conn-set-owner! is accepted)"
                    (guard (e (#t #f)) (conn-set-owner! client self) #t))
             ;; ---- U11 ----------------------------------------------------------
-            (check "U11: conn-peer-ip on a pipe conn is #f" (eq? (conn-peer-ip client) #f)
-                   (conn-peer-ip client))
+            ;; THIS ROW PINS THE ANSWER, NOT THE GUARD, and the difference is
+            ;; measured: with the type discriminator in conn-peer-ip replaced by
+            ;; #t, all 28 rows here stay green, this one included. The old code
+            ;; already answered #f -- it called the TCP operation on a pipe
+            ;; handle and the operation failed, so the >= 0 test produced #f
+            ;; anyway. What the discriminator removes is a TYPE hazard, an
+            ;; operation declared on uv_tcp_t* being handed a uv_pipe_t, and on
+            ;; these two platforms that has no observable consequence. So the
+            ;; guard has NO red cell and cannot be given one here; the criterion
+            ;; for it is the declaration, not the behaviour. Do not cite this
+            ;; row as coverage for the discriminator.
+            (check "U11: conn-peer-ip on a pipe conn is #f (the ANSWER; see above)"
+                   (eq? (conn-peer-ip client) #f) (conn-peer-ip client))
             (tcp-close! client)))
         (tcp-stop-listen! l (listener-token l))))
 
@@ -189,6 +201,19 @@
         (when client (tcp-close! client))
         (when srv (tcp-close! srv)))
       (tcp-stop-listen! l (listener-token l)))
+
+    ;; ---- U13: the accept-failure counters keep their causes apart ------------
+    ;; The straggler branch -- accept ran but the listener row was already gone
+    ;; -- used to pour its count into the same bucket as a real uv_accept
+    ;; refusal. A count that cannot separate its two causes is, for the rarer
+    ;; one, not a record at all. This row goes red the day someone merges them
+    ;; back, which is the only way that decision would otherwise be noticed.
+    (let ((c (uv-accept-failure-counts)))
+      (check "U13: the failure counts name three causes, separately"
+             (and (list? c) (= (length c) 3)
+                  (assq 'error c) (assq 'refused c) (assq 'straggler c)) c)
+      (check "U13: and nothing in this cell provoked any of them"
+             (and (list? c) (for-all (lambda (kv) (eqv? (cdr kv) 0)) c)) c))
 
     ;; ---- U12 -------------------------------------------------------------------
     (let* ((path (p "u12"))
