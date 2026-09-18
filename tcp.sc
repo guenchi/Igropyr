@@ -198,12 +198,13 @@
       (mutable closing? conn-tls-closing? conn-tls-set-closing!)
       ;; THE CLEAN-CLOSE DRAIN NEEDS TWO FLAGS, NOT ONE (E9), because the
       ;; two questions have different answers for a stretch of time.
-      ;; finishing? means "some process is inside finish-shutdown" and is a
-      ;; once-only entry guard, set before anything can fail. shutdown?
+      ;; finishing? means "some process is inside
+      ;; tls-conn-finish-shutdown!" and is a once-only entry guard, set
+      ;; before anything can fail. shutdown?
       ;; means "the alert exists and a bound is armed", and is set only once
       ;; both are true -- the repeat-close no-ops key on THAT, so a
-      ;; finish-shutdown that raised on the way in never leaves a later
-      ;; closer believing a drain is in progress.
+      ;; tls-conn-finish-shutdown! that raised on the way in never leaves
+      ;; a later closer believing a drain is in progress.
       (mutable finishing? conn-tls-finishing? conn-tls-set-finishing!)
       (mutable shutdown? conn-tls-shutdown? conn-tls-set-shutdown!)
       (mutable aggregate conn-tls-aggregate conn-tls-set-aggregate!)
@@ -211,7 +212,7 @@
       ;; handshake, stopped on establishment, re-armed for clean shutdown
       (mutable timer conn-tls-timer conn-tls-set-timer!)
       (immutable timer-id conn-tls-timer-id)
-      ;; armed? is tracked because active-timer accounting has three
+      ;; timer-armed? is tracked because active-timer accounting has three
       ;; movers -- arm, stop, close -- and only a flag makes each of them
       ;; idempotent with respect to the count.
       (mutable timer-armed? conn-tls-timer-armed? conn-tls-set-timer-armed!)
@@ -483,8 +484,8 @@
        (and (hashtable-ref conn-table h #f) #t))
      ;; ---- child-process seams ---------------------------------------------
      ;;
-     ;; THREE OF THESE ANSWER WITH ADDRESSES, NOT COUNTS, and that is the
-     ;; whole point. The rule under test is "the process handle block is not
+     ;; SOME OF THESE ANSWER WITH ADDRESSES RATHER THAN COUNTS, and that is
+     ;; the whole point. The rule under test is "the process handle block is not
      ;; freed while a row still names its address", and a count of frees
      ;; cannot tell a premature free of THIS handle from a timely free of
      ;; some other child's. The address is what makes the two readings
@@ -594,9 +595,10 @@
   ;;
   ;; A write block is the single [uv_write_t][uv_buf_t][payload] allocation a
   ;; queued write needs. Two producers make one -- the plaintext writer and the
-  ;; TLS close-notify path -- and seven places can release one, which is why
-  ;; this is a pair of helpers rather than a list of call sites: enumerating
-  ;; release sites is how the TLS ones came to be missed.
+  ;; TLS close-notify path -- and many places release one, which is why this
+  ;; is a pair of helpers rather than a list of call sites: enumerating
+  ;; release sites is how the TLS ones came to be missed, and a count
+  ;; written here would be one more enumeration to fall behind.
   ;;
   ;; EVERY BLOCK IS ALLOCATED HERE AND RELEASED HERE. A raw foreign-alloc or
   ;; foreign-free of a write block anywhere else is a defect, and the counter
@@ -675,7 +677,7 @@
   ;; conn-table for this would allocate two vectors proportional to the
   ;; connection count INSIDE the region below -- on the call an http server
   ;; makes to publish its connection count. The counter is maintained at the
-  ;; two places a tagged conn enters and leaves the table, the same
+  ;; places a tagged conn enters and leaves the table, the same
   ;; construction the write-block counter uses.
   (define pipe-conns-live 0)
   (define (note-pipe-conn! d) (set! pipe-conns-live (fx+ pipe-conns-live d)))
@@ -926,11 +928,12 @@
   ;; the watcher are. It is legal to park here precisely because the writer is
   ;; a green process: the identity assertion above has already refused any
   ;; caller running inside a libuv callback frame.
-  ;; HOW THIS LAYER ASKS WHETHER A PROCESS IS ALIVE. Two callers, and the
-  ;; second is not introspection: the watcher-count seam prunes pids whose
-  ;; process died without running an exit, and the retirement's terminal
-  ;; notification asks so it can stay silent when the owner is already gone.
-  ;; Installed by (igropyr tls-watch) beside the other four. With no hook
+  ;; HOW THIS LAYER ASKS WHETHER A PROCESS IS ALIVE. None of its callers is
+  ;; introspection: the watcher-count seam prunes pids whose process died
+  ;; without running an exit, the retirement's terminal notification asks so
+  ;; it can stay silent when the owner is already gone, and proc-spawn!
+  ;; re-checks the owner it was handed before admitting a child.
+  ;; Installed by (igropyr tls-watch) beside its other hooks. With no hook
   ;; installed the seam simply does not prune, and the notification defaults to
   ;; sending -- a reader parked forever is the worse failure of the two.
   (define uv-alive? #f)
@@ -973,7 +976,7 @@
   ;; Two pairs: the entry itself and the list cell that will carry it.
   ;; Publishing is set-cdr! plus hashtable-set!, and the latter CAN
   ;; allocate -- it adds a key the first time an owner appears, and may
-  ;; grow. Preparing separately no longer shortens the region -- both
+  ;; grow. Preparing separately no longer shortens the region -- its
   ;; callers now prepare INSIDE theirs -- it survives because publishing
   ;; is then a set-cdr! and a store with the key already in hand, not
   ;; the region allocating nothing; an earlier version of this note
@@ -1185,9 +1188,9 @@
                    (when (and j (eq? (fsw-job-owner j) owner))
                      (fsw-job-owner-set! j #f))))
                 ;; A connect request cannot be synchronously cancelled on
-                ;; every supported libuv. Clear its owner instead; on-connect
-                ;; then closes a late successful handle rather than
-                ;; registering it for a dead pid.
+                ;; every supported libuv. Clear its owner instead;
+                ;; on-connect-code then closes a late successful handle
+                ;; rather than registering it for a dead pid.
                 ((connect)
                  (let ((e (hashtable-ref connect-table key #f)))
                    (when (and e (eq? (vector-ref e 1) owner))
@@ -1195,7 +1198,7 @@
                 ;; DNS has no handle to close. Suppress its eventual delivery
                 ;; while RETAINING the request entry so the callback still
                 ;; frees it. Do NOT "simplify" this into a hashtable-delete!:
-                ;; on-getaddrinfo runs either way and does the foreign-free,
+                ;; on-getaddrinfo-code runs either way and does the foreign-free,
                 ;; so dropping the key here only loses the record that this
                 ;; request is still outstanding. Setting #f is safe because
                 ;; both delivery sites are guarded by (when owner ...).
@@ -1241,9 +1244,10 @@
   ;; The row's slots are named where it is built, in tcp-listen!; they are
   ;; not listed here, because a copy of the shape in a second place is a
   ;; copy that goes stale on its own -- this one had said
-  ;; "#(token on-accept)" through several widenings. Keyed dispatch (not a single global) so several
-  ;; servers can listen on different ports in one process; the table
-  ;; also roots each listener's accept hook, which nothing else holds
+  ;; "#(token on-accept)" through several widenings. Keyed dispatch (not
+  ;; a single global) so several servers can listen on different ports in
+  ;; one process; the table also roots each listener's accept hook,
+  ;; which nothing else holds
   ;; (the handles themselves are foreign-alloc'd and are not the GC's
   ;; business).
   (define listener-table (make-eqv-hashtable))
@@ -2020,8 +2024,8 @@
                             (bump-saturating accept-refused-count))
                       (uv-close client on-close-entry)
                       (clear-in-flight!))
-                  ;; #(token on-accept handshaking tls-ctx handle transport
-                  ;;   reserve dead?)
+                  ;; the row's slots are named where it is built; a third
+                  ;; copy of the shape here would expire like the other two
                   (begin
                    ;; THE DESCRIPTOR IS OURS NOW, so a later raise costs a
                    ;; connection and not the listener.
@@ -2100,7 +2104,8 @@
       ;; Nothing else ever writes it, and it is set exactly once, before
       ;; the op is published anywhere.
       (mutable req fs-op-req fs-op-req-set!)         ; uv_fs_t address
-      (mutable phase fs-op-phase fs-op-phase-set!)   ; open|fstat|idle|read|close
+      ;; the phases are the symbols on-fs-code dispatches on
+      (mutable phase fs-op-phase fs-op-phase-set!)
       (mutable aborted? fs-op-aborted? fs-op-aborted?-set!)
       (mutable raw? fs-op-raw? fs-op-raw?-set!)      ; deliver lengths, not bvs
       (mutable fd fs-op-fd fs-op-fd-set!)
@@ -2594,7 +2599,8 @@
     (fields
       (immutable id fsw-job-id)
       (mutable owner fsw-job-owner fsw-job-owner-set!)
-      (immutable kind fsw-job-kind)         ; open|write|fsync|rename|close
+      ;; the kinds are the symbols the fs-*-async! entries submit
+      (immutable kind fsw-job-kind)
       (immutable fd fsw-job-fd)             ; the fd acted on, or -1
       ;; WHICH TENANCY OF THAT NUMBER THIS JOB MEANT. Captured when the
       ;; job is submitted; see the generation note below.
@@ -3361,8 +3367,8 @@
   ;; deferred until the region is left, and the only failure shape is a
   ;; raise, which the handler catches. The prepare/publish split is
   ;; NOT about the region being allocation-free: hashtable-set! may
-  ;; allocate when it adds a key or grows, and both callers now prepare
-  ;; inside their region anyway.
+  ;; allocate when it adds a key or grows, and its callers now prepare
+  ;; inside their regions anyway.
   ;; SHAPED LIKE fs-start-fd!: the submission is INSIDE the region.
   ;; Publishing and submitting have to be one step, because the state
   ;; between them is one nothing can reclaim -- a published op whose
@@ -3383,9 +3389,10 @@
   ;; from its first instruction, so an allocation failure there escaped
   ;; with the fd still open.
   ;;
-  ;; ONE COPY, TWO CALL SITES. The handler and the refused-submission
-  ;; branch both need exactly this, and when they were written separately
-  ;; they drifted -- see the cleanup-safe? note below for what that cost.
+  ;; ONE COPY, SEVERAL CALL SITES. Each submission path needs exactly this
+  ;; in its handler and again in its refused-submission branch, and when
+  ;; they were written separately they drifted -- see the cleanup-safe?
+  ;; note below for what that cost.
   ;;
   ;; State vector: #(cell req cleanup-safe? fd fd-open?).
   ;;
@@ -3403,9 +3410,9 @@
       ;; idempotent step keeps its slot live across itself, so a retry
       ;; after a raise can complete it; a step that must not run twice
       ;; has its slot cleared first, at the price of leaking on a raise
-      ;; before the effect. unpublish-head! and hashtable-delete! are
-      ;; retry-safe (a completed one makes the next a no-op); free and
-      ;; close are not.
+      ;; before the effect. owner-index-unpublish-head! and
+      ;; hashtable-delete! are retry-safe (a completed one makes the next
+      ;; a no-op); free and close are not.
       (when cell
         (owner-index-unpublish-head! owner cell)
         (vector-set! st 0 #f))
@@ -3957,8 +3964,8 @@
   ;; NEITHER OF THEM DID, AND NOTHING SAID SO. The entry survived every
   ;; completed resolution for the life of the owning process; only owner
   ;; death cleared it, by deleting that owner's list wholesale. The
-  ;; symptom was growth alone, which is why unindex-owner! reports a
-  ;; count -- and that count is what a cell reads here.
+  ;; symptom was growth alone, which is why the index publishes a count
+  ;; at all -- uv-owner-index-count is what a cell reads here.
   (define (dns-resolve! host owner)
     (let ((req (foreign-alloc getaddrinfo-req-size)))
       (hashtable-set! getaddrinfo-table req owner)
@@ -3979,14 +3986,25 @@
           ;; the table row is gone and a refused submission produces no
           ;; callback.
           ;;
-          ;; ZERO COVERAGE, AND THE REASON IS NAMED. This branch runs
-          ;; only when uv_getaddrinfo refuses SYNCHRONOUSLY. A name that
-          ;; does not resolve is refused by the resolver instead, through
-          ;; the callback with a negative status, so the suite's bad-host
-          ;; case exercises the copy above and not this one: mutating
-          ;; this line leaves test/dns-owner-index.sc green. host is
-          ;; always a string here, so it is not currently known whether
-          ;; any public call can reach it at all.
+          ;; NOT REACHABLE FROM OUTSIDE, AND COVERED FROM INSIDE. This
+          ;; branch runs only when uv_getaddrinfo refuses SYNCHRONOUSLY. A
+          ;; name that does not resolve is refused by the resolver
+          ;; instead, through the callback with a negative status, so the
+          ;; suite's bad-host case exercises the copy above and not this
+          ;; one: mutating this line leaves test/dns-owner-index.sc green.
+          ;; host is always a string here, so it is not known that any
+          ;; public call can reach it at all.
+          ;;
+          ;; The seam is what reaches it. This paragraph said ZERO
+          ;; COVERAGE for as long as that was true and went on saying it
+          ;; afterwards -- the injection point on the call above lets a
+          ;; cell take this branch without a resolver that behaves
+          ;; unusually, and test/inject.sc drives it: it arms the point,
+          ;; calls dns-resolve!, and then asserts the two retirements this
+          ;; branch is responsible for. An out-of-date "there is no cell
+          ;; here" is the worst direction for a note like this to be
+          ;; wrong in: it tells the next reader not to expect a red.
+          ;;
           ;; Do not manufacture reachability by changing this code to
           ;; suit a test.
           (guard (e (#t (foreign-free req) (raise e)))
@@ -4084,9 +4102,10 @@
                  ;; cell reads the two counts after the loop has run.
                  (inject-fault! 'connect-oom)
                  (set! req (foreign-alloc connect-req-size))
-                 ;; THREE SLOTS, and the third is #f for a plaintext dial: that
-                 ;; path answers once, from the callback, and has no other
-                 ;; place it could answer from.
+                 ;; The slots are named in the constructor on the next line;
+                 ;; d is #f for a plaintext dial, because that path answers
+                 ;; once, from the callback, and has no other place it
+                 ;; could answer from.
                  (hashtable-set! connect-table req
                                  (vector h owner d ctx sni))
                  (index-owner! owner 'connect req)
@@ -5485,8 +5504,11 @@
 
   ;; ONE aggregate per application write, however many TLS records it becomes
   ;; (X1). Raw completions -- which may run INLINE on a full uv_try_write --
-  ;; may only decrement pending, record first-error, and mark completed? once
-  ;; sealed? and pending = 0; they never call user code and never re-enter SSL.
+  ;; may only decrement pending, record the first error, and mark the
+  ;; aggregate done once sealed? and pending = 0; they never call user code
+  ;; and never re-enter SSL. (The fields are error and done?; this sentence
+  ;; called them first-error and completed? for a while after they were
+  ;; renamed.)
   (define next-agg-id 0)
   (define (fresh-agg-id) (let ((i next-agg-id)) (set! next-agg-id (fx+ i 1)) i))
 
@@ -5717,8 +5739,9 @@
   ;; the event-loop process can run a read callback, tls-read-plaintext! sees
   ;; gated? still #t and appends B to inbound -- and then the second region
   ;; opens the gate and this call returns. NOTHING REVISITS B. The watcher
-  ;; calls open-and-drain ONCE (tls-watch.sc), so that plaintext was stranded
-  ;; for the life of the connection, with no error and no counter moving.
+  ;; calls tls-open-gate-and-drain! ONCE (tls-watch.sc), so that plaintext
+  ;; was stranded for the life of the connection, with no error and no
+  ;; counter moving.
   ;;
   ;; THE GATE STAYS SHUT UNTIL A ROUND FINDS NOTHING LEFT. Each round takes
   ;; a batch with the gate STILL CLOSED and delivers it outside the region, so
@@ -5946,8 +5969,8 @@
     (conn-tls-set-charged! t (fx+ (conn-tls-charged t) n)))
 
   ;; THE REFUND HAPPENS ON EVERY OUTCOME (X4), and it is asserted BEFORE
-  ;; teardown clears the counters: charged-total and refunded-total are
-  ;; monotonic, so a skipped refund shows up as an inequality that teardown
+  ;; teardown clears the counters: charged and refunded are cumulative and
+  ;; only grow, so a skipped refund shows up as an inequality that teardown
   ;; cannot hide.
   (define (tls-raw-done! c t agg sz status)
     (with-interrupts-disabled
