@@ -208,10 +208,16 @@
     ;; refusal. A count that cannot separate its two causes is, for the rarer
     ;; one, not a record at all. This row goes red the day someone merges them
     ;; back, which is the only way that decision would otherwise be noticed.
+    ;; 2026-09-18: FOUR, not three. This row went red exactly as it was built to
+    ;; when the accept-reserve batch added `exhausted` -- a listener that closed
+    ;; because it could not allocate a client handle. That is the mechanism
+    ;; working: the count set changed and something said so. Widened here rather
+    ;; than loosened; a row that stopped checking the length would stop noticing
+    ;; the next one.
     (let ((c (uv-accept-failure-counts)))
-      (check "U13: the failure counts name three causes, separately"
-             (and (list? c) (= (length c) 3)
-                  (assq 'error c) (assq 'refused c) (assq 'straggler c)) c)
+      (check "U13: the failure counts name four causes, separately"
+             (and (list? c) (= (length c) 4)
+                  (assq 'error c) (assq 'refused c) (assq 'straggler c) (assq 'exhausted c)) c)
       (check "U13: and nothing in this cell provoked any of them"
              (and (list? c) (for-all (lambda (kv) (eqv? (cdr kv) 0)) c)) c))
 
