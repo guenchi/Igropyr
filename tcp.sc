@@ -617,7 +617,10 @@
     (foreign-free block))
   (define (write-blocks-live-count) write-blocks-live)
   (define (write-table-size) (hashtable-size write-table))
-  ;; pending outbound connects: req address -> (handle . owner-pid)
+  ;; pending outbound connects: req address -> the vector built by the
+  ;; submission paths (connect-submit! and pipe-connect!), whose slots are
+  ;; named where they are constructed. It was a (handle . owner-pid) pair
+  ;; once and this line went on saying so afterwards.
   (define connect-table (make-eqv-hashtable))
   ;; pending DNS lookups: getaddrinfo req address -> owner-pid
   (define getaddrinfo-table (make-eqv-hashtable))
@@ -1234,8 +1237,11 @@
                 (else (void)))))
           owned))))
 
-  ;; live listeners: handle address -> #(token on-accept), one entry per
-  ;; tcp-listen!. Keyed dispatch (not a single global) so several
+  ;; live listeners: handle address -> one row per listener incarnation.
+  ;; The row's slots are named where it is built, in tcp-listen!; they are
+  ;; not listed here, because a copy of the shape in a second place is a
+  ;; copy that goes stale on its own -- this one had said
+  ;; "#(token on-accept)" through several widenings. Keyed dispatch (not a single global) so several
   ;; servers can listen on different ports in one process; the table
   ;; also roots each listener's accept hook, which nothing else holds
   ;; (the handles themselves are foreign-alloc'd and are not the GC's
@@ -1507,15 +1513,33 @@
 
   ;; connection_cb: accept, register, hand the conn to the upper layer.
   ;; Accept errors are swallowed; the listener must stay alive.
-  ;; Accept failures, counted rather than logged. Two of them, because
-  ;; they mean different things: `error` is the listener callback being
-  ;; handed a negative status by libuv; `refused` is uv_accept declining
-  ;; a connection that was already announced.
+  ;; Accept failures, counted rather than logged, each naming a different
+  ;; event. THE LIST AND ITS LENGTH LIVE AT uv-accept-failure-counts, not
+  ;; here: a heading that reports how many there are expires every time one
+  ;; is split off, and this paragraph has already been wrong once that way
+  ;; -- it went on describing a key called `error` after that key had been
+  ;; divided in two and removed. One authority for the number, and the best
+  ;; one is the place cells assert against.
   ;;
-  ;; COUNTED BECAUSE THE ALTERNATIVE WAS NOTHING AT ALL. Both branches
-  ;; discard silently -- correctly, since the listener has to stay alive
-  ;; -- so a server dropping every arrival looked exactly like a server
-  ;; nobody was calling. The kernel counts what it refuses itself; this
+  ;; WHAT THESE COUNTS DO NOT COVER, said here because a count is read as the
+  ;; total of the thing it names and almost never is:
+  ;;   - a TLS acceptance that fails inside tls-accept! -- a refused slot,
+  ;;     a context problem, a timer it could not arm -- is cleaned up by
+  ;;     that procedure's own guard and reaches none of these;
+  ;;   - an application accept hook raising on the TLS path runs later
+  ;;     still, under the read guard, and is not connection-callback-raised;
+  ;;   - a reserve re-arm that fails is deliberately swallowed (its cost
+  ;;     is the next connection taking rung 2) and is counted nowhere;
+  ;;   - the transport's post-accept step discards its result, so a
+  ;;     refused uv_tcp_nodelay is invisible here and always has been.
+  ;; Each of those is a decision or an older gap rather than an oversight
+  ;; of this split, and naming them is what keeps the six from being read
+  ;; as an inventory.
+  ;;
+  ;; COUNTED BECAUSE THE ALTERNATIVE WAS NOTHING AT ALL. Every one of
+  ;; these branches discards silently -- correctly, since the listener has
+  ;; to stay alive -- so a server dropping every arrival looked exactly
+  ;; like a server nobody was calling. The kernel counts what it refuses itself; this
   ;; is the half that happens after the kernel handed the connection up.
   ;;
   ;; SATURATING, NOT WRAPPING. A wrapped counter reports a small number
@@ -1527,34 +1551,90 @@
   ;; watching deltas sees a saturated counter stop changing and can read
   ;; that as recovery. Saturation is chosen because the alternative is
   ;; worse, not because it is safe.
-  (define accept-error-count 0)
+  ;; TWO CAUSES, TWO BUCKETS, AND THE SPLIT FINISHES AN ARGUMENT THIS FILE
+  ;; ALREADY MADE. The branch that reads a negative status from libuv says
+  ;; in its own comment that it is "not the same event as a refusal ...
+  ;; which is why the two are counted separately" -- and then shared a
+  ;; bucket with the outer guard's handler, which counts something else
+  ;; again. So this is not a new decision; it is the same reason carried to
+  ;; the case it had not been applied to.
+  ;;
+  ;; connection-callback-raised: SOMETHING IN THE CONNECTION CALLBACK
+  ;; RAISED. It names the
+  ;; mechanism and deliberately does not claim the origin: an allocation
+  ;; failure and a bookkeeping slip are ours, while the application's own
+  ;; accept hook runs in here too and can raise for reasons this library
+  ;; knows nothing about. One bucket, more than one origin, and the name
+  ;; says only what is actually established.
+  ;;
+  ;; listener-status-negative: libuv handed the listener callback a
+  ;; negative status.
+  ;; The accept failed BELOW us, possibly before there was a connection at
+  ;; all -- so an operator reading this looks outward, where the previous
+  ;; one sends them inward.
+  ;;
+  ;; NOT A COUNT OF KERNEL ACCEPT FAILURES, and that limit is older than
+  ;; this split: in libuv's unix server callback a failed accept returns
+  ;; WITHOUT invoking the connection callback at all, so the cases that
+  ;; reach here are only the ones libuv chooses to surface. Read as "libuv
+  ;; told us an accept failed", not as "this many accepts failed".
+  (define connection-callback-raised-count 0)
+  (define listener-status-negative-count 0)
   (define accept-refused-count 0)
   ;; an accept whose listener row was already gone -- see on-connection-code
   (define accept-straggler-count 0)
-  ;; a listener closed at rung 3: no client handle could be made twice over
+  ;; THE LISTENER WAS RETIRED BY THE ACCEPT LADDER. Named for the case it
+  ;; was built for -- no client handle could be had twice over -- but it
+  ;; records the retirement, not a proof of exhaustion: the same call is
+  ;; reached from a negative init and from the outer handler, which catches
+  ;; bookkeeping failures as well as allocation ones. Read it as "a
+  ;; listener stopped this way", and read connection-callback-raised
+  ;; beside it to see whether an exception was involved.
   (define accept-exhausted-count 0)
+  ;; uv_read_start refused on an open conn -- see tcp-read-start!
+  (define read-start-error-count 0)
   (define (bump-saturating n)
     (if (fx< n (greatest-fixnum)) (fx+ n 1) n))
-  ;; BOTH VALUES ARE READ IN ONE REGION, then the list is built
-  ;; outside it. Reading them across the allocations of the list would
-  ;; let a bump land in between, so the pair returned could pair an old
-  ;; error count with a new refused count -- a combination that never
-  ;; existed. Individual fixnums are never torn; it is the PAIR that
-  ;; needs the region, and callers comparing deltas are exactly who
-  ;; would be misled.
-  ;; THREE CAUSES, KEPT APART. The straggler count was poured into `refused`
-  ;; when this branch was first written, and that is the shape of having
-  ;; computed a fact and then discarded it: a count that cannot separate its
-  ;; two causes is, for the rarer one, not a record at all. Whoever merges
+  ;; EVERY VALUE IS READ IN ONE REGION, then the list is built outside it.
+  ;; Reading them across the allocations of the list would let a bump land
+  ;; in between, so the answer could carry one counter from before an event
+  ;; and another from after it -- a combination that never existed at any
+  ;; instant. Individual fixnums are never torn; it is the SET that needs
+  ;; the region, and callers comparing deltas are exactly who would be
+  ;; misled. (This paragraph said "both values" and named a key called
+  ;; `error` for as long as there were two of them; it is the same kind of
+  ;; sentence as the one two paragraphs down, and it went stale in the same
+  ;; commit.)
+  ;; WHY THESE ARE KEPT APART AT ALL, which is the part that does not
+  ;; expire -- for how many there are, read the list itself. The straggler
+  ;; count was poured into `refused` when that branch was first written,
+  ;; and that is the shape of having computed a fact and then discarded it:
+  ;; a count that cannot separate its two causes is, for the rarer one, not
+  ;; a record at all. Whoever merges
   ;; them back makes a decision nobody would otherwise notice.
+  ;; THESE COUNTS DO NOT ADD UP TO A TOTAL, and the sum is worth refusing
+  ;; explicitly because a list of numbers invites arithmetic. One failed
+  ;; arrival can move two of them (an exception in the accept window
+  ;; increments the raised count and then, through the same handler, the
+  ;; retirement count); read-start counts starts on connections this
+  ;; process dialled as well as ones it accepted; and the paragraph above
+  ;; lists the failures that move none of them. A number built by adding
+  ;; these would be wrong in both directions at once.
+  ;;
+  ;; AND THEY ARE PROCESS-WIDE. Not per listener, not per connection: two
+  ;; listeners in one process share every one of these.
   (define (uv-accept-failure-counts)
-    (let-values (((e r st ex) (with-interrupts-disabled
-                                (values accept-error-count
-                                        accept-refused-count
-                                        accept-straggler-count
-                                        accept-exhausted-count))))
-      (list (cons 'error e) (cons 'refused r) (cons 'straggler st)
-            (cons 'exhausted ex))))
+    (let-values (((cr as r st ex rs)
+                  (with-interrupts-disabled
+                    (values connection-callback-raised-count
+                            listener-status-negative-count
+                            accept-refused-count
+                            accept-straggler-count
+                            accept-exhausted-count
+                            read-start-error-count))))
+      (list (cons 'connection-callback-raised cr) (cons 'listener-status-negative as)
+            (cons 'refused r) (cons 'straggler st)
+            (cons 'exhausted ex) (cons 'read-start rs))))
 
   ;; DEFINED HERE RATHER THAN BESIDE THE CHILD-PROCESS CODE that first
   ;; needed it: the transport records below take it as a field value, which
@@ -1576,7 +1656,7 @@
   ;; ran: before init the block is plain memory, after it the loop holds a
   ;; pointer and it has to leave through uv_close.
   ;;
-  ;; after-accept! is the setup that can only run once the accepted socket is
+  ;; after-accept is the setup that can only run once the accepted socket is
   ;; open. For TCP that is uv_tcp_nodelay, which is declared on uv_tcp_t* and
   ;; is meaningless on a pipe; for a unix socket there is nothing to do.
   (define-record-type (transport make-transport transport?)
@@ -1773,10 +1853,12 @@
        ;; exists to keep clear. The second: this catches ANY raise between
        ;; the lookup and the accept, not only the allocation -- and "any
        ;; raise in that window" is what the reachable wedge actually is.
-       ;; The third: the same two variables close the leak after the accept
-       ;; as well, so one mechanism serves both.
+       ;; The third: the same variables close the leak after the accept as
+       ;; well, so one mechanism serves both.
        (guard (e (#t (note-swallowed! 'on-connection e)
-                     (set! accept-error-count (bump-saturating accept-error-count))
+                     ;; ours: something in this callback raised
+                     (set! connection-callback-raised-count
+                           (bump-saturating connection-callback-raised-count))
                      ;; THE DESCRIPTOR WAS NEVER CONSUMED. Returning now is
                      ;; the wedge, so the listener goes instead -- visibly.
                      (when in-flight-server
@@ -1811,7 +1893,7 @@
             ;; itself having failed, possibly before the kernel had a
             ;; connection to hand up at all, which is why the two are
             ;; counted separately.
-            (set! accept-error-count (bump-saturating accept-error-count))
+            (set! listener-status-negative-count (bump-saturating listener-status-negative-count))
             ;; THE LOOKUP COMES FIRST, AND THE ORDER IS PART OF THE DESIGN.
             ;; The client handle is made by a factory the listener carries,
             ;; and a factory cannot be fetched from a #f entry -- so the
@@ -3060,8 +3142,9 @@
         (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
         (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf flags))
         (check 'uv-listen (uv-listen l backlog on-connection-entry))
-        ;; #(token on-accept). The token is a fresh Scheme object per
-        ;; LISTENER INCARNATION, and it is what makes an address safe to
+        ;; The row built just below is the one description of its own
+        ;; shape; the slots are named in the comments beside them. The
+        ;; token is a fresh Scheme object per LISTENER INCARNATION, and it is what makes an address safe to
         ;; use as an identity. Addresses alone are not: uv_handle_size
         ;; for a TCP handle was 264 bytes on the build this was measured
         ;; on (uv_handle_size is queried at run time and is not a
@@ -4193,12 +4276,81 @@
           #f
           (if (not (fx= 0 (uv-is-active (conn-handle c))))
               #t                        ; already reading: nothing to do
-              (let ((r (uv-read-start (conn-handle c)
-                                      on-alloc-entry on-read-entry)))
+              ;; INJECTION POINT 'read-start-neg -- OWNING GUARD: NONE, and
+              ;; none may be added. This sits inside the region opened at
+              ;; the top of this procedure, where a raise would leave the
+              ;; conn's state observed but the region unfinished; the whole
+              ;; reason the test and the use are one step is that nothing
+              ;; between them may yield or unwind.
+              ;;
+              ;; A RETURN, NOT A RAISE, AND THE DIFFERENCE IS THE BRANCH
+              ;; UNDER TEST. uv_read_start reports failure by returning a
+              ;; negative libuv code; it does not signal. Injecting a raise
+              ;; here would exercise a path this procedure does not have,
+              ;; and would do it inside a region that must not unwind --
+              ;; two departures from reality at once. The value is read
+              ;; only as "negative means reading did not start", which is
+              ;; why the arm accepts the same errno range uv_accept's point
+              ;; does.
+              ;;
+              ;; WHAT IS INJECTED IS "A NEGATIVE RETURN", NOT A PARTICULAR
+              ;; ERRNO. The arm-time check on that range is a range check
+              ;; and nothing more, and this caller never passes the value
+              ;; on: it tests the sign and answers #t or #f. That is worth
+              ;; saying because the same check is NOT formality at its
+              ;; other points -- uv-write-neg hands its value to on-done as
+              ;; an errno and getaddrinfo-refused puts it in
+              ;; #(dns-failed ...), where a value outside libuv's range
+              ;; would be a reading nobody could get from the real system.
+              ;;
+              ;; THE COST OF THE POINT, MEASURED, so no one reads the
+              ;; region above as stricter than it is: with injection
+              ;; expanded in, an injection point costs about 80 bytes of
+              ;; Scheme heap per execution whether or not it is armed, and
+              ;; an arm carrying a raw filter procedure -- which the
+              ;; inject-control helpers do not produce -- could run that
+              ;; procedure inside this region. Production expands this to
+              ;; the bare call, which is the configuration the no-unwind
+              ;; rule above is about.
+              ;;
+              ;; A RETURN SKIPS THE CALL, AND HERE THAT IS FAITHFUL --
+              ;; unlike at the accept point a few hundred lines up, where
+              ;; skipping uv_accept would leave a descriptor unconsumed and
+              ;; silently kill the listener, so that point had to be an
+              ;; override instead. A uv_read_start that fails does not
+              ;; start reading; not calling it leaves the conn in exactly
+              ;; that state, which is why the cheaper form is the correct
+              ;; one here and the wrong one there.
+              ;;
+              ;; IT WRAPS THE CALL, NOT THE TEST BELOW. Around the `if`
+              ;; instead, an armed value would become this procedure's
+              ;; answer directly: the branch under test -- count it, answer
+              ;; #f -- would never run, and a cell driving the seam would
+              ;; go green having measured nothing.
+              (let ((r (inject-return! 'read-start-neg
+                         (uv-read-start (conn-handle c)
+                                        on-alloc-entry on-read-entry))))
                 (if (fx>= r 0)
                     #t
-                    (begin (set! accept-error-count
-                                 (bump-saturating accept-error-count))
+                    ;; ITS OWN COUNT. This used to land in the bucket the
+                    ;; accept callback uses, which is a different event: a
+                    ;; read that would not start is not an accept that
+                    ;; failed, and the consumer most likely to care -- a
+                    ;; daemon that ends itself when its socket stops
+                    ;; delivering -- is exactly the one the merged number
+                    ;; cannot inform. A count that cannot separate its
+                    ;; causes is, for the rarer one, not a record at all.
+                    ;;
+                    ;; WHAT IT DOES NOT COUNT, so the name is not read for
+                    ;; more than it says: not an asynchronous read error
+                    ;; delivered later, not a start refused because the
+                    ;; conn is closed (that answers #f without coming
+                    ;; here), not a redundant start on a conn already
+                    ;; reading (uv_is_active answers that above), and not
+                    ;; the separate uv_read_start the child-process code
+                    ;; issues on its own pipes.
+                    (begin (set! read-start-error-count
+                                 (bump-saturating read-start-error-count))
                            #f)))))))
 
   ;; Stop delivering #(tcp-data ...), so the kernel's receive window closes

@@ -280,8 +280,13 @@
            ;; uv_accept declining an announced connection joins them:
            ;; same errno domain, and its caller reads only "negative
            ;; means refused".
+           ;; uv_read_start joins them for the same reason uv_accept did:
+           ;; its caller reads only "negative means it did not start", and
+           ;; the value is not carried anywhere a different range could be
+           ;; observed.
            ((uv-write-neg uv-write-sealing-neg getaddrinfo-refused
-             tcp-connect-refused accept-refused tls-handshake-write-status)
+             tcp-connect-refused accept-refused tls-handshake-write-status
+             read-start-neg)
             (unless (and (fixnum? value) (fx< value 0) (fx>= value -4095))
               (assertion-violation '$inject-arm!
                 "this point needs an exact libuv error code in [-4095,-1]"
