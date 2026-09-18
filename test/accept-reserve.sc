@@ -67,9 +67,14 @@
     (define (dial port) (tcp-connect! "127.0.0.1" port main))
     (define (took-a-connection? ms)
       (receive (after ms #f) (`#(acc ,c) c)))
+    ;; THE DIALLING END HAS TO BE CLOSED TOO. The first version of this helper
+    ;; took the completion message and returned the conn without closing it, so
+    ;; every SUCCESSFUL dial left a live client conn and its handle behind. The
+    ;; rows that count handles back to baseline are the ones that noticed -- R4
+    ;; and R6 -- and they were reading this leak, not the implementation's.
     (define (drain-dial! ms)
       (receive (after ms 'none)
-        (`#(tcp-connected ,c) (list 'connected c))
+        (`#(tcp-connected ,c) (tcp-close! c) (list 'connected c))
         (`#(tcp-connect-failed ,s) (list 'failed s))))
 
     ;; ---- R1: the normal path refills -----------------------------------------
