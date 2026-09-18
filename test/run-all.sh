@@ -65,6 +65,13 @@ trap 'st=$?; if [ "$st" -ne 0 ]; then
   echo "=== result and must not be reported as one."
 fi' EXIT
 
+# FIRST, BECAUSE IT GUARDS THIS FILE. Every test/*.sc that ends like a suite
+# must be named below; a new one that nobody adds a line for never runs and
+# nothing says so, which has happened. Exclusions are explicit and a stale one
+# is also an error. Scope: it cannot see a listed suite that has lost a
+# section -- that is a different hole.
+sh test/listed-suites.sh
+
 "$scheme_bin" --script test/import-all.sc
 # the names applications import, each named ONE BY ONE: a rename that
 # rewrites a substring inside them moves every use with every definition,

@@ -103,32 +103,15 @@
                          (receive (after 3000 #f) (`#(tcp-connected ,c) c)))))
         (check "premise: a connection pair, server reading" (and cli (within? 2000 (lambda () srv))))
 
-        ;; ---- A1: the kill lands strictly inside the copy ------------------
-        (let* ((w0 (write-blocks-live-count)) (i0 (uv-owner-index-count))
-               (tw (inject-arm-barrier! 'write-before-region 1 60000))
-               (p (park-writer! cli 'write-before-copy long-write))
-               (t (car p)) (pid (cadr p)))
-          (check "A1 premise: a writer parked between the allocation and the copy (#f = the point does not exist yet)"
-                 (and pid #t) pid)
-          (check "A1 premise: it holds one block, already owned, copy not started"
-                 (and pid (eqv? (write-blocks-live-count) (+ w0 1))) (blocks) w0)
-          (when pid (inject-barrier-drain! pid t 3000))
-          (guard (e (#t (void))) (inject-release! t))
-          (sleep-ms 5)
-          (when pid (kill pid 'test-kill))
-          (check "A1 the writer never reached the end of the copy -- so the kill was INSIDE it"
-                 (and pid (eqv? (hits 'write-before-region) 0)) (hits 'write-before-region))
-          (guard (e (#t (void))) (inject-release! tw))
-          (check "A1 the block is reclaimed by the owner-death sweep"
-                 (and pid (within? 5000 (lambda () (eqv? (write-blocks-live-count) w0))))
-                 (write-blocks-live-count) w0)
-          (check "A1 ...and so is its index entry (a freed block with a live entry is the other half)"
-                 (and pid (within? 5000 (lambda () (eqv? (uv-owner-index-count) i0))))
-                 (uv-owner-index-count) i0))
-        (inject-disarm!)
-
-        ;; ---- A2: the twin. Without it A1 is satisfied by a writer that never
-        ;; got anywhere, and nothing here would read a single byte.
+        ;; ---- A2 RUNS FIRST, AND THAT ORDER IS THE POINT ------------------
+        ;; A1's whole conclusion rests on a ZERO reading from the tripwire, and
+        ;; a zero is also exactly what a tripwire that CANNOT FIRE produces --
+        ;; an arming of the wrong kind is rejected before the hit is counted, so
+        ;; it reads 0 forever. A2 drives the same point with the same arming and
+        ;; asserts it reads 1. Only after that does a 0 from A1 mean anything.
+        ;;
+        ;; It is also the twin: without it A1 is satisfied by a writer that never
+        ;; got anywhere, and nothing else in this file reads a single byte.
         (let* ((w0 (write-blocks-live-count))
                (payload (make-bytevector queued-size 66))
                (tw (inject-arm-barrier! 'write-before-region 1 60000))
@@ -152,6 +135,32 @@
                    (apply + (map bytevector-length got)) queued-size)
             (check "A2 the block returns by the ordinary path"
                    (within? 3000 (lambda () (eqv? (write-blocks-live-count) w0))) (write-blocks-live-count) w0)))
+        (inject-disarm!)
+
+        ;; ---- A1: the kill lands strictly inside the copy ------------------
+        ;; Reads the tripwire's SILENCE, which is only evidence because A2 above
+        ;; has just shown the same point speaking.
+        (let* ((w0 (write-blocks-live-count)) (i0 (uv-owner-index-count))
+               (tw (inject-arm-barrier! 'write-before-region 1 60000))
+               (p (park-writer! cli 'write-before-copy long-write))
+               (t (car p)) (pid (cadr p)))
+          (check "A1 premise: a writer parked between the allocation and the copy (#f = the point does not exist yet)"
+                 (and pid #t) pid)
+          (check "A1 premise: it holds one block, already owned, copy not started"
+                 (and pid (eqv? (write-blocks-live-count) (+ w0 1))) (blocks) w0)
+          (when pid (inject-barrier-drain! pid t 3000))
+          (guard (e (#t (void))) (inject-release! t))
+          (sleep-ms 5)
+          (when pid (kill pid 'test-kill))
+          (check "A1 the writer never reached the end of the copy -- so the kill was INSIDE it"
+                 (and pid (eqv? (hits 'write-before-region) 0)) (hits 'write-before-region))
+          (guard (e (#t (void))) (inject-release! tw))
+          (check "A1 the block is reclaimed by the owner-death sweep"
+                 (and pid (within? 5000 (lambda () (eqv? (write-blocks-live-count) w0))))
+                 (write-blocks-live-count) w0)
+          (check "A1 ...and so is its index entry (a freed block with a live entry is the other half)"
+                 (and pid (within? 5000 (lambda () (eqv? (uv-owner-index-count) i0))))
+                 (uv-owner-index-count) i0))
         (inject-disarm!)
 
         ;; ---- B1/B2: the two ends of the interval, still worth having -------
