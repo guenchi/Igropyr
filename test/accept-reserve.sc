@@ -238,9 +238,10 @@
 
     ;; ---- R7: the counts --------------------------------------------------------------
     (let ((c (counts)))
-      (check "R7: the failure counts name four causes, separately"
-             (and (list? c) (= (length c) 4)
-                  (assq 'error c) (assq 'refused c) (assq 'straggler c) (assq 'exhausted c)) c))
+      (check "R7: the failure counts name six causes, separately"
+             (and (list? c) (= (length c) 6)
+                  (assq 'callback-raised c) (assq 'accept-status c) (assq 'refused c)
+                  (assq 'straggler c) (assq 'exhausted c) (assq 'read-start c)) c))
 
     ;; ---- R8: a reserve is a block, not a handle ----------------------------------------
     ;; an initialised handle would be in the loop's handle queue and uv_walk would

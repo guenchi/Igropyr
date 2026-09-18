@@ -208,16 +208,20 @@
     ;; refusal. A count that cannot separate its two causes is, for the rarer
     ;; one, not a record at all. This row goes red the day someone merges them
     ;; back, which is the only way that decision would otherwise be noticed.
-    ;; 2026-09-18: FOUR, not three. This row went red exactly as it was built to
-    ;; when the accept-reserve batch added `exhausted` -- a listener that closed
-    ;; because it could not allocate a client handle. That is the mechanism
-    ;; working: the count set changed and something said so. Widened here rather
-    ;; than loosened; a row that stopped checking the length would stop noticing
-    ;; the next one.
+    ;; SIX now, and this row has gone red twice for the right reason. First when
+    ;; `exhausted` arrived (a listener closing because it could not allocate a
+    ;; client handle), then when `error` was split: it had been carrying two
+    ;; opposite diagnoses -- our own code raising while handling an inbound
+    ;; connection, and libuv reporting a negative status for the accept itself,
+    ;; possibly before there was a connection at all. Somebody reading `error: 3`
+    ;; could not tell which half to investigate. Widened each time rather than
+    ;; loosened; a row that stopped checking the length would stop noticing the
+    ;; next one.
     (let ((c (uv-accept-failure-counts)))
-      (check "U13: the failure counts name four causes, separately"
-             (and (list? c) (= (length c) 4)
-                  (assq 'error c) (assq 'refused c) (assq 'straggler c) (assq 'exhausted c)) c)
+      (check "U13: the failure counts name six causes, separately"
+             (and (list? c) (= (length c) 6)
+                  (assq 'callback-raised c) (assq 'accept-status c) (assq 'refused c)
+                  (assq 'straggler c) (assq 'exhausted c) (assq 'read-start c)) c)
       (check "U13: and nothing in this cell provoked any of them"
              (and (list? c) (for-all (lambda (kv) (eqv? (cdr kv) 0)) c)) c))
 
