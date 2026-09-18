@@ -50,6 +50,8 @@
     tcp-connect! tcp-connect-tls! tcp-listen! tcp-listen-tls!
     ;; the unix domain socket pair, beside the TCP one
     pipe-listen! pipe-connect!
+    ;; INJECT-gated seam for the accept ladder
+    $listener-reserve?
     tcp-read-start!
     tcp-read-stop! tcp-stop-listen! tcp-write! tcp-write-foreign!
     tcp-writev! tcp-writev-raw!
@@ -1529,6 +1531,8 @@
   (define accept-refused-count 0)
   ;; an accept whose listener row was already gone -- see on-connection-code
   (define accept-straggler-count 0)
+  ;; a listener closed at rung 3: no client handle could be made twice over
+  (define accept-exhausted-count 0)
   (define (bump-saturating n)
     (if (fx< n (greatest-fixnum)) (fx+ n 1) n))
   ;; BOTH VALUES ARE READ IN ONE REGION, then the list is built
@@ -1544,11 +1548,18 @@
   ;; two causes is, for the rarer one, not a record at all. Whoever merges
   ;; them back makes a decision nobody would otherwise notice.
   (define (uv-accept-failure-counts)
-    (let-values (((e r st) (with-interrupts-disabled
-                             (values accept-error-count
-                                     accept-refused-count
-                                     accept-straggler-count))))
-      (list (cons 'error e) (cons 'refused r) (cons 'straggler st))))
+    (let-values (((e r st ex) (with-interrupts-disabled
+                                (values accept-error-count
+                                        accept-refused-count
+                                        accept-straggler-count
+                                        accept-exhausted-count))))
+      (list (cons 'error e) (cons 'refused r) (cons 'straggler st)
+            (cons 'exhausted ex))))
+
+  ;; DEFINED HERE RATHER THAN BESIDE THE CHILD-PROCESS CODE that first
+  ;; needed it: the transport records below take it as a field value, which
+  ;; is evaluated when the library body runs, so it has to exist by then.
+  (define pipe-handle-size (uv-handle-size UV-NAMED-PIPE))
 
   ;; ---- transports ---------------------------------------------------------
   ;;
@@ -1571,6 +1582,12 @@
   (define-record-type (transport make-transport transport?)
     (fields
       (immutable name transport-name)
+      ;; the handle size, so the reserve can be taken and re-armed without
+      ;; anything outside this record naming a transport
+      (immutable handle-size transport-handle-size)
+      ;; init-client is the half of make-client that does NOT allocate: it
+      ;; is what the accept window is allowed to call.
+      (immutable init-client transport-init-client)
       (immutable make-client transport-make-client)
       (immutable after-accept transport-after-accept)))
 
@@ -1584,7 +1601,8 @@
           h)))
 
   (define tcp-transport
-    (make-transport 'tcp
+    (make-transport 'tcp tcp-handle-size
+      (lambda (h) (uv-tcp-init (uv-loop-handle) h))
       (lambda ()
         (make-client-handle tcp-handle-size
           (lambda (h) (uv-tcp-init (uv-loop-handle) h))))
@@ -1593,11 +1611,153 @@
   ;; The 0 is uv_pipe_init's ipc argument: this is a byte stream, not a
   ;; channel for passing handles between processes.
   (define pipe-transport
-    (make-transport 'pipe
+    (make-transport 'pipe pipe-handle-size
+      (lambda (h) (uv-pipe-init (uv-loop-handle) h 0))
       (lambda ()
         (make-client-handle pipe-handle-size
           (lambda (h) (uv-pipe-init (uv-loop-handle) h 0))))
       (lambda (client) (void))))
+
+  ;; ---- the accept window, and what it may not do --------------------------
+  ;;
+  ;; THE INVARIANT THIS BATCH EXISTS TO ESTABLISH:
+  ;;
+  ;;   on the reserve path, from entering the connection callback until
+  ;;   uv_accept has returned, there is no foreign-alloc.
+  ;;
+  ;; STATED IN C-HEAP TERMS ON PURPOSE, and an earlier version of this
+  ;; comment overreached by adding "and in a production build, no allocation
+  ;; at all". That is false and was measured false: establishing the outer
+  ;; guard itself allocates about 300 bytes of SCHEME heap on entry, with
+  ;; injection off, before anything else in the callback runs. The guard
+  ;; cannot move out -- it is what catches the failure the ladder answers --
+  ;; so the Scheme-heap half of that claim was never available. What the
+  ;; design actually removes, and what the wedge was made of, is the
+  ;; foreign-alloc: the C-heap request that fails under pressure by raising.
+  ;;
+  ;; Why it matters: uv__server_io accepts the descriptor BEFORE calling this
+  ;; callback and stops polling the listener if the callback returns without
+  ;; consuming it. So anything in that window which can raise can wedge a
+  ;; listener permanently and in silence. Under memory pressure a
+  ;; foreign-alloc in there does exactly that, and it is the reachable form
+  ;; of the wedge -- older than any of this code, because the old accept path
+  ;; allocated its client handle in the same window.
+  ;;
+  ;; AND ONE FURTHER MEASURED COST THAT IS THE INSTRUMENT'S. In a build expanded
+  ;; with IGROPYR_INJECT=on, every injection point costs 80 bytes of Scheme
+  ;; heap per execution whether or not it is armed (measured: override,
+  ;; return, fault and barrier, 2000 calls each; with injection off all four
+  ;; are zero). The override wrapping uv_accept below is inside the window
+  ;; and cannot be moved out without destroying the point. So the invariant
+  ;; holds as stated for what ships, and the cells can only witness the
+  ;; foreign-alloc half of it.
+  ;;
+  ;; AND THE CELLS' INSTRUMENT SEES ONLY ONE HALF ANYWAY. (bytes-allocated)
+  ;; measures the SCHEME heap; foreign-alloc moves the C heap, so a zero
+  ;; there reads "this did not touch the Scheme heap", not "this did not
+  ;; allocate" -- and the C-heap allocation is precisely what this design
+  ;; removes from the window. No allocation counter can witness that; only
+  ;; the act of moving it out is the evidence.
+
+  ;; WHAT IS IN HAND WHEN SOMETHING RAISES. The callback's outer guard runs
+  ;; the failure ladder, and these say what it has to clean up. They are
+  ;; module variables rather than locals because the guard must reach them
+  ;; from outside the region that set them, and assignment to a module
+  ;; variable allocates nothing (measured).
+  ;;
+  ;; in-flight-server: the descriptor has been accepted by libuv and NOT yet
+  ;; consumed by us. A raise here is the wedge, so the ladder's rung 3 runs.
+  ;; in-flight-client: a block or an initialised handle is ours and no conn
+  ;; owns it yet. Which of the two it is decides free against close, so the
+  ;; third variable says.
+  ;; in-flight-conn: the conn is PUBLISHED and the application's accept hook
+  ;; has not returned. A hook that raises used to leave that conn in
+  ;; conn-table, open, owned by nobody -- reachable from any application, not
+  ;; only under memory pressure, and older than this batch. It is a conn and
+  ;; not a handle by then, so the release is tcp-close! rather than uv_close.
+  (define in-flight-server #f)
+  (define in-flight-client #f)
+  (define in-flight-client-inited? #f)
+  (define in-flight-conn #f)
+
+  (define (clear-in-flight!)
+    (set! in-flight-server #f)
+    (set! in-flight-client #f)
+    (set! in-flight-client-inited? #f)
+    (set! in-flight-conn #f))
+
+  ;; RUNG 3. Reached only when no client handle could be had twice over -- a
+  ;; failed re-arm after one connection, then a failed allocation on the
+  ;; next -- or when init returned negative. Sustained exhaustion, not a
+  ;; blip.
+  ;;
+  ;; THE ROW IS MARKED, NOT REMOVED, and that is a measurement talking:
+  ;; hashtable-delete! allocates (16448 bytes over 2000 calls on an eq
+  ;; table), and this runs in the window's failure path where allocating is
+  ;; the thing being avoided. vector-set! of a boolean is an immediate and
+  ;; allocates nothing. The row and any TLS context are reclaimed by the
+  ;; next tcp-stop-listen!, which runs outside the callback and may allocate
+  ;; freely; the cost of not reclaiming them here is one dead row and one
+  ;; SSL_CTX per listener that died this way, stated rather than hidden.
+  ;;
+  ;; LOUD, WHICH IS THE WHOLE POINT. listener-open? answers #f afterwards,
+  ;; so a supervisor has a reading to take; the wedge this replaces had the
+  ;; same operational outcome -- a listener that never accepts again -- with
+  ;; nothing to observe.
+  ;; RUNG 1 AND RUNG 2, IN ONE PLACE. Rung 1 is the whole of normal
+  ;; operation: the reserve is present, so nothing allocates -- the block was
+  ;; taken at listen time, where a failure could be raised to the caller who
+  ;; was asking for a listener. Rung 2 is the single transient miss: a
+  ;; previous re-arm failed, so one allocation is attempted here, exactly as
+  ;; the code did before any of this existed. If THAT raises, the outer guard
+  ;; takes rung 3 -- which is why there is no guard around it here.
+  ;;
+  ;; -> an initialised handle, or #f when init refused it (rung 3's other
+  ;; door). The block is freed before answering #f, so the caller has
+  ;; nothing left to release.
+  (define (take-client-handle! v tr)
+    (let ((reserved (vector-ref v 6)))
+      (let ((block
+              (if reserved
+                  (begin (vector-set! v 6 #f) reserved)
+                  ;; INJECTION POINT 'accept-reserve-inwindow (fault) --
+                  ;; OWNING GUARD: the callback's outer one, deliberately:
+                  ;; this is the allocation whose failure is rung 3, and
+                  ;; catching it closer would put a guard in the window.
+                  (begin (inject-fault! 'accept-reserve-inwindow)
+                         (foreign-alloc (transport-handle-size tr))))))
+        (if (< ((transport-init-client tr) block) 0)
+            (begin (foreign-free block) #f)
+            block))))
+
+  ;; AFTER THE ACCEPT, SO ITS FAILURE COSTS NOTHING. The descriptor is
+  ;; already ours by the time this runs, so a raise here must not take the
+  ;; connection with it -- hence the guard, which is legal because this is
+  ;; outside the window the invariant covers. A failed re-arm simply leaves
+  ;; the reserve empty and the next connection takes rung 2.
+  (define (rearm-reserve! v tr)
+    (guard (e (#t (note-swallowed! 'accept-rearm e) (void)))
+      ;; INJECTION POINT 'accept-reserve-rearm (fault) -- OWNING GUARD: the
+      ;; one on the line above. Arming it alone empties the reserve without
+      ;; disturbing this connection, which is how a cell reaches rung 2
+      ;; through the path production would take rather than through a seam.
+      (inject-fault! 'accept-reserve-rearm)
+      (vector-set! v 6 (foreign-alloc (transport-handle-size tr)))))
+
+  ;; NOT IDEMPOTENT BY ITSELF -- uv_close on an already-closing handle is
+  ;; an abort in libuv -- so every caller asks the row first, and the flag
+  ;; is what answers.
+  (define (listener-exhausted! server v)
+    ;; the reserve is empty on both routes into this procedure -- the ladder
+    ;; takes it before it can fail -- but releasing it rather than dropping
+    ;; the reference keeps "a dead row holds nothing" true by construction
+    ;; instead of by argument.
+    (let ((r (vector-ref v 6)))
+      (when r (foreign-free r)))
+    (vector-set! v 6 #f)
+    (vector-set! v 7 #t)
+    (set! accept-exhausted-count (bump-saturating accept-exhausted-count))
+    (uv-close server on-close-entry))
 
   (define on-connection-code
     (foreign-callable
@@ -1606,8 +1766,39 @@
        ;; tls-accept! is even entered, foreign-alloc and make-conn can raise
        ;; under allocation pressure, and an exception leaving here unwinds
        ;; into C. The handler does the least it can and cannot itself raise.
+       ;; THE HANDLER RUNS THE FAILURE LADDER, and it is the outer guard
+       ;; that does it rather than an inner one. Three reasons, and the
+       ;; first is the design's: establishing a guard inside the window is
+       ;; not obviously allocation-free, and the window is what this batch
+       ;; exists to keep clear. The second: this catches ANY raise between
+       ;; the lookup and the accept, not only the allocation -- and "any
+       ;; raise in that window" is what the reachable wedge actually is.
+       ;; The third: the same two variables close the leak after the accept
+       ;; as well, so one mechanism serves both.
        (guard (e (#t (note-swallowed! 'on-connection e)
                      (set! accept-error-count (bump-saturating accept-error-count))
+                     ;; THE DESCRIPTOR WAS NEVER CONSUMED. Returning now is
+                     ;; the wedge, so the listener goes instead -- visibly.
+                     (when in-flight-server
+                       (let ((v (hashtable-ref listener-table in-flight-server #f)))
+                         (when (and v (not (vector-ref v 7)))
+                           (listener-exhausted! in-flight-server v))))
+                     ;; A BLOCK OR A HANDLE IS OURS AND NO CONN OWNS IT.
+                     ;; Which it is decides the release: before init it is
+                     ;; plain memory, after init the loop holds a pointer
+                     ;; and it must leave through uv_close. This is also the
+                     ;; leak after uv_accept -- reachable not only from OOM
+                     ;; but from the application's own accept hook raising.
+                     (when in-flight-client
+                       (if in-flight-client-inited?
+                           (uv-close in-flight-client on-close-entry)
+                           (foreign-free in-flight-client)))
+                     ;; A PUBLISHED CONN WHOSE HOOK RAISED. It is in
+                     ;; conn-table already, so it goes out the way a conn
+                     ;; does; closing the handle underneath it would leave
+                     ;; the row behind.
+                     (when in-flight-conn (tcp-close! in-flight-conn))
+                     (clear-in-flight!)
                      (void)))
         (if (< status 0)
             ;; NO CELL COVERS THIS BRANCH. Making libuv hand a negative
@@ -1666,8 +1857,13 @@
              (if (not v)
               (set! accept-straggler-count
                     (bump-saturating accept-straggler-count))
-              (let ((client ((transport-make-client (vector-ref v 5)))))
-               (if (not client)
+              (begin
+               (set! in-flight-server server)
+               (let* ((tr (vector-ref v 5))
+                      (client (take-client-handle! v tr)))
+                (set! in-flight-client client)
+                (set! in-flight-client-inited? (and client #t))
+                (if (not client)
                 ;; THE FACTORY COULD NOT MAKE A HANDLE, and this branch is
                 ;; incomplete in a way worth naming rather than smoothing
                 ;; over. It releases what the factory took and counts the
@@ -1696,7 +1892,17 @@
                 ;; callback has run. Both are reachable from inside a
                 ;; foreign callback; what is not permitted here is an
                 ;; exception escaping into C.
-                (set! accept-error-count (bump-saturating accept-error-count))
+                ;;
+                ;; RUNG 3, REACHED BY THE OTHER DOOR: init returned negative
+                ;; rather than an allocation raising. The block is already
+                ;; released by the factory, so only the listener is left.
+                ;;
+                ;; AND THE IN-FLIGHT STATE IS CLEARED BEFORE RETURNING. These
+                ;; are module variables: leaving in-flight-server set here
+                ;; would make the NEXT callback's handler -- on any listener
+                ;; -- run rung 3 against this stale one.
+                (begin (listener-exhausted! server v)
+                       (clear-in-flight!))
               ;; INJECTION POINT 'accept-refused -- OWNING GUARD: none in
               ;; this callback, and none may be added: it runs in foreign
               ;; callback context, where an escaping raise unwinds into C.
@@ -1726,14 +1932,30 @@
                 (if (< (inject-override! 'accept-refused
                                          (uv-accept server client)) 0)
                     (begin
+                      ;; the descriptor went with uv_accept's own failure
+                      (set! in-flight-server #f)
                       (set! accept-refused-count
                             (bump-saturating accept-refused-count))
-                      (uv-close client on-close-entry))
-                  ;; #(token on-accept handshaking tls-ctx handle transport)
-                  (let ((c (make-conn client #f 'open #f #f #f #f #f)))
+                      (uv-close client on-close-entry)
+                      (clear-in-flight!))
+                  ;; #(token on-accept handshaking tls-ctx handle transport
+                  ;;   reserve dead?)
+                  (begin
+                   ;; THE DESCRIPTOR IS OURS NOW, so a later raise costs a
+                   ;; connection and not the listener.
+                   (set! in-flight-server #f)
+                   (rearm-reserve! v tr)
+                   (let ((c (make-conn client #f 'open #f #f #f #f #f)))
                     ;; the transport's own post-accept step, which for TCP is
                     ;; the nodelay that used to stand here unconditionally
-                    ((transport-after-accept (vector-ref v 5)) client)
+                    ((transport-after-accept tr) client)
+                    ;; INJECTION POINT 'accept-before-publish (fault) --
+                    ;; OWNING GUARD: the callback's outer one, which is what
+                    ;; closes the client here. This is the window the leak
+                    ;; lived in: the handle is ours, no conn owns it, and the
+                    ;; application's own hook can raise a few lines further
+                    ;; down for the same effect.
+                    (inject-fault! 'accept-before-publish)
                     (let ((ctx (incarnation-tls-ctx v)))
                       (cond
                         ;; THE TLS PATH PUBLISHES ITSELF. X2 requires the
@@ -1742,10 +1964,16 @@
                         ;; publication is cleaned up by the only code that can
                         ;; see the session. The insert therefore moves inside
                         ;; tls-accept! rather than happening here.
-                        (ctx (tls-accept! c v ctx))
+                        (ctx (clear-in-flight!) (tls-accept! c v ctx))
                         (else
                           (hashtable-set! conn-table client c)
-                          ((vector-ref v 1) c)))))))))))))
+                          ;; the conn owns the handle from here; what is not
+                          ;; yet settled is whether the application took it
+                          (set! in-flight-client #f)
+                          (set! in-flight-client-inited? #f)
+                          (set! in-flight-conn c)
+                          ((vector-ref v 1) c)
+                          (clear-in-flight!)))))))))))))))
       (void* int)
       void))
 
@@ -2662,6 +2890,28 @@
   ;;     libuv implements, not what we have measured.
   ;; opts: (flags [tls-ctx]). The context is taken HERE rather than patched
   ;; in afterwards -- see the incarnation vector below for why.
+  ;; A DEAD ROW AT THIS ADDRESS IS RECLAIMED BEFORE IT IS OVERWRITTEN, and
+  ;; the case is reachable rather than theoretical. Rung 3 of the accept
+  ;; ladder leaves the row in the table on purpose and closes the handle;
+  ;; the close callback then frees that block, and a foreign-alloc of the
+  ;; same size afterwards returns the SAME address -- measured here, and the
+  ;; reason the incarnation token exists at all. The next listener therefore
+  ;; publishes over the dead row, and from that moment nothing can reach it:
+  ;; the old token no longer matches, and the handle-only and no-argument
+  ;; stops find only the replacement. Its SSL_CTX would never be retired.
+  ;;
+  ;; ONLY A DEAD ROW IS RECLAIMED HERE. A LIVE row at this address would
+  ;; mean two listeners believe they own the same handle, which is a defect
+  ;; somewhere else; quietly retiring its context would destroy a working
+  ;; listener's TLS rather than report the contradiction.
+  (define (reclaim-displaced-row! l)
+    (let ((old (hashtable-ref listener-table l #f)))
+      (when (and old (vector-ref old 7))
+        (let ((ctx (vector-ref old 3)))
+          (when ctx (tls-context-retire! ctx)))
+        (let ((r (vector-ref old 6)))
+          (when r (foreign-free r))))))
+
   ;; ---- unix domain sockets ------------------------------------------------
   ;;
   ;; THE LIBRARY REFUSES A PATH IT CANNOT PASS THROUGH UNCHANGED, and both
@@ -2754,14 +3004,16 @@
     (check-socket-path 'pipe-listen! path)
     (with-interrupts-disabled
       (let ((l (foreign-alloc pipe-handle-size))
-            (inited? #f))
+            (inited? #f)
+            (reserve #f))
         ;; WHICH RELEASE IS RIGHT DEPENDS ON HOW FAR THIS GOT, the same
         ;; distinction tcp-listen! makes: before init the block is plain
         ;; memory; after it the loop holds a pointer and the block may only
         ;; be freed by the close callback. A failed bind -- a stale socket
         ;; file, a path in a directory that does not exist -- is the routine
         ;; case and lands on the second branch.
-        (guard (e (#t (if inited? (uv-close l on-close-entry) (foreign-free l))
+        (guard (e (#t (when reserve (foreign-free reserve))
+                      (if inited? (uv-close l on-close-entry) (foreign-free l))
                       (raise e)))
           ;; the 0 is uv_pipe_init's ipc flag: a byte stream, not a channel
           ;; for passing handles between processes
@@ -2769,9 +3021,13 @@
           (set! inited? #t)
           (check 'uv-pipe-bind (uv-pipe-bind l path))
           (check 'uv-listen (uv-listen l backlog on-connection-entry))
-          ;; slot 3 is #f: a unix-socket listener carries no TLS context
+          ;; slot 3 is #f: a unix-socket listener carries no TLS context.
+          ;; The reserve is taken here for the reason tcp-listen! gives.
+          (set! reserve (foreign-alloc pipe-handle-size))
+          (reclaim-displaced-row! l)
           (hashtable-set! listener-table l
-            (vector (list 'listener) on-accept 0 #f l pipe-transport))
+            (vector (list 'listener) on-accept 0 #f l pipe-transport
+                    reserve #f))
           l))))
 
   (define (tcp-listen! host port backlog on-accept . opts)
@@ -2782,7 +3038,8 @@
     (uv-sockaddr-lease (lambda (sockaddr-buf)
     (let ((flags (if (pair? opts) (car opts) 0))
           (l (foreign-alloc tcp-handle-size))
-          (inited? #f))
+          (inited? #f)
+          (reserve #f))
       ;; EVERY ONE OF THESE FOUR CAN FAIL, and one of them fails as a
       ;; matter of routine: a bind onto a port somebody else already
       ;; holds. Without this the handle allocated above is simply
@@ -2795,7 +3052,8 @@
       ;; handle belongs to libuv and has to go out through uv_close,
       ;; whose callback frees the block. Getting that backwards frees
       ;; memory the loop still holds a pointer to.
-      (guard (e (#t (if inited? (uv-close l on-close-entry) (foreign-free l))
+      (guard (e (#t (when reserve (foreign-free reserve))
+                    (if inited? (uv-close l on-close-entry) (foreign-free l))
                     (raise e)))
         (check 'uv-tcp-init (uv-tcp-init (uv-loop-handle) l))
         (set! inited? #t)
@@ -2830,15 +3088,24 @@
         ;; a plain HTTP request reaching the reader on an https port. The
         ;; caller's context therefore arrives as an argument and is in the
         ;; vector the moment anything can see it.
-        ;; SLOT 5 IS APPENDED, not inserted: every reader of this vector
-        ;; indexes a fixed slot, so adding one at the end touches none of
-        ;; them. The whole row is still published complete, in this same
-        ;; region, for the reason stated just above.
+        ;; SLOTS ARE APPENDED, not inserted: every reader of this vector
+        ;; indexes a fixed slot, so adding at the end touches none of them.
+        ;; The whole row is still published complete, in this same region,
+        ;; for the reason stated just above.
+        ;;
+        ;; THE RESERVE IS TAKEN HERE, WHERE FAILING IS ALLOWED. This is the
+        ;; allocation the accept window must not make; asking for it now
+        ;; means a caller who cannot have a listener is told so, instead of
+        ;; a listener that wedges the first time memory is short.
+        (set! reserve (foreign-alloc tcp-handle-size))
+        (reclaim-displaced-row! l)
         (hashtable-set! listener-table l
           (vector (list 'listener) on-accept 0
                   (if (and (pair? opts) (pair? (cdr opts))) (cadr opts) #f)
                   l
-                  tcp-transport))
+                  tcp-transport
+                  reserve
+                  #f))
         l)))))
 
   ;; Stop accepting new connections (graceful shutdown step 1);
@@ -2878,9 +3145,22 @@
     (let ((v (and h (hashtable-ref listener-table h #f))))
       (and v (vector-ref v 0))))
 
+  ;; #f ALSO WHEN THE ROW IS STILL THERE BUT DEAD. A listener that ran out
+  ;; of client handles is closed by rung 3 of the accept ladder, which marks
+  ;; the row rather than deleting it -- deleting allocates, and that happens
+  ;; in a path where allocating is what failed. This is the reading a
+  ;; supervisor takes: the answer is #f the moment the listener stops being
+  ;; able to accept, whichever way it stopped.
   (define (listener-open? h token)
     (let ((v (and h (hashtable-ref listener-table h #f))))
-      (and v (eq? token (vector-ref v 0)))))
+      (and v (eq? token (vector-ref v 0)) (not (vector-ref v 7)))))
+
+  ;; TEST SEAM. Whether this listener is holding a reserve block. The cells
+  ;; need to see the ladder's state, and it is not otherwise observable; the
+  ;; $ says it is not part of the API.
+  (define ($listener-reserve? h)
+    (let ((v (and h (hashtable-ref listener-table h #f))))
+      (and v (vector-ref v 6) #t)))
 
   ;; (tcp-stop-listen!)            -- every listener in this process
   ;; (tcp-stop-listen! h)          -- that handle, whatever incarnation
@@ -2914,6 +3194,11 @@
     ;; The membership test inside stop! is therefore not redundant with
     ;; the token test outside it: it is what makes the no-argument sweep
     ;; safe over a snapshot that may already be stale.
+    ;; A DEAD ROW IS STILL RECLAIMED HERE, AND ITS HANDLE IS NOT CLOSED
+    ;; TWICE. Rung 3 of the accept ladder already called uv_close on the
+    ;; handle and left the row behind on purpose, so this is the only place
+    ;; that frees the row and its context -- and the one thing it must not
+    ;; repeat is the close.
     (define (stop! l)                        ; caller holds the region
       (when (hashtable-ref listener-table l #f)
         ;; THE INCARNATION OWNS ITS CONTEXT, so stopping it gives the
@@ -2922,9 +3207,13 @@
         ;; generation, which contradicts the ownership this vector claims.
         (let ((v (hashtable-ref listener-table l #f)))
           (let ((ctx (and v (vector-ref v 3))))
-            (when ctx (tls-context-retire! ctx))))
-        (hashtable-delete! listener-table l)
-        (uv-close l on-close-entry)))
+            (when ctx (tls-context-retire! ctx)))
+          ;; the reserve is plain memory the loop never saw
+          (let ((reserve (and v (vector-ref v 6))))
+            (when reserve (foreign-free reserve)))
+          (hashtable-delete! listener-table l)
+          (unless (and v (vector-ref v 7))
+            (uv-close l on-close-entry)))))
     (cond
       ((null? rest)
        ;; The key vector is built OUTSIDE any region -- hashtable-keys
@@ -2941,7 +3230,22 @@
        (with-interrupts-disabled (stop! (car rest))))
       (else
        (with-interrupts-disabled
-         (when (listener-open? (car rest) (cadr rest))
+         ;; THE TOKEN, NOT listener-open?. A row that rung 3 marked dead
+         ;; answers #f to listener-open? -- correctly, it accepts nothing --
+         ;; but it is still this caller's listener and still holds a row, a
+         ;; reserve and possibly an SSL_CTX. Asking the open? question here
+         ;; would leave exactly those pinned for the life of the process.
+         ;;
+         ;; AND THAT WOULD BE THIS BATCH'S OWN DEFECT COMING BACK. The
+         ;; point of rung 3 is to replace a silent wedge with a loud
+         ;; failure; a loud failure that also shuts the cleanup path is
+         ;; silent again one level down -- the listener is visibly gone and
+         ;; its resources are invisibly kept. The two questions are
+         ;; different and have to stay different: "can this listener still
+         ;; accept" is what a supervisor asks, "is this row still mine to
+         ;; release" is what a release path asks.
+         (when (let ((v (hashtable-ref listener-table (car rest) #f)))
+                 (and v (eq? (cadr rest) (vector-ref v 0))))
            ;; INJECTION POINT 'tcp-stop-listen-before-close -- OWNING
            ;; REGION: the with-interrupts-disabled on the line above,
            ;; which is the region the comment at the top of this
@@ -4764,9 +5068,24 @@
           (complete-once! (conn-tls-connect-d t) (vector 'tcp-connected c)))
         ;; ---- listener role ----------------------------------------------
         ;; revalidate the incarnation: the listener row can go during a handshake
+        ;;
+        ;; A DEAD ROW COUNTS AS GONE, and the reason is that this tree
+        ;; already decided what happens when a listener disappears mid
+        ;; handshake: an ordinary tcp-stop-listen! deletes the row, the eq?
+        ;; below fails, and the connection is retired as 'listener-gone with
+        ;; the accept hook never called. Rung 3 of the accept ladder keeps
+        ;; its row on purpose -- so the release path can still find it -- and
+        ;; that alone would have let a handshake begun before the listener
+        ;; died pass this gate and call the hook. The difference would have
+        ;; been a side effect of marking rather than deleting, not a decision
+        ;; anybody made, and it would leave an application unable to tell the
+        ;; two kinds of hook apart. The rule an application can rely on is
+        ;; the simple one: once a listener is no longer open, its accept
+        ;; hook does not fire again.
         (let ((v (conn-tls-listener t)))
       (if (not (and v (eq? v (hashtable-ref listener-table
-                                            (listener-handle-of v) #f))))
+                                            (listener-handle-of v) #f))
+                    (not (vector-ref v 7))))
           (conn-tls-retire! c 'listener-gone 'tls-listener-stopped)
           (begin
             ((vector-ref v 1) c)             ; the delayed on-accept: owner in
@@ -5826,7 +6145,6 @@
       (else (void))))
 
   (define process-handle-size (uv-handle-size UV-PROCESS))
-  (define pipe-handle-size (uv-handle-size UV-NAMED-PIPE))
 
   ;; Start a child process without blocking the scheduler. Answers the proc,
   ;; or (failed . reason) where reason is a symbol for a refusal this library
