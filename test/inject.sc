@@ -767,11 +767,14 @@
           (let* ((h0 (handles-stable! "a2-baseline"))   ; listener up, nothing else
                  (c0 (uv-accept-failure-counts))
                  (refused0 (cdr (assq 'refused c0)))
-                 ;; 2026-09-18: this key was 'error until the bucket was split.
+                 ;; 2026-09-18: this key was 'error until the bucket was split, and
+                 ;; then gained its longer name, which is the point of the name:
+                 ;; it says WHICH callback, and it is true of the application's
+                 ;; accept hook raising as well as of ours.
                  ;; A2's point is sharper against the new name: a refused accept
                  ;; is neither our code raising nor libuv reporting a negative
                  ;; status, so callback-raised must not move for it.
-                 (raised0 (cdr (assq 'callback-raised c0))))
+                 (raised0 (cdr (assq 'connection-callback-raised c0))))
             (inject-arm-return! 'accept-refused -53 1)   ; ECONNABORTED, once
             (tcp-connect! "127.0.0.1" lport self)
             (let ((c1 (receive (after 5000 (fail! "a2-first-connect-silent"))
@@ -800,8 +803,8 @@
               (let ((c1n (uv-accept-failure-counts)))
                 (unless (= (cdr (assq 'refused c1n)) (+ refused0 1))
                   (fail! "a2-refused-not-counted" (cdr (assq 'refused c1n)) refused0))
-                (unless (= (cdr (assq 'callback-raised c1n)) raised0)
-                  (fail! "a2-callback-raised-counter-moved" (cdr (assq 'callback-raised c1n)) raised0)))
+                (unless (= (cdr (assq 'connection-callback-raised c1n)) raised0)
+                  (fail! "a2-connection-callback-raised-counter-moved" (cdr (assq 'connection-callback-raised c1n)) raised0)))
               (when (conn? c1) (tcp-close! c1))
               (inject-disarm!)
               ;; ROUND TWO, for the counter's reset. delivered lives with the

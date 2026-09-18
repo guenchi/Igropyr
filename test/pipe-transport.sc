@@ -220,7 +220,7 @@
     (let ((c (uv-accept-failure-counts)))
       (check "U13: the failure counts name six causes, separately"
              (and (list? c) (= (length c) 6)
-                  (assq 'callback-raised c) (assq 'accept-status c) (assq 'refused c)
+                  (assq 'connection-callback-raised c) (assq 'listener-status-negative c) (assq 'refused c)
                   (assq 'straggler c) (assq 'exhausted c) (assq 'read-start c)) c)
       (check "U13: and nothing in this cell provoked any of them"
              (and (list? c) (for-all (lambda (kv) (eqv? (cdr kv) 0)) c)) c))
