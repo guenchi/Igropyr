@@ -65,11 +65,19 @@ trap 'st=$?; if [ "$st" -ne 0 ]; then
   echo "=== result and must not be reported as one."
 fi' EXIT
 
-# FIRST, BECAUSE IT GUARDS THIS FILE. Every test/*.sc that ends like a suite
-# must be named below; a new one that nobody adds a line for never runs and
-# nothing says so, which has happened. Exclusions are explicit and a stale one
-# is also an error. Scope: it cannot see a listed suite that has lost a
-# section -- that is a different hole.
+# FIRST, BECAUSE IT GUARDS THIS FILE. Every test/*.sc must be named below or
+# carry a reason in listed-suites.sh -- unconditionally, with no judgement
+# about whether a file looks like a suite. A file nobody adds a line for is
+# never run and nothing says so, which has happened here.
+#
+# THE OBLIGATION IS DELIBERATELY WIDER THAN "SUITES". An earlier version asked
+# only about files ending with a pass line, and 19 suites listed below do not
+# end that way -- import-all and public-names among them. Deleting either from
+# this file would have reddened nothing. Read listed-suites.sh for the rest;
+# what matters here is that no reader of THIS file should conclude their new
+# file is exempt because it does not look like the others.
+#
+# Scope: it cannot see a listed suite that has lost a section -- different hole.
 sh test/listed-suites.sh
 
 "$scheme_bin" --script test/import-all.sc
