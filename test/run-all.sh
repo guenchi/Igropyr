@@ -288,6 +288,14 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script test/checked-off.sc
 # filesystem (naming why), where there are no variant spellings to collapse
 "$scheme_bin" --script test/static-cache-key.sc
 "$scheme_bin" --script test/node.sc
+# A SECOND TIME, INSTRUMENTED. Four of node.sc's cells -- the superseded-link
+# ones -- assert an interleaving that only an injection seam can hold still,
+# so they exist only in an artifact expanded with IGROPYR_INJECT=on. The run
+# above prints a SKIP line for each of them naming this one; this run is
+# where they execute. The other cells run twice, which costs about a minute
+# and is the price of not having a suite that is quietly narrower than the
+# property it claims to cover.
+IGROPYR_INJECT=on IGROPYR_CONTRACTS=full "$scheme_bin" --script test/node.sc
 # worker slot accounting: a killed or stuck task must not hold its slot
 "$scheme_bin" --script test/dpool-slots.sc
 "$scheme_bin" --script test/dpool.sc

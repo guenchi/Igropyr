@@ -13,6 +13,7 @@
 ;;;   - reconnect delay: bounded, deterministic, dispersed across names
 
 (import (chezscheme) (igropyr actor) (igropyr libuv) (igropyr tcp)
+        (igropyr inject-control)
         (igropyr node) (igropyr pubsub)
         (only (igropyr crypto) hmac-sha256 bytevector->hex))
 
@@ -23,6 +24,20 @@
 (define scheme-bin (or (getenv "SCHEME_BIN") "scheme"))
 
 
+;; THE FOUR SUPERSEDED-LINK CELLS NEED THE SEAMS, and the seams exist only
+;; in an artifact expanded with IGROPYR_INJECT=on ('link-before-dispatch is
+;; (void) otherwise, and $node-agent-pid raises). They are not skipped
+;; silently: this run says which cells it did not run and why, and
+;; test/run-all.sh runs this suite a second time instrumented so that they
+;; do run in the gate. Detected by asking a seam for a key nothing can be
+;; filed under -- on answers #f, off raises.
+;; poll a predicate until it holds or the bound passes; the same shape the
+;; proc-faults suite uses
+(define (within? ms thunk)
+  (let ((deadline (+ (now-ms) ms)))
+    (let loop () (cond ((thunk) #t) ((> (now-ms) deadline) #f) (else (sleep-ms 20) (loop))))))
+(define seams-present?
+  (guard (e (#t #f)) ($node-agent-pid 'no-such-peer -1) #t))
 (define port 18091)
 (define secret "test-mesh-secret")
 
@@ -1721,10 +1736,12 @@
                                                 (wait (string-append
                                                         acc (utf8->string bv))
                                                       k ov 0))
+                                ;; A LOST CONNECTION IS NOT A COUNT. EOF and error report 'closed so
+                                ;; a consumer cannot mistake a collector that dropped for a zero.
                                               (`#(tcp-eof)
-                                                (send me (vector ref 'count k ov)))
+                                                (send me (vector ref 'closed k ov)))
                                               (`#(tcp-error ,e)
-                                                (send me (vector ref 'count k ov)))))))))))))))))))
+                                                (send me (vector ref 'closed k ov)))))))))))))))))))
 
       (define (burst-session! label boot gen me ref arm)
         ;; Handshake as "wpeer", then WAIT. On #(go victim mref) it writes
@@ -2008,57 +2025,71 @@
       ;; teardown drops the monitors another cell parked: a global count
       ;; that falls proves nothing about this cell's cancel. Killing the
       ;; watched process and counting the mdowns for THIS mref does.
+      (if seams-present?
       (let* ((me self) (r1 (gensym)) (r2 (gensym)) (rm (gensym))
-             (victim (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
-             (marker (spawn (lambda ()
-                              (receive (after 30000 (void))
-                                (`(tail ,m) (send me (vector rm 'tail m)))))))
-             (base (callee-count)))
+             (mref 9301)
+             (peer 'wpeer)
+             (victim (spawn (lambda () (receive (`#(stop) (void))))))
+             (marker (spawn (lambda () (receive (`(done ,m) (send me (vector rm 'done m))))))))
         (register 'watch-victim-3 victim)
-        (register 'burst-marker marker)
-        (let ((p1 (burst-session! "s-burst-old" probe-boot-id 31 me r1 #f)))
+        (register 'marker-after-3 marker)
+        ;; OLD connection, NO pre-arm: a fresh, initially absent mref. A pre-existing
+        ;; agent would report the kill itself and hide a dropped late mon.
+        (let ((p1 (burst-session! "s-late-old" probe-boot-id 31 me r1 #f)))
           (welcomed! r1 "late-mon-on-superseded-link")
-          (let ((p2 (watch-session! "s-burst-new" probe-boot-id 32 #f
-                                    'watch-victim-3 me r2)))
-            (send p1 (vector 'go 4000
-                             (list (list 'send 'burst-marker (list 'tail 9301))
-                                   (list 'mon 'watch-victim-3 9301))))
-            (let ((anchor
-                    (receive (after 25000 'nothing)
-                      (`#(,@r2 welcomed) 'ordered)
-                      (`#(,@r2 ,other)
-                        (fail! "late-mon-on-superseded-link"
-                               (list 'handshake other)))
-                      (`#(,@rm tail ,m) 'marker-first))))
-              (cond
-                ((eq? anchor 'nothing)
-                 (fail! "late-mon-on-superseded-link" 'no-welcome-no-marker))
-                ((eq? anchor 'marker-first)
-                 (display "  💥 INCONCLUSIVE late-mon-on-superseded-link: ")
-                 (display "the burst reached its tail before the replacement ")
-                 (display "was installed; raise the filler count\n")
-                 (kill p1 'done) (kill p2 'done))
-                (else
-                  (receive (after 20000
-                             (fail! "burst-never-reached-tail" 'marker-timeout))
-                    (`#(,@rm tail ,m)
-                      (unless (eqv? m 9301) (fail! "burst-marker-wrong" m))))
-                  (let poll ((n 0))
-                    (unless (> (callee-count) base)
-                      (if (= n 120)
-                          (fail! "late-mon-dropped-on-superseded-link"
-                                 (list (callee-count) base))
-                          (begin (sleep-ms 50) (poll (+ n 1))))))
-                  (kill victim 'for-the-cell)
-                  (receive (after 12000
-                             (fail! "late-mon-no-verdict" 'verdict-timeout))
-                    (`#(,@r2 (mdown ,m))
-                      (unless (eqv? m 9301) (fail! "late-mon-wrong-mref" m)))
-                    (`#(,@r2 ,what)
-                      (fail! "late-mon-not-reported" what)))
-                  (kill p1 'done) (kill p2 'done)
-                  (sleep-ms 700)
-                  (display "a late mon on a superseded link ok\n")))))))
+          (let ((link (or ($node-link-pid peer)
+                          (fail! "late-mon-on-superseded-link" 'no-link-pid))))
+            ;; identity, before anything is written: nothing filed under this mref
+            (when ($node-agent-pid peer mref)
+              (fail! "late-mon-on-superseded-link" (list 'mref-already-armed mref)))
+            ;; TIMEOUT WELL UNDER tick-ms (15000): while the link is parked the peer
+            ;; sees no whole frame, and after tick-ms it sends (ping), which is
+            ;; dispatched through the same point and would take an occurrence.
+            (let ((t (inject-arm-barrier! 'link-before-dispatch 1 3000 #f link)))
+              ;; the tested frame, then the completion witness, one write, no filler
+              (send p1 (vector 'go 0 (list (list 'mon 'watch-victim-3 mref)
+                                           (list 'send 'marker-after-3 (list 'done mref)))))
+              (let ((w (inject-barrier-wait t 'link-before-dispatch 5000)))
+                (unless (and (pair? w) (eq? (cdr w) link))
+                  (fail! "late-mon-on-superseded-link" (list 'park (if (pair? w) 'parked-but-other-pid w) 'expected-link (and (pair? w) (eq? (cdr w) link)))))
+                ;; identity again, parked: the tested frame has not taken effect.
+                ;; If it has, N was too large and we are parked past it.
+                (when ($node-agent-pid peer mref)
+                  (fail! "late-mon-on-superseded-link" (list 'parked-past-tested-frame mref)))
+                ;; replacement, installed and welcomed while the old link is parked
+                (let ((p2 (watch-session! "s-late-new" probe-boot-id 32 #f 'watch-victim-3 me r2)))
+                  (welcomed! r2 "late-mon-on-superseded-link")
+                  (let ((new-link ($node-link-pid peer)))
+                    (when (eq? new-link link)
+                      (fail! "late-mon-on-superseded-link" 'replacement-did-not-change-link))
+                    ;; release: explicit resume, then require resumed with zero timeouts
+                    (send link (vector 'inject-resume t))
+                    (let ((st (inject-barrier-drain! link t 3000)))
+                      (unless (and (eq? st 'resumed) (eqv? (inject-barrier-timeouts t) 0))
+                        (fail! "late-mon-on-superseded-link" (list 'resume st (inject-barrier-timeouts t)))))
+                    (inject-release! t)
+                    ;; completion: the frame AFTER the tested one was dispatched
+                    (receive (after 5000 (fail! "late-mon-on-superseded-link" 'no-completion-witness))
+                      (`#(,@rm done ,m) (unless (eqv? m mref) (fail! "late-mon-on-superseded-link" (list 'witness-mref m)))))
+                    ;; verdict, per mref: the late mon on the superseded link was refused,
+                    ;; so no agent exists for it -- OR it was admitted (the documented
+                    ;; incarnation rule), in which case exactly one agent exists. The
+                    ;; property this cell asserts is the one the existing cell asserts;
+                    ;; keep its expectation, do not re-decide it here.
+                    (unless (within? 2000 (lambda () ($node-agent-pid peer mref)))
+                      (fail! "late-mon-dropped-on-superseded-link" mref))
+                    ;; the replacement link must still be live through the verdict, or
+                    ;; a removal-triggered demon-local would be read as the cell's own
+                    (unless (and (eq? ($node-link-pid peer) new-link) (process-alive? new-link))
+                      (fail! "late-mon-on-superseded-link" 'replacement-link-dropped-during-verdict))
+                    (kill victim 'for-the-cell)
+                    (receive (after 12000 (fail! "late-mon-no-verdict" 'verdict-timeout))
+                      (`#(,@r2 (mdown ,m)) (unless (eqv? m mref) (fail! "late-mon-wrong-mref" m)))
+                      (`#(,@r2 closed) (fail! "late-mon-on-superseded-link" 'collector-closed-before-verdict))
+                      (`#(,@r2 ,what) (fail! "late-mon-not-reported" what)))
+                    (kill p1 'done) (kill p2 'done)
+                    (display "a late mon on a superseded link ok\n"))))))))
+          (display "  SKIP late mon on a superseded link: needs the injection seams; run under IGROPYR_INJECT=on (test/run-all.sh does)\n"))
 
       ;; ---- and the cancel, the other direction of the same predicate ----
       ;; Armed while the connection is current; the CANCEL arrives on the
@@ -2067,58 +2098,73 @@
       ;; cancel was honoured, one if it was dropped. The superseded link's
       ;; own teardown cannot supply that -- remove-peer! only sweeps when
       ;; the connection it is given is still the peer's current one.
+      (if seams-present?
       (let* ((me self) (r1 (gensym)) (r2 (gensym)) (rm (gensym))
-             (victim (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
-             (marker (spawn (lambda ()
-                              (receive (after 30000 (void))
-                                (`(tail ,m) (send me (vector rm 'tail m)))))))
-             (base (callee-count)))
+             (mref 9401) (peer 'wpeer)
+             (victim (spawn (lambda () (receive (`#(stop) (void))))))
+             (marker (spawn (lambda () (receive (`(done ,m) (send me (vector rm 'done m))))))))
         (register 'watch-victim-4 victim)
-        (register 'burst-marker-2 marker)
-        (let ((p1 (burst-session! "s-dem-old" probe-boot-id 41 me r1
-                                  (cons 'watch-victim-4 9401))))
+        (register 'marker-after-4 marker)
+        (let ((p1 (burst-session! "s-dem-old" probe-boot-id 41 me r1 (cons 'watch-victim-4 mref))))
           (welcomed! r1 "late-demon-on-superseded-link")
-          (armed! base "late-demon-on-superseded-link")
-          ;; p2 does NOT arm: it is here to be the current connection and
-          ;; to read what the target writes to the peer name.
-          (let ((p2 (mdown-count-session! "s-dem-new" probe-boot-id 42 9401
-                                          #f me r2)))
-            (send p1 (vector 'go 4000
-                             (list (list 'send 'burst-marker-2 (list 'tail 9401))
-                                   (list 'demon 9401))))
-            (let ((anchor
-                    (receive (after 25000 'nothing)
-                      (`#(,@r2 welcomed) 'ordered)
-                      (`#(,@r2 ,other)
-                        (fail! "late-demon-on-superseded-link"
-                               (list 'handshake other)))
-                      (`#(,@rm tail ,m) 'marker-first))))
-              (cond
-                ((eq? anchor 'nothing)
-                 (fail! "late-demon-on-superseded-link" 'no-welcome-no-marker))
-                ((eq? anchor 'marker-first)
-                 (display "  💥 INCONCLUSIVE late-demon-on-superseded-link: ")
-                 (display "the burst reached its tail before the replacement ")
-                 (display "was installed; raise the filler count\n")
-                 (kill p1 'done) (kill p2 'done))
-                (else
-                  (receive (after 20000
-                             (fail! "demon-burst-never-reached-tail" 'marker-timeout))
-                    (`#(,@rm tail ,m)
-                      (unless (eqv? m 9401) (fail! "demon-burst-marker-wrong" m))))
-                  (sleep-ms 600)
-                  (kill victim 'for-the-cell)
-                  (receive (after 20000
-                             (fail! "late-demon-on-superseded-link" 'count-timeout))
-                    (`#(,@r2 count ,k ,ov)
-                      (unless (= k 0)
+          ;; precondition, PER MREF: the arm landed as an agent for this key. Not the
+          ;; global count -- another cell's teardown moves that (test/node.sc:2006).
+          (let ((agent (let poll ((n 0))
+                         (or ($node-agent-pid peer mref)
+                             (if (= n 60)
+                                 (fail! "late-demon-on-superseded-link" (list 'arm-never-landed mref))
+                                 (begin (sleep-ms 50) (poll (+ n 1))))))))
+            (let ((link (or ($node-link-pid peer) (fail! "late-demon-on-superseded-link" 'no-link-pid))))
+              ;; timeout well under tick-ms (15000): a parked link's peer pings after
+              ;; that, and (ping) is dispatched through the same point
+              (let ((t (inject-arm-barrier! 'link-before-dispatch 1 3000 #f link)))
+                (send p1 (vector 'go 0 (list (list 'demon mref)
+                                             (list 'send 'marker-after-4 (list 'done mref)))))
+                (let ((w (inject-barrier-wait t 'link-before-dispatch 5000)))
+                  (unless (and (pair? w) (eq? (cdr w) link))
+                    (fail! "late-demon-on-superseded-link" (list 'park (if (pair? w) 'parked-but-other-pid w) 'expected-link (and (pair? w) (eq? (cdr w) link)))))
+                  ;; identity, parked: the agent still exists. WEAK for this path -- a
+                  ;; demon already dispatched but not yet processed reads the same,
+                  ;; because the cancel is a send to the agent (node.sc:6473), not a
+                  ;; table write. It catches N too large only when the agent has
+                  ;; already gone; the strong check is the termination witness below.
+                  (unless (eq? ($node-agent-pid peer mref) agent)
+                    (fail! "late-demon-on-superseded-link" (list 'agent-changed-while-parked mref)))
+                  (let ((p2 (mdown-count-session! "s-dem-new" probe-boot-id 42 mref #f me r2)))
+                    (welcomed! r2 "late-demon-on-superseded-link")
+                    (let ((new-link ($node-link-pid peer)))
+                      (when (eq? new-link link)
+                        (fail! "late-demon-on-superseded-link" 'replacement-did-not-change-link))
+                      (send link (vector 'inject-resume t))
+                      (let ((st (inject-barrier-drain! link t 3000)))
+                        (unless (and (eq? st 'resumed) (eqv? (inject-barrier-timeouts t) 0))
+                          (fail! "late-demon-on-superseded-link" (list 'resume st (inject-barrier-timeouts t)))))
+                      (inject-release! t)
+                      (receive (after 5000 (fail! "late-demon-on-superseded-link" 'no-completion-witness))
+                        (`#(,@rm done ,m) (unless (eqv? m mref) (fail! "late-demon-on-superseded-link" (list 'witness-mref m)))))
+                      ;; TERMINATION WITNESS, before the victim is killed: the agent this
+                      ;; mref had is dead and nothing is filed under the key. A dropped
+                      ;; cancellation with a DOWN delayed past collection reads as zero
+                      ;; without this (review round 3).
+                      (unless (within? 3000 (lambda () (and (not (process-alive? agent))
+                                                            (not ($node-agent-pid peer mref)))))
                         (fail! "late-demon-dropped-on-superseded-link"
-                               (list 'mdowns k 'want 0 'overloads ov))))
-                    (`#(,@r2 ,other)
-                      (fail! "late-demon-on-superseded-link" other)))
-                  (kill p1 'done) (kill p2 'done)
-                  (sleep-ms 700)
-                  (display "a late demon on a superseded link ok\n")))))))
+                               (list 'agent-alive (process-alive? agent) 'still-filed (and ($node-agent-pid peer mref) #t))))
+                      ;; ...and the replacement link is still the one we installed and
+                      ;; alive, or that termination came from remove-peer! (round 4)
+                      (unless (and (eq? ($node-link-pid peer) new-link) (process-alive? new-link))
+                        (fail! "late-demon-on-superseded-link" 'replacement-link-dropped-during-witness))
+                      (kill victim 'for-the-cell)
+                      (receive (after 12000 (fail! "late-demon-on-superseded-link" 'count-timeout))
+                        (`#(,@r2 count ,k ,ov)
+                          (unless (and (= k 0) (= ov 0))
+                            (fail! "late-demon-dropped-on-superseded-link" (list 'mdowns k 'want 0 'overloads ov))))
+                        (`#(,@r2 closed ,k ,ov)
+                          (fail! "late-demon-on-superseded-link" (list 'collector-closed-before-verdict k ov)))
+                        (`#(,@r2 ,other) (fail! "late-demon-on-superseded-link" other)))
+                      (kill p1 'done) (kill p2 'done)
+                      (display "a late demon on a superseded link ok\n")))))))))
+          (display "  SKIP late demon on a superseded link: needs the injection seams; run under IGROPYR_INJECT=on (test/run-all.sh does)\n"))
 
       ;; ---- a retired-but-living agent must not outlive its retirement ----
       ;;
@@ -2224,92 +2270,51 @@
       ;; Same anchor as the cells above: the WELCOME of the replacement
       ;; must arrive before the MARKER that precedes the frame under test,
       ;; or the run is inconclusive rather than green.
+      (if seams-present?
       (let* ((me self) (r1 (gensym)) (r2 (gensym)) (rm (gensym))
-             (marker (spawn (lambda ()
-                              (receive (after 30000 (void))
-                                (`(tail ,m) (send me (vector rm 'tail m))))))))
-        (register 'burst-marker-4 marker)
+             (peer 'wpeer)
+             (marker (spawn (lambda () (receive (`(done ,m) (send me (vector rm 'done m))))))))
+        (register 'marker-after-7 marker)
         (let ((p1 (watcher-burst-session! "s-wmd-old" probe-boot-id 71 me r1)))
           (welcomed! r1 "late-mdown-on-superseded-link-as-watcher")
-          ;; this node arms the watch; the fixture reads the mon and hands
-          ;; back the mref it carried
-          (let ((mref (monitor-remote 'wpeer 'watched-by-this-node)))
-            (receive (after 10000
-                       (fail! "late-mdown-as-watcher" 'fixture-never-saw-mon))
-              (`#(,@r1 armed ,seen)
-                (unless (eqv? seen mref)
-                  (fail! "late-mdown-as-watcher" (list 'mref seen 'want mref))))
+          ;; this node arms the watch; the fixture reads the mon and returns its mref
+          (let ((mref (monitor-remote peer 'watched-by-this-node)))
+            (receive (after 10000 (fail! "late-mdown-as-watcher" 'fixture-never-saw-mon))
+              (`#(,@r1 armed ,seen) (unless (eqv? seen mref) (fail! "late-mdown-as-watcher" (list 'mref seen 'want mref))))
               (`#(,@r1 ,other) (fail! "late-mdown-as-watcher" other)))
-            ;; same run, higher generation: I8a replaces the link
-            (let ((p2 (watch-session! "s-wmd-new" probe-boot-id 72 #f #f me r2)))
-              (send p1 (vector 'go 4000
-                               (list (list 'send 'burst-marker-4 (list 'tail mref))
-                                     (list 'mdown mref 'noproc))))
-              (let ((anchor
-                      (receive (after 25000 'nothing)
-                        (`#(,@r2 welcomed) 'ordered)
-                        (`#(,@r2 ,other)
-                          (fail! "late-mdown-as-watcher" (list 'handshake other)))
-                        (`#(,@rm tail ,m) 'marker-first))))
-                (cond
-                  ((eq? anchor 'nothing)
-                   (fail! "late-mdown-as-watcher" 'no-welcome-no-marker))
-                  ((eq? anchor 'marker-first)
-                   (display "  💥 INCONCLUSIVE late-mdown-as-watcher: ")
-                   (display "the burst reached its tail before the replacement ")
-                   (display "was installed; raise the filler count\n")
-                   (kill p1 'done) (kill p2 'done))
-                  (else
-                    (receive (after 20000
-                               (fail! "late-mdown-burst-never-reached-tail"
-                                      'marker-timeout))
-                      (`#(,@rm tail ,m)
-                        (unless (eqv? m mref) (fail! "late-mdown-marker-wrong" m))))
-                    ;; THE VERDICT: the caller of monitor-remote -- this
-                    ;; process -- must receive the TARGET'S remote-down,
-                    ;; reason noproc. A node that judged the old link by
-                    ;; connection dropped that mdown and left the row
-                    ;; standing; what the caller then hears is either
-                    ;; nothing (this receive times out) or -- measured on
-                    ;; the mutant tree -- `noconnection`, synthesized when
-                    ;; the replacing session closes ~5s after its handshake.
-                    ;;
-                    ;; THAT SECOND SHAPE IS DEADLINE-TYPE. It comes from
-                    ;; watch-session!'s 5s no-mdown close, so on a CORRECT
-                    ;; tree a sufficiently slow mdown takes the same road
-                    ;; and reads as this red. Load can therefore make a
-                    ;; false red here, never a false green -- the safe
-                    ;; direction, and stated so a noconnection under load
-                    ;; is not read as the gate having regressed.
-                    ;;
-                    ;; The red prints its MARGIN: ms from the marker's
-                    ;; arrival to the verdict. The marker is the frame
-                    ;; right before the mdown in the same segment, so it
-                    ;; proves the mdown reached the dispatcher -- but not
-                    ;; that it was not merely late. Far below 5000 means
-                    ;; the gate dropped it; near 5000 means the deadline
-                    ;; was hit, rerun. Reading on the mutant: FAIL
-                    ;; late-mdown-as-watcher (reason noconnection); the
-                    ;; same mutation was green before this cell existed.
-                    ;; (This paragraph was first written as a prediction
-                    ;; -- "this receive times out" -- and was falsified on
-                    ;; the first real red; it now records what was seen.)
-                    (let ((t-marker (now-ms)))
-                      (receive (after 15000
-                                 (fail! "late-mdown-dropped-on-superseded-link-as-watcher"
-                                        (list 'no-remote-down
-                                              'ms-since-marker (- (now-ms) t-marker))))
+            (let ((link (or ($node-link-pid peer) (fail! "late-mdown-as-watcher" 'no-link-pid))))
+              (let ((t (inject-arm-barrier! 'link-before-dispatch 1 3000 #f link)))
+                (send p1 (vector 'go 0 (list (list 'mdown mref 'noproc)
+                                             (list 'send 'marker-after-7 (list 'done mref)))))
+                (let ((w (inject-barrier-wait t 'link-before-dispatch 5000)))
+                  (unless (and (pair? w) (eq? (cdr w) link))
+                    (fail! "late-mdown-as-watcher" (list 'park (if (pair? w) 'parked-but-other-pid w) 'expected-link (and (pair? w) (eq? (cdr w) link)))))
+                  ;; identity, parked: nothing has fired yet. A remote-down already in
+                  ;; this mailbox means we are parked past the tested frame.
+                  (receive (after 0 'none)
+                    (`#(remote-down ,@early) (fail! "late-mdown-as-watcher" (cons 'parked-past-tested-frame early))))
+                  (let ((p2 (watch-session! "s-wmd-new" probe-boot-id 72 #f #f me r2)))
+                    (welcomed! r2 "late-mdown-as-watcher")
+                    (let ((new-link ($node-link-pid peer)))
+                      (when (eq? new-link link) (fail! "late-mdown-as-watcher" 'replacement-did-not-change-link))
+                      (send link (vector 'inject-resume t))
+                      (let ((st (inject-barrier-drain! link t 3000)))
+                        (unless (and (eq? st 'resumed) (eqv? (inject-barrier-timeouts t) 0))
+                          (fail! "late-mdown-as-watcher" (list 'resume st (inject-barrier-timeouts t)))))
+                      (inject-release! t)
+                      (receive (after 5000 (fail! "late-mdown-as-watcher" 'no-completion-witness))
+                        (`#(,@rm done ,m) (unless (eqv? m mref) (fail! "late-mdown-as-watcher" (list 'witness-mref m)))))
+                      (unless (and (eq? ($node-link-pid peer) new-link) (process-alive? new-link))
+                        (fail! "late-mdown-as-watcher" 'replacement-link-dropped-during-verdict))
+                      ;; the verdict: the watcher heard the target's down, reason noproc.
+                      ;; fire-remote-down! is synchronous, so it precedes the witness.
+                      (receive (after 2000 (fail! "late-mdown-dropped-on-superseded-link-as-watcher" 'no-remote-down))
                         (`#(remote-down wpeer watched-by-this-node ,reason)
-                          (unless (eq? reason 'noproc)
-                            (fail! "late-mdown-as-watcher"
-                                   (list 'reason reason
-                                         'ms-since-marker (- (now-ms) t-marker)))))
-                        (`#(remote-down ,@rest)
-                          (fail! "late-mdown-as-watcher"
-                                 (cons 'wrong-watch rest)))))
-                    (kill p1 'done) (kill p2 'done)
-                    (sleep-ms 700)
-                    (display "a late mdown on a superseded link reaches the watcher ok\n"))))))))
+                          (unless (eq? reason 'noproc) (fail! "late-mdown-as-watcher" (list 'reason reason))))
+                        (`#(remote-down ,@rest) (fail! "late-mdown-as-watcher" (cons 'wrong-watch rest))))
+                      (kill p1 'done) (kill p2 'done)
+                      (display "a late mdown on a superseded link reaches the watcher ok\n")))))))))
+          (display "  SKIP late mdown on a superseded link as watcher: needs the injection seams; run under IGROPYR_INJECT=on (test/run-all.sh does)\n"))
 
       ;; ---- a REPEAT on a superseded link must not revoke the watch -----
       ;;
@@ -2332,59 +2337,64 @@
       ;; process it is watching can die unremarked. That is why the
       ;; verdict asserts BOTH numbers -- a watch that reports once, and
       ;; no refusal -- rather than only that something arrived.
+      (if seams-present?
       (let* ((me self) (r1 (gensym)) (r2 (gensym)) (rm (gensym))
-             (victim (spawn (lambda () (receive (after 30000 (void)) (`#(stop) (void))))))
-             (marker (spawn (lambda ()
-                              (receive (after 30000 (void))
-                                (`(tail ,m) (send me (vector rm 'tail m)))))))
-             (base (callee-count)))
+             (mref 9601) (peer 'wpeer)
+             (victim (spawn (lambda () (receive (`#(stop) (void))))))
+             (marker (spawn (lambda () (receive (`(done ,m) (send me (vector rm 'done m))))))))
         (register 'watch-victim-6 victim)
-        (register 'burst-marker-3 marker)
-        (let ((p1 (burst-session! "s-rep-old" probe-boot-id 61 me r1
-                                  (cons 'watch-victim-6 9601))))
-          (welcomed! r1 "repeat-on-superseded-link-revokes-watch")
-          (armed! base "repeat-on-superseded-link-revokes-watch")
-          (let ((p2 (mdown-count-session! "s-rep-new" probe-boot-id 62 9601
-                                          #f me r2)))
-            (send p1 (vector 'go 4000
-                             (list (list 'send 'burst-marker-3 (list 'tail 9601))
-                                   ;; the repeat: the SAME triple it armed
-                                   (list 'mon 'watch-victim-6 9601))))
-            (let ((anchor
-                    (receive (after 25000 'nothing)
-                      (`#(,@r2 welcomed) 'ordered)
-                      (`#(,@r2 ,other)
-                        (fail! "repeat-on-superseded-link-revokes-watch"
-                               (list 'handshake other)))
-                      (`#(,@rm tail ,m) 'marker-first))))
-              (cond
-                ((eq? anchor 'nothing)
-                 (fail! "repeat-on-superseded-link-revokes-watch"
-                        'no-welcome-no-marker))
-                ((eq? anchor 'marker-first)
-                 (display "  💥 INCONCLUSIVE repeat-on-superseded-link: ")
-                 (display "the burst reached its tail before the replacement ")
-                 (display "was installed; raise the filler count\n")
-                 (kill p1 'done) (kill p2 'done))
-                (else
-                  (receive (after 20000
-                             (fail! "repeat-burst-never-reached-tail" 'marker-timeout))
-                    (`#(,@rm tail ,m)
-                      (unless (eqv? m 9601) (fail! "repeat-burst-marker-wrong" m))))
-                  (sleep-ms 600)
-                  (kill victim 'for-the-cell)
-                  (receive (after 20000
-                             (fail! "repeat-on-superseded-link-revokes-watch"
-                                    'count-timeout))
-                    (`#(,@r2 count ,k ,ov)
-                      (unless (and (= k 1) (= ov 0))
-                        (fail! "repeat-on-superseded-link-revokes-watch"
-                               (list 'downs k 'want 1 'refusals ov 'want 0))))
-                    (`#(,@r2 ,other)
-                      (fail! "repeat-on-superseded-link-revokes-watch" other)))
-                  (kill p1 'done) (kill p2 'done)
-                  (sleep-ms 700)
-                  (display "a repeat on a superseded link keeps the watch ok\n"))))))))
+        (register 'marker-after-6 marker)
+        (let ((p1 (burst-session! "s-rep-old" probe-boot-id 61 me r1 (cons 'watch-victim-6 mref))))
+          (welcomed! r1 "repeat-on-superseded-link-keeps-watch")
+          (let ((agent (let poll ((n 0))
+                         (or ($node-agent-pid peer mref)
+                             (if (= n 60)
+                                 (fail! "repeat-on-superseded-link-keeps-watch" (list 'arm-never-landed mref))
+                                 (begin (sleep-ms 50) (poll (+ n 1))))))))
+            (let ((link (or ($node-link-pid peer) (fail! "repeat-on-superseded-link-keeps-watch" 'no-link-pid))))
+              (let ((t (inject-arm-barrier! 'link-before-dispatch 1 3000 #f link)))
+                ;; the repeat: the SAME triple it armed, then the completion witness
+                (send p1 (vector 'go 0 (list (list 'mon 'watch-victim-6 mref)
+                                             (list 'send 'marker-after-6 (list 'done mref)))))
+                (let ((w (inject-barrier-wait t 'link-before-dispatch 5000)))
+                  (unless (and (pair? w) (eq? (cdr w) link))
+                    (fail! "repeat-on-superseded-link-keeps-watch" (list 'park (if (pair? w) 'parked-but-other-pid w) 'expected-link (and (pair? w) (eq? (cdr w) link)))))
+                  ;; identity, parked: still exactly the agent the arm made. The
+                  ;; baseline is that pid, read at arm time -- not a count.
+                  (unless (eq? ($node-agent-pid peer mref) agent)
+                    (fail! "repeat-on-superseded-link-keeps-watch" (list 'agent-changed-while-parked mref)))
+                  (let ((p2 (mdown-count-session! "s-rep-new" probe-boot-id 62 mref #f me r2)))
+                    (welcomed! r2 "repeat-on-superseded-link-keeps-watch")
+                    (let ((new-link ($node-link-pid peer)))
+                      (when (eq? new-link link)
+                        (fail! "repeat-on-superseded-link-keeps-watch" 'replacement-did-not-change-link))
+                      (send link (vector 'inject-resume t))
+                      (let ((st (inject-barrier-drain! link t 3000)))
+                        (unless (and (eq? st 'resumed) (eqv? (inject-barrier-timeouts t) 0))
+                          (fail! "repeat-on-superseded-link-keeps-watch" (list 'resume st (inject-barrier-timeouts t)))))
+                      (inject-release! t)
+                      (receive (after 5000 (fail! "repeat-on-superseded-link-keeps-watch" 'no-completion-witness))
+                        (`#(,@rm done ,m) (unless (eqv? m mref) (fail! "repeat-on-superseded-link-keeps-watch" (list 'witness-mref m)))))
+                      ;; verdict part 1: idempotent -- the same agent, still alive, and
+                      ;; no erroneous stop was queued for it (node.sc:6382 is the path
+                      ;; this guards); a replaced agent would be a different pid
+                      (unless (and (eq? ($node-agent-pid peer mref) agent) (process-alive? agent))
+                        (fail! "repeat-on-superseded-link-keeps-watch"
+                               (list 'same-agent (eq? ($node-agent-pid peer mref) agent) 'alive (process-alive? agent))))
+                      (unless (and (eq? ($node-link-pid peer) new-link) (process-alive? new-link))
+                        (fail! "repeat-on-superseded-link-keeps-watch" 'replacement-link-dropped-during-witness))
+                      ;; verdict part 2: the watch still fires, exactly once
+                      (kill victim 'for-the-cell)
+                      (receive (after 12000 (fail! "repeat-on-superseded-link-keeps-watch" 'count-timeout))
+                        (`#(,@r2 count ,k ,ov)
+                          (unless (and (= k 1) (= ov 0))
+                            (fail! "repeat-on-superseded-link-keeps-watch" (list 'downs k 'want 1 'refusals ov 'want 0))))
+                        (`#(,@r2 closed ,k ,ov)
+                          (fail! "repeat-on-superseded-link-keeps-watch" (list 'collector-closed-before-verdict k ov)))
+                        (`#(,@r2 ,other) (fail! "repeat-on-superseded-link-keeps-watch" other)))
+                      (kill p1 'done) (kill p2 'done)
+                      (display "a repeat on a superseded link keeps the watch ok\n")))))))))
+          (display "  SKIP repeat on a superseded link keeps the watch: needs the injection seams; run under IGROPYR_INJECT=on (test/run-all.sh does)\n")))
 
 
     (display "CV cells passed\n")
