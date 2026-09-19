@@ -7293,7 +7293,27 @@
             ;; The reason raised is the one stop-link! would have
             ;; delivered anyway, so this makes an existing ending arrive
             ;; earlier and introduces no new outcome downstream.
-            (begin (dispatch! c peer boot-id d) (drain))))))
+            ;; INJECTION POINT 'link-before-dispatch -- OWNING REGION: none,
+            ;; inside the drain loop and outside the receive. Interrupt
+            ;; state: ON -- depth 0, parks; OFF -- (void). Parks the link
+            ;; before it dispatches ONE PARSED FRAME: d is already decoded
+            ;; and about to be served, and whatever followed it is still in
+            ;; buf.
+            ;;
+            ;; WHAT A SUPERSEDED LINK CAN STILL SERVE is stated in the
+            ;; paragraph above beginning "THE BOUND IS NOT" -- read it
+            ;; there rather than from here. The paragraph after it, marked
+            ;; OLD TEXT, is kept as history and is not the rule.
+            ;;
+            ;; SCOPE, BECAUSE A CELL COUNTING ARRIVALS WILL BE WRONG
+            ;; WITHOUT IT: (ping) and (pong) are dispatched frames like any
+            ;; other -- they are clauses of dispatch! -- so they reach this
+            ;; point and they advance a cell's occurrence count. A link
+            ;; parked here for longer than the peer's heartbeat interval
+            ;; will find one waiting when it resumes.
+            (begin (inject-barrier! 'link-before-dispatch)
+                   (dispatch! c peer boot-id d)
+                   (drain))))))
 
   ;; Run the link until it drops, then clean up.
   ;; -> the moment the link STOPPED CARRYING TRAFFIC, read before the
