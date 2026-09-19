@@ -150,6 +150,67 @@
         (inject-disarm!)
         (check "W3: disarm succeeds once the row is gone" (null? (inject-armed-points)) (inject-armed-points)))
 
+      ;; ---- W4: the pid filter -- another process's arrival is not a hit ---
+      ;; THE DISCRIMINATING ROW IS B'S, NOT A'S. A filter that ignores its
+      ;; argument still parks A, so a cell that only watched A would pass
+      ;; against no filter at all. B is the row that can only be green when
+      ;; the predicate actually ran.
+      ;;
+      ;; THIS IS THE FIRST CELL THAT ARMS WITH A PID. inject-control.sc
+      ;; records what that costs: a pid-filtered arm used to raise at the
+      ;; hit instead of filtering, and it shipped because no cell exercised
+      ;; the parameter. Ordering matters here -- B must cross the point
+      ;; while A's arming is live, so both readers wait for a go-ahead
+      ;; rather than reading as soon as they are spawned.
+      (let* ((mk (lambda (tag)
+                   (spawn (lambda ()
+                            (send main (vector 'w4-ready tag self))
+                            (receive (`#(go) (void)))
+                            (file-read-async! victim-file self)
+                            (receive (after 20000 (send main (vector tag 'no-file-message)))
+                              (`#(file-read ,bv) (send main (vector tag 'read (bytevector-length bv))))
+                              (`#(file-error ,errno) (send main (vector tag 'error errno))))))))
+             (a (mk 'w4a))
+             (b (mk 'w4b)))
+        ;; INFO VALUES ARE BOOLEANS AND SYMBOLS, NEVER PIDS. A failing check
+        ;; prints what it was handed, and printing a pid record here raises
+        ;; "cycle detected" and takes the suite down with it -- so the red
+        ;; that matters most would arrive as a panic instead of a sentence.
+        ;; Measured: that is what the first run of this cell against the
+        ;; mutant did.
+        (check "W4: reader A announced itself before arming"
+               (receive (after 5000 #f) (`#(w4-ready w4a ,p) (eq? p a))) 'no-announce)
+        (check "W4: reader B announced itself before arming"
+               (receive (after 5000 #f) (`#(w4-ready w4b ,p) (eq? p b))) 'no-announce)
+        (let ((t (inject-arm-barrier! 'fs-open-before-region 1 30000 #f a)))
+          (send b (vector 'go))
+          (let ((w (receive (after 10000 'no-witness) (`#(w4b ,how ,n) (list how n)))))
+            (check "W4: B crossed the armed point without parking"
+                   (and (pair? w) (eq? (car w) 'read)) w))
+          (check "W4: B's arrival did not reserve the row"
+                 (eq? (inject-barrier-state t) 'armed) (inject-barrier-state t))
+          (check "W4: B's arrival did not count as a hit"
+                 (eqv? (inject-hits 'fs-open-before-region) 0)
+                 (inject-hits 'fs-open-before-region))
+          (send a (vector 'go))
+          (let ((r (inject-barrier-wait t 'fs-open-before-region 10000)))
+            (check "W4: A parks" (pair? r) (if (pair? r) (car r) r))
+            (check "W4: the report names A and not B"
+                   (and (pair? r) (eq? (cdr r) a))
+                   (list 'names-a (and (pair? r) (eq? (cdr r) a))
+                         'names-b (and (pair? r) (eq? (cdr r) b))))
+            (when (pair? r)
+              (check "W4: drained to resumed"
+                     (eq? (inject-barrier-drain! (cdr r) t 10000) 'resumed))))
+          (let ((w (receive (after 10000 'no-witness) (`#(w4a ,how ,n) (list how n)))))
+            (check "W4: A finished its read after the resume"
+                   (and (pair? w) (eq? (car w) 'read)) w))
+          (let ((v (inject-release! t)))
+            (check "W4: exactly one hit was counted over the whole cell"
+                   (and (vector? v) (eqv? (vector-ref v 4) 1))
+                   (and (vector? v) (vector-ref v 4))))
+          (inject-disarm!)))
+
       ;; ---- B2: killed between the Scheme allocation and the region ---------
       ;; The fs request block is allocated INSIDE the region (fs-req-alloc!,
       ;; count and foreign-alloc together). A victim killed at this point has

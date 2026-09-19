@@ -32,7 +32,12 @@
 ;;;
 ;;; THE BARRIER PROTOCOL, IN ORDER. Departing from it is what the
 ;;; assertions below are for; each step names the one that catches it.
-;;;   1. controller: (inject-arm-barrier! point occurrence [timeout [before]])
+;;;   1. controller:
+;;;      (inject-arm-barrier! point occurrence [timeout [before [pid]]])
+;;;      pid narrows the arming to one process. A hit from any other is
+;;;      not a hit: the filter runs BEFORE the occurrence counter, so a
+;;;      process that does not match neither parks nor advances the count,
+;;;      and occurrence k means the k-th arrival OF THAT PROCESS.
 ;;;   2. victim reaches the point, reserves it, and reports:
 ;;;      #(inject-barrier ticket point victim-pid)
 ;;;   3. controller: (inject-barrier-wait ticket point bound-ms)
@@ -114,17 +119,24 @@
   ;; what makes "reserved" distinguishable from "never arrived".
   (define inject-arm-barrier!
     (case-lambda
-      ((point occurrence) (inject-arm-barrier! point occurrence 30000 #f))
+      ((point occurrence) (inject-arm-barrier! point occurrence 30000 #f #f))
       ((point occurrence timeout-ms)
-       (inject-arm-barrier! point occurrence timeout-ms #f))
+       (inject-arm-barrier! point occurrence timeout-ms #f #f))
       ((point occurrence timeout-ms before-report)
+       (inject-arm-barrier! point occurrence timeout-ms before-report #f))
+      ;; THE PID FORM IS THE SAME SHAPE THE FAULT AND RETURN ARMS ALREADY
+      ;; USE -- pid-filter builds the predicate, $inject-arm! holds it in
+      ;; the slot it has always had. A barrier-specific filter would be a
+      ;; second supplier of one judgement, and the shorter arities above
+      ;; would be the ones that got it wrong.
+      ((point occurrence timeout-ms before-report pid)
        ;; CAPTURED HERE, NOT READ IN THE PARKER. The parker runs in the
        ;; victim, where `self` is the victim; the report has to go to the
        ;; process that armed it.
        (let ((controller self))
          ($inject-arm! point 'barrier
            (make-parker controller timeout-ms before-report)
-           occurrence #f)))))
+           occurrence (pid-filter pid))))))
 
   ;; The parker owns slots 9, 10 and 11 from the moment $inject-barrier
   ;; applies it -- see the slot/writer table in inject.sc. It is the only
