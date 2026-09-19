@@ -209,6 +209,7 @@
           monitor-node/token demonitor-node/token
           $registrar-seed-gen! $registrar-pid $registrar-queue-length
           $registrar-peer-gen $node-link-pid $node-entry-mons-id
+          $node-agent-pid
           $node-stale-chain-node! set-link-reaper-scan-ms!)
   ;; (igropyr inject) IS A COMPILE-TIME ONLY DEPENDENCY WHEN OFF -- see
   ;; the note in libuv.sc; test/inject-isolation.ss is what measures it.
@@ -7999,6 +8000,32 @@
      ;; and after the entry is removed.
      (define ($node-link-pid peer)
        (let ((e (peer-entry peer))) (and e (entry-link e))))
+     ;; THE AGENT HOSTING ONE MONITOR, under the key dispatch! itself uses.
+     ;; The global monitor count cannot tell this mref's agent from any
+     ;; other's, and it moves when an unrelated cell tears down -- which is
+     ;; the trap armed! fell into, and the reason its note exists in the node
+     ;; suite. A cell that needs to know whether ONE mon has landed has to
+     ;; ask by that mon's own key.
+     ;;
+     ;; peer IS A SYMBOL, as it is everywhere past the handshake: the hello
+     ;; frame carries a string and it is converted where peer is bound, so a
+     ;; cell holding the name it dialled with can build this key directly.
+     ;;
+     ;; ATOMICALLY, for the reason the demon clause gives where it reads this
+     ;; same table: the test is inside the same region as the lookup, which
+     ;; is what makes it a decision rather than a guess.
+     ;;
+     ;; -> THE PID, NOT THE RECORD, because what a cell does with it is
+     ;; monitor or kill that process; handing out the record would export the
+     ;; monitor's internals to get at one field.
+     ;;
+     ;; -> #f when nothing is filed under (peer . mref). That is a real
+     ;; state, not an error: it is what a cell sees before a mon has landed
+     ;; and again once a demon has been processed.
+     (define ($node-agent-pid peer mref)
+       (atomically
+         (let ((r (hashtable-ref callee-agents (cons peer mref) #f)))
+           (and r (agent-pid r)))))
      ;; THE IDENTITY OF THE MONITOR LIFETIME, as a value a cell can compare
      ;; across a transition. A replacement must hand the SAME object to the new
      ;; entry and a removal must end it; neither fact is visible from outside
@@ -8048,6 +8075,10 @@
        (assertion-violation '$node-entry-mons-id
          "test seam: this artifact was expanded without IGROPYR_INJECT=on"
          peer))
+     (define ($node-agent-pid peer mref)
+       (assertion-violation '$node-agent-pid
+         "test seam: this artifact was expanded without IGROPYR_INJECT=on"
+         peer mref))
      (define ($node-stale-chain-node! peer)
        (assertion-violation '$node-stale-chain-node!
          "test seam: this artifact was expanded without IGROPYR_INJECT=on"
