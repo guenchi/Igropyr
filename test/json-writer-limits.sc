@@ -153,7 +153,7 @@
     'truncate)
   (let* ((cmd (string-append
                 "CHEZSCHEMELIBEXTS='" (or (getenv "CHEZSCHEMELIBEXTS") "") "' "
-                "timeout 10 scheme -q --libdirs . --script " src
+                "timeout 10 " (or (getenv "SCHEME_BIN") "scheme") " -q --libdirs . --script " src
                 " > " out " 2>&1"))
          (status (system cmd))
          (text (guard (e (#t ""))
