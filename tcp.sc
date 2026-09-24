@@ -2086,8 +2086,10 @@
   ;;             is served in constant memory (one chunk in flight).
   ;;             With file-stream-raw! the chunk STAYS in the op's C
   ;;             buffer and only its length is delivered -- the consumer
-  ;;             sends it with tcp-write-foreign! (buffer -> kernel, no
-  ;;             per-chunk Scheme allocation, no GC traffic).
+  ;;             sends it with tcp-write-foreign!, which on a plaintext
+  ;;             connection hands the kernel that buffer without copying
+  ;;             the payload into the Scheme heap, and on a TLS
+  ;;             connection copies it once before encrypting it.
   (define file-read-chunk-size 65536)
   ;; stream reads use bigger chunks: fewer thread-pool round trips per
   ;; GB; memory per in-flight download is still just one chunk
@@ -3838,8 +3840,10 @@
 
   ;; Switch chunk delivery to lengths: the bytes stay in the stream's C
   ;; buffer (file-stream-chunk-ptr) until the next pull, so a consumer
-  ;; that only forwards them (tcp-write-foreign!) never touches the
-  ;; Scheme heap. Set it before the first pull.
+  ;; that only forwards them (tcp-write-foreign!) does not copy the
+  ;; payload into the Scheme heap on a plaintext connection; on a TLS
+  ;; connection it is copied once, because it has to be encrypted. Set it
+  ;; before the first pull.
   (define (file-stream-raw! op)
     (fs-op-raw?-set! op #t))
 
@@ -6033,11 +6037,32 @@
     (tcp-writev! c (list bv) on-done))
 
   ;; Write len bytes straight from foreign memory (e.g. a file stream's
-  ;; chunk buffer): the fast path is buffer -> kernel with no copy at
-  ;; all; a partial write or EAGAIN copies only the unwritten remainder
-  ;; into the queued write block. The source buffer is free for reuse
-  ;; as soon as this returns. on-done as in tcp-writev!.
+  ;; chunk buffer). The source buffer is free for reuse as soon as this
+  ;; returns. on-done and the return value as in tcp-writev!.
+  ;;
+  ;; THE SAME SHAPE AS tcp-writev!, AND IT HAS TO BE. An exported write
+  ;; whose name does not say raw must ask conn-tls before it touches the
+  ;; socket; this one did not, and a large file served over HTTPS went out
+  ;; as plaintext on the encrypted connection. On a TLS connection the
+  ;; bytes are copied into a bytevector BEFORE the codec sees them: the
+  ;; codec may make this caller wait at the write gate, and the promise
+  ;; above -- the source buffer is free once this returns -- has to hold
+  ;; whether it waited or not.
   (define (tcp-write-foreign! c ptr len on-done)
+    (let ((t (conn-tls c)))
+      (if t
+          (let ((bv (make-bytevector len)))
+            (memcpy-from-c bv ptr len)
+            (tls-conn-writev! c t (list bv) on-done))
+          (tcp-write-foreign-raw! c ptr len on-done))))
+
+  ;; The plaintext sink behind tcp-write-foreign!: the fast path is buffer
+  ;; -> kernel with no copy at all; a partial write or EAGAIN copies only
+  ;; the unwritten remainder into the queued write block. NOT EXPORTED.
+  ;; The raw sink that is exported is tcp-writev-raw!, whose name says what
+  ;; it does; exporting this one too would be a second way to put plaintext
+  ;; on a TLS connection, and nothing outside this file needs it.
+  (define (tcp-write-foreign-raw! c ptr len on-done)
     (if (not (eq? (conn-state c) 'open))
         (begin (when on-done (on-done -1)) #f)
         (uv-scratch-lease (lambda (write-scratch write-scratch-size scratch-buf)

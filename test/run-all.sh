@@ -283,6 +283,11 @@ env -u IGROPYR_CONTRACTS "$scheme_bin" --script test/checked-off.sc
 # broke -- it must never be read as a clean source.
 "$scheme_bin" --script test/owner-index-tags.sc
 "$scheme_bin" --script test/static-stream.sc
+# R01: a static file above the 1 MiB cache cap over HTTPS must not put
+# plaintext on the TLS connection. Asserted on the wire through a recording
+# relay, with a plaintext twin that proves the relay records and the search
+# finds. Needs the openssl CLI, no injection seams.
+"$scheme_bin" --script test/https-large-file.sc
 "$scheme_bin" --script test/static-cache-capacity.sc
 # one file must be one cache entry: self-skips on a case-sensitive
 # filesystem (naming why), where there are no variant spellings to collapse
