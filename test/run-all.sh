@@ -565,9 +565,9 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/t
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-attempt.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-link.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reaper.sc
-IGROPYR_SCHEME="$scheme_bin" IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reaper-restart.sc
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reaper-restart.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reaper-starve.sc
-IGROPYR_SCHEME="$scheme_bin" IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reconnect.sc
+IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-mesh-reconnect.sc
 # Batch 2 (cleanup records for peer removal and replacement): collections hung
 #      on the peer entry, an intrusive record chain, notify-then-retire obligations,
 #      admission fences, executor liveness, reaper recovery. Plaintext peers from
@@ -581,15 +581,15 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/p
 #      string->number (an exact 10^N literal never returns); the kdf and gzip cells run
 #      a child under timeout, witness first
 "$scheme_bin" --script test/number-guards.sc
-IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/kdf-cost.sc
-IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/gzip-q.sc
-IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-poison.sc
-IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-escapes.sc
-IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-plus-tokens.sc
-IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-fixture-read.sc
-IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/s3-xml-ref.sc
-IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/listen-stdout.sc
-IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/panic-stderr.sc
+SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/kdf-cost.sc
+SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/gzip-q.sc
+SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-poison.sc
+SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-escapes.sc
+SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-plus-tokens.sc
+SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/sexpr-fixture-read.sc
+SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/s3-xml-ref.sc
+SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/listen-stdout.sc
+SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/panic-stderr.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/cleanup-record.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/cleanup-record-exec.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/cleanup-record-reaper.sc
@@ -599,7 +599,7 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/c
 #      their cell-start values while the owner is alive. The TLS write-block variants
 #      (P30) live at the end of test/tls-race.sc.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/proc-spawn.sc
-IGROPYR_SCHEME="$scheme_bin" SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/pipe-transport.sc
+SCHEME_BIN="$scheme_bin" "$scheme_bin" --script test/pipe-transport.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/accept-reserve.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/proc-stream.sc
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/proc-owner.sc

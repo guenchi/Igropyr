@@ -14,13 +14,19 @@
 (define dir "/tmp/igropyr-tls-mesh-reconnect")
 (system (string-append "sh igropyr/test/tls-certs.sh " dir " >/dev/null"))
 (define (in-dir f) (string-append dir "/" f))
-(define scheme-bin (let ((s (getenv "IGROPYR_SCHEME"))) (or s "chez")))
+;; THE INTERPRETER COMES FROM SCHEME_BIN, like every other suite that starts
+;; a child. This one read IGROPYR_SCHEME with a default of "chez", which the
+;; runner never set for it; on a host without a binary of that name the child
+;; never started and the parent reported the relay's refusal as a TLS
+;; handshake EOF (2026-09-07 review, R18). Quoted, so a path with a space in
+;; it is one word to the shell.
+(define scheme-bin (or (getenv "SCHEME_BIN") "scheme"))
 (define a-port 18660)
 (define b-port 40030)
 (define secret "tls-mesh-reconnect-secret-0123456789abcdef")
 (define pidf "/tmp/igropyr-tls-mesh-reconnect-b.pid")
 (define (spawn-child!)
-  (system (string-append scheme-bin " --script igropyr/test/tls-node-child.sc b "
+  (system (string-append "'" scheme-bin "' --script igropyr/test/tls-node-child.sc b "
                          (number->string b-port) " " secret " " (in-dir "good.pem") " " (in-dir "good.key")
                          " 40000 > /tmp/igropyr-tls-mesh-reconnect-b.log 2>&1 & echo $! > " pidf)))
 (define (kill-child!) (system (string-append "kill -9 $(cat " pidf " 2>/dev/null) 2>/dev/null; rm -f " pidf)))
@@ -33,6 +39,12 @@
     (monitor-node 'b)
     (spawn-child!)
     (sleep-ms 1500)
+    ;; A CHILD THAT DID NOT START SAYS SO HERE, with its own log, instead of
+    ;; surfacing fifteen seconds later as a handshake failure through the relay.
+    (unless (zero? (system (string-append "kill -0 $(cat " pidf " 2>/dev/null) 2>/dev/null")))
+      (display "FAIL  the child node did not start; its log:\n")
+      (system "sed 's/^/    /' /tmp/igropyr-tls-mesh-reconnect-b.log 2>/dev/null")
+      (exit 1))
     (node-connect! 'b "127.0.0.1" b-port)
     (receive (after 10000 (check "reconnect: node-up b (first connection)" #f 'timeout))
       (`#(node-up b) (check "reconnect: node-up b (first connection)" #t)))

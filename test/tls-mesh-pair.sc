@@ -14,7 +14,13 @@
   (if ok (begin (display "  ok  ") (display label) (newline))
       (begin (set! fails (+ fails 1)) (display "FAIL  ") (display label)
              (for-each (lambda (x) (display " ") (write x)) info) (newline))))
-(define scheme-bin (let ((s (getenv "IGROPYR_SCHEME"))) (or s "chez")))
+;; THE INTERPRETER COMES FROM SCHEME_BIN, like every other suite that starts
+;; a child. This one read IGROPYR_SCHEME with a default of "chez", which the
+;; runner never set for it; on a host without a binary of that name the child
+;; never started and the parent reported the relay's refusal as a TLS
+;; handshake EOF (2026-09-07 review, R18). Quoted, so a path with a space in
+;; it is one word to the shell.
+(define scheme-bin (or (getenv "SCHEME_BIN") "scheme"))
 (define dir "/tmp/igropyr-tls-mesh-pair")
 (system (string-append "sh igropyr/test/tls-certs.sh " dir " >/dev/null"))
 (define (in-dir f) (string-append dir "/" f))
@@ -24,7 +30,7 @@
 (define relay-port 18592)
 (define pid-file "/tmp/igropyr-tls-mesh-pair-b.pid")
 (define (spawn-child!)
-  (system (string-append scheme-bin " --script igropyr/test/tls-node-child.sc b "
+  (system (string-append "'" scheme-bin "' --script igropyr/test/tls-node-child.sc b "
                          (number->string b-port) " " secret " " (in-dir "good.pem") " " (in-dir "good.key")
                          " 40000 > /tmp/igropyr-tls-mesh-pair-b.log 2>&1 & echo $! > " pid-file)))
 (define (kill-child!)
@@ -74,6 +80,12 @@
     (monitor-node 'b)
     (spawn-child!)
     (sleep-ms 1500)                                   ; the child's listener comes up
+    ;; A CHILD THAT DID NOT START SAYS SO HERE, with its own log, instead of
+    ;; surfacing fifteen seconds later as a handshake failure through the relay.
+    (unless (zero? (system (string-append "kill -0 $(cat " pid-file " 2>/dev/null) 2>/dev/null")))
+      (display "FAIL  the child node did not start; its log:\n")
+      (system "sed 's/^/    /' /tmp/igropyr-tls-mesh-pair-b.log 2>/dev/null")
+      (exit 1))
     (node-connect! 'b "127.0.0.1" relay-port)         ; through the relay
     (check "M3: node-up for the child over TLS through the relay" (receive (after 15000 #f) (`#(node-up b) #t)))
     ;; two-way: ping the child's 'ping, await its pong
