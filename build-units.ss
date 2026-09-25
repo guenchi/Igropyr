@@ -80,6 +80,7 @@
     ;; here, which is the same omission this list already documents.
     "igropyr/json-internal.sc"
     "igropyr/json.sc"
+    "igropyr/jose.sc"
     "igropyr/gzip.sc"
     ;; sexpr must be compiled too: a source-only library gets a fresh
     ;; UID per process, which invalidates every dependent .so ("reloading

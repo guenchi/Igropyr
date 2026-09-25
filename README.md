@@ -1524,6 +1524,7 @@ express.sc framework layer (optional): router with :param segments,
            middleware chain, static files (cached + gzip), app-ws,
            forms/cookies, SSE, JSON/text/html/file encoders
 json.sc    safe recursive-descent JSON parser + writer
+jose.sc    protected-header rules the JWS verifiers share (crit)
 gzip.sc    gzip compression via zlib
 gen-server.sc  OTP gen-server (call/cast/info)
 pubsub.sc  topic publish/subscribe with dead-subscriber cleanup

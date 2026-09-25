@@ -102,6 +102,35 @@
   (not (jwt-verify (string-append (b64url (string->utf8 "{\"alg\":\"none\"}")) "."
                                   (b64url (string->utf8 "{\"sub\":\"1\"}")) ".")
                    key)))
+;; ---- crit (RFC 7515 4.1.11) -------------------------------------------------
+;; This verifier implements no JOSE extension. A crit that names an extension
+;; it does not understand MUST be refused (RFC 7515 4.1.11); a crit that breaks
+;; its own form -- an empty list, a value that is not a list -- MAY be refused,
+;; and this library chooses to. So the rows below pin a policy: any crit
+;; member at all is refused. The first row is the twin:
+;; the same token without crit, signed the same way, must verify, or the
+;; refusals prove only that craft cannot sign. The last row is the other
+;; twin: the same unknown member NOT marked critical is ignored (RFC 7515
+;; section 4; 4.1.11 is the exception for critical ones), so a fix that
+;; refused every unknown header member fails there.
+(let ((claims "{\"sub\":\"crit\"}"))
+  (check "crit-twin-plain-header-verifies"
+    (and (jwt-verify (craft "{\"alg\":\"HS256\",\"typ\":\"JWT\"}" claims key) key) #t))
+  (check "crit-unknown-extension-rejected"
+    (not (jwt-verify (craft "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"crit\":[\"x-ext\"],\"x-ext\":1}" claims key) key)))
+  (check "crit-empty-list-rejected"
+    (not (jwt-verify (craft "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"crit\":[]}" claims key) key)))
+  ;; THE DISCRIMINATING ROW: json-ref without a thunk answers #f both for an
+  ;; absent member and for "crit": false, so a predicate that reads the VALUE
+  ;; lets this one through while refusing the two above. Only a check for the
+  ;; member's PRESENCE refuses it. null pins the other end of "any value".
+  (check "crit-false-rejected"
+    (not (jwt-verify (craft "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"crit\":false}" claims key) key)))
+  (check "crit-null-rejected"
+    (not (jwt-verify (craft "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"crit\":null}" claims key) key)))
+  (check "crit-unknown-noncritical-member-still-verifies"
+    (and (jwt-verify (craft "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"x-ext\":1}" claims key) key) #t)))
+
 ;; correctly HMAC-SHA256-signed but the header claims another alg: pinned out
 (check "alg-hs384-header-rejected"
   (not (jwt-verify (craft "{\"alg\":\"HS384\"}" "{\"sub\":\"1\"}" key) key)))

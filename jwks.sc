@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr jwks) -- RSA keys, RS256 signing/verification, and JWKS.
 ;;;
 ;;; The asymmetric half of (igropyr jwt). HS256 authenticates with a shared
@@ -15,11 +29,11 @@
 ;;;   jwks-fetch!        url -> jwks (forced refetch; verify uses the cache)
 ;;;   jwks-cache-clear!  drop cached documents (tests, key rotation drills)
 ;;;
-;;; jwks-verify mirrors jwt-verify: fail-closed, and every failure -- bad
-;;; format, wrong alg, unknown kid, bad signature, expired, wrong iss/aud --
-;;; is the same #f. A caller needing to tell them apart (to log, or to answer
-;;; a specific status) should classify before calling rather than have this
-;;; leak which check failed to whoever supplied the token.
+;;; jwks-verify mirrors jwt-verify: fail-closed, and every failure, whichever
+;;; check refused, is the same #f. A caller needing to tell them apart (to
+;;; log, or to answer a specific status) should classify before calling
+;;; rather than have this leak which check failed to whoever supplied the
+;;; token.
 ;;;
 ;;; RSA is libcrypto FFI. The deprecated-but-exported RSA_get0_key /
 ;;; RSA_set0_key / EVP_PKEY_set1_RSA path is used because it is present in
@@ -33,7 +47,7 @@
           jwks-fetch! jwks-cache-clear!)
   (import (chezscheme) (igropyr checked) (igropyr util)
           (igropyr platform) (igropyr crypto) (igropyr json)
-          (igropyr http-client))
+          (igropyr jose) (igropyr http-client))
 
   (define (jwks-fail msg) (raise (vector 'jwks-error msg)))
 
@@ -421,6 +435,9 @@
                     ;; do, rather than leaving that to hold by accident of the
                     ;; call order below.
                     (equal? (json-ref header "alg") "RS256")
+                    ;; a crit member refuses the token whatever it lists;
+                    ;; why is written once, in (igropyr jose)
+                    (not (jose-crit-present? header))
                     (let ((typ (json-ref header "typ")))
                       (or (not typ) (and (string? typ) (string-ci=? typ "JWT"))))
                     (let ((kid (json-ref header "kid")))

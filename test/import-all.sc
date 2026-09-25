@@ -5,7 +5,7 @@
         (igropyr platform) (igropyr quickjs) (igropyr crypto)
         (igropyr libuv) (igropyr actor) (igropyr otp)
         (igropyr http) (igropyr websocket) (igropyr ws-client)
-        (igropyr json) (igropyr gzip) (igropyr gen-server)
+        (igropyr json) (igropyr jose) (igropyr gzip) (igropyr gen-server)
         ;; listed in its own right, not left to conversation pulling it in:
         ;; the point of this library is that it loads nothing, and only a
         ;; direct import can notice the day it starts to

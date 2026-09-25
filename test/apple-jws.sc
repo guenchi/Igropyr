@@ -3,9 +3,10 @@
 ;;; x5c is a self-made EC chain (leaf -> intermediate -> root), generated
 ;;; with openssl + node's crypto (dsaEncoding ieee-p1363, the raw R||S JOSE
 ;;; form). JWS carries Apple's marker OIDs on the leaf/intermediate; the
-;;; separate JWS-NO-OID chain omits them. Pins the happy path plus every way
-;;; a token must be rejected: unpinned root, missing leaf OID, wrong alg,
-;;; tampered signature, tampered payload, non-base64url, and non-JWS.
+;;; separate JWS-NO-OID chain omits them. Pins the happy path and rejection
+;;; cases -- unpinned root, missing leaf OID, wrong alg, a crit header member,
+;;; tampered signature, tampered payload, non-base64url, non-JWS. Not every
+;;; way a token can be refused.
 
 (import (chezscheme) (igropyr apple-jws)
         (only (igropyr crypto) base64-decode base64-encode))
@@ -115,6 +116,36 @@
 ;; not a compact JWS at all
 (check "not-a-jws-rejected"
   (eq? 'not-jws (err-code (lambda () (verify-jws-x5c "not-a-jws" (list test-root-der))))))
+
+;; ---- crit (RFC 7515 4.1.11) -------------------------------------------------
+;; The fixture has no leaf private key, so these tokens are NOT re-signed: the
+;; header is edited and the original signature kept. That is what makes the
+;; codes discriminate. Every token below carries a signature that no longer
+;; matches its header, so only a crit check that runs BEFORE the signature can
+;; answer 'crit; and the twin -- the same unknown member, not marked critical,
+;; which RFC 7515 says to ignore -- must get past the header checks and be
+;; refused by the signature, 'sig-failed. A fix placed after the signature, or
+;; one that refused every unknown member, fails one of the two.
+(define (b64url->string s)
+  (let* ((std (list->string (map (lambda (c) (case c ((#\-) #\+) ((#\_) #\/) (else c))) (string->list s))))
+         (pad (make-string (mod (- 4 (mod (string-length std) 4)) 4) #\=)))
+    (utf8->string (base64-decode (string-append std pad)))))
+(define (with-header-member member)
+  (let* ((d (dot1 JWS)) (h (b64url->string (substring JWS 0 d))))
+    (string-append (b64url-of (string-append "{" member "," (substring h 1 (string-length h))))
+                   (substring JWS d (string-length JWS)))))
+(check "crit-twin-edited-header-reaches-the-signature"
+  (eq? 'sig-failed (err-code (lambda () (verify-jws-x5c (with-header-member "\"x-ext\":1") (list test-root-der))))))
+(check "crit-unknown-extension-rejected-before-the-signature"
+  (eq? 'crit (err-code (lambda () (verify-jws-x5c (with-header-member "\"crit\":[\"x-ext\"],\"x-ext\":1") (list test-root-der))))))
+(check "crit-empty-list-rejected-before-the-signature"
+  (eq? 'crit (err-code (lambda () (verify-jws-x5c (with-header-member "\"crit\":[]") (list test-root-der))))))
+;; the discriminating row: absent and false read alike through json-ref
+;; without a thunk; only a presence check answers 'crit here
+(check "crit-false-rejected-before-the-signature"
+  (eq? 'crit (err-code (lambda () (verify-jws-x5c (with-header-member "\"crit\":false") (list test-root-der))))))
+(check "crit-null-rejected-before-the-signature"
+  (eq? 'crit (err-code (lambda () (verify-jws-x5c (with-header-member "\"crit\":null") (list test-root-der))))))
 
 (if (zero? failures)
     (begin (display "apple-jws: all tests passed\n") (exit 0))

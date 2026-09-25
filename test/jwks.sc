@@ -46,6 +46,15 @@
                            "/.well-known/jwks.json"))
 (define url-b (string-append "http://127.0.0.1:" (number->string port)
                              "/b/jwks.json"))
+;; RS256 over "header.claims" with key-a's private key, via the openssl CLI,
+;; for tokens whose header jwks-sign would never produce (the crit cells).
+(define (rs256-craft header-json claims-json)
+  (let* ((si (string-append (base64url-encode (string->utf8 header-json)) "."
+                            (base64url-encode (string->utf8 claims-json))))
+         (in (string-append dir "/si.txt")) (out (string-append dir "/sig.bin")))
+    (call-with-output-file in (lambda (p) (put-string p si)) 'truncate)
+    (system (string-append "openssl dgst -sha256 -sign " dir "/a.pem -out " out " " in))
+    (string-append si "." (base64url-encode (call-with-port (open-file-input-port out) get-bytevector-all)))))
 (define delayed-url (string-append "http://127.0.0.1:" (number->string port)
                                     "/delayed/jwks.json"))
 
@@ -159,12 +168,39 @@
       (check "token refused against a different key's JWKS"
         (not (jwks-verify tok url-b)))
 
+      ;; ---- crit (RFC 7515 4.1.11) -------------------------------------
+      ;; Tokens hand-built with key-a's own private key (openssl), so the
+      ;; signature is valid and a refusal can only be the header. The first
+      ;; row is the twin that proves the hand-built signature verifies; the
+      ;; last is the unknown member NOT marked critical, which must be ignored.
+      (let* ((kid (jwks-key-id key-a))
+             (claims (string-append "{\"iss\":\"https://a.example\",\"sub\":\"crit\",\"exp\":"
+                                    (number->string (+ (time-second (current-time)) 300)) "}"))
+             (hdr (lambda (extra)
+                    (string-append "{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"" kid "\"" extra "}"))))
+        (check "crit twin: a hand-signed plain header verifies"
+          (and (jwks-verify (rs256-craft (hdr "") claims) url) #t))
+        (check "crit naming an unknown extension is refused"
+          (not (jwks-verify (rs256-craft (hdr ",\"crit\":[\"x-ext\"],\"x-ext\":1") claims) url)))
+        (check "an empty crit list is refused"
+          (not (jwks-verify (rs256-craft (hdr ",\"crit\":[]") claims) url)))
+        ;; the discriminating row: absent and false read alike through
+        ;; json-ref without a thunk; only a presence check refuses this
+        (check "crit false is refused (presence, not value)"
+          (not (jwks-verify (rs256-craft (hdr ",\"crit\":false") claims) url)))
+        (check "crit null is refused"
+          (not (jwks-verify (rs256-craft (hdr ",\"crit\":null") claims) url)))
+        (check "an unknown member not marked critical is ignored"
+          (and (jwks-verify (rs256-craft (hdr ",\"x-ext\":1") claims) url) #t)))
+
       ;; THE load-bearing signature case: a token whose kid resolves, whose
       ;; three segments all decode, and whose ONLY defect is that the
-      ;; signature was made by the wrong key. Every other rejection here can
-      ;; also be produced by a malformed segment or a kid miss, so without
-      ;; this one a verifier that skipped the signature entirely still passes
-      ;; the whole file -- verified by short-circuiting rs256-verify to #t.
+      ;; signature was made by the wrong key. Every other rejection here is
+      ;; refused for a reason that does not depend on the signature, so
+      ;; without this one a verifier that skipped the signature entirely
+      ;; would still pass the whole file. Measured 2026-09-25 by making
+      ;; rs256-verify answer #t for any signature: this row went red and no
+      ;; other did (50 rows passed).
       (let* ((b-tok (jwks-sign key-b '(("iss" . "https://a.example")
                                        ("sub" . "u-1"))))
              (d1 (let loop ((i 0))

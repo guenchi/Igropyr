@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr jwt) -- JSON Web Tokens: HS256 JWS compact serialization.
 ;;;
 ;;;   (jwt-sign '(("sub" . "42") ("role" . "admin")) key
@@ -58,7 +72,7 @@
 (library (igropyr jwt)
   (export jwt-sign jwt-verify jwt-verifier jwt-decode)
   (import (chezscheme) (igropyr checked) (igropyr util)
-          (igropyr crypto) (igropyr json))
+          (igropyr crypto) (igropyr json) (igropyr jose))
 
   (define (jwt-fail msg)
     (raise (vector 'jwt-error msg)))
@@ -167,8 +181,8 @@
       ((list? a) (and (member expected a) #t))
       (else #f)))
 
-  ;; -> claims alist (possibly '(), still true) | #f. Every failure --
-  ;; format, algorithm, signature, time, iss/aud -- is the same #f.
+  ;; -> claims alist (possibly '(), still true) | #f. Every failure,
+  ;; whichever check refused, is the same #f.
   ;; rest: one options alist: (leeway . secs) (iss . str) (aud . str)
   (define (jwt-verify token key . rest)
     ;; the key is OUR caller's argument, not attacker input: a bad key
@@ -185,6 +199,9 @@
                     (header (string->json (utf8->string (b64url-decode h64)))))
                (and (list? header)
                     (equal? (json-ref header "alg") "HS256")
+                    ;; a crit member refuses the token whatever it lists;
+                    ;; why is written once, in (igropyr jose)
+                    (not (jose-crit-present? header))
                     (let ((typ (json-ref header "typ")))
                       (or (not typ) (and (string? typ) (string-ci=? typ "JWT"))))
                     (bv-ct=?

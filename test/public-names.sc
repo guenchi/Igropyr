@@ -173,6 +173,8 @@
               set-https-connector! start-scheduler spawn send
               receive self sleep-ms kill register whereis
               process-id)
+        (only (igropyr jose)
+              jose-crit-present?)
         (only (igropyr json)
               string->json json->string json-object? json-array?
               json-null? json-ref json-ref* json-set json-set*

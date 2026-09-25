@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr apple-jws) -- verify Apple App Store Server (v2) JWS.
 ;;;
 ;;; App Store Server Notifications V2 and the App Store Server API deliver
@@ -14,11 +28,12 @@
 ;;; symbol so the caller can map it to an HTTP status (bad signature /
 ;;; chain / root / expiry are attacker-facing 401s; parse/internal are
 ;;; retryable 5xx):
-;;;   not-jws bad-alg no-x5c cert-parse-failed invalid-root chain-failed
-;;;   cert-expired sig-failed internal
+;;;   not-jws bad-alg crit no-x5c cert-parse-failed invalid-root
+;;;   chain-failed cert-expired sig-failed internal
 ;;;
 ;;; Verification (mirrors Apple's own app-store-server-library):
-;;;   1. the header alg is ES256 (never trusted to pick the algorithm)
+;;;   1. the header alg is ES256 (never trusted to pick the algorithm), and
+;;;      the header has no crit member (no extension is understood here)
 ;;;   2. the x5c root's DER bytes equal a pinned trusted root (verify-apple-jws
 ;;;      pins Apple Root CA G3; verify-jws-x5c takes explicit roots)
 ;;;   3. each cert is issued by the next, whose CA bit is set, and its
@@ -40,7 +55,8 @@
   (export verify-apple-jws verify-jws-x5c apple-root-ca-g3-der)
   (import (chezscheme) (igropyr platform)
           (only (igropyr crypto) base64-decode base64url-decode)
-          (only (igropyr json) string->json json-ref))
+          (only (igropyr json) string->json json-ref)
+          (only (igropyr jose) jose-crit-present?))
 
   ;; ---- libcrypto (loaded explicitly, like (igropyr tls)) ----------------
 
@@ -207,6 +223,16 @@
         ;; anything else (including "none") is refused fail-closed
         (unless (equal? alg "ES256")
           (ajws-fail 'bad-alg "unexpected JWS alg (want ES256)"))
+        ;; CRIT IS REFUSED HERE, BEFORE THE CHAIN OR THE SIGNATURE IS
+        ;; TOUCHED. The position is a choice, and it buys two things: no
+        ;; certificate parsing or OpenSSL work is spent on a token that is
+        ;; refused whatever the chain says, and the refusal is reported as
+        ;; 'crit rather than as whichever later check it would have tripped
+        ;; first. The header is known to be an object by now: the alg test
+        ;; above passes only on a pair. Why any crit member refuses, whatever
+        ;; it lists, is written once in (igropyr jose).
+        (when (jose-crit-present? header)
+          (ajws-fail 'crit "JWS header marks an extension critical; none is understood"))
         (unless (and (vector? x5c) (fx>= (vector-length x5c) 3))
           (ajws-fail 'no-x5c "x5c header missing or shorter than 3 certificates"))
         ;; And an UPPER bound, checked before any DER is decoded or handed to
