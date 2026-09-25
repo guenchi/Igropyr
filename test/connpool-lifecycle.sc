@@ -643,8 +643,29 @@
                                       (number->string first-gap) "ms, last "
                                       (number->string last-gap) "ms over "
                                       (number->string (length ts)) " attempts\n"))
+              ;; THE LINE IS BETWEEN THE STEPS, NOT A RATIO OF TWO GAPS.
+              ;; Each wait is its step +/- 20% (connpool.sc next-backoff!):
+              ;; the first in [800, 1200) ms, the second in [1600, 2400).
+              ;; The old line, last > 1.5 x first, sat about 1% below the
+              ;; last gap: on FreeBSD ten runs read first 1168-1200 ms and
+              ;; last 1798-1829 ms, the same draws every run (random starts
+              ;; from the same state each process). Under the whole-suite
+              ;; run the first gap read 1206 ms, the line moved to 1809, and
+              ;; a correct pool failed at 1800. A backoff stuck on its first
+              ;; step waits at most 1200 ms plus the rebuild's own time
+              ;; (measured with the step held: last 1009-1014 ms, red); an
+              ;; escalated one at least 1600. 1400 sits between them while
+              ;; the rebuild's own time stays under about 200 ms.
+              ;;
+              ;; BOTH ENDS ARE PINNED. The last gap above the line alone
+              ;; would pass a backoff that starts at its second step and
+              ;; never grows (review, 2026-09-25: a constant 2000 ms base
+              ;; read first 1617, last 1904); so the first gap must also be
+              ;; on the first step.
+              (check "the first backoff wait is on the first step"
+                     (< first-gap 1400))
               (check "and the backoff escalates rather than repeating its first step"
-                     (> last-gap (* 3/2 first-gap))))))
+                     (> last-gap 1400)))))
       (send pool (vector 'pool-quit)))
 
     ;; ---- the pool's own teardown stays the pool's own decision ------------
