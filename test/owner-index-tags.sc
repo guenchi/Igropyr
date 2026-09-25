@@ -25,11 +25,22 @@
 ;;;     position as one token and lost BOTH sides of 'conn; the control is
 ;;;     what said so. A control on a tag whose sides are both simple would
 ;;;     have stayed green while the scanner was broken.
+;;;
+;;; THERE ARE TWO WAYS IN (2026-09-25). A kind is filed either by
+;;; index-owner! or by owner-index-prepare! (a cell built where allocation
+;;; is allowed, published later inside a region). This file read only the
+;;; first, and 'fs passed by the accident of also having an index-owner!
+;;; line; 'signal, filed only through a prepared cell, read as
+;;; "unindex-owner! only" and stopped the whole-suite run on three hosts
+;;; while its pairing was right. Both forms now count as the filing side,
+;;; and the prepared form has its own control, 'fs, so a scanner that
+;;; stopped seeing prepared cells says so instead of passing.
 
 (import (chezscheme))
 
 (define source "tcp.sc")
 (define control 'conn)
+(define prepare-control 'fs)
 
 (define (lines-of path)
   (call-with-input-file path
@@ -81,7 +92,12 @@
                       (if (and t (not (memq t acc))) (cons t acc) acc))
                     acc))))))
 
-(let* ((ins  (tags-for "(index-owner!"))
+(let* ((direct   (tags-for "(index-owner!"))
+       (prepared (tags-for "(owner-index-prepare!"))
+       (ins  (let loop ((xs prepared) (acc direct))
+               (cond ((null? xs) acc)
+                     ((memq (car xs) acc) (loop (cdr xs) acc))
+                     (else (loop (cdr xs) (cons (car xs) acc))))))
        (outs (tags-for "(unindex-owner!"))
        (all  (let loop ((xs (append ins outs)) (acc '()))
                (cond ((null? xs) acc)
@@ -90,13 +106,20 @@
   ;; THE CONTROL RUNS FIRST AND HAS ITS OWN NAME. A scanner that matches
   ;; nothing reports zero one-sided tags, which reads exactly like a clean
   ;; source. These two outcomes must never share a message.
-  (if (not (and (memq control ins) (memq control outs)))
-      (begin
-        (display "FAIL owner-index-tag-scanner-broken: control ")
-        (write control)
-        (display " not found on both sides (in=")
-        (write ins) (display " out=") (write outs) (display ")\n")
-        (exit 2))
+  (cond
+    ((not (and (memq control ins) (memq control outs)))
+      (display "FAIL owner-index-tag-scanner-broken: control ")
+      (write control)
+      (display " not found on both sides (in=")
+      (write ins) (display " out=") (write outs) (display ")\n")
+      (exit 2))
+    ((not (memq prepare-control prepared))
+      (display "FAIL owner-index-tag-scanner-broken: prepared-cell control ")
+      (write prepare-control)
+      (display " not found (prepared=")
+      (write prepared) (display ")\n")
+      (exit 2))
+    (else
       (let loop ((xs all) (bad 0))
         (cond
           ((null? xs)
@@ -115,4 +138,4 @@
                  (display "FAIL owner-index-tag-one-sided ") (write t)
                  (display " unindex-owner! only\n")
                  (loop (cdr xs) (+ bad 1)))
-                (else (loop (cdr xs) bad)))))))))
+                (else (loop (cdr xs) bad))))))))))
