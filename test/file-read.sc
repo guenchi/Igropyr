@@ -13,9 +13,15 @@
     (open-file-output-port path (file-options no-fail) (buffer-mode block) #f)
     (lambda (p) (put-bytevector p bv))))
 
+;; no-truncate IS WHAT MAKES THIS AN APPEND. Without it Chez truncates an
+;; existing file on open even with `append`, so this helper emptied the file
+;; and wrote the extra bytes from offset 0 -- while the read was running.
+;; The cell below then read a file that shrank under it: measured on FreeBSD,
+;; one run in about forty returned 6750208 bytes of an 8388608-byte file
+;; (the read met end-of-file early, as it should), and the size check failed.
 (define (append-bytes path bv)
   (call-with-port
-    (open-file-output-port path (file-options no-create no-fail append)
+    (open-file-output-port path (file-options no-create no-fail no-truncate append)
                            (buffer-mode block) #f)
     (lambda (p) (put-bytevector p bv))))
 
@@ -69,9 +75,11 @@
     (expect-file-error "/dev/zero" "non-regular file")
     ;; A file that GROWS while it is being read must still yield a
     ;; consistent snapshot: the read is sized by one fstat, so it returns
-    ;; either the size seen then or -- if the append landed before that
-    ;; fstat -- the larger one, but never a torn mixture and never more
-    ;; than was actually written.
+    ;; the size seen then, which may be the original size, the full size, or
+    ;; anything between -- the append is 64 KiB through a buffered port and
+    ;; need not reach the file in one write -- but never less than the
+    ;; original, never more than was written, and always a prefix of the
+    ;; original bytes followed by the appended ones.
     ;;
     ;; Which of the two sizes comes back is a race with libuv's thread
     ;; pool, so it is NOT asserted: an earlier version slept 10 ms and
@@ -88,13 +96,16 @@
               (base-n (bytevector-length append-base))
               (full-n (+ (bytevector-length append-base)
                          (bytevector-length append-extra))))
-          (unless (or (= n base-n) (= n full-n))
-            (fail "append-during-read size is neither snapshot"))
+          (unless (and (>= n base-n) (<= n full-n))
+            (fail (string-append "append-during-read size "
+                                 (number->string n) " is outside ["
+                                 (number->string base-n) ", "
+                                 (number->string full-n) "]")))
           (unless (equal? (bytevector-copy-part bv 0 base-n) append-base)
             (fail "append-during-read content changed"))
-          (when (= n full-n)
-            (unless (equal? (bytevector-copy-part bv base-n full-n) append-extra)
-              (fail "append-during-read tail mismatched")))))
+          (unless (equal? (bytevector-copy-part bv base-n n)
+                          (bytevector-copy-part append-extra 0 (- n base-n)))
+            (fail "append-during-read tail is not a prefix of the appended bytes"))))
       (`#(file-error ,e)
         (fail "append-during-read unexpectedly failed")))
     (cleanup)
