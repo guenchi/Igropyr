@@ -59,6 +59,8 @@
     uv-owner-index-count uv-set-alive?! uv-set-deliver! uv-set-gate-wait!
     uv-set-self!
     uv-set-tls-watcher-spawner!
+    ;; OS signals delivered as messages; the last two are diagnostics
+    signal-watch! signal-unwatch! signal-watch-counts signal-watch-handle
     ;; write-block accounting, TCP-wide: a write block belongs to a
     ;; connection, not to a child process, so these are their own two
     ;; readings rather than entries in proc-stats -- a program with no
@@ -113,8 +115,8 @@
             uv-handle-size uv-req-size
             uv-spawn uv-process-kill uv-kill uv-process-get-pid
             uv-pipe-init uv-pipe-bind uv-pipe-connect uv-handle-get-type
-            uv-shutdown
-            UV-PROCESS UV-NAMED-PIPE UV-SHUTDOWN UV-TCP)
+            uv-shutdown uv-signal-init uv-signal-start
+            UV-PROCESS UV-NAMED-PIPE UV-SHUTDOWN UV-TCP UV-SIGNAL)
           (igropyr tls-core))
 
   ;; connection record; one per accepted TCP client
@@ -1237,6 +1239,14 @@
                               (eq? (proc-child p) 'running)
                               (proc-handle-alive? p))
                      (uv-process-kill (proc-handle p) 15))))
+                ;; A SIGNAL WATCH WHOSE OWNER IS GONE. Owner re-checked like
+                ;; the others, because the index is a superset, and closed
+                ;; through the one step signal-unwatch! also uses -- so a watch
+                ;; the owner had already unwatched is left as it is.
+                ((signal)
+                 (let ((w (hashtable-ref signal-table key #f)))
+                   (when (and w (eq? (signal-watch-owner w) owner))
+                     (signal-watch-close! w))))
                 (else (void)))))
           owned))))
 
@@ -1251,6 +1261,111 @@
   ;; (the handles themselves are foreign-alloc'd and are not the GC's
   ;; business).
   (define listener-table (make-eqv-hashtable))
+
+  ;; ---- signal watches: the record, the table, the storage count ------------
+  ;;
+  ;; THE RECORD IS THE TOKEN. signal-unwatch! acts on the record, never on the
+  ;; handle address: once a watch's close callback has freed its handle, the
+  ;; allocator may hand that address to a newer watch, and an unwatch that
+  ;; looked the address up would close the newer one.
+  ;;
+  ;; state never moves backward. A record is built open, and it is handed to
+  ;; the caller only after its handle has started. closing means uv_close has
+  ;; been called on the handle. closed means its storage is gone: normally
+  ;; because the close callback ran, but a construction whose storage libuv
+  ;; never initialised is freed directly and marked closed with no callback.
+  ;; A construction that fails before any storage exists leaves the record
+  ;; open -- it was never published and is simply dropped. Either way a
+  ;; failed construction's record is never returned to the caller.
+  (define-record-type (signal-watch make-signal-watch signal-watch?)
+    (fields
+      ;; the uv_signal_t address, or 0 before it is allocated
+      (mutable handle signal-watch-handle signal-watch-set-handle!)
+      (immutable owner signal-watch-owner)
+      ;; the name the messages carry, e.g. SIGTERM
+      (immutable sym signal-watch-sym)
+      (mutable state signal-watch-state signal-watch-set-state!))
+    (nongenerative)
+    (sealed #t)
+    (opaque #t))
+
+  ;; handle address -> watch, from the row insert until the close callback.
+  ;; It roots the record while libuv holds the handle, and it is what both
+  ;; signal callbacks look the watch up by.
+  (define signal-table (make-eqv-hashtable))
+
+  ;; HANDLE STORAGE, COUNTED AT ITS ONE ALLOCATION AND ITS TWO RELEASES: the
+  ;; rollback of a handle libuv never initialised, and the close callback.
+  ;; The row count cannot stand in for it, because a construction that fails
+  ;; before the row insert holds storage with no row. Nor can the loop's
+  ;; handle count, which a handle leaves just before its close callback runs,
+  ;; so a close callback that did not free would still read as released.
+  (define signal-storage-live 0)
+  (define signal-handle-size (uv-handle-size UV-SIGNAL))
+  (define (alloc-signal-handle!)
+    (let ((h (foreign-alloc signal-handle-size)))
+      (set! signal-storage-live (fx+ signal-storage-live 1))
+      h))
+  (define (free-signal-handle! h)
+    (set! signal-storage-live (fx- signal-storage-live 1))
+    (foreign-free h))
+
+  ;; THE ACCEPTED SIGNALS, AN ALLOW-LIST ON PURPOSE. Disposition is
+  ;; process-wide, and when the LAST watch of a signal closes, libuv resets
+  ;; that signal to SIG_DFL -- not to what it was before the first watch. In
+  ;; a Chez process that has not installed a handler of its own, these five
+  ;; are at their default already (measured on FreeBSD 15 with ps -o
+  ;; sigignore,sigcatch), so the reset leaves them as it found them. The
+  ;; others are refused:
+  ;;
+  ;;   - SIGPIPE is ignored in a Chez process (same measurement). Watched and
+  ;;     then unwatched, it would be left at the default, and the next write
+  ;;     to a closed pipe or socket would terminate the process.
+  ;;   - SIGINT and SIGQUIT are caught by the Chez runtime (same measurement).
+  ;;     After the last watch closed they would be left at the default, and
+  ;;     the runtime's own handler would be gone for the rest of the process.
+  ;;     Refused until there is a design that restores the previous
+  ;;     disposition.
+  ;;   - the fault signals (ILL, FPE, BUS, SEGV) are caught by the runtime
+  ;;     too, and a watch would take them from it.
+  ;;
+  ;; Adding a signal is a decision about its disposition first; then its
+  ;; name goes here and its number goes in (igropyr platform)'s
+  ;; platform-signal-numbers.
+  (define signal-allow-list '(SIGHUP SIGTERM SIGUSR1 SIGUSR2 SIGWINCH))
+
+  ;; sig -> (number . name), or #f when sig is not an accepted signal on this
+  ;; host. Wide on input -- the name, or this host's number for it -- and
+  ;; narrow on output: the name is what the messages carry, because the
+  ;; numbers differ between OSes.
+  (define (signal-resolve sig)
+    (define (number-of name)
+      (let ((e (assq name platform-signal-numbers)))
+        (and e (cdr e))))
+    (cond
+      ((symbol? sig)
+       (and (memq sig signal-allow-list)
+            (let ((n (number-of sig)))
+              (and n (cons n sig)))))
+      ((fixnum? sig)
+       (let loop ((names signal-allow-list))
+         (cond
+           ((null? names) #f)
+           ((eqv? (number-of (car names)) sig) (cons sig (car names)))
+           (else (loop (cdr names))))))
+      (else #f)))
+
+  ;; THE ONE STEP THAT STARTS A WATCH'S CLOSE, for signal-unwatch! and the
+  ;; owner-death arm alike. The caller holds the region, so the test and the
+  ;; two writes are one step and two closers cannot both win. Nothing is
+  ;; removed here: the close callback is the one place that removes the
+  ;; row, unindexes and frees. -> #t when this call started the close.
+  (define (signal-watch-close! w)
+    (and (eq? (signal-watch-state w) 'open)
+         (begin
+           (signal-watch-set-state! w 'closing)
+           (uv-close (signal-watch-handle w) on-signal-close-entry)
+           #t)))
 
   ;; ---- callbacks ----------------------------------------------------
 
@@ -1513,6 +1628,59 @@
           (guard (e (#t (note-swallowed! 'proc-shutdown-cb e)))
             (when c (tcp-close-raw! c)))))
       (void* int)
+      void))
+
+  ;; signal_cb. libuv's own OS handler does no more than note the delivery:
+  ;; under its signal lock it writes one record per watching handle to the
+  ;; loop's signal pipe. This runs later, from uv_run, on the loop -- never
+  ;; inside the OS handler. So the delivery is an ordinary send from loop
+  ;; context, the same path a read callback's tcp-data takes.
+  ;;
+  ;; The state test is the second of two guards against delivering after an
+  ;; unwatch: uv_close has already cleared the handle's signum, and libuv
+  ;; skips any record still queued for it.
+  ;;
+  ;; TODAY A TRIPWIRE, NOT A MEASUREMENT. Because libuv already skips those
+  ;; records, no cell can turn this test red: removing it was measured and
+  ;; every row stayed green. It is kept for the day libuv stops clearing the
+  ;; signum, and nothing today shows that it works.
+  ;;
+  ;; Everything is guarded: a raise here would unwind into C.
+  (define on-signal-code
+    (foreign-callable
+      (lambda (handle signum)
+        (guard (e (#t (note-swallowed! 'signal-deliver e)))
+          (let ((w (hashtable-ref signal-table handle #f)))
+            (when (and w (eq? (signal-watch-state w) 'open))
+              (deliver (signal-watch-owner w)
+                       (vector 'signal (signal-watch-sym w)))))))
+      (void* int)
+      void))
+
+  ;; close_cb for a signal handle, and THE ONE PLACE A ROW IS REMOVED AND
+  ;; ITS STORAGE FREED, whoever asked for the close: signal-unwatch!, owner
+  ;; death, or a construction's rollback. Same order as on-close-code: the
+  ;; pointer writes first, the allocating unindex guarded, the free last and
+  ;; unconditional.
+  ;;
+  ;; THE FREE DOES NOT DEPEND ON THE ROW. A construction that failed after
+  ;; uv_signal_init and before the row insert closes a handle that no row
+  ;; names, and its storage is released here like any other.
+  ;;
+  ;; Freeing here is safe because libuv holds a closing signal handle's close
+  ;; callback back until every record it caught has been dispatched
+  ;; (uv__finish_close in src/unix/core.c, libuv 1.50.0).
+  (define on-signal-close-code
+    (foreign-callable
+      (lambda (handle)
+        (let ((w (hashtable-ref signal-table handle #f)))
+          (when w
+            (hashtable-delete! signal-table handle)
+            (signal-watch-set-state! w 'closed)
+            (guard (e (#t (note-swallowed! 'signal-close-unindex e)))
+              (unindex-owner! (signal-watch-owner w) 'signal handle))))
+        (free-signal-handle! handle))
+      (void*)
       void))
 
   ;; connection_cb: accept, register, hand the conn to the upper layer.
@@ -2914,18 +3082,21 @@
       (lock-object on-process-exit-code)
       (lock-object on-process-close-code)
       (lock-object on-shutdown-code)
-      ;; FOURTEEN, NOT SIXTEEN. on-timer-code and on-walk-code belong to the
-      ;; loop itself -- its wakeup timer and uv_walk -- and are locked in
-      ;; (igropyr libuv), beside the loop. Every code object must be locked in
-      ;; whichever library holds it: libuv keeps only a raw entry pointer, so
-      ;; a collected object means the loop jumps into freed memory. The
-      ;; invariant is the ORDER -- construct, lock, take the entry, hand it
-      ;; over -- not any registration, which C never sees.
+      (lock-object on-signal-code)
+      (lock-object on-signal-close-code)
+      ;; THIS FILE'S CALLBACKS, NOT THE LOOP'S. on-timer-code and on-walk-code
+      ;; belong to the loop itself -- its wakeup timer and uv_walk -- and are
+      ;; locked in (igropyr libuv), beside the loop. Every code object must be
+      ;; locked in whichever library holds it: libuv keeps only a raw entry
+      ;; pointer, so a collected object means the loop jumps into freed
+      ;; memory. The invariant is the ORDER -- construct, lock, take the
+      ;; entry, hand it over -- not any registration, which C never sees.
       (vector on-alloc-code on-read-code on-close-code
               on-write-code on-connection-code on-connect-code
               on-getaddrinfo-code on-fs-code on-fsw-code
               on-tls-timer-code on-tls-timer-close-code
-              on-process-exit-code on-process-close-code on-shutdown-code)))
+              on-process-exit-code on-process-close-code on-shutdown-code
+              on-signal-code on-signal-close-code)))
 
   (define on-fsw-entry (foreign-callable-entry-point on-fsw-code))
   (define on-alloc-entry (foreign-callable-entry-point on-alloc-code))
@@ -2944,6 +3115,9 @@
   (define on-process-close-entry
     (foreign-callable-entry-point on-process-close-code))
   (define on-shutdown-entry (foreign-callable-entry-point on-shutdown-code))
+  (define on-signal-entry (foreign-callable-entry-point on-signal-code))
+  (define on-signal-close-entry
+    (foreign-callable-entry-point on-signal-close-code))
 
 
 
@@ -7051,4 +7225,191 @@
                       (if (eq? (proc-child p) 'running) (fx+ running 1) running)
                       (if (eq? (proc-child p) 'exited) (fx+ exited 1) exited)
                       (fx+ queued (proc-queued p)))))))))
+
+  ;; ---- signal watches: the public API -------------------------------------
+  ;;
+  ;;   (signal-watch! sig)         -> watch, owned by the calling process
+  ;;   (signal-watch! sig owner)   -> watch, owned by owner
+  ;;   (signal-unwatch! watch)     -> #t, or #f when it was already closing
+  ;;                                  or closed
+  ;;   the owner receives          #(signal SIG), SIG always a name: SIGTERM
+  ;;
+  ;; sig is a name in signal-allow-list or this host's number for one; the
+  ;; message carries the name either way, so a receiver matches 'SIGUSR1 on
+  ;; every OS. Anything else is refused with an assertion-violation that names
+  ;; the list. So is an owner that is not a live process, and so is every
+  ;; call made before the actor scheduler has started. A watch is an opaque
+  ;; record; keep it to unwatch with.
+  ;;
+  ;; A MESSAGE IS NOT A COUNT. Each one says that the signal arrived at least
+  ;; once, and two messages from ONE watch stand for two different arrivals;
+  ;; but arrivals can outnumber messages -- the kernel merges a standard
+  ;; signal that arrives while one is pending, and libuv's signal pipe can
+  ;; drop records when it is full -- and messages can outnumber arrivals,
+  ;; because every watch gets its own: an owner holding two watches of one
+  ;; signal receives two messages for one arrival.
+  ;;
+  ;; UNWATCH STOPS FUTURE MESSAGES; IT DOES NOT TAKE BACK ONE ALREADY SENT. A
+  ;; message that reached the owner's mailbox before signal-unwatch! returned
+  ;; stays there, so a receiver can see #(signal ...) after unwatching.
+  ;;
+  ;; DO NOT USE register-signal-handler FOR A SIGNAL THAT IS, OR WAS, WATCHED.
+  ;; libuv installs its OS handler on a signal's first watch and does not
+  ;; necessarily install it again for later ones, so mixing the two does not
+  ;; mean "the last one installed wins": which handler runs is unspecified.
+  ;;
+  ;; SIGINT AND SIGQUIT ARE REFUSED, NOT OVERLOOKED. The Chez runtime catches
+  ;; both; when the last watch closed, libuv would leave them at SIG_DFL, and
+  ;; the runtime's own handler would be gone for the rest of the process. The
+  ;; reasons for the other refusals are at signal-allow-list.
+  ;;
+  ;; The owner's death closes its watches, as it closes its connections. A
+  ;; child started with proc-spawn! does not inherit a watch: libuv resets the
+  ;; signal dispositions of a child it spawns (src/unix/process.c, libuv
+  ;; 1.50.0). That is a statement about uv_spawn, not about a raw fork.
+  (define signal-watch!
+    (case-lambda
+      ((sig) (signal-watch! sig (and uv-self (uv-self))))
+      ((sig owner) (signal-watch-open! sig owner))))
+
+  ;; A NON-PROCESS IS REFUSED, NOT PASSED THROUGH. This layer does not know
+  ;; what a process is; the liveness hook installed from above does, and it
+  ;; raises for anything that is not one, which this counts as "not alive".
+  ;;
+  ;; NO HOOK MEANS NO WATCH. The hook is installed when the actor scheduler
+  ;; starts. Before that nothing could receive a message and no owner death
+  ;; would ever close the watch -- yet the watch would still take the
+  ;; signal's disposition, so a watched SIGTERM would silently stop
+  ;; terminating the process. signal-watch-open! refuses that case by name
+  ;; before asking this.
+  (define (signal-owner-alive? owner)
+    (and owner
+         uv-alive?
+         (guard (e (#t #f)) (and (uv-alive? owner) #t))))
+
+  (define (signal-watch-open! sig owner)
+    ;; (1) VALIDATED OUT HERE, where a raise costs nothing: nothing has been
+    ;; allocated yet.
+    (let ((ns (signal-resolve sig)))
+      (unless ns
+        (assertion-violation 'signal-watch!
+          "not an accepted signal on this host; the accepted ones are"
+          sig signal-allow-list))
+      ;; THE LOOP HAS TO EXIST FIRST: uv_signal_init on a null loop is a
+      ;; segfault, not an error return.
+      (when (= (uv-loop-handle) 0)
+        (assertion-violation 'signal-watch!
+          "the event loop is not running" sig))
+      (unless uv-alive?
+        (assertion-violation 'signal-watch!
+          "the actor scheduler has not started; nothing could receive" sig))
+      (unless (signal-owner-alive? owner)
+        (assertion-violation 'signal-watch!
+          "owner must be a live process" owner))
+      ;; (2) STILL OUTSIDE THE REGION, AND SCHEME OBJECTS ONLY: the owner-index
+      ;; cell and the watch record itself, so that every rollback below has a
+      ;; record to mark. A kill here loses nothing the collector cannot take.
+      (let* ((cell (owner-index-prepare! 'signal))
+             (w (make-signal-watch 0 owner (cdr ns) 'open))
+             ;; (3) the region; its answer is (#t . watch) or (#f . condition)
+             (r (with-interrupts-disabled
+                  (signal-watch-acquire! w (car ns) cell))))
+        ;; RE-RAISED HERE, AFTER THE REGION, never from inside it.
+        (if (car r)
+            (cdr r)
+            (raise (cdr r))))))
+
+  ;; Caller holds the region. The acquisition state is one local, moved
+  ;; forward as each resource appears, and the guard's rollback reads it --
+  ;; THE ROLLBACK IS THE ONLY CLEANUP PATH, so no step below frees or closes
+  ;; anything on its own failure; it raises and lets the rollback do it.
+  ;;
+  ;;   none        nothing to undo
+  ;;   allocated   storage libuv has never seen: freed directly
+  ;;   initialised libuv has seen the handle, so it goes out through uv_close
+  ;;   rowed       and the close callback removes the row
+  ;;   published   and unindexes
+  ;;   started     the last acquisition step. A raise after it -- the
+  ;;               answer pair allocates -- takes the same close as
+  ;;               initialised
+  ;;
+  ;; For initialised and later the record is marked closing, and the close
+  ;; callback frees the storage with or without a row.
+  ;;
+  ;; uv_signal_start IS NOT BOUNDED TIME. It takes libuv's process-wide signal
+  ;; lock, whose acquisition is a pipe read that can wait for another OS thread:
+  ;; libuv's OS signal handler takes the same lock, on whichever thread the
+  ;; signal is delivered to. That handler and the other start and stop calls
+  ;; hold it only briefly, none of them waits for a green process to run, and
+  ;; uv_signal_start blocks every blockable signal on its own thread before
+  ;; taking the lock, so the handler cannot interrupt it there. Holding the
+  ;; region across the call is therefore safe; "inside the region" does not mean
+  ;; "fast".
+  (define (signal-watch-acquire! w signum cell)
+    (let ((owner (signal-watch-owner w))
+          (acq 'none))
+      (define (rollback!)
+        (case acq
+          ((none) (void))
+          ((allocated)
+           (signal-watch-set-state! w 'closed)
+           (free-signal-handle! (signal-watch-handle w)))
+          (else
+           (signal-watch-set-state! w 'closing)
+           (uv-close (signal-watch-handle w) on-signal-close-entry))))
+      (guard (e (#t (rollback!) (cons #f e)))
+        ;; (a) RE-CHECKED HERE, INSIDE THE REGION, as proc-spawn! does: an
+        ;; owner that died after the check outside would otherwise be handed
+        ;; a watch that nothing will ever close.
+        (unless (signal-owner-alive? owner)
+          (assertion-violation 'signal-watch!
+            "owner must be a live process" owner))
+        ;; (b)
+        (signal-watch-set-handle! w (alloc-signal-handle!))
+        (set! acq 'allocated)
+        ;; (c) INJECTION POINT 'signal-init-neg (return) -- OWNING GUARD: the
+        ;; guard at the top of this body. Skipping uv_signal_init leaves
+        ;; storage libuv has never seen, which is exactly the allocated state
+        ;; the rollback frees.
+        (let ((rc (inject-return! 'signal-init-neg
+                    (uv-signal-init (uv-loop-handle) (signal-watch-handle w)))))
+          (when (< rc 0)
+            (assertion-violation 'signal-watch! (uv-strerror rc) rc)))
+        (set! acq 'initialised)
+        ;; (d) INJECTION POINT 'signal-row (fault) -- OWNING GUARD: the guard
+        ;; at the top of this body. Raising here leaves an initialised handle
+        ;; with no row.
+        (inject-fault! 'signal-row)
+        (hashtable-set! signal-table (signal-watch-handle w) w)
+        (set! acq 'rowed)
+        ;; INJECTION POINT 'signal-publish (fault) -- OWNING GUARD: the guard
+        ;; at the top of this body. Raising here leaves a row with no index
+        ;; entry.
+        (inject-fault! 'signal-publish)
+        (owner-index-publish! owner cell (signal-watch-handle w))
+        (set! acq 'published)
+        ;; (e) INJECTION POINT 'signal-start-neg (return) -- OWNING GUARD: the
+        ;; guard at the top of this body. A uv_signal_start that failed
+        ;; registered nothing, so skipping it leaves the published state the
+        ;; rollback closes.
+        (let ((rc (inject-return! 'signal-start-neg
+                    (uv-signal-start (signal-watch-handle w) on-signal-entry
+                                     signum))))
+          (when (< rc 0)
+            (assertion-violation 'signal-watch! (uv-strerror rc) rc)))
+        (set! acq 'started)
+        (cons #t w))))
+
+  (define (signal-unwatch! w)
+    (unless (signal-watch? w)
+      (assertion-violation 'signal-unwatch! "not a signal watch" w))
+    (with-interrupts-disabled
+      (signal-watch-close! w)))
+
+  ;; -> (rows . storage): the signal table's size, and the handle blocks
+  ;; allocated and not yet freed. DIAGNOSTIC. One region, so the two
+  ;; numbers describe one instant.
+  (define (signal-watch-counts)
+    (with-interrupts-disabled
+      (cons (hashtable-size signal-table) signal-storage-live)))
   )

@@ -517,6 +517,9 @@ IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/r
 # item 8: the quarantine reason is a private record, and the observer message
 # carries its kind in a seventh slot -- readers that matched six slots must move
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/quarantine-reason.sc
+# OS signals delivered as messages; 7c's rollback rows need the injection
+# seams. Sends signals to itself and to two child interpreters (SCHEME_BIN)
+SCHEME_BIN="$scheme_bin" IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/signal-watch.sc
 # server-side TLS context layer (no port; mints its PKI with the openssl CLI like
 # tls.sc). Instrumented because it reads the error-attribution and lazy-load seams.
 IGROPYR_INJECT=on CHEZSCHEMELIBEXTS='.sc::.no-obj' "$scheme_bin" --script test/tls-server.sc

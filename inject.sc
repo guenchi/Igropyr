@@ -368,6 +368,15 @@
               (assertion-violation '$inject-arm!
                 "this point needs a libuv error code in [-4095,-1]"
                 value)))
+           ;; The two signal-watch points, uv_signal_init and
+           ;; uv_signal_start. Their caller asks (< rc 0) and hands a
+           ;; negative code to uv-strerror, so the reading and the range
+           ;; are the child-process points' above.
+           ((signal-init-neg signal-start-neg)
+            (unless (and (fixnum? value) (fx< value 0) (fx>= value -4095))
+              (assertion-violation '$inject-arm!
+                "this point needs a libuv error code in [-4095,-1]"
+                value)))
            ;; Three flags, read by `when`: #t is the only value that
            ;; does anything, and #f is exactly what the unarmed point
            ;; already yields. None of the three callers inspects the

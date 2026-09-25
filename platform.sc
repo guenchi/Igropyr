@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr platform) -- supported-host detection and shared-library loading.
 
 (library (igropyr platform)
@@ -21,7 +35,9 @@
           uv-stdio-container-size uv-sc-flags-offset uv-sc-data-offset
           UV-IGNORE UV-CREATE-PIPE UV-INHERIT-FD
           UV-READABLE-PIPE UV-WRITABLE-PIPE
-          uv-handle-queue-next-offset uv-handle-queue-prev-offset)
+          uv-handle-queue-next-offset uv-handle-queue-prev-offset
+          ;; signal numbers
+          platform-signal-numbers)
   (import (chezscheme) (igropyr util))
 
   (define machine-name (symbol->string (machine-type)))
@@ -232,4 +248,32 @@
   ;; does not raise; it writes a pointer into the middle of another structure.
   (define uv-handle-queue-next-offset 32)
   (define uv-handle-queue-prev-offset 40)
+
+  ;; ---- signal numbers ------------------------------------------------------
+  ;;
+  ;; name -> this host's number, for the signals (igropyr tcp)'s signal watch
+  ;; accepts, and only those. Which signals are accepted is decided there,
+  ;; not here: this table only gives each accepted name's number on this OS,
+  ;; so adding a signal to that list also means adding its number here,
+  ;; for every OS.
+  ;;
+  ;; THE NUMBERS DIFFER BETWEEN OSes, which is why the names are the interface.
+  ;; USR1 and USR2 are 30 and 31 on macOS and FreeBSD and 10 and 12 on Linux.
+  ;;
+  ;; macOS and FreeBSD: read from <sys/signal.h> in the macOS 26 SDK and on a
+  ;; FreeBSD 15.0 amd64 host (2026-09-25); the five values agree.
+  ;; Linux: the values in the kernel's uapi signal headers, the same on x86_64
+  ;; and arm64. NOT read on a Linux host for this table. A wrong number here
+  ;; can watch a different signal without any error -- any other catchable
+  ;; signal's number is accepted -- so print these from <signal.h> on the
+  ;; target before relying on them there.
+  (define platform-signal-numbers
+    (case platform-os
+      ((macos freebsd)
+       '((SIGHUP . 1) (SIGTERM . 15) (SIGUSR1 . 30) (SIGUSR2 . 31)
+         (SIGWINCH . 28)))
+      ((linux)
+       '((SIGHUP . 1) (SIGTERM . 15) (SIGUSR1 . 10) (SIGUSR2 . 12)
+         (SIGWINCH . 28)))
+      (else '())))
 )

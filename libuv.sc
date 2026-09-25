@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr libuv) -- the raw libuv binding layer.
 ;;;
 ;;; THE CUT IS BY OWNERSHIP, NOT BY SUBJECT. What lives here is what belongs
@@ -50,6 +64,7 @@
     uv-spawn uv-process-kill uv-kill uv-process-get-pid
     uv-pipe-init uv-pipe-bind uv-pipe-connect uv-handle-get-type uv-shutdown
     UV-PROCESS UV-NAMED-PIPE UV-SHUTDOWN
+    uv-signal-init uv-signal-start UV-SIGNAL
     uv-timer-init uv-timer-start uv-timer-stop
     memcpy-from-c memcpy-to-c memcpy-cc
     c-open c-openat c-close uv-fileno c-getsockopt)
@@ -85,6 +100,7 @@
   (define UV-PROCESS 10)
   (define UV-SHUTDOWN 4)
   (define UV-TIMER 13)
+  (define UV-SIGNAL 16)
   (define UV-WRITE 3)
   (define UV-EOF -4095)
 
@@ -130,6 +146,17 @@
   ;; UV_ENOTCONN -- so a caller that waits for the callback anyway waits
   ;; forever.
   (define uv-shutdown    (foreign-procedure "uv_shutdown" (void* void* void*) int))
+  ;; ---- signals -------------------------------------------------------------
+  ;;
+  ;; The callback is uv_signal_cb, (uv_signal_t* handle, int signum) -> void,
+  ;; and it runs from uv_run on the loop's thread. libuv's own OS handler
+  ;; does no more than note the delivery, writing one record per watching
+  ;; handle to a pipe the loop polls. uv_signal_stop is not
+  ;; bound, because uv_close stops the handle as part of closing it and
+  ;; closing is the only way the layer above ends a watch.
+  (define uv-signal-init (foreign-procedure "uv_signal_init" (void* void*) int))
+  (define uv-signal-start
+    (foreign-procedure "uv_signal_start" (void* void* int) int))
   (define uv-tcp-connect (foreign-procedure "uv_tcp_connect" (void* void* void* void*) int))
   (define uv-getaddrinfo (foreign-procedure "uv_getaddrinfo" (void* void* void* string void* void*) int))
   (define uv-freeaddrinfo (foreign-procedure "uv_freeaddrinfo" (void*) void))
@@ -360,8 +387,8 @@
 
   ;; THE LOCK TABLE IS SPLIT BY OWNERSHIP, NOT MOVED WHOLE. Only these two
   ;; code objects belong to the loop itself -- its wakeup timer and uv_walk.
-  ;; The other eleven reach into connection and file tables and are locked in
-  ;; (igropyr tcp), beside the state they touch. libuv holds raw entry
+  ;; The others reach into the tables (igropyr tcp) keeps and are locked
+  ;; there, beside the state they touch. libuv holds raw entry
   ;; pointers, so every code object must be locked wherever it lives or the
   ;; loop jumps into collected code; the invariant is the ORDER -- construct,
   ;; lock, take the entry point, hand it over -- not any registration with
