@@ -36,20 +36,28 @@
 ;;;      the header has no crit member (no extension is understood here)
 ;;;   2. the x5c root's DER bytes equal a pinned trusted root (verify-apple-jws
 ;;;      pins Apple Root CA G3; verify-jws-x5c takes explicit roots)
-;;;   3. each cert is issued by the next, whose CA bit is set, and its
-;;;      signature verifies under the issuer's public key
+;;;   3. OpenSSL validates the certificate path from the leaf to that root,
+;;;      and the path it validated is exactly the presented chain
 ;;;   4. the leaf carries Apple's App Store Server signing OID
 ;;;      (1.2.840.113635.100.6.11.1) and the intermediate the WWDR OID
 ;;;      (1.2.840.113635.100.6.2.1) -- so a cert that merely chains to the
 ;;;      pinned root but is not the notification signer is rejected
-;;;   5. every cert is inside its validity window
-;;;   6. the JWS signature (ES256) verifies under the leaf's public key
+;;;   5. the JWS signature, 64 bytes of R||S, verifies over SHA-256 under
+;;;      the leaf's public key. The key's algorithm and curve are NOT checked,
+;;;      so this is weaker than ES256, which requires ECDSA on P-256.
+;;;
+;;; WHAT STEP 3 PROMISES, AND WHAT IT DOES NOT. It is OpenSSL's path
+;;; validation to a pinned anchor, under the default profile, with policy
+;;; processing on and an initial policy set of anyPolicy, at the current
+;;; time. The strict-profile rules (X509_V_FLAG_X509_STRICT) are NOT
+;;; applied: whether Apple's real chain passes them has not been measured,
+;;; and turning them on blind could refuse every genuine notification. That
+;;; is a compatibility allowance, written here so it is not read as an
+;;; oversight. There is no revocation checking -- no CRL, no OCSP.
 ;;;
 ;;; It is VERIFY-ONLY: no signing, so no App Store Server API JWT is
-;;; produced here (ynthu talks to the legacy verifyReceipt endpoint for
-;;; receipts). The heavy lifting -- X.509 parsing, ECDSA -- is libcrypto
-;;; via FFI, the same library (igropyr tls) loads; only the pinned-root
-;;; byte compare and the JOSE raw-R||S -> DER signature reshaping are here.
+;;; produced here. The heavy lifting -- X.509 parsing, path validation,
+;;; ECDSA -- is libcrypto via FFI, the same library (igropyr tls) loads.
 
 (library (igropyr apple-jws)
   (export verify-apple-jws verify-jws-x5c apple-root-ca-g3-der)
@@ -71,13 +79,41 @@
   (define BIO_write   (foreign-procedure "BIO_write" (void* u8* int) int))
   (define d2i_X509_bio (foreign-procedure "d2i_X509_bio" (void* void*) void*))
   (define X509_free   (foreign-procedure "X509_free" (void*) void))
-  (define X509_check_issued (foreign-procedure "X509_check_issued" (void* void*) int))
-  (define X509_check_ca (foreign-procedure "X509_check_ca" (void*) int))
-  (define X509_verify (foreign-procedure "X509_verify" (void* void*) int))
   (define X509_get_pubkey (foreign-procedure "X509_get_pubkey" (void*) void*))
-  (define X509_get0_notBefore (foreign-procedure "X509_get0_notBefore" (void*) void*))
-  (define X509_get0_notAfter  (foreign-procedure "X509_get0_notAfter" (void*) void*))
-  (define X509_cmp_current_time (foreign-procedure "X509_cmp_current_time" (void*) int))
+  (define X509_cmp (foreign-procedure "X509_cmp" (void* void*) int))
+  ;; the path validator: a store holding the anchor, a stack of the
+  ;; untrusted intermediates, and a context that ties them to the leaf
+  (define X509_STORE_new (foreign-procedure "X509_STORE_new" () void*))
+  (define X509_STORE_free (foreign-procedure "X509_STORE_free" (void*) void))
+  (define X509_STORE_add_cert
+    (foreign-procedure "X509_STORE_add_cert" (void* void*) int))
+  (define X509_STORE_CTX_new (foreign-procedure "X509_STORE_CTX_new" () void*))
+  (define X509_STORE_CTX_free (foreign-procedure "X509_STORE_CTX_free" (void*) void))
+  (define X509_STORE_CTX_init
+    (foreign-procedure "X509_STORE_CTX_init" (void* void* void* void*) int))
+  (define X509_STORE_CTX_get0_param
+    (foreign-procedure "X509_STORE_CTX_get0_param" (void*) void*))
+  (define X509_VERIFY_PARAM_set_flags
+    (foreign-procedure "X509_VERIFY_PARAM_set_flags" (void* unsigned-long) int))
+  (define X509_VERIFY_PARAM_add0_policy
+    (foreign-procedure "X509_VERIFY_PARAM_add0_policy" (void* void*) int))
+  (define X509_verify_cert (foreign-procedure "X509_verify_cert" (void*) int))
+  (define X509_STORE_CTX_get_error
+    (foreign-procedure "X509_STORE_CTX_get_error" (void*) int))
+  (define X509_verify_cert_error_string
+    (foreign-procedure "X509_verify_cert_error_string" (long) string))
+  (define X509_STORE_CTX_get0_chain
+    (foreign-procedure "X509_STORE_CTX_get0_chain" (void*) void*))
+  ;; OpenSSL 3's sk_X509_* are macros over these
+  (define OPENSSL_sk_new_null (foreign-procedure "OPENSSL_sk_new_null" () void*))
+  (define OPENSSL_sk_push (foreign-procedure "OPENSSL_sk_push" (void* void*) int))
+  (define OPENSSL_sk_free (foreign-procedure "OPENSSL_sk_free" (void*) void))
+  (define OPENSSL_sk_num (foreign-procedure "OPENSSL_sk_num" (void*) int))
+  (define OPENSSL_sk_value (foreign-procedure "OPENSSL_sk_value" (void* int) void*))
+  ;; from x509_vfy.h
+  (define X509_V_ERR_CERT_NOT_YET_VALID 9)
+  (define X509_V_ERR_CERT_HAS_EXPIRED 10)
+  (define X509_V_FLAG_POLICY_CHECK #x80)
   (define EVP_PKEY_free (foreign-procedure "EVP_PKEY_free" (void*) void))
   (define EVP_sha256  (foreign-procedure "EVP_sha256" () void*))
   (define EVP_MD_CTX_new (foreign-procedure "EVP_MD_CTX_new" () void*))
@@ -249,7 +285,7 @@
           (let ((e (vector-ref x5c i)))
             (unless (and (string? e) (fx<= (string-length e) 8192))
               (ajws-fail 'cert-parse-failed "x5c entry is missing or too large"))))
-        (let ((certs '()))
+        (let ((certs '()) (store 0) (untrusted 0) (ctx 0))
           (dynamic-wind
             (lambda () (void))
             (lambda ()
@@ -268,21 +304,94 @@
                                   (and (bytevector? d) (bytevector=? d presented-root)))
                                 trusted-root-ders)
                   (ajws-fail 'invalid-root "root certificate is not a pinned trusted root")))
-              ;; 2) chain: cert[i] issued by cert[i+1], which is a CA, sig valid
-              (let loop ((cs certs))
-                (when (pair? (cdr cs))
-                  (let ((cert (car cs)) (issuer (cadr cs)))
-                    (when (fx<= (X509_check_ca issuer) 0)
-                      (ajws-fail 'chain-failed "issuer is not a CA"))
-                    (unless (fx= 0 (X509_check_issued issuer cert))
-                      (ajws-fail 'chain-failed "issuer does not match subject"))
-                    (let ((pk (X509_get_pubkey issuer)))
-                      (when (zero? pk) (ajws-fail 'chain-failed "issuer has no public key"))
-                      (let ((ok (fx= 1 (X509_verify cert pk))))
-                        (EVP_PKEY_free pk)
-                        (unless ok (ajws-fail 'chain-failed "certificate signature is invalid")))))
-                  (loop (cdr cs))))
-              ;; 2b) Apple marker OIDs: the leaf must be the App Store Server
+              ;; 2) THE PATH IS OPENSSL'S. X509_verify_cert checks signatures,
+              ;; CA status and path length, unknown critical extensions, name
+              ;; and policy constraints and validity at the current time. The
+              ;; loop this replaced checked adjacent pairs, and constraints that
+              ;; span the chain -- pathLenConstraint, critical extensions,
+              ;; policy constraints -- were never evaluated: re-implementing RFC
+              ;; 5280 a clause at a time leaves every clause not yet written as
+              ;; a silent accept.
+              ;;
+              ;; THE ONLY ANCHOR IS THE PRESENTED ROOT, which step 1 has just
+              ;; proved byte-equal to a pin, and which is already parsed. The
+              ;; pins themselves are not parsed here: a pin that is not a valid
+              ;; certificate would then fail verification of tokens it has
+              ;; nothing to do with. The untrusted stack holds the presented
+              ;; intermediates and nothing else; the leaf is the target.
+              (let ((n (length certs)))
+                (set! store (X509_STORE_new))
+                (when (zero? store) (ajws-fail 'internal "X509_STORE_new failed"))
+                (unless (fx= 1 (X509_STORE_add_cert store (list-ref certs (fx- n 1))))
+                  (ajws-fail 'internal "X509_STORE_add_cert failed"))
+                (set! untrusted (OPENSSL_sk_new_null))
+                (when (zero? untrusted) (ajws-fail 'internal "OPENSSL_sk_new_null failed"))
+                ;; push answers the new count, not 1, so success is > 0
+                (do ((i 1 (fx+ i 1))) ((fx= i (fx- n 1)))
+                  (unless (fx> (OPENSSL_sk_push untrusted (list-ref certs i)) 0)
+                    (ajws-fail 'internal "OPENSSL_sk_push failed")))
+                (set! ctx (X509_STORE_CTX_new))
+                (when (zero? ctx) (ajws-fail 'internal "X509_STORE_CTX_new failed"))
+                (unless (fx= 1 (X509_STORE_CTX_init ctx store (car certs) untrusted))
+                  (ajws-fail 'internal "X509_STORE_CTX_init failed"))
+                ;; POLICY PROCESSING ON, AND THE INITIAL SET IS anyPolicy.
+                ;; Without the flag, a critical policyConstraints is recognised
+                ;; -- so the unknown-critical-extension rule does not catch it
+                ;; -- and then never enforced. Without the initial set, a path
+                ;; on which requireExplicitPolicy takes effect -- carried below
+                ;; the anchor, whose own policy constraints are not processed,
+                ;; with its skip count reached -- fails whatever policies its
+                ;; certificates assert, so the day Apple's chain carried such a
+                ;; constraint every notification would fail. Adding the policy
+                ;; does not turn the flag on; both are needed. The parameter
+                ;; belongs to the context and must not be freed here; once add0
+                ;; succeeds the policy object belongs to the parameter, and
+                ;; until then it is ours.
+                (let ((param (X509_STORE_CTX_get0_param ctx)))
+                  (when (zero? param) (ajws-fail 'internal "X509_STORE_CTX_get0_param failed"))
+                  (unless (fx= 1 (X509_VERIFY_PARAM_set_flags param X509_V_FLAG_POLICY_CHECK))
+                    (ajws-fail 'internal "X509_VERIFY_PARAM_set_flags failed"))
+                  (let ((any-policy (OBJ_txt2obj "2.5.29.32.0" 1)))
+                    (when (zero? any-policy)
+                      (ajws-fail 'internal "OBJ_txt2obj failed for anyPolicy"))
+                    (unless (fx= 1 (X509_VERIFY_PARAM_add0_policy param any-policy))
+                      (ASN1_OBJECT_free any-policy)
+                      (ajws-fail 'internal "X509_VERIFY_PARAM_add0_policy failed"))))
+                ;; 1 verified, 0 refused, negative for an internal error. Of
+                ;; the refusals only the two validity-window errors are
+                ;; cert-expired; the set of codes this file raises is
+                ;; unchanged.
+                (let ((r (X509_verify_cert ctx)))
+                  (cond
+                    ((fx< r 0) (ajws-fail 'internal "X509_verify_cert failed internally"))
+                    ((fx= r 0)
+                     (let ((err (X509_STORE_CTX_get_error ctx)))
+                       (if (or (fx= err X509_V_ERR_CERT_HAS_EXPIRED)
+                               (fx= err X509_V_ERR_CERT_NOT_YET_VALID))
+                           (ajws-fail 'cert-expired
+                             (string-append "certificate is outside its validity window: "
+                                            (X509_verify_cert_error_string err)))
+                           (ajws-fail 'chain-failed
+                             (string-append "certificate path does not verify: "
+                                            (X509_verify_cert_error_string err))))))))
+                ;; THE VERIFIED PATH MUST BE THE PRESENTED CHAIN, position by
+                ;; position. OpenSSL builds its own path from the leaf, the
+                ;; untrusted stack and the store; if some other path verified --
+                ;; one skipping an intermediate, or taking the presented ones in
+                ;; another order -- the marker checks below, which look at
+                ;; the presented positions, would be judging a certificate
+                ;; the verification did not use, or one it used at another
+                ;; place in the path. A length comparison alone accepts a
+                ;; reordering, so every position is compared.
+                (let ((chain (X509_STORE_CTX_get0_chain ctx)))
+                  (unless (and (not (zero? chain))
+                               (fx= (OPENSSL_sk_num chain) n)
+                               (let loop ((i 0) (cs certs))
+                                 (or (null? cs)
+                                     (and (fx= 0 (X509_cmp (OPENSSL_sk_value chain i) (car cs)))
+                                          (loop (fx+ i 1) (cdr cs))))))
+                    (ajws-fail 'chain-failed "the verified path is not the presented chain"))))
+              ;; 3) Apple marker OIDs: the leaf must be the App Store Server
               ;; signing cert and the intermediate the WWDR CA -- exactly what
               ;; Apple's own app-store-server-library pins, so a certificate
               ;; that merely chains to the pinned root but is not the
@@ -291,13 +400,6 @@
                 (ajws-fail 'chain-failed "leaf is not an App Store Server signing certificate"))
               (unless (cert-has-oid? (cadr certs) "1.2.840.113635.100.6.2.1")
                 (ajws-fail 'chain-failed "intermediate is not the Apple WWDR CA"))
-              ;; 3) validity window (notBefore < now < notAfter) for every cert
-              (for-each
-                (lambda (c)
-                  (unless (and (fx< (X509_cmp_current_time (X509_get0_notBefore c)) 0)
-                               (fx> (X509_cmp_current_time (X509_get0_notAfter c)) 0))
-                    (ajws-fail 'cert-expired "certificate is outside its validity window")))
-                certs)
               ;; 4) ES256 over "header.payload" under the leaf's public key
               (let ((der-sig (es256-raw->der (b64url->bytes s-b64))))
                 (unless der-sig (ajws-fail 'sig-failed "signature is not a 64-byte ES256 value"))
@@ -306,7 +408,16 @@
                   (ajws-fail 'sig-failed "JWS signature does not verify")))
               ;; success -> the decoded payload bytes
               (b64url->bytes p-b64))
-            (lambda () (for-each X509_free certs)))))))
+            ;; the context (which frees its parameter and the anyPolicy object
+            ;; it owns), the stack container only -- the certificates in it
+            ;; are the ones in certs -- the store (which drops its own
+            ;; reference to the anchor), then every certificate parsed above,
+            ;; once
+            (lambda ()
+              (unless (zero? ctx) (X509_STORE_CTX_free ctx))
+              (unless (zero? untrusted) (OPENSSL_sk_free untrusted))
+              (unless (zero? store) (X509_STORE_free store))
+              (for-each X509_free certs)))))))
 
   ;; ---- Apple Root CA G3 (pinned) ---------------------------------------
   ;; https://www.apple.com/certificateauthority/AppleRootCA-G3.cer ; notAfter 2039.

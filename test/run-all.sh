@@ -328,6 +328,9 @@ IGROPYR_INJECT=on IGROPYR_CONTRACTS=full "$scheme_bin" --script test/node.sc
 "$scheme_bin" --script test/conv-record.sc
 "$scheme_bin" --script test/tls.sc
 "$scheme_bin" --script test/apple-jws.sc
+# x5c path validation against certificate hierarchies generated per run;
+# needs the openssl CLI, 3.4 or later
+"$scheme_bin" --script test/apple-jws-path.sc
 # needs the openssl CLI to mint its ephemeral RSA keys, same as tls.sc above
 "$scheme_bin" --script test/jwks.sc
 # pbkdf2/scrypt always run; the argon2id derivations self-skip (naming what
