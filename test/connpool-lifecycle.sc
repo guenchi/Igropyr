@@ -662,6 +662,13 @@
               ;; never grows (review, 2026-09-25: a constant 2000 ms base
               ;; read first 1617, last 1904); so the first gap must also be
               ;; on the first step.
+              ;;
+              ;; WHAT THIS STILL DOES NOT SHOW: that growth continues past the
+              ;; second step (a cap at 2000 ms passes), or that the steps are
+              ;; 1 s and 2 s rather than a base that straddles the line (a
+              ;; constant 1500 ms, jittered, can read first 1300, last 1500).
+              ;; It guards the defect named above -- a backoff that never
+              ;; leaves its first step -- and a start on the second.
               (check "the first backoff wait is on the first step"
                      (< first-gap 1400))
               (check "and the backoff escalates rather than repeating its first step"
