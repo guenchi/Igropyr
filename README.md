@@ -72,9 +72,12 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   keeps a hostile page from holding an authenticated session. Browser
   origins fail closed until the application configures the list; clients
   without an Origin header remain supported
-- **JWT** — `(igropyr jwt)` signs and verifies HS256 tokens (algorithm
+- **JWT and JWS** — `(igropyr jwt)` signs and verifies HS256 tokens (algorithm
   pinned, constant-time compare, strict base64url, fail-closed), the
-  credential format plugged into `(igropyr auth)`
+  credential format plugged into `(igropyr auth)`; `(igropyr jwks)` signs
+  RS256 and verifies against a fetched JWKS; `(igropyr apple-jws)` verifies
+  x5c-signed JWS (App Store Server notifications) with OpenSSL path
+  validation to a pinned root. All three refuse a header carrying `crit`
 - **Password hashing** — `(igropyr kdf)` derives and verifies passwords
   over libcrypto (PBKDF2-HMAC-SHA256, scrypt, argon2id) with
   self-describing hashes, so an app can migrate algorithms on login;
@@ -93,9 +96,9 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
   server-side parameter binding (`$1..$n`, injection impossible)
 - **Non-blocking HTTP & WebSocket clients** — outbound `http-get` /
   `http-post` and `ws-connect`, both with async DNS (libuv thread pool)
-  and the same park-the-caller model; `https://` / `wss://` via the
-  optional `(igropyr tls)` library (OpenSSL as a byte codec, certificates
-  verified — the core stays dependency-free)
+  and the same park-the-caller model; `https://` via the optional
+  `(igropyr tls)` library (OpenSSL as a byte codec, certificates verified —
+  the core stays dependency-free). Outbound `wss://` is not supported
 - **Static file serving** — hot files come from an in-memory cache (a
   hashtable lookup: no disk read, no `stat` syscall; mtime re-checked at
   most once a second). A cache miss opens the file beneath its root with
@@ -136,6 +139,13 @@ A distributed, fault-tolerant, high-concurrency backend framework with continuat
 - **Multi-process scaling** — `SO_REUSEPORT` bind option for
   kernel-balanced multi-process listening on Linux (pair with
   pm2 or systemd)
+- **OS signals as messages** — `signal-watch!` delivers `SIGHUP`, `SIGTERM`,
+  `SIGUSR1`, `SIGUSR2` and `SIGWINCH` to a green process as
+  `#(signal SIGTERM)`, from the event loop, with no polling; the signals whose
+  disposition the runtime depends on (`SIGPIPE`, `SIGINT`, `SIGQUIT`, the
+  fault signals) are refused
+- **Unix-domain sockets** — `pipe-listen!` / `pipe-connect!` hand over the
+  same connections as TCP, so the read, write and close calls are unchanged
 - **Distributed actors** — connect nodes into a mesh (`(igropyr node)`):
   `rsend`/`rcall` to a process registered on another node,
   `monitor-node`/`monitor-remote`, cluster-wide PubSub, a distributed
@@ -731,12 +741,16 @@ inside a handler.
              (timeout . 5000)))
 ```
 
-One connection per request (no pooling); a transport failure or timeout
-raises `#(http-client-error msg)`.
+Connections are reused: after a response that leaves the connection framed
+and drained, it is kept for the next request to the same host, port and
+scheme, which saves a TCP handshake (and over TLS a full TLS handshake). Pass
+`(reuse . #f)` to opt one request out; `http-client-pool!` sizes the pool,
+`http-client-close-idle!` empties it and `http-client-pool-stats` reports it.
+A transport failure or timeout raises `#(http-client-error msg)`.
 
 **`https://`** works once you enable the optional `(igropyr tls)`
 library — one import plus one call at startup, and every `http-get` /
-`http-request` (and `ws-client`'s `wss://`) can reach TLS endpoints:
+`http-request` can reach TLS endpoints:
 
 ```scheme
 (import (igropyr http-client) (igropyr tls))
@@ -1405,8 +1419,11 @@ fully-addressable mesh caps out at a few hundred nodes by nature.
 > **Security:** the dist port is full control of the node — anyone on it
 > can message any registered process, including supervisors. The
 > handshake is a mutual HMAC-SHA256 challenge/response on the shared
-> secret, but there is no TLS and the port binds `127.0.0.1` by default.
-> Across machines, keep it on a private network (WireGuard, VPC). For a
+> secret, and the port binds `127.0.0.1` by default. The links can run
+> over TLS (`tls-cert` / `tls-key`, and `tls-ca` to verify peers, on
+> `node-start!`), which binds both proofs to the certificate; identity is
+> still the shared secret. Across machines, keep it on a private network
+> (WireGuard, VPC) all the same. For a
 > cluster-wide singleton or leader election, use a system that already
 > solved consensus (Redis `SET NX`, etcd) — a network partition turns
 > in-process election into split-brain.
@@ -1414,17 +1431,21 @@ fully-addressable mesh caps out at a few hundred nodes by nature.
 ## HTTPS / TLS
 
 Two directions, handled differently. **Inbound** (browsers reaching your
-server) is terminated by a reverse proxy — covered here. **Outbound**
-(your code calling `https://` APIs) is the optional `(igropyr tls)`
-library — see [Outbound TLS](#outbound-tls) at the end of this section
-and the `https://` example under [Outbound HTTP](#outbound-http).
+server) can be served directly, but for a public deployment is best
+terminated by a reverse proxy — covered here. **Outbound** (your code
+calling `https://` APIs) is the optional `(igropyr tls)` library — see
+[Outbound TLS](#outbound-tls) at the end of this section and the
+`https://` example under [Outbound HTTP](#outbound-http).
 
 ### Inbound: terminate at a reverse proxy
 
-Igropyr's server speaks plain HTTP; terminate inbound TLS in a reverse
-proxy in front of it. This is the standard deployment and gets you
-automatic certificates, HTTP/2 to the browser, and OCSP stapling for
-free, without the server owning TLS or its CVE surface.
+The server can serve HTTPS itself — give `app-listen` (or `http-listen`)
+both `tls-cert` and `tls-key`, and WebSocket upgrades on that port are
+`wss` — which suits a single machine, an internal service or local
+development. For a public deployment the recommendation is a reverse proxy
+in front, with the server listening in plaintext on loopback or a private
+interface: the proxy gets you automatic certificates, HTTP/2 to the browser
+and OCSP stapling, and is where renewal and request logging already live.
 
 **Caddy** (automatic Let's Encrypt certificates, one line per host):
 
@@ -1475,7 +1496,7 @@ the original scheme from `X-Forwarded-Proto`.
 
 For the other direction — calling `https://` services from your own code
 — import `(igropyr tls)` and call `(tls-enable!)` once at startup; then
-the HTTP client and `ws-client` speak `https://` / `wss://`. Unlike the
+the HTTP client speaks `https://` (`ws-connect` refuses `wss://`). Unlike the
 inbound side, this is a real TLS client *in* the process, so it verifies
 certificates itself.
 
@@ -1509,8 +1530,10 @@ HTTPS still belongs at the proxy.
 ## Internals
 
 ```
-libuv.sc   libuv FFI: event loop, TCP, async DNS, async file reads,
-           write queue, GC roots
+libuv.sc   libuv FFI: the event loop, its constants and loop-owned buffers
+tcp.sc     what a connection or owning process owns: TCP and unix-domain
+           listeners and connects, write queue, async DNS and file I/O,
+           child processes, OS signal watches, TLS connection codec
 actor.sc   green processes: spawn/send/receive, link/monitor/register,
            preemptive scheduler (call/1cc + timer interrupt), run/sleep queues
 otp.sc     supervisor + fixed worker pool + stuck-worker ticker
@@ -1524,6 +1547,9 @@ express.sc framework layer (optional): router with :param segments,
            middleware chain, static files (cached + gzip), app-ws,
            forms/cookies, SSE, JSON/text/html/file encoders
 json.sc    safe recursive-descent JSON parser + writer
+jwt.sc     HS256 JSON Web Tokens: sign, verify, jwt-verifier for auth
+jwks.sc    RS256 signing and verification against a fetched JWKS
+apple-jws.sc  x5c-signed JWS: OpenSSL path validation to a pinned root
 jose.sc    protected-header rules the JWS verifiers share (crit)
 gzip.sc    gzip compression via zlib
 gen-server.sc  OTP gen-server (call/cast/info)
@@ -1533,12 +1559,12 @@ auth.sc        auth role: auth middleware + token-guard / session-guard for ws
 middleware.sc  cors / security-headers / logger / rate-limit / error-handler
 metrics.sc     metrics signal: Prometheus / JSON / sexpr, cluster snapshot
 dashboard.sc   metrics dashboard + turnkey admin listener (loopback default)
-client.sc  non-blocking outbound HTTP client (async DNS)
+http-client.sc  non-blocking outbound HTTP client (async DNS, pooled)
 sigv4.sc   AWS Signature V4 request signing (pure)
 s3.sc      S3-compatible object storage (AWS S3 / R2 / MinIO)
 blas.sc    vector scoring kernel: optional CBLAS sgemv, pure fallback
 quickjs.sc embed a JS engine in-process (QuickJS, pure Scheme FFI)
-tls.sc     optional outbound TLS (OpenSSL memory-BIO codec) for https/wss
+tls.sc     optional outbound TLS (OpenSSL memory-BIO codec) for https
 redis.sc   non-blocking Redis client (RESP2), pipelined
 mysql.sc   non-blocking MySQL client (caching_sha2_password) + pool
 ```
