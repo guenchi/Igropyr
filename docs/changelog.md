@@ -1,5 +1,168 @@
 # Changelog
 
+## 1.8.0 — 2026-09-26
+
+*33 commits.* HTTPS no longer sends large static files in plaintext; JWS
+verification refuses critical header extensions and validates the whole
+certificate path; OS signals delivered to a process as messages; a
+unix-domain-socket transport; a listener that runs out of memory stops
+accepting loudly instead of silently.
+
+### Security
+
+- **HTTPS static files above 1 MiB went out in plaintext** (`0eb264c`). A file
+  above express's per-file cache cap is streamed from a C buffer with
+  `tcp-write-foreign!`, which wrote straight to the socket without asking
+  whether the connection was TLS. On an HTTPS listener the file's bytes went
+  onto the connection unencrypted: the client failed with a TLS record-layer
+  error, and an observer on the link could read the file. **Present in 1.7.0
+  and 1.7.1.**
+
+  `tcp-write-foreign!` now dispatches like `tcp-writev!`: on a TLS connection
+  it copies the buffer once and hands it to the existing TLS codec; on a
+  plaintext connection it is unchanged.
+
+- **JWS verifiers ignored `crit`** (`1643388`). RFC 7515 requires refusing a
+  token whose `crit` names an extension the recipient does not understand.
+  `jwt-verify`, `jwks-verify` and `verify-jws-x5c` now refuse any protected
+  header carrying a `crit` member, whatever its value: none of them implements
+  an extension, and a `crit` that is empty or malformed is a producer error the
+  RFC permits a recipient to refuse. `jwt-verify` and `jwks-verify` answer
+  `#f`; `verify-jws-x5c` raises the new code `crit`, before any certificate
+  work. Header members not marked critical are still ignored. The shared rule
+  is `jose-crit-present?` in the new `(igropyr jose)`.
+
+- **`verify-jws-x5c` checked certificates pair by pair, not as a path**
+  (`52fcbdd`). Constraints that span the chain -- path length, unknown critical
+  extensions, name constraints, policy constraints -- were never evaluated.
+  The chain is now validated by OpenSSL (`X509_verify_cert`) against the
+  presented root, which must still equal a pinned root byte for byte; the path
+  OpenSSL validated must be exactly the presented chain, certificate by
+  certificate; only then are Apple's marker OIDs checked. Policy processing is
+  on, with an initial policy set of anyPolicy. The strict X.509 profile is
+  deliberately not applied (whether Apple's real chain passes it has not been
+  measured), and there is no revocation checking. `verify-apple-jws`, which
+  pins Apple Root CA G3, was not shown to be forgeable before this change --
+  the reproduction used an explicitly passed test root.
+
+### Added
+
+- **OS signals as messages** (`0a86f0a`). `(signal-watch! sig [owner])`
+  opens a watch; each arrival reaches the owner as `#(signal SIG)`, sent from
+  the event loop, which wakes on the signal itself -- no flag, no polling
+  timer. `(signal-unwatch! watch)` closes it and answers `#t`, or `#f` when
+  it was already closing or closed; the owner's death closes its watches. The
+  owner defaults to the calling process. `sig` is a name or this host's
+  number for it; the message always carries the name, so `'SIGUSR1` matches
+  on every OS (USR1 is 30 on macOS and FreeBSD, 10 on Linux).
+
+  Accepted: `SIGHUP`, `SIGTERM`, `SIGUSR1`, `SIGUSR2`, `SIGWINCH`. Everything
+  else is refused, because libuv resets a signal to its default action when
+  its last watch closes, not to what it was before: `SIGPIPE` is ignored in a
+  Chez process, and after a watch and an unwatch the next write to a closed
+  pipe or socket would terminate the process; `SIGINT`, `SIGQUIT` and the
+  fault signals are caught by the Chez runtime, whose handlers would be lost.
+
+  **A message is not a count.** The kernel merges a signal that arrives
+  while one is pending, libuv's signal pipe can drop records when full, and
+  every watch gets its own message, so two watches of one signal give two
+  messages for one arrival. **Unwatch does not take back a message already
+  in the mailbox**: one can arrive after `signal-unwatch!` returns. **Do not
+  use Chez's `register-signal-handler` for a signal that is or was
+  watched**: which handler then runs is unspecified. A child started with
+  `proc-spawn!` does not inherit a watch.
+
+  **Precondition:** `signal-watch!` is refused before the actor scheduler
+  has started, when nothing could receive a message or close the watch --
+  yet the watch would still take the signal, so a watched `SIGTERM` would
+  silently stop terminating the process.
+
+  Diagnostics: `signal-watch-counts` and `signal-watch-handle`.
+  `(igropyr libuv)` gains `uv-signal-init`, `uv-signal-start` and
+  `UV-SIGNAL`; `(igropyr platform)` gains `platform-signal-numbers`.
+- **Unix-domain-socket transport** (`5dfe5d6`): `pipe-listen!` and
+  `pipe-connect!` hand over ordinary conns, so `tcp-read-start!`,
+  `tcp-write!`, `tcp-close!` and `conn-on-close!` work unchanged. A socket
+  path is limited to 103 UTF-8 bytes and may not contain NUL; either would
+  otherwise land on a different name without an error -- the OS truncates a
+  longer path, and a NUL ends the C string the path is passed as.
+  `(igropyr libuv)` gains `uv-pipe-bind`, `uv-pipe-connect` and
+  `uv-handle-get-type`.
+- `(igropyr jose)`: `jose-crit-present?`.
+- Test seams, active only in `IGROPYR_INJECT=on` builds:
+  `inject-arm-barrier!` takes an optional pid, so a barrier parks one process
+  only (`81d8b72`); `(igropyr node)` gains the injection point
+  `'link-before-dispatch` (`5079bf5`) and `$node-agent-pid` (`ea1c609`).
+
+### Fixed
+
+- **A listener under memory pressure stopped accepting, silently, for good**
+  (`7e142c7`). An allocation that raised inside the connection callback left
+  the accepted descriptor unconsumed, and libuv stopped polling the listener.
+  Each listener now keeps a pre-allocated block for its next client handle,
+  refilled after every accept; if even the fallback allocation fails, the
+  listener is closed and counted, and `listener-open?` and
+  `http-server-ready?` answer `#f` -- a reading a supervisor can act on.
+
+  A raise from the application's own accept hook no longer leaks the
+  connection it was handed: that connection is closed and the raise counted,
+  and the listener stays open.
+
+### Breaking
+
+- **`uv-accept-failure-counts` keys.** `'error` answered three different
+  questions and is gone (`50db007`). The list is now
+  `connection-callback-raised`, `listener-status-negative`, `refused`,
+  `straggler` (`5dfe5d6`), `exhausted` (`7e142c7`) and `read-start`
+  (`50db007`). *Migration:* a caller reading `'error` reads
+  `'connection-callback-raised` (our or the application's connection callback
+  raised) and `'listener-status-negative` (libuv reported a negative status to
+  the listener) separately. The six do not add up to a total, and they are
+  process-wide, not per listener.
+- **`verify-jws-x5c` requires the pinned root to be a self-signed anchor.**
+  Before, the pairwise checks accepted a chain ending in any pinned
+  certificate; OpenSSL's path validation needs the anchor to be self-signed
+  (measured: `openssl verify` without `-partial_chain`, with a non-self-signed
+  CA as the only trusted certificate, answers error 2, unable to get issuer
+  certificate). `verify-apple-jws` (Apple Root CA G3) is unaffected.
+  *Migration:* pin the self-signed root of the chain, not an intermediate.
+- A JWS header with a `crit` member is now refused (see Security).
+- **`verify-jws-x5c` reason code for unreadable validity dates**: a
+  certificate whose dates cannot be read now answers `chain-failed`
+  (OpenSSL's error), not `cert-expired` (the old loop answered `cert-expired`
+  for any failed validity comparison). A caller that maps codes to HTTP
+  statuses sees a different code for that case.
+
+### Known, not fixed in this release
+
+- `verify-jws-x5c`'s signature step checks the JWS signature over SHA-256
+  under the leaf's key, but checks neither the key's algorithm nor its curve,
+  so it is weaker than ES256 (RFC 7518 3.4 requires ECDSA on P-256): leaves on
+  secp256k1 and DSA were both measured to pass. A leaf that chains to a
+  pinned root and carries Apple's markers is still required, and forging a
+  notification still needs that leaf's private key.
+
+### Tests
+
+- `test/https-large-file.sc` (the HTTPS plaintext fix above, observed on the
+  wire through a recording relay), `test/apple-jws-path.sc` (18 generated
+  EC hierarchies), and `crit` rows in the jwt, jwks and apple-jws suites.
+- The two TLS mesh suites start their child with `SCHEME_BIN` and say so when
+  it does not start; before, FreeBSD stopped the whole-suite run at
+  `tls-mesh-pair` (`7767eed`).
+- The four superseded-link cells in `test/node.sc` are deterministic
+  (`278ce21`). Every `test/*.sc` must now be named in `run-all.sh` or excluded
+  with a reason, and the run fails otherwise (`38a2a7e`, `30bfbbb`).
+- `test/signal-watch.sc` (`0a86f0a`): delivery, refusals, owner death, every
+  rollback state of a watch's construction, a stale token against a reused
+  handle address, and the default action after the last unwatch, measured in
+  a child.
+- `test/redis-incremental.sc` asserts a size ratio instead of a millisecond
+  budget (`ccbe50b`): it times 400000 and 800000 elements in one process and
+  requires the larger to take under three times as long -- linear parsing is
+  about 2x, reparsing from byte zero about 4x. The old 250 ms budget failed a
+  correct parser on a slower FreeBSD host.
+
 ## 1.7.1 — 2026-09-12
 
 *11 commits.* The S-expression reader accepts the escapes and the numerals a

@@ -26,23 +26,25 @@ This manual covers the architecture, design patterns, and implementation details
 20. [Durable Writes](#durable-writes)
 21. [Durable Writes Without Blocking](#durable-writes-without-blocking)
 22. [Child Processes](#child-processes)
-23. [JSON and gzip](#json-and-gzip)
-24. [HTML and CSS](#html-and-css)
-25. [S-Expression RPC](#s-expression-rpc)
-26. [Distribution](#distribution)
-27. [Vector Scoring](#vector-scoring)
-28. [Embedded JavaScript](#embedded-javascript)
-29. [Cached SSR](#cached-ssr)
-30. [Object Storage and AWS](#object-storage-and-aws)
-31. [Password Hashing](#password-hashing)
-32. [Numbers from Outside the Process](#numbers-from-outside-the-process)
-33. [Running and Building](#running-and-building)
-34. [Testing](#testing)
-35. [Development Contracts](#development-contracts)
-36. [Code Style](#code-style)
-37. [Common Pitfalls](#common-pitfalls)
-38. [Appendix: Performance Tips](#appendix-performance-tips)
-39. [Further Reading](#further-reading)
+23. [OS Signals](#os-signals)
+24. [Unix-Domain Sockets](#unix-domain-sockets)
+25. [JSON and gzip](#json-and-gzip)
+26. [HTML and CSS](#html-and-css)
+27. [S-Expression RPC](#s-expression-rpc)
+28. [Distribution](#distribution)
+29. [Vector Scoring](#vector-scoring)
+30. [Embedded JavaScript](#embedded-javascript)
+31. [Cached SSR](#cached-ssr)
+32. [Object Storage and AWS](#object-storage-and-aws)
+33. [Password Hashing](#password-hashing)
+34. [Numbers from Outside the Process](#numbers-from-outside-the-process)
+35. [Running and Building](#running-and-building)
+36. [Testing](#testing)
+37. [Development Contracts](#development-contracts)
+38. [Code Style](#code-style)
+39. [Common Pitfalls](#common-pitfalls)
+40. [Appendix: Performance Tips](#appendix-performance-tips)
+41. [Further Reading](#further-reading)
 
 ---
 
@@ -1042,6 +1044,46 @@ Returns:
  (busy . 2)            ; workers processing a task
  (pending . 1))        ; queued tasks waiting for a worker
 ```
+
+#### Listener health and accept failures
+
+`(http-server-ready? srv)` answers `#t` while the listener is still registered
+under this server's incarnation and the worker pool's supervisor is alive. It
+is lifecycle state, not a promise that a request would be served — the event
+loop, the workers and the handler are not observed — so `#f` is the answer
+that settles something. At the connection layer the same question is
+`(listener-open? listener token)` from `(igropyr tcp)`.
+
+**A listener that runs out of memory stops accepting loudly (1.8.0).** Before,
+an allocation that raised inside libuv's connection callback left the accepted
+descriptor unconsumed, and libuv stopped polling that listener: the server went
+quiet for good and nothing said so. Each listener now keeps a pre-allocated
+block for its next client handle, refilled after every accept. If even the
+fallback allocation fails, the listener is closed and counted under
+`exhausted`, and `listener-open?` and `http-server-ready?` answer `#f` — a
+reading a supervisor can act on. A raise from the application's own accept
+hook closes that one connection and is counted; the listener stays open.
+
+`(uv-accept-failure-counts)` from `(igropyr tcp)` answers an alist of
+counters for what happens after the kernel hands a connection up — every one
+of those branches otherwise discards silently, so that the listener stays
+alive:
+
+| key | counts |
+|---|---|
+| `connection-callback-raised` | something inside the connection callback raised: an allocation, the library's own bookkeeping, or the application's accept hook |
+| `listener-status-negative` | libuv reported a negative status to the listener — the failure happened below the library |
+| `refused` | `uv_accept` refused an arrival |
+| `straggler` | an arrival for a listener that had already been removed |
+| `exhausted` | a listener closed by the allocation fallback above |
+| `read-start` | `uv_read_start` refused on an open connection, accepted or dialled |
+
+The counters are **process-wide**, not per listener; they **do not add up to a
+total** (one failed arrival can move two of them); they saturate rather than
+wrap; and they are not a count of kernel accept failures, because libuv does
+not surface every one. **1.8.0 removed the key `error`**, which answered
+three different questions: read `connection-callback-raised` and
+`listener-status-negative` in its place.
 
 ### Graceful Shutdown
 
@@ -3134,6 +3176,14 @@ These are deliberate and non-configurable:
   rejects the token rather than skipping the check.
 - **Every verification failure returns the same `#f`** — no reason oracle
   for an attacker to probe.
+- **A header carrying `crit` is refused, whatever it lists** (1.8.0). RFC 7515
+  §4.1.11 requires a recipient to refuse a token whose `crit` names an
+  extension it does not understand; this library implements none, so every
+  extension `crit` could name is one of those, and a malformed `crit` (empty,
+  not a list of names) is a producer error the RFC permits a recipient to
+  refuse. Header members not marked critical are still ignored. The rule is
+  shared with `(igropyr jwks)` and `(igropyr apple-jws)` through
+  `(igropyr jose)`'s `jose-crit-present?`.
 
 ### API
 
@@ -3213,10 +3263,86 @@ guard works for any future token format — JWT is only today's credential.
 
 ### Not Implemented
 
-RS256/ES256 (no RSA/EC in `(igropyr crypto)`), HS384/HS512 (no
-SHA-384/512), JWE, and multi-signature JWS JSON serialization are out of
-scope. Adding an algorithm means extending sign and verify in lockstep,
-with the verifier staying pinned to an explicit list.
+`(igropyr jwt)` is HS256 only. RS256 lives in `(igropyr jwks)`, and ES256
+*verification* of x5c-signed tokens in `(igropyr apple-jws)`, both below.
+HS384/HS512 (no SHA-384/512), JWE, and multi-signature JWS JSON
+serialization are out of scope. Adding an algorithm means extending sign and
+verify in lockstep, with the verifier staying pinned to an explicit list.
+
+### RS256 and JWKS: `(igropyr jwks)`
+
+HS256 authenticates with a shared secret, so every party that can verify can
+also mint. RS256 splits that: one service signs with a private key, and any
+other checks with the public half, published as a JWKS document.
+
+- `(jwks-load-key path)` → a key record from a PEM private key;
+  `(jwks-key-id key)` → its `kid`; `(jwks-key-free! key)` releases it.
+- `(jwks-document key)` → the JWKS JSON body to serve (for example at
+  `/.well-known/jwks.json`).
+- `(jwks-sign key claims [options])` → a compact RS256 token. `claims` has
+  **string** keys; `(expires-in . N)` stamps `iat` and `exp` as in `jwt-sign`.
+- `(jwks-verify token jwks-url [options])` → claims alist or `#f`, with the
+  same `leeway`/`iss`/`aud` options and the same fail-closed contract as
+  `jwt-verify`: every failure, whichever check refused, is the same `#f`.
+- `(jwks-fetch! url)` forces a refetch; `(jwks-cache-clear!)` drops cached
+  documents.
+
+A fetched document is cached for six hours. A token whose `kid` is not in the
+cached document may force one refetch, at most once every five seconds per
+URL, because the `kid` is attacker-controlled and each miss would otherwise
+be an outbound request. The algorithm is pinned to RS256, and `crit` is
+refused as in `(igropyr jwt)`. Not implemented here: ES256/EdDSA, encrypted
+PEM keys, and x5c chains in a JWKS.
+
+### x5c-signed JWS: `(igropyr apple-jws)`
+
+App Store Server Notifications V2 and the App Store Server API deliver signed
+data as a compact JWS whose protected header carries the certificate chain in
+`x5c` (leaf → intermediate → root). `(verify-apple-jws token)` verifies one
+against the pinned Apple Root CA G3 and answers the payload as a bytevector;
+`(verify-jws-x5c token roots)` does the same against a list of DER root
+certificates you pass (`apple-root-ca-g3-der` is the pinned one). It is
+verify-only.
+
+```scheme
+(import (igropyr apple-jws) (igropyr json))
+(let ((payload (verify-apple-jws signed-payload)))      ; bytevector
+  (string->json (utf8->string payload)))                ; -> the claims
+```
+
+Any failure raises `#(apple-jws-error code message)`, where `code` is one of
+`not-jws bad-alg crit no-x5c cert-parse-failed invalid-root chain-failed
+cert-expired sig-failed internal`, so a caller can map it to a status. In
+order, a token must pass:
+
+1. the header's `alg` is `ES256` (the header never picks the algorithm), and
+   the header has no `crit` member;
+2. `x5c` holds 3 to 8 certificates, and the presented root is byte-for-byte
+   one of the trusted roots;
+3. **OpenSSL validates the certificate path** from the leaf to that root
+   (`X509_verify_cert`), and the path it validated is exactly the presented
+   chain, certificate by certificate (1.8.0 — before, certificates were
+   checked pair by pair, so constraints spanning the chain, such as path
+   length, name constraints and policy constraints, were never evaluated).
+   Policy processing is on, with an initial policy set of anyPolicy. The
+   strict X.509 profile is not applied, and there is no revocation checking;
+4. the leaf carries Apple's App Store Server signing OID and the
+   intermediate the WWDR OID, so a certificate that merely chains to the root
+   is not accepted as the signer;
+5. the 64-byte R‖S signature verifies over SHA-256 under the leaf's key.
+
+Two behaviours changed in 1.8.0 with the path validation. **The trusted root
+must be a self-signed anchor**: OpenSSL does not accept a non-self-signed CA
+as the end of a path, so pinning an intermediate no longer works — pin the
+self-signed root of the chain. `verify-apple-jws` is unaffected. **A
+certificate whose validity dates cannot be read now answers `chain-failed`**
+(OpenSSL's error), not `cert-expired`.
+
+**Known limitation:** step 5 checks neither the leaf key's algorithm nor its
+curve, so it is weaker than ES256, which requires ECDSA on P-256; leaves on
+secp256k1 and DSA were both measured to pass it. A leaf that chains to a
+pinned root and carries Apple's markers is still required, and forging a
+token still needs that leaf's private key.
 
 ---
 
@@ -4431,6 +4557,102 @@ HTTP server's connection count is not inflated by a child's pipes.
 `write-blocks-live-count` and `write-table-size` are TCP-wide rather than
 per-child: a write block belongs to a connection, so a program with no
 children still has write blocks to account for.
+
+---
+
+## OS Signals
+
+`(igropyr tcp)` delivers an OS signal to a green process as a message (1.8.0):
+
+```scheme
+(import (igropyr tcp))
+
+(signal-watch! 'SIGTERM)            ; owned by the calling process
+(receive
+  (`#(signal SIGTERM) (drain-and-exit)))
+```
+
+- `(signal-watch! sig [owner])` → a watch, an opaque record; keep it to
+  unwatch with. `owner` defaults to the calling process. `sig` is a name or
+  this host's number for one; the message always carries the **name**, so a
+  receiver matches `'SIGUSR1` on every OS (USR1 is 30 on macOS and FreeBSD,
+  10 on Linux).
+- `(signal-unwatch! watch)` → `#t`, or `#f` when the watch was already
+  closing or closed.
+- The owner's death closes its watches, as it closes its connections.
+
+The signal is noted by libuv's own handler and delivered from the event loop,
+the same path a read callback takes, and the loop wakes for it: there is no
+flag to poll and no handler code running inside whichever process happened to
+be running.
+
+**Accepted: `SIGHUP`, `SIGTERM`, `SIGUSR1`, `SIGUSR2`, `SIGWINCH`.** Everything
+else is refused with an assertion-violation naming the list. Disposition is
+process-wide, and when the last watch of a signal closes, libuv resets that
+signal to its default action — not to what it was before the first watch. For
+these five that leaves them as a process without a watch has them. For the
+others it would not:
+
+- `SIGPIPE` is ignored in a Chez process. After a watch and an unwatch it
+  would be left at the default, and the next write to a closed pipe or socket
+  would terminate the process.
+- `SIGINT` and `SIGQUIT` are caught by the Chez runtime, and the runtime's
+  handler would be gone for the rest of the process. They stay refused until
+  there is a design that restores the previous disposition.
+- The fault signals (`SIGILL`, `SIGFPE`, `SIGBUS`, `SIGSEGV`) are the
+  runtime's too.
+
+**A message is not a count.** Each one says the signal arrived at least once.
+Arrivals can outnumber messages — the kernel merges a signal that arrives
+while one is pending, and libuv's signal pipe can drop records when it is full
+— and messages can outnumber arrivals, because every watch gets its own: an
+owner holding two watches of one signal receives two messages for one
+arrival.
+
+**Unwatch stops future messages; it does not take back one already sent.** A
+message that reached the owner's mailbox before `signal-unwatch!` returned
+stays there.
+
+**Do not use Chez's `register-signal-handler` for a signal that is, or was,
+watched.** libuv installs its handler on a signal's first watch and does not
+necessarily install it again for later ones, so which handler runs is
+unspecified.
+
+**The actor scheduler must be running.** `signal-watch!` is refused before
+`start-scheduler`: nothing could receive a message or close the watch, yet the
+watch would still take the signal — a watched `SIGTERM` would silently stop
+terminating the process.
+
+A child started with `proc-spawn!` does not inherit a watch: libuv resets the
+signal dispositions of a child it spawns. `(signal-watch-counts)` →
+`(rows . storage)` and `(signal-watch-handle watch)` are diagnostics.
+
+---
+
+## Unix-Domain Sockets
+
+`pipe-listen!` and `pipe-connect!` in `(igropyr tcp)` are the unix-domain
+counterparts of `tcp-listen!` and `tcp-connect!` (1.8.0). They hand over
+ordinary connections, so `tcp-read-start!`, `tcp-write!`, `tcp-close!` and
+`conn-on-close!` work on them unchanged.
+
+- `(pipe-listen! path backlog on-accept)` → a listener, or raises with
+  libuv's message. `on-accept` receives each connection, as with
+  `tcp-listen!`; stop it with `tcp-stop-listen!`.
+- `(pipe-connect! path owner)` dials. Like `tcp-connect!` it takes an owner,
+  not a callback: the owner receives `#(tcp-connected conn)` or
+  `#(tcp-connect-failed status)`, and every failure — including a path
+  nothing is listening on — arrives that way.
+
+A socket path is limited to **103 UTF-8 bytes** (bytes, not characters) and
+may not contain NUL. Either would otherwise land on a different name without
+an error: the OS truncates a longer path, and a NUL ends the C string the path
+is passed as. Both are refused up front.
+
+A stale socket file is **not** unlinked, and `EADDRINUSE` passes through:
+whether the previous owner is really gone is the application's decision.
+There is no mode option; a socket that must be private goes in a directory
+created `0700` before the bind, which leaves no window at the process umask.
 
 ---
 
