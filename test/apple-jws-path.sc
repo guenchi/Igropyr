@@ -65,7 +65,7 @@
                   (let loop ((acc '()))
                     (let ((l (get-line p)))
                       (if (eof-object? l) (reverse acc) (loop (cons l acc)))))))))
-  (check "setup: the manifest lists every case's files" (= (length listed) 75) (length listed))
+  (check "setup: the manifest lists every case's files" (= (length listed) 96) (length listed))
   (for-each
     (lambda (f)
       (check (string-append "setup: generated " f)
@@ -178,8 +178,11 @@
 (expect "9 valid four-certificate chain: accepted" 'accepted
         (outcome "valid4" '("leaf.der" "i1.der" "i2.der" "root.der")))
 ;; 10. presented out of order: the verified path has the same length but a
-;;     different certificate at position 1 (the unmarked one). Only a
-;;     comparison of each element, not of the lengths, refuses it.
+;;     different certificate at position 1 (the unmarked one). Of verifiers
+;;     that let OpenSSL build the path, one comparing positions, not only the
+;;     lengths, refuses it -- comparing position 1 alone would be enough; a
+;;     pairwise verifier refuses it too (leaf is not issued by i1), so this row
+;;     guards the comparison, it does not prove it compares every position.
 (expect "10 presented order differs from the verified path, same length: chain-failed" 'chain-failed
         (outcome "order" '("leaf.der" "i1.der" "i2.der" "root.der")))
 ;; 11. each Apple marker checked on its own
@@ -194,6 +197,150 @@
         (outcome "bcnoncrit" three))
 (expect "13 leaf with an extendedKeyUsage (no purpose is set): accepted" 'accepted
         (outcome "eku" three))
+;; 15. ES256 is ECDSA on P-256 (RFC 7518 3.4). A leaf whose key is on
+;;     another curve, or is not EC at all, is refused -- here the chain, the
+;;     markers and the signature are all otherwise good. Row 1 (a P-256 leaf,
+;;     accepted) is the twin; p384ca is the production-shaped twin (Apple's
+;;     root is P-384): the requirement is on the leaf, not on the chain.
+(for-each
+  (lambda (c label)
+    (let ((r (raw-outcome c three (list (root-of c)))))
+      (check (string-append "15 leaf key " label ": sig-failed naming EC P-256")
+             (and (vector? r) (eq? (vector-ref r 1) 'sig-failed)
+                  (string? (vector-ref r 2)) (contains? (vector-ref r 2) "EC P-256"))
+             r)))
+  '("k1leaf" "dsaleaf" "bpleaf" "p224leaf")
+  '("on secp256k1" "is DSA" "on brainpoolP256r1" "on P-224"))
+(expect "15 P-384 root and intermediate above a P-256 leaf: accepted" 'accepted
+        (outcome "p384ca" three))
+;;     THE KEY IS THE REASON GIVEN, EVEN WHEN THE SIGNATURE IS ALSO BAD. The
+;;     same secp256k1 token with one signature character changed (still 64
+;;     bytes) must be refused naming the key. This shows which reason wins,
+;;     not the order of the calls: a verifier that verified first, kept the
+;;     answer and then reported the key would read the same.
+(define (flip-signature tok)
+  (let* ((n (string-length tok)) (i (- n 10)))
+    (string-append (substring tok 0 i)
+                   (if (char=? (string-ref tok i) #\A) "B" "A")
+                   (substring tok (+ i 1) n))))
+(define (outcome-of-token tok root)
+  (guard (e ((and (vector? e) (eq? (vector-ref e 0) 'apple-jws-error)) e))
+    (let* ((payload-b64 (let loop ((i 0) (dots '()))
+                          (cond ((= i (string-length tok))
+                                 (let ((d (reverse dots)))
+                                   (substring tok (+ 1 (car d)) (cadr d))))
+                                ((char=? (string-ref tok i) #\.) (loop (+ i 1) (cons i dots)))
+                                (else (loop (+ i 1) dots)))))
+           (bv (verify-jws-x5c tok (list root))))
+      ;; accepted only with the payload the token carried, as raw-outcome does
+      (if (and (bytevector? bv) (string=? (b64url bv) payload-b64))
+          'accepted
+          (list 'wrong-payload bv)))))
+(let ((r (outcome-of-token (flip-signature (jws "k1leaf" three "{\"r15\":\"k1leaf\"}"))
+                           (root-of "k1leaf"))))
+  (check "15 a secp256k1 leaf with a broken signature is refused naming its key"
+         (and (vector? r) (eq? (vector-ref r 1) 'sig-failed)
+              (string? (vector-ref r 2)) (contains? (vector-ref r 2) "EC P-256"))
+         r))
+;;     and a P-256 leaf with a broken signature is refused FOR THE SIGNATURE:
+;;     the key check must not stand in for verifying it.
+(let ((r (outcome-of-token (flip-signature (jws "valid" three "{\"r15\":\"valid\"}"))
+                           (root-of "valid"))))
+  (check "15 a P-256 leaf with a broken signature is refused, and not for its key"
+         (and (vector? r) (eq? (vector-ref r 1) 'sig-failed)
+              (string? (vector-ref r 2)) (not (contains? (vector-ref r 2) "EC P-256")))
+         r))
+
+;; 16. EVERY NAMED CURVE THIS HOST'S OPENSSL LISTS, EXCEPT P-256, IS REFUSED,
+;;     in its default encoding, and so are RSA, Ed25519 and Ed448 -- the set
+;;     the generator enumerated, under one shared root and intermediate. The
+;;     P-256 twin differs from each in the leaf's key and also in subject,
+;;     serial, payload and signature, which the key check does not read.
+;;     These tokens are not signed -- a curve above 256 bits cannot fit its
+;;     signature in 64 bytes -- so the signature is 64 fixed bytes, and the
+;;     refusal must name the key: a refusal for the signature would read
+;;     "does not verify" instead.
+;;
+;;     WHAT THIS DELIBERATELY DOES NOT COVER, so "is there a wrong criterion
+;;     that still passes" has a written answer:
+;;     - a group with no name (explicit parameters). A criterion admitting NID
+;;       0 would pass. Not built: on OpenSSL 3.6.3 an explicit-parameter
+;;       P-256 decodes back to NID 415 (review, 2026-09-27), so the only NID-0
+;;       key is a custom curve, which a real notification leaf is not.
+;;     - a P-256 point in a non-default encoding (compressed). A criterion
+;;       that also demanded the default encoding would wrongly refuse it and
+;;       still pass here. Apple's leaves are named P-256 in the default form.
+;;     - any key type or size outside the enumeration. The non-EC types are
+;;       one size each (RSA 2048, Ed25519, Ed448), so "P-256, or RSA of 3072
+;;       bits and more" would pass. No finite set of refused keys can stop a
+;;       criterion of the form "P-256, or something not in the set"; this is
+;;       the boundary of the enumeration, stated rather than extended. Within
+;;       it, the only criterion that passes every row is EC on P-256.
+(define (read-lines f)
+  (if (file-exists? f)
+      (call-with-input-file f
+        (lambda (p)
+          (let loop ((acc '()))
+            (let ((l (get-line p)))
+              (if (eof-object? l) (reverse acc) (loop (cons l acc)))))))
+      '()))
+(define (curves-token leaf)
+  (let* ((x5c (map (lambda (f) (string-append "\"" (base64-encode (read-file (in-dir (string-append "curves/" f)))) "\""))
+                   (list (string-append leaf ".der") "i1.der" "root.der")))
+         (header (string-append "{\"alg\":\"ES256\",\"x5c\":["
+                                (fold-left (lambda (acc s) (if (string=? acc "") s (string-append acc "," s))) "" x5c)
+                                "]}")))
+    (string-append (b64url (string->utf8 header)) "."
+                   (b64url (string->utf8 "{\"r16\":1}")) "."
+                   (b64url (make-bytevector 64 7)))))
+(let ((made (read-lines (in-dir "curves/made")))
+      (refused (read-lines (in-dir "curves/refused-by-openssl")))
+      (root (read-file (in-dir "curves/root.der"))))
+  (check "16 setup: the generator made at least ten non-P-256 leaves" (>= (length made) 10) (length made))
+  ;; ACCOUNTED FOR, NOT ONLY COUNTED: every listed curve other than P-256,
+  ;; plus the three non-EC types, is either made or refused by openssl with
+  ;; its reason, and the curves the earlier rows name are among the made.
+  (let ((listed (read-lines (in-dir "curves/listed"))))
+    (check "16 setup: made + refused-by-openssl = listed curves - P-256 + 3 non-EC types"
+           (= (+ (length made) (length refused))
+              (+ (- (length listed) (if (member "prime256v1" listed) 1 0)) 3))
+           (length made) (length refused) (length listed))
+    (for-each
+      (lambda (c)
+        (check (string-append "16 setup: " c " is among the leaves made") (member c made)))
+      '("secp384r1" "secp521r1" "secp256k1" "brainpoolP256r1" "rsa2048" "ed25519")))
+  (display "  [info] ") (display (length made)) (display " non-P-256 leaves made; openssl could not make ")
+  (display (length refused)) (display "\n")
+  (for-each (lambda (l) (display "  [info]   ") (display l) (newline)) refused)
+  ;; the twin, same root and intermediate, a real signature
+  (let ((r (outcome-of-token (jws "curves" three "{\"r15\":\"curves\"}") root)))
+    (check "16 twin: the P-256 leaf in this hierarchy is accepted" (eq? r 'accepted) r))
+  (let ((wrong
+          (fold-left
+            (lambda (acc leaf)
+              (let ((r (outcome-of-token (curves-token leaf) root)))
+                (if (and (vector? r) (eq? (vector-ref r 1) 'sig-failed)
+                         (string? (vector-ref r 2)) (contains? (vector-ref r 2) "EC P-256"))
+                    acc
+                    (cons (list leaf (if (vector? r) (vector-ref r 2) r)) acc))))
+            '() made)))
+    (check (string-append "16 every one of the " (number->string (length made))
+                          " non-P-256 leaves is refused naming EC P-256")
+           (null? wrong) (length wrong) (if (pair? wrong) (reverse wrong) '()))))
+
+;;     a P-384 leaf under a P-384 intermediate: refused. The requirement is
+;;     P-256, not "the leaf's curve matches its issuer's".
+(let* ((x5c (map (lambda (f) (string-append "\"" (base64-encode (read-file (in-dir (string-append "p384ca/" f)))) "\""))
+                 '("leaf384.der" "i1.der" "root.der")))
+       (tok (string-append (b64url (string->utf8 (string-append "{\"alg\":\"ES256\",\"x5c\":["
+                                                                (car x5c) "," (cadr x5c) "," (caddr x5c) "]}")))
+                           "." (b64url (string->utf8 "{\"r16\":2}")) "." (b64url (make-bytevector 64 7))))
+       (r (outcome-of-token tok (root-of "p384ca"))))
+  (check "16 a P-384 leaf under a P-384 intermediate is refused naming EC P-256"
+         (and (vector? r) (eq? (vector-ref r 1) 'sig-failed)
+              (string? (vector-ref r 2)) (contains? (vector-ref r 2) "EC P-256"))
+         r))
+
 ;; 14. the refusal carries OpenSSL's reason, not only the code
 (let ((r (raw-outcome "pathlen" '("leaf.der" "i1.der" "i2.der" "root.der") (list (root-of "pathlen")))))
   (check "14 chain-failed message names OpenSSL's reason (path length)"

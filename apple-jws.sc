@@ -42,9 +42,10 @@
 ;;;      (1.2.840.113635.100.6.11.1) and the intermediate the WWDR OID
 ;;;      (1.2.840.113635.100.6.2.1) -- so a cert that merely chains to the
 ;;;      pinned root but is not the notification signer is rejected
-;;;   5. the JWS signature, 64 bytes of R||S, verifies over SHA-256 under
-;;;      the leaf's public key. The key's algorithm and curve are NOT checked,
-;;;      so this is weaker than ES256, which requires ECDSA on P-256.
+;;;   5. the leaf's public key is an EC key on P-256, the only key ES256
+;;;      (RFC 7518 3.4) is defined for, and the JWS signature, 64 bytes of
+;;;      R||S, verifies over SHA-256 under it. A leaf with any other key is
+;;;      refused as sig-failed before the signature is verified.
 ;;;
 ;;; WHAT STEP 3 PROMISES, AND WHAT IT DOES NOT. It is OpenSSL's path
 ;;; validation to a pinned anchor, under the default profile, with policy
@@ -124,6 +125,30 @@
     (foreign-procedure "EVP_DigestUpdate" (void* u8* size_t) int))
   (define EVP_DigestVerifyFinal
     (foreign-procedure "EVP_DigestVerifyFinal" (void* u8* size_t) int))
+  ;; THE KEY-TYPE CHECK USES TWO DEPRECATED FUNCTIONS, ON PURPOSE.
+  ;; EVP_PKEY_get0_EC_KEY and EC_KEY_get0_group are deprecated in OpenSSL
+  ;; 3.0; EC_GROUP_get_curve_name is not. All three predate 3.0 -- FreeBSD's
+  ;; 3.5.4 exports each under the version tag OPENSSL_1_1_0 -- while the
+  ;; replacements (EVP_PKEY_get_group_name and friends) exist in 3.x only;
+  ;; the same trade (igropyr jwks) makes with RSA_get0_key. Read as
+  ;; exported, with nm, from 3.6.3 and from that 3.5.4.
+  ;;
+  ;; Every get0 here is BORROWED: the pkey owns what it answers, and
+  ;; nothing obtained through one is freed on its own. For a key a 3.x
+  ;; provider manages, EVP_PKEY_get0_EC_KEY answers a cached legacy copy;
+  ;; a provider that cannot produce one answers NULL, and such a key is
+  ;; refused like any other that is not EC P-256.
+  ;;
+  ;; EVP_PKEY_get0_EC_KEY answers NULL for a key that is not EC, so the one
+  ;; chain below settles the key's algorithm and its curve together.
+  (define EVP_PKEY_get0_EC_KEY
+    (foreign-procedure "EVP_PKEY_get0_EC_KEY" (void*) void*))
+  (define EC_KEY_get0_group
+    (foreign-procedure "EC_KEY_get0_group" (void*) void*))
+  (define EC_GROUP_get_curve_name
+    (foreign-procedure "EC_GROUP_get_curve_name" (void*) int))
+  ;; from obj_mac.h
+  (define NID_X9_62_prime256v1 415)
   (define OBJ_txt2obj (foreign-procedure "OBJ_txt2obj" (string int) void*))
   (define ASN1_OBJECT_free (foreign-procedure "ASN1_OBJECT_free" (void*) void))
   (define X509_get_ext_by_OBJ
@@ -189,9 +214,29 @@
 
   ;; ---- ES256 verify (leaf pubkey over the signing input) ---------------
 
+  ;; -> #t when pk is an EC key on P-256. Every pointer here is borrowed
+  ;; from pk, and none is freed.
+  (define (es256-key? pk)
+    (let ((ec (EVP_PKEY_get0_EC_KEY pk)))
+      (and (not (zero? ec))
+           (let ((group (EC_KEY_get0_group ec)))
+             (and (not (zero? group))
+                  (fx= (EC_GROUP_get_curve_name group)
+                       NID_X9_62_prime256v1))))))
+
   (define (es256-verify cert signing-input der-sig)
     (let ((pk (X509_get_pubkey cert)))
       (when (zero? pk) (ajws-fail 'sig-failed "leaf certificate has no public key"))
+      ;; THE KEY IS CHECKED BEFORE THE DIGEST IS VERIFIED, so a well-formed
+      ;; signature over a leaf with the wrong kind of key is refused for the
+      ;; key, whether or not it would verify. (The caller has already decoded
+      ;; the signature: one that does not decode, or does not decode to 64
+      ;; bytes, is refused for that first.) The refusal releases pk first, as
+      ;; the paths after it do.
+      (unless (guard (e (#t (EVP_PKEY_free pk) (raise e)))
+                (es256-key? pk))
+        (EVP_PKEY_free pk)
+        (ajws-fail 'sig-failed "leaf key is not EC P-256, which ES256 requires"))
       (let ((ctx (EVP_MD_CTX_new)))
         (when (zero? ctx) (EVP_PKEY_free pk) (ajws-fail 'internal "EVP_MD_CTX_new failed"))
         (let ((ok (guard (e (#t (EVP_MD_CTX_free ctx) (EVP_PKEY_free pk) (raise e)))
