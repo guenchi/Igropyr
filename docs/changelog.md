@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.8.1 — 2026-09-27
+
+*1 commit.* x5c-signed JWS verification now requires the leaf's key to be
+EC on P-256, as ES256 is defined.
+
+### Security
+
+- **`verify-jws-x5c` accepted leaf keys that ES256 does not allow**
+  (`d52e625`). The JWS signature was checked over SHA-256 under the leaf's
+  public key without checking the key's algorithm or curve, so a leaf on
+  secp256k1, brainpoolP256r1 or P-224, or a DSA leaf, passed, where ES256
+  (RFC 7518 3.4) is ECDSA on P-256 only. **Present in 1.8.0 and earlier.**
+  Such a token still had to chain to a pinned root, carry Apple's markers,
+  and be signed with that leaf's private key.
+
+  Before the digest is verified, the leaf's key must now be an EC key on
+  P-256; anything else is refused as `sig-failed`, with the message "leaf key
+  is not EC P-256, which ES256 requires". The requirement is on the leaf
+  only: a P-384 root and intermediate above a P-256 leaf are accepted, as
+  Apple's own root is P-384. `verify-apple-jws` goes through the same check.
+
 ## 1.8.0 — 2026-09-26
 
 *33 commits.* HTTPS no longer sends large static files in plaintext; JWS

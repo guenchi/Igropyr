@@ -3312,8 +3312,9 @@ verify-only.
 
 Any failure raises `#(apple-jws-error code message)`, where `code` is one of
 `not-jws bad-alg crit no-x5c cert-parse-failed invalid-root chain-failed
-cert-expired sig-failed internal`, so a caller can map it to a status. In
-order, a token must pass:
+cert-expired sig-failed internal`, so a caller can map it to a status.
+`sig-failed` covers both a signature that does not verify and, since 1.8.1,
+a leaf whose key is not EC on P-256. In order, a token must pass:
 
 1. the header's `alg` is `ES256` (the header never picks the algorithm), and
    the header has no `crit` member;
@@ -3329,7 +3330,12 @@ order, a token must pass:
 4. the leaf carries Apple's App Store Server signing OID and the
    intermediate the WWDR OID, so a certificate that merely chains to the root
    is not accepted as the signer;
-5. the 64-byte R‖S signature verifies over SHA-256 under the leaf's key.
+5. the leaf's key is an EC key on P-256 — the only key ES256 is defined for
+   (RFC 7518 §3.4) — and the 64-byte R‖S signature verifies over SHA-256
+   under it (1.8.1). Any other key is refused as `sig-failed`, with the
+   message "leaf key is not EC P-256, which ES256 requires", before the
+   digest is verified. The requirement is on the leaf only: a P-384 root and
+   intermediate are accepted, as Apple's own root is P-384.
 
 Two behaviours changed in 1.8.0 with the path validation. **The trusted root
 must be a self-signed anchor**: OpenSSL does not accept a non-self-signed CA
@@ -3338,11 +3344,10 @@ self-signed root of the chain. `verify-apple-jws` is unaffected. **A
 certificate whose validity dates cannot be read now answers `chain-failed`**
 (OpenSSL's error), not `cert-expired`.
 
-**Known limitation:** step 5 checks neither the leaf key's algorithm nor its
-curve, so it is weaker than ES256, which requires ECDSA on P-256; leaves on
-secp256k1 and DSA were both measured to pass it. A leaf that chains to a
-pinned root and carries Apple's markers is still required, and forging a
-token still needs that leaf's private key.
+**Before 1.8.1**, step 5 checked neither the leaf key's algorithm nor its
+curve, so leaves on secp256k1, brainpoolP256r1 or P-224, and DSA leaves,
+passed it. Such a token still had to chain to a pinned root, carry Apple's
+markers, and be signed with that leaf's private key.
 
 ---
 
