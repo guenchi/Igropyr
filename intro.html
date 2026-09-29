@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Igropyr Intro</title>
+<style>
+:root{
+  --bg:#ffffff;--bg2:#f6f8fa;--panel:#ffffff;--line:#e2e7ee;--fg:#1f2430;--dim:#57606a;--com:#6e7781;
+  --acc:#e8590c;--acc2:#0969da;--kw:#8250df;--str:#0a7227;--num:#953800;--warn:#9a6700;--red:#cf222e;
+  --okbg:#e6f4ea;--okbd:#a6d8b4;--redbg:#ffebe9;--redbd:#f5b5b0;--accbg:#fff1e8;--bluebg:#ddf0ff;
+  --sans:"Avenir Next","SF Pro Display",-apple-system,"Helvetica Neue",Arial,sans-serif;
+  --mono:"SF Mono",ui-monospace,Menlo,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--bg);height:100%;overflow:hidden}
+#wrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+#stage{position:relative;width:1920px;height:1080px;overflow:hidden;background:var(--bg);font-family:var(--sans);color:var(--fg);transform-origin:center center;flex:none;cursor:pointer}
+.abs{position:absolute;left:0;top:0;will-change:transform,opacity}
+.scene{position:absolute;inset:0;opacity:0}
+.tag{position:absolute;left:120px;top:78px;font:600 22px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--acc)}
+.title{position:absolute;left:120px;top:112px;font:700 62px/1.1 var(--sans);letter-spacing:-.01em}
+.win{background:var(--panel);border:2px solid var(--line);border-radius:18px;box-shadow:0 12px 40px rgba(31,36,48,.10);overflow:hidden}
+.win .hd{position:relative;z-index:1;height:48px;border-bottom:2px solid var(--line);display:flex;align-items:center;gap:9px;padding:0 18px;font:600 20px var(--mono);color:var(--dim);background:var(--bg2)}
+.win .hd .d{width:12px;height:12px;border-radius:50%;background:var(--line)}
+.win .in{padding:16px 20px}
+.chip{display:inline-block;padding:10px 18px;border-radius:12px;font:600 23px var(--mono);white-space:nowrap}
+.toast{padding:12px 22px;border-radius:14px;font:700 25px var(--sans);white-space:nowrap;box-shadow:0 8px 24px rgba(0,0,0,.10)}
+.ok{background:var(--okbg);color:var(--str);border:2px solid var(--okbd)}
+.bad{background:var(--redbg);color:var(--red);border:2px solid var(--redbd)}
+.warn{background:#fff8c5;color:var(--warn);border:2px solid #eed888}
+.term{background:#1f2430;border-radius:18px;box-shadow:0 16px 50px rgba(0,0,0,.22);color:#e6edf3;font:500 25px/1.75 var(--mono);padding:24px 30px;overflow:hidden}
+.term .k{color:#ffa657}.term .s{color:#a5d6ff}.term .c{color:#8b949e}.term .f{color:#d2a8ff}
+.lbl{font:700 17px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+.wk{position:absolute;width:96px;height:96px;border-radius:50%;border:4px solid var(--acc);background:#fff;display:flex;align-items:center;justify-content:center;font:700 38px var(--mono);color:var(--acc);box-shadow:0 6px 18px rgba(232,89,12,.15)}
+.dot{position:absolute;left:0;top:0;width:22px;height:22px;border-radius:50%;background:var(--acc);box-shadow:0 2px 8px rgba(0,0,0,.18);opacity:0}
+.burst{position:absolute;width:140px;height:140px;border-radius:50%;border:6px solid var(--red);opacity:0}
+.stamp{position:absolute;left:0;width:1920px;text-align:center;font:800 42px var(--sans);letter-spacing:-.005em}
+svg.full{position:absolute;left:0;top:0;width:1920px;height:1080px;overflow:visible}
+#ctl{position:fixed;left:0;right:0;bottom:0;display:flex;align-items:center;gap:10px;padding:12px 14px 10px;z-index:9;background:linear-gradient(rgba(31,36,48,0),rgba(31,36,48,.28));background-size:100% 0;background-repeat:no-repeat;background-position:bottom;transition:background-size .25s}
+body:hover #ctl,body.paused #ctl{background-size:100% 100%}
+#ctl button{flex:none;width:34px;height:34px;border:0;border-radius:50%;background:#fff;color:#1f2430;font:700 14px/34px var(--sans);cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.2);opacity:0;transition:opacity .25s}
+body:hover #ctl button,body.paused #ctl button,#ctl button:focus-visible{opacity:1}
+#segs{flex:1;display:flex;gap:3px;height:14px;align-items:center;cursor:pointer}
+.seg{position:relative;height:4px;border-radius:2px;background:rgba(31,36,48,.14);overflow:hidden;transition:height .15s}
+#segs:hover .seg{height:8px}
+.seg i{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--acc)}
+</style>
+</head>
+<body>
+<div id="wrap"><div id="stage"></div></div>
+<div id="ctl"><button id="pp" aria-label="Pause">❚❚</button><div id="segs" role="slider" aria-label="Chapters"></div><button id="rs" aria-label="Restart">↺</button></div>
+<script>
+// ---------------------------------------------------------------------------
+// Deterministic renderer: every frame is a pure function of t (seconds).
+// window.seek(t) draws the frame at t; the player below only advances t.
+// Embed with <iframe src="igropyr-intro.html" style="aspect-ratio:16/9;width:100%;border:0">.
+// URL parameter ?t=<seconds> starts at that time.
+// ---------------------------------------------------------------------------
+const clamp=(x,a=0,b=1)=>Math.max(a,Math.min(b,x));
+const io=x=>x<.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2;
+const eo=x=>1-Math.pow(1-x,3);
+const bk=x=>{const c1=1.70158,c3=c1+1;return 1+c3*Math.pow(x-1,3)+c1*Math.pow(x-1,2)};
+const P=(t,a,b,f=io)=>f(clamp((t-a)/(b-a)));
+const L=(a,b,p)=>a+(b-a)*p;
+const stage=document.getElementById('stage');
+function el(html,parent){const d=document.createElement('div');d.innerHTML=html.trim();const n=d.firstChild;(parent||stage).appendChild(n);return n}
+function S(n,{o,x=0,y=0,s=1,r=0,sx,sy}={}){
+  if(o!==undefined)n.style.opacity=o;
+  n.style.transform=`translate(${x}px,${y}px) scale(${sx??s},${sy??s}) rotate(${r}deg)`;
+}
+const pop=(t,a,d=.45)=>{const p=clamp((t-a)/d);return{o:clamp(p*2.5),s:p<=0?.6:L(.6,1,bk(p))}};
+// visible from a to b with a short fade at both ends
+const win=(t,a,b,f=.25)=>P(t,a,a+f)*(1-P(t,b-f,b));
+const typed=(str,t,a,cps=28)=>str.slice(0,Math.max(0,Math.floor((t-a)*cps)));
+function along(pts,p){const n=pts.length-1;const f=clamp(p)*n;const i=Math.min(n-1,Math.floor(f));const q=f-i;return[L(pts[i][0],pts[i+1][0],q),L(pts[i][1],pts[i+1][1],q)]}
+// a request dot travelling pts from time a for d seconds; hidden outside that window
+function runDot(e,t,a,d,pts,color){
+  const p=(t-a)/d;
+  if(p<0||p>1){e.style.opacity=0;return}
+  const [x,y]=along(pts,io(p));S(e,{o:1,x:x-11,y:y-11});
+  if(color)e.style.background=color;
+}
+function burst(e,t,a,cx,cy){const p=clamp((t-a)/.55);S(e,{o:p>0&&p<1?1-p:0,x:cx-70,y:cy-70,s:L(.4,1.8,eo(p))})}
+const winHTML=(title,w,h,inner='')=>`<div class="abs win" style="width:${w}px;height:${h}px"><div class="hd"><span class="d"></span><span class="d"></span><span class="d"></span><span style="margin-left:8px">${title}</span></div><div class="in">${inner}</div></div>`;
+const LOGO=(size)=>`<svg width="${size}" height="${size}" viewBox="0 0 64 64"><defs><linearGradient id="fl${size}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffa129"/><stop offset=".55" stop-color="#f2691a"/><stop offset="1" stop-color="#d63f0a"/></linearGradient></defs><g transform="translate(32 32) scale(1.14) translate(-32 -32)"><path d="M59 32 L45.5 55.38 L18.5 55.38 L5 32 L18.5 8.62 L45.5 8.62 Z" fill="url(#fl${size})" stroke="#c0380a" stroke-width="2" stroke-linejoin="round"/><g fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"><path d="M28 22 L42 45"/><path d="M34.8 33.2 L22 45"/><path d="M28 22 L24.8 20.3"/></g></g></svg>`;
+const HEX=(name,c='var(--acc)')=>`<div class="abs" style="width:150px;height:130px"><svg width="150" height="130" viewBox="0 0 150 130" style="position:absolute;inset:0"><path class="hx" d="M146 65 L111 127 L39 127 L4 65 L39 3 L111 3 Z" fill="#fff" stroke="${c}" stroke-width="5" stroke-linejoin="round"/></svg><div class="nm" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:700 24px var(--mono);color:var(--fg)">${name}</div></div>`;
+// a stuck-worker spinner: an arc that turns with t
+const ARC=`<svg class="abs" width="130" height="130" viewBox="0 0 130 130"><circle cx="65" cy="65" r="58" fill="none" stroke="var(--red)" stroke-width="7" stroke-linecap="round" stroke-dasharray="120 400"/></svg>`;
+
+const scenes=[];
+function scene(o){scenes.push(o)}
+const FADE=.45;
+const CHAPTERS=['Let It Crash','Hot code swapping','Faults speak a protocol','Conversations are continuations','Communicate in S-expressions','Write once, run distributed'];
+
+// ============================== INTRO ======================================
+scene({dur:4.5,build(r){
+  this.logo=el(`<div class="abs" style="width:1920px;display:flex;justify-content:center">${LOGO(170)}</div>`,r);
+  this.name=el(`<div class="abs" style="width:1920px;text-align:center;font:800 118px/1 var(--sans);letter-spacing:-.015em">Igropyr</div>`,r);
+  this.tag=el(`<div class="abs" style="width:1920px;text-align:center;font:600 38px var(--sans);color:var(--dim)">A distributed backend framework in <span style="color:var(--acc)">pure Chez Scheme</span></div>`,r);
+},update(t){
+  const lp=pop(t,.15,.6);S(this.logo,{o:lp.o,s:lp.s,y:250});
+  S(this.name,{o:P(t,.5,1),y:L(470,450,P(t,.5,1.1,eo))});
+  S(this.tag,{o:P(t,.9,1.4),y:625});
+}});
+
+// ============================== 01 LET IT CRASH ============================
+scene({tag:'Fault tolerance',title:'Let It Crash',dur:13.5,build(r){
+  this.cl=el(winHTML('client',300,180,`<div class="st" style="font:700 25px var(--mono);line-height:1.5"></div>`),r);
+  this.st=this.cl.querySelector('.st');
+  this.CX=[300,460,620,780];this.CY=560;
+  this.lines=el(`<svg class="full"><g stroke="#d0d7de" stroke-width="4">${this.CX.map(x=>`<line x1="540" y1="330" x2="${x}" y2="${this.CY-48}"/>`).join('')}</g></svg>`,r);
+  this.sup=el(`<div class="abs" style="width:260px;height:80px;border-radius:18px;background:var(--fg);color:#fff;display:flex;align-items:center;justify-content:center;font:700 28px var(--mono)">supervisor</div>`,r);
+  this.w=this.CX.map((x,i)=>el(`<div class="wk">λ</div>`,r));
+  // replacements for the worker that crashes (1) and the one that hangs (2)
+  this.w1n=el(`<div class="wk" style="border-color:var(--str);color:var(--str)">λ</div>`,r);
+  this.w2n=el(`<div class="wk" style="border-color:var(--str);color:var(--str)">λ</div>`,r);
+  this.b1=el(`<div class="burst"></div>`,r);this.b2=el(`<div class="burst"></div>`,r);
+  this.arc=el(ARC,r);
+  this.timer=el(`<div class="abs" style="width:200px;text-align:center;font:700 26px var(--mono);color:var(--red)"></div>`,r);
+  this.crash=el(`<div class="abs chip" style="background:#1f2430;color:#ffa657">(raise 'handler-crashed)</div>`,r);
+  this.retry=el(`<div class="abs toast ok">fresh worker · retry 1 of 3</div>`,r);
+  this.tick=el(`<div class="abs toast bad">stuck &gt; 30 s → killed, replaced</div>`,r);
+  this.keep=el(`<div class="abs toast" style="background:var(--bluebg);color:var(--acc2);border:2px solid #9ecbff">preemptive — the others keep serving</div>`,r);
+  this.dots=Array.from({length:24},()=>el(`<div class="dot"></div>`,r));
+  // slow-drip lane
+  this.slow=el(winHTML('slow client',330,110,`<div style="font:600 21px var(--mono);color:var(--dim)">sending… 1 byte / s</div>`),r);
+  this.rd=el(`<div class="abs" style="width:74px;height:74px;border-radius:50%;border:4px dashed var(--dim);display:flex;align-items:center;justify-content:center;font:700 16px var(--mono);color:var(--dim)">reader</div>`,r);
+  this.drip=Array.from({length:4},()=>el(`<div class="dot" style="width:12px;height:12px;background:var(--dim)"></div>`,r));
+  this.reap=el(`<div class="abs chip" style="background:var(--bg2);color:var(--dim)">reaped by timeout · nobody else noticed</div>`,r);
+  this.stamp=el(`<div class="stamp">Write the happy path. <span style="color:var(--acc)">The supervisor owns the sad one.</span></div>`,r);
+},update(t){
+  const C=[1400,520],sup=[540,330],W=i=>[this.CX[i],this.CY];
+  S(this.cl,{o:P(t,0,.4),x:1400,y:430});
+  S(this.sup,{o:P(t,.1,.5),x:410,y:250,s:1+.07*(Math.max(0,1-Math.abs(t-2.6)*5)+Math.max(0,1-Math.abs(t-8.3)*5))});
+  this.lines.style.opacity=P(t,.2,.6);
+  const wp=(e,i,o,sh=0,bg='#fff')=>{S(e,{o,x:this.CX[i]-48+sh,y:this.CY-48});e.style.background=bg};
+  // worker 1 crashes at 2.2 and is replaced at 2.8; worker 2 hangs 5.7-8.0
+  const shake=(a,b)=>t>a&&t<b?Math.sin(t*70)*6:0;
+  this.w.forEach((e,i)=>{
+    let o=P(t,.3+i*.1,.6+i*.1),bg='#fff',sh=0;
+    if(i==1){o*=1-P(t,2.25,2.5);sh=shake(1.9,2.25);if(t>1.9&&t<2.5)bg='var(--redbg)'}
+    if(i==2){o*=1-P(t,8,8.25);if(t>5.7&&t<8.25)bg='var(--redbg)';sh=shake(7.8,8)}
+    wp(e,i,o,sh,bg);
+  });
+  const p1=pop(t,2.8),p2=pop(t,8.5);
+  S(this.w1n,{o:p1.o,s:p1.s,x:this.CX[1]-48,y:this.CY-48});
+  S(this.w2n,{o:p2.o,s:p2.s,x:this.CX[2]-48,y:this.CY-48});
+  burst(this.b1,t,2.25,...W(1));burst(this.b2,t,8,...W(2));
+  S(this.arc,{o:t>5.7&&t<8?1:0,x:this.CX[2]-65,y:this.CY-65,r:(t-5.7)*300});
+  const secs=Math.min(30,Math.floor(P(t,5.8,7.8,x=>x)*30));
+  S(this.timer,{o:win(t,5.8,8.1),x:this.CX[2]-100,y:this.CY+80});this.timer.textContent=`stuck ${secs} s`;
+  S(this.crash,{o:win(t,2.1,3.5),x:this.CX[1]-150,y:this.CY+84});
+  S(this.retry,{...pop(t,3),x:this.CX[1]-60,y:this.CY+150});this.retry.style.opacity=pop(t,3).o*(1-P(t,4.8,5.1));
+  S(this.tick,{...pop(t,8),x:700,y:250});this.tick.style.opacity=pop(t,8).o*(1-P(t,9.6,9.9));
+  S(this.keep,{...pop(t,6.3),x:250,y:720});this.keep.style.opacity=pop(t,6.3).o*(1-P(t,9.6,9.9));
+  // requests: [start, worker, returns?]
+  const out=.7,back=.7,G='var(--str)';
+  const R=[[.6,0,1],[1.2,1,0],[2,3,1],[3,0,1],[5,2,0],[5.6,0,1],[6.2,3,1],[6.8,1,1],[7.4,0,1],[8.8,3,1],[9.1,2,1]];
+  let k=0;
+  R.forEach(([a,i,ret])=>{
+    const tgt=i==1&&a>2.8?W(1):W(i);
+    runDot(this.dots[k++],t,a,out,[C,tgt],'var(--acc)');
+    runDot(this.dots[k++],t,ret?a+out+.25:-99,back,[tgt,C],G);
+  });
+  // the crashed request is retried from the supervisor on the fresh worker
+  runDot(this.dots[22],t,2.9,.5,[sup,W(1)],'var(--acc)');
+  runDot(this.dots[23],t,3.65,back,[W(1),C],G);
+  this.st.innerHTML=t<4.3?`<span style="color:var(--dim)">GET /order</span><br>waiting…`:`<span style="color:var(--str)">200 OK ✓</span><br><span style="font-size:19px;color:var(--dim)">never saw the crash</span>`;
+  // slow drip
+  const sl=P(t,9.4,9.8);
+  S(this.slow,{o:sl,x:1400,y:740});
+  S(this.rd,{o:sl*(1-P(t,11.4,11.8)),x:1200,y:758,s:1-P(t,11.4,11.8)*.3});
+  this.drip.forEach((d,i)=>{const a=9.8+i*.4;const p=(t-a)/.7;if(p<0||p>1){d.style.opacity=0;return}S(d,{o:1,x:L(1390,1280,p),y:790})});
+  S(this.reap,{...pop(t,11.5),x:1170-this.reap.offsetWidth,y:772});this.reap.style.opacity=pop(t,11.5).o;
+  S(this.stamp,{o:P(t,11.9,12.4),y:920});
+}});
+
+// ============================== 02 HOT CODE SWAPPING =======================
+scene({tag:'Live systems',title:'Hot code swapping',dur:11,build(r){
+  this.cl=el(winHTML('client',300,300,`<div class="lbl" style="font-size:15px">responses</div><div class="rs" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px"></div>`),r);
+  this.rs=this.cl.querySelector('.rs');
+  this.srv=el(`<div class="abs" style="width:1180px;height:520px;border:3px solid var(--fg);border-radius:24px;background:var(--bg2)"><div class="lbl" style="position:absolute;left:24px;top:18px;font-size:18px;color:var(--fg)">live server · pid 4127</div></div>`,r);
+  this.lis=el(`<div class="abs" style="width:190px;height:120px;border-radius:16px;background:#fff;border:3px solid var(--acc2);display:flex;flex-direction:column;align-items:center;justify-content:center;font:700 22px var(--mono);color:var(--acc2)"><div>TCP listener</div><div style="font-size:20px;color:var(--dim)">:8080</div></div>`,r);
+  this.PW=[[810,470],[910,470],[810,570],[910,570]];
+  this.pw=this.PW.map(()=>el(`<div class="wk" style="width:78px;height:78px;font-size:30px">λ</div>`,r));
+  this.pl=el(`<div class="abs lbl" style="width:220px;text-align:center">worker pool</div>`,r);
+  this.reg=el(`<div class="abs" style="width:470px;border-radius:16px;background:#fff;border:3px solid var(--line);overflow:hidden"><div class="lbl" style="padding:14px 20px;background:var(--bg2);border-bottom:2px solid var(--line)">route registry</div>${[['/version','"v1"'],['/users','handler'],['/health','handler']].map(([a,b],i)=>`<div class="row r${i}" style="display:flex;gap:20px;padding:14px 20px;font:600 24px var(--mono);border-bottom:2px solid var(--line)"><span style="width:150px">${a}</span><span>→</span><span class="v">${b}</span></div>`).join('')}</div>`,r);
+  this.r0=this.reg.querySelector('.r0');this.v0=this.r0.querySelector('.v');
+  this.card=el(`<div class="abs chip" style="background:#1f2430;color:#e6edf3;font-size:22px;box-shadow:0 10px 30px rgba(0,0,0,.25)">(app-get app <span style="color:#a5d6ff">"/version"</span> … <span style="color:#a5d6ff">"v2"</span>)</div>`,r);
+  this.atom=el(`<div class="abs toast ok">atomic · takes effect on the next request</div>`,r);
+  this.stats=el(`<div class="abs" style="display:flex;gap:18px;font:600 22px var(--mono)"></div>`,r);
+  this.swap=el(`<div class="abs chip" style="background:#fff;border:2px solid var(--line);color:var(--dim)"><b style="color:var(--fg)">http-swap!</b> replaces the whole handler — same guarantee</div>`,r);
+  this.dots=Array.from({length:36},()=>el(`<div class="dot"></div>`,r));
+  this.stamp=el(`<div class="stamp">Zero downtime isn't a project. <span style="color:var(--acc)">It's the default.</span></div>`,r);
+},update(t){
+  const TS=4.6,C=[1420,560],LI=[1145,560];
+  S(this.cl,{o:P(t,0,.4),x:1420,y:410});
+  S(this.srv,{o:P(t,.1,.5),x:150,y:290});
+  S(this.lis,{o:P(t,.3,.6),x:1100,y:500});
+  this.pw.forEach((e,i)=>{S(e,{o:P(t,.4+i*.08,.7+i*.08),x:this.PW[i][0]-39+30,y:this.PW[i][1]-39+10});e.style.background='#fff'});
+  S(this.pl,{o:P(t,.5,.8),x:785,y:680});
+  S(this.reg,{o:P(t,.5,.9),x:200,y:350});
+  const cp=P(t,3.6,4.5);
+  S(this.card,{o:P(t,3.3,3.6)*(1-P(t,4.5,4.7)),x:L(200,240,cp),y:L(170,420,cp),s:L(1,.9,cp)});
+  const sw=t>=TS;
+  this.v0.innerHTML=sw?'<span style="color:var(--acc2)">"v2"</span>':'"v1"';
+  this.r0.style.background=sw?`rgba(9,105,218,${.18*(1-P(t,TS,TS+1.2))})`:'transparent';
+  S(this.atom,{...pop(t,4.8),x:190,y:640});this.atom.style.opacity=pop(t,4.8).o*(1-P(t,6.4,6.7));
+  S(this.swap,{...pop(t,6.6),x:190,y:640});this.swap.style.opacity=pop(t,6.6).o*(1-P(t,8.8,9.1));
+  const ss=String(7+Math.floor(t)).padStart(2,'0');
+  this.stats.innerHTML=`<span>open connections <b>1,284</b></span><span style="color:var(--line)">|</span><span>restarts <b style="color:var(--str)">0</b></span><span style="color:var(--line)">|</span><span>uptime <b>41d 06:12:${ss}</b></span>`;
+  S(this.stats,{o:P(t,.8,1.2),x:200,y:740});
+  // steady traffic: requests that started before the swap finish on v1
+  const got=[];
+  this.dots.forEach((d,j)=>{
+    const i=j>>1,a=.4+i*.55,wk=this.PW[i%4].map((v,q)=>v+(q?10:30));
+    const v2=a>=TS,col=v2?'var(--acc2)':'var(--acc)';
+    if(j%2==0)runDot(d,t,a,.8,[C,LI,wk],col);
+    else{runDot(d,t,a+1.1,.7,[wk,C],col);if(t>a+1.8)got.push(v2)}
+  });
+  this.pw.forEach((e,i)=>{const busy=this.dots.some((d,j)=>{const k=j>>1;return j%2==0&&k%4==i&&t>.4+k*.55+.8&&t<.4+k*.55+1.1});e.style.background=busy?'var(--accbg)':'#fff'});
+  this.rs.innerHTML=got.slice(-10).map(v=>`<span class="chip" style="font-size:20px;padding:6px 10px;background:${v?'var(--bluebg)':'var(--accbg)'};color:${v?'var(--acc2)':'var(--acc)'}">${v?'v2':'v1'}</span>`).join('');
+  S(this.stamp,{o:P(t,9,9.5),y:900});
+}});
+
+// ============================== 03 FAULTS SPEAK A PROTOCOL =================
+scene({tag:'The remote retry ring',title:'Faults speak a protocol',dur:12,build(r){
+  this.cl=el(winHTML('client',400,260,`<div class="st" style="font:700 24px/1.5 var(--mono)"></div>`),r);
+  this.st=this.cl.querySelector('.st');
+  this.pipe=el(`<svg class="full"><line x1="620" y1="450" x2="1370" y2="450" stroke="var(--okbd)" stroke-width="16" stroke-linecap="round"/><line class="glow" x1="620" y1="450" x2="1370" y2="450" stroke="var(--str)" stroke-width="4" stroke-dasharray="14 14"/></svg>`,r);
+  this.glow=this.pipe.querySelector('.glow');
+  this.pl=el(`<div class="abs lbl" style="width:700px;text-align:center;color:var(--str)">keep-alive connection</div>`,r);
+  this.srv=el(`<div class="abs" style="width:470px;height:300px;border:3px solid var(--fg);border-radius:24px;background:var(--bg2)"><div class="lbl" style="position:absolute;left:22px;top:16px;color:var(--fg)">igropyr</div><div class="chip" style="position:absolute;right:16px;top:12px;font-size:18px;padding:6px 12px;background:#fff;border:2px solid var(--line)">stuck-ms 3000</div></div>`,r);
+  this.w=el(`<div class="wk">λ</div>`,r);this.wn=el(`<div class="wk" style="border-color:var(--str);color:var(--str)">λ</div>`,r);
+  this.arc=el(ARC,r);this.b=el(`<div class="burst"></div>`,r);
+  this.timer=el(`<div class="abs" style="width:200px;text-align:center;font:700 24px var(--mono);color:var(--red)"></div>`,r);
+  this.k1=el(`<div class="abs toast bad"><span style="font-family:var(--mono)">①</span> killed</div>`,r);
+  this.k2=el(`<div class="abs toast" style="background:#fff;border:2px solid var(--fg)"><span style="font-family:var(--mono)">②</span> then told</div>`,r);
+  this.json=el(`<div class="abs chip" style="background:#1f2430;color:#e6edf3;font-size:21px">{"fault":<span style="color:#ff7b72">"stuck"</span>,"elapsed-ms":3012}</div>`,r);
+  this.def=el(`<div class="abs toast ok">nothing left in flight — the state is definite</div>`,r);
+  this.dots=[0,1,2].map(()=>el(`<div class="dot"></div>`,r));
+  this.same=el(`<div class="abs toast ok">resubmitted on the same connection ✓</div>`,r);
+  // before / after timeline
+  this.tl=el(`<div class="abs" style="width:1500px"><div style="display:flex;align-items:center;gap:24px;margin-bottom:22px"><div class="lbl" style="width:150px">before</div><div style="flex:1;height:52px;border-radius:12px;background:var(--bg2);position:relative;overflow:hidden"><div class="f1" style="position:absolute;inset:0 auto 0 0;background:#d0d7de;display:flex;align-items:center;padding-left:18px;font:700 22px var(--mono);color:var(--fg);white-space:nowrap">spinner · 30 s · 500</div></div></div><div style="display:flex;align-items:center;gap:24px"><div class="lbl" style="width:150px">now</div><div class="row2" style="flex:1;height:52px;display:flex;gap:8px"></div></div></div>`,r);
+  this.f1=this.tl.querySelector('.f1');
+  this.segs=['3 s · stuck → told','3 s · retry','✓ 200'].map((s,i)=>el(`<div style="flex:${i<2?1:1.2};border-radius:12px;background:${i<2?'var(--accbg)':'var(--okbg)'};border:2px solid ${i<2?'#ffc8a8':'var(--okbd)'};display:flex;align-items:center;justify-content:center;font:700 21px var(--mono);color:${i<2?'var(--acc)':'var(--str)'};opacity:0">${s}</div>`,this.tl.querySelector('.row2')));
+},update(t){
+  const C=[1370,450],W=[385,480];
+  const top=1-P(t,7.3,7.8)*.0;
+  S(this.cl,{o:P(t,0,.4),x:1370,y:320});
+  this.pipe.style.opacity=P(t,.2,.6);this.glow.style.strokeDashoffset=-t*40;
+  S(this.pl,{o:P(t,.4,.8),x:645,y:470});
+  S(this.srv,{o:P(t,.1,.5),x:150,y:300});
+  S(this.w,{o:P(t,.3,.6)*(1-P(t,3,3.25)),x:W[0]-48+(t>2.8&&t<3?Math.sin(t*70)*6:0),y:W[1]-48});this.w.style.background=t>1.5&&t<3.3?'var(--redbg)':'#fff';
+  const pn=pop(t,4.4);S(this.wn,{o:pn.o,s:pn.s,x:W[0]-48,y:W[1]-48});
+  S(this.arc,{o:t>1.5&&t<3?1:0,x:W[0]-65,y:W[1]-65,r:(t-1.5)*300});
+  burst(this.b,t,3,...W);
+  S(this.timer,{o:win(t,1.5,3.2),x:W[0]-100,y:W[1]+64});this.timer.textContent=Math.floor(P(t,1.5,2.95,x=>x)*3012)+' ms';
+  S(this.k1,{...pop(t,3)} );this.k1.style.transform=`translate(150px,650px) scale(${pop(t,3).s})`;this.k1.style.opacity=pop(t,3).o*(1-P(t,7,7.3));
+  S(this.k2,{...pop(t,3.6)});this.k2.style.transform=`translate(330px,650px) scale(${pop(t,3.6).s})`;this.k2.style.opacity=pop(t,3.6).o*(1-P(t,7,7.3));
+  const jp=P(t,3.6,4.5);
+  S(this.json,{o:t<3.6?0:1,x:L(560,1770-this.json.offsetWidth,jp),y:L(395,600,P(t,4.1,4.5))});
+  S(this.def,{...pop(t,4.6),x:1770-this.def.offsetWidth,y:672});this.def.style.opacity=pop(t,4.6).o*(1-P(t,7,7.3));
+  runDot(this.dots[0],t,.6,.8,[C,W]);
+  runDot(this.dots[1],t,5.2,.8,[C,W]);
+  runDot(this.dots[2],t,6.3,.7,[W,C],'var(--str)');
+  S(this.same,{...pop(t,5.3),x:1340-this.same.offsetWidth,y:520});this.same.style.opacity=pop(t,5.3).o*(1-P(t,7,7.3));
+  this.st.innerHTML=t<4.5?'<span style="color:var(--dim)">POST /transfer</span><br>…':(t<7?'<span style="color:var(--dim)">POST /transfer</span>':'<span style="color:var(--str)">200 OK ✓</span>');
+  if(t>=4.5&&t<5.2)this.st.innerHTML+='<br><span style="font-size:20px;color:var(--dim)">resubmitting…</span>';
+  S(this.tl,{o:P(t,7.4,7.8),x:210,y:760});
+  this.f1.style.width=(P(t,7.9,10.4,x=>x)*100)+'%';
+  this.segs.forEach((s,i)=>{const a=7.9+i*.8;s.style.opacity=P(t,a,a+.3);s.style.transform=`scaleX(${L(.6,1,P(t,a,a+.4,eo))})`;s.style.transformOrigin='left'});
+}});
+
+// ============================== 04 CONVERSATIONS ===========================
+scene({tag:'Web programming with continuations',title:'Conversations are continuations',dur:14.5,build(r){
+  this.LN=['(conversation-start!','  (lambda (req suspend! commit!)','    (let ((tx (begin-tx!)))','      (let ((req2 (suspend! confirm-page)))','        (commit! (lambda () (commit-tx! tx)))','        done))))'];
+  const hl=s=>s.replace(/(conversation-start!|lambda|let|begin-tx!|suspend!|commit!|commit-tx!)/g,'<span class="k">$1</span>');
+  this.code=el(`<div class="abs term" style="width:820px;padding:22px 30px 22px 70px">${this.LN.map((l,i)=>`<div class="ln" style="white-space:pre;border-radius:8px;margin:0 -10px;padding:0 10px">${hl(l)}</div>`).join('')}</div>`,r);
+  this.lns=[...this.code.querySelectorAll('.ln')];
+  this.mk=el(`<div class="abs" style="width:34px;height:34px;border-radius:50%;background:var(--str);box-shadow:0 0 0 6px rgba(10,114,39,.25)"></div>`,r);
+  this.park=el(`<div class="abs toast" style="background:#fff;border:2px solid var(--str);color:var(--str)">⏸ parked on this line = “the user is at the confirm step”</div>`,r);
+  this.nor=el(`<div class="abs" style="width:820px;border-top:4px dashed var(--red)"><span class="lbl" style="position:absolute;left:calc(100% + 14px);top:-12px;color:var(--red);white-space:nowrap">point of<br>no return</span></div>`,r);
+  this.cl=el(winHTML('browser',330,300,`<div class="pg" style="font:700 28px var(--sans);line-height:1.4"></div>`),r);
+  this.pg=this.cl.querySelector('.pg');
+  this.db=el(`<div class="abs" style="width:200px;text-align:center"><svg width="120" height="130" viewBox="0 0 120 130"><ellipse cx="60" cy="20" rx="54" ry="16" fill="#fff" stroke="var(--fg)" stroke-width="4"/><path d="M6 20 V108 A54 16 0 0 0 114 108 V20" fill="#fff" stroke="var(--fg)" stroke-width="4"/><ellipse cx="60" cy="20" rx="54" ry="16" fill="none" stroke="var(--fg)" stroke-width="4"/></svg><div class="tx" style="margin-top:6px;font:700 22px var(--mono)"></div></div>`,r);
+  this.tx=this.db.querySelector('.tx');
+  this.dots=[0,1,2,3].map(()=>el(`<div class="dot"></div>`,r));
+  // the gone guarantee
+  this.g=[['dies before commit!','database rolled back','gone','safe to retry','var(--str)','var(--okbg)','var(--okbd)'],['dies after commit! — or unknown','the server refuses to guess','unknown','reconcile · never resubmit','var(--warn)','#fff8c5','#eed888']].map(([h,s,a,n,c,bg,bd])=>el(`<div class="abs" style="width:760px;height:220px;border-radius:20px;border:3px solid ${bd};background:${bg};padding:22px 28px"><div style="font:700 28px var(--sans)">${h}</div><div style="font:500 23px var(--sans);color:var(--dim);margin-top:6px">${s}</div><div style="display:flex;align-items:center;gap:18px;margin-top:22px"><span class="ans chip" style="background:#fff;border:3px solid ${c};color:${c};font-size:30px">'${a}</span><span style="font:700 25px var(--sans);color:${c}">${n}</span></div></div>`,r));
+  this.gt=el(`<div class="abs lbl" style="font-size:20px;color:var(--fg)">the gone guarantee</div>`,r);
+},update(t){
+  const CODE=[150,250],LH=43.75,lineY=i=>CODE[1]+22+i*LH;
+  const B=P(t,8,8.6);
+  S(this.code,{o:P(t,0,.4),x:CODE[0],y:CODE[1]});
+  // the process marker walks the program text
+  const stops=[[1,0],[1.5,1],[1.9,2],[2.4,3],[5.6,3],[6,4],[6.9,5]];
+  let li=-1;for(const [a,i] of stops)if(t>=a)li=i;
+  let yy=lineY(Math.max(li,0));
+  for(let k=1;k<stops.length;k++){const [a,i]=stops[k],[a0,i0]=stops[k-1];if(t>=a-.3&&t<a)yy=L(lineY(i0),lineY(i),P(t,a-.3,a))}
+  S(this.mk,{o:(li>=0?1:0)*(1-P(t,7.4,7.7)),x:CODE[0]+20,y:yy+5,s:1+(t>2.4&&t<5.6?.12*Math.sin(t*6):0)});
+  this.lns.forEach((e,i)=>e.style.background=(i==li&&t<7.6)?'rgba(255,255,255,.10)':'transparent');
+  S(this.park,{...pop(t,2.8),x:CODE[0],y:590});this.park.style.opacity=pop(t,2.8).o*(1-P(t,5.2,5.5));
+  S(this.nor,{o:P(t,6,6.3)*(1-B*.0),x:CODE[0],y:lineY(4)+2});
+  const up=1-B*.75;
+  S(this.cl,{o:P(t,.2,.6)*up,x:1190,y:250});
+  S(this.db,{o:P(t,.3,.7)*up,x:1560,y:280});this.db.style.width='300px';
+  this.pg.innerHTML=t<3?'<span style="color:var(--dim)">Transfer €50</span>':(t<7.3?'Confirm transfer?<div class="chip" style="margin-top:14px;background:'+(t>4.6&&t<5?'var(--acc2)':'var(--acc)')+';color:#fff;font-family:var(--sans)">Confirm</div>':'<span style="color:var(--str)">Done ✓</span>');
+  this.tx.innerHTML=t<1.9?'<span style="color:var(--dim)">idle</span>':(t<6.4?`<span style="color:var(--acc)">tx open${t>2.4?'<br>across requests':''}</span>`:'<span style="color:var(--str)">committed ✓</span>');
+  const C=[1190,400],K=[CODE[0]+820,lineY(0)+10];
+  runDot(this.dots[0],t,.4,.6,[C,K]);
+  runDot(this.dots[1],t,2.4,.6,[[CODE[0]+820,lineY(3)],C],'var(--acc2)');
+  runDot(this.dots[2],t,4.9,.6,[C,[CODE[0]+820,lineY(3)]]);
+  runDot(this.dots[3],t,6.9,.5,[[CODE[0]+820,lineY(5)],C],'var(--str)');
+  S(this.gt,{o:B,x:150,y:640});
+  this.g.forEach((g,i)=>{const p=pop(t,8.3+i*1.6);S(g,{o:p.o,s:p.s,x:150+i*860,y:690});const a=g.querySelector('.ans');const q=pop(t,9.1+i*1.6);a.style.transform=`scale(${q.s})`;a.style.opacity=q.o});
+}});
+
+// ============================== 05 S-EXPRESSIONS ===========================
+scene({tag:'Scheme talks to Scheme',title:'Communicate in S-expressions',dur:11.5,build(r){
+  this.cl=el(`<div class="abs win" style="width:440px;height:230px;border-color:#dbe2ee;background:#fff"><div class="hd"><span class="d"></span><span class="d"></span><span class="d"></span><span style="margin-left:8px">browser</span></div><div style="padding:22px"><div style="display:flex;align-items:center;gap:14px"><svg width="46" height="46" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#1550c4"/><text x="32" y="45" text-anchor="middle" fill="#f4f6fb" font-family="Georgia,Times New Roman,serif" font-weight="700" font-size="34">λΓ</text></svg><span style="font:800 34px var(--sans);color:#1550c4">Goeteia</span></div><div style="font:600 21px var(--sans);color:#566080;margin-top:4px">Scheme compiled to WebAssembly</div><div class="st" style="margin-top:14px;font:700 26px var(--mono)"></div></div></div>`,r);
+  this.st=this.cl.querySelector('.st');
+  this.srv=el(`<div class="abs" style="width:440px;height:230px;border:3px solid var(--fg);border-radius:20px;background:var(--bg2);padding:22px;display:flex;gap:18px;align-items:center">${LOGO(80)}<div><div style="font:800 34px var(--sans)">Igropyr</div><div style="font:600 21px var(--mono);color:var(--dim)">(app-rpc app "/rpc" …)</div></div></div>`,r);
+  this.wire=el(`<svg class="full"><line x1="590" y1="395" x2="1330" y2="395" stroke="var(--line)" stroke-width="6" stroke-linecap="round"/></svg>`,r);
+  this.q=el(`<div class="abs chip" style="background:#1f2430;color:#e6edf3;font-size:27px">'(add 1 2 <span style="color:#ffa657">1/2</span>)</div>`,r);
+  this.a=el(`<div class="abs chip" style="background:#1f2430;color:#e6edf3;font-size:27px">(ok <span style="color:#ffa657">7/2</span>)</div>`,r);
+  this.tr=el(`<div class="abs" style="display:flex;gap:12px">${['HTTP','WebSocket','SSE'].map(s=>`<span class="chip" style="font-size:19px;padding:6px 12px;background:#fff;border:2px solid var(--line);color:var(--dim)">${s}</span>`).join('')}<span class="lbl" style="align-self:center;margin-left:6px">one datum per message</span></div>`,r);
+  // the JSON lane, for contrast
+  this.j=el(`<div class="abs" style="width:1620px;height:120px;display:flex;align-items:center;gap:26px;padding:0 30px;border-radius:20px;background:var(--bg2);border:2px dashed #d0d7de"><span class="lbl">json</span><span class="chip" style="background:#fff;border:2px solid var(--line);font-size:22px">{"op":"add","args":[1,2,0.5]}</span><span style="font:700 30px var(--sans);color:var(--com)">→</span><span class="chip" style="background:#fff;border:2px solid var(--line);font-size:22px">⚙ codec: design · agree · debug</span><span style="font:700 30px var(--sans);color:var(--com)">→</span><span class="chip" style="background:#fff;border:2px solid var(--line);font-size:22px">3.5 <span style="color:var(--red)">(7/2 lost)</span></span></div>`,r);
+  this.strike=el(`<div class="abs" style="width:1620px;height:6px;border-radius:3px;background:var(--red);transform-origin:left"></div>`,r);
+  this.no=el(`<div class="abs toast bad" style="background:#fff">no codec on the wire</div>`,r);
+  this.big=el(`<div class="abs" style="width:1620px;display:flex;flex-direction:column;gap:14px"><div style="display:flex;gap:22px;align-items:center"><span class="lbl" style="width:120px">scheme</span><span class="chip" style="background:var(--okbg);color:var(--str);border:2px solid var(--okbd);font-size:24px">(expt 2 100) → 1267650600228229401496703205376</span></div><div style="display:flex;gap:22px;align-items:center"><span class="lbl" style="width:120px">json</span><span class="chip" style="background:var(--redbg);color:var(--red);border:2px solid var(--redbd);font-size:24px">1.2676506002282294e30</span></div></div>`,r);
+},update(t){
+  S(this.cl,{o:P(t,0,.4),x:1330,y:280});
+  S(this.srv,{o:P(t,.1,.5),x:150,y:280});
+  this.wire.style.opacity=P(t,.3,.6);
+  const qp=P(t,1,2.2);S(this.q,{o:win(t,.9,2.35),x:L(1320-this.q.offsetWidth,600,qp),y:360});
+  const ap=P(t,2.6,3.8);S(this.a,{o:t>2.5?1:0,x:L(600,1320-this.a.offsetWidth,ap),y:360});
+  if(t>=3.8)S(this.a,{o:0});
+  this.st.innerHTML=t<3.8?'':'<span>(ok <span style="color:var(--acc)">7/2</span>)</span> <span style="font:700 20px var(--sans);color:var(--str)">exact ✓</span>';
+  S(this.tr,{o:P(t,4,4.4),x:640,y:440});
+  const jb=1-P(t,8,8.4);
+  S(this.j,{o:P(t,4.6,5)*jb*(1-P(t,7,7.3)*.45),x:150,y:620});
+  S(this.strike,{o:(t>6.7?1:0)*jb,x:150,y:677,sx:P(t,6.7,7.1)});
+  S(this.no,{...pop(t,7.1),x:1500,y:560});this.no.style.opacity=pop(t,7.1).o*jb;
+  S(this.big,{o:P(t,8.4,8.8),x:150,y:620});
+}});
+
+// ============================== 06 DISTRIBUTED =============================
+scene({tag:'From node to hive',title:'Write once, run distributed',dur:14,build(r){
+  this.N=[['node-1',760,330],['node-2',1150,330],['node-3',1340,620],['node-4',960,760],['node-5',570,620]];
+  this.edgesSvg=el(`<svg class="full"><g stroke="var(--acc)" stroke-width="5" stroke-linecap="round"></g></svg>`,r);
+  const g=this.edgesSvg.querySelector('g');
+  this.E=[];
+  const join=[.3,.8,1.3,1.8,3.2];
+  for(let i=0;i<5;i++)for(let j=0;j<i;j++){const ln=document.createElementNS('http://www.w3.org/2000/svg','line');const [,x1,y1]=this.N[j],[,x2,y2]=this.N[i];ln.setAttribute('x1',x1+75);ln.setAttribute('y1',y1+65);ln.setAttribute('x2',x2+75);ln.setAttribute('y2',y2+65);g.appendChild(ln);this.E.push({i,j,ln,len:Math.hypot(x2-x1,y2-y1),a:join[i]+.25+j*.12})}
+  this.nodes=this.N.map(([n])=>el(HEX(n),r));
+  this.hearts=this.N.map(()=>el(`<div class="abs" style="font:700 26px var(--sans);color:var(--red)">♥</div>`,r));
+  this.redis=el(`<div class="abs" style="width:250px;border-radius:16px;background:#fff;border:3px solid var(--red);overflow:hidden"><div class="lbl" style="padding:12px 16px;background:var(--redbg);color:var(--red)">discovery · redis</div><div class="rows" style="padding:8px 16px;font:600 21px/1.8 var(--mono)"></div></div>`,r);
+  this.rows=this.N.map(([n])=>el(`<div style="opacity:0">${n} <span style="color:var(--red)">♥</span></div>`,this.redis.querySelector('.rows')));
+  this.hs=el(`<div class="abs chip" style="background:var(--fg);color:#fff;font-size:20px">🔒 HMAC-SHA256 handshake ✓</div>`,r);
+  this.left=el(`<div class="abs chip" style="background:var(--bg2);color:var(--dim);font-size:20px">stopped beating → out of the mesh</div>`,r);
+  this.rc=el(`<div class="abs chip" style="background:#1f2430;color:#e6edf3;font-size:21px">(rcall <span style="color:#a5d6ff">'render</span> …)</div>`,r);
+  this.msg=[0,1].map(()=>el(`<div class="dot" style="background:var(--acc2)"></div>`,r));
+  this.tasks=[0,1,2].map(()=>el(`<div class="abs" style="width:40px;height:40px;border-radius:9px;background:var(--acc2);box-shadow:0 4px 12px rgba(9,105,218,.3)"></div>`,r));
+  this.dp=el(`<div class="abs chip" style="background:#1f2430;color:#e6edf3;font-size:21px">(dpool-submit pool #(resize "x.png" 800))</div>`,r);
+  this.b=el(`<div class="burst"></div>`,r);
+  this.alo=el(`<div class="abs toast ok">node died mid-task → reran elsewhere · at-least-once</div>`,r);
+},update(t){
+  const c=i=>[this.N[i][1]+75,this.N[i][2]+65];
+  const join=[.3,.8,1.3,1.8,3.2];
+  // node-3 stops beating at 4.4 and drops out; node-4 dies at 10
+  const gone3=P(t,5,5.5),dead4=P(t,10,10.3);
+  const alive=i=>i==2?1-gone3:(i==3?1-dead4:1);
+  this.nodes.forEach((e,i)=>{const p=pop(t,join[i]);S(e,{o:p.o*L(1,.18,1-alive(i)),s:p.s,x:this.N[i][1],y:this.N[i][2]})});
+  this.E.forEach(e=>{e.ln.style.strokeDasharray=e.len;e.ln.style.strokeDashoffset=e.len*(1-P(t,e.a,e.a+.5));e.ln.style.opacity=Math.min(alive(e.i),alive(e.j))*(t>e.a?1:0)});
+  this.hearts.forEach((h,i)=>{const beat=(i==2&&t>4.4)||(i==3&&t>10)?0:1;const ph=((t*1.3+i*.37)%1);S(h,{o:P(t,join[i]+.3,join[i]+.6)*alive(i)*(beat?1:.3),x:c(i)[0]+46,y:c(i)[1]-70,s:beat?1+.35*Math.max(0,1-ph*5):1})});
+  S(this.redis,{o:P(t,.2,.6),x:150,y:280});
+  this.rows.forEach((row,i)=>{row.style.opacity=P(t,join[i]+.3,join[i]+.6)*(i==2?1-gone3*.7:1);row.style.textDecoration=i==2&&t>5?'line-through':'none'});
+  S(this.hs,{...pop(t,3.3),x:220,y:780});this.hs.style.opacity=pop(t,3.3).o*(1-P(t,4.8,5.1));
+  S(this.left,{...pop(t,5.1),x:1420,y:820});this.left.style.opacity=pop(t,5.1).o*(1-P(t,6.8,7.1));
+  // name-based call from node-1 to the process registered as 'render on node-4
+  S(this.rc,{...pop(t,6.2),x:420,y:220});this.rc.style.opacity=pop(t,6.2).o*(1-P(t,8,8.3));
+  runDot(this.msg[0],t,6.5,.7,[c(0),c(3)]);runDot(this.msg[1],t,7.4,.6,[c(3),c(0)],'var(--str)');
+  S(this.dp,{...pop(t,8.4),x:1090,y:200});this.dp.style.opacity=pop(t,8.4).o*(1-P(t,12.4,12.7));
+  const dest=[1,3,4];
+  this.tasks.forEach((e,k)=>{
+    const a=8.7+k*.2,p=P(t,a,a+.6);let [x,y]=along([c(0),c(dest[k])],p);
+    if(k==1&&t>10.3){const q=P(t,10.4,11);[x,y]=along([c(3),c(1)],q)}
+    const done=t>11.8;
+    e.style.background=done?'var(--str)':'var(--acc2)';
+    S(e,{o:t>a?1:0,x:x-20+(k==1&&t>10.3?30:0),y:y-20+(dest[k]==1&&k==0?-30:0)+(k==1&&t>10.3?20:0),r:done?0:(t*120+k*40)%360});
+  });
+  burst(this.b,t,10,...c(3));
+  S(this.alo,{...pop(t,11.6),x:560,y:930});
+}});
+
+// ============================== OUTRO ======================================
+scene({dur:7,build(r){
+  this.logo=el(`<div class="abs" style="width:1920px;display:flex;justify-content:center">${LOGO(150)}</div>`,r);
+  this.name=el(`<div class="abs" style="width:1920px;text-align:center;font:800 110px/1 var(--sans);letter-spacing:-.015em">Igropyr</div>`,r);
+  this.tag=el(`<div class="abs" style="width:1920px;text-align:center;font:600 36px var(--sans);color:var(--dim)">A distributed backend framework in <span style="color:var(--acc)">pure Chez Scheme</span></div>`,r);
+  this.chips=CHAPTERS.map(c=>el(`<div class="abs chip" style="background:#fff;border:2.5px solid var(--line);font:700 26px var(--sans);color:var(--fg)">${c}</div>`,r));
+  this.npm=el(`<div class="abs chip" style="background:#1f2430;color:#e6edf3;font-size:30px;padding:14px 26px">$ npm i igropyr</div>`,r);
+  this.base=el(`<div class="abs" style="width:1920px;text-align:center;font:600 24px var(--mono);color:var(--dim)">Pure Chez Scheme · Erlang-style actors · Async on libuv</div>`,r);
+},update(t){
+  const lp=pop(t,.1,.6);S(this.logo,{o:lp.o,s:lp.s,y:110});
+  S(this.name,{o:P(t,.4,.9),y:L(290,270,P(t,.4,1,eo))});
+  S(this.tag,{o:P(t,.8,1.3),y:400});
+  const ws=this.chips.map(e=>e.offsetWidth);
+  [[0,1,2],[3,4,5]].forEach((row,ri)=>{
+    const tot=row.reduce((a,i)=>a+ws[i],0)+24*(row.length-1);let x=(1920-tot)/2;
+    row.forEach(i=>{const p=pop(t,1.4+i*.15);S(this.chips[i],{o:p.o,s:p.s,x,y:520+ri*92});x+=ws[i]+24});
+  });
+  const np=pop(t,2.6);S(this.npm,{o:np.o,s:np.s,x:(1920-this.npm.offsetWidth)/2,y:740});
+  S(this.base,{o:P(t,3,3.4),y:850});
+}});
+
+// ---------------------------------------------------------------------------
+let T0=0;scenes.forEach(s=>{s.t0=T0;T0+=s.dur});
+const TOTAL=T0;
+scenes.forEach(s=>{
+  s.root=el(`<div class="scene"></div>`);
+  if(s.tag)el(`<div class="tag">${s.tag}</div>`,s.root);
+  if(s.title)s.tEl=el(`<div class="title">${s.title}</div>`,s.root);
+  s.build(s.root);
+});
+function seek(t){
+  t=clamp(t,0,TOTAL);
+  scenes.forEach(s=>{
+    const lt=t-s.t0;
+    if(lt<-FADE||lt>s.dur+FADE){s.root.style.display='none';return}
+    s.root.style.display='block';
+    const o=Math.min(clamp((lt+FADE)/FADE),clamp((s.dur+FADE-lt)/FADE));
+    // first scene has no fade-in, last has no fade-out
+    const oo=(s===scenes[0]&&lt<0)?0:(s===scenes[0]&&lt<FADE?1:(s===scenes[scenes.length-1]&&lt>s.dur-FADE?1:o));
+    s.root.style.opacity=(s===scenes[0]&&lt>=0&&lt<s.dur-FADE)?1:oo;
+    if(s.tEl)S(s.tEl,{o:P(lt,0,.5),x:L(-30,0,P(lt,0,.5,eo))});
+    s.update(clamp(lt,0,s.dur));
+  });
+  segFill.forEach((f,i)=>{f.style.width=(clamp((t-scenes[i].t0)/scenes[i].dur)*100)+'%'});
+}
+
+// ---------------------------------------------------------------------------
+// Player: fits the stage to the frame, advances t, and stops the clock while
+// the tab is hidden or the player is scrolled out of view.
+// ---------------------------------------------------------------------------
+const segs=document.getElementById('segs');
+const segFill=scenes.map(s=>{const d=el(`<div class="seg" style="flex:${s.dur}"><i></i></div>`,segs);return d.firstChild});
+function fit(){const k=Math.min(innerWidth/1920,innerHeight/1080);stage.style.transform=`scale(${k})`}
+addEventListener('resize',fit);fit();
+
+const HOLD=2;
+const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+// with reduced motion, open paused on the closing frame with all six chapters
+const POSTER=scenes[scenes.length-1].t0+5;
+let cur=+(new URLSearchParams(location.search).get('t'))||(reduce?POSTER:0);
+let userPaused=reduce,visible=true,last=performance.now();
+const pp=document.getElementById('pp');
+function setPaused(v){userPaused=v;document.body.classList.toggle('paused',v);pp.textContent=v?'▶':'❚❚';pp.setAttribute('aria-label',v?'Play':'Pause')}
+setPaused(userPaused);
+pp.onclick=e=>{e.stopPropagation();setPaused(!userPaused)};
+stage.onclick=()=>setPaused(!userPaused);
+document.getElementById('rs').onclick=e=>{e.stopPropagation();cur=0;setPaused(false)};
+segs.onclick=e=>{
+  const r=segs.getBoundingClientRect();const x=(e.clientX-r.left)/r.width*TOTAL;
+  // a click jumps to the start of the chapter under the pointer
+  const sc=scenes.find(s=>x>=s.t0&&x<s.t0+s.dur)||scenes[0];cur=sc.t0;seek(cur);
+};
+addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();setPaused(!userPaused)}});
+if('IntersectionObserver' in window)new IntersectionObserver(es=>{visible=es[0].isIntersecting},{threshold:.2}).observe(stage);
+(function loop(now){
+  const dt=Math.min(.1,(now-last)/1000);last=now;
+  if(!userPaused&&visible&&!document.hidden){cur+=dt;if(cur>TOTAL+HOLD)cur=0;seek(cur)}
+  requestAnimationFrame(loop);
+})(performance.now());
+window.seek=seek;window.TOTAL=TOTAL;
+seek(cur);
+</script>
+</body>
+</html>
