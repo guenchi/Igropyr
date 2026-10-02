@@ -209,8 +209,10 @@ brew install chezscheme libuv        # macOS
 ```
 
 Igropyr selects the platform ABI and loads libuv, zlib, and the system C
-library automatically. Supported Chez machine types are macOS/Linux on
-x86_64 and arm64; an unsupported host fails at import time with a clear error.
+library automatically; on macOS, libuv is looked for under both Homebrew
+prefixes, `/opt/homebrew` (Apple silicon) and `/usr/local` (x86_64).
+Supported Chez machine types are macOS, Linux and FreeBSD on x86_64 and
+arm64; an unsupported host fails at import time with a clear error.
 
 ### Portability
 
