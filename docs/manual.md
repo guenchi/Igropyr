@@ -6242,9 +6242,12 @@ The script should call `(start-scheduler thunk)` at the end. The scheduler never
 
 ### Native Libraries and Supported Platforms
 
-Igropyr supports Chez Scheme 10 on macOS and Linux, on x86_64 and arm64.
+Igropyr supports Chez Scheme 10 on macOS, Linux and FreeBSD, on x86_64 and
+arm64.
 The internal platform layer automatically selects the correct ABI layout and
 loads libuv, zlib, and the system C library from standard shared-object names.
+On macOS, libuv and QuickJS are looked for under both Homebrew prefixes,
+`/opt/homebrew` on Apple silicon and `/usr/local` on x86_64 (1.8.2).
 Unsupported machine types fail during import with a list of expected platforms.
 
 ```bash

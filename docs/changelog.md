@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.8.2 — 2026-10-02
+
+*1 commit.* libuv and QuickJS are found on x86_64 Macs, and the exported
+`c-open` / `c-openat` create files with the mode they are given on arm64
+macOS.
+
+### Fixed
+
+- **libuv and QuickJS were looked for only under Apple silicon's Homebrew
+  prefix** (`3ed1972`). Homebrew installs under `/opt/homebrew` on Apple
+  silicon and under `/usr/local` on x86_64, and the macOS candidate lists
+  for libuv and QuickJS named only `/opt/homebrew`. On an x86_64 macOS 15
+  host with libuv 1.52.1 installed under `/usr/local`, `(igropyr libuv)`
+  ended in "could not load any shared library candidate". Every macOS list
+  now names both prefixes — libuv also the formula's own `opt/libuv/lib/`
+  under each — and the first candidate on Apple silicon is the one it
+  always was. On the same kind of host, with no `DYLD_` variable set, a
+  process built on `(igropyr libuv)` now starts. For QuickJS only the
+  candidate list was checked; it has not been run on an x86_64 Mac.
+- **`c-open` and `c-openat` lost the mode on arm64 macOS** (`3ed1972`).
+  `open` and `openat` are variadic in C, and on arm64 macOS a variadic
+  argument is passed on the stack; declared with fixed argument lists, the
+  mode given with `O_CREAT` was not where the callee reads it, and a file
+  asked for `0o600` or `0o640` was created `0o010`. They are now declared
+  variadic, as are `durable`'s internal `open` and `fcntl`. No call inside
+  the library passed such an argument, so the library's own behaviour was
+  not affected; x86_64 passes both kinds alike.
+
+### Added
+
+- `(igropyr platform)`: `homebrew-prefixes`, `libuv-candidates` and
+  `quickjs-candidates`, and a two-argument form of
+  `shared-object-candidates` taking the OS (`3ed1972`). The candidate lists
+  are pure functions of the OS, so any OS's list can be read on any host;
+  the one-argument form answers for this host, as before.
+
+### Behaviour
+
+- On macOS, when both libqjs and libquickjs are installed under
+  `/usr/local` and no earlier candidate loads, libqjs is now chosen where
+  `libquickjs.dylib` was before. This follows the existing rule that every
+  libqjs candidate comes before the first libquickjs one; the new
+  `/usr/local/lib/libqjs.dylib` candidate sits in the libqjs group.
+
 ## 1.8.1 — 2026-09-27
 
 *1 commit.* x5c-signed JWS verification now requires the leaf's key to be
