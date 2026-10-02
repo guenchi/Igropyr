@@ -218,7 +218,8 @@
               load-first-shared-object! shared-object-candidates
               addrinfo-address-offset addrinfo-next-offset
               uv-stat-mode-offset uv-stat-size-offset
-              platform-signal-numbers)
+              platform-signal-numbers
+              homebrew-prefixes libuv-candidates quickjs-candidates)
         (only (igropyr pubsub)
               start-pubsub! subscribe unsubscribe publish)
         (only (igropyr quickjs)

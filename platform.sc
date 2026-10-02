@@ -19,6 +19,7 @@
   (export platform-os platform-arch ensure-supported-platform!
           so-listenqlimit sol-socket
           load-first-shared-object! shared-object-candidates
+          homebrew-prefixes libuv-candidates quickjs-candidates
           addrinfo-address-offset addrinfo-next-offset
           uv-stat-dev-offset uv-stat-mode-offset uv-stat-nlink-offset
           uv-stat-uid-offset uv-stat-gid-offset uv-stat-ino-offset
@@ -62,6 +63,19 @@
         "unsupported platform; expected Chez Scheme 10 on macOS/Linux/FreeBSD x86_64/arm64"
         (machine-type))))
 
+  ;; HOMEBREW'S PREFIX DEPENDS ON THE MACHINE: /opt/homebrew on Apple
+  ;; silicon, /usr/local on x86_64. A bare library name is not enough: on an
+  ;; x86_64 macOS 15 host with libuv 1.52.1 installed under /usr/local, the
+  ;; bare names were not found and a list naming only /opt/homebrew failed
+  ;; with "could not load any shared library candidate". So every macOS
+  ;; candidate list below is built from this one list, and no other file
+  ;; spells either prefix. Apple silicon's comes
+  ;; first, so the first candidate on that machine is the one it always was.
+  (define homebrew-prefixes '("/opt/homebrew" "/usr/local"))
+
+  (define (each-homebrew-prefix suffix)
+    (map (lambda (prefix) (string-append prefix suffix)) homebrew-prefixes))
+
   ;; Filename candidates for an OpenSSL-family library, most specific first.
   ;; Homebrew keeps openssl@3 keg-only, so its lib directory is not on the
   ;; default search path and has to be named outright; elsewhere the soname
@@ -69,15 +83,91 @@
   ;; without a -dev package often ships only the versioned file).
   ;; Every caller needing libcrypto/libssl shares this list: a fix for one
   ;; platform's layout must not have to be repeated per module.
-  (define (shared-object-candidates base)
-    (case platform-os
-      ((macos) (list (string-append "/opt/homebrew/opt/openssl@3/lib/" base ".3.dylib")
-                     (string-append "/usr/local/opt/openssl@3/lib/" base ".3.dylib")
-                     (string-append base ".3.dylib")
-                     (string-append base ".dylib")))
-      (else    (list (string-append base ".so.3")
+  ;;
+  ;; With one argument it answers for this host; with an OS it answers for
+  ;; that OS, which is what lets a test read every OS's list on any machine.
+  (define shared-object-candidates
+    (case-lambda
+      ((base) (shared-object-candidates base platform-os))
+      ((base os)
+       (case os
+         ((macos)
+          (append (each-homebrew-prefix
+                    (string-append "/opt/openssl@3/lib/" base ".3.dylib"))
+                  (list (string-append base ".3.dylib")
+                        (string-append base ".dylib"))))
+         (else (list (string-append base ".so.3")
                      (string-append base ".so.1.1")
-                     (string-append base ".so")))))
+                     (string-append base ".so")))))))
+
+  ;; libuv's candidates for an OS, most specific first. On macOS, for each
+  ;; Homebrew prefix, the linked lib/ directory and then the formula's own
+  ;; opt/libuv/lib, which exists whether or not the formula is linked; the
+  ;; bare names last. On FreeBSD, /usr/local is the ports prefix, not
+  ;; Homebrew's.
+  (define (libuv-candidates os)
+    (case os
+      ((macos)
+       (append (apply append
+                 (map (lambda (prefix)
+                        (list (string-append prefix "/lib/libuv.1.dylib")
+                              (string-append prefix
+                                             "/opt/libuv/lib/libuv.1.dylib")))
+                      homebrew-prefixes))
+               '("libuv.1.dylib" "libuv.dylib")))
+      ((freebsd) '("/usr/local/lib/libuv.so.1" "libuv.so.1" "libuv.so"))
+      (else '("libuv.so.1" "libuv.so"))))
+
+  ;; QuickJS's candidates for an OS, before the two a caller can add
+  ;; (an explicit path and IGROPYR_LIBQUICKJS_SO, which stay in
+  ;; (igropyr quickjs) and come first).
+  ;;
+  ;; Two upstreams, two library names: bellard/quickjs ships libquickjs,
+  ;; quickjs-ng ships libqjs. FreeBSD's packages install either straight
+  ;; under lib/, not in a quickjs/ subdirectory.
+  ;;
+  ;; libqjs FIRST, everywhere. bellard's build alone does not satisfy
+  ;; (igropyr quickjs)'s bind! (see the JS_FreeValue check there), and on a
+  ;; machine carrying both builds the old order dlopened bellard's
+  ;; libquickjs first. That fails the bind -- and it fails it AFTER the
+  ;; library is in the process's global symbol namespace, where Chez's
+  ;; foreign-procedure resolves from. Falling through to the next candidate
+  ;; would then be worse than stopping: JS_NewRuntime would still resolve to
+  ;; the first library loaded while JS_FreeValue came from the second, which
+  ;; is a mixed-ABI free on every value. The only safe order is to look for
+  ;; the right one first.
+  ;;
+  ;; Grouped by LIBRARY, not by how the name is written: EVERY libqjs
+  ;; candidate, bare and absolute, comes before the first libquickjs one.
+  ;; Interleaving them is not enough and was measured not to be -- a bare
+  ;; "libqjs.dylib" does not resolve where the library lives outside the
+  ;; dynamic loader's default path (/opt/homebrew/lib on macOS), so a bare
+  ;; "libquickjs.dylib" sitting anywhere on the search path still won.
+  ;;
+  ;; On macOS the Homebrew entries are made for each prefix. Elsewhere the
+  ;; list is exactly what it was, including the one Apple-silicon entry per
+  ;; library it always carried: this change is about macOS, and leaves every
+  ;; other system's list as it found it.
+  (define (quickjs-candidates os)
+    (let ((prefixes (if (eq? os 'macos)
+                        homebrew-prefixes
+                        (list (car homebrew-prefixes)))))
+      (append
+        (list "libqjs.dylib" "libqjs.so")
+        (map (lambda (prefix) (string-append prefix "/lib/libqjs.dylib"))
+             prefixes)
+        (list "/usr/local/lib/libqjs.so"
+              "/usr/local/lib/libqjs.so.0"
+              "/usr/lib/libqjs.so"
+              "libquickjs.dylib" "libquickjs.so")
+        (map (lambda (prefix)
+               (string-append prefix "/lib/quickjs/libquickjs.dylib"))
+             prefixes)
+        (list "/usr/local/lib/libquickjs.so"
+              "/usr/local/lib/libquickjs.so.0"
+              "/usr/local/lib/quickjs/libquickjs.so"
+              "/usr/lib/libquickjs.so"
+              "/usr/lib/quickjs/libquickjs.so"))))
 
   ;; Try names in order and report every candidate when none can be loaded.
   (define (load-first-shared-object! who candidates)

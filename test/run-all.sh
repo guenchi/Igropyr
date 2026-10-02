@@ -327,6 +327,11 @@ IGROPYR_INJECT=on IGROPYR_CONTRACTS=full "$scheme_bin" --script test/node.sc
 # process through durable's traced fsync/rename sequence
 "$scheme_bin" --script test/conv-record.sc
 "$scheme_bin" --script test/tls.sc
+# pure: the shared-library candidate lists for every OS, read on any host
+"$scheme_bin" --script test/platform-candidates.sc
+# open/openat with O_CREAT through the exported bindings; the mode rows are
+# the ones a fixed-arity binding fails on arm64
+"$scheme_bin" --script test/variadic-bindings.sc
 "$scheme_bin" --script test/apple-jws.sc
 # x5c path validation against certificate hierarchies generated per run;
 # needs the openssl CLI, 3.4 or later

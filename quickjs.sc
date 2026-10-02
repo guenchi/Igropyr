@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr quickjs) -- embed a JavaScript engine (QuickJS) in-process, in
 ;;; PURE Scheme: no custom C shim, it binds a stock shared QuickJS library
 ;;; over the FFI. Load a fixed JS bundle at boot, then call its global
@@ -90,43 +104,12 @@
       (load-first-shared-object! 'quickjs
         (append (if explicit (list explicit) '())
                 (let ((e (getenv "IGROPYR_LIBQUICKJS_SO"))) (if e (list e) '()))
-                ;; Two upstreams, two library names: bellard/quickjs ships
-                ;; libquickjs, quickjs-ng ships libqjs. FreeBSD's packages
-                ;; install either straight under lib/, not in a quickjs/
-                ;; subdirectory.
-                ;;
-                ;; libqjs FIRST, everywhere. bellard's build alone does not
-                ;; satisfy bind! (see the JS_FreeValue check there), and
-                ;; on a machine
-                ;; carrying both builds the old order dlopened bellard's
-                ;; libquickjs first. That fails the bind -- and it fails it
-                ;; AFTER the library is in the process's global symbol
-                ;; namespace, where Chez's foreign-procedure resolves from.
-                ;; Falling through to the next candidate would then be worse
-                ;; than stopping: JS_NewRuntime would still resolve to the
-                ;; first library loaded while JS_FreeValue came from the
-                ;; second, which is a mixed-ABI free on every value. The only
-                ;; safe order is to look for the right one first.
-                ;; Grouped by LIBRARY, not by how the name is written: EVERY
-                ;; libqjs candidate, bare and absolute, comes before the
-                ;; first libquickjs one. Interleaving them is not enough and
-                ;; was measured not to be -- a bare "libqjs.dylib" does not
-                ;; resolve where the library lives outside the dynamic
-                ;; loader's default path (/opt/homebrew/lib on macOS), so a
-                ;; bare "libquickjs.dylib" sitting anywhere on the search
-                ;; path still won.
-                (list "libqjs.dylib" "libqjs.so"
-                      "/opt/homebrew/lib/libqjs.dylib"
-                      "/usr/local/lib/libqjs.so"
-                      "/usr/local/lib/libqjs.so.0"
-                      "/usr/lib/libqjs.so"
-                      "libquickjs.dylib" "libquickjs.so"
-                      "/opt/homebrew/lib/quickjs/libquickjs.dylib"
-                      "/usr/local/lib/libquickjs.so"
-                      "/usr/local/lib/libquickjs.so.0"
-                      "/usr/local/lib/quickjs/libquickjs.so"
-                      "/usr/lib/libquickjs.so"
-                      "/usr/lib/quickjs/libquickjs.so")))
+                ;; Then (igropyr platform)'s list. ITS ORDER IS LOAD-BEARING:
+                ;; every libqjs candidate comes before the first libquickjs
+                ;; one, because a libquickjs loaded first fails bind! after
+                ;; its symbols are already in the process -- the reason is
+                ;; written beside quickjs-candidates.
+                (quickjs-candidates platform-os)))
       (set! so-loaded #t)))
 
   (define _memcpy #f)
@@ -174,16 +157,16 @@
       ;; a narrower set of usable builds in exchange for deleting that
       ;; out-of-bounds read.
       ;; Refuse loudly here rather than silently taking a different path.
-      ;; NOTE WHAT THIS ASKS. foreign-entry? resolves in the PROCESS's
-      ;; global symbol namespace, not in the library just loaded -- the
-      ;; same namespace whose hazards the candidate-order comment above
-      ;; describes. The question is therefore whether JS_FreeValue is
-      ;; visible AT ALL, by whoever made it so. If nothing else has, this
-      ;; is the library just loaded and the two coincide. If something
-      ;; else already has -- an ng loaded earlier, a shim, any DSO
-      ;; exporting that name -- this passes on that one's export while
-      ;; the other entry points may resolve elsewhere, which is the
-      ;; mixed-ABI hazard described up there.
+      ;; NOTE WHAT THIS ASKS. foreign-entry? resolves in the PROCESS's global
+      ;; symbol namespace, not in the library just loaded -- the same
+      ;; namespace whose hazards the candidate-order comment at (igropyr
+      ;; platform)'s quickjs-candidates describes. The question is therefore
+      ;; whether JS_FreeValue is visible AT ALL, by whoever made it so. If
+      ;; nothing else has, this is the library just loaded and the two
+      ;; coincide. If something else already has -- an ng loaded earlier, a
+      ;; shim, any DSO exporting that name -- this passes on that one's export
+      ;; while the other entry points may resolve elsewhere, which is the
+      ;; mixed-ABI hazard described there.
       (unless (foreign-entry? "JS_FreeValue")
         (assertion-violation 'qjs-boot!
           (string-append

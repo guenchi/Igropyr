@@ -77,11 +77,9 @@
   (define shared-objects
     (begin
       (ensure-supported-platform!)
-      (load-first-shared-object! 'libuv
-        (case platform-os
-          ((macos) '("/opt/homebrew/lib/libuv.1.dylib" "libuv.1.dylib" "libuv.dylib"))
-          ((freebsd) '("/usr/local/lib/libuv.so.1" "libuv.so.1" "libuv.so"))
-          (else '("libuv.so.1" "libuv.so"))))
+      ;; The list is (igropyr platform)'s, which names every Homebrew
+      ;; prefix; this file spells none of its own.
+      (load-first-shared-object! 'libuv (libuv-candidates platform-os))
       (load-first-shared-object! 'libc
         (case platform-os
           ((macos) '("libSystem.B.dylib" "libSystem.dylib"))
@@ -221,8 +219,18 @@
   (define memcpy-from-c  (foreign-procedure "memcpy" (u8* void* size_t) void*))
   (define memcpy-to-c    (foreign-procedure "memcpy" (void* u8* size_t) void*))
   (define memcpy-cc      (foreign-procedure "memcpy" (void* void* size_t) void*))
-  (define c-open          (foreign-procedure "open" (string int int) int))
-  (define c-openat        (foreign-procedure "openat" (int string int int) int))
+  ;; open(2) AND openat(2) ARE VARIADIC: mode is in the `...`, after two
+  ;; named arguments for open and three for openat. Declared with fixed
+  ;; arity, the mode went where a named argument goes -- on arm64 macOS, a
+  ;; register -- while the callee read it from the stack, so a file created
+  ;; with O_CREAT got whatever was there: 0o010 asked for 0o600 or 0o640,
+  ;; measured on arm64 macOS. (__varargs_after n) passes it as a variadic
+  ;; argument. x86_64 passes both kinds alike, which is why it never
+  ;; showed there.
+  (define c-open
+    (foreign-procedure (__varargs_after 2) "open" (string int int) int))
+  (define c-openat
+    (foreign-procedure (__varargs_after 3) "openat" (int string int int) int))
   (define c-close         (foreign-procedure "close" (int) int))
   (define uv-fileno       (foreign-procedure "uv_fileno" (void* void*) int))
   (define c-getsockopt    (foreign-procedure "getsockopt"

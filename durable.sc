@@ -120,30 +120,29 @@
       'igropyr-durable
       '("libc.dylib" "libc.so.7" "libc.so.6" "libc.so")))
 
-  ;; THIS DECLARATION CANNOT CARRY A MODE, AND open(2) IS VARIADIC.
-  ;; Only the first two arguments are named in C; `mode` lives in the
-  ;; `...`, so it is passed the way a variadic argument is passed. A
-  ;; fixed-arity FFI declaration passes the third argument the way a
-  ;; NAMED one goes -- on arm64, in a register -- while the callee reads
-  ;; it with va_arg, from the stack. The mode that arrives is whatever
-  ;; was there.
+  ;; open(2) AND fcntl(2) ARE VARIADIC, AND ARE DECLARED SO. Only the
+  ;; first two arguments are named in C; open's mode and fcntl's argument
+  ;; live in the `...`. A fixed-arity FFI declaration passes the third
+  ;; argument the way a NAMED one goes -- on arm64 macOS, in a register --
+  ;; while the callee reads it with va_arg from the stack, as Apple's arm64
+  ;; ABI passes variadic arguments, and gets whatever was there: open with
+  ;; O_CREAT, asked for 0644, created files 0o010, measured twice
+  ;; independently on arm64 macOS. (__varargs_after 2) passes the third
+  ;; argument as a variadic one.
   ;;
-  ;; Measured twice independently, on macOS 15 arm64 and in a consumer's
-  ;; own arm64 test, both asking for 0644 and both getting 0o010: a file
-  ;; created --x------, which its own owner cannot read back. The symptom
-  ;; does not look like a calling-convention bug, it looks like the
-  ;; filesystem is broken, which is why this note exists.
-  ;;
-  ;; SAFE TODAY BECAUSE NOTHING CREATES THROUGH IT. The one caller passes
-  ;; O_RDONLY, and mode is not read unless O_CREAT (or O_TMPFILE) is in
-  ;; the flags. Adding a creating call here is the change that breaks it.
-  ;; If one is ever needed: use libuv's uv_fs_open, whose signature takes
-  ;; mode as a real fixed parameter, or open with mode 0 and fchmod
-  ;; afterwards.
-  (define c-open  (foreign-procedure "open"  (string int int) int))
+  ;; TODAY A TRIPWIRE, NOT A MEASUREMENT. The one open passes O_RDONLY, and
+  ;; mode is not read without O_CREAT (or O_TMPFILE); the one fcntl is
+  ;; F_FULLFSYNC, which takes no argument. So no cell can turn either
+  ;; declaration red: the convention is right, and nothing here would show
+  ;; it if it were not. It is declared correctly so that the next caller --
+  ;; a creating open, an fcntl that reads its argument -- is not the one
+  ;; that finds out.
+  (define c-open
+    (foreign-procedure (__varargs_after 2) "open" (string int int) int))
   (define c-close (foreign-procedure "close" (int) int))
   (define c-fsync (foreign-procedure "fsync" (int) int))
-  (define c-fcntl (foreign-procedure "fcntl" (int int int) int))
+  (define c-fcntl
+    (foreign-procedure (__varargs_after 2) "fcntl" (int int int) int))
 
   ;; MEASURED, not remembered -- compiled against <fcntl.h> on each
   ;; platform rather than taken from memory or from a table on the web:
