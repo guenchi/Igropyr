@@ -332,6 +332,12 @@ IGROPYR_INJECT=on IGROPYR_CONTRACTS=full "$scheme_bin" --script test/node.sc
 # open/openat with O_CREAT through the exported bindings; the mode rows are
 # the ones a fixed-arity binding fails on arm64
 "$scheme_bin" --script test/variadic-bindings.sc
+# the HTTP client's grammar: the method as a token, the status line's version
+# and three-digit code, hex chunk sizes; buffered and streaming (port 18851)
+"$scheme_bin" --script test/http-client-syntax.sc
+# the WebSocket client's handshake and close handling against recording
+# servers (ports 18852, 18853)
+"$scheme_bin" --script test/ws-client-protocol.sc
 "$scheme_bin" --script test/apple-jws.sc
 # x5c path validation against certificate hierarchies generated per run;
 # needs the openssl CLI, 3.4 or later

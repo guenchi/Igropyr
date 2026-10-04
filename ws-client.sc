@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr ws-client) -- outbound WebSocket client.
 ;;;
 ;;; Connects, performs the RFC 6455 upgrade handshake, and returns a ws
@@ -118,11 +132,56 @@
                       (not (= n 127))
                       (loop (+ i 1))))))))
 
+  ;; Sec-WebSocket-Extensions IS MANAGED BECAUSE NO EXTENSION IS
+  ;; IMPLEMENTED: a caller could offer one, and a server that accepted it
+  ;; would then send frames this client cannot read. Sec-WebSocket-Protocol
+  ;; is NOT managed: a subprotocol changes nothing about framing, the caller
+  ;; may offer some, and the 101 is checked against what was offered.
   (define (managed-handshake-header? name)
     (exists (lambda (reserved) (string-ci=? name reserved))
             '("Host" "Upgrade" "Connection"
               "Sec-WebSocket-Key" "Sec-WebSocket-Version"
+              "Sec-WebSocket-Extensions"
               "Content-Length" "Transfer-Encoding")))
+
+  ;; "a, b" -> ("a" "b"): the elements of a comma-separated field value,
+  ;; each with surrounding whitespace removed.
+  (define (comma-elements value)
+    (let ((n (string-length value)))
+      (let loop ((start 0) (i 0) (acc '()))
+        (cond
+          ((= i n) (reverse (cons (trim-ows (substring value start i)) acc)))
+          ((char=? (string-ref value i) #\,)
+           (loop (+ i 1) (+ i 1)
+                 (cons (trim-ows (substring value start i)) acc)))
+          (else (loop start (+ i 1) acc))))))
+
+  ;; The subprotocols this request offers: every element of every
+  ;; Sec-WebSocket-Protocol in the extra headers, in order. Each must be a
+  ;; token and all must be distinct (RFC 6455 4.1), across repeated fields as
+  ;; well as within one; anything else is refused here, before DNS, since a
+  ;; server could not be held to an offer that is not one. Compared
+  ;; case-sensitively, here and against the 101, as the RFC's tokens are.
+  (define (offered-subprotocols extra-headers)
+    (let ((offered
+           (apply append
+             (map (lambda (h)
+                    (if (string-ci=? (car h) "Sec-WebSocket-Protocol")
+                        (let ((xs (comma-elements (cdr h))))
+                          (unless (for-all header-name-safe? xs)
+                            (fail (string-append
+                                    "invalid Sec-WebSocket-Protocol: "
+                                    "each subprotocol must be a token")))
+                          xs)
+                        '()))
+                  extra-headers))))
+      (let loop ((xs offered))
+        (unless (null? xs)
+          (when (member (car xs) (cdr xs))
+            (fail (string-append "invalid Sec-WebSocket-Protocol: "
+                                 "subprotocol offered twice: " (car xs))))
+          (loop (cdr xs))))
+      offered))
 
   ;; Consume, and close, whatever an earlier timed-out attempt left behind.
   ;; A connect that lands after its caller gave up is a live socket nobody
@@ -154,11 +213,23 @@
                                ": control characters are not allowed"))))
       extra-headers))
 
-  (define (handshake-request host path key extra-headers)
+  ;; THE Host FIELD'S AUTHORITY, made in this one place (RFC 6455 4.1, RFC
+  ;; 9110 7.2): the host, and the port when it is not 80, the default for
+  ;; ws://. A server or proxy that routes on the authority otherwise sees
+  ;; the default port for a connection made to another. parse-ws-url does
+  ;; not handle bracketed IPv6 literals -- it splits the authority at the
+  ;; first colon -- and when it does, the brackets belong in this
+  ;; procedure.
+  (define (ws-authority host port)
+    (if (= port default-port)
+        host
+        (string-append host ":" (number->string port))))
+
+  (define (handshake-request authority path key extra-headers)
     (string->utf8
       (string-append
         "GET " path " HTTP/1.1\r\n"
-        "Host: " host "\r\n"
+        "Host: " authority "\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Key: " key "\r\n"
@@ -209,7 +280,14 @@
              (and eol
                   (let* ((line (substring text pos eol))
                          (colon (string-index line #\: 0)))
+                    ;; THE NAME MUST BE A TOKEN, so nothing -- not even a
+                    ;; space before the colon -- separates it from the
+                    ;; colon (RFC 9112 5.1). A name with a trailing space
+                    ;; would otherwise be stored under a different key and
+                    ;; slip past every check below that looks fields up by
+                    ;; name.
                     (and colon (> colon 0)
+                         (header-name-safe? (substring line 0 colon))
                          (loop (+ eol 2)
                            (cons (cons (string-downcase (substring line 0 colon))
                                        (trim-ows
@@ -242,7 +320,7 @@
   ;; RFC 6455 4.1: the response must be an HTTP/1.1 101 upgrade, nominate
   ;; websocket/Upgrade in its token fields, and carry exactly one Accept
   ;; field whose complete value proves possession of this request's key.
-  (define (verify-response head-bv key)
+  (define (verify-response head-bv key offered)
     (guard (e (#t #f))
       (let* ((text (utf8->string head-bv))
              (status-end (string-crlf-index text 0)))
@@ -256,7 +334,23 @@
                            (response-header-values
                              headers "sec-websocket-accept")))
                       (and (= (length accepts) 1)
-                           (string=? (car accepts) (ws-accept-key key))))))))))
+                           (string=? (car accepts) (ws-accept-key key))))
+                    ;; ONLY WHAT WAS OFFERED MAY BE SELECTED (RFC 6455 4.1).
+                    ;; A subprotocol: none, or exactly one value that is one
+                    ;; of this request's offers -- with nothing offered, any
+                    ;; is refused. An extension: this client offers none,
+                    ;; and one such as permessage-deflate would change how
+                    ;; every frame after this must be read; a field whose
+                    ;; values are all empty selects nothing and is accepted.
+                    (let ((selected (response-header-values
+                                      headers "sec-websocket-protocol")))
+                      (or (null? selected)
+                          (and (= (length selected) 1)
+                               (member (car selected) offered)
+                               #t)))
+                    (for-all (lambda (v) (string=? v ""))
+                             (response-header-values
+                               headers "sec-websocket-extensions"))))))))
 
   (define max-handshake-header 16384)   ; cap on the 101 response headers
 
@@ -267,17 +361,23 @@
   ;; inside the window holds this process and its connection open forever
   ;; at no cost to itself -- slowloris, against a client. The server bounds
   ;; the same shape with request-deadline-ms for the same reason.
-  (define (await-handshake c key buf deadline)
+  (define (await-handshake c key offered buf deadline)
     (let ((left (- deadline (now-ms))))
       (if (<= left 0)
           (begin (tcp-close! c) (fail "handshake timeout"))
-          (await-handshake* c key buf deadline left))))
+          (await-handshake* c key offered buf deadline left))))
 
-  (define (await-handshake* c key buf deadline left)
+  (define (await-handshake* c key offered buf deadline left)
     (let ((hend (inbuf-find-header-end buf)))
       (cond
+        ;; THE CEILING APPLIES TO A COMPLETE HEAD TOO. Checking it only
+        ;; while still accumulating let a peer that sent the whole head in
+        ;; one segment past it. The head is counted up to and including its
+        ;; terminator; bytes after it are the first frame and are not.
+        ((and hend (> (fx+ hend 4) max-handshake-header))
+         (tcp-close! c) (fail "handshake header too large"))
         (hend
-         (if (verify-response (inbuf-sub buf 0 (fx+ hend 2)) key)
+         (if (verify-response (inbuf-sub buf 0 (fx+ hend 2)) key offered)
              ;; leftover bytes after \r\n\r\n belong to the ws stream
              (make-ws-client c (inbuf-sub buf (fx+ hend 4) (inbuf-length buf)))
              (begin (tcp-close! c) (fail "handshake rejected"))))
@@ -288,7 +388,7 @@
                      (tcp-close! c) (fail "handshake timeout"))
            (`#(tcp-data ,bv)
              (inbuf-append! buf bv)
-             (await-handshake c key buf deadline))
+             (await-handshake c key offered buf deadline))
            (`#(tcp-eof) (tcp-close! c) (fail "connection closed during handshake"))
            (`#(tcp-error ,e) (tcp-close! c) (fail "connection error")))))))
 
@@ -305,6 +405,7 @@
         ;; Validate before DNS or connect so attacker-controlled request
         ;; metadata cannot become a second header or request on the wire.
         (validate-handshake-request! host path extra-headers)
+        (let ((offered (offered-subprotocols extra-headers)))
         ;; ONE SESSION PER PROCESS -- see ws-recv in (igropyr websocket).
         ;; DNS, connect and socket events all name this process and carry no
         ;; connection identity, so two sessions in one process consume each
@@ -330,8 +431,10 @@
                 (`#(tcp-connected ,c)
                   (tcp-read-start! c)
                   (let ((key (make-ws-key)))
-                    (tcp-write! c (handshake-request host path key extra-headers) #f)
-                    (await-handshake c key (make-inbuf) deadline)))
+                    (tcp-write! c (handshake-request (ws-authority host port)
+                                                     path key extra-headers)
+                                #f)
+                    (await-handshake c key offered (make-inbuf) deadline)))
                 (`#(tcp-connect-failed ,e) (fail (uv-strerror e)))))
-            (`#(dns-failed ,e) (fail "dns resolution failed")))))))
+            (`#(dns-failed ,e) (fail "dns resolution failed"))))))))
 )

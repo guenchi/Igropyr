@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr http-client) -- non-blocking outbound HTTP/1.1 client.
 ;;;
 ;;; Same actor model as the database clients: each request runs in its
@@ -138,6 +152,23 @@
 
   (define (fail msg) (raise (vector 'http-client-error msg)))
 
+  ;; RFC 9112 3: method = token, and RFC 9110 5.6.2: token = 1*tchar,
+  ;; tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+  ;; "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA. The method's text goes
+  ;; onto the request line as it is, so anything outside this set -- a
+  ;; space, a tab, CR or LF, a delimiter -- would change the request on the
+  ;; wire. Extension methods (PURGE, ...) are tokens and pass.
+  (define (http-token? s)
+    (and (fx> (string-length s) 0)
+         (let loop ((i 0))
+           (or (fx= i (string-length s))
+               (let ((c (string-ref s i)))
+                 (and (or (char<=? #\a c #\z) (char<=? #\A c #\Z)
+                          (char<=? #\0 c #\9)
+                          (memv c '(#\! #\# #\$ #\% #\& #\' #\* #\+ #\-
+                                    #\. #\^ #\_ #\` #\| #\~)))
+                      (loop (fx+ i 1))))))))
+
   ;; ---- URL parsing ----------------------------------------------------
 
   (define (string-index s ch from)
@@ -275,18 +306,33 @@
     (let ((p (assq name (response-headers r))))
       (and p (cdr p))))
 
+  ;; RFC 9112 2.3: HTTP-version = "HTTP" "/" DIGIT "." DIGIT, and the name
+  ;; is case-sensitive. Only major version 1 is a reply this HTTP/1.1
+  ;; client can read; HTTP/2 is not even this shape.
+  (define (http-1x-version? v)
+    (and (fx= (string-length v) 8)
+         (string=? (substring v 0 7) "HTTP/1.")
+         (char<=? #\0 (string-ref v 7) #\9)))
+
+  ;; -> the status code, or #f when the version is not HTTP/1.D or what
+  ;; follows it is not exactly three digits.
+  ;;
+  ;; THE VERSION IS CHECKED HERE, where the status is, because the buffered
+  ;; and the streaming read both take the head through this one procedure,
+  ;; and #f is what they already refuse as a malformed line.
   (define (parse-status-line bv end)
     ;; "HTTP/1.1 200 OK"
     (let* ((s (utf8->string (bv-sub bv 0 end)))
            (sp1 (string-index s #\space 0)))
       (and sp1
-           (let ((sp2 (string-index s #\space (+ sp1 1))))
-             ;; the status code is the server's text; three digits is
-             ;; every code the protocol defines
-             (digits->exact
-               (if sp2 (substring s (+ sp1 1) sp2)
-                   (substring s (+ sp1 1) (string-length s)))
-               3)))))
+           (http-1x-version? (substring s 0 sp1))
+           (let* ((sp2 (string-index s #\space (+ sp1 1)))
+                  (code (if sp2 (substring s (+ sp1 1) sp2)
+                            (substring s (+ sp1 1) (string-length s)))))
+             ;; status-code = 3DIGIT (RFC 9112 4): exactly three, so "20"
+             ;; is refused as well as "2000"
+             (and (fx= (string-length code) 3)
+                  (digits->exact code 3))))))
 
   ;; the version token of a status line: "HTTP/1.1 200 OK" -> "HTTP/1.1"
   (define (parse-http-version bv end)
@@ -1237,6 +1283,10 @@
            ;; internal: set by the stale retry so it dials rather than
            ;; taking another connection that may be equally stale
            (fresh-only? (and (assq '%fresh opts) #t)))
+      ;; FIRST, before the URL, DNS or any connection, and on the one entry
+      ;; that both the buffered and the streaming request go through.
+      (unless (and (symbol? method) (http-token? (symbol->string method)))
+        (fail "method must be an HTTP token (RFC 9112 3)"))
       (when on-chunk
         (unless (procedure? on-chunk)
           (fail "on-chunk must be a procedure")))

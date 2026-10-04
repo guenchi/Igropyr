@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr websocket) -- WebSocket (RFC 6455) codec and session primitives.
 ;;;
 ;;; Pure protocol layer: SHA-1 + base64 for the upgrade handshake key,
@@ -405,10 +419,21 @@
                          ((fx= n 1) (ws-fail! w 1002))
                          (else
                           (let ((code (fx+ (fxsll (bytevector-u8-ref payload 0) 8)
-                                           (bytevector-u8-ref payload 1))))
-                            (if (valid-close-code? code)
-                                (ws-fail! w code)           ; echo it back
-                                (ws-fail! w 1002))))))
+                                           (bytevector-u8-ref payload 1)))
+                                (reason (let ((r (make-bytevector (fx- n 2))))
+                                          (bytevector-copy! payload 2 r 0
+                                                            (fx- n 2))
+                                          r)))
+                            (cond
+                              ((not (valid-close-code? code)) (ws-fail! w 1002))
+                              ;; THE REASON MUST BE UTF-8 (RFC 6455 5.5.1),
+                              ;; and a close whose reason is not is a data
+                              ;; error: answered 1007, as a text frame with
+                              ;; invalid UTF-8 is, rather than echoed as a
+                              ;; clean close.
+                              ((not (valid-utf8? reason)) (ws-fail! w 1007))
+                              ;; a valid code is echoed back
+                              (else (ws-fail! w code)))))))
                      (vector 'close))
                     ((0)                                    ; continuation frame
                      (cond
