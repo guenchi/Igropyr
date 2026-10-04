@@ -9,25 +9,21 @@ set -eu
 # runner used to sit one level up and name every script through the
 # igropyr symlink; under that directory those opens resolved to nothing,
 # and the suites that do it died on a missing-file error rather than
-# running. Library resolution does not need the parent: the symlink
-# inside the repository answers (igropyr ...) from here.
+# running. Library resolution does not need the parent either: test/env.sh
+# maps the library name to this tree.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-if [ -n "${SCHEME_BIN:-}" ]; then
-  scheme_bin="$SCHEME_BIN"
-elif command -v chez >/dev/null 2>&1; then
-  scheme_bin=chez
-else
-  scheme_bin=scheme
-fi
-
-# Suites that start child processes read this rather than hardcoding a
-# name. Without it they invoke `scheme` while the run itself may be using
-# `chez` or $SCHEME_BIN, and the child simply never starts -- which the
-# parent reports as whatever it was waiting for timing out, never as a
-# missing interpreter.
-export SCHEME_BIN="$scheme_bin"
+# THE ENVIRONMENT IS test/env.sh's, shared with anyone running one suite by
+# hand: the interpreter, the library-name mapping (no hand-made link needed)
+# and the object-free extension list. Suites that start child processes
+# read SCHEME_BIN rather than hardcoding a name. Without it they invoke
+# `scheme` while the run itself may be using `chez` or $SCHEME_BIN, and the
+# child simply never starts -- which the parent reports as whatever it was
+# waiting for timing out, never as a missing interpreter.
+IGROPYR_ROOT="$ROOT"
+. "$ROOT/test/env.sh"
+scheme_bin="$SCHEME_BIN"
 
 # OPTIONAL LOCAL CREDENTIALS, sourced if present. The database suites gate
 # themselves on IGROPYR_*_TEST and otherwise skip, which is right for a
@@ -39,16 +35,6 @@ if [ -f "${IGROPYR_TEST_ENV:-$HOME/.igropyr-test-env}" ]; then
   . "${IGROPYR_TEST_ENV:-$HOME/.igropyr-test-env}"
 fi
 
-export CHEZSCHEMELIBDIRS=.
-# THE OBJECT EXTENSION POINTS AT A SUFFIX THAT DOES NOT EXIST, so a
-# stale .so can never answer for a source file. Chez picks by timestamp,
-# which is why this has not bitten yet -- every edited source here is
-# newer than the objects left in the tree -- but "has not bitten" is not
-# a property: an object built after its source, from a tree that has
-# since moved, wins and nothing says so. Leaving the object extension
-# EMPTY does not do this; it still resolves to .so (measured). Naming an
-# extension nothing produces is what excludes them.
-export CHEZSCHEMELIBEXTS=.chezscheme.sls::.no-obj:.ss::.no-obj:.sls::.no-obj:.scm::.no-obj:.sch::.no-obj:.sc::.no-obj
 
 # A RUN THAT STOPPED EARLY MUST NOT READ LIKE A RUN THAT PASSED. set -e
 # is deliberate -- the suites are serial and expensive, and the first red
@@ -58,7 +44,7 @@ export CHEZSCHEMELIBEXTS=.chezscheme.sls::.no-obj:.ss::.no-obj:.sls::.no-obj:.sc
 # quoted as a whole-suite result more than once, and the suites it never
 # reached were counted as fine. This banner is the only thing standing
 # between those two readings.
-trap 'st=$?; if [ "$st" -ne 0 ]; then
+trap 'st=$?; rm -rf "$IGROPYR_LIBMAP"; if [ "$st" -ne 0 ]; then
   echo ""
   echo "=== PARTIAL RUN: STOPPED AT THE SUITE ABOVE (exit $st) ==="
   echo "=== The suites after it were NOT RUN. This is not a whole-suite"
@@ -79,6 +65,9 @@ fi' EXIT
 #
 # Scope: it cannot see a listed suite that has lost a section -- different hole.
 sh test/listed-suites.sh
+# a fresh archive of this tree, under another name and a path with a space,
+# resolves the libraries through test/env.sh alone -- no hand-made link
+sh test/clean-checkout.sh
 
 "$scheme_bin" --script test/import-all.sc
 # the names applications import, each named ONE BY ONE: a rename that
