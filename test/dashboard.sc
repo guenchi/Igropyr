@@ -310,7 +310,7 @@
                                   `((headers . (("Authorization"
                                                  . ,(string-append
                                                       "Bearer "
-                                                      hdr-token-good))))))))))))))))))
+                                                      hdr-token-good)))))))))))))))))
 
       ;; ---- injection guard: a quote in the data path is rejected ----
       (check "quote-in-path-rejected"
