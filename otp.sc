@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr otp) -- worker pool with Let-It-Crash fault tolerance.
 ;;;
 ;;; A fixed pool of worker processes executes tasks handed in by reader
@@ -74,7 +88,7 @@
 ;;; (igropyr node) for both in full.
 
 (library (igropyr otp)
-  (export start-worker-pool pool-stats)
+  (export start-worker-pool pool-stats pool-stop!)
   (import (chezscheme) (igropyr actor)
           (only (igropyr libuv) now-ms))
 
@@ -360,6 +374,22 @@
           (handle-down w reason)
           (drain!)))
       (loop)))
+
+  ;; STOP A POOL: its supervisor, and through the supervisor its workers
+  ;; and its ticker, each of which monitors the supervisor and returns when
+  ;; it goes (see ticker and worker above). Idempotent: a supervisor that
+  ;; is already gone is left alone.
+  ;;
+  ;; A POOL MARKED critical! MUST BE UNMARKED FIRST, with uncritical!, or
+  ;; this ends the image with exit 70; the caller is the one that knows
+  ;; whether it marked it.
+  ;;
+  ;; What it does not do is interrupt a worker that is inside run-task: that
+  ;; worker returns when the task does. A caller that wants no task running
+  ;; stops the work first -- http-shutdown! drains the pool before this.
+  (define (pool-stop! sup)
+    (when (process-alive? sup)
+      (kill sup 'pool-stopped)))
 
   ;; synchronous stats snapshot from the supervisor
   (define stats-ref 0)

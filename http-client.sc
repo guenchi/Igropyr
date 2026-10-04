@@ -1157,8 +1157,27 @@
           (last-chunk (box (now-ms)))
           (buf (make-inbuf)))
       (tcp-write! c (if codec ((vector-ref codec 0) req) req) #f)
-      (client-loop c self ref buf 'head idle codec emit max-resp method
-                   deadline vbox progress last-chunk (lambda (d) (set! disp d)))
+      ;; A RAISE IS ANSWERED HERE, FOR THIS REQUEST. On a reused connection
+      ;; the only guard above this is the one this process was spawned with,
+      ;; and it answers the FIRST request this connection served -- its
+      ;; caller, its ref. A later request's on-chunk handler raising then
+      ;; ended the keeper reporting to a stale ref; the current caller saw
+      ;; only a DOWN, read it as a pooled connection that had gone stale
+      ;; before starting, and sent the request again on a fresh connection:
+      ;; the handler ran twice and the server saw the request twice. Caught
+      ;; here, the raise becomes this request's http-error, the connection
+      ;; is closed rather than kept (disp stays 'close), and nothing is
+      ;; retried, because something was received.
+      (guard (e (#t (send self
+                      (vector 'http-error ref
+                        (if (and (vector? e) (fx= (vector-length e) 2)
+                                 (eq? (vector-ref e 0) 'http-client-error)
+                                 (string? (vector-ref e 1)))
+                            (vector-ref e 1)
+                            "request failed")))))
+        (client-loop c self ref buf 'head idle codec emit max-resp method
+                     deadline vbox progress last-chunk
+                     (lambda (d) (set! disp d))))
       ;; client-loop has already sent its answer to us
       (receive (after 0 (void))
         (`#(http-reply ,@ref ,r) (send real-caller (vector 'http-reply ref r)))
@@ -1327,6 +1346,16 @@
                  ;; one. Taken BEFORE the keeper is spawned, so a hit costs
                  ;; no process at all.
                  (pooled (and reuse? (not fresh-only?) (take-pooled! origin)))
+                 ;; SET THE MOMENT THE ON-CHUNK HANDLER IS FIRST CALLED, by the
+                 ;; wrapper below, which is what the connection process runs.
+                 ;; Once it is set the request has had an effect this caller
+                 ;; can see, and it is never sent again, whatever happens to
+                 ;; the connection after.
+                 (handler-called (box #f))
+                 (emit (and on-chunk
+                            (lambda (bv)
+                              (set-box! handler-called #t)
+                              (on-chunk bv))))
                  (pid (or
                         pooled
                         (spawn
@@ -1372,8 +1401,9 @@
                                           (set! codec (https-connector c host (setup-left))))
                                         (set! stat-dialed (+ stat-dialed 1))
                                         (let ((disp (keeper-serve c codec origin #f ref caller
-                                                                  req idle on-chunk max-resp
-                                                                  method deadline)))
+                                                                  req idle emit
+                                                                  max-resp method
+                                                                  deadline)))
                                           (if (and reuse? (eq? disp 'reuse))
                                               (keeper-idle c codec origin)
                                               (keeper-bye! c codec origin))))))
@@ -1395,8 +1425,22 @@
             ;; The pooled connection was already gone. Nothing was received,
             ;; so no server acted on this request and it can be sent again --
             ;; on a fresh connection, and only once.
+            ;; NOT ONCE THE HANDLER HAS SEEN ANYTHING: a request whose
+            ;; on-chunk ran has been answered, at least in part, and sending
+            ;; it again would run the handler again.
+            ;;
+            ;; Reached only when the keeper dies after delivering: a failure
+            ;; after bytes arrived is reported by the keeper as an error,
+            ;; which is never retried, and a raise from the handler is
+            ;; answered by the keeper's per-request guard. The keeper dies
+            ;; instead when, for example, the on-chunk handler -- which runs
+            ;; in the keeper's process -- kills that process; this check is
+            ;; what keeps that from being sent again.
             (define (retry-fresh!)
               (set! stat-stale (+ stat-stale 1))
+              (when (unbox handler-called)
+                (raise (vector 'http-client-error
+                         "connection failed after on-chunk had been called; not retried")))
               (if (replayable? method body)
                   (begin
                     (set! stat-retried (+ stat-retried 1))
@@ -1408,7 +1452,7 @@
             ;; a pooled keeper is already running: hand it the job. After
             ;; the internal defines, which R6RS requires to come first.
             (when pooled
-              (send pid (vector 'hc-run ref caller req idle on-chunk
+              (send pid (vector 'hc-run ref caller req idle emit
                                 max-resp method deadline)))
             ;; The total deadline is enforced INSIDE the connection process
             ;; (see `deadline` above), which answers http-error and cleans up

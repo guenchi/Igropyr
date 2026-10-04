@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr mysql) -- non-blocking MySQL client (protocol 4.1, text mode).
 ;;;
 ;;; One green process per connection; callers park in receive while the
@@ -416,18 +430,30 @@
   ;; key (opts 'server-public-key, a PEM string) -- then we never trust a
   ;; key from the wire -- or explicitly opts in with 'allow-insecure-auth
   ;; (appropriate over TLS or a trusted local socket).
-  (define (full-auth! c buf password nonce seq opts deadline)
+  ;;
+  ;; next-seq IS THE SEQUENCE NUMBER OF THE NEXT PACKET THIS CLIENT SENDS --
+  ;; the server's AuthMoreData number plus one, as the caller computes it.
+  ;; With a pinned key that next packet is the encrypted password itself, so
+  ;; it goes at next-seq; it used to go one higher, and a server reading the
+  ;; sequence strictly rejected the exchange. Fetching the key spends
+  ;; next-seq on the request, and the password then follows the number of
+  ;; the key packet the server sent back.
+  ;;
+  ;; nonce is the one the server will verify against: the greeting's, or
+  ;; the one an AuthSwitchRequest replaced it with (see auth-loop!).
+  (define (full-auth! c buf password nonce next-seq opts deadline)
     (define pinned (assq-ref opts 'server-public-key))
     (define (encrypt-with n e)
       (let ((plain (bv-xor (bv-append (string->utf8 password) (bytevector 0))
                            nonce)))
-        (send-packet! c (rsa-oaep-encrypt plain n e) (+ seq 1))))
+        (send-packet! c (rsa-oaep-encrypt plain n e) next-seq)))
     (cond
       (pinned
        (let-values (((n e) (parse-rsa-public-key pinned)))
          (encrypt-with n e)))
       ((assq-ref opts 'allow-insecure-auth)
-       (send-packet! c (bytevector 2) seq)          ; request public key
+       ;; request public key
+       (send-packet! c (bytevector 2) next-seq)
        (let-values (((p sq) (next-packet! c buf (lambda () (auth-wait-ms deadline)))))
          (unless (fx= (bytevector-u8-ref p 0) 1)
            (mysql-fail -1 "expected server public key"))
@@ -457,9 +483,15 @@
         (else (assertion-violation 'mysql-connect
                 "'connect-deadline-ms must be a positive exact integer" v)))))
 
-  (define (auth-loop! c buf user password nonce opts deadline)
+  ;; THE LOOP CARRIES THE CURRENT PLUGIN AND NONCE. An AuthSwitchRequest
+  ;; replaces both: the scramble answering it was computed from the new
+  ;; nonce, but the loop went on with the greeting's, so a full
+  ;; authentication after a switch encrypted the password against a nonce
+  ;; the server was no longer using. The sequence is not carried: it is read
+  ;; from each packet as it arrives.
+  (define (auth-loop! c buf user password plugin nonce opts deadline)
     (let ()
-     (let loop ()
+     (let loop ((plugin plugin) (nonce nonce))
       (let-values (((p seq) (next-packet! c buf (lambda () (auth-wait-ms deadline)))))
         (let ((b0 (bytevector-u8-ref p 0)))
           (cond
@@ -468,12 +500,21 @@
             ((fx= b0 1)                            ; AuthMoreData
              (let ((b1 (bytevector-u8-ref p 1)))
                (cond
-                 ((fx= b1 3) (loop))               ; fast path ok; OK follows
-                 ((fx= b1 4)                       ; full auth required
+                 ;; AuthMoreData IS caching_sha2's, fast path and full
+                 ;; authentication alike; under any other plugin it means
+                 ;; nothing, and is refused before either is handled
+                 ((not (string=? plugin "caching_sha2_password"))
+                  (mysql-fail -1 "unexpected auth data"))
+                 ;; fast path ok; OK follows
+                 ((fx= b1 3) (loop plugin nonce))
+                 ;; full auth required
+                 ((fx= b1 4)
                   (if (= 0 (string-length password))
-                      (begin (send-packet! c (bytevector 0) (+ seq 1)) (loop))
-                      (begin (full-auth! c buf password nonce (+ seq 1) opts deadline)
-                             (loop))))
+                      (begin (send-packet! c (bytevector 0) (+ seq 1))
+                             (loop plugin nonce))
+                      (begin (full-auth! c buf password nonce (+ seq 1) opts
+                                         deadline)
+                             (loop plugin nonce))))
                  (else (mysql-fail -1 "unexpected auth data")))))
             ((fx= b0 #xFE)                         ; AuthSwitchRequest
              (let* ((plug-end (or (find-u8 p 1 0) (bytevector-length p)))
@@ -488,10 +529,10 @@
                (cond
                  ((string=? plugin "mysql_native_password")
                   (send-packet! c (scramble-sha1 password nonce2) (+ seq 1))
-                  (loop))
+                  (loop plugin nonce2))
                  ((string=? plugin "caching_sha2_password")
                   (send-packet! c (scramble-sha2 password nonce2) (+ seq 1))
-                  (loop))
+                  (loop plugin nonce2))
                  (else (mysql-fail -1 (string-append "unsupported auth plugin: "
                                                      plugin))))))
             (else (mysql-fail -1 "unexpected packet during auth"))))))))
@@ -515,7 +556,7 @@
                                               "unsupported auth plugin: " plugin))))))
           (send-packet! c (handshake-response user token db plugin) (+ seq 1))
           ;; full-auth path needs the nonce again
-          (auth-loop! c buf user password nonce opts deadline))))))
+          (auth-loop! c buf user password plugin nonce opts deadline))))))
 
   ;; ---- queries ------------------------------------------------------------------------
 

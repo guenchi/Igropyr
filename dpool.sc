@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr dpool) -- a distributed task pool over node links.
 ;;;
 ;;; Spreads tasks across member nodes and runs them concurrently. Built
@@ -39,6 +53,11 @@
 ;;; node death: the node replies with the error, dpool-await raises
 ;;; #(dpool-error task-error id), and the task is NOT re-dispatched --
 ;;; a deterministic crash would only re-crash elsewhere.
+;;;
+;;; A task the WORKER ends -- killed for outstaying task-timeout-ms, or
+;;; otherwise dead without having reported -- is answered too:
+;;; dpool-await raises #(dpool-error task-killed id), from the kill, and
+;;; the task is not re-dispatched (it may have run part way).
 ;;;
 ;;; Wire safety: a task payload and its result must be extended-wire-safe
 ;;; (see (igropyr sexpr)) -- they cross node links.
@@ -106,7 +125,7 @@
   ;; in FIFO order and start as slots free.
   ;; rest: [max-concurrency [task-timeout-ms]]. task-timeout-ms > 0 kills a
   ;; task that has run that long (its slot is then reclaimed by the monitor
-  ;; below and the caller sees a task-error); 0 -- the default -- means a
+  ;; below and the caller sees task-killed); 0 -- the default -- means a
   ;; task may run indefinitely, so a handler that can block forever should
   ;; either carry its own timeout or be given one here.
   (define (dpool-worker-start name handler . rest)
@@ -124,8 +143,10 @@
           (lambda ()
             (let ((worker self)          ; tasks send #(slot-free ,self) back
                   (running 0)
-                  ;; task pid -> #(monitor-ref started-ms); a task occupies a
-                  ;; slot exactly as long as it has an entry here
+                  ;; task pid -> #(monitor-ref started-ms id token rnode rname);
+                  ;; a task occupies a slot exactly as long as it has an
+                  ;; entry here, and the entry carries what is needed to
+                  ;; answer for it if it dies without answering itself
                   (live (make-eq-hashtable))
                   (pf '()) (pb '()))     ; two-list FIFO of tasks over the cap
               (define (penq! x) (set! pb (cons x pb)))
@@ -149,7 +170,8 @@
                                                    (vector 'task-error 'not-serializable)))))
                                    (rsend rnode rname (vector 'dresult id token result))))
                                (send worker (vector 'slot-free me)))))))
-                  (hashtable-set! live p (vector (monitor p) (real-time)))
+                  (hashtable-set! live p (vector (monitor p) (real-time)
+                                                 id token rnode rname))
                   p))
               ;; Release the slot p holds, if it still holds one. Idempotent:
               ;; a task normally reports #(slot-free) and THEN dies, so its
@@ -200,7 +222,35 @@
                   ;; Without this the slot would be occupied forever, and
                   ;; after `cap` such tasks the node would keep ACCEPTING
                   ;; work while executing none of it.
+                  ;;
+                  ;; AND THE COORDINATOR IS TOLD. Freeing the slot alone left
+                  ;; the task in flight there until the caller's own await
+                  ;; window ran out, reported as await-timeout. A task that
+                  ;; still has an entry here never reached its #(slot-free),
+                  ;; which run! sends only after shipping the result, so a
+                  ;; task-killed result goes out under the task's own token.
+                  ;; WHATEVER THE REASON: a handler can end its own process
+                  ;; with `normal` before answering, and that is no answer.
+                  ;; If the task
+                  ;; had shipped its result just before the kill, the
+                  ;; coordinator has already completed the task and drops
+                  ;; this second one as it drops any result for an id no
+                  ;; longer in flight -- silently, and without touching the
+                  ;; topology counters.
+                  ;;
+                  ;; IF THIS SEND RAISES, the task stays in flight at the
+                  ;; coordinator and the caller's await-timeout answers, as
+                  ;; it did for every reaped task before this; the worker
+                  ;; cannot do better, and must not die trying.
                   (`#(DOWN ,p ,reason)
+                    (let ((e (hashtable-ref live p #f)))
+                      (when e
+                        (guard (x (#t (void)))
+                          (rsend (vector-ref e 4) (vector-ref e 5)
+                                 (vector 'dresult (vector-ref e 2)
+                                         (vector-ref e 3)
+                                         (vector 'task-killed
+                                                 (reason-of reason)))))))
                     (release! p)
                     (loop))
                   (`#(check-stuck-tasks)
@@ -563,8 +613,8 @@
           (raise (vector 'dpool-error 'overloaded why))))))
 
   ;; Block for a task's result: the handler's return value, or a raised
-  ;; #(dpool-error ,reason ,id) where reason is task-error | node-down |
-  ;; await-timeout.
+  ;; #(dpool-error ,reason ,id) where reason is task-error | task-killed |
+  ;; node-down | await-timeout.
   ;; Drain the late answer to a previously timed-out await. Its ref can
   ;; never match again (refs are monotonic), so selective receive would
   ;; keep it in this mailbox forever, rescanned by every later receive.

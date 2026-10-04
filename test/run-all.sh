@@ -335,6 +335,18 @@ IGROPYR_INJECT=on IGROPYR_CONTRACTS=full "$scheme_bin" --script test/node.sc
 # the HTTP client's grammar: the method as a token, the status line's version
 # and three-digit code, hex chunk sizes; buffered and streaming (port 18851)
 "$scheme_bin" --script test/http-client-syntax.sc
+# a reused request whose on-chunk handler raised, or that received data before
+# the connection died, is failed and not replayed (port 18855)
+"$scheme_bin" --script test/http-client-replay.sc
+# a failed http-listen leaves no worker pool behind; shutdown drains, stops the
+# pool and answers 503 on connections kept open (port 18854)
+"$scheme_bin" --script test/http-listen-failure.sc
+# a task the worker killed for outstaying its timeout is awaited as task-killed
+# (node port 18097)
+"$scheme_bin" --script test/dpool-timeout.sc
+# caching_sha2 full authentication: packet numbers and the nonce after an
+# auth switch, against a fake server (port 18856)
+"$scheme_bin" --script test/mysql-auth-sequence.sc
 # the WebSocket client's handshake and close handling against recording
 # servers (ports 18852, 18853)
 "$scheme_bin" --script test/ws-client-protocol.sc

@@ -1372,7 +1372,14 @@ Failure mode is per pool, overridable per task: **at-least-once**
 (default; a node death re-dispatches the task — completes for sure, may
 run twice, needs idempotent tasks) or **at-most-once** (a node death
 fails it — never re-run). Exactly-once isn't offered: no message-passing
-system gives both across a crash.
+system gives both across a crash. A handler that raises is awaited as
+`#(dpool-error task-error id)`; a task that ends without answering --
+killed for outstaying its task timeout (`dpool-worker-start`'s optional
+`task-timeout-ms`, after `max-concurrency`), or dying outside the handler
+-- as `#(dpool-error task-killed id)`, as soon as it ends, unless its own
+result arrived first. Neither answer is re-dispatched. If the node is lost
+before the answer arrives, the failure mode above applies instead; an
+answer the worker cannot deliver leaves the caller to its await timeout.
 
 **Automatic discovery** — instead of dialing every peer by hand,
 `(igropyr cluster)` periodically asks a strategy for the member list and

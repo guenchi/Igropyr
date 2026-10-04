@@ -1755,9 +1755,27 @@
                               '()))
            (id (next-task-id!))
            (token (make-token)))
-      (send (http-server-sup srv)
-        (vector 'submit-task (vector 'task id c req token)))
-      (await-response c srv buf #f)))
+      ;; A STOPPED POOL ANSWERS 503 RATHER THAN NOTHING. http-shutdown!
+      ;; stops the pool once it has drained, but a keep-alive connection
+      ;; accepted earlier still has a reader, and a request it finishes
+      ;; reading after that would be sent to a supervisor that is gone --
+      ;; dropped, with the client left to its own timeout. This narrows that
+      ;; to the instant between the test and the send; it does not close it.
+      ;;
+      ;; The answer is a HEAD-aware one, and the reader then waits for its
+      ;; write to finish as it does for any dispatched response: ending the
+      ;; reader closes the connection, and a close while the write is still
+      ;; queued would cancel it.
+      (if (not (process-alive? (http-server-sup srv)))
+          (begin
+            (send-response!* c token 503 '(("Content-Type" . "text/plain"))
+                             (string->utf8 "Service Unavailable") #f
+                             (eq? (req-method req) 'HEAD))
+            (await-response c srv buf #f))
+          (begin
+            (send (http-server-sup srv)
+              (vector 'submit-task (vector 'task id c req token)))
+            (await-response c srv buf #f)))))
 
   ;; total = header block + body length, RELATIVE to the buffer start
   ;; The body phases share the header phase's whole-request deadline -- the
@@ -2091,12 +2109,14 @@
          (http-stats srv)))
 
   ;; Graceful shutdown: stop accepting, then wait until the pool reports
-  ;; busy = pending = 0. TWO LIMITS ON THAT PROMISE, both real:
-  ;; established keep-alive connections stay open and their readers can
-  ;; still dispatch further requests -- nothing sets a shutdown flag on
-  ;; them -- so "every accepted request" means every one counted at the
-  ;; moments the pool was asked; and if the pool is already dead there is
-  ;; nothing to drain and this returns without waiting for anything. Call from a detached process, never from a
+  ;; busy = pending = 0, then stop the pool. TWO LIMITS ON THAT PROMISE,
+  ;; both real: established keep-alive connections stay open, and a request
+  ;; their readers hand to the pool after the drain finds it stopped and is
+  ;; answered 503 -- so "every accepted request" means every one counted
+  ;; at the moments the pool was asked, and one submitted between the last
+  ;; empty answer and the stop can be lost to the client's timeout; and if the
+  ;; pool is already dead there is nothing to drain and this returns
+  ;; without waiting for anything. Call from a detached process, never from a
   ;; pool worker (the worker itself counts as busy -- deadlock).
   (define (http-shutdown! srv)
     (tcp-stop-listen! (http-server-listener srv) (http-server-ltoken srv))
@@ -2162,7 +2182,17 @@
                 ((and (= 0 (cdr (assq 'busy s)))
                       (= 0 (cdr (assq 'pending s))))
                  'done)
-                (else (sleep-ms 100) (drain))))))))
+                (else (sleep-ms 100) (drain)))))))
+    ;; THEN THE POOL ITSELF STOPS. Draining used to be the end of it: the
+    ;; supervisor, its ticker and its workers stayed alive with nothing left
+    ;; to serve, one set per server ever shut down. The pool is unmarked
+    ;; first -- it may have been registered critical!, and stopping a
+    ;; critical process ends the image with exit 70. Enqueueing the
+    ;; unmarking is what orders it ahead of the stop (see uncritical! in
+    ;; (igropyr actor)), so no yield is needed between the two.
+    (let ((sup (http-server-sup srv)))
+      (uncritical! sup)
+      (pool-stop! sup)))
 
   ;; Start the worker pool and the TCP listener; handler is
   ;; (lambda (req res) ...), run inside a pool worker for every request.
@@ -2220,11 +2250,11 @@
         (assertion-violation 'http-listen
           "tls-cert and tls-key must be given together"
           (list 'tls-cert cert 'tls-key key))))
-    ;; VALIDATED BEFORE ANYTHING IS CREATED, which is why it is here
-    ;; and not beside the host check further down. That check runs after
-    ;; start-worker-pool, so a bad value there raises with a worker pool
-    ;; already running and nothing left holding it -- the caller sees an
-    ;; assertion and the process keeps the threads.
+    ;; VALIDATED BEFORE ANYTHING IS CREATED, as the checks of the options in
+    ;; this procedure are: a raise from a pure check costs nothing, while one
+    ;; after the worker pool exists has something to give back. The
+    ;; certificate and key themselves are read only when the TLS context is
+    ;; built, after the pool, which is why that stage has a release.
     ;;
     ;; The upper bound is uv_listen's parameter type, not a taste. It
     ;; takes a C int, and a fixnum above 2^31-1 does not fail on the way
@@ -2236,6 +2266,10 @@
                  (fx<= backlog 2147483647))
       (assertion-violation 'http-listen
         "backlog must be a positive fixnum <= 2147483647" backlog))
+    (let ((host (opt 'host "0.0.0.0")))
+      (unless (and (string? host) (> (string-length host) 0))
+        (assertion-violation 'http-listen
+          "host must be a non-empty string" host)))
     ;; Configurable body-limit (process-global): also unblocks cp0 constant
     ;; inlining so parser reads see the new value. Keep pipeline-limit in
     ;; step. A bad value must crash HERE, at boot -- deferred to request
@@ -2251,84 +2285,60 @@
            (wsbox (box #f))
            (obox (box (opt 'on-failure #f)))
            (supbox (box #f))
-           (sup (start-worker-pool (opt 'workers 8)
-                  (lambda (task) (run-task (unbox hbox) (unbox obox) task))
-                  (lambda (task info)
-                    (fail-task (unbox supbox) (unbox obox) task info))
-                  (opt 'max-retries 3)
-                  (opt 'stuck-ms 30000)
-                  (opt 'check-ms 5000)
-                  ;; Only a task that has NOT answered may be re-run. A
-                  ;; handler that responded and then raised -- in cleanup, in
-                  ;; logging, on a middleware's way back out -- has already
-                  ;; had its effects observed, and the claimed token means a
-                  ;; retry could not produce a response anyway. Re-running it
-                  ;; would repeat the writes it made while the client holds a
-                  ;; success it will never see corrected.
-                  (lambda (task) (not (unbox (vector-ref task 4))))))
            (host (opt 'host "0.0.0.0"))
            ;; TLS IS TWO OPTIONS AND BOTH ARE REQUIRED TOGETHER. One alone
            ;; is a misconfiguration, not a default: a certificate with no key
            ;; cannot serve, and a key with no certificate would quietly start
            ;; a PLAINTEXT listener on the port an operator believed was
-           ;; https. Refused here, before anything is created.
+           ;; https. Refused above, before anything is created.
            (tls-cert (opt 'tls-cert #f))
            (tls-key (opt 'tls-key #f))
-           ;; the pairing was checked above, before the pool existed
-           (tlsctx (and tls-cert (tls-listen-context! tls-cert tls-key)))
-           (srv (make-http-server sup hbox wsbox (now-ms) 0 backlog tlsctx #f)))
-      ;; ANYTHING THAT RAISES FROM HERE GIVES THE CONTEXT BACK. Startup can
-      ;; still fail after the context exists -- an invalid host, a bind onto a
-      ;; taken port, a watcher hook that will not install -- and http-listen
-      ;; raises without returning a server. There is then no one to call
-      ;; http-shutdown!, so the context and its listener count would stay live
-      ;; with nothing in the process able to reach them.
-      (guard (e (#t (let ((ctx (http-server-tlsctx srv)))
-                      (when ctx
-                        (http-server-tlsctx-set! srv #f)
-                        (tls-context-retire! ctx)))
+           ;; what has been acquired, newest first, as release thunks
+           (releases '()))
+      (define (acquired! release) (set! releases (cons release releases)))
+      ;; ACQUIRED IN STAGES, RELEASED IN REVERSE ON ANY RAISE. Startup can
+      ;; fail after something exists -- a TLS certificate that will not load,
+      ;; a bind onto a taken port, a watcher hook that will not install --
+      ;; and http-listen then raises without returning a server. Nobody can
+      ;; call http-shutdown! on a server they were never given, so whatever
+      ;; this call created is given back here: the worker pool (it used to
+      ;; stay alive, its supervisor, ticker and workers, one set per failed
+      ;; attempt), the TLS context, and the listener. Each release is
+      ;; guarded so one that fails cannot keep the others from running, and
+      ;; the original raise is the one the caller sees.
+      ;;
+      ;; ONE RESIDUAL, NAMED: recording a release allocates a pair, after the
+      ;; resource exists, so a raise in that allocation leaves the resource
+      ;; unrecorded. It is the one-allocation gap proc-spawn! states for its
+      ;; blocks, and start-worker-pool has the same between spawning its
+      ;; supervisor and its ticker.
+      (guard (e (#t (for-each (lambda (release)
+                                (guard (x (#t (void))) (release)))
+                              releases)
                     (raise e)))
-      (unless (and (string? host) (> (string-length host) 0))
-        (assertion-violation 'http-listen "host must be a non-empty string" host))
+      (let* ((sup (start-worker-pool (opt 'workers 8)
+                    (lambda (task) (run-task (unbox hbox) (unbox obox) task))
+                    (lambda (task info)
+                      (fail-task (unbox supbox) (unbox obox) task info))
+                    (opt 'max-retries 3)
+                    (opt 'stuck-ms 30000)
+                    (opt 'check-ms 5000)
+                    ;; Only a task that has NOT answered may be re-run. A
+                    ;; handler that responded and then raised -- in cleanup, in
+                    ;; logging, on a middleware's way back out -- has already
+                    ;; had its effects observed, and the claimed token means a
+                    ;; retry could not produce a response anyway. Re-running it
+                    ;; would repeat the writes it made while the client holds a
+                    ;; success it will never see corrected.
+                    (lambda (task) (not (unbox (vector-ref task 4))))))
+             (_ (acquired! (lambda () (pool-stop! sup))))
+             ;; the pairing was checked above, before the pool existed
+             (tlsctx (and tls-cert (tls-listen-context! tls-cert tls-key)))
+             (_ (when tlsctx
+                  (acquired! (lambda () (tls-context-retire! tlsctx)))))
+             (srv (make-http-server sup hbox wsbox (now-ms) 0 backlog
+                                    tlsctx #f)))
       (set-box! supbox sup)
-      ;; LOSING THE POOL SUPERVISOR LEAVES A LISTENER THAT CANNOT SERVE.
-      ;; Every request is submitted to it, so once it is gone requests are
-      ;; submitted to nothing and time out -- while the process is still
-      ;; running and still accepting connections. Marking it critical turns
-      ;; that into an exit 70 instead. Nothing here could restart it and
-      ;; reattach the workers and tasks it owned, which is why the answer is
-      ;; to end the image rather than to grow a supervision tree.
-      ;;
-      ;; THE NAME CARRIES THE PORT, because a process may run several
-      ;; listeners -- an application port and an admin or metrics port are
-      ;; the usual pair -- and a panic saying only "http-worker-pool"
-      ;; would not say which.
-      ;;
-      ;; NOT EVERY LISTENER IS ONE THE IMAGE CANNOT SERVE WITHOUT, so
-      ;; `critical` can be set to #f. It defaults to #t because that is
-      ;; the safe answer for the listener an application exists to serve,
-      ;; and because it is the behaviour every existing caller already
-      ;; has.
-      ;;
-      ;; WHAT OPTING OUT BUYS IS NOT GRACEFUL DEGRADATION, and a caller
-      ;; should decide with that in front of them. The pool dying does
-      ;; not stop the listener: it goes on accepting connections and
-      ;; submitting requests to something that is gone, so every request
-      ;; on that port times out, with the port still open and the process
-      ;; still healthy by every other measure. `critical` #t converts
-      ;; that into an exit 70. Setting it to #f says the silence is
-      ;; preferable to ending the image -- true for a metrics or admin
-      ;; port, whose absence an operator notices and whose failure should
-      ;; not take the application down with it, and false for anything a
-      ;; client depends on.
-      ;;
-      ;; Nothing restarts the pool either way. There is no supervision
-      ;; tree to reattach its workers and tasks to, which is why the two
-      ;; choices are "end the image" and "this port stops working".
-      (when (opt 'critical #t)
-        (critical! sup (string->symbol
-                         (string-append "http-worker-pool:"
-                                        (number->string port)))))
       ;; THE on-accept LAMBDA IS THE SAME FOR BOTH. On a TLS listener libuv
       ;; does not run it until the handshake has completed, so what it receives
       ;; is a connection that already speaks plaintext -- the reader, the
@@ -2361,6 +2371,59 @@
       ;; Every later use pairs handle and token; the address alone would
       ;; match a future listener's.
       (http-server-ltoken-set! srv (listener-token (http-server-listener srv)))
+      ;; WITH THE TOKEN SAVED FOR THIS SERVER, not the listener's current
+      ;; one: if this listener had been stopped and its address reused, the
+      ;; current token would name the newer listener, and the release would
+      ;; stop that instead.
+      (acquired! (lambda ()
+                   (let ((l (http-server-listener srv)))
+                     (when l (tcp-stop-listen! l (http-server-ltoken srv))))))
+      ;; MARKED CRITICAL LAST, once nothing after it can fail: a pool
+      ;; registered critical and then stopped by the release above would
+      ;; end the image with exit 70 instead of letting the raise through.
+      ;; LOSING THE POOL SUPERVISOR LEAVES A LISTENER THAT CAN START NO NEW
+      ;; HANDLER. (A worker that had already passed its check of the
+      ;; supervisor may still run its handler to the end; see otp.sc.)
+      ;; Every request the reader accepts, other than a WebSocket upgrade,
+      ;; is submitted to it, so once it is gone each of those is answered
+      ;; 503 -- while the process is still running and still accepting
+      ;; connections. (A request the reader rejects itself -- 400, 413, 431,
+      ;; 505 -- is answered as before, and an upgrade still opens.) Marking
+      ;; it critical turns that into an exit 70 instead. Nothing here could
+      ;; restart it and reattach the workers and tasks it owned, which is
+      ;; why the answer is to end the image rather than to grow a
+      ;; supervision tree.
+      ;;
+      ;; THE NAME CARRIES THE PORT, because a process may run several
+      ;; listeners -- an application port and an admin or metrics port are
+      ;; the usual pair -- and a panic saying only "http-worker-pool"
+      ;; would not say which.
+      ;;
+      ;; NOT EVERY LISTENER IS ONE THE IMAGE CANNOT SERVE WITHOUT, so
+      ;; `critical` can be set to #f. It defaults to #t because that is
+      ;; the safe answer for the listener an application exists to serve,
+      ;; and because it is the behaviour every existing caller already
+      ;; has.
+      ;;
+      ;; WHAT OPTING OUT BUYS IS NOT GRACEFUL DEGRADATION, and a caller
+      ;; should decide with that in front of them. The pool dying does
+      ;; not stop the listener: it goes on accepting connections and
+      ;; finding the pool gone, so every request that would have gone to
+      ;; the pool is answered 503, with the port still open and the process
+      ;; still healthy by every other measure. `critical` #t converts that
+      ;; into an exit 70. Setting it to #f says a port that can start no new
+      ;; handler is preferable to ending the image -- true for a
+      ;; metrics or admin port, whose absence an operator notices and whose
+      ;; failure should not take the application down with it, and false
+      ;; for anything a client depends on.
+      ;;
+      ;; Nothing restarts the pool either way. There is no supervision
+      ;; tree to reattach its workers and tasks to, which is why the two
+      ;; choices are "end the image" and "this port starts no new handler".
+      (when (opt 'critical #t)
+        (critical! sup (string->symbol
+                         (string-append "http-worker-pool:"
+                                        (number->string port)))))
       ;; The two numbers are printed together because the pair is the
       ;; whole point: the request is what this process chose, the
       ;; effective value is what the kernel kept, and only their
@@ -2389,5 +2452,5 @@
                         (let ((e (http-server-backlog-effective srv)))
                           (if e (number->string e) "unavailable"))
                         ")\n")))
-      srv))
+      srv)))
 ))

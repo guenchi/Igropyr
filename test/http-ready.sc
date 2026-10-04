@@ -22,13 +22,22 @@
       (unless (http-server-pool-alive? srv) (fail "pool-not-alive-at-start"))
       (unless (http-server-ready? srv) (fail "not-ready-with-listener-and-pool"))
       ;; ---- listener gone, pool alive: NOT ready, though pool-alive? says yes
-      (http-shutdown! srv)
+      ;; The listener is stopped behind the server's back (this is the only
+      ;; listener in the process at this point). http-shutdown! would not
+      ;; produce this state any more: since it stops the pool after draining,
+      ;; a shut-down server has neither.
+      (tcp-stop-listen!)
       (sleep-ms 200)
       (unless (http-server-pool-alive? srv)
         (fail "pool-died-with-listener-stop" 'pool-alive? #f))
       (when (http-server-ready? srv)
-        (fail "ready-without-listener")))
-    (display "listener stopped: pool-alive? #t, ready? #f ok\n")
+        (fail "ready-without-listener"))
+      ;; ---- and after http-shutdown! the pool is gone too --------------------
+      (http-shutdown! srv)
+      (sleep-ms 300)
+      (when (http-server-pool-alive? srv)
+        (fail "pool-alive-after-shutdown" 'pool-alive? #t)))
+    (display "listener stopped: pool-alive? #t, ready? #f; after shutdown pool-alive? #f ok\n")
     ;; ---- pool dead under a live listener: not ready either ----------------
     (let ((srv (http-listen 18115 handler '((host . "127.0.0.1") (workers . 1) (critical . #f)))))
       (sleep-ms 100)
