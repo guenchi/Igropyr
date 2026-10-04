@@ -343,6 +343,8 @@ IGROPYR_INJECT=on IGROPYR_CONTRACTS=full "$scheme_bin" --script test/node.sc
 # servers (ports 18852, 18853)
 "$scheme_bin" --script test/ws-client-protocol.sc
 "$scheme_bin" --script test/apple-jws.sc
+# the reason codes apple-jws.sc raises equal the set its header lists
+"$scheme_bin" --script test/apple-jws-codes.sc
 # x5c path validation against certificate hierarchies generated per run;
 # needs the openssl CLI, 3.4 or later
 "$scheme_bin" --script test/apple-jws-path.sc
