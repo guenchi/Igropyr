@@ -345,6 +345,8 @@ IGROPYR_INJECT=on IGROPYR_CONTRACTS=full "$scheme_bin" --script test/node.sc
 "$scheme_bin" --script test/apple-jws.sc
 # the reason codes apple-jws.sc raises equal the set its header lists
 "$scheme_bin" --script test/apple-jws-codes.sc
+# the x5c count (3..8) and entry-size (8192) bounds at their edges
+"$scheme_bin" --script test/apple-jws-bounds.sc
 # x5c path validation against certificate hierarchies generated per run;
 # needs the openssl CLI, 3.4 or later
 "$scheme_bin" --script test/apple-jws-path.sc
