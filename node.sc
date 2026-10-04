@@ -1,4 +1,18 @@
 #!chezscheme
+;;; Copyright 2018 - 2026 guenchi.
+;;;
+;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;; you may not use this file except in compliance with the License.
+;;; You may obtain a copy of the License at
+;;;
+;;; http://www.apache.org/licenses/LICENSE-2.0
+;;;
+;;; Unless required by applicable law or agreed to in writing, software
+;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;; See the License for the specific language governing permissions and
+;;; limitations under the License.
+
 ;;; (igropyr node) -- node-to-node links: distribution phase 1.
 ;;;
 ;;; Connects igropyr instances (other cores via loopback, other machines
@@ -1264,10 +1278,30 @@
   ;; cursor into a chain other processes are unlinking from can be left
   ;; pointing at a node whose next pointer has been cleared, and the walk
   ;; would then stop early and silently leave the rest unwatched. Starting
-  ;; over is quadratic in the worst case and correct under concurrent
-  ;; unlinking; this runs only when a reaper restarts, so the cheaper
-  ;; version would buy speed on a path that almost never executes at the
-  ;; cost of a correctness question on the path that matters.
+  ;; over is quadratic in the worst case; this runs only when a reaper
+  ;; restarts, so the cheaper version would buy speed on a path that almost
+  ;; never executes.
+  ;;
+  ;; IT DOES NOT CLOSE THAT HOLE, ONLY NARROWS IT. Each step of a pass reads
+  ;; the next pointer in its own region, so the record a pass is standing
+  ;; on can be unlinked under it, its next pointer cleared, and that pass
+  ;; ends early just as a carried cursor would. If it had found nothing
+  ;; fresh before that point, the walk takes the early end for the real
+  ;; one and stops. With 65 holders of inherited leases: the first pass
+  ;; indexes 64, the second starts at the head, the head's lease is freed
+  ;; while the pass stands on it, and the 65th holder is never watched by
+  ;; this incarnation. The agent chain has the same shape (its unlink
+  ;; clears gnext). Known and not yet fixed.
+  ;;
+  ;; MEMBERSHIP IS `hashtable-contains?`, NOT `hashtable-ref ... #f`, in
+  ;; both walks. A lease-only entry holds #f, so a ref test reads it as
+  ;; absent: every pass found a live lease holder "fresh" again and
+  ;; monitored it again, and the walk did not end while such a lease
+  ;; stayed on the chain -- a replacement reaper alive and registered that
+  ;; processed no DOWN until the holder let go (a pre-auth lease lasts up
+  ;; to the handshake timeout). The rescan asks "is this pid indexed"; the
+  ;; `watch` clause in reaper-loop asks "does it have a key yet", which is
+  ;; why that one keeps its ref test.
   (define (reaper-rescan! watched)
     (let outer ()
       (let ((fresh
@@ -1275,7 +1309,7 @@
                (cond
                  ((not r) (reverse acc))
                  ((fx= n reaper-chunk) (reverse acc))
-                 ((hashtable-ref watched (agent-pid r) #f)
+                 ((hashtable-contains? watched (agent-pid r))
                   (scan (atomically (agent-gnext r)) n acc))
                  (else
                   (scan (atomically (agent-gnext r)) (fx+ n 1)
@@ -1294,8 +1328,9 @@
     ;;
     ;; Monitoring a process that is already dead delivers its DOWN at
     ;; once, so a holder that died while no reaper was running is
-    ;; collected here rather than being missed: the rescan is what makes
-    ;; the announcement message a shortcut instead of the mechanism.
+    ;; collected here when the walk reaches it (the hole described above
+    ;; can keep it from doing so): the rescan is what makes the
+    ;; announcement message a shortcut instead of the mechanism.
     (let outer ()
       (let ((fresh
              (let scan ((x (atomically leases)) (n 0) (acc (list)))
@@ -1303,7 +1338,7 @@
                  ((not x) (reverse acc))
                  ((fx= n reaper-chunk) (reverse acc))
                  ((or (not (lease-pid x))
-                      (hashtable-ref watched (lease-pid x) #f))
+                      (hashtable-contains? watched (lease-pid x)))
                   (scan (atomically (lease-next x)) n acc))
                  (else
                   (scan (atomically (lease-next x)) (fx+ n 1)
@@ -1345,18 +1380,26 @@
         (receive
           (`#(watch ,pid ,key)
             ;; A pid already watched for one reason keeps its key: the
-            ;; DOWN below runs BOTH sweeps regardless of why it was
-            ;; indexed, so arriving twice costs nothing and losing the
-            ;; key would cost an agent.
+            ;; DOWN below retires an agent only when the entry holds a
+            ;; key, so losing the key would cost an agent. Arriving twice
+            ;; can mean another monitor and another DOWN; that DOWN never
+            ;; takes another process's agent, because retirement checks
+            ;; that the record under the key belongs to this pid.
+            ;;
+            ;; THE REF TEST HERE IS DELIBERATE, unlike the rescan's: the
+            ;; question is "does it have a key yet", and a lease-only
+            ;; entry (#f) must be upgraded when the same pid later
+            ;; arrives with a key.
             (unless (hashtable-ref watched pid #f)
               (hashtable-set! watched pid key))
             (monitor pid)
             (loop))
           (`#(DOWN ,pid ,reason)
-            ;; BOTH SWEEPS, ALWAYS. One process can be an agent and hold
-            ;; leases, or hold two leases of different kinds; deciding
-            ;; which sweep to run from how the pid happened to be indexed
-            ;; would give back one resource and quietly keep the other.
+            ;; THE LEASE SWEEP ALWAYS, AND THE AGENT ONE WHENEVER THERE IS
+            ;; A KEY. One process can be an agent and hold leases, or hold
+            ;; two leases of different kinds; choosing between the sweeps
+            ;; by how the pid happened to be indexed would give back one
+            ;; resource and quietly keep the other.
             (let ((key (hashtable-ref watched pid #f)))
               (hashtable-delete! watched pid)
               (when key (retire-agent-of-pid! key pid)))

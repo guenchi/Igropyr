@@ -336,6 +336,9 @@ IGROPYR_INJECT=on IGROPYR_CONTRACTS=full "$scheme_bin" --script test/node.sc
 # a reply with a pending call's ref from a peer the call was not sent to
 # neither answers it nor removes it (node port 18103)
 "$scheme_bin" --script test/rcall-reply-peer.sc
+# a reaper restarted while a pre-auth lease is held finishes its rescan and
+# serves: credit comes back, its monitor count stays bounded (node port 18099)
+"$scheme_bin" --script test/node-reaper-restart-preauth.sc
 # caching_sha2 full authentication: packet numbers and the nonce after an
 # auth switch, against a fake server (port 18856)
 "$scheme_bin" --script test/mysql-auth-sequence.sc
