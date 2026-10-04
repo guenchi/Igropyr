@@ -170,8 +170,11 @@
 ;;;
 ;;; SECURITY: the dist port is FULL CONTROL of the node -- anyone on it
 ;;; can message any registered process, including supervisors. The
-;;; listener binds 127.0.0.1 unless told otherwise, and there is no TLS:
-;;; across machines, keep it on a private network (WireGuard, VPC).
+;;; listener binds 127.0.0.1 unless told otherwise. TLS is opt-in, with
+;;; node-start!'s tls-cert and tls-key options (and tls-ca to verify peers
+;;; against one private CA); without them the mesh is plaintext, and across
+;;; machines it belongs on a private network (WireGuard, VPC). Either way
+;;; every peer must also prove the shared secret.
 ;;;
 ;;; ---- Design model ----------------------------------------------------
 ;;;

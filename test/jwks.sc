@@ -217,15 +217,23 @@
         (check "valid-shaped token with a foreign signature refused"
           (not (jwks-verify relabelled url))))
 
-      ;; a flipped byte in the payload invalidates the signature; the claims
-      ;; must never be read, let alone returned
-      (let* ((last-dot (let loop ((i (- (string-length tok) 1)))
-                         (if (char=? (string-ref tok i) #\.) i (loop (- i 1)))))
+      ;; a flipped character in the HEADER segment invalidates the signature
+      ;; (the row below flips one in the payload: the claims must never be
+      ;; read, let alone returned). An earlier comment here said "payload"
+      ;; of a flip at index 3, which is inside the header.
+      (let ((tampered (string-append
+                        (substring tok 0 3)
+                        (if (char=? (string-ref tok 3) #\A) "B" "A")
+                        (substring tok 4 (string-length tok)))))
+        (check "tampered token (header) refused" (not (jwks-verify tampered url))))
+      (let* ((d1 (let loop ((i 0))
+                   (if (char=? (string-ref tok i) #\.) i (loop (+ i 1)))))
+             (k (+ d1 2))
              (tampered (string-append
-                         (substring tok 0 3)
-                         (if (char=? (string-ref tok 3) #\A) "B" "A")
-                         (substring tok 4 (string-length tok)))))
-        (check "tampered token refused" (not (jwks-verify tampered url))))
+                         (substring tok 0 k)
+                         (if (char=? (string-ref tok k) #\A) "B" "A")
+                         (substring tok (+ k 1) (string-length tok)))))
+        (check "tampered token (payload) refused" (not (jwks-verify tampered url))))
 
       ;; ---- alg pinning ----------------------------------------------------
       ;; the alg=none downgrade: re-encode the header as {"alg":"none"} and

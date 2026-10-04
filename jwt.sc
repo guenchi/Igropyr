@@ -19,11 +19,11 @@
 ;;;             '((expires-in . 3600)))            ; -> token string
 ;;;   (jwt-verify token key)                       ; -> claims alist | #f
 ;;;   (jwt-verify token key '((leeway . 30) (iss . "api.example.com")))
-;;;   (app-use app (auth (jwt-verifier key)))      ; (igropyr middleware)
+;;;   (app-use app (auth (jwt-verifier key)))      ; (igropyr auth)
 ;;;   (req-claims req)                             ; claims in a handler
 ;;;
 ;;; This library is the CREDENTIAL FORMAT only (the J is JSON). The
-;;; HTTP-side middleware lives in (igropyr middleware) under the
+;;; HTTP-side middleware lives in (igropyr auth) under the
 ;;; format-neutral name auth -- it guards s-expression RPC endpoints
 ;;; just as well, taking any (lambda (token) claims-or-#f) verifier.
 ;;; jwt-verifier packages a key (+ options) into that shape.
@@ -231,7 +231,7 @@
   ;; ---- verifier factory ------------------------------------------------------
 
   ;; Package a key (+ verification options: leeway/iss/aud) into the
-  ;; (lambda (token) claims-or-#f) shape that (igropyr middleware)'s
+  ;; (lambda (token) claims-or-#f) shape that (igropyr auth)'s
   ;; auth takes. The key is checked here, at boot, not per request.
   (define (jwt-verifier key . rest)
     (let ((kbv (key->bv key))

@@ -25,13 +25,18 @@
 ;;;     (string->json (utf8->string payload)))               ; -> the claims
 ;;;
 ;;; On any failure it raises #(apple-jws-error CODE MESSAGE); CODE is a
-;;; symbol so the caller can map it to an HTTP status (bad signature /
-;;; chain / root / expiry are attacker-facing 401s; parse/internal are
-;;; retryable 5xx):
-;;;   not-jws bad-alg crit no-x5c cert-parse-failed invalid-root
-;;;   chain-failed cert-expired sig-failed internal
+;;; symbol so the caller can map it to an HTTP status:
+;;;   about the token it was handed, so the sender's problem (a 4xx, 401
+;;;   for a webhook): not-jws bad-alg crit no-x5c cert-parse-failed
+;;;     invalid-root chain-failed cert-expired sig-failed
+;;;   ours, and worth a retry (a 5xx): internal
 ;;;
-;;; Verification (mirrors Apple's own app-store-server-library):
+;;; Verification, in the same order as Apple's own app-store-server-library
+;;; but not with the same behaviour -- this accepts a chain of 3 to 8
+;;; certificates, does not apply the strict profile, validates at the
+;;; current time, and has no revocation checking, where Apple's library
+;;; makes its own choices on each (online revocation checks among them, as
+;;; an option):
 ;;;   1. the header alg is ES256 (never trusted to pick the algorithm), and
 ;;;      the header has no crit member (no extension is understood here)
 ;;;   2. the x5c root's DER bytes equal a pinned trusted root (verify-apple-jws
