@@ -333,6 +333,9 @@ IGROPYR_INJECT=on IGROPYR_CONTRACTS=full "$scheme_bin" --script test/node.sc
 # a task the worker killed for outstaying its timeout is awaited as task-killed
 # (node port 18097)
 "$scheme_bin" --script test/dpool-timeout.sc
+# a reply with a pending call's ref from a peer the call was not sent to
+# neither answers it nor removes it (node port 18103)
+"$scheme_bin" --script test/rcall-reply-peer.sc
 # caching_sha2 full authentication: packet numbers and the nonce after an
 # auth switch, against a fake server (port 18856)
 "$scheme_bin" --script test/mysql-auth-sequence.sc
