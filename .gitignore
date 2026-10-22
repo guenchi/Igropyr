@@ -1,0 +1,8 @@
+/instance.sexp
+/request-index.sexp
+/snap/
+/derived/
+/writers/*/working/
+/writers/*/draft.lock
+*.tmp-*
+!/writers/*/incoming/*
