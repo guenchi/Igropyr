@@ -6282,7 +6282,7 @@ The test directory contains self-asserting regression tests and interactive
 smoke/demo servers. Run every automated check with:
 
 ```sh
-./igropyr/test/run-all.sh
+sh igropyr/test/run-all.sh
 ```
 
 The suite verifies all library imports, the actor scheduler, asynchronous file
